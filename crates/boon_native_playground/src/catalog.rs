@@ -1,10 +1,9 @@
-use crate::distributed_program::{ProgramSource, compile_distributed_program};
 use crate::protocol::{
     ApplicationIdentity, AssetBlob, CatalogItem, MigrationBundle, MigrationStage,
-    MigrationTestDriver, SourceUnit, TestStep,
+    MigrationTestDriver, ProgramSource, SourceUnit, TestStep,
 };
 use boon_plan::ProgramRole;
-use boon_runtime::{DistributedProgramBundle, ExampleManifestEntry, RuntimeResult};
+use boon_runtime::{ExampleManifestEntry, RuntimeResult};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::{fs, path::PathBuf};
@@ -18,7 +17,7 @@ pub struct LoadedExample {
     pub test_steps: Vec<TestStep>,
     pub assets: Vec<AssetBlob>,
     pub migration: Option<MigrationBundle>,
-    distributed_program: Option<DistributedProgramBundle>,
+    pub programs: Vec<ProgramSource>,
 }
 
 pub struct Catalog {
@@ -105,11 +104,11 @@ impl Catalog {
                 .collect(),
         };
         let base_application = built_in_application_identity(entry);
-        let distributed_program = load_distributed_program(entry, &base_application, &units)?;
-        let application = distributed_program
-            .as_ref()
-            .and_then(|bundle| bundle.artifact(ProgramRole::Client))
-            .map_or(base_application, |artifact| artifact.application().clone());
+        let programs = load_program_sources(entry, &base_application, &units)?;
+        let application = programs
+            .iter()
+            .find(|source| source.role == ProgramRole::Client)
+            .map_or(base_application, |source| source.application.clone());
         let test_steps = match migration.as_ref().map(|migration| migration.test_driver) {
             Some(MigrationTestDriver::Migration) => Vec::new(),
             Some(MigrationTestDriver::Example) | None => ordinary_test_steps(&entry.scenario)?,
@@ -131,18 +130,18 @@ impl Catalog {
             test_steps,
             assets,
             migration,
-            distributed_program,
+            programs,
         })
     }
 }
 
-fn load_distributed_program(
+fn load_program_sources(
     entry: &ExampleManifestEntry,
     base_application: &ApplicationIdentity,
     primary_units: &[SourceUnit],
-) -> RuntimeResult<Option<DistributedProgramBundle>> {
+) -> RuntimeResult<Vec<ProgramSource>> {
     if entry.programs.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let distributed = entry.programs.len() == 3;
     let sources = entry
@@ -204,7 +203,7 @@ fn load_distributed_program(
         )
         .into());
     }
-    compile_distributed_program(sources).map(Some)
+    Ok(sources)
 }
 
 fn workspace_relative_source_path(path: &str) -> RuntimeResult<String> {

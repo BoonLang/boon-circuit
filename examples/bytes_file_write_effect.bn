@@ -1,19 +1,14 @@
 store: [
-    save: [press: SOURCE]
+    save: SOURCE
     bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD bytes { LATEST {} }
     result:
-        TEXT { not written }
-        |> HOLD result {
-            store.save.press |> THEN {
-                File/write_bytes(input: store.bytes, path: TEXT { output.bin })
+        NotStarted |> HOLD result {
+            store.save |> THEN {
+                File/write_bytes(file: store.save.file, bytes: store.bytes)
             }
         }
 ]
 
-document: Document/new(
-    root: Element/label(
-        element: []
-        style: []
-        text: store.result
-    )
-)
+outputs: [
+    result: store.result
+]

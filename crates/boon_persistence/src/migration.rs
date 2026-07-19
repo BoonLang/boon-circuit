@@ -834,7 +834,7 @@ fn evaluate_expression(
                     )),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(StoredValue::Bytes(bytes))
+            Ok(StoredValue::Bytes(bytes.into()))
         }
         MigrationExpressionPlan::Match { input, arms } => {
             let value = evaluate_expression(input, inputs, parameters)?;

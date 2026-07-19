@@ -10,9 +10,9 @@ boon_effect_schema.workspace = true
 boon_host_runtime.workspace = true
 boon_plan.workspace = true
 boon_runtime.workspace = true
+tokio.workspace = true
 wellen.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
 tempfile = "3.27.0"
-tokio.workspace = true

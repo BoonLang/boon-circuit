@@ -76,6 +76,9 @@ boon_native_app_window = { path = "crates/boon_native_app_window" }
 app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "6aec9831f281df355736df28a4c3aacdef7cf8a1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22.1"
+bytes = { version = "1.11.1", features = ["serde"] }
+atomic-write-file = "0.3.0"
 ciborium = "0.2.2"
 toml = "0.9"
 web-time = "1.1.0"
@@ -98,7 +101,7 @@ wgpu = "=29.0.1"
 glyphon = "=0.11.0"
 wgsl_bindgen = "=0.22.2"
 futures = "0.3"
-getrandom = "0.3.4"
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
 hmac = "0.12.1"
 libc = "0.2"
 evdev = "0.13.2"
@@ -117,6 +120,7 @@ tokio-tungstenite = "0.29.0"
 url = "2.5.7"
 wasm-bindgen-cli-support = "=0.2.121"
 zeroize = "1.8.2"
+static_assertions = "1.1.0"
 
 [profile.dev.package.boon_document]
 opt-level = 2

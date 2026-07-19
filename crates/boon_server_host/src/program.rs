@@ -1,6 +1,10 @@
-use crate::{HttpRequest, HttpResponse, WebSocketAction, WebSocketEvent};
+use crate::{
+    DistributedSessionAction, DistributedSessionConnectionId, DistributedSessionEvent, HttpRequest,
+    HttpResponse, WebSocketAction, WebSocketEvent,
+};
 use async_trait::async_trait;
 use std::fmt::{self, Debug, Formatter};
+use std::time::Instant;
 use tokio::sync::watch;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +88,82 @@ pub trait ServerProgram: Send + 'static {
         event: WebSocketEvent,
         cancellation: CallCancellation,
     ) -> Vec<WebSocketAction>;
+
+    /// Enables the host-owned distributed-Session transport lane.
+    ///
+    /// The host reads this capability once during binding. The reserved path is
+    /// never dispatched to [`ServerProgram::on_http`] or
+    /// [`ServerProgram::on_websocket`], whether this returns true or false.
+    fn has_distributed_session_transport(&self) -> bool {
+        false
+    }
+
+    /// Dispatches one lifecycle event from the dedicated binary transport.
+    async fn on_distributed_session(
+        &mut self,
+        _connection: DistributedSessionConnectionId,
+        _event: DistributedSessionEvent,
+        _cancellation: CallCancellation,
+    ) -> Vec<DistributedSessionAction> {
+        Vec::new()
+    }
+
+    /// Returns the next monotonic instant at which the host should poll the
+    /// distributed-Session program, or `None` when no timer is armed.
+    fn distributed_session_next_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// Runs when [`ServerProgram::distributed_session_next_deadline`] is due.
+    async fn on_distributed_session_timer(
+        &mut self,
+        _now: Instant,
+        _cancellation: CallCancellation,
+    ) -> Vec<DistributedSessionAction> {
+        Vec::new()
+    }
+
+    /// Reports whether the program has asynchronous internal work for the
+    /// owner to await.
+    ///
+    /// Keep this true while [`ServerProgram::on_internal_work`] can make
+    /// progress, including while its next item is not ready yet. Return false
+    /// when there is no work to prevent the owner from polling needlessly.
+    fn has_pending_internal_work(&self) -> bool {
+        false
+    }
+
+    /// Awaits and processes one internal work item, returning any resulting
+    /// distributed-Session transport actions.
+    ///
+    /// The owner may drop this future whenever a timer or owner command wins
+    /// the scheduling race. Implementations must therefore be cancellation
+    /// safe and leave the item available for a later call until it is ready to
+    /// complete.
+    async fn on_internal_work(&mut self) -> Vec<DistributedSessionAction> {
+        std::future::pending().await
+    }
+
+    /// Acknowledges one `Send` after, and only after, its target connection's
+    /// bounded writer accepted the bytes.
+    ///
+    /// Programs that lease an outbound queue head must commit that lease here,
+    /// not while constructing the action. Queue rejection closes the connection
+    /// and never calls this method.
+    fn on_distributed_session_send_accepted(
+        &mut self,
+        _connection: DistributedSessionConnectionId,
+    ) {
+    }
+
+    /// Reports cancellation after an in-progress distributed callback future
+    /// has been dropped. `connection` is `None` for timer callbacks.
+    async fn on_distributed_session_cancelled(
+        &mut self,
+        _connection: Option<DistributedSessionConnectionId>,
+        _reason: CancellationReason,
+    ) {
+    }
 
     /// Reports cancellation after the in-progress HTTP future has been dropped.
     async fn on_http_cancelled(&mut self, _reason: CancellationReason) {}

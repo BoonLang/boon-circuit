@@ -11,15 +11,20 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 boon_app_package.workspace = true
 boon_document.workspace = true
+boon_effect_schema.workspace = true
 boon_host.workspace = true
 boon_native_gpu.workspace = true
+boon_plan.workspace = true
 boon_runtime.workspace = true
+boon_wire.workspace = true
+getrandom.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
+sha2.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
-boon_plan.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 idb = { version = "0.6.5", default-features = false, features = ["builder"] }

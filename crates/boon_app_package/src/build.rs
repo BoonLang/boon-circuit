@@ -1,7 +1,8 @@
 use crate::{
     AppManifest, ArtifactDescriptor, BUNDLE_FORMAT, BUNDLE_MANIFEST_FILE, BrowserAppConfig,
-    BundleFileDescriptor, BundleFileKind, BundleManifest, MAX_PACKAGE_FILE_BYTES, NamespaceProfile,
-    PackageError, PackageFileManifest, ProgramManifest, RunMode, StaticCachePolicy, sha256_bytes,
+    BundleFileDescriptor, BundleFileKind, BundleManifest, CapabilityProfileDescriptor,
+    MAX_PACKAGE_FILE_BYTES, NamespaceProfile, PackageError, PackageFileManifest, ProgramManifest,
+    RunMode, StaticCachePolicy, sha256_bytes,
 };
 use boon_plan::{ApplicationIdentity, ProgramRole};
 use boon_runtime::{
@@ -212,12 +213,18 @@ fn build_into(
         &mut files,
         &mut targets,
     )?;
+    let capability_profiles = selected_capability_profiles(app)?;
+    let client_capability_profile = capability_profiles
+        .iter()
+        .find(|profile| profile.role == ProgramRole::Client)
+        .ok_or_else(|| PackageError::new("selected Client capability profile is absent"))?;
 
     generate_browser_assets(
         app,
         browser_wasm,
         output,
         &client_descriptor,
+        client_capability_profile,
         &mut files,
         &mut targets,
     )?;
@@ -292,6 +299,7 @@ fn build_into(
         run_mode,
         namespace_profile,
         protocol_version: app.package.protocol_version,
+        capability_profiles,
         artifacts: vec![client_descriptor, session_descriptor, server_descriptor],
         files,
         browser: app.browser.clone(),
@@ -304,6 +312,41 @@ fn build_into(
         .map_err(|error| PackageError::context("encode bundle manifest", error))?;
     fs::write(output.join(BUNDLE_MANIFEST_FILE), bundle_bytes)?;
     Ok(bundle)
+}
+
+fn selected_capability_profiles(
+    app: &AppManifest,
+) -> Result<Vec<CapabilityProfileDescriptor>, PackageError> {
+    let mut profiles = Vec::with_capacity(3);
+    for program in [
+        &app.programs.client,
+        &app.programs.session,
+        &app.programs.server,
+    ] {
+        let profile = app
+            .capability_profiles
+            .get(&program.capability_profile_id)
+            .ok_or_else(|| {
+                PackageError::new(format!(
+                    "{} program references omitted capability profile `{}`",
+                    program.role.as_str(),
+                    program.capability_profile_id
+                ))
+            })?;
+        if profile.role != program.role {
+            return Err(PackageError::new(format!(
+                "{} program capability profile `{}` has role {}",
+                program.role.as_str(),
+                profile.id,
+                profile.role.as_str()
+            )));
+        }
+        profiles.push(CapabilityProfileDescriptor::canonical_from_manifest(
+            profile,
+        ));
+    }
+    profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(profiles)
 }
 
 struct CompiledProgram {
@@ -444,6 +487,7 @@ fn generate_browser_assets(
     browser_wasm: &Path,
     output: &Path,
     client: &ArtifactDescriptor,
+    client_capability_profile: &CapabilityProfileDescriptor,
     files: &mut Vec<BundleFileDescriptor>,
     targets: &mut BTreeSet<String>,
 ) -> Result<(), PackageError> {
@@ -478,6 +522,7 @@ fn generate_browser_assets(
         app.package.protocol_version,
         &app.browser.canvas_id,
         client,
+        client_capability_profile,
     )?;
     let app_config_bytes = app_config.encode()?;
     write_generated_public_file(

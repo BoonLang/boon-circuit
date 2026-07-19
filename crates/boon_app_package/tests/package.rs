@@ -1,8 +1,9 @@
 #![cfg(feature = "build")]
 
 use boon_app_package::{
-    AppManifest, BrowserAppConfig, BuildRequest, LoadedAppBundle, NamespaceProfile, RunMode,
-    build_app_package,
+    AppManifest, BUNDLE_MANIFEST_FILE, BrowserAppConfig, BuildRequest, BundleManifest,
+    LoadedAppBundle, MAX_CAPABILITY_GRANTS_PER_PROFILE, MAX_CAPABILITY_PROFILES, NamespaceProfile,
+    RunMode, build_app_package,
 };
 use boon_plan::ProgramRole;
 use boon_runtime::ProgramCapabilityProfile;
@@ -34,6 +35,38 @@ fn build_fixture(temp: &tempfile::TempDir, output_name: &str) -> PathBuf {
     })
     .unwrap();
     output
+}
+
+fn read_bundle_manifest(output: &Path) -> BundleManifest {
+    let bytes = fs::read(output.join(BUNDLE_MANIFEST_FILE)).unwrap();
+    ciborium::from_reader(bytes.as_slice()).unwrap()
+}
+
+fn write_bundle_manifest(output: &Path, manifest: &BundleManifest) {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(manifest, &mut bytes).unwrap();
+    fs::write(output.join(BUNDLE_MANIFEST_FILE), bytes).unwrap();
+}
+
+fn assert_bundle_manifest_rejected(
+    output: &Path,
+    manifest: &BundleManifest,
+    expected_message: &str,
+) {
+    write_bundle_manifest(output, manifest);
+    let error = LoadedAppBundle::load(output)
+        .err()
+        .expect("tampered bundle manifest must fail");
+    assert!(
+        error.to_string().contains(expected_message),
+        "unexpected package error: {error}"
+    );
+}
+
+fn encode_browser_config_unchecked(config: &BrowserAppConfig) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(config, &mut bytes).unwrap();
+    bytes
 }
 
 #[test]
@@ -92,6 +125,46 @@ fn manifest_requires_distinct_artifact_paths_and_state_namespaces() {
 }
 
 #[test]
+fn manifest_bounds_and_deduplicates_capability_grants() {
+    let mut manifest = AppManifest::from_path(&fixture_manifest()).unwrap();
+    {
+        let client = manifest
+            .capability_profiles
+            .get_mut("public-webgpu-v1")
+            .unwrap();
+        client.grants.push(client.grants[0].clone());
+    }
+    let error = manifest.validate().unwrap_err();
+    assert!(error.to_string().contains("repeats grant"));
+
+    manifest
+        .capability_profiles
+        .get_mut("public-webgpu-v1")
+        .unwrap()
+        .grants = (0..=MAX_CAPABILITY_GRANTS_PER_PROFILE)
+        .map(|index| format!("browser.grant-{index}"))
+        .collect();
+    let error = manifest.validate().unwrap_err();
+    assert!(error.to_string().contains("exceeds 64 grants"));
+
+    let mut profile = manifest
+        .capability_profiles
+        .get("public-webgpu-v1")
+        .unwrap()
+        .clone();
+    profile.grants.clear();
+    manifest.capability_profiles.clear();
+    for index in 0..=MAX_CAPABILITY_PROFILES {
+        profile.id = format!("bounded-profile-{index}");
+        manifest
+            .capability_profiles
+            .insert(profile.id.clone(), profile.clone());
+    }
+    let error = manifest.validate().unwrap_err();
+    assert!(error.to_string().contains("profile count is outside"));
+}
+
+#[test]
 fn build_rejects_source_escape_even_when_the_external_file_exists() {
     let temp = tempfile::tempdir().unwrap();
     let scratch_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/package-tests");
@@ -129,6 +202,39 @@ fn unrelated_triple_builds_and_loads_with_exact_roles_profiles_and_identity() {
         "dev.boon.fixture.triple-notes"
     );
     assert_eq!(loaded.manifest().artifacts.len(), 3);
+    assert_eq!(loaded.manifest().capability_profiles.len(), 3);
+    assert_eq!(
+        loaded
+            .manifest()
+            .capability_profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "public-webgpu-v1",
+            "trusted-server-v1",
+            "trusted-session-v1"
+        ]
+    );
+    assert!(
+        loaded
+            .manifest()
+            .capability_profile("unused-client-v1")
+            .is_none(),
+        "unselected declarations must not become ambient bundle grants"
+    );
+    let client_profile = loaded
+        .manifest()
+        .capability_profile("public-webgpu-v1")
+        .unwrap();
+    assert_eq!(
+        client_profile.grants,
+        vec![
+            "browser.same-origin-http",
+            "browser.same-origin-websocket",
+            "browser.webgpu"
+        ]
+    );
     assert_eq!(loaded.client_artifact().role(), ProgramRole::Client);
     assert_eq!(loaded.session_artifact().role(), ProgramRole::Session);
     assert_eq!(loaded.server_artifact().role(), ProgramRole::Server);
@@ -171,6 +277,25 @@ fn unrelated_triple_builds_and_loads_with_exact_roles_profiles_and_identity() {
         browser_config.canvas_id,
         loaded.manifest().browser.canvas_id
     );
+    assert_eq!(
+        browser_config.client_capability_profile_id,
+        "public-webgpu-v1"
+    );
+    assert_eq!(browser_config.client_capability_profile, *client_profile);
+    for private_role in [ProgramRole::Session, ProgramRole::Server] {
+        let private_profile = loaded
+            .manifest()
+            .capability_profiles
+            .iter()
+            .find(|profile| profile.role == private_role)
+            .unwrap();
+        assert!(private_profile.grants.iter().all(|grant| {
+            !browser_config
+                .client_capability_profile
+                .grants
+                .contains(grant)
+        }));
+    }
     let client_path = browser_config
         .client_artifact_path
         .strip_prefix('/')
@@ -179,6 +304,50 @@ fn unrelated_triple_builds_and_loads_with_exact_roles_profiles_and_identity() {
         .decode_client_artifact(fs::read(output.join(client_path)).unwrap())
         .unwrap();
     assert_eq!(browser_client, loaded.client_artifact().clone());
+}
+
+#[test]
+fn bundle_capability_profile_tampering_and_omission_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = build_fixture(&temp, "bundle");
+    let original = read_bundle_manifest(&output);
+
+    let mut omitted = original.clone();
+    omitted
+        .capability_profiles
+        .retain(|profile| profile.role != ProgramRole::Session);
+    assert_bundle_manifest_rejected(&output, &omitted, "exactly one selected");
+
+    let mut missing_reference = original.clone();
+    missing_reference
+        .artifacts
+        .iter_mut()
+        .find(|artifact| artifact.role == ProgramRole::Client)
+        .unwrap()
+        .capability_profile_id = "omitted-client-v1".to_owned();
+    assert_bundle_manifest_rejected(&output, &missing_reference, "references omitted");
+
+    let mut wrong_role = original.clone();
+    wrong_role
+        .capability_profiles
+        .iter_mut()
+        .find(|profile| profile.role == ProgramRole::Client)
+        .unwrap()
+        .role = ProgramRole::Session;
+    assert_bundle_manifest_rejected(&output, &wrong_role, "repeats session");
+
+    let mut noncanonical_profiles = original.clone();
+    noncanonical_profiles.capability_profiles.reverse();
+    assert_bundle_manifest_rejected(&output, &noncanonical_profiles, "strictly sorted by id");
+
+    let mut duplicate_grant = original;
+    let client = duplicate_grant
+        .capability_profiles
+        .iter_mut()
+        .find(|profile| profile.role == ProgramRole::Client)
+        .unwrap();
+    client.grants.insert(1, client.grants[0].clone());
+    assert_bundle_manifest_rejected(&output, &duplicate_grant, "strictly sorted and unique");
 }
 
 #[test]
@@ -230,7 +399,7 @@ fn browser_bootstrap_rejects_tampered_and_trailing_input() {
             .contains("digest differs")
     );
 
-    let mut trailing = config_bytes;
+    let mut trailing = config_bytes.clone();
     trailing.push(0);
     assert!(
         BrowserAppConfig::decode(&trailing)
@@ -238,4 +407,43 @@ fn browser_bootstrap_rejects_tampered_and_trailing_input() {
             .to_string()
             .contains("trailing CBOR data")
     );
+
+    let bundle = read_bundle_manifest(&output);
+    for private_role in [ProgramRole::Session, ProgramRole::Server] {
+        let mut private_profile = config.clone();
+        private_profile.client_capability_profile = bundle
+            .capability_profiles
+            .iter()
+            .find(|profile| profile.role == private_role)
+            .unwrap()
+            .clone();
+        private_profile.client_capability_profile_id =
+            private_profile.client_capability_profile.id.clone();
+        let error = BrowserAppConfig::decode(&encode_browser_config_unchecked(&private_profile))
+            .unwrap_err();
+        assert!(error.to_string().contains("non-Client"));
+    }
+
+    let mut mismatched = config.clone();
+    mismatched.client_capability_profile_id = "different-client-v1".to_owned();
+    let error =
+        BrowserAppConfig::decode(&encode_browser_config_unchecked(&mismatched)).unwrap_err();
+    assert!(error.to_string().contains("missing or mismatched"));
+
+    let mut noncanonical = config.clone();
+    noncanonical.client_capability_profile.grants.swap(0, 1);
+    let error =
+        BrowserAppConfig::decode(&encode_browser_config_unchecked(&noncanonical)).unwrap_err();
+    assert!(error.to_string().contains("strictly sorted and unique"));
+
+    let mut value: ciborium::Value = ciborium::from_reader(config_bytes.as_slice()).unwrap();
+    let ciborium::Value::Map(fields) = &mut value else {
+        panic!("browser config must encode as a CBOR map");
+    };
+    fields.retain(|(key, _)| {
+        !matches!(key, ciborium::Value::Text(name) if name == "client_capability_profile")
+    });
+    let mut omitted_profile = Vec::new();
+    ciborium::into_writer(&value, &mut omitted_profile).unwrap();
+    assert!(BrowserAppConfig::decode(&omitted_profile).is_err());
 }

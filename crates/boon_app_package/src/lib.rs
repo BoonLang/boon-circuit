@@ -22,11 +22,13 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 pub const APP_MANIFEST_FORMAT: u32 = 1;
-pub const BUNDLE_FORMAT: u32 = 1;
+pub const BUNDLE_FORMAT: u32 = 2;
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PACKAGE_FILE_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_PACKAGE_FILES: usize = 4096;
+pub const MAX_CAPABILITY_PROFILES: usize = 64;
+pub const MAX_CAPABILITY_GRANTS_PER_PROFILE: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageError(String);

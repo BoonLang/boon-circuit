@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplaySpec {
     ReadOnly,
+    ProcessScoped,
     IdempotentBytesKey,
     NonReplayable,
 }
@@ -22,20 +23,16 @@ pub enum ResultPolicySpec {
 pub const MAX_STREAM_INITIAL_CREDITS: u32 = 256;
 pub const MAX_STREAM_IN_FLIGHT: u32 = 256;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum DeliveryCardinalitySpec {
+    #[default]
     Single,
     Stream {
         initial_credits: u32,
         max_in_flight: u32,
+        credit_result_tags: Vec<&'static str>,
         terminal_result_tags: Vec<&'static str>,
     },
-}
-
-impl Default for DeliveryCardinalitySpec {
-    fn default() -> Self {
-        Self::Single
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,11 +63,30 @@ pub struct EffectSchema {
     pub intent: ValueType,
     pub result: ValueType,
     pub intent_constraints: Vec<IntentConstraintSpec>,
+    pub intent_defaults: Vec<IntentDefaultSpec>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntentDefaultSpec {
+    pub field_name: &'static str,
+    pub value: IntentDefaultValueSpec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IntentDefaultValueSpec {
+    Bool(bool),
+    ExactInteger(i64),
+    Text(&'static str),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IntentConstraintSpec {
     UnsignedIntegerRange {
+        field_path: Vec<&'static str>,
+        min_inclusive: u64,
+        max_inclusive: u64,
+    },
+    BytesLengthRange {
         field_path: Vec<&'static str>,
         min_inclusive: u64,
         max_inclusive: u64,
@@ -88,10 +104,18 @@ pub struct HostEffectSpec {
 }
 
 pub const OUTBOUND_HTTP_REQUEST_OPERATION: &str = "Http/request";
+pub const FILE_READ_BYTES_OPERATION: &str = "File/read_bytes";
+pub const FILE_WRITE_BYTES_OPERATION: &str = "File/write_bytes";
 pub const FILE_READ_STREAM_OPERATION: &str = "File/read_stream";
+pub const CONTENT_IMPORT_OPERATION: &str = "Content/import";
+pub const CONTENT_SAVE_OPERATION: &str = "Content/save";
+pub const FILE_BYTES_MIN_LIMIT: u64 = 1;
+pub const FILE_BYTES_DEFAULT_LIMIT: i64 = 1024 * 1024;
+pub const FILE_BYTES_MAX_LIMIT: u64 = 16 * 1024 * 1024;
 pub const FILE_STREAM_MIN_CHUNK_BYTES: u64 = 1;
 pub const FILE_STREAM_MAX_CHUNK_BYTES: u64 = 1024 * 1024;
-pub const FILE_STREAM_INITIAL_CREDITS: u32 = 2;
+pub const FILE_STREAM_DEFAULT_CHUNK_BYTES: i64 = 64 * 1024;
+pub const FILE_STREAM_INITIAL_CREDITS: u32 = 4;
 pub const FILE_STREAM_MAX_IN_FLIGHT: u32 = 4;
 pub const WALL_CLOCK_READ_OPERATION: &str = "Clock/wall";
 pub const SECURE_RANDOM_BYTES_OPERATION: &str = "Random/bytes";
@@ -116,7 +140,7 @@ pub fn host_effect_spec(operation: &str) -> Option<HostEffectSpec> {
             BarrierSpec::None,
             ResultPolicySpec::ReturnValue,
         )),
-        "File/read_bytes" | "File/read_text" => Some((
+        "File/read_text" => Some((
             ReplaySpec::ReadOnly,
             BarrierSpec::None,
             ResultPolicySpec::ReturnValue,
@@ -144,22 +168,11 @@ pub fn host_effect_spec(operation: &str) -> Option<HostEffectSpec> {
         });
     }
     match operation {
-        "File/write_bytes" => Some(HostEffectSpec {
-            operation: "File/write_bytes",
-            replay: ReplaySpec::IdempotentBytesKey,
-            barrier: BarrierSpec::BeforeAndAfter,
-            result_policy: ResultPolicySpec::Acknowledgement,
-            delivery: DeliveryCardinalitySpec::Single,
-            schema: Some(EffectSchema {
-                intent: record([
-                    field("bytes", ValueType::Bytes { fixed_len: None }),
-                    field("path", ValueType::Text),
-                ]),
-                result: ValueType::Text,
-                intent_constraints: Vec::new(),
-            }),
-        }),
+        FILE_READ_BYTES_OPERATION => Some(file_read_bytes()),
+        FILE_WRITE_BYTES_OPERATION => Some(file_write_bytes()),
         FILE_READ_STREAM_OPERATION => Some(file_read_stream()),
+        CONTENT_IMPORT_OPERATION => Some(content_import()),
+        CONTENT_SAVE_OPERATION => Some(content_save()),
         "DevelopmentPasskey/register" => Some(development_passkey_registration()),
         "DevelopmentPasskey/authenticate" => Some(development_passkey_authentication()),
         OUTBOUND_HTTP_REQUEST_OPERATION => Some(outbound_http_request()),
@@ -180,23 +193,15 @@ pub fn host_effect_spec(operation: &str) -> Option<HostEffectSpec> {
 fn file_selection_type() -> ValueType {
     ValueType::Variant {
         variants: vec![
-            variant(
-                "FileSelected",
-                [field(
-                    "capability",
-                    record([
-                        field(
-                            "token",
-                            ValueType::Bytes {
-                                fixed_len: Some(32),
-                            },
-                        ),
-                        field("generation", ValueType::Number),
-                    ]),
-                )],
-            ),
+            variant("FileSelected", []),
             variant("PackageAsset", [field("url", ValueType::Text)]),
         ],
+    }
+}
+
+fn file_target_type() -> ValueType {
+    ValueType::Variant {
+        variants: vec![variant("FileTarget", [])],
     }
 }
 
@@ -217,8 +222,32 @@ fn content_ref_type() -> ValueType {
                 fixed_len: Some(32),
             },
         ),
-        field("byte_count", ValueType::Number),
+        field("size", ValueType::Number),
+        field("media", ValueType::Text),
     ])
+}
+
+fn retained_content_type() -> ValueType {
+    ValueType::Variant {
+        variants: vec![
+            variant("NotRetained", []),
+            variant("Retained", [field("content", content_ref_type())]),
+        ],
+    }
+}
+
+fn file_failure_variants() -> [Variant; 3] {
+    [
+        variant("Busy", []),
+        variant("Cancelled", []),
+        variant(
+            "Failed",
+            [
+                field("code", ValueType::Text),
+                field("diagnostic", ValueType::Text),
+            ],
+        ),
+    ]
 }
 
 fn waveform_failure_variant() -> Variant {
@@ -315,6 +344,7 @@ fn wellen_hierarchy_page() -> HostEffectSpec {
                                         field("id", ValueType::Text),
                                         field("parent_id", ValueType::Text),
                                         field("name", ValueType::Text),
+                                        field("full_name", ValueType::Text),
                                         field("signal_id", ValueType::Text),
                                         field("width", ValueType::Number),
                                         field("encoding", ValueType::Text),
@@ -338,6 +368,7 @@ fn wellen_hierarchy_page() -> HostEffectSpec {
                     max_inclusive: WELLEN_MAX_SAFE_TIME,
                 },
             ],
+            intent_defaults: Vec::new(),
         }),
     }
 }
@@ -392,6 +423,7 @@ fn wellen_signal_page() -> HostEffectSpec {
                                             ValueType::List {
                                                 item: Box::new(record([
                                                     field("time", ValueType::Number),
+                                                    field("end_time", ValueType::Number),
                                                     field("value", waveform_value_type()),
                                                 ])),
                                             },
@@ -426,6 +458,7 @@ fn wellen_signal_page() -> HostEffectSpec {
                     max_inclusive: WELLEN_MAX_SAFE_TIME,
                 },
             ],
+            intent_defaults: Vec::new(),
         }),
     }
 }
@@ -476,6 +509,7 @@ fn wellen_cursor_values() -> HostEffectSpec {
                 min_inclusive: 0,
                 max_inclusive: WELLEN_MAX_SAFE_TIME,
             }],
+            intent_defaults: Vec::new(),
         }),
     }
 }
@@ -612,6 +646,147 @@ fn transient_host_service(
             intent,
             result,
             intent_constraints: Vec::new(),
+            intent_defaults: Vec::new(),
+        }),
+    }
+}
+
+fn file_read_bytes() -> HostEffectSpec {
+    let mut variants = vec![variant(
+        "BytesRead",
+        [
+            field("bytes", ValueType::Bytes { fixed_len: None }),
+            field("byte_count", ValueType::Number),
+            field("media", ValueType::Text),
+            field("display_name", ValueType::Text),
+        ],
+    )];
+    variants.extend(file_failure_variants());
+    HostEffectSpec {
+        operation: FILE_READ_BYTES_OPERATION,
+        replay: ReplaySpec::ReadOnly,
+        barrier: BarrierSpec::None,
+        result_policy: ResultPolicySpec::ReturnValue,
+        delivery: DeliveryCardinalitySpec::Single,
+        schema: Some(EffectSchema {
+            intent: record([
+                field("file", file_selection_type()),
+                field("max_bytes", ValueType::Number),
+            ]),
+            result: ValueType::Variant { variants },
+            intent_constraints: vec![IntentConstraintSpec::UnsignedIntegerRange {
+                field_path: vec!["max_bytes"],
+                min_inclusive: FILE_BYTES_MIN_LIMIT,
+                max_inclusive: FILE_BYTES_MAX_LIMIT,
+            }],
+            intent_defaults: vec![IntentDefaultSpec {
+                field_name: "max_bytes",
+                value: IntentDefaultValueSpec::ExactInteger(FILE_BYTES_DEFAULT_LIMIT),
+            }],
+        }),
+    }
+}
+
+fn file_write_bytes() -> HostEffectSpec {
+    let mut variants = vec![variant(
+        "BytesWritten",
+        [field("byte_count", ValueType::Number)],
+    )];
+    variants.extend(file_failure_variants());
+    HostEffectSpec {
+        operation: FILE_WRITE_BYTES_OPERATION,
+        replay: ReplaySpec::ProcessScoped,
+        barrier: BarrierSpec::None,
+        result_policy: ResultPolicySpec::ReturnValue,
+        delivery: DeliveryCardinalitySpec::Single,
+        schema: Some(EffectSchema {
+            intent: record([
+                field("file", file_target_type()),
+                field("bytes", ValueType::Bytes { fixed_len: None }),
+            ]),
+            result: ValueType::Variant { variants },
+            intent_constraints: vec![IntentConstraintSpec::BytesLengthRange {
+                field_path: vec!["bytes"],
+                min_inclusive: 0,
+                max_inclusive: FILE_BYTES_MAX_LIMIT,
+            }],
+            intent_defaults: Vec::new(),
+        }),
+    }
+}
+
+fn content_import() -> HostEffectSpec {
+    let mut variants = vec![
+        variant(
+            "Started",
+            [
+                field("byte_count", ValueType::Number),
+                field("media", ValueType::Text),
+                field("display_name", ValueType::Text),
+            ],
+        ),
+        variant(
+            "Progress",
+            [
+                field("completed_bytes", ValueType::Number),
+                field("total_bytes", ValueType::Number),
+            ],
+        ),
+        variant("Imported", [field("content", content_ref_type())]),
+    ];
+    variants.extend(file_failure_variants());
+    HostEffectSpec {
+        operation: CONTENT_IMPORT_OPERATION,
+        replay: ReplaySpec::ReadOnly,
+        barrier: BarrierSpec::None,
+        result_policy: ResultPolicySpec::ReturnValue,
+        delivery: DeliveryCardinalitySpec::Stream {
+            initial_credits: FILE_STREAM_INITIAL_CREDITS,
+            max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
+            credit_result_tags: vec!["Progress"],
+            terminal_result_tags: vec!["Busy", "Cancelled", "Failed", "Imported"],
+        },
+        schema: Some(EffectSchema {
+            intent: record([field("file", file_selection_type())]),
+            result: ValueType::Variant { variants },
+            intent_constraints: Vec::new(),
+            intent_defaults: Vec::new(),
+        }),
+    }
+}
+
+fn content_save() -> HostEffectSpec {
+    let mut variants = vec![
+        variant("Started", [field("byte_count", ValueType::Number)]),
+        variant(
+            "Progress",
+            [
+                field("completed_bytes", ValueType::Number),
+                field("total_bytes", ValueType::Number),
+            ],
+        ),
+        variant("Saved", [field("byte_count", ValueType::Number)]),
+    ];
+    variants.extend(file_failure_variants());
+    HostEffectSpec {
+        operation: CONTENT_SAVE_OPERATION,
+        replay: ReplaySpec::ProcessScoped,
+        barrier: BarrierSpec::None,
+        result_policy: ResultPolicySpec::ReturnValue,
+        delivery: DeliveryCardinalitySpec::Stream {
+            initial_credits: FILE_STREAM_INITIAL_CREDITS,
+            max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
+            credit_result_tags: vec!["Progress"],
+            terminal_result_tags: vec!["Busy", "Cancelled", "Failed", "Saved"],
+        },
+        schema: Some(EffectSchema {
+            intent: record([
+                field("content", content_ref_type()),
+                field("file", file_target_type()),
+            ]),
+            result: ValueType::Variant { variants },
+            intent_constraints: Vec::new(),
+            intent_defaults: Vec::new(),
         }),
     }
 }
@@ -625,6 +800,7 @@ fn file_read_stream() -> HostEffectSpec {
         delivery: DeliveryCardinalitySpec::Stream {
             initial_credits: FILE_STREAM_INITIAL_CREDITS,
             max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
+            credit_result_tags: vec!["Chunk"],
             terminal_result_tags: vec!["Cancelled", "Failed", "Finished"],
         },
         schema: Some(EffectSchema {
@@ -661,7 +837,7 @@ fn file_read_stream() -> HostEffectSpec {
                                     fixed_len: Some(32),
                                 },
                             ),
-                            field("content", content_ref_type()),
+                            field("retained", retained_content_type()),
                         ],
                     ),
                     variant(
@@ -678,6 +854,10 @@ fn file_read_stream() -> HostEffectSpec {
                 field_path: vec!["chunk_bytes"],
                 min_inclusive: FILE_STREAM_MIN_CHUNK_BYTES,
                 max_inclusive: FILE_STREAM_MAX_CHUNK_BYTES,
+            }],
+            intent_defaults: vec![IntentDefaultSpec {
+                field_name: "chunk_bytes",
+                value: IntentDefaultValueSpec::ExactInteger(FILE_STREAM_DEFAULT_CHUNK_BYTES),
             }],
         }),
     }
@@ -696,7 +876,6 @@ fn host_service_failure() -> Variant {
 fn canonical_operation(operation: &str) -> &'static str {
     match operation {
         "Directory/entries" => "Directory/entries",
-        "File/read_bytes" => "File/read_bytes",
         "File/read_text" => "File/read_text",
         "File/write_text" => "File/write_text",
         "Log/error" => "Log/error",
@@ -750,6 +929,7 @@ fn development_passkey_registration() -> HostEffectSpec {
                 ],
             },
             intent_constraints: Vec::new(),
+            intent_defaults: Vec::new(),
         }),
     }
 }
@@ -788,6 +968,7 @@ fn development_passkey_authentication() -> HostEffectSpec {
                 ],
             },
             intent_constraints: Vec::new(),
+            intent_defaults: Vec::new(),
         }),
     }
 }
@@ -837,7 +1018,6 @@ fn outbound_http_request() -> HostEffectSpec {
                 field("body", ValueType::Bytes { fixed_len: None }),
                 field("connect_timeout_ms", ValueType::Number),
                 field("overall_timeout_ms", ValueType::Number),
-                field("cancellation", tags(["Independent", "CancelPrevious"])),
             ]),
             result: ValueType::Variant {
                 variants: vec![
@@ -865,6 +1045,7 @@ fn outbound_http_request() -> HostEffectSpec {
                 ],
             },
             intent_constraints: Vec::new(),
+            intent_defaults: Vec::new(),
         }),
     }
 }
@@ -873,20 +1054,24 @@ impl HostEffectSpec {
     pub fn validate(&self) -> Result<(), &'static str> {
         if let Some(schema) = &self.schema {
             validate_intent_constraints(schema)?;
+            validate_intent_defaults(schema)?;
         }
         let DeliveryCardinalitySpec::Stream {
             initial_credits,
             max_in_flight,
+            credit_result_tags,
             terminal_result_tags,
         } = &self.delivery
         else {
             return Ok(());
         };
-        if self.replay != ReplaySpec::ReadOnly
-            || self.barrier != BarrierSpec::None
+        if !matches!(
+            self.replay,
+            ReplaySpec::ReadOnly | ReplaySpec::ProcessScoped
+        ) || self.barrier != BarrierSpec::None
             || self.result_policy != ResultPolicySpec::ReturnValue
         {
-            return Err("stream effects must be read-only, barrier-free return-value effects");
+            return Err("stream effects must be process-local, barrier-free return-value effects");
         }
         if *initial_credits == 0
             || *initial_credits > MAX_STREAM_INITIAL_CREDITS
@@ -895,6 +1080,11 @@ impl HostEffectSpec {
             || initial_credits > max_in_flight
         {
             return Err("stream effect credit limits must be nonzero, bounded, and ordered");
+        }
+        if credit_result_tags.is_empty()
+            || credit_result_tags.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err("stream credit result tags must be nonempty, unique, and ordered");
         }
         if terminal_result_tags.is_empty()
             || terminal_result_tags
@@ -910,11 +1100,23 @@ impl HostEffectSpec {
         else {
             return Err("stream effects require a closed variant result schema");
         };
+        if credit_result_tags
+            .iter()
+            .any(|credit| !variants.iter().any(|variant| variant.tag == *credit))
+        {
+            return Err("stream credit result tags must exist in the result schema");
+        }
         if terminal_result_tags
             .iter()
             .any(|terminal| !variants.iter().any(|variant| variant.tag == *terminal))
         {
             return Err("stream terminal result tags must exist in the result schema");
+        }
+        if credit_result_tags
+            .iter()
+            .any(|credit| terminal_result_tags.contains(credit))
+        {
+            return Err("stream credit and terminal result tags must be disjoint");
         }
         if terminal_result_tags.len() == variants.len() {
             return Err("stream effects require at least one nonterminal result variant");
@@ -923,14 +1125,89 @@ impl HostEffectSpec {
     }
 }
 
+fn validate_intent_defaults(schema: &EffectSchema) -> Result<(), &'static str> {
+    if schema
+        .intent_defaults
+        .windows(2)
+        .any(|pair| pair[0].field_name >= pair[1].field_name)
+    {
+        return Err("effect intent defaults must be unique and ordered by field name");
+    }
+    let ValueType::Record {
+        fields,
+        open: false,
+    } = &schema.intent
+    else {
+        return if schema.intent_defaults.is_empty() {
+            Ok(())
+        } else {
+            Err("effect intent defaults require a closed record intent schema")
+        };
+    };
+    for default in &schema.intent_defaults {
+        let Some(field) = fields.iter().find(|field| field.name == default.field_name) else {
+            return Err("effect intent default field must exist in the intent schema");
+        };
+        let type_matches = matches!(
+            (&default.value, &field.value_type),
+            (IntentDefaultValueSpec::Bool(_), ValueType::Bool)
+                | (IntentDefaultValueSpec::ExactInteger(_), ValueType::Number)
+                | (IntentDefaultValueSpec::Text(_), ValueType::Text)
+        );
+        if !type_matches {
+            return Err("effect intent default value must match its field type");
+        }
+        for constraint in &schema.intent_constraints {
+            let IntentConstraintSpec::UnsignedIntegerRange {
+                field_path,
+                min_inclusive,
+                max_inclusive,
+            } = constraint
+            else {
+                continue;
+            };
+            if field_path.as_slice() == [default.field_name]
+                && let IntentDefaultValueSpec::ExactInteger(value) = default.value
+            {
+                let Ok(value) = u64::try_from(value) else {
+                    return Err("effect intent default violates its unsigned integer constraint");
+                };
+                if value < *min_inclusive || value > *max_inclusive {
+                    return Err("effect intent default violates its unsigned integer constraint");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_intent_constraints(schema: &EffectSchema) -> Result<(), &'static str> {
     let mut previous_path: Option<&[&str]> = None;
     for constraint in &schema.intent_constraints {
-        let IntentConstraintSpec::UnsignedIntegerRange {
-            field_path,
-            min_inclusive,
-            max_inclusive,
-        } = constraint;
+        let (field_path, min_inclusive, max_inclusive, expected_type, error) = match constraint {
+            IntentConstraintSpec::UnsignedIntegerRange {
+                field_path,
+                min_inclusive,
+                max_inclusive,
+            } => (
+                field_path,
+                min_inclusive,
+                max_inclusive,
+                ValueType::Number,
+                "unsigned integer constraints must target numeric intent fields",
+            ),
+            IntentConstraintSpec::BytesLengthRange {
+                field_path,
+                min_inclusive,
+                max_inclusive,
+            } => (
+                field_path,
+                min_inclusive,
+                max_inclusive,
+                ValueType::Bytes { fixed_len: None },
+                "byte length constraints must target Bytes intent fields",
+            ),
+        };
         if field_path.is_empty() || min_inclusive > max_inclusive {
             return Err("effect intent constraints must have a valid field path and range");
         }
@@ -938,11 +1215,16 @@ fn validate_intent_constraints(schema: &EffectSchema) -> Result<(), &'static str
             return Err("effect intent constraints must be uniquely ordered by field path");
         }
         previous_path = Some(field_path);
-        if !matches!(
+        let type_matches = match (
             value_type_at_path(&schema.intent, field_path),
-            Some(ValueType::Number)
+            expected_type,
         ) {
-            return Err("unsigned integer constraints must target numeric intent fields");
+            (Some(ValueType::Number), ValueType::Number)
+            | (Some(ValueType::Bytes { .. }), ValueType::Bytes { .. }) => true,
+            _ => false,
+        };
+        if !type_matches {
+            return Err(error);
         }
     }
     Ok(())
@@ -1094,6 +1376,7 @@ mod tests {
             assert_eq!(spec.result_policy, ResultPolicySpec::ReturnValue);
             assert_eq!(spec.barrier, BarrierSpec::None);
             let schema = spec.schema.unwrap();
+            assert!(schema.intent_constraints.is_empty());
             assert!(matches!(
                 schema.intent,
                 ValueType::Record { open: false, .. }
@@ -1107,6 +1390,35 @@ mod tests {
                     .any(|variant| variant.tag == "HostServiceFailed")
             );
         }
+    }
+
+    #[test]
+    fn bounded_file_byte_contracts_constrain_the_correct_intent_fields() {
+        let read = host_effect_spec(FILE_READ_BYTES_OPERATION)
+            .unwrap()
+            .schema
+            .unwrap();
+        assert_eq!(
+            read.intent_constraints,
+            vec![IntentConstraintSpec::UnsignedIntegerRange {
+                field_path: vec!["max_bytes"],
+                min_inclusive: FILE_BYTES_MIN_LIMIT,
+                max_inclusive: FILE_BYTES_MAX_LIMIT,
+            }]
+        );
+
+        let write = host_effect_spec(FILE_WRITE_BYTES_OPERATION)
+            .unwrap()
+            .schema
+            .unwrap();
+        assert_eq!(
+            write.intent_constraints,
+            vec![IntentConstraintSpec::BytesLengthRange {
+                field_path: vec!["bytes"],
+                min_inclusive: 0,
+                max_inclusive: FILE_BYTES_MAX_LIMIT,
+            }]
+        );
     }
 
     #[test]
@@ -1207,6 +1519,7 @@ mod tests {
             DeliveryCardinalitySpec::Stream {
                 initial_credits: FILE_STREAM_INITIAL_CREDITS,
                 max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
+                credit_result_tags: vec!["Chunk"],
                 terminal_result_tags: vec!["Cancelled", "Failed", "Finished"],
             }
         );
@@ -1218,6 +1531,13 @@ mod tests {
                 field_path: vec!["chunk_bytes"],
                 min_inclusive: FILE_STREAM_MIN_CHUNK_BYTES,
                 max_inclusive: FILE_STREAM_MAX_CHUNK_BYTES,
+            }]
+        );
+        assert_eq!(
+            schema.intent_defaults,
+            vec![IntentDefaultSpec {
+                field_name: "chunk_bytes",
+                value: IntentDefaultValueSpec::ExactInteger(FILE_STREAM_DEFAULT_CHUNK_BYTES),
             }]
         );
         let ValueType::Record {
@@ -1233,21 +1553,9 @@ mod tests {
         };
         assert_eq!(variants.len(), 2);
         assert_eq!(variants[0].tag, "FileSelected");
+        assert!(variants[0].fields.is_empty());
         assert_eq!(variants[1].tag, "PackageAsset");
         assert_eq!(variants[1].fields[0].name, "url");
-        let capability = variants[0]
-            .fields
-            .iter()
-            .find(|field| field.name == "capability")
-            .unwrap();
-        assert!(matches!(
-            &capability.value_type,
-            ValueType::Record { fields, open: false }
-                if fields.iter().any(|field| {
-                    field.name == "token"
-                        && field.value_type == ValueType::Bytes { fixed_len: Some(32) }
-                })
-        ));
         let ValueType::Variant { variants } = schema.result else {
             panic!("stream result must be a closed variant");
         };
@@ -1279,6 +1587,7 @@ mod tests {
         zero_credit.delivery = DeliveryCardinalitySpec::Stream {
             initial_credits: 0,
             max_in_flight: 1,
+            credit_result_tags: vec!["Chunk"],
             terminal_result_tags: vec!["Cancelled", "Failed", "Finished"],
         };
         assert!(zero_credit.validate().is_err());
@@ -1287,6 +1596,7 @@ mod tests {
         unbounded.delivery = DeliveryCardinalitySpec::Stream {
             initial_credits: 1,
             max_in_flight: MAX_STREAM_IN_FLIGHT + 1,
+            credit_result_tags: vec!["Chunk"],
             terminal_result_tags: vec!["Cancelled", "Failed", "Finished"],
         };
         assert!(unbounded.validate().is_err());
@@ -1307,8 +1617,80 @@ mod tests {
         unknown_terminal.delivery = DeliveryCardinalitySpec::Stream {
             initial_credits: 1,
             max_in_flight: 1,
+            credit_result_tags: vec!["Chunk"],
             terminal_result_tags: vec!["Missing"],
         };
         assert!(unknown_terminal.validate().is_err());
+
+        let mut unknown_credit = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
+        unknown_credit.delivery = DeliveryCardinalitySpec::Stream {
+            initial_credits: 1,
+            max_in_flight: 1,
+            credit_result_tags: vec!["Missing"],
+            terminal_result_tags: vec!["Cancelled", "Failed", "Finished"],
+        };
+        assert!(unknown_credit.validate().is_err());
+
+        let mut overlapping = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
+        overlapping.delivery = DeliveryCardinalitySpec::Stream {
+            initial_credits: 1,
+            max_in_flight: 1,
+            credit_result_tags: vec!["Finished"],
+            terminal_result_tags: vec!["Cancelled", "Failed", "Finished"],
+        };
+        assert!(overlapping.validate().is_err());
+    }
+
+    #[test]
+    fn intent_defaults_are_generic_typed_and_constraint_checked() {
+        let mut bool_default = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
+        bool_default.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
+            field_name: "retain_content",
+            value: IntentDefaultValueSpec::Bool(false),
+        }];
+        assert_eq!(bool_default.validate(), Ok(()));
+
+        let mut text_default = host_effect_spec(OUTBOUND_HTTP_REQUEST_OPERATION).unwrap();
+        text_default.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
+            field_name: "endpoint",
+            value: IntentDefaultValueSpec::Text("primary"),
+        }];
+        assert_eq!(text_default.validate(), Ok(()));
+
+        let mut unknown = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
+        unknown.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
+            field_name: "missing",
+            value: IntentDefaultValueSpec::ExactInteger(1),
+        }];
+        assert!(unknown.validate().is_err());
+
+        let mut duplicate = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
+        duplicate.schema.as_mut().unwrap().intent_defaults = vec![
+            IntentDefaultSpec {
+                field_name: "chunk_bytes",
+                value: IntentDefaultValueSpec::ExactInteger(1),
+            },
+            IntentDefaultSpec {
+                field_name: "chunk_bytes",
+                value: IntentDefaultValueSpec::ExactInteger(2),
+            },
+        ];
+        assert!(duplicate.validate().is_err());
+
+        let mut wrong_type = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
+        wrong_type.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
+            field_name: "chunk_bytes",
+            value: IntentDefaultValueSpec::Bool(false),
+        }];
+        assert!(wrong_type.validate().is_err());
+
+        let mut out_of_range = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
+        out_of_range.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
+            field_name: "chunk_bytes",
+            value: IntentDefaultValueSpec::ExactInteger(
+                i64::try_from(FILE_STREAM_MAX_CHUNK_BYTES).unwrap() + 1,
+            ),
+        }];
+        assert!(out_of_range.validate().is_err());
     }
 }

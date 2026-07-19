@@ -140,15 +140,15 @@ memory, or depend on the host machine endian.
 
 ## Current Implementation Notes
 
-PlanExecutor/runtime byte paths can currently carry inline, shared, blob-ref,
-and page-ref runtime bytes from bridge paths and source/runtime execution paths.
-Source-language BYTES literals currently lower to inline runtime bytes.
-Runtime-owned dynamic payloads larger than the
-source-event inline limit use shared executable storage: public summaries still
-expose only storage kind, digest, and byte length, while byte operations borrow
-the shared payload through the private runtime representation. Blob/page-backed
-concatenation in constructors is intentionally rejected until a resolver exists
-for descriptor-only external byte references.
+Canonical `boon_data::Value`, persistence values, document evaluation, scalar
+indexes, and PlanExecutor values use immutable reference-counted
+`bytes::Bytes`. Cloning a Boon value therefore shares its byte storage, while
+slice, take, and drop reuse the same allocation. Operations that change bytes,
+such as set, integer write, and concatenate, allocate a fresh finite value and
+freeze it before publication. External file, HTTP, query-cursor, and persistence
+code converts to or from owned buffers only at those actual ownership
+boundaries. Blob/page descriptors remain host-private; descriptor-only
+concatenation is rejected until a bounded resolver exists.
 
 The final PlanExecutor path must not execute parser AST or string paths for
 BYTES. It must use typed IDs, typed storage layout, typed operation regions,
@@ -168,6 +168,13 @@ tracks hidden invocation identity, sequence, outstanding credit, and terminal
 state; Boon source uses ordinary calls, `WHEN`, `THEN`, `HOLD`, and `LATEST`.
 There is no top-level `effects:` declaration syntax and no manually routed
 result source.
+
+`File/read_stream()` defaults `chunk_bytes` to 64 KiB through centralized typed
+effect-schema metadata. Its producer may have at most four unaccepted `Chunk`
+outcomes. Only `Chunk` consumes and replenishes this credit; `Opened` and all
+terminal outcomes remain ordered but never wait for chunk credit. The host may
+read at most one chunk buffer ahead while it waits for credit, and every event
+queue remains explicitly bounded.
 
 EOF, success, failure, timeout, and cancellation are terminal and release the
 host resource. Replacing or removing the producing expression, including a

@@ -1,6 +1,6 @@
 use boon_host_runtime::{
-    ContentRef, ContentStore, ContentStoreLimits, FileCapabilityRegistry,
-    FileReadStreamEffectAdapter, apply_event as apply_file_event,
+    ContentRef, ContentStore, ContentStoreLimits, FileCapabilityRegistry, FileEffectAdapter,
+    apply_event as apply_file_event,
 };
 use boon_plan::{ApplicationIdentity, FiniteReal, ProgramRole};
 use boon_runtime::{
@@ -166,7 +166,7 @@ fn submit_waveform(
 }
 
 async fn materialize(
-    adapter: &mut FileReadStreamEffectAdapter,
+    adapter: &mut FileEffectAdapter,
     program: &mut ProgramSession,
     selected_file: Value,
 ) -> ContentRef {
@@ -182,8 +182,15 @@ async fn materialize(
             let Value::Record(fields) = &event.outcome else {
                 panic!("finished event must be a record");
             };
-            let content = ContentRef::from_value(&fields["content"]).unwrap();
-            assert_eq!(fields["digest"], Value::Bytes(content.digest().to_vec()));
+            let Value::Record(retained) = &fields["retained"] else {
+                panic!("finished retention must be a tagged record");
+            };
+            assert_eq!(retained["$tag"], Value::Text("Retained".to_owned()));
+            let content = ContentRef::from_value(&retained["content"]).unwrap();
+            assert_eq!(
+                fields["digest"],
+                Value::Bytes(content.digest().to_vec().into())
+            );
             content
         });
         apply_file_event(program, adapter, event).unwrap();
@@ -248,14 +255,16 @@ async fn real_vcd_fst_and_ghw_stream_then_open_without_filename_dispatch() {
         })
         .collect::<Vec<_>>();
     let store = content_store(paths.len());
-    let mut stream = FileReadStreamEffectAdapter::new(registry, store.clone(), 1).unwrap();
+    let mut stream = FileEffectAdapter::new(registry, store.clone(), 1).unwrap();
     let mut file_program = program(FILE_STREAM_PROGRAM, "stream-real-formats");
     let mut wellen = WaveformEffectAdapter::new(store.clone(), paths.len()).unwrap();
     let mut open = program(OPEN_PROGRAM, "open-real-formats");
+    let mut hierarchy = program(HIERARCHY_PROGRAM, "hierarchy-real-formats");
+    let mut signal = program(SIGNAL_PROGRAM, "signal-real-formats");
 
     for (file, expected_format, expected_len, expected_digest) in selected {
         let content = materialize(&mut stream, &mut file_program, file).await;
-        assert_eq!(content.byte_count(), expected_len);
+        assert_eq!(content.size(), expected_len);
         assert_eq!(content.digest().as_slice(), &expected_digest[..]);
         let outcome = submit_waveform(
             &mut wellen,
@@ -267,6 +276,53 @@ async fn real_vcd_fst_and_ghw_stream_then_open_without_filename_dispatch() {
         assert_eq!(integer(&opened["byte_length"]), expected_len as i64);
         assert!(integer(&opened["signal_count"]) > 0);
         assert!(integer(&opened["hierarchy_bytes"]) > 0);
+        let artifact = opened["artifact"].clone();
+        let hierarchy_page = submit_waveform(
+            &mut wellen,
+            &mut hierarchy,
+            BTreeMap::from([
+                ("artifact".to_owned(), artifact.clone()),
+                (
+                    "request_fingerprint".to_owned(),
+                    Value::Text(format!("{expected_format}:hierarchy")),
+                ),
+                ("offset".to_owned(), number(0)),
+                ("limit".to_owned(), number(256)),
+            ]),
+        );
+        let hierarchy_page = fields(&hierarchy_page, "HierarchyPage");
+        let Value::List(rows) = &hierarchy_page["rows"] else {
+            panic!("{expected_format} hierarchy rows must be a List");
+        };
+        let signal_id = rows
+            .iter()
+            .find_map(|row| match row {
+                Value::Record(row)
+                    if row.get("kind") == Some(&Value::Text("Signal".to_owned())) =>
+                {
+                    row.get("signal_id").cloned()
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{expected_format} hierarchy has no signal row"));
+        let signal_page = submit_waveform(
+            &mut wellen,
+            &mut signal,
+            BTreeMap::from([
+                ("artifact".to_owned(), artifact),
+                (
+                    "request_fingerprint".to_owned(),
+                    Value::Text(format!("{expected_format}:signal")),
+                ),
+                ("signal_ids".to_owned(), Value::List(vec![signal_id])),
+                ("start_time".to_owned(), opened["start_time"].clone()),
+                ("end_time".to_owned(), opened["end_time"].clone()),
+                ("offset".to_owned(), number(0)),
+                ("max_transitions".to_owned(), number(256)),
+            ]),
+        );
+        let signal_page = fields(&signal_page, "SignalPage");
+        assert!(matches!(signal_page.get("signals"), Some(Value::List(rows)) if !rows.is_empty()));
     }
     assert_eq!(store.entry_count(), 3);
     assert_eq!(store.pending_writer_count(), 0);
@@ -282,7 +338,7 @@ async fn real_content_drives_bounded_typed_pages_and_survives_parser_cache_evict
         .map(|path| registry.register_file(path).unwrap().file_selected_value())
         .collect::<Vec<_>>();
     let store = content_store(paths.len());
-    let mut stream = FileReadStreamEffectAdapter::new(registry, store.clone(), 1).unwrap();
+    let mut stream = FileEffectAdapter::new(registry, store.clone(), 1).unwrap();
     let mut file_program = program(FILE_STREAM_PROGRAM, "stream-page-content");
     let first = materialize(&mut stream, &mut file_program, selected[0].clone()).await;
     let second = materialize(&mut stream, &mut file_program, selected[1].clone()).await;
@@ -334,6 +390,14 @@ async fn real_content_drives_bounded_typed_pages_and_survives_parser_cache_evict
                 .then(|| row["signal_id"].clone())
         })
         .expect("real VCD hierarchy must expose a signal");
+    assert!(rows.iter().all(|row| {
+        matches!(row, Value::Record(fields) if matches!(fields.get("full_name"), Some(Value::Text(_))))
+    }));
+    assert!(rows.iter().any(|row| {
+        matches!(row, Value::Record(fields)
+            if fields.get("kind") == Some(&Value::Text("Signal".to_owned()))
+                && fields.get("full_name") == fields.get("signal_id"))
+    }));
     assert_eq!(wellen.cached_waveform_count(), 1);
 
     let mut signal = program(SIGNAL_PROGRAM, "signal-page");
@@ -370,10 +434,48 @@ async fn real_content_drives_bounded_typed_pages_and_survives_parser_cache_evict
     let Value::Record(transition) = &transitions[0] else {
         panic!("transition must be a record");
     };
+    let first_transition_time = transition["time"].clone();
+    assert!(integer(&transition["end_time"]) >= integer(&transition["time"]));
     let Value::Record(value) = &transition["value"] else {
         panic!("transition value must be a closed variant");
     };
     assert!(matches!(value.get("$tag"), Some(Value::Text(tag)) if tag.ends_with("Value")));
+    assert_eq!(signal_page["has_more"], Value::Bool(true));
+    assert_eq!(integer(&signal_page["next_offset"]), 1);
+
+    let next_signal_page = submit_waveform(
+        &mut wellen,
+        &mut signal,
+        BTreeMap::from([
+            ("artifact".to_owned(), first_artifact.clone()),
+            (
+                "request_fingerprint".to_owned(),
+                Value::Text("signal:1".to_owned()),
+            ),
+            (
+                "signal_ids".to_owned(),
+                Value::List(vec![signal_id.clone()]),
+            ),
+            ("start_time".to_owned(), number(0)),
+            ("end_time".to_owned(), first_opened["end_time"].clone()),
+            ("offset".to_owned(), signal_page["next_offset"].clone()),
+            ("max_transitions".to_owned(), number(1)),
+        ]),
+    );
+    let next_signal_page = fields(&next_signal_page, "SignalPage");
+    let Value::List(next_signals) = &next_signal_page["signals"] else {
+        panic!("second signal page must contain signal rows");
+    };
+    let Value::Record(next_signal) = &next_signals[0] else {
+        panic!("second signal row must be a record");
+    };
+    let Value::List(next_transitions) = &next_signal["transitions"] else {
+        panic!("second signal page must contain transitions");
+    };
+    let Value::Record(next_transition) = &next_transitions[0] else {
+        panic!("second transition must be a record");
+    };
+    assert!(integer(&next_transition["time"]) > integer(&first_transition_time));
 
     let mut cursor = program(CURSOR_PROGRAM, "cursor-values");
     let cursor_values = submit_waveform(
@@ -407,7 +509,7 @@ async fn malformed_content_and_oversized_page_requests_fail_as_typed_values() {
         .unwrap()
         .file_selected_value();
     let store = content_store(2);
-    let mut stream = FileReadStreamEffectAdapter::new(registry, store.clone(), 1).unwrap();
+    let mut stream = FileEffectAdapter::new(registry, store.clone(), 1).unwrap();
     let mut file_program = program(FILE_STREAM_PROGRAM, "stream-malformed");
     let malformed = materialize(&mut stream, &mut file_program, selected).await;
     let mut wellen = WaveformEffectAdapter::new(store.clone(), 1).unwrap();
@@ -426,7 +528,7 @@ async fn malformed_content_and_oversized_page_requests_fail_as_typed_values() {
     let path = fixture("simple.vcd");
     let mut registry = FileCapabilityRegistry::new(1).unwrap();
     let selected = registry.register_file(path).unwrap().file_selected_value();
-    let mut stream = FileReadStreamEffectAdapter::new(registry, store.clone(), 1).unwrap();
+    let mut stream = FileEffectAdapter::new(registry, store.clone(), 1).unwrap();
     let content = materialize(&mut stream, &mut file_program, selected).await;
     let opened = submit_waveform(
         &mut wellen,

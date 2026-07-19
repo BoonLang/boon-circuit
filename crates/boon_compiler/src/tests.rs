@@ -1,7 +1,8 @@
 use super::*;
 use boon_plan::{
-    HostPortPlan, PlanListProjection, PlanQuerySelection, QueryKeyType, QueryTextNormalization,
-    SourcePayloadField,
+    DistributedRouteScopePlan, HostPortPlan, PlanListProjection, PlanQuerySelection,
+    PlanSourceGuard, QueryKeyType, QueryTextNormalization, SourcePayloadField,
+    distributed_graph_schema_hash,
 };
 use std::collections::BTreeSet;
 
@@ -89,6 +90,70 @@ store: [
 ]
 "#;
 
+#[test]
+fn nested_effect_guards_lower_to_bounded_selector_conjunctions() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "nested-effect-guards.bn",
+        r#"
+store: [
+    read: SOURCE
+    selected: PackageAsset[url: TEXT { asset://files/primary.vcd }]
+    file_result:
+        NotStarted |> HOLD file_result {
+            read |> THEN {
+                File/read_stream(file: selected, retain_content: True)
+            }
+        }
+    waveform_result:
+        NotStarted |> HOLD waveform_result {
+            file_result |> WHEN {
+                Finished => file_result.retained |> WHEN {
+                    Retained => Wellen/open(content: file_result.retained.content)
+                    __ => SKIP
+                }
+                __ => SKIP
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let guards = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::HostEffect,
+                source_guard: Some(guard),
+                ..
+            } => Some(guard),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [PlanSourceGuard::All { guards }] = guards.as_slice() else {
+        panic!("expected exactly one guarded nested host effect, got {guards:#?}");
+    };
+    assert_eq!(guards.len(), 2);
+    assert!(matches!(
+        &guards[0],
+        PlanSourceGuard::ValueOneOf {
+            input: ValueRef::State(_),
+            values,
+        } if values == &["Finished".to_owned()]
+    ));
+    assert!(matches!(
+        &guards[1],
+        PlanSourceGuard::ValueOneOf {
+            input: ValueRef::StateProjection { field_path, .. },
+            values,
+        } if field_path == &["retained".to_owned()]
+            && values == &["Retained".to_owned()]
+    ));
+}
+
 fn fixture_program_role(source: &str) -> ProgramRole {
     if source.lines().any(|line| {
         let line = line.trim_start();
@@ -111,6 +176,93 @@ fn compile_fixture_source_text_to_machine_plan(
         target_profile,
         fixture_program_role(source),
     )
+}
+
+#[test]
+fn nested_when_with_multiline_pipeline_arms_has_a_typed_derived_expression() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "nested-when-multiline-pipeline.bn",
+        r#"
+store: [
+    active_file: TEXT { main.vcd }
+    compare_file: TEXT { none }
+    file_compare_status:
+        compare_file |> WHEN {
+            TEXT { none } => active_file |> WHEN {
+                TEXT { none } => TEXT { no waveform loaded }
+                file => TEXT { single file: } |> Text/concat(with: file, separator: " ")
+            }
+            compare =>
+                TEXT { comparing }
+                |> Text/concat(with: compare, separator: " ")
+                |> Text/concat(with: TEXT { to }, separator: " ")
+                |> Text/concat(with: active_file, separator: " ")
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let field = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == "store.file_compare_status")
+        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("file_compare_status field id");
+    let op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(field)))
+        .expect("file_compare_status derived op");
+    assert!(
+        matches!(
+            op.kind,
+            PlanOpKind::DerivedValue {
+                expression: Some(_),
+                ..
+            }
+        ),
+        "nested WHEN output lost its typed expression: {op:#?}"
+    );
+}
+
+#[test]
+fn document_scalar_field_lowers_a_multiline_pipeline_as_one_value() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "document-multiline-scalar-pipeline.bn",
+        r#"
+store: [suffix: TEXT { ready }]
+
+document: Document/new(
+    root: Element/text(
+        element: []
+        text:
+            TEXT { Reference }
+            |> Text/concat(with: store.suffix, separator: ": ")
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+
+    assert!(document.expressions.iter().any(|expression| {
+        matches!(
+            expression.op,
+            DocumentExprOp::Builtin {
+                builtin: boon_plan::DocumentBuiltin::TextConcat,
+                input: Some(_),
+                ..
+            }
+        )
+    }));
 }
 
 fn compile_fixture_source_text_to_machine_plan_with_identity(
@@ -914,18 +1066,16 @@ fn compiler_preserves_multiline_list_arguments_in_source_event_transforms() {
 store: [
     request: SOURCE
     joined:
-        LATEST {
-            request.method |> THEN {
-                request.query
-                    |> List/filter_field_equal(
-                        field: "name"
-                        value: TEXT { q }
-                    )
-                    |> List/join_field(
-                        field: "value"
-                        separator: Text/empty()
-                    )
-            }
+        request.method |> THEN {
+            request.query
+                |> List/filter_field_equal(
+                    field: "name"
+                    value: TEXT { q }
+                )
+                |> List/join_field(
+                    field: "value"
+                    separator: Text/empty()
+                )
         }
 ]
 
@@ -1158,7 +1308,7 @@ document: Document/new(
 }
 
 #[test]
-fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes() {
+fn compiler_uses_central_host_effect_contracts_for_bounded_file_operations() {
     let read = compile_fixture_source_text_to_machine_plan(
         "bytes-file-read.bn",
         include_str!("../../../examples/bytes_file_read_plan_ops.bn"),
@@ -1182,22 +1332,24 @@ fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes()
         .iter()
         .find(|contract| contract.host_operation == "File/write_bytes")
         .expect("write effect contract");
-    assert!(matches!(
-        contract.replay,
-        EffectReplay::Idempotent {
-            key_type: DataTypePlan::Bytes {
-                fixed_len: Some(32)
-            }
-        }
-    ));
-    assert_eq!(contract.barrier, EffectBarrier::BeforeAndAfter);
+    assert_eq!(contract.replay, EffectReplay::ProcessScoped);
+    assert_eq!(contract.barrier, EffectBarrier::None);
+    assert_eq!(
+        contract.schema.as_ref().unwrap().intent_constraints,
+        vec![boon_plan::EffectIntentConstraintPlan::BytesLengthRange {
+            field_path: vec!["bytes".to_owned()],
+            min_inclusive: 0,
+            max_inclusive: 16 * 1024 * 1024,
+        }]
+    );
     assert!(
-        write
+        !write
             .plan
             .persistence
             .effect_outbox
             .iter()
-            .any(|schema| schema.effect_id == contract.effect_id)
+            .any(|schema| schema.effect_id == contract.effect_id),
+        "process-scoped writes must not enter the durable outbox"
     );
     let invocation = write
         .plan
@@ -1206,7 +1358,7 @@ fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes()
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
             PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::FileWriteBytes,
+                expression_kind: PlanExpressionKind::HostEffect,
                 effect,
                 ..
             } => effect.as_ref(),
@@ -1220,7 +1372,7 @@ fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes()
             .iter()
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>(),
-        ["bytes", "path"]
+        ["bytes", "file"]
     );
     assert!(
         verify_plan(&write.plan)
@@ -1228,7 +1380,7 @@ fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes()
             .checks
             .iter()
             .all(|check| check.pass),
-        "compiled transactional write plan must verify"
+        "compiled bounded write plan must verify"
     );
 }
 
@@ -1431,6 +1583,196 @@ fn state_triggered_effect_plan_has_no_original_source_input() {
             .checks
             .iter()
             .all(|check| check.pass)
+    );
+}
+
+#[test]
+fn host_effect_schema_default_lowers_to_a_typed_plan_constant() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "defaulted-host-effect-intent.bn",
+        r#"
+store: [
+    load: SOURCE
+    asset: PackageAsset[url: TEXT { asset://wave.vcd }]
+    result:
+        NotStarted |> HOLD result {
+            load |> THEN {
+                File/read_stream(
+                    file: asset
+                    retain_content: False
+                )
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let stream_effect = compiled
+        .plan
+        .effects
+        .iter()
+        .find(|effect| effect.host_operation == "File/read_stream")
+        .unwrap();
+    let invocation = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                effect: Some(effect),
+                ..
+            } if effect.effect_id == stream_effect.effect_id => Some(effect),
+            _ => None,
+        })
+        .unwrap();
+    let chunk_bytes = invocation
+        .intent_fields
+        .iter()
+        .find(|field| field.name == "chunk_bytes")
+        .unwrap();
+    let ValueRef::Constant(constant_id) = chunk_bytes.input else {
+        panic!("defaulted chunk_bytes must lower to a plan constant");
+    };
+    let Some(boon_plan::PlanConstantValue::Number { value }) = compiled
+        .plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == constant_id)
+        .map(|constant| &constant.value)
+    else {
+        panic!("defaulted chunk_bytes constant must be a Number");
+    };
+    assert_eq!(value.to_i64_exact().unwrap(), 64 * 1024);
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.pass)
+    );
+}
+
+#[test]
+fn one_effect_result_owner_keeps_one_identity_across_possible_trigger_sources() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "multi-cause-file-stream.bn",
+        r#"
+store: [
+    load_primary: SOURCE
+    load_secondary: SOURCE
+    selected_name:
+        LATEST {
+            TEXT { primary.vcd }
+            load_primary |> THEN { TEXT { primary.vcd } }
+            load_secondary |> THEN { TEXT { secondary.vcd } }
+        }
+    selected_asset:
+        selected_name |> WHEN {
+            TEXT { primary.vcd } => PackageAsset[url: TEXT { asset://primary.vcd }]
+            __ => PackageAsset[url: TEXT { asset://secondary.vcd }]
+        }
+    result:
+        NotStarted |> HOLD result {
+            selected_name |> THEN {
+                File/read_stream(
+                    file: selected_asset
+                    chunk_bytes: 4096
+                    retain_content: True
+                )
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let stream = compiled
+        .plan
+        .effects
+        .iter()
+        .find(|effect| effect.host_operation == "File/read_stream")
+        .unwrap();
+    let invocations = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                effect: Some(effect),
+                ..
+            } if effect.effect_id == stream.effect_id => Some(effect),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        invocations.len() > 1,
+        "the regression fixture must lower one call site through multiple possible causes"
+    );
+    assert_eq!(
+        invocations
+            .iter()
+            .map(|invocation| invocation.invocation_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "trigger specialization must not split one effect result owner"
+    );
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.pass)
+    );
+}
+
+#[test]
+fn multiline_tagged_record_fields_lower_to_executable_row_expressions() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "multiline-tagged-record-field.bn",
+        r#"
+store: [
+    asset:
+        PackageAsset[url: TEXT { asset://files/example.vcd }]
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let field = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.asset")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(boon_plan::FieldId)
+        .expect("asset field");
+    let operation = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(field)))
+        .expect("asset operation");
+    assert!(
+        matches!(
+            (&operation.output, &operation.kind),
+            (
+                Some(ValueRef::Field(output)),
+                PlanOpKind::DerivedValue {
+                    expression: Some(PlanDerivedExpression::RowExpression {
+                        expression: PlanRowExpression::TaggedObject { tag, .. },
+                    }),
+                    ..
+                }
+            ) if *output == field && tag == "PackageAsset"
+        ),
+        "asset operation was not executable tagged data: {operation:#?}"
     );
 }
 
@@ -1650,7 +1992,8 @@ store: [
     }));
     assert!(
         compiled.plan.capability_summary.cpu_plan_executor_complete,
-        "call-derived match op must be CPU-executable: {op:?}"
+        "call-derived match op must be CPU-executable: {op:?}; unresolved={:?}",
+        compiled.plan.debug_map.unresolved_executable_refs,
     );
     let verification = verify_plan(&compiled.plan).unwrap();
     assert!(
@@ -1814,11 +2157,11 @@ store: [
     ]
     alpha:
         0 |> HOLD alpha {
-            LATEST { events.alpha |> THEN { alpha + 1 } }
+            events.alpha |> THEN { alpha + 1 }
         }
     beta:
         0 |> HOLD beta {
-            LATEST { events.beta |> THEN { beta + 1 } }
+            events.beta |> THEN { beta + 1 }
         }
     primary: LIST {
         [label: TEXT { primary }]
@@ -1839,14 +2182,14 @@ store: [
     }
     beta:
         0 |> HOLD beta {
-            LATEST { events.beta |> THEN { beta + 1 } }
+            events.beta |> THEN { beta + 1 }
         }
     primary: LIST {
         [label: TEXT { primary }]
     }
     alpha:
         0 |> HOLD alpha {
-            LATEST { events.alpha |> THEN { alpha + 1 } }
+            events.alpha |> THEN { alpha + 1 }
         }
 ]
 "#;
@@ -1879,14 +2222,14 @@ fn memory_identity_excludes_defaults_and_recursive_type_fingerprints() {
 events: SOURCE
 value:
     0 |> HOLD value {
-        LATEST { events |> THEN { 1 } }
+        events |> THEN { 1 }
     }
 "#;
     let text = r#"
 events: SOURCE
 value:
     TEXT { zero } |> HOLD value {
-        LATEST { events |> THEN { TEXT { one } } }
+        events |> THEN { TEXT { one } }
     }
 "#;
     let number = compile_fixture_source_text_to_machine_plan(
@@ -2398,7 +2741,7 @@ fn indexed_migrations_reconstruct_untouched_row_defaults() {
             .scalar_slots
             .iter()
             .find(|slot| slot.id == memory.runtime_slot)
-            .and_then(|slot| slot.initial_row_expression.clone())
+            .and_then(|slot| slot.initial_expression.clone())
             .unwrap_or_else(|| panic!("missing row default expression for `{path}`"))
     };
 
@@ -2453,7 +2796,7 @@ fn anonymous_line_based_state_is_a_compile_diagnostic() {
         "anonymous-state.bn",
         r#"
 0 |> HOLD {
-    LATEST { 1 }
+    1
 }
 "#,
         TargetProfile::SoftwareDefault,
@@ -2501,20 +2844,28 @@ fn scoped_list_event_projection_has_a_typed_source_transform() {
         "scoped-event-projection.bn",
         r#"
 store: [
+    clear: SOURCE
+    active_label:
+        TEXT { First } |> HOLD active_label {
+            clear |> THEN { TEXT { none } }
+        }
     rows:
         LIST {
             [label: TEXT { First }]
         }
         |> List/map(model_item, new: new_row(item: model_item))
-    row_selected:
+    visible_rows:
         rows
-        |> List/map(event_item, new: LATEST {
+        |> List/filter_field_equal(field: "label", value: active_label)
+    row_selected:
+        visible_rows
+        |> List/map(event_item, new:
             event_item.controls.select.event.press |> THEN { event_item.label }
-        })
+        )
         |> List/latest()
     selected:
         TEXT { none } |> HOLD selected {
-            LATEST { row_selected }
+            row_selected
         }
 ]
 
@@ -2547,7 +2898,7 @@ FUNCTION new_row(item) {
         .expect("row_selected plan op");
 
     let PlanOpKind::DerivedValue {
-        expression: Some(PlanDerivedExpression::SourceEventTransform { default, .. }),
+        expression: Some(PlanDerivedExpression::SourceEventTransform { default, arms, .. }),
         ..
     } = &op.kind
     else {
@@ -2562,6 +2913,18 @@ FUNCTION new_row(item) {
             value: String::new()
         }
     );
+    let clear_source = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.clear")
+        .map(|route| route.source_id)
+        .expect("clear source route");
+    assert!(
+        arms.iter()
+            .all(|arm| arm.trigger != ValueRef::Source(clear_source)),
+        "a source that only changes list membership must not become a row-event arm: {op:#?}"
+    );
     let verification = verify_plan(&compiled.plan).unwrap();
     assert_eq!(
         verification.status,
@@ -2573,6 +2936,573 @@ FUNCTION new_row(item) {
             .filter(|check| !check.pass)
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn match_arm_payload_dependencies_do_not_create_untyped_source_arms() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "match-arm-sampled-payload.bn",
+        r#"
+store: [
+    elements: [ready: SOURCE, fire: SOURCE, payload: SOURCE]
+    payload_value:
+        TEXT { initial } |> HOLD payload_value {
+            elements.payload.text
+        }
+    fingerprint:
+        TEXT { request }
+        |> Text/concat(with: payload_value, separator: ":")
+    request:
+        LATEST {
+            elements.ready.event.press |> WHEN {
+                True => fingerprint
+                False => SKIP
+            }
+            elements.fire.event.press |> THEN { fingerprint }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let field = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.request")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(boon_plan::FieldId)
+        .expect("request field");
+    let op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(field)))
+        .expect("request plan op");
+    let PlanOpKind::DerivedValue {
+        expression: Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
+        ..
+    } = &op.kind
+    else {
+        panic!("request must lower to a typed source-event transform: {op:#?}");
+    };
+    assert_eq!(arms.len(), 2);
+
+    let source_id = |path: &str| {
+        compiled
+            .plan
+            .source_routes
+            .iter()
+            .find(|route| route.path == path)
+            .map(|route| route.source_id)
+            .unwrap_or_else(|| panic!("missing source route `{path}`"))
+    };
+    let arm_sources = arms
+        .iter()
+        .map(|arm| match &arm.trigger {
+            ValueRef::Source(source) => *source,
+            trigger => panic!("request arm has non-source trigger {trigger:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        arm_sources,
+        BTreeSet::from([
+            source_id("store.elements.fire"),
+            source_id("store.elements.ready"),
+        ])
+    );
+    assert!(
+        !op.inputs
+            .contains(&ValueRef::Source(source_id("store.elements.payload"))),
+        "sampled payload updates must not invoke the request transform"
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn field_equality_host_effect_guard_is_typed_and_executable() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "field-equality-host-effect-guard.bn",
+        r#"
+store: [
+    start: SOURCE
+    replace_request: SOURCE
+    request_fingerprint:
+        TEXT { current } |> HOLD request_fingerprint {
+            replace_request.text
+        }
+    response_fingerprint: TEXT { current }
+    clock_result:
+        ClockNotRequested |> HOLD clock_result {
+            start |> THEN { Clock/wall() }
+        }
+    random_result:
+        RandomNotRequested |> HOLD random_result {
+            clock_result |> WHEN {
+                WallClockRead => request_fingerprint == response_fingerprint |> WHEN {
+                    True => Random/bytes(byte_count: 16)
+                    False => SKIP
+                }
+                __ => SKIP
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let guarded_effect = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                source_guard: Some(PlanSourceGuard::All { guards }),
+                effect: Some(_),
+                ..
+            } if guards
+                .iter()
+                .any(|guard| matches!(guard, PlanSourceGuard::ValuesEqual { .. })) =>
+            {
+                Some(op)
+            }
+            _ => None,
+        })
+        .expect("typed field-equality host-effect guard");
+    assert_eq!(guarded_effect.unresolved_executable_ref_count, 0);
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn scalar_list_nonempty_host_effect_guard_is_typed_and_executable() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "scalar-list-nonempty-host-effect-guard.bn",
+        r#"
+store: [
+    start: SOURCE
+    signal_ids: LIST { TEXT { top.clk } }
+    random_result:
+        RandomNotRequested |> HOLD random_result {
+            start |> THEN {
+                signal_ids |> List/is_not_empty() |> WHEN {
+                    True => Random/bytes(byte_count: 1)
+                    False => SKIP
+                }
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let guarded_effect = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                source_guard: Some(PlanSourceGuard::ListIsNotEmpty { expected: true, .. }),
+                effect: Some(_),
+                ..
+            } => Some(op),
+            _ => None,
+        })
+        .expect("typed scalar-list nonempty host-effect guard");
+    assert_eq!(guarded_effect.unresolved_executable_ref_count, 0);
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn nested_row_helper_aliases_resolve_to_the_canonical_keyed_row() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "nested-row-helper-alias.bn",
+        r#"
+store: [
+    reset: SOURCE
+    seed_rows: LIST {
+        [initial: TEXT { first }]
+    }
+    rows:
+        seed_rows
+        |> List/map(seed_row, new:
+            wrap_row(row: seed_record(seed: seed_row))
+        )
+]
+
+FUNCTION seed_record(seed) {
+    [initial: seed.initial]
+}
+
+FUNCTION wrap_row(row) {
+    stateful_row(seed: row)
+}
+
+FUNCTION stateful_row(seed) {
+    [
+        initial: seed.initial
+        value:
+            seed.initial |> HOLD value {
+                store.reset |> THEN { seed.initial }
+            }
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert!(
+        compiled
+            .plan
+            .debug_map
+            .state_slots
+            .iter()
+            .any(|entry| { entry.label.ends_with(".value") && entry.label.contains("seed_row") })
+    );
+    assert_eq!(compiled.plan.commit_plan.unresolved_update_branch_count, 0);
+    assert_eq!(
+        compiled
+            .plan
+            .capability_summary
+            .unresolved_executable_ref_count,
+        0
+    );
+}
+
+#[test]
+fn constructor_formal_does_not_bind_to_an_unrelated_row_alias() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "constructor-formal-row-owner.bn",
+        r#"
+store: [
+    unrelated_seed: LIST {
+        [label: TEXT { wrong }]
+    }
+    unrelated_rows:
+        unrelated_seed
+        |> List/map(signal, new: unrelated_row(signal: signal))
+    source_rows: LIST {
+        [signal_id: TEXT { right }, name: TEXT { expected }]
+    }
+    catalog:
+        source_rows
+        |> List/map(signal_row, new:
+            catalog_row(signal: catalog_record(signal_row: signal_row))
+        )
+]
+
+FUNCTION unrelated_row(signal) {
+    [
+        select: SOURCE
+        label: signal.label
+    ]
+}
+
+FUNCTION catalog_record(signal_row) {
+    [
+        key: signal_row.signal_id
+        label: signal_row.name
+    ]
+}
+
+FUNCTION catalog_row(signal) {
+    [
+        select: SOURCE
+        key: signal.key
+        label: signal.label
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let label = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "signal_row.label")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(FieldId)
+        .unwrap_or_else(|| {
+            panic!(
+                "catalog label field; available fields: {:?}",
+                compiled
+                    .plan
+                    .debug_map
+                    .fields
+                    .iter()
+                    .map(|field| field.label.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .all(|op| op.output != Some(ValueRef::Field(label))),
+        "a materialized row field must not have a second indexed writer"
+    );
+    let catalog = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.catalog")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("catalog field");
+    let catalog_op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(catalog)))
+        .expect("catalog materialization operation");
+    let PlanOpKind::DerivedValue {
+        expression:
+            Some(PlanDerivedExpression::MaterializeList {
+                fields: materialized_fields,
+                expression: materialized_expression,
+                ..
+            }),
+        ..
+    } = &catalog_op.kind
+    else {
+        panic!("catalog must have one authoritative materializer: {catalog_op:#?}");
+    };
+    assert_eq!(materialized_fields.get("label"), Some(&label));
+    let PlanDerivedExpression::RowExpression {
+        expression: PlanRowExpression::ListMap { value, .. },
+    } = materialized_expression.as_ref()
+    else {
+        panic!("catalog materializer must retain the exact list map");
+    };
+    let PlanRowExpression::Object { fields } = value.as_ref() else {
+        panic!("catalog map must produce a record");
+    };
+    let PlanRowExpression::ObjectField {
+        object,
+        field: projected_field,
+    } = &fields
+        .iter()
+        .find(|field| field.name == "label")
+        .expect("materialized catalog label")
+        .value
+    else {
+        panic!("catalog label must project the constructor argument object");
+    };
+    assert_eq!(projected_field, "label");
+    let PlanRowExpression::Object {
+        fields: constructor_fields,
+    } = object.as_ref()
+    else {
+        panic!("catalog constructor argument must retain its exact record");
+    };
+    let PlanRowExpression::ListRowField {
+        row: source_row,
+        list_id: source_list,
+        field: source_field,
+    } = &constructor_fields
+        .iter()
+        .find(|field| field.name == "label")
+        .expect("constructor label")
+        .value
+    else {
+        panic!(
+            "constructor label must project the mapped source row: {:#?}",
+            constructor_fields
+                .iter()
+                .find(|field| field.name == "label")
+        );
+    };
+    assert!(matches!(
+        source_row.as_ref(),
+        PlanRowExpression::ListMapItem { binding } if binding == "signal_row"
+    ));
+    let source_rows = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name.ends_with("source_rows"))
+        .expect("source rows list");
+    assert_eq!(source_list.0, source_rows.id.0);
+    assert_eq!(
+        compiled
+            .plan
+            .debug_map
+            .fields
+            .iter()
+            .find(|field| field.id == format!("field:{}", source_field.0))
+            .map(|field| field.label.as_str()),
+        Some("source_rows.name")
+    );
+    verify_plan(&compiled.plan).expect("constructor formal plan must verify");
+}
+
+#[test]
+fn row_preserving_list_filters_keep_exact_mapped_field_identity() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "filtered-mapped-row-identity.bn",
+        r#"
+store: [
+    selected_file: TEXT { first.vcd }
+    rows:
+        LIST {
+            [file: TEXT { first.vcd }]
+            [file: TEXT { second.vcd }]
+        }
+        |> List/map(input_row, new: mapped_row(input: input_row))
+    selected:
+        rows
+        |> List/filter_field_equal(field: "file", value: selected_file)
+        |> List/map(filtered_row, new: copied_row(input: filtered_row))
+    continued:
+        selected_file |> WHEN {
+            TEXT { first.vcd } =>
+                selected
+                |> List/map(continued_row, new:
+                    copied_row(
+                        input: continued_row
+                    )
+                )
+            __ => LIST {}
+        }
+]
+
+FUNCTION mapped_row(input) {
+    [file: input.file, select: SOURCE]
+}
+
+FUNCTION copied_row(input) {
+    [file: input.file]
+}
+
+document: Document/new(
+    root: Element/label(element: [], label: TEXT { row identity })
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let selected = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.selected")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("selected field");
+    let selected_op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(selected)))
+        .expect("selected operation");
+    let PlanOpKind::DerivedValue {
+        expression: Some(expression),
+        ..
+    } = &selected_op.kind
+    else {
+        panic!("selected operation lost its typed expression: {selected_op:#?}");
+    };
+    let expression = match expression {
+        PlanDerivedExpression::MaterializeList { expression, .. } => expression.as_ref(),
+        expression => expression,
+    };
+    let PlanDerivedExpression::RowExpression {
+        expression: PlanRowExpression::ListMap { value, input, .. },
+    } = expression
+    else {
+        panic!("selected list must lower its filtered map");
+    };
+    assert!(matches!(
+        input.as_ref(),
+        PlanRowExpression::ListFilterField {
+            retain_equal: true,
+            ..
+        }
+    ));
+    let PlanRowExpression::Object { fields } = value.as_ref() else {
+        panic!("selected map must produce a record");
+    };
+    let PlanRowExpression::ListRowField { list_id, field, .. } = &fields
+        .iter()
+        .find(|field| field.name == "file")
+        .expect("selected file field")
+        .value
+    else {
+        panic!("filtered row field must retain an exact list and field identity");
+    };
+    let field_label = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.id == format!("field:{}", field.0))
+        .map(|entry| entry.label.as_str())
+        .expect("mapped field label");
+    assert!(field_label.ends_with("file"));
+    assert!(
+        compiled
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .any(|slot| slot.list_id == *list_id)
+    );
+
+    let continued = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.continued")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("continued field");
+    let continued_op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(continued)))
+        .expect("continued operation");
+    let PlanOpKind::DerivedValue {
+        expression: Some(expression),
+        ..
+    } = &continued_op.kind
+    else {
+        panic!("continued operation lost its typed expression: {continued_op:#?}");
+    };
+    let expression = match expression {
+        PlanDerivedExpression::MaterializeList { expression, .. } => expression.as_ref(),
+        expression => expression,
+    };
+    let PlanDerivedExpression::RowExpression {
+        expression: PlanRowExpression::Select { arms, .. },
+    } = expression
+    else {
+        panic!("continued field must lower to a select expression");
+    };
+    assert!(matches!(
+        arms.first().map(|arm| &arm.value),
+        Some(PlanRowExpression::ListMap { .. })
+    ));
 }
 
 #[test]
@@ -2656,7 +3586,7 @@ fn derived_list_input_wins_over_same_named_list_memory() {
 store: [
     sources: [events: SOURCE]
     value: 0 |> HOLD value {
-        LATEST { sources.events |> THEN { value + 1 } }
+        sources.events |> THEN { value + 1 }
     }
     items: LIST {
         [id: TEXT { a }]
@@ -2773,15 +3703,24 @@ FUNCTION decorate(item) {
         .find(|op| op.output == Some(ValueRef::Field(mapped)))
         .expect("mapped operation");
 
-    assert!(matches!(
-        mapped_op.kind,
-        PlanOpKind::DerivedValue {
-            expression: Some(PlanDerivedExpression::RowExpression {
-                expression: PlanRowExpression::ListMap { .. },
-            }),
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &mapped_op.kind,
+            PlanOpKind::DerivedValue {
+                expression: Some(PlanDerivedExpression::MaterializeList {
+                    expression,
+                    ..
+                }),
+                ..
+            } if matches!(
+                expression.as_ref(),
+                PlanDerivedExpression::RowExpression {
+                    expression: PlanRowExpression::ListMap { .. },
+                }
+            )
+        ),
+        "record-returning helper did not lower as List/map: {mapped_op:#?}"
+    );
 }
 
 #[test]
@@ -2840,6 +3779,62 @@ FUNCTION select_items(items) {
             ..
         }
     ));
+}
+
+#[test]
+fn scalar_record_lists_lower_find_find_value_and_get_without_list_memory_identity() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "scalar-record-list-lookups.bn",
+        r#"
+store: [
+    request: SOURCE
+    found_value:
+        request.method |> THEN {
+            List/find_value(
+                request.query
+                field: "name"
+                value: TEXT { q }
+                target: "value"
+                fallback: TEXT { missing }
+            )
+        }
+    second_row:
+        request.method |> THEN { List/get(request.query, index: 1) }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let arm_values = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression: Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
+                ..
+            } => Some(arms.iter().map(|arm| &arm.value)),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(
+        arm_values.iter().any(|value| matches!(
+            value,
+            PlanRowExpression::BuiltinCall { function, .. } if function == "List/find_value"
+        )),
+        "missing scalar List/find_value: {arm_values:#?}"
+    );
+    assert!(
+        arm_values.iter().any(|value| matches!(
+            value,
+            PlanRowExpression::BuiltinCall { function, .. } if function == "List/get"
+        )),
+        "missing scalar List/get: {arm_values:#?}"
+    );
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
 }
 
 #[test]
@@ -3003,7 +3998,7 @@ FUNCTION new_row(title, kind) {
         controls: [select: SOURCE]
         selected:
             False |> HOLD selected {
-                LATEST { controls.select |> THEN { True } }
+                controls.select |> THEN { True }
             }
         title: title
         kind: kind
@@ -3217,7 +4212,7 @@ fn document_backend_contains_no_fixture_branches() {
 fn unknown_document_constructor_fails_compilation() {
     let source = r#"
 events: SOURCE
-value: 0 |> HOLD value { LATEST { events |> THEN { value } } }
+value: 0 |> HOLD value { events |> THEN { value } }
 items: LIST {}
 document: Document/new(root: Unknown/widget())
 "#;
@@ -3247,9 +4242,7 @@ store: [
             pulse |> THEN { count + 1 }
         }
     transient:
-        LATEST {
-            pulse |> THEN { count + 10 }
-        }
+        pulse |> THEN { count + 10 }
     derived: count + 20
 ]
 "#,
@@ -3295,9 +4288,7 @@ fn compiler_resolves_append_record_fields_from_the_trigger_source_payload() {
 store: [
     completed: SOURCE
     append_token:
-        LATEST {
-            completed |> THEN { completed.digest }
-        }
+        completed |> THEN { completed.digest }
     revisions:
         LIST {}
         |> List/append(item: append_token |> THEN {
@@ -3399,6 +4390,107 @@ fn compile_distributed_compiler_test_bundle(
     )
 }
 
+fn assert_distributed_endpoints_are_independently_routable(
+    compiled: &CompiledDistributedMachinePlans,
+) {
+    assert_eq!(
+        compiled.graph.wire_schema_hash,
+        distributed_graph_schema_hash(&compiled.graph).unwrap()
+    );
+    for role in [
+        ProgramRole::Client,
+        ProgramRole::Session,
+        ProgramRole::Server,
+    ] {
+        let endpoint = compiled
+            .program(role)
+            .unwrap()
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(endpoint.wire_schema, compiled.graph.wire_schema);
+        assert_eq!(endpoint.wire_schema_hash, compiled.graph.wire_schema_hash);
+    }
+    for edge in &compiled.graph.wire_schema.value_edges {
+        let producer = compiled
+            .program(edge.producer_role)
+            .unwrap()
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .unwrap();
+        let consumer = compiled
+            .program(edge.consumer_role)
+            .unwrap()
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .unwrap();
+        assert!(
+            producer
+                .endpoint
+                .value_exports
+                .iter()
+                .any(|export| export.export_id == edge.export_id)
+        );
+        assert_eq!(consumer.value_import_route(edge.import_id), Some(edge));
+    }
+    for edge in &compiled.graph.wire_schema.event_edges {
+        let producer = compiled
+            .program(edge.producer_role)
+            .unwrap()
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .unwrap();
+        let consumer = compiled
+            .program(edge.consumer_role)
+            .unwrap()
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .unwrap();
+        assert!(
+            producer
+                .endpoint
+                .event_exports
+                .iter()
+                .any(|export| export.export_id == edge.export_id)
+        );
+        assert_eq!(consumer.event_import_route(edge.import_id), Some(edge));
+    }
+    for edge in &compiled.graph.wire_schema.call_edges {
+        let caller = compiled
+            .program(edge.caller_role)
+            .unwrap()
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .unwrap();
+        let callee = compiled
+            .program(edge.callee_role)
+            .unwrap()
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(caller.outbound_call_route(edge.call_site_id), Some(edge));
+        assert_eq!(callee.inbound_call_route(edge.call_site_id), Some(edge));
+        assert!(
+            callee
+                .endpoint
+                .pure_function_exports
+                .iter()
+                .any(|function| {
+                    function.export_id == edge.function_export_id
+                        && function.parameters == edge.parameters
+                        && function.result_type == edge.result_type
+                })
+        );
+    }
+}
+
 const DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT: &str = r#"
 document: Document/new(
     root: Element/label(
@@ -3415,9 +4507,8 @@ fn distributed_compiler_links_three_verified_role_plans_without_string_fallbacks
         r#"
 store: [
     operand: 3
-    server_count: Server.store.count
-    session_count: Session.outputs.adjusted_count
-    sum: Server/add(value: operand + server_count + session_count)
+    session_count: Session/store.adjusted_count
+    sum: Session/decorate(value: operand + session_count)
 ]
 
 document: Document/new(
@@ -3430,27 +4521,22 @@ document: Document/new(
 "#,
         r#"
 store: [
-    server_count: Server.store.count
+    server_count: Server/store.count
     adjusted_count: server_count + 1
+    server_sum: Server/add(value: adjusted_count)
 ]
 
-outputs: [
-    adjusted_count: store.adjusted_count
-]
+FUNCTION decorate(value) {
+    value + 3
+}
 "#,
         r#"
 store: [
     increment: SOURCE
     count:
         40 |> HOLD count {
-            LATEST {
-                increment |> THEN { count + 1 }
-            }
+            increment |> THEN { count + 1 }
         }
-]
-
-outputs: [
-    count: store.count
 ]
 
 FUNCTION add(value) {
@@ -3459,6 +4545,8 @@ FUNCTION add(value) {
 "#,
     )
     .unwrap();
+
+    assert_distributed_endpoints_are_independently_routable(&compiled);
 
     let graph_id = compiled.graph.graph.graph_id;
     assert_eq!(compiled.graph.endpoints.len(), 3);
@@ -3513,6 +4601,8 @@ FUNCTION add(value) {
         .unwrap();
     assert_eq!(session.value_imports.len(), 1);
     assert_eq!(session.value_exports.len(), 1);
+    assert_eq!(session.pure_function_exports.len(), 1);
+    assert_eq!(session.remote_call_sites.len(), 1);
     let session_plan = &compiled.program(ProgramRole::Session).unwrap().plan;
     assert!(session_plan.regions.iter().flat_map(|region| &region.ops).any(|op| {
         op.inputs.iter().any(|input| {
@@ -3526,7 +4616,7 @@ FUNCTION add(value) {
         .iter()
         .find(|endpoint| endpoint.role == ProgramRole::Client)
         .unwrap();
-    assert_eq!(client.value_imports.len(), 2);
+    assert_eq!(client.value_imports.len(), 1);
     let [call] = client.remote_call_sites.as_slice() else {
         panic!(
             "expected one remote call, got {:?}",
@@ -3568,32 +4658,578 @@ FUNCTION add(value) {
 }
 
 #[test]
+fn distributed_compiler_wire_hash_ignores_bodies_and_local_ids() {
+    let baseline = compile_distributed_compiler_test_bundle(
+        r#"
+store: [
+    submit: SOURCE
+    current: Session/store.current
+    doubled: Session/double(value: current)
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: TEXT { Wire schema }
+    )
+)
+"#,
+        r#"
+store: [
+    submit: Client/store.submit
+    count:
+        0 |> HOLD count {
+            submit |> THEN { count + 1 }
+        }
+    current: 7
+]
+
+FUNCTION double(value) {
+    value + 1
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+    let changed_locals = compile_distributed_compiler_test_bundle(
+        r#"
+store: [
+    local_tick: SOURCE
+    submit: SOURCE
+    padding: 11
+    current: Session/store.current
+    doubled: Session/double(value: current)
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: TEXT { Wire schema }
+    )
+)
+"#,
+        r#"
+store: [
+    local_tick: SOURCE
+    submit: Client/store.submit
+    count:
+        0 |> HOLD count {
+            submit |> THEN { count + 1 }
+        }
+    padding: 13
+    current: 7
+]
+
+FUNCTION double(value) {
+    value + 2
+}
+"#,
+        "store: [\n    padding: 17\n    ready: True\n]\n",
+    )
+    .unwrap();
+
+    assert_distributed_endpoints_are_independently_routable(&baseline);
+    assert_distributed_endpoints_are_independently_routable(&changed_locals);
+    assert_eq!(baseline.graph.wire_schema, changed_locals.graph.wire_schema);
+    assert_eq!(
+        distributed_graph_schema_hash(&baseline.graph).unwrap(),
+        distributed_graph_schema_hash(&changed_locals.graph).unwrap()
+    );
+
+    let baseline_client = baseline
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Client)
+        .unwrap();
+    let changed_client = changed_locals
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Client)
+        .unwrap();
+    assert_ne!(
+        baseline_client.event_exports[0].source_id,
+        changed_client.event_exports[0].source_id
+    );
+    let baseline_session = baseline
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    let changed_session = changed_locals
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    assert_ne!(
+        baseline_session.event_imports[0].local_source_id,
+        changed_session.event_imports[0].local_source_id
+    );
+    assert_ne!(
+        baseline_session.value_exports[0].value,
+        changed_session.value_exports[0].value
+    );
+    assert_ne!(
+        baseline_session.pure_function_exports[0].body,
+        changed_session.pure_function_exports[0].body
+    );
+}
+
+#[test]
+fn distributed_compiler_wire_hash_changes_with_type_and_edge() {
+    let client_for = |values: &str| {
+        format!(
+            "store: [\n{values}\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        )
+    };
+    let baseline = compile_distributed_compiler_test_bundle(
+        &client_for("    primary: Session/store.primary"),
+        "store: [\n    primary: 7\n    secondary: 8\n]\n",
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+    let changed_type = compile_distributed_compiler_test_bundle(
+        &client_for("    primary: Session/store.primary"),
+        "store: [\n    primary: TEXT { seven }\n    secondary: 8\n]\n",
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+    let added_edge = compile_distributed_compiler_test_bundle(
+        &client_for("    primary: Session/store.primary\n    secondary: Session/store.secondary"),
+        "store: [\n    primary: 7\n    secondary: 8\n]\n",
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+
+    assert_ne!(baseline.graph.wire_schema, changed_type.graph.wire_schema);
+    assert_ne!(
+        distributed_graph_schema_hash(&baseline.graph).unwrap(),
+        distributed_graph_schema_hash(&changed_type.graph).unwrap()
+    );
+    assert_ne!(baseline.graph.wire_schema, added_edge.graph.wire_schema);
+    assert_ne!(
+        distributed_graph_schema_hash(&baseline.graph).unwrap(),
+        distributed_graph_schema_hash(&added_edge.graph).unwrap()
+    );
+}
+
+#[test]
 fn distributed_compiler_rejects_dependencies_in_the_wrong_role_direction() {
     let error = compile_distributed_compiler_test_bundle(
-        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+        &format!(
+            "server_count: Server/store.count\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
         "outputs: [\n    count: 1\n]\n",
-        "outputs: [\n    count: Session.outputs.count\n]\n",
+        "store: [\n    count: 1\n]\n",
     )
     .unwrap_err();
     let message = error.to_string();
     assert!(
-        message.contains("Session.outputs.count")
+        message.contains("Client cannot depend directly on Server")
             && (message.contains("direction")
                 || message.contains("cannot depend")
-                || message.contains("unknown qualified external value")),
+                || message.contains("route the value through Session")),
         "unexpected error: {message}"
     );
 }
 
 #[test]
-fn distributed_compiler_rejects_effectful_function_exports() {
-    let client = format!(
-        "result: Server/logged(value: 1)\n{}",
-        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
-    );
+fn distributed_compiler_rejects_role_outputs_as_application_state() {
     let error = compile_distributed_compiler_test_bundle(
-        &client,
-        "outputs: [\n    ready: True\n]\n",
+        &format!(
+            "store: [\n    count: 1\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        "store: [\n    count: Client/outputs.count\n]\n",
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must use `Client/store.<value>`"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn distributed_compiler_rejects_session_scoped_server_host_outputs() {
+    let error = compile_distributed_compiler_test_bundle(
+        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+        "store: [\n    value: 42\n]\n",
+        r#"
+store: [
+    session_value: Session/store.value
+]
+
+outputs: [
+    leaked: store.session_value
+]
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("host output `leaked` depends on Session-scoped state"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn distributed_compiler_lowers_reverse_adjacent_edges_without_role_ordering() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+        r#"
+store: [
+    seed: 7
+]
+
+FUNCTION double(value) {
+    value + value
+}
+"#,
+        r#"
+store: [
+    session_seed: Session/store.seed
+    doubled: Session/double(value: session_seed)
+]
+"#,
+    )
+    .unwrap();
+    let server = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Server)
+        .unwrap();
+    assert_eq!(server.value_imports.len(), 1);
+    assert_eq!(server.remote_call_sites.len(), 1);
+    let session = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    assert_eq!(session.value_exports.len(), 1);
+    assert_eq!(session.pure_function_exports.len(), 1);
+}
+
+#[test]
+fn distributed_compiler_scopes_only_server_values_derived_from_session_inputs() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        r#"
+store: [
+    increment: SOURCE
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: TEXT { Origin scope }
+    )
+)
+"#,
+        r#"
+store: [
+    increment: Client/store.increment
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+    mirrored: Server/store.mirrored
+    shared: Server/store.shared
+]
+"#,
+        r#"
+store: [
+    session_count: Session/store.count
+    mirrored: session_count + 1
+    shared: 42
+]
+"#,
+    )
+    .unwrap();
+
+    let server = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Server)
+        .unwrap();
+    let session = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    let mirrored = server
+        .value_exports
+        .iter()
+        .find(|export| export.origin_scoped)
+        .expect("Session-derived Server export");
+    let shared = server
+        .value_exports
+        .iter()
+        .find(|export| !export.origin_scoped)
+        .expect("independent shared Server export");
+    assert!(session.value_imports.iter().any(|import| {
+        import.source_export_id == mirrored.export_id
+            && import.scope == DistributedRouteScopePlan::OriginScoped
+            && import.source_origin_scoped
+    }));
+    assert!(session.value_imports.iter().any(|import| {
+        import.source_export_id == shared.export_id
+            && import.scope == DistributedRouteScopePlan::SharedSubscription
+            && !import.source_origin_scoped
+    }));
+}
+
+#[test]
+fn distributed_compiler_rejects_session_info_captured_by_global_server_state() {
+    let error = compile_distributed_compiler_test_bundle(
+        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+        r#"
+store: [
+    seed: 1
+    saved: Server/store.saved
+]
+"#,
+        r#"
+store: [
+    session_seed: Session/store.seed
+    saved:
+        SessionInfo/principal() |> HOLD saved {
+            LATEST {}
+        }
+]
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("outside an active Session scope"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn distributed_compiler_solves_simultaneous_adjacent_role_interfaces() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    client_seed: 3
+    session_seed: Session/store.session_seed
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    session_seed: 7
+    client_seed: Client/store.client_seed
+    server_seed: Server/store.server_seed
+]
+"#,
+        r#"
+store: [
+    server_seed: 11
+    session_seed: Session/store.session_seed
+]
+"#,
+    )
+    .unwrap();
+
+    let client = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Client)
+        .unwrap();
+    let session = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    let server = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Server)
+        .unwrap();
+    assert_eq!(client.value_imports.len(), 1);
+    assert_eq!(client.value_exports.len(), 1);
+    assert_eq!(session.value_imports.len(), 2);
+    assert_eq!(session.value_exports.len(), 1);
+    assert_eq!(server.value_imports.len(), 1);
+    assert_eq!(server.value_exports.len(), 1);
+}
+
+#[test]
+fn distributed_compiler_rejects_unresolved_interface_cycles() {
+    let error = compile_distributed_compiler_test_bundle(
+        &format!(
+            "store: [\n    left: Session/store.right\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        "store: [\n    right: Client/store.left\n]\n",
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("distributed interface types did not resolve")
+            && message.contains("Client/store.left")
+            && message.contains("Session/store.right"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn distributed_compiler_rejects_grounded_combinational_cycles() {
+    let error = compile_distributed_compiler_test_bundle(
+        &format!(
+            "store: [\n    left: Session/store.right + 1\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        "store: [\n    right: Client/store.left + 1\n]\n",
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("distributed combinational cycle")
+            && message.contains("Client/store.left")
+            && message.contains("Session/store.right")
+            && message.contains("SOURCE, HOLD, or asynchronous effect"),
+        "unexpected cycle diagnostic: {message}"
+    );
+}
+
+#[test]
+fn distributed_compiler_accepts_a_cycle_broken_by_source_and_hold() {
+    compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    tick: SOURCE
+    left:
+        0 |> HOLD left {{
+            tick |> THEN {{ Session/store.right + 1 }}
+        }}
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        "store: [\n    right: Client/store.left + 1\n]\n",
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn distributed_compiler_infers_identity_function_boundary_from_its_call_site() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            "store: [\n    result: Session/identity(value: 5)\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    ready: True
+]
+
+FUNCTION identity(value) {
+    value
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+    let session = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    let [identity] = session.pure_function_exports.as_slice() else {
+        panic!("expected one identity export");
+    };
+    assert_eq!(identity.parameters[0].data_type, DataTypePlan::Number);
+    assert_eq!(identity.result_type, DataTypePlan::Number);
+}
+
+#[test]
+fn distributed_compiler_lowers_remote_source_as_an_event_lane() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            "store: [\n    submit: SOURCE\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    submit: Client/store.submit
+    count:
+        0 |> HOLD count {
+            submit |> THEN { count + 1 }
+        }
+]
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+
+    let client = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Client)
+        .unwrap();
+    let session = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    assert_eq!(client.event_exports.len(), 1);
+    assert!(client.value_exports.is_empty());
+    assert_eq!(session.event_imports.len(), 1);
+    assert!(session.value_imports.is_empty());
+    assert_eq!(
+        client.event_exports[0].export_id,
+        session.event_imports[0].source_export_id
+    );
+    assert!(
+        compiled
+            .program(ProgramRole::Session)
+            .unwrap()
+            .plan
+            .source_routes
+            .iter()
+            .any(|route| route.source_id == session.event_imports[0].local_source_id)
+    );
+}
+
+#[test]
+fn distributed_compiler_rejects_effectful_function_exports() {
+    let error = compile_distributed_compiler_test_bundle(
+        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+        "result: Server/logged(value: 1)\noutputs: [\n    ready: True\n]\n",
         r#"
 outputs: [
     ready: True
@@ -3626,7 +5262,7 @@ store: [
 ]
 
 FUNCTION decorate(item) {{
-    [value: Server/add(value: item.value)]
+    [value: Session/add(value: item.value)]
 }}
 
 {}
@@ -3635,7 +5271,6 @@ FUNCTION decorate(item) {{
     );
     let error = compile_distributed_compiler_test_bundle(
         &client,
-        "outputs: [\n    ready: True\n]\n",
         r#"
 outputs: [
     ready: True
@@ -3645,6 +5280,7 @@ FUNCTION add(value) {
     value + 1
 }
 "#,
+        "outputs: [\n    ready: True\n]\n",
     )
     .unwrap_err();
     let message = error.to_string();

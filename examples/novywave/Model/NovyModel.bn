@@ -240,7 +240,7 @@ FUNCTION signal_octal_digits(width) {
 }
 
 FUNCTION signal_numeric_value_label(value, bit_width, format) {
-    signal_value_number(value: value) |> WHILE {
+    signal_value_number(value: value) |> WHEN {
         NaN => signal_value_trimmed(value: value)
         number => signal_numeric_number_label(number: number, width: signal_bit_width(value: value, bit_width: bit_width), format: format)
     }

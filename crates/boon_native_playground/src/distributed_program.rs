@@ -1,17 +1,9 @@
-use crate::protocol::{ApplicationIdentity, SourceUnit};
+use crate::protocol::ProgramSource;
 use boon_plan::ProgramRole;
 use boon_runtime::{
     DistributedProgramBundle, ProgramCapabilityProfile, ProgramCompileRequest, RuntimeResult,
     RuntimeSourceUnit, compile_distributed_program_bundle,
 };
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProgramSource {
-    pub role: ProgramRole,
-    pub entry_path: String,
-    pub units: Vec<SourceUnit>,
-    pub application: ApplicationIdentity,
-}
 
 pub(crate) fn compile_distributed_program(
     mut sources: Vec<ProgramSource>,
@@ -60,9 +52,8 @@ fn role_rank(role: ProgramRole) -> u8 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use boon_runtime::{ProgramArtifact, SourcePayload, Value};
+pub(crate) fn distributed_fixture_sources() -> Vec<ProgramSource> {
+    use crate::protocol::{ApplicationIdentity, SourceUnit};
 
     const SHARED_PATH: &str = "distributed_fixture/Shared/DistributedContract.bn";
     const CLIENT_PATH: &str = "distributed_fixture/Client/RUN.bn";
@@ -74,10 +65,69 @@ mod tests {
     const SESSION_SOURCE: &str = include_str!("../testdata/distributed_fixture/Session/RUN.bn");
     const SERVER_SOURCE: &str = include_str!("../testdata/distributed_fixture/Server/RUN.bn");
 
+    [
+        (
+            ProgramRole::Client,
+            CLIENT_PATH,
+            CLIENT_SOURCE,
+            "fixture-client",
+        ),
+        (
+            ProgramRole::Session,
+            SESSION_PATH,
+            SESSION_SOURCE,
+            "fixture-session",
+        ),
+        (
+            ProgramRole::Server,
+            SERVER_PATH,
+            SERVER_SOURCE,
+            "fixture-server",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(role, entry_path, source, state_namespace)| ProgramSource {
+            role,
+            entry_path: entry_path.to_owned(),
+            units: vec![
+                SourceUnit {
+                    path: SHARED_PATH.to_owned(),
+                    source: SHARED_SOURCE.to_owned(),
+                },
+                SourceUnit {
+                    path: entry_path.to_owned(),
+                    source: source.to_owned(),
+                },
+            ],
+            application: ApplicationIdentity::new(
+                "dev.boon.distributed-fixture",
+                state_namespace,
+                "test",
+            ),
+        },
+    )
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::SourceUnit;
+    use boon_runtime::ProgramArtifact;
+
+    const SHARED_PATH: &str = "distributed_fixture/Shared/DistributedContract.bn";
+    const SERVER_PATH: &str = "distributed_fixture/Server/RUN.bn";
+    const SHARED_SOURCE: &str =
+        include_str!("../testdata/distributed_fixture/Shared/DistributedContract.bn");
+    const CLIENT_SOURCE: &str = include_str!("../testdata/distributed_fixture/Client/RUN.bn");
+    const SESSION_SOURCE: &str = include_str!("../testdata/distributed_fixture/Session/RUN.bn");
+    const SERVER_SOURCE: &str = include_str!("../testdata/distributed_fixture/Server/RUN.bn");
+
     #[test]
-    fn unrelated_distributed_program_compiles_and_runs_as_isolated_deterministic_sessions() {
-        let bundle =
-            compile_distributed_program(fixture_sources()).expect("compile distributed fixture");
+    fn unrelated_distributed_program_compiles_role_owned_artifacts() {
+        let bundle = compile_distributed_program(distributed_fixture_sources())
+            .expect("compile distributed fixture");
         assert_eq!(bundle.artifacts().len(), 3);
         let client = bundle.artifact(ProgramRole::Client).expect("client");
         let session = bundle.artifact(ProgramRole::Session).expect("session");
@@ -112,119 +162,36 @@ mod tests {
         assert_ne!(client.plan_digest(), session.plan_digest());
         assert_ne!(session.plan_digest(), server.plan_digest());
 
-        let stable_document_session = bundle
-            .start_distributed()
-            .expect("first distributed lifecycle")
-            .session_id(ProgramRole::Client)
-            .expect("document session")
-            .clone();
-        let mut lifecycle = bundle
-            .start_distributed()
-            .expect("start distributed fixture");
-        assert_eq!(lifecycle.session_count(), 3);
+        let wire_hash = client
+            .plan()
+            .distributed_endpoint
+            .as_ref()
+            .expect("client distributed endpoint")
+            .wire_schema_hash;
         assert_eq!(
-            lifecycle.session_id(ProgramRole::Client),
-            Some(&stable_document_session)
-        );
-        assert_ne!(
-            lifecycle.session_id(ProgramRole::Client),
-            lifecycle.session_id(ProgramRole::Session)
-        );
-        assert_ne!(
-            lifecycle.session_id(ProgramRole::Session),
-            lifecycle.session_id(ProgramRole::Server)
-        );
-        let expected_session_id = lifecycle
-            .session_id(ProgramRole::Session)
-            .expect("session identity")
-            .0
-            .clone();
-        assert!(matches!(
-            lifecycle
-                .output_value_current(ProgramRole::Session, "status")
-                .expect("session status"),
-            Value::Record(fields)
-                if fields.get("$tag") == Some(&Value::Text("Active".to_owned()))
-                    && fields.get("role") == Some(&Value::Text("Session".to_owned()))
-                    && fields.get("session_id") == Some(&Value::Text(expected_session_id))
-        ));
-        assert_eq!(
-            lifecycle
-                .output_value_current(ProgramRole::Session, "principal")
-                .expect("session principal"),
-            Value::Text("Anonymous".to_owned())
+            wire_hash,
+            session
+                .plan()
+                .distributed_endpoint
+                .as_ref()
+                .expect("session distributed endpoint")
+                .wire_schema_hash
         );
         assert_eq!(
-            lifecycle
-                .root_value_current(ProgramRole::Client, "store.client_count")
-                .expect("client count"),
-            Value::integer(0).unwrap()
-        );
-        assert_eq!(
-            lifecycle
-                .root_value_current(ProgramRole::Server, "store.server_count")
-                .expect("server count"),
-            Value::integer(0).unwrap()
-        );
-
-        let server_turn = lifecycle
-            .dispatch(
-                ProgramRole::Server,
-                "store.request_received",
-                None,
-                SourcePayload::default(),
-            )
-            .expect("server turn");
-        assert_eq!(server_turn.turn.lifecycle_sequence, 1);
-        assert_eq!(server_turn.turn.source_sequence, 1);
-        assert_eq!(
-            lifecycle
-                .root_value_current(ProgramRole::Server, "store.server_count")
-                .expect("updated server count"),
-            Value::integer(1).unwrap()
-        );
-        let response = lifecycle
-            .output_value_current(ProgramRole::Server, "api_response")
-            .expect("server output");
-        assert!(matches!(response, Value::Record(fields)
-            if fields.get("count") == Some(&Value::integer(1).unwrap())));
-        assert_eq!(
-            lifecycle
-                .root_value_current(ProgramRole::Client, "store.client_count")
-                .expect("isolated client count"),
-            Value::integer(0).unwrap()
-        );
-
-        let client_turn = lifecycle
-            .dispatch(
-                ProgramRole::Client,
-                "store.increment",
-                None,
-                SourcePayload::default(),
-            )
-            .expect("client turn");
-        assert_eq!(client_turn.turn.lifecycle_sequence, 2);
-        assert_eq!(client_turn.turn.source_sequence, 1);
-        assert_eq!(
-            lifecycle
-                .root_value_current(ProgramRole::Client, "store.client_count")
-                .expect("updated client count"),
-            Value::integer(1).unwrap()
-        );
-        assert_eq!(
-            lifecycle
-                .turn_log()
-                .iter()
-                .map(|turn| (turn.lifecycle_sequence, turn.role, turn.source_sequence))
-                .collect::<Vec<_>>(),
-            [(1, ProgramRole::Server, 1), (2, ProgramRole::Client, 1)]
+            wire_hash,
+            server
+                .plan()
+                .distributed_endpoint
+                .as_ref()
+                .expect("server distributed endpoint")
+                .wire_schema_hash
         );
     }
 
     #[test]
     fn distributed_fixture_uses_runtime_content_artifacts_for_all_roles() {
-        let bundle =
-            compile_distributed_program(fixture_sources()).expect("compile distributed fixture");
+        let bundle = compile_distributed_program(distributed_fixture_sources())
+            .expect("compile distributed fixture");
         for (role, profile) in [
             (ProgramRole::Client, ProgramCapabilityProfile::PublicClient),
             (
@@ -245,7 +212,7 @@ mod tests {
 
     #[test]
     fn declared_role_is_validated_against_the_compiled_output_boundary() {
-        let mut sources = fixture_sources();
+        let mut sources = distributed_fixture_sources();
         sources
             .iter_mut()
             .find(|source| source.role == ProgramRole::Server)
@@ -271,7 +238,7 @@ mod tests {
 
     #[test]
     fn distributed_program_rejects_a_shared_state_namespace() {
-        let mut sources = fixture_sources();
+        let mut sources = distributed_fixture_sources();
         for source in &mut sources {
             source.application.state_namespace = "shared-state".to_owned();
         }
@@ -282,67 +249,5 @@ mod tests {
                 .contains("distributed roles must use distinct state namespaces"),
             "unexpected shared-namespace diagnostic: {error}"
         );
-    }
-
-    fn fixture_sources() -> Vec<ProgramSource> {
-        vec![
-            ProgramSource {
-                role: ProgramRole::Client,
-                entry_path: CLIENT_PATH.to_owned(),
-                units: vec![
-                    SourceUnit {
-                        path: SHARED_PATH.to_owned(),
-                        source: SHARED_SOURCE.to_owned(),
-                    },
-                    SourceUnit {
-                        path: CLIENT_PATH.to_owned(),
-                        source: CLIENT_SOURCE.to_owned(),
-                    },
-                ],
-                application: ApplicationIdentity::new(
-                    "dev.boon.distributed-fixture",
-                    "fixture-client",
-                    "test",
-                ),
-            },
-            ProgramSource {
-                role: ProgramRole::Session,
-                entry_path: SESSION_PATH.to_owned(),
-                units: vec![
-                    SourceUnit {
-                        path: SHARED_PATH.to_owned(),
-                        source: SHARED_SOURCE.to_owned(),
-                    },
-                    SourceUnit {
-                        path: SESSION_PATH.to_owned(),
-                        source: SESSION_SOURCE.to_owned(),
-                    },
-                ],
-                application: ApplicationIdentity::new(
-                    "dev.boon.distributed-fixture",
-                    "fixture-session",
-                    "test",
-                ),
-            },
-            ProgramSource {
-                role: ProgramRole::Server,
-                entry_path: SERVER_PATH.to_owned(),
-                units: vec![
-                    SourceUnit {
-                        path: SHARED_PATH.to_owned(),
-                        source: SHARED_SOURCE.to_owned(),
-                    },
-                    SourceUnit {
-                        path: SERVER_PATH.to_owned(),
-                        source: SERVER_SOURCE.to_owned(),
-                    },
-                ],
-                application: ApplicationIdentity::new(
-                    "dev.boon.distributed-fixture",
-                    "fixture-server",
-                    "test",
-                ),
-            },
-        ]
     }
 }

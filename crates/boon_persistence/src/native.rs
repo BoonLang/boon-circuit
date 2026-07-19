@@ -1,8 +1,8 @@
 use super::codec::{
     BlobDigest, BlobRecord, EncodedComponent, decode_blob_record, decode_outbox_record,
-    decode_row_component, decode_scalar_component, encode_blob_record, encode_outbox_record,
-    encode_row_component, encode_scalar_component, row_component_blob_references,
-    scalar_component_blob_references,
+    decode_protocol_state_record, decode_row_component, decode_scalar_component,
+    encode_blob_record, encode_outbox_record, encode_protocol_state_record, encode_row_component,
+    encode_scalar_component, row_component_blob_references, scalar_component_blob_references,
 };
 use super::{
     ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, CheckpointBatch, CommitAck,
@@ -10,8 +10,9 @@ use super::{
     ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
     DurableChange, DurableOutboxItem, ExportApplicationRequest, LoadContentArtifactRequest,
     OutboxItemId, PersistenceCommand, PersistenceDriver, PersistenceInspectorSnapshot,
-    PersistenceResult, PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck,
-    ResetApplicationBatch, RestoreImage, ShutdownAck, StoreError, StoredList, StoredRow,
+    PersistenceResult, ProtocolStateKey, ProtocolStateRecord, ProtocolStateSnapshot,
+    PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch,
+    RestoreImage, ShutdownAck, StoreError, StoredList, StoredRow,
     apply_durable_content_artifact_changes, encode_restore_image, exact_content_artifact_closure,
     hash_application, inspector_snapshot_with_artifacts, validate_activation,
     validate_application_transfer, validate_checkpoint, validate_content_artifact,
@@ -36,6 +37,7 @@ const ROWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ROWS");
 const CHECKPOINTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("CHECKPOINTS");
 const MIGRATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("MIGRATIONS");
 const OUTBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("OUTBOX");
+const PROTOCOL_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("PROTOCOL_STATE");
 const BLOBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("BLOBS");
 const ARTIFACTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ARTIFACTS");
 const ARTIFACT_OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ARTIFACT_OWNERS");
@@ -273,6 +275,21 @@ impl RedbDriver {
         }))
     }
 
+    fn load_protocol_state(
+        &self,
+        application: &ApplicationIdentity,
+    ) -> Result<ProtocolStateSnapshot, StoreError> {
+        let transaction = self.database()?.begin_read().map_err(backend)?;
+        let meta = transaction.open_table(META).map_err(backend)?;
+        if read_meta(&meta, application, self.limits)?.is_none() {
+            return Err(StoreError::MissingApplication);
+        }
+        drop(meta);
+        let app = application_key(application);
+        let table = transaction.open_table(PROTOCOL_STATE).map_err(backend)?;
+        load_protocol_state_table(&table, &app, self.limits)
+    }
+
     fn initialize(&self, image: RestoreImage) -> Result<CommitAck, StoreError> {
         validate_initial_image(&image)?;
         if image
@@ -393,6 +410,22 @@ impl RedbDriver {
                 replace_outbox(&mut outbox, &app, &current_outbox, &candidate_outbox)?;
             }
 
+            if !batch.protocol_state_changes.is_empty() {
+                let mut protocol_state = transaction.open_table(PROTOCOL_STATE).map_err(backend)?;
+                let current = load_protocol_state_table(&protocol_state, &app, self.limits)?;
+                let mut candidate = current.clone();
+                super::apply_durable_protocol_state_changes(
+                    &mut candidate.records,
+                    &batch.protocol_state_changes,
+                )?;
+                replace_protocol_state(
+                    &mut protocol_state,
+                    &app,
+                    &current.records,
+                    &candidate.records,
+                )?;
+            }
+
             if !batch.content_artifact_changes.is_empty() {
                 let mut artifact_owners =
                     transaction.open_table(ARTIFACT_OWNERS).map_err(backend)?;
@@ -506,6 +539,10 @@ impl RedbDriver {
                 &app,
             )?;
             delete_prefix(&mut transaction.open_table(OUTBOX).map_err(backend)?, &app)?;
+            delete_prefix(
+                &mut transaction.open_table(PROTOCOL_STATE).map_err(backend)?,
+                &app,
+            )?;
             delete_prefix(&mut transaction.open_table(BLOBS).map_err(backend)?, &app)?;
             delete_prefix(
                 &mut transaction.open_table(ARTIFACTS).map_err(backend)?,
@@ -1034,6 +1071,11 @@ impl PersistenceDriver for RedbDriver {
                 });
                 PersistenceResult::Loaded(result)
             }
+            PersistenceCommand::LoadProtocolState(request) => {
+                PersistenceResult::ProtocolStateLoaded(
+                    self.load_protocol_state(&request.application),
+                )
+            }
             PersistenceCommand::Initialize(image) => {
                 PersistenceResult::Initialized(self.initialize(image))
             }
@@ -1079,6 +1121,7 @@ fn create_tables(transaction: &WriteTransaction) -> Result<(), StoreError> {
     transaction.open_table(CHECKPOINTS).map_err(backend)?;
     transaction.open_table(MIGRATIONS).map_err(backend)?;
     transaction.open_table(OUTBOX).map_err(backend)?;
+    transaction.open_table(PROTOCOL_STATE).map_err(backend)?;
     transaction.open_table(BLOBS).map_err(backend)?;
     transaction.open_table(ARTIFACTS).map_err(backend)?;
     transaction.open_table(ARTIFACT_OWNERS).map_err(backend)?;
@@ -1119,6 +1162,66 @@ where
     }
     super::validate_outbox(&outbox)?;
     Ok(outbox)
+}
+
+fn load_protocol_state_table<T>(
+    table: &T,
+    app: &[u8; 32],
+    limits: DecodeLimits,
+) -> Result<ProtocolStateSnapshot, StoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let mut records = BTreeMap::new();
+    let mut total_bytes = 0usize;
+    for entry in table.iter().map_err(backend)? {
+        let (key, value) = entry.map_err(backend)?;
+        let key = key.value();
+        if !key.starts_with(app) {
+            continue;
+        }
+        if key.len() != 64 {
+            return Err(corrupt("invalid protocol-state key"));
+        }
+        let mut digest = [0; 32];
+        digest.copy_from_slice(&key[32..]);
+        let bytes = value.value();
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| corrupt("protocol-state byte count overflow"))?;
+        if total_bytes > limits.max_total_bytes {
+            return Err(corrupt("protocol-state records exceed decode limit"));
+        }
+        let record = decode_protocol_state_record(bytes, limits).map_err(codec)?;
+        if records.insert(ProtocolStateKey(digest), record).is_some() {
+            return Err(corrupt("duplicate protocol-state key"));
+        }
+    }
+    super::validate_protocol_state(&records)?;
+    Ok(ProtocolStateSnapshot { records })
+}
+
+fn replace_protocol_state(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    current: &BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
+    candidate: &BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
+) -> Result<(), StoreError> {
+    for key in current.keys().filter(|key| !candidate.contains_key(key)) {
+        let storage_key = protocol_state_storage_key(app, *key);
+        table.remove(storage_key.as_slice()).map_err(backend)?;
+    }
+    for (key, record) in candidate {
+        if current.get(key) == Some(record) {
+            continue;
+        }
+        let storage_key = protocol_state_storage_key(app, *key);
+        let bytes = encode_protocol_state_record(record).map_err(codec)?;
+        table
+            .insert(storage_key.as_slice(), bytes.as_slice())
+            .map_err(backend)?;
+    }
+    Ok(())
 }
 
 fn replace_outbox(
@@ -2287,6 +2390,13 @@ fn outbox_storage_key(app: &[u8; 32], item_id: OutboxItemId) -> [u8; 64] {
     key
 }
 
+fn protocol_state_storage_key(app: &[u8; 32], key: ProtocolStateKey) -> [u8; 64] {
+    let mut storage_key = [0; 64];
+    storage_key[..32].copy_from_slice(app);
+    storage_key[32..].copy_from_slice(key.as_bytes());
+    storage_key
+}
+
 fn blob_storage_key(app: &[u8; 32], digest: BlobDigest) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(app);
@@ -2429,7 +2539,8 @@ fn corrupt(detail: impl Into<String>) -> StoreError {
 mod tests {
     use super::*;
     use crate::{
-        CompactRequest, DurableOutboxState, InspectRequest, PersistenceCommand, PersistenceResult,
+        CompactRequest, DurableOutboxState, DurableProtocolStateChange, InspectRequest,
+        LoadProtocolStateRequest, PersistenceCommand, PersistenceResult, ProtocolStateKey,
         RestoreRequest, ShutdownRequest, StoredScalar, StoredValue,
     };
     use boon_plan::{EffectId, MemoryKind, MemoryLeafId, MemoryOwnerPath};
@@ -2492,8 +2603,7 @@ mod tests {
     fn pending_outbox(turn_sequence: u64) -> DurableOutboxItem {
         let effect = EffectId::from_host_operation("Test/send").unwrap();
         DurableOutboxItem::pending(
-            boon_plan::EffectInvocationId::from_semantic_route(effect, "test.send", "store.result")
-                .unwrap(),
+            boon_plan::EffectInvocationId::from_result_owner(effect, "store.result").unwrap(),
             effect,
             StoredValue::Text("request-1".to_owned()),
             StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(12))])),
@@ -2519,6 +2629,7 @@ mod tests {
             last_turn_sequence: turn_sequence,
             changes,
             outbox_changes,
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -2557,6 +2668,7 @@ mod tests {
             last_turn_sequence: turn_sequence,
             changes: Vec::new(),
             outbox_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             content_artifact_changes,
             checksum: [0; 32],
         }
@@ -2588,6 +2700,7 @@ mod tests {
                     "META".to_owned(),
                     "MIGRATIONS".to_owned(),
                     "OUTBOX".to_owned(),
+                    "PROTOCOL_STATE".to_owned(),
                     "ROWS".to_owned(),
                     "SLOTS".to_owned(),
                 ])
@@ -2832,6 +2945,7 @@ mod tests {
                     },
                 ],
                 outbox_changes: Vec::new(),
+                protocol_state_changes: Vec::new(),
                 content_artifact_changes: Vec::new(),
                 checksum: [0; 32],
             }
@@ -2898,6 +3012,7 @@ mod tests {
                     },
                 ],
                 outbox_changes: Vec::new(),
+                protocol_state_changes: Vec::new(),
                 content_artifact_changes: Vec::new(),
                 checksum: [0; 32],
             }
@@ -2956,6 +3071,7 @@ mod tests {
                 },
             ],
             outbox_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -2982,6 +3098,7 @@ mod tests {
                 },
             }],
             outbox_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3113,6 +3230,7 @@ mod tests {
                 last_turn_sequence: sequence,
                 changes: Vec::new(),
                 outbox_changes: Vec::new(),
+                protocol_state_changes: Vec::new(),
                 content_artifact_changes: Vec::new(),
                 checksum: [0; 32],
             }
@@ -3128,6 +3246,67 @@ mod tests {
             count_prefix(&table, &application_key(&app)).unwrap(),
             MAX_CHECKPOINT_RECORDS_PER_APPLICATION
         );
+    }
+
+    #[test]
+    fn protocol_state_commits_atomically_with_authority_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.redb");
+        let app = application();
+        let count = scalar("count");
+        let key = ProtocolStateKey([0x51; 32]);
+        {
+            let mut driver = RedbDriver::open(&path).unwrap();
+            initialize(&mut driver, RestoreImage::empty(app.clone(), 1, [0x52; 32]));
+            let batch = CheckpointBatch {
+                application: app.clone(),
+                schema_hash: [0x52; 32],
+                base_epoch: 0,
+                next_epoch: 1,
+                first_turn_sequence: 1,
+                last_turn_sequence: 1,
+                changes: vec![DurableChange::SetScalar {
+                    memory_id: count,
+                    value: StoredScalar {
+                        touched: true,
+                        value: number(1),
+                    },
+                }],
+                outbox_changes: Vec::new(),
+                protocol_state_changes: vec![DurableProtocolStateChange::Put {
+                    key,
+                    expected_revision: None,
+                    next_revision: 1,
+                    payload: crate::Bytes::from_static(b"opaque-session-v1"),
+                    turn_sequence: 1,
+                }],
+                content_artifact_changes: Vec::new(),
+                checksum: [0; 32],
+            }
+            .seal();
+            assert!(matches!(
+                driver.execute(PersistenceCommand::Commit(batch)),
+                PersistenceResult::Committed(Ok(_))
+            ));
+        }
+
+        let mut driver = RedbDriver::open(&path).unwrap();
+        assert_eq!(
+            load(&mut driver, app.clone()).scalars[&count].value,
+            number(1)
+        );
+        let snapshot = match driver.execute(PersistenceCommand::LoadProtocolState(
+            LoadProtocolStateRequest { application: app },
+        )) {
+            PersistenceResult::ProtocolStateLoaded(Ok(snapshot)) => snapshot,
+            result => panic!("unexpected protocol-state load result: {result:?}"),
+        };
+        assert_eq!(snapshot.records[&key].revision, 1);
+        assert_eq!(
+            snapshot.records[&key].payload.as_ref(),
+            b"opaque-session-v1"
+        );
+        assert!(!format!("{snapshot:?}").contains("opaque-session-v1"));
     }
 
     #[test]
@@ -3260,7 +3439,7 @@ mod tests {
             scalar_memory,
             StoredScalar {
                 touched: true,
-                value: StoredValue::Bytes(payload.clone()),
+                value: StoredValue::Bytes(payload.clone().into()),
             },
         );
         image.lists.insert(
@@ -3271,7 +3450,7 @@ mod tests {
                 rows: vec![StoredRow {
                     key: 0,
                     generation: 1,
-                    fields: BTreeMap::from([(field, StoredValue::Bytes(payload.clone()))]),
+                    fields: BTreeMap::from([(field, StoredValue::Bytes(payload.clone().into()))]),
                     touched_fields: BTreeSet::from([field]),
                 }],
             },
@@ -3300,7 +3479,7 @@ mod tests {
                 memory_id: scalar_memory,
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Bytes(vec![1, 2, 3]),
+                    value: StoredValue::Bytes(vec![1, 2, 3].into()),
                 },
             }],
             Vec::new(),
@@ -3357,7 +3536,7 @@ mod tests {
         assert_eq!(count_prefix(&table, &app_key).unwrap(), 0);
         assert_eq!(
             load(&mut driver, app).scalars[&scalar_memory].value,
-            StoredValue::Bytes(vec![1, 2, 3])
+            StoredValue::Bytes(vec![1, 2, 3].into())
         );
     }
 
@@ -3374,7 +3553,7 @@ mod tests {
             scalar("payload"),
             StoredScalar {
                 touched: true,
-                value: StoredValue::Bytes(vec![4; super::super::INLINE_BYTES_THRESHOLD + 1]),
+                value: StoredValue::Bytes(vec![4; super::super::INLINE_BYTES_THRESHOLD + 1].into()),
             },
         );
         let mut driver = RedbDriver::open(&path).unwrap();

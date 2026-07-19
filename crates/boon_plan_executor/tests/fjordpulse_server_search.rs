@@ -2,7 +2,9 @@ use boon_plan::{
     FieldId, OutputValueRef, ProgramRole, TargetProfile, ValueRef,
     cpu_plan_executor_supports_whole_plan_op,
 };
-use boon_plan_executor::{Session, SessionOptions, SourceEvent, SourcePayload, Value, ValueTarget};
+use boon_plan_executor::{
+    MachineInstance, SessionOptions, SourceEvent, SourcePayload, Value, ValueTarget,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -72,7 +74,7 @@ fn fjordpulse_server_search_uses_the_compiler_owned_prefix_index() {
         .find(|route| route.path == "store.http_request")
         .expect("HTTP request source must exist")
         .source_id;
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     let turn = session
         .apply_with_demand(

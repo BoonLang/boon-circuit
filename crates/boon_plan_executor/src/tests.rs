@@ -1,6 +1,6 @@
 use super::*;
 use boon_plan::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn compile_server_source(
     source_label: &str,
@@ -344,7 +344,7 @@ fn number_slot(state: usize, constant: usize) -> ScalarStorageSlot {
         initial_constant_id: Some(PlanConstantId(constant)),
         initial_root_field_path: None,
         initial_row_field_path: None,
-        initial_row_expression: None,
+        initial_expression: None,
     }
 }
 
@@ -432,7 +432,7 @@ fn root_value_comparison_tracks_both_state_inputs() {
         indexed: false,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![
@@ -465,7 +465,7 @@ fn root_value_comparison_tracks_both_state_inputs() {
 
 #[test]
 fn fully_qualified_state_lookup_wins_over_an_unrelated_field_local_name() {
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![
@@ -526,9 +526,9 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
         )
     };
 
-    let untouched = Session::new(make_plan(0), SessionOptions::default()).unwrap();
+    let untouched = MachineInstance::new(make_plan(0), SessionOptions::default()).unwrap();
     let semantic_default = untouched.semantic_value_image().unwrap();
-    let mut original = Session::new(make_plan(0), SessionOptions::default()).unwrap();
+    let mut original = MachineInstance::new(make_plan(0), SessionOptions::default()).unwrap();
     let turn = original.apply(event(1, 0, None)).unwrap();
     assert!(turn.deltas.is_empty());
     assert_eq!(
@@ -549,7 +549,7 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
     assert_eq!(durable.scalars.len(), 1);
     assert_eq!(original.semantic_value_image().unwrap(), semantic_default);
 
-    let restored = SessionBuilder::new(make_plan(10), SessionOptions::default())
+    let restored = MachineInstanceBuilder::new(make_plan(10), SessionOptions::default())
         .unwrap()
         .restore_durable(durable)
         .unwrap()
@@ -577,7 +577,7 @@ fn failed_turn_rolls_back_authority_and_touch_provenance() {
         Vec::new(),
         Vec::new(),
     );
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
     let before = session.authority_snapshot().unwrap();
 
     assert!(session.apply(event(1, 0, None)).is_err());
@@ -600,7 +600,7 @@ fn unsettled_turn_can_rollback_authority_sequence_and_durable_delta() {
         Vec::new(),
         Vec::new(),
     );
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
     let before = session.authority_snapshot().unwrap();
 
     let turn = session.apply(event(1, 0, None)).unwrap();
@@ -666,7 +666,7 @@ fn field_ids_keep_same_named_list_fields_distinct() {
             },
         ],
     };
-    let session = Session::new(
+    let session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![
@@ -760,7 +760,7 @@ fn text_filter_uses_empty_scope_only_for_empty_queries() {
         })
         .collect(),
     };
-    let session = Session::new(
+    let session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             ["name", "family", "scope", "tx", "top.uart", ""]
@@ -843,7 +843,7 @@ fn list_any_evaluates_bound_row_predicates() {
             },
         ],
     };
-    let session = Session::new(
+    let session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![constant(
@@ -934,7 +934,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
         initial_constant_id: None,
         initial_root_field_path: None,
         initial_row_field_path: Some("source.initial".into()),
-        initial_row_expression: None,
+        initial_expression: None,
     };
     let select_route = SourceRoute {
         id: PlanSourceRouteId(0),
@@ -1023,7 +1023,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
             ],
         }),
     );
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![
@@ -1097,7 +1097,7 @@ fn mapped_range_initializes_synthetic_input_columns() {
         range: Some(PlanRangeInitializer { from: 3, to: 4 }),
         initial_rows: Vec::new(),
     };
-    let session = Session::new(
+    let session = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             Vec::new(),
@@ -1164,7 +1164,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
         initial_constant_id: None,
         initial_root_field_path: None,
         initial_row_field_path: Some("items.initial".into()),
-        initial_row_expression: None,
+        initial_expression: None,
     };
     let update = PlanOp {
         id: PlanOpId(0),
@@ -1203,7 +1203,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
         indexed: true,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             vec![
@@ -1325,7 +1325,7 @@ fn list_find_uses_typed_index_without_scanning() {
         indexed: false,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![
@@ -1343,7 +1343,7 @@ fn list_find_uses_typed_index_without_scanning() {
                 initial_constant_id: Some(PlanConstantId(0)),
                 initial_root_field_path: None,
                 initial_row_field_path: None,
-                initial_row_expression: None,
+                initial_expression: None,
             }],
             vec![list],
             vec![projection, const_update(2, 0, 0, 1)],
@@ -1407,7 +1407,7 @@ fn compiled_prefix_query_uses_bounded_index_and_tracks_currentness() {
         .and_then(|id| id.parse::<usize>().ok())
         .map(FieldId)
         .unwrap();
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     let initial = session
         .project_current(&[ValueTarget::Field(results)])
@@ -1528,7 +1528,7 @@ fn compiled_compound_query_executes_through_canonical_query_collection() {
         })
         .unwrap()
         .clone();
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
     let mode_values = session
         .list_row_snapshots(mode_index.source_list)
         .unwrap()
@@ -1561,7 +1561,7 @@ fn compiled_compound_query_executes_through_canonical_query_collection() {
         panic!("indexed query did not return a page record");
     };
     assert!(matches!(page.get("rows"), Some(Value::List(rows)) if rows.len() == 1));
-    assert_eq!(page.get("cursor"), Some(&Value::Bytes(Vec::new())));
+    assert_eq!(page.get("cursor"), Some(&Value::Bytes(Vec::new().into())));
     assert!(matches!(
         projected.remove(&ValueTarget::Field(union_page)),
         Some(Value::Record(page)) if matches!(page.get("rows"), Some(Value::List(rows)) if rows.len() == 3)
@@ -1611,7 +1611,7 @@ fn indexed_query_mutation_is_atomic_current_and_never_scans() {
         .and_then(|id| id.parse::<usize>().ok())
         .map(FieldId)
         .unwrap();
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
     let initial = session
         .project_current(&[ValueTarget::Field(page)])
         .unwrap()
@@ -1689,7 +1689,7 @@ fn list_map_records_preserve_source_row_identity() {
             }),
         }),
     );
-    let session = Session::new(
+    let session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             Vec::new(),
@@ -1728,7 +1728,7 @@ fn selected_demand_stays_current_without_eager_unrequested_work() {
         }),
     );
     let unsupported_unrequested = derived(1, 1, Vec::new(), None);
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(vec![FieldId(0)]),
             vec![
@@ -1787,9 +1787,9 @@ fn deterministic_work_budget_bounds_startup_without_affecting_unbounded_sessions
         )
     };
 
-    Session::new(make_plan(), SessionOptions::default())
+    MachineInstance::new(make_plan(), SessionOptions::default())
         .expect("trusted sessions remain unbounded by default");
-    let error = Session::new(
+    let error = MachineInstance::new(
         make_plan(),
         SessionOptions {
             max_work_units_per_transaction: Some(0),
@@ -1814,7 +1814,7 @@ fn source_turn_work_budget_rolls_back_authority_and_current_outputs() {
         kind: PlanOpKind::UpdateBranch {
             trigger: ValueRef::Source(SourceId(0)),
             expression_kind: PlanExpressionKind::ReadPath,
-            ordered_inputs: Vec::new(),
+            ordered_inputs: vec![ValueRef::Field(FieldId(0))],
             source_payload_field: None,
             update_constant_id: None,
             source_guard: None,
@@ -1825,7 +1825,7 @@ fn source_turn_work_budget_rolls_back_authority_and_current_outputs() {
         indexed: false,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(vec![FieldId(1)]),
             vec![constant(0, number_constant(1))],
@@ -1914,7 +1914,7 @@ fn materializing_a_row_field_does_not_invalidate_list_structure_consumers() {
         indexed: true,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(vec![FieldId(0)]),
             Vec::new(),
@@ -1957,7 +1957,7 @@ fn source_transform_captures_event_before_later_demand() {
                     constant_id: PlanConstantId(0),
                 }),
                 arms: vec![PlanSourceEventTransformArm {
-                    source_id: SourceId(0),
+                    trigger: ValueRef::Source(SourceId(0)),
                     value: PlanRowExpression::Constant {
                         constant_id: PlanConstantId(1),
                     },
@@ -1974,7 +1974,7 @@ fn source_transform_captures_event_before_later_demand() {
         indexed: false,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             vec![
@@ -2018,7 +2018,7 @@ fn source_transform_keeps_precommit_state_for_the_event_turn() {
                     constant_id: PlanConstantId(1),
                 }),
                 arms: vec![PlanSourceEventTransformArm {
-                    source_id: SourceId(0),
+                    trigger: ValueRef::Source(SourceId(0)),
                     value: PlanRowExpression::Field {
                         input: ValueRef::State(StateId(0)),
                     },
@@ -2061,9 +2061,9 @@ fn source_transform_keeps_precommit_state_for_the_event_turn() {
         initial_constant_id: Some(PlanConstantId(0)),
         initial_root_field_path: None,
         initial_row_field_path: None,
-        initial_row_expression: None,
+        initial_expression: None,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![
@@ -2107,7 +2107,7 @@ fn reverse_dependencies_recompute_every_dependent_once() {
             }),
         )
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![
@@ -2139,7 +2139,7 @@ fn same_turn_recompute_does_not_suppress_later_invalidation() {
         kind: PlanOpKind::UpdateBranch {
             trigger: ValueRef::Source(SourceId(0)),
             expression_kind: PlanExpressionKind::ReadPath,
-            ordered_inputs: Vec::new(),
+            ordered_inputs: vec![ValueRef::Field(FieldId(1))],
             source_payload_field: None,
             update_constant_id: None,
             source_guard: None,
@@ -2150,7 +2150,7 @@ fn same_turn_recompute_does_not_suppress_later_invalidation() {
         indexed: false,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
             vec![
@@ -2214,7 +2214,7 @@ fn recursive_derived_reentry_returns_typed_cycle_error() {
             input: ValueRef::Field(FieldId(0)),
         }),
     );
-    let error = Session::new(
+    let error = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(vec![FieldId(0)]),
             Vec::new(),
@@ -2294,7 +2294,7 @@ fn remove_then_append_allocates_a_new_row_identity() {
         indexed: true,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             vec![constant(
@@ -2394,7 +2394,7 @@ fn authority_restore_preserves_an_explicitly_emptied_list_and_allocator() {
         vec![(ListId(0), "items")],
         vec![(FieldId(0), "items.value")],
     );
-    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
     let original = session.list_row_at(ListId(0), 0).unwrap();
     session.apply(event(1, 0, Some(original))).unwrap();
     let authority = session.authority_snapshot().unwrap();
@@ -2407,7 +2407,7 @@ fn authority_restore_preserves_an_explicitly_emptied_list_and_allocator() {
     assert_eq!(durable.lists.len(), 1);
     assert!(durable.lists.values().next().unwrap().rows.is_empty());
 
-    let restored = SessionBuilder::new(machine, SessionOptions::default())
+    let restored = MachineInstanceBuilder::new(machine, SessionOptions::default())
         .unwrap()
         .restore_durable(durable)
         .unwrap()
@@ -2454,7 +2454,7 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
         initial_constant_id: Some(PlanConstantId(0)),
         initial_root_field_path: None,
         initial_row_field_path: None,
-        initial_row_expression: None,
+        initial_expression: None,
     };
     let update = PlanOp {
         id: PlanOpId(0),
@@ -2496,7 +2496,7 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
         vec![(ListId(0), "cells")],
         vec![(FieldId(0), "cells.formula")],
     );
-    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
     let selected = session.list_row_at(ListId(0), 1).unwrap();
     let turn = session.apply(event(1, 0, Some(selected))).unwrap();
     assert!(matches!(
@@ -2512,7 +2512,7 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
     assert_eq!(stored.rows.len(), 1);
     assert_eq!(stored.rows[0].key, selected.key);
 
-    let restored = SessionBuilder::new(machine, SessionOptions::default())
+    let restored = MachineInstanceBuilder::new(machine, SessionOptions::default())
         .unwrap()
         .restore_durable(durable)
         .unwrap()
@@ -2532,7 +2532,7 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
 
 #[test]
 fn non_monotonic_source_sequences_are_rejected() {
-    let mut session = Session::new(
+    let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             Vec::new(),
@@ -2557,7 +2557,7 @@ fn non_monotonic_source_sequences_are_rejected() {
 #[test]
 fn durable_variants_round_trip_tag_only_and_structured_values() {
     assert_eq!(
-        crate::session::runtime_value(boon_persistence::StoredValue::Variant {
+        crate::machine::runtime_value(boon_persistence::StoredValue::Variant {
             tag: "Done".to_owned(),
             fields: BTreeMap::new(),
         })
@@ -2569,13 +2569,13 @@ fn durable_variants_round_trip_tag_only_and_structured_values() {
         ("$tag".to_owned(), Value::Text("Ready".to_owned())),
         ("count".to_owned(), number(4)),
     ]));
-    let stored = crate::session::stored_value(&runtime).unwrap();
+    let stored = crate::machine::stored_value(&runtime).unwrap();
     assert!(matches!(
         &stored,
         boon_persistence::StoredValue::Variant { tag, fields }
             if tag == "Ready" && fields["count"] == stored_number(4)
     ));
-    assert_eq!(crate::session::runtime_value(stored).unwrap(), runtime);
+    assert_eq!(crate::machine::runtime_value(stored).unwrap(), runtime);
 }
 
 #[test]
@@ -2600,12 +2600,12 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
         .find(|route| route.path == "store.request_received")
         .unwrap()
         .source_id;
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     assert_eq!(
         session.output_value_current("api_response").unwrap(),
         Value::Record(BTreeMap::from([
-            ("body".to_owned(), Value::Bytes(b"accepted".to_vec())),
+            ("body".to_owned(), Value::Bytes(b"accepted".to_vec().into()),),
             ("status".to_owned(), number(200)),
         ]))
     );
@@ -2632,7 +2632,7 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
     let Value::Record(response) = session.output_value_current("api_response").unwrap() else {
         panic!("response output must remain a record");
     };
-    assert_eq!(response["body"], Value::Bytes(b"accepted".to_vec()));
+    assert_eq!(response["body"], Value::Bytes(b"accepted".to_vec().into()));
 }
 
 #[test]
@@ -2645,7 +2645,7 @@ fn recursive_http_source_payload_executes_list_get_and_current_response() {
     .unwrap();
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
     let source = source_id(&compiled.plan, "store.request");
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     session
         .apply(SourceEvent {
@@ -2671,10 +2671,98 @@ fn recursive_http_source_payload_executes_list_get_and_current_response() {
     assert_eq!(
         session.output_value_current("response").unwrap(),
         Value::Record(BTreeMap::from([
-            ("body".to_owned(), Value::Bytes(b"GET:health".to_vec())),
+            (
+                "body".to_owned(),
+                Value::Bytes(b"GET:health".to_vec().into()),
+            ),
             ("status".to_owned(), number(200)),
         ]))
     );
+}
+
+#[test]
+fn recursive_http_source_payload_executes_scalar_list_find_variants() {
+    let compiled = compile_server_source(
+        "server-http-scalar-list-lookups.bn",
+        r#"
+store: [
+    request: SOURCE
+    found_value:
+        request.method |> THEN {
+            List/find_value(
+                request.query
+                field: "name"
+                value: TEXT { q }
+                target: "value"
+                fallback: TEXT { missing }
+            )
+        }
+    found_row_name:
+        request.method |> THEN {
+            List/find_value(
+                request.query
+                field: "name"
+                value: TEXT { q }
+                target: "name"
+                fallback: TEXT { missing }
+            )
+        }
+]
+
+outputs: [
+    response: [
+        status: 200
+        body: store.found_value
+            |> Text/concat(with: store.found_row_name, separator: ":")
+            |> Text/to_bytes(encoding: Utf8)
+    ]
+]
+
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    let source = source_id(&compiled.plan, "store.request");
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                fields: BTreeMap::from([
+                    ("method".to_owned(), Value::Text("GET".to_owned())),
+                    (
+                        "query".to_owned(),
+                        Value::List(vec![
+                            Value::Record(BTreeMap::from([
+                                ("name".to_owned(), Value::Text("q".to_owned())),
+                                ("value".to_owned(), Value::Text("answer".to_owned())),
+                            ])),
+                            Value::Record(BTreeMap::from([
+                                ("name".to_owned(), Value::Text("other".to_owned())),
+                                ("value".to_owned(), Value::Text("ignored".to_owned())),
+                            ])),
+                        ]),
+                    ),
+                ]),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+
+    let Value::Record(response) = session.output_value_current("response").unwrap() else {
+        panic!("response output must be a record");
+    };
+    assert_eq!(response["body"], Value::Bytes(b"answer:q".to_vec().into()));
 }
 
 #[test]
@@ -2687,7 +2775,7 @@ fn number_to_text_then_utf8_bytes_executes_for_http_output() {
     .unwrap();
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
     let source = source_id(&compiled.plan, "store.request");
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     session
         .apply(SourceEvent {
@@ -2704,7 +2792,7 @@ fn number_to_text_then_utf8_bytes_executes_for_http_output() {
     assert_eq!(
         session.output_value_current("response").unwrap(),
         Value::Record(BTreeMap::from([
-            ("body".to_owned(), Value::Bytes(b"1".to_vec())),
+            ("body".to_owned(), Value::Bytes(b"1".to_vec().into())),
             ("status".to_owned(), number(200)),
         ]))
     );
@@ -2725,7 +2813,7 @@ outputs: [
     )
     .unwrap();
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
     assert_eq!(
         session.output_value_current("grouped").unwrap(),
         Value::Text("0010 1010".to_owned())
@@ -2749,7 +2837,7 @@ fn fjordpulse_server_routes_http_and_keeps_search_results_structural() {
     .unwrap();
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
     let source = source_id(&compiled.plan, "store.http_request");
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     session
         .apply(SourceEvent {
@@ -2836,9 +2924,7 @@ store: [
     truncate: -1.9 |> Number/truncate()
     latitude:
         59.91 |> HOLD latitude {
-            LATEST {
-                store.tick |> THEN { latitude + 0.1 }
-            }
+            store.tick |> THEN { latitude + 0.1 }
         }
 ]
 
@@ -2861,7 +2947,7 @@ outputs: [
         .find(|route| route.path == "store.tick")
         .unwrap()
         .source_id;
-    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     assert_eq!(
         session.output_value_current("half").unwrap(),
@@ -2901,6 +2987,47 @@ fn whole_and_decimal_numbers_share_one_value_identity() {
 }
 
 #[test]
+fn scalar_list_literals_execute_as_immutable_values() {
+    let machine = compile_server_source(
+        "scalar-list-values-executor.bn",
+        r#"
+store: [
+    selected: TEXT { alpha }
+    selected_ids: LIST { selected }
+    optional_selected_ids:
+        False |> WHEN {
+            True => LIST {}
+            False => LIST { selected }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    assert!(
+        machine
+            .debug_map
+            .list_slots
+            .iter()
+            .all(|entry| !entry.label.contains("selected_ids"))
+    );
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let selected = Value::List(vec![Value::Text("alpha".to_owned())]);
+
+    assert_eq!(
+        session.root_value_current("store.selected_ids").unwrap(),
+        selected
+    );
+    assert_eq!(
+        session
+            .root_value_current("store.optional_selected_ids")
+            .unwrap(),
+        selected
+    );
+}
+
+#[test]
 fn source_payload_text_to_number_executes_the_typed_conversion() {
     let machine = compile_server_source(
         "source-text-to-number-executor.bn",
@@ -2920,7 +3047,7 @@ store: [
     .unwrap()
     .plan;
     let source = source_id(&machine, "store.input");
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
 
     session
         .apply(SourceEvent {
@@ -2994,6 +3121,79 @@ store: [
     .plan
 }
 
+fn nested_stream_effect_chain_machine() -> MachinePlan {
+    compile_server_source(
+        "nested-stream-effect-chain.bn",
+        r#"
+store: [
+    read: SOURCE
+    selected: PackageAsset[url: TEXT { asset://files/primary.vcd }]
+    file_result:
+        NotStarted |> HOLD file_result {
+            read |> THEN {
+                File/read_stream(file: selected, retain_content: True)
+            }
+        }
+    waveform_result:
+        NotStarted |> HOLD waveform_result {
+            file_result |> WHEN {
+                Finished => file_result.retained |> WHEN {
+                    Retained => Wellen/open(content: file_result.retained.content)
+                    __ => SKIP
+                }
+                __ => SKIP
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan
+}
+
+fn indexed_file_stream_effect_machine() -> MachinePlan {
+    boon_compiler::compile_source_text_to_machine_plan_for_role(
+        "indexed-file-stream-effect-executor.bn",
+        r#"
+store: [
+    asset:
+        PackageAsset[url: TEXT { asset://files/primary.bin }]
+    rows:
+        LIST {
+            [name: TEXT { primary }]
+        }
+        |> List/map(row, new: stream_row(row: row, asset: asset))
+        |> List/remove(row, when:
+            row.remove |> THEN { True }
+        )
+]
+
+FUNCTION stream_row(row, asset) {
+    [
+        name: row.name
+        open: SOURCE
+        remove: SOURCE
+        stream_result:
+            NotStarted |> HOLD stream_result {
+                open |> THEN {
+                    File/read_stream(
+                        file: asset
+                        chunk_bytes: 4
+                        retain_content: False
+                    )
+                }
+            }
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+        ProgramRole::Server,
+    )
+    .unwrap()
+    .plan
+}
+
 fn mapped_request_root_file_stream_effect_machine() -> MachinePlan {
     boon_compiler::compile_source_text_to_machine_plan_for_role(
         "mapped-request-root-file-stream.bn",
@@ -3058,23 +3258,328 @@ FUNCTION mapped_effect_row(row) {
     .plan
 }
 
+#[test]
+fn derived_empty_list_materializes_keyed_rows_and_initializes_row_state() {
+    let compiled = compile_server_source(
+        "derived-list-materialization.bn",
+        r#"
+store: [
+    reset: SOURCE
+    seeds: LIST {
+        [id: TEXT { first }, initial: TEXT { ready }]
+    }
+    rows:
+        seeds
+        |> List/map(seed_row, new:
+            wrap_row(row: seed_record(seed: seed_row))
+        )
+]
+
+FUNCTION seed_record(seed) {
+    [id: seed.id, initial: seed.initial]
+}
+
+FUNCTION wrap_row(row) {
+    stateful_row(seed: row)
+}
+
+FUNCTION stateful_row(seed) {
+    [
+        id: seed.id
+        initial: seed.initial
+        value:
+            seed.initial |> HOLD value {
+                store.reset |> THEN { seed.initial }
+            }
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let rows = compiled
+        .plan
+        .debug_map
+        .list_slots
+        .iter()
+        .find(|entry| entry.label == "rows")
+        .and_then(|entry| entry.id.strip_prefix("list:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(ListId)
+        .expect("rows list");
+    let value_field = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label.ends_with(".value"))
+        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("row value field");
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .all(|op| !matches!(
+                (&op.kind, op.output.as_ref()),
+                (
+                    PlanOpKind::DerivedValue {
+                        expression: Some(PlanDerivedExpression::RowExpression {
+                            expression: PlanRowExpression::Field {
+                                input: ValueRef::Field(input),
+                            },
+                        }),
+                        ..
+                    },
+                    Some(ValueRef::Field(output)),
+                ) if input == output
+            ))
+    );
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    let materialized = session.root_value_current("store.rows").unwrap();
+    let Value::List(materialized) = materialized else {
+        panic!("derived list did not produce a list facade");
+    };
+    let [Value::Row { id: row, .. }] = materialized.as_slice() else {
+        panic!("derived list did not materialize exactly one keyed row");
+    };
+    assert_eq!(row.list, rows);
+    assert_eq!(
+        session
+            .project_current(&[ValueTarget::RowField {
+                row: *row,
+                field: value_field,
+            }])
+            .unwrap()[&ValueTarget::RowField {
+            row: *row,
+            field: value_field,
+        }],
+        Value::Text("ready".to_owned())
+    );
+    let semantic_image = session.semantic_value_image().unwrap();
+    assert_eq!(semantic_image.lists.len(), 2);
+    assert!(
+        semantic_image
+            .lists
+            .values()
+            .all(|list| list.rows.iter().all(|row| row.fields.len() <= 2))
+    );
+}
+
 fn file_stream_payload() -> SourcePayload {
+    let binding = HostValueIssuer::new([3; 32]).mint([7; 32], 1).unwrap();
     SourcePayload {
         fields: BTreeMap::from([(
             "file".to_owned(),
-            Value::Record(BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("FileSelected".to_owned())),
-                (
-                    "capability".to_owned(),
-                    Value::Record(BTreeMap::from([
-                        ("token".to_owned(), Value::Bytes(vec![7; 32])),
-                        ("generation".to_owned(), number(1)),
-                    ])),
-                ),
-            ])),
+            Value::host_bound(
+                Value::Record(BTreeMap::from([(
+                    "$tag".to_owned(),
+                    Value::Text("FileSelected".to_owned()),
+                )])),
+                binding,
+            ),
         )]),
         ..SourcePayload::default()
     }
+}
+
+#[test]
+fn host_value_issuers_isolate_bindings_and_fully_redact_debug_output() {
+    let issuer = HostValueIssuer::new([0x11; 32]);
+    let foreign = HostValueIssuer::new([0x22; 32]);
+    let binding = issuer.mint([0x33; 32], 17).unwrap();
+
+    assert_eq!(issuer.open(&binding), Some(([0x33; 32], 17)));
+    assert_eq!(foreign.open(&binding), None);
+    assert!(issuer.mint([0x33; 32], 0).is_err());
+    assert_eq!(format!("{issuer:?}"), "HostValueIssuer(<opaque>)");
+    assert_eq!(format!("{binding:?}"), "HostValueBinding(<opaque>)");
+}
+
+#[test]
+fn host_bound_projection_preserves_authority_and_tag_matching_uses_the_facade() {
+    let binding = HostValueIssuer::new([1; 32]).mint([2; 32], 1).unwrap();
+    let value = Value::host_bound(
+        Value::Record(BTreeMap::from([(
+            "$tag".to_owned(),
+            Value::Text("FileSelected".to_owned()),
+        )])),
+        binding,
+    );
+    let enclosing = Value::Record(BTreeMap::from([("file".to_owned(), value.clone())]));
+    let tag = vec!["$tag".to_owned()];
+    let file = vec!["file".to_owned()];
+    let nested_tag = vec!["file".to_owned(), "$tag".to_owned()];
+
+    assert!(value.host_binding().is_some());
+    assert!(value.contains_host_binding());
+    assert_eq!(crate::machine::project_value(&value, &[]), Some(&value));
+    assert_eq!(crate::machine::project_value(&value, &tag), None);
+    assert_eq!(
+        crate::machine::project_value(&enclosing, &file),
+        Some(&value)
+    );
+    assert_eq!(crate::machine::project_value(&enclosing, &nested_tag), None);
+    assert_eq!(
+        crate::machine::value_to_match_label(&value).unwrap(),
+        "FileSelected"
+    );
+}
+
+#[test]
+fn inspection_reports_hide_nested_bindings_while_boundaries_fail_closed() {
+    let binding = HostValueIssuer::new([4; 32]).mint([5; 32], 9).unwrap();
+    let bound = Value::host_bound(
+        Value::Record(BTreeMap::from([(
+            "$tag".to_owned(),
+            Value::Text("FileSelected".to_owned()),
+        )])),
+        binding,
+    );
+    let value = Value::Record(BTreeMap::from([(
+        "nested".to_owned(),
+        Value::List(vec![bound.clone()]),
+    )]));
+    let visible = Value::Record(BTreeMap::from([(
+        "nested".to_owned(),
+        Value::List(vec![bound.visible().clone()]),
+    )]));
+
+    let machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        vec![constant(0, number_constant(1))],
+        Vec::new(),
+        vec![number_slot(0, 0)],
+        Vec::new(),
+        Vec::new(),
+        vec![(StateId(0), "store.bound")],
+        Vec::new(),
+        Vec::new(),
+    );
+    let authority = AuthoritySnapshot {
+        through_turn_sequence: 0,
+        states: BTreeMap::from([(
+            StateId(0),
+            ScalarAuthority {
+                touched: true,
+                value: value.clone(),
+            },
+        )]),
+        lists: BTreeMap::new(),
+    };
+    let mut session = MachineInstanceBuilder::new(machine, SessionOptions::default())
+        .unwrap()
+        .restore(authority)
+        .build()
+        .unwrap();
+
+    assert_eq!(session.root_value_current("store.bound").unwrap(), visible);
+    assert_eq!(session.snapshot().unwrap().states[&StateId(0)], visible);
+    assert_eq!(
+        session
+            .project_current(&[ValueTarget::State(StateId(0))])
+            .unwrap()[&ValueTarget::State(StateId(0))],
+        visible
+    );
+    assert!(
+        session.authority_snapshot().unwrap().states[&StateId(0)]
+            .value
+            .contains_host_binding()
+    );
+    assert_eq!(
+        crate::machine::report_deltas(vec![Delta::SetValue {
+            target: ValueTarget::State(StateId(0)),
+            value: value.clone(),
+        }]),
+        vec![Delta::SetValue {
+            target: ValueTarget::State(StateId(0)),
+            value: visible.clone(),
+        }]
+    );
+    assert!(value.to_data().is_err());
+    assert!(crate::machine::stored_value(&value).is_err());
+    assert!(crate::machine::normalize_host_output_value(value).is_err());
+    assert!(session.durable_restore_image(0, BTreeSet::new()).is_err());
+}
+
+#[test]
+fn host_bound_persistence_failure_rolls_back_authority_and_sequence() {
+    let payload_field = SourcePayloadField::Named("value".to_owned());
+    let update = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::UpdateBranch {
+            trigger: ValueRef::Source(SourceId(0)),
+            expression_kind: PlanExpressionKind::SourcePayload,
+            ordered_inputs: Vec::new(),
+            source_payload_field: Some(payload_field.clone()),
+            update_constant_id: None,
+            source_guard: None,
+            effect: None,
+        },
+        inputs: vec![
+            ValueRef::Source(SourceId(0)),
+            ValueRef::SourcePayload {
+                source_id: SourceId(0),
+                field: payload_field.clone(),
+            },
+        ],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        vec![constant(0, number_constant(1))],
+        vec![route(0, None)],
+        vec![number_slot(0, 0)],
+        Vec::new(),
+        vec![update],
+        vec![(StateId(0), "store.value")],
+        Vec::new(),
+        Vec::new(),
+    );
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let before = session.authority_snapshot().unwrap();
+    let bound = Value::host_bound(
+        Value::Text("visible".to_owned()),
+        HostValueIssuer::new([8; 32]).mint([9; 32], 1).unwrap(),
+    );
+
+    assert!(
+        session
+            .apply(SourceEvent {
+                sequence: 1,
+                source: SourceId(0),
+                target: None,
+                payload: SourcePayload {
+                    fields: BTreeMap::from([("value".to_owned(), bound)]),
+                    ..SourcePayload::default()
+                },
+            })
+            .is_err()
+    );
+    assert_eq!(session.authority_snapshot().unwrap(), before);
+
+    let retry = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: SourceId(0),
+            target: None,
+            payload: SourcePayload {
+                fields: BTreeMap::from([("value".to_owned(), number(2))]),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+    assert_eq!(retry.sequence, 1);
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        number(2)
+    );
 }
 
 fn file_stream_outcome(
@@ -3088,6 +3593,25 @@ fn file_stream_outcome(
             .map(|(name, value)| (name.to_owned(), value)),
     );
     Value::Record(record)
+}
+
+fn retained_content_outcome(tag: &str, content: Option<Value>) -> Value {
+    let mut fields = BTreeMap::from([("$tag".to_owned(), Value::Text(tag.to_owned()))]);
+    if let Some(content) = content {
+        fields.insert("content".to_owned(), content);
+    }
+    Value::Record(fields)
+}
+
+fn content_ref_value() -> Value {
+    Value::Record(BTreeMap::from([
+        ("digest".to_owned(), Value::Bytes(vec![9; 32].into())),
+        ("size".to_owned(), number(3)),
+        (
+            "media".to_owned(),
+            Value::Text("application/octet-stream".to_owned()),
+        ),
+    ]))
 }
 
 fn outbound_http_payload() -> SourcePayload {
@@ -3115,17 +3639,13 @@ fn outbound_http_payload() -> SourcePayload {
                     ("name".to_owned(), Value::Text("accept".to_owned())),
                     (
                         "value".to_owned(),
-                        Value::Bytes(b"application/json".to_vec()),
+                        Value::Bytes(b"application/json".to_vec().into()),
                     ),
                 ]))]),
             ),
-            ("body".to_owned(), Value::Bytes(Vec::new())),
+            ("body".to_owned(), Value::Bytes(Vec::new().into())),
             ("connect_timeout_ms".to_owned(), number(500)),
             ("overall_timeout_ms".to_owned(), number(2_000)),
-            (
-                "cancellation".to_owned(),
-                Value::Text("CancelPrevious".to_owned()),
-            ),
         ]),
         ..SourcePayload::default()
     }
@@ -3142,11 +3662,14 @@ fn outbound_http_success(status: i64) -> Value {
                 ("name".to_owned(), Value::Text("content-type".to_owned())),
                 (
                     "value".to_owned(),
-                    Value::Bytes(b"application/json".to_vec()),
+                    Value::Bytes(b"application/json".to_vec().into()),
                 ),
             ]))]),
         ),
-        ("body".to_owned(), Value::Bytes(br#"{"ok":true}"#.to_vec())),
+        (
+            "body".to_owned(),
+            Value::Bytes(br#"{"ok":true}"#.to_vec().into()),
+        ),
         ("redirects_followed".to_owned(), number(0)),
     ]))
 }
@@ -3170,7 +3693,7 @@ fn read_only_http_effect_is_transient_typed_correlated_and_cycle_safe() {
     assert!(machine.persistence.effect_outbox.is_empty());
 
     let request = source_id(&machine, "store.request");
-    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
     let turn = session
         .apply(SourceEvent {
             sequence: 1,
@@ -3220,7 +3743,7 @@ fn read_only_http_effect_is_transient_typed_correlated_and_cycle_safe() {
             .is_err()
     );
 
-    let stale = Session::new(machine, SessionOptions::default())
+    let stale = MachineInstance::new(machine, SessionOptions::default())
         .unwrap()
         .complete_transient_effect(invocation.call_id, outbound_http_success(200));
     assert!(
@@ -3249,7 +3772,7 @@ fn effect_completion_triggers_the_next_effect_even_when_the_value_repeats() {
         ("unix_seconds".to_owned(), number(1_700_000_000)),
         ("nanoseconds".to_owned(), number(123)),
     ]));
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
 
     for sequence in 1..=2 {
         let clock = session
@@ -3278,7 +3801,10 @@ fn effect_completion_triggers_the_next_effect_even_when_the_value_repeats() {
                         "$tag".to_owned(),
                         Value::Text("RandomBytesReady".to_owned()),
                     ),
-                    ("bytes".to_owned(), Value::Bytes(vec![sequence as u8; 16])),
+                    (
+                        "bytes".to_owned(),
+                        Value::Bytes(vec![sequence as u8; 16].into()),
+                    ),
                 ])),
             )
             .unwrap();
@@ -3314,10 +3840,165 @@ fn effect_completion_triggers_the_next_effect_even_when_the_value_repeats() {
 }
 
 #[test]
+fn derived_when_event_updates_state_despite_later_list_map_branches() {
+    let machine = compile_server_source(
+        "derived-when-with-list-map-executor.bn",
+        r#"
+store: [
+    start: SOURCE
+    reset: SOURCE
+    seed_rows: LIST { [key: TEXT { row }] }
+    rows:
+        seed_rows |> List/map(seed_row, new: selectable_row(seed_row: seed_row))
+    clock_result:
+        ClockNotRequested |> HOLD clock_result {
+            start |> THEN { Clock/wall() }
+        }
+    projected:
+        clock_result |> WHEN {
+            WallClockRead => TEXT { canonical }
+            __ => TEXT { none }
+        }
+    direct_active:
+        TEXT { fallback } |> HOLD direct_active {
+            projected
+        }
+    active:
+        TEXT { fallback } |> HOLD active {
+            LATEST {
+                projected |> WHEN {
+                    TEXT { none } => SKIP
+                    __ => projected
+                }
+                reset |> THEN { TEXT { fallback } }
+                rows
+                    |> List/map(row, new: LATEST {
+                        row.select |> THEN { row.key }
+                    })
+                    |> List/latest()
+            }
+        }
+]
+
+FUNCTION selectable_row(seed_row) {
+    [key: seed_row.key, select: SOURCE]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    let start = source_id(&machine, "store.start");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let clock = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: start,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+
+    session
+        .complete_transient_effect(
+            clock.call_id,
+            Value::Record(BTreeMap::from([
+                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
+                ("unix_seconds".to_owned(), number(1_700_000_000)),
+                ("nanoseconds".to_owned(), number(123)),
+            ])),
+        )
+        .unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.active").unwrap(),
+        Value::Text("canonical".to_owned())
+    );
+    assert_eq!(
+        session.root_value_current("store.direct_active").unwrap(),
+        Value::Text("canonical".to_owned())
+    );
+}
+
+#[test]
+fn effects_sample_state_after_same_trigger_updates_settle() {
+    let machine = compile_server_source(
+        "effect-samples-post-update-state.bn",
+        r#"
+store: [
+    start: SOURCE
+    reset: SOURCE
+    clock_result:
+        ClockNotRequested |> HOLD clock_result {
+            start |> THEN { Clock/wall() }
+        }
+    requested_size:
+        LATEST {
+            clock_result |> WHEN {
+                WallClockRead => active_size
+                __ => SKIP
+            }
+            reset |> THEN { 2 }
+        }
+    random_result:
+        RandomNotRead |> HOLD random_result {
+            requested_size |> THEN { Random/bytes(byte_count: requested_size) }
+        }
+    active_size:
+        1 |> HOLD active_size {
+            clock_result |> WHEN {
+                WallClockRead => 7
+                __ => SKIP
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    let start = source_id(&machine, "store.start");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let clock = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: start,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+
+    let completed = session
+        .complete_transient_effect(
+            clock.call_id,
+            Value::Record(BTreeMap::from([
+                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
+                ("unix_seconds".to_owned(), number(1_700_000_000)),
+                ("nanoseconds".to_owned(), number(123)),
+            ])),
+        )
+        .unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.active_size").unwrap(),
+        number(7)
+    );
+    assert_eq!(completed.transient_effects.len(), 1);
+    assert_eq!(
+        completed.transient_effects[0].intent,
+        Value::Record(BTreeMap::from([("byte_count".to_owned(), number(7))]))
+    );
+}
+
+#[test]
 fn transient_http_cancel_and_rollback_preserve_one_shot_ownership() {
     let machine = outbound_http_effect_machine();
     let request = source_id(&machine, "store.request");
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
 
     let first = session
         .apply(SourceEvent {
@@ -3363,10 +4044,97 @@ fn transient_http_cancel_and_rollback_preserve_one_shot_ownership() {
 }
 
 #[test]
+fn stream_credit_accounting_follows_contract_tags_not_result_names() {
+    let mut machine = file_stream_effect_machine();
+    let contract = machine
+        .effects
+        .iter_mut()
+        .find(|contract| contract.host_operation == "File/read_stream")
+        .unwrap();
+    contract.delivery = EffectDeliveryCardinality::Stream {
+        initial_credits: 1,
+        max_in_flight: 1,
+        credit_result_tags: vec!["Opened".to_owned()],
+        terminal_result_tags: vec![
+            "Cancelled".to_owned(),
+            "Failed".to_owned(),
+            "Finished".to_owned(),
+        ],
+    };
+    contract.validate().unwrap();
+
+    let read = source_id(&machine, "store.read");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let invocation = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: read,
+            target: None,
+            payload: file_stream_payload(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+
+    let opened = session
+        .deliver_transient_effect_result(
+            invocation.call_id,
+            0,
+            file_stream_outcome(
+                "Opened",
+                [
+                    ("size", number(3)),
+                    ("content_type", Value::Text("audio/wav".to_owned())),
+                    ("display_name", Value::Text("fixture.wav".to_owned())),
+                ],
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        opened.transient_effect_credit_grants,
+        vec![TransientEffectCreditGrant {
+            call_id: invocation.call_id,
+            credits: 1,
+        }]
+    );
+
+    let chunk = session
+        .deliver_transient_effect_result(
+            invocation.call_id,
+            1,
+            file_stream_outcome(
+                "Chunk",
+                [
+                    ("sequence", number(0)),
+                    ("offset", number(0)),
+                    ("bytes", Value::Bytes(vec![1, 2, 3].into())),
+                ],
+            ),
+        )
+        .unwrap();
+    assert!(chunk.transient_effect_credit_grants.is_empty());
+
+    session
+        .deliver_transient_effect_result(
+            invocation.call_id,
+            2,
+            file_stream_outcome(
+                "Finished",
+                [
+                    ("byte_count", number(3)),
+                    ("digest", Value::Bytes(vec![9; 32].into())),
+                    ("retained", retained_content_outcome("NotRetained", None)),
+                ],
+            ),
+        )
+        .unwrap();
+}
+
+#[test]
 fn stream_effect_delivery_is_ordered_bounded_terminal_and_replaced_by_owner() {
     let machine = file_stream_effect_machine();
     let read = source_id(&machine, "store.read");
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
     let first_turn = session
         .apply(SourceEvent {
             sequence: 1,
@@ -3381,14 +4149,15 @@ fn stream_effect_delivery_is_ordered_bounded_terminal_and_replaced_by_owner() {
     assert!(matches!(
         first.delivery,
         EffectDeliveryCardinality::Stream {
-            initial_credits: 2,
+            initial_credits: 4,
             max_in_flight: 4,
+            ref credit_result_tags,
             ..
-        }
+        } if credit_result_tags == &["Chunk".to_owned()]
     ));
     assert_eq!(
         session.pending_transient_effect_credits(first.call_id),
-        Some(2)
+        Some(4)
     );
     assert!(
         session
@@ -3436,16 +4205,10 @@ fn stream_effect_delivery_is_ordered_bounded_terminal_and_replaced_by_owner() {
             ),
         )
         .unwrap();
-    assert_eq!(
-        opened.transient_effect_credit_grants,
-        vec![TransientEffectCreditGrant {
-            call_id: first.call_id,
-            credits: 1,
-        }]
-    );
+    assert!(opened.transient_effect_credit_grants.is_empty());
     assert_eq!(
         session.pending_transient_effect_credits(first.call_id),
-        Some(2)
+        Some(4)
     );
     assert!(matches!(
         session.root_value_current("store.stream_result").unwrap(),
@@ -3462,7 +4225,7 @@ fn stream_effect_delivery_is_ordered_bounded_terminal_and_replaced_by_owner() {
                 [
                     ("sequence", number(0)),
                     ("offset", number(0)),
-                    ("bytes", Value::Bytes(vec![1, 2, 3])),
+                    ("bytes", Value::Bytes(vec![1, 2, 3].into())),
                 ],
             ),
         )
@@ -3476,14 +4239,8 @@ fn stream_effect_delivery_is_ordered_bounded_terminal_and_replaced_by_owner() {
                 "Finished",
                 [
                     ("byte_count", number(3)),
-                    ("digest", Value::Bytes(vec![9; 32])),
-                    (
-                        "content",
-                        Value::Record(BTreeMap::from([
-                            ("digest".to_owned(), Value::Bytes(vec![9; 32])),
-                            ("byte_count".to_owned(), number(3)),
-                        ])),
-                    ),
+                    ("digest", Value::Bytes(vec![9; 32].into())),
+                    ("retained", retained_content_outcome("NotRetained", None)),
                 ],
             ),
         )
@@ -3528,6 +4285,585 @@ fn stream_effect_delivery_is_ordered_bounded_terminal_and_replaced_by_owner() {
 }
 
 #[test]
+fn nested_effect_guards_ignore_partial_variants_and_invoke_only_the_retained_branch() {
+    let machine = nested_stream_effect_chain_machine();
+    let read = source_id(&machine, "store.read");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+
+    let first_file = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: read,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+    for (sequence, result) in [
+        (
+            0,
+            file_stream_outcome(
+                "Opened",
+                [
+                    ("size", number(3)),
+                    (
+                        "content_type",
+                        Value::Text("application/octet-stream".to_owned()),
+                    ),
+                    ("display_name", Value::Text("primary.vcd".to_owned())),
+                ],
+            ),
+        ),
+        (
+            1,
+            file_stream_outcome(
+                "Chunk",
+                [
+                    ("sequence", number(0)),
+                    ("offset", number(0)),
+                    ("bytes", Value::Bytes(vec![1, 2, 3].into())),
+                ],
+            ),
+        ),
+        (
+            2,
+            file_stream_outcome(
+                "Finished",
+                [
+                    ("byte_count", number(3)),
+                    ("digest", Value::Bytes(vec![9; 32].into())),
+                    ("retained", retained_content_outcome("NotRetained", None)),
+                ],
+            ),
+        ),
+    ] {
+        let turn = session
+            .deliver_transient_effect_result(first_file.call_id, sequence, result)
+            .unwrap();
+        assert!(
+            turn.transient_effects.is_empty(),
+            "a non-retained or nonterminal stream result invoked the nested effect"
+        );
+    }
+
+    let second_file = session
+        .apply(SourceEvent {
+            sequence: 2,
+            source: read,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+    let content = content_ref_value();
+    let turn = session
+        .deliver_transient_effect_result(
+            second_file.call_id,
+            0,
+            file_stream_outcome(
+                "Finished",
+                [
+                    ("byte_count", number(3)),
+                    ("digest", Value::Bytes(vec![9; 32].into())),
+                    (
+                        "retained",
+                        retained_content_outcome("Retained", Some(content.clone())),
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+    let [waveform] = turn.transient_effects.as_slice() else {
+        panic!(
+            "the retained terminal result did not invoke exactly one nested effect: {:?}",
+            turn.transient_effects
+        );
+    };
+    assert_eq!(
+        waveform.intent,
+        Value::Record(BTreeMap::from([("content".to_owned(), content)]))
+    );
+}
+
+#[test]
+fn nonmatching_source_guard_invalidates_the_owned_transient_effect() {
+    let mut machine = file_stream_effect_machine();
+    let read = source_id(&machine, "store.read");
+    let effect_op = machine
+        .regions
+        .iter_mut()
+        .flat_map(|region| region.ops.iter_mut())
+        .find(|op| {
+            matches!(
+                &op.kind,
+                PlanOpKind::UpdateBranch {
+                    effect: Some(_),
+                    ..
+                }
+            )
+        })
+        .expect("file stream plan has an effect update");
+    let PlanOpKind::UpdateBranch { source_guard, .. } = &mut effect_op.kind else {
+        unreachable!();
+    };
+    *source_guard = Some(PlanSourceGuard::ValueOneOf {
+        input: ValueRef::SourcePayload {
+            source_id: read,
+            field: SourcePayloadField::Text,
+        },
+        values: vec!["start".to_owned()],
+    });
+
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let mut start_payload = file_stream_payload();
+    start_payload.text = Some("start".to_owned());
+    let first = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: read,
+            target: None,
+            payload: start_payload,
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+
+    let mut stop_payload = file_stream_payload();
+    stop_payload.text = Some("stop".to_owned());
+    let stopped = session
+        .apply(SourceEvent {
+            sequence: 2,
+            source: read,
+            target: None,
+            payload: stop_payload,
+        })
+        .unwrap();
+
+    assert!(stopped.transient_effects.is_empty());
+    assert_eq!(stopped.cancelled_transient_effects, vec![first.call_id]);
+    assert_eq!(session.pending_transient_effect_count(), 0);
+    assert!(session
+        .deliver_transient_effect_result(
+            first.call_id,
+            0,
+            file_stream_outcome("Cancelled", []),
+        )
+        .is_err());
+
+    let mut restart_payload = file_stream_payload();
+    restart_payload.text = Some("start".to_owned());
+    let restarted = session
+        .apply(SourceEvent {
+            sequence: 3,
+            source: read,
+            target: None,
+            payload: restart_payload,
+        })
+        .unwrap();
+    let [second] = restarted.transient_effects.as_slice() else {
+        panic!("re-entering the active WHILE branch must start a fresh stream");
+    };
+    assert_ne!(second.call_id, first.call_id);
+    assert_eq!(session.pending_transient_effect_count(), 1);
+}
+
+#[test]
+fn inactive_while_branch_cancels_its_owned_transient_effect() {
+    let compiled = compile_server_source(
+        "while-owned-stream.bn",
+        r#"
+store: [
+    start: SOURCE
+    stop: SOURCE
+    mode:
+        Inactive |> HOLD mode {
+            LATEST {
+                start |> THEN { Active }
+                stop |> THEN { Inactive }
+            }
+        }
+    selected_file: PackageAsset[url: TEXT { asset://fixture/large.vcd }]
+    stream_result:
+        NotStarted |> HOLD stream_result {
+            mode |> WHILE {
+                Active => File/read_stream(
+                    file: selected_file
+                    chunk_bytes: 65536
+                    retain_content: True
+                )
+                Inactive => SKIP
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let machine = compiled.plan;
+    let start = source_id(&machine, "store.start");
+    let stop = source_id(&machine, "store.stop");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+
+    let started = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: start,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    let [invocation] = started.transient_effects.as_slice() else {
+        panic!("activating WHILE must start exactly one stream: {started:#?}");
+    };
+    let call_id = invocation.call_id;
+
+    let stopped = session
+        .apply(SourceEvent {
+            sequence: 2,
+            source: stop,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    assert!(stopped.transient_effects.is_empty());
+    assert_eq!(stopped.cancelled_transient_effects, vec![call_id]);
+    assert_eq!(session.pending_transient_effect_count(), 0);
+}
+
+#[test]
+fn mapped_row_selection_enters_derived_while_owned_effect() {
+    let compiled = compile_server_source(
+        "mapped-derived-while-owned-stream.bn",
+        r#"
+store: [
+    mode:
+        Inactive |> HOLD mode {
+            selected |> WHEN {
+                TEXT { two } => Active
+                __ => Inactive
+            }
+        }
+    selected_file: PackageAsset[url: TEXT { asset://fixture/large.vcd }]
+    stream_result:
+        NotStarted |> HOLD stream_result {
+            mode |> WHILE {
+                Active => File/read_stream(
+                    file: selected_file
+                    chunk_bytes: 65536
+                    retain_content: True
+                )
+                Inactive => SKIP
+            }
+        }
+    rows:
+        LIST {
+            [name: TEXT { one }]
+            [name: TEXT { two }]
+        }
+        |> List/map(row, new: new_row(row: row))
+    fallback: SOURCE
+    row_selected:
+        rows
+        |> List/map(row, new:
+            row.controls.select.event.press |> THEN { row.name }
+        )
+        |> List/latest()
+    selected:
+        LATEST {
+            row_selected
+            fallback.text
+        }
+]
+
+FUNCTION new_row(row) {
+    [
+        controls: [select: SOURCE]
+        name: row.name
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let machine = compiled.plan;
+    let route = machine
+        .source_routes
+        .iter()
+        .find(|route| route.path.ends_with(".controls.select"))
+        .expect("mapped row exposes select");
+    let scope = route.scope_id.expect("mapped row source has a list scope");
+    let list = machine
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.scope_id == Some(scope))
+        .expect("mapped row source scope has list storage")
+        .list_id;
+    let source = route.source_id;
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let row = session.list_row_at(list, 1).unwrap();
+
+    let selected = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: Some(row),
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.mode").unwrap(),
+        Value::Text("Active".to_owned())
+    );
+    assert_eq!(
+        selected.transient_effects.len(),
+        1,
+        "a row-derived mode change must enter its WHILE-owned effect in the same turn"
+    );
+}
+
+#[test]
+fn field_equality_guard_blocks_stale_host_effect_invocation() {
+    let compiled = compile_server_source(
+        "field-equality-effect-guard.bn",
+        r#"
+store: [
+    start: SOURCE
+    replace_request: SOURCE
+    request_fingerprint:
+        TEXT { current } |> HOLD request_fingerprint {
+            replace_request.text
+        }
+    response_fingerprint: TEXT { current }
+    random_result:
+        RandomNotRequested |> HOLD random_result {
+            start |> THEN {
+                request_fingerprint == response_fingerprint |> WHEN {
+                    True => Random/bytes(byte_count: 1)
+                    False => SKIP
+                }
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let machine = compiled.plan;
+    let start = source_id(&machine, "store.start");
+    let replace_request = source_id(&machine, "store.replace_request");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+
+    let first = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: start,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+    session
+        .complete_transient_effect(
+            first.call_id,
+            Value::Record(BTreeMap::from([
+                (
+                    "$tag".to_owned(),
+                    Value::Text("RandomBytesReady".to_owned()),
+                ),
+                ("bytes".to_owned(), Value::Bytes(vec![7].into())),
+            ])),
+        )
+        .unwrap();
+
+    session
+        .apply(SourceEvent {
+            sequence: 2,
+            source: replace_request,
+            target: None,
+            payload: SourcePayload {
+                text: Some("stale".to_owned()),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+    let stale = session
+        .apply(SourceEvent {
+            sequence: 3,
+            source: start,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    assert!(stale.transient_effects.is_empty());
+    assert_eq!(session.pending_transient_effect_count(), 0);
+}
+
+#[test]
+fn scalar_list_nonempty_guard_blocks_empty_host_effect_invocation() {
+    let compiled = compile_server_source(
+        "scalar-list-nonempty-effect-guard.bn",
+        r#"
+store: [
+    start: SOURCE
+    empty_ids:
+        False |> WHEN {
+            True => LIST { TEXT { top.clk } }
+            False => LIST {}
+        }
+    nonempty_ids: LIST { TEXT { top.clk } }
+    empty_result:
+        RandomNotRequested |> HOLD empty_result {
+            start |> THEN {
+                empty_ids |> List/is_not_empty() |> WHEN {
+                    True => Random/bytes(byte_count: 1)
+                    False => SKIP
+                }
+            }
+        }
+    nonempty_result:
+        RandomNotRequested |> HOLD nonempty_result {
+            start |> THEN {
+                nonempty_ids |> List/is_not_empty() |> WHEN {
+                    True => Random/bytes(byte_count: 1)
+                    False => SKIP
+                }
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let machine = compiled.plan;
+    let start = source_id(&machine, "store.start");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: start,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+
+    assert_eq!(turn.transient_effects.len(), 1);
+    assert_eq!(session.pending_transient_effect_count(), 1);
+}
+
+#[test]
+fn rollback_of_owner_replacement_restores_the_previous_transient_effect() {
+    let machine = file_stream_effect_machine();
+    let read = source_id(&machine, "store.read");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let first = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: read,
+            target: None,
+            payload: file_stream_payload(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+    let replacement_turn = session
+        .apply(SourceEvent {
+            sequence: 2,
+            source: read,
+            target: None,
+            payload: file_stream_payload(),
+        })
+        .unwrap();
+    let replacement = replacement_turn.transient_effects[0].clone();
+    assert_eq!(
+        replacement_turn.cancelled_transient_effects,
+        vec![first.call_id]
+    );
+
+    session.rollback_unsettled_turn().unwrap();
+
+    assert_eq!(session.pending_transient_effect_count(), 1);
+    assert!(
+        session
+            .deliver_transient_effect_result(
+                replacement.call_id,
+                0,
+                file_stream_outcome("Cancelled", []),
+            )
+            .is_err()
+    );
+    session
+        .deliver_transient_effect_result(
+            first.call_id,
+            0,
+            file_stream_outcome(
+                "Opened",
+                [
+                    ("size", number(3)),
+                    (
+                        "content_type",
+                        Value::Text("application/octet-stream".to_owned()),
+                    ),
+                    ("display_name", Value::Text("primary.bin".to_owned())),
+                ],
+            ),
+        )
+        .unwrap();
+}
+
+#[test]
+fn removing_an_indexed_row_invalidates_its_owned_transient_effect() {
+    let machine = indexed_file_stream_effect_machine();
+    let open = machine
+        .source_routes
+        .iter()
+        .find(|route| route.path.ends_with(".open"))
+        .expect("mapped row exposes open")
+        .source_id;
+    let remove = machine
+        .source_routes
+        .iter()
+        .find(|route| route.path.ends_with(".remove"))
+        .expect("mapped row exposes remove")
+        .source_id;
+    let list = machine.storage_layout.list_slots[0].list_id;
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let row = session.list_row_at(list, 0).unwrap();
+    let invocation = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: open,
+            target: Some(row),
+            payload: SourcePayload::default(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+    assert_eq!(invocation.target, Some(row));
+
+    let removed = session
+        .apply(SourceEvent {
+            sequence: 2,
+            source: remove,
+            target: Some(row),
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+
+    assert!(session.list_rows(list).is_empty());
+    assert_eq!(
+        removed.cancelled_transient_effects,
+        vec![invocation.call_id]
+    );
+    assert_eq!(session.pending_transient_effect_count(), 0);
+}
+
+#[test]
 fn mapped_source_row_does_not_become_the_root_effect_result_owner() {
     let machine = mapped_request_root_file_stream_effect_machine();
     let route = machine
@@ -3544,7 +4880,7 @@ fn mapped_source_row_does_not_become_the_root_effect_result_owner() {
         .find(|slot| slot.scope_id == Some(scope))
         .unwrap()
         .list_id;
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
     let row = session.snapshot().unwrap().lists[&list][0].id;
     let turn = session
         .apply(SourceEvent {
@@ -3611,7 +4947,7 @@ fn enqueue_item(turn: &Turn) -> boon_persistence::DurableOutboxItem {
 }
 
 fn dispatch_item(
-    session: &mut Session,
+    session: &mut MachineInstance,
     item: &boon_persistence::DurableOutboxItem,
 ) -> boon_persistence::DurableOutboxItem {
     let turn = session.begin_effect_dispatch(item).unwrap();
@@ -3652,8 +4988,8 @@ fn result_variant(
 fn apply_register_effect(
     machine: &MachinePlan,
     sequence: u64,
-) -> (Session, boon_persistence::DurableOutboxItem) {
-    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+) -> (MachineInstance, boon_persistence::DurableOutboxItem) {
+    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
     let turn = session
         .apply(SourceEvent {
             sequence,
@@ -3853,7 +5189,7 @@ fn effect_result_is_a_state_not_an_externally_dispatchable_source() {
 fn identical_effect_intents_on_distinct_source_turns_have_distinct_identities() {
     let machine = typed_passkey_effect_machine();
     let register = source_id(&machine, "store.register");
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
     let first = enqueue_item(
         &session
             .apply(SourceEvent {
@@ -3908,7 +5244,7 @@ fn reconciliation_completion_routes_result_after_session_restart() {
         boon_persistence::DurableOutboxState::ReconciliationRequired { attempt: *attempt };
 
     let authority = session.authority_snapshot().unwrap();
-    let mut restored = SessionBuilder::new(machine.clone(), SessionOptions::default())
+    let mut restored = MachineInstanceBuilder::new(machine.clone(), SessionOptions::default())
         .unwrap()
         .restore(authority)
         .build()
@@ -3983,7 +5319,7 @@ store: [
     .unwrap()
     .plan;
     let pulse = source_id(&machine, "store.pulse");
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
 
     for sequence in 1..=2 {
         session
@@ -4014,9 +5350,7 @@ store: [
             pulse |> THEN { count + 1 }
         }
     transient:
-        LATEST {
-            pulse |> THEN { count + 10 }
-        }
+        pulse |> THEN { count + 10 }
     derived: count + 20
 ]
 "#,
@@ -4026,7 +5360,7 @@ store: [
     .plan;
     let pulse = source_id(&machine, "store.pulse");
     let count = state_id(&machine, "store.count");
-    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
 
     session
         .apply(SourceEvent {
@@ -4041,7 +5375,7 @@ store: [
     assert_eq!(authority.states[&count].value, number(1));
     assert!(authority.states[&count].touched);
 
-    let mut restored = SessionBuilder::new(machine, SessionOptions::default())
+    let mut restored = MachineInstanceBuilder::new(machine, SessionOptions::default())
         .unwrap()
         .restore(authority)
         .build()
@@ -4091,7 +5425,7 @@ FUNCTION entry_view(entry) {
     assert!(machine.persistence.memory.is_empty());
     assert_eq!(machine.persistence.lists.len(), 1);
     let add = source_id(&machine, "store.add");
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
     let event = |sequence, text: &str| SourceEvent {
         sequence,
         source: add,
@@ -4148,9 +5482,7 @@ fn list_append_record_transform_reads_current_source_payload_fields() {
 store: [
     completed: SOURCE
     append_token:
-        LATEST {
-            completed |> THEN { completed.digest }
-        }
+        completed |> THEN { completed.digest }
     revisions:
         LIST {}
         |> List/append(item: append_token |> THEN {
@@ -4200,7 +5532,7 @@ FUNCTION revision_view(revision) {
     let digest = field_id("digest");
     let compiler = field_id("compiler");
     let target = field_id("target");
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
 
     session
         .apply(SourceEvent {
@@ -4237,90 +5569,145 @@ outputs: [
 ]
 "#;
 
-fn session_info_plan(role: ProgramRole) -> MachinePlan {
-    let mut plan = boon_compiler::compile_source_text_to_machine_plan_for_role(
+fn session_info_plan() -> MachinePlan {
+    boon_compiler::compile_source_text_to_machine_plan_for_role(
         "session-info.bn",
         SESSION_INFO_SOURCE,
         TargetProfile::SoftwareDefault,
         ProgramRole::Session,
     )
     .unwrap()
-    .plan;
-    plan.program_role = role;
-    plan
+    .plan
 }
 
 #[test]
-fn session_info_intrinsics_read_role_and_default_identity() {
-    for (role, expected_role) in [
-        (ProgramRole::Client, "Client"),
-        (ProgramRole::Session, "Session"),
-        (ProgramRole::Server, "Server"),
-    ] {
-        let mut session = Session::new(session_info_plan(role), SessionOptions::default()).unwrap();
-        assert_eq!(
-            session.output_value_current("status").unwrap(),
-            Value::Record(BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("Active".to_owned())),
-                ("role".to_owned(), Value::Text(expected_role.to_owned())),
-                ("session_id".to_owned(), Value::Text(String::new())),
-            ]))
-        );
-        assert_eq!(
-            session.output_value_current("principal").unwrap(),
-            Value::Text("Anonymous".to_owned())
-        );
-    }
+fn machine_template_shares_verified_plan_metadata_across_isolated_instances() {
+    let template = MachineTemplate::new(session_info_plan()).unwrap();
+    let first = template
+        .instantiate(SessionOptions::default())
+        .unwrap()
+        .build()
+        .unwrap();
+    let second = template
+        .instantiate(SessionOptions::default())
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(first.shares_template_metadata(&template));
+    assert!(second.shares_template_metadata(&template));
 }
 
 #[test]
-fn session_info_intrinsics_read_bounded_option_ids() {
+fn session_info_intrinsics_default_to_current_and_anonymous_without_hidden_identity() {
+    let mut session = MachineInstance::new(session_info_plan(), SessionOptions::default()).unwrap();
+    assert_eq!(
+        session.output_value_current("status").unwrap(),
+        Value::Text("Current".to_owned())
+    );
+    assert_eq!(
+        session.output_value_current("principal").unwrap(),
+        Value::Text("Anonymous".to_owned())
+    );
+}
+
+#[test]
+fn session_info_context_updates_are_current_and_canonical() {
     let options = SessionOptions {
-        session_id: Some("session-01".to_owned()),
-        principal_id: Some("principal-42".to_owned()),
+        session_context: SessionContext::Available {
+            status: SessionConnectionStatus::Connecting,
+            principal: SessionPrincipal::authenticated(
+                "person-42",
+                ["viewer", "operator", "viewer"],
+            )
+            .unwrap(),
+        },
         ..SessionOptions::default()
     };
-    let mut session = Session::new(session_info_plan(ProgramRole::Server), options).unwrap();
+    let mut session = MachineInstance::new(session_info_plan(), options).unwrap();
 
     assert_eq!(
         session.output_value_current("status").unwrap(),
-        Value::Record(BTreeMap::from([
-            ("$tag".to_owned(), Value::Text("Active".to_owned())),
-            ("role".to_owned(), Value::Text("Server".to_owned())),
-            (
-                "session_id".to_owned(),
-                Value::Text("session-01".to_owned()),
-            ),
-        ]))
+        Value::Text("Connecting".to_owned())
     );
     assert_eq!(
         session.output_value_current("principal").unwrap(),
         Value::Record(BTreeMap::from([
             ("$tag".to_owned(), Value::Text("Authenticated".to_owned()),),
-            ("id".to_owned(), Value::Text("principal-42".to_owned()),),
+            ("subject".to_owned(), Value::Text("person-42".to_owned()),),
+            (
+                "roles".to_owned(),
+                Value::List(vec![
+                    Value::Text("operator".to_owned()),
+                    Value::Text("viewer".to_owned()),
+                ]),
+            ),
         ]))
     );
 
-    let boundary_options = SessionOptions {
-        session_id: Some("s".repeat(MAX_SESSION_INFO_ID_BYTES)),
-        principal_id: Some("p".repeat(MAX_SESSION_INFO_ID_BYTES)),
-        ..SessionOptions::default()
-    };
-    assert!(Session::new(session_info_plan(ProgramRole::Session), boundary_options).is_ok());
+    assert!(
+        session
+            .update_session_context(
+                SessionConnectionStatus::Failed {
+                    code: "transport_timeout".to_owned(),
+                },
+                SessionPrincipal::Anonymous,
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        session.output_value_current("status").unwrap(),
+        Value::Record(BTreeMap::from([
+            ("$tag".to_owned(), Value::Text("Failed".to_owned())),
+            (
+                "code".to_owned(),
+                Value::Text("transport_timeout".to_owned()),
+            ),
+        ]))
+    );
+    assert_eq!(
+        session.output_value_current("principal").unwrap(),
+        Value::Text("Anonymous".to_owned())
+    );
+}
 
-    for options in [
+#[test]
+fn session_info_context_rejects_unbounded_or_noncanonical_host_values() {
+    let invalid = [
         SessionOptions {
-            session_id: Some("s".repeat(MAX_SESSION_INFO_ID_BYTES + 1)),
+            session_context: SessionContext::Available {
+                status: SessionConnectionStatus::Failed {
+                    code: "contains spaces".to_owned(),
+                },
+                principal: SessionPrincipal::Anonymous,
+            },
             ..SessionOptions::default()
         },
         SessionOptions {
-            principal_id: Some("p".repeat(MAX_SESSION_INFO_ID_BYTES + 1)),
+            session_context: SessionContext::Available {
+                status: SessionConnectionStatus::Current,
+                principal: SessionPrincipal::Authenticated {
+                    subject: "person".to_owned(),
+                    roles: vec!["viewer".to_owned(), "operator".to_owned()],
+                },
+            },
             ..SessionOptions::default()
         },
-    ] {
-        let error = Session::new(session_info_plan(ProgramRole::Session), options)
+        SessionOptions {
+            session_context: SessionContext::Available {
+                status: SessionConnectionStatus::Current,
+                principal: SessionPrincipal::Authenticated {
+                    subject: "s".repeat(MAX_SESSION_INFO_TEXT_BYTES + 1),
+                    roles: Vec::new(),
+                },
+            },
+            ..SessionOptions::default()
+        },
+    ];
+    for options in invalid {
+        let error = MachineInstance::new(session_info_plan(), options)
             .err()
-            .expect("oversized identity must be rejected");
+            .expect("invalid SessionInfo context must be rejected");
         assert!(matches!(error, Error::InvalidOptions(_)));
     }
 }
@@ -4363,6 +5750,7 @@ fn distributed_session_fixture() -> DistributedSessionFixture {
         executor_distributed_declaration("server.value.count"),
         1,
         ProgramRole::Server,
+        false,
         ValueRef::Constant(PlanConstantId(99)),
         DataTypePlan::Number,
     )
@@ -4390,6 +5778,7 @@ fn distributed_session_fixture() -> DistributedSessionFixture {
         executor_distributed_declaration("session.value.current_count"),
         1,
         ProgramRole::Session,
+        false,
         ValueRef::Field(FieldId(0)),
         DataTypePlan::Number,
     )
@@ -4433,8 +5822,42 @@ fn distributed_session_fixture() -> DistributedSessionFixture {
         ProgramRole::Session,
         vec![value_export.clone()],
         vec![value_import.clone()],
+        Vec::new(),
+        Vec::new(),
         vec![function_export],
         Vec::new(),
+    )
+    .unwrap();
+    let client_endpoint = DistributedEndpointContractPlan::new(
+        &graph,
+        executor_distributed_declaration("endpoint.client"),
+        1,
+        ProgramRole::Client,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let server_endpoint = DistributedEndpointContractPlan::new(
+        &graph,
+        server_declaration,
+        1,
+        ProgramRole::Server,
+        vec![server_value.clone()],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let linked_graph = DistributedGraphPlan::new(
+        &application_identity,
+        graph.clone(),
+        vec![client_endpoint, endpoint, server_endpoint],
     )
     .unwrap();
 
@@ -4459,8 +5882,10 @@ fn distributed_session_fixture() -> DistributedSessionFixture {
     );
     assert_eq!(machine.application.identity, application_identity);
     machine.program_role = ProgramRole::Session;
-    machine.distributed_endpoint =
-        Some(DistributedEndpointPlan::new(&application_identity, graph.clone(), endpoint).unwrap());
+    machine.distributed_endpoint = Some(
+        DistributedEndpointPlan::new(&application_identity, &linked_graph, ProgramRole::Session)
+            .unwrap(),
+    );
 
     let undeclared_import_id = ImportId::from_value_identity(
         graph.graph_id,
@@ -4480,10 +5905,702 @@ fn distributed_session_fixture() -> DistributedSessionFixture {
     }
 }
 
+struct AtomicDistributedContextFixture {
+    plan: MachinePlan,
+    first_import_id: ImportId,
+    second_import_id: ImportId,
+    call_result_import_id: ImportId,
+    undeclared_import_id: ImportId,
+}
+
+fn atomic_distributed_context_fixture() -> AtomicDistributedContextFixture {
+    let application_identity =
+        ApplicationIdentity::new("dev.boon.plan-executor-tests", "test", "local");
+    let graph = DistributedGraphIdentityPlan::new(
+        &application_identity,
+        executor_distributed_declaration("atomic.graph"),
+        1,
+    )
+    .unwrap();
+    let server_declaration = executor_distributed_declaration("atomic.endpoint.server");
+    let server_endpoint_id = DistributedEndpointId::from_identity(
+        graph.graph_id,
+        ProgramRole::Server,
+        server_declaration,
+    )
+    .unwrap();
+    let first_export = DistributedValueExportPlan::new(
+        graph.graph_id,
+        server_endpoint_id,
+        executor_distributed_declaration("atomic.server.value.first"),
+        1,
+        ProgramRole::Server,
+        true,
+        ValueRef::Constant(PlanConstantId(98)),
+        DataTypePlan::Number,
+    )
+    .unwrap();
+    let second_export = DistributedValueExportPlan::new(
+        graph.graph_id,
+        server_endpoint_id,
+        executor_distributed_declaration("atomic.server.value.second"),
+        1,
+        ProgramRole::Server,
+        true,
+        ValueRef::Constant(PlanConstantId(99)),
+        DataTypePlan::Number,
+    )
+    .unwrap();
+    let function_declaration = executor_distributed_declaration("atomic.server.function.identity");
+    let function_export_id = ExportId::from_identity(
+        graph.graph_id,
+        server_endpoint_id,
+        DistributedExportKind::PureFunction,
+        function_declaration,
+    )
+    .unwrap();
+    let function_argument_id =
+        DistributedArgumentId::from_parameter_name(function_export_id, "value").unwrap();
+    let server_function = DistributedPureFunctionExportPlan::new(
+        graph.graph_id,
+        server_endpoint_id,
+        function_declaration,
+        1,
+        ProgramRole::Server,
+        vec![("value".to_owned(), DataTypePlan::Number)],
+        DataTypePlan::Number,
+        PlanRowExpression::Field {
+            input: ValueRef::DistributedFunctionArgument {
+                export_id: function_export_id,
+                argument_id: function_argument_id,
+            },
+        },
+    )
+    .unwrap();
+
+    let session_declaration = executor_distributed_declaration("atomic.endpoint.session");
+    let session_endpoint_id = DistributedEndpointId::from_identity(
+        graph.graph_id,
+        ProgramRole::Session,
+        session_declaration,
+    )
+    .unwrap();
+    let first_import = DistributedValueImportPlan::new(
+        graph.graph_id,
+        session_endpoint_id,
+        executor_distributed_declaration("atomic.session.import.first"),
+        1,
+        ProgramRole::Session,
+        &first_export,
+    )
+    .unwrap();
+    let second_import = DistributedValueImportPlan::new(
+        graph.graph_id,
+        session_endpoint_id,
+        executor_distributed_declaration("atomic.session.import.second"),
+        1,
+        ProgramRole::Session,
+        &second_export,
+    )
+    .unwrap();
+    let remote_call = RemoteCallSitePlan::new(
+        graph.graph_id,
+        session_endpoint_id,
+        executor_distributed_declaration("atomic.session.call.identity"),
+        1,
+        ProgramRole::Session,
+        &server_function,
+        vec![(
+            "value".to_owned(),
+            ValueRef::DistributedImport(first_import.import_id),
+        )],
+    )
+    .unwrap();
+    let endpoint = DistributedEndpointContractPlan::new(
+        &graph,
+        session_declaration,
+        1,
+        ProgramRole::Session,
+        Vec::new(),
+        vec![first_import.clone(), second_import.clone()],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![remote_call.clone()],
+    )
+    .unwrap();
+    let client_endpoint = DistributedEndpointContractPlan::new(
+        &graph,
+        executor_distributed_declaration("atomic.endpoint.client"),
+        1,
+        ProgramRole::Client,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let server_endpoint = DistributedEndpointContractPlan::new(
+        &graph,
+        server_declaration,
+        1,
+        ProgramRole::Server,
+        vec![first_export, second_export],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![server_function],
+        Vec::new(),
+    )
+    .unwrap();
+    let linked_graph = DistributedGraphPlan::new(
+        &application_identity,
+        graph.clone(),
+        vec![client_endpoint, endpoint, server_endpoint],
+    )
+    .unwrap();
+    let context_expression = PlanRowExpression::Object {
+        fields: vec![
+            PlanRowObjectField {
+                name: "status".to_owned(),
+                value: PlanRowExpression::Intrinsic {
+                    intrinsic: PlanIntrinsic::SessionInfoStatus,
+                },
+            },
+            PlanRowObjectField {
+                name: "principal".to_owned(),
+                value: PlanRowExpression::Intrinsic {
+                    intrinsic: PlanIntrinsic::SessionInfoPrincipal,
+                },
+            },
+            PlanRowObjectField {
+                name: "first".to_owned(),
+                value: PlanRowExpression::Field {
+                    input: ValueRef::DistributedImport(first_import.import_id),
+                },
+            },
+            PlanRowObjectField {
+                name: "second".to_owned(),
+                value: PlanRowExpression::Field {
+                    input: ValueRef::DistributedImport(second_import.import_id),
+                },
+            },
+            PlanRowObjectField {
+                name: "call_result".to_owned(),
+                value: PlanRowExpression::Field {
+                    input: ValueRef::DistributedImport(remote_call.result_import_id),
+                },
+            },
+        ],
+    };
+    let mut machine = plan(
+        RootOutputDemand::All,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![derived(
+            0,
+            0,
+            vec![
+                ValueRef::DistributedImport(first_import.import_id),
+                ValueRef::DistributedImport(second_import.import_id),
+                ValueRef::DistributedImport(remote_call.result_import_id),
+            ],
+            Some(context_expression),
+        )],
+        Vec::new(),
+        Vec::new(),
+        vec![(FieldId(0), "store.distributed_context")],
+    );
+    machine.program_role = ProgramRole::Session;
+    machine.distributed_endpoint = Some(
+        DistributedEndpointPlan::new(&application_identity, &linked_graph, ProgramRole::Session)
+            .unwrap(),
+    );
+
+    AtomicDistributedContextFixture {
+        plan: machine,
+        first_import_id: first_import.import_id,
+        second_import_id: second_import.import_id,
+        call_result_import_id: remote_call.result_import_id,
+        undeclared_import_id: ImportId::from_value_identity(
+            graph.graph_id,
+            session_endpoint_id,
+            executor_distributed_declaration("atomic.session.import.undeclared"),
+        )
+        .unwrap(),
+    }
+}
+
+fn distributed_context_value(
+    status: Value,
+    principal: Value,
+    first: Value,
+    second: Value,
+    call_result: Value,
+) -> Value {
+    Value::Record(BTreeMap::from([
+        ("call_result".to_owned(), call_result),
+        ("first".to_owned(), first),
+        ("principal".to_owned(), principal),
+        ("second".to_owned(), second),
+        ("status".to_owned(), status),
+    ]))
+}
+
+fn remote_not_current() -> Value {
+    Value::Error {
+        code: "remote_not_current".to_owned(),
+    }
+}
+
+fn session_scope_unavailable() -> Value {
+    Value::Error {
+        code: "session_scope_unavailable".to_owned(),
+    }
+}
+
+fn authenticated_principal_value(subject: &str, roles: &[&str]) -> Value {
+    Value::Record(BTreeMap::from([
+        ("$tag".to_owned(), Value::Text("Authenticated".to_owned())),
+        ("subject".to_owned(), Value::Text(subject.to_owned())),
+        (
+            "roles".to_owned(),
+            Value::List(
+                roles
+                    .iter()
+                    .map(|role| Value::Text((*role).to_owned()))
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+#[test]
+fn distributed_context_transaction_recomputes_dependents_once_with_the_complete_batch() {
+    let fixture = atomic_distributed_context_fixture();
+    let mut session = MachineInstance::new(
+        fixture.plan,
+        SessionOptions {
+            session_context: SessionContext::Available {
+                status: SessionConnectionStatus::Connecting,
+                principal: SessionPrincipal::Anonymous,
+            },
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    let principal = SessionPrincipal::authenticated("person-42", ["operator", "viewer"]).unwrap();
+    let expected = distributed_context_value(
+        Value::Text("Current".to_owned()),
+        Value::Record(BTreeMap::from([
+            ("$tag".to_owned(), Value::Text("Authenticated".to_owned())),
+            (
+                "roles".to_owned(),
+                Value::List(vec![
+                    Value::Text("operator".to_owned()),
+                    Value::Text("viewer".to_owned()),
+                ]),
+            ),
+            ("subject".to_owned(), Value::Text("person-42".to_owned())),
+        ])),
+        number(11),
+        number(22),
+        remote_not_current(),
+    );
+
+    let turn = session
+        .update_distributed_context(
+            SessionConnectionStatus::Current,
+            principal,
+            vec![
+                DistributedImportUpdate::new(fixture.second_import_id, 7, number(22)),
+                DistributedImportUpdate::new(fixture.first_import_id, 3, number(11)),
+            ],
+        )
+        .unwrap()
+        .expect("new distributed context must produce one internal turn");
+
+    assert_eq!(turn.sequence, 1);
+    assert_eq!(turn.source_sequence, None);
+    assert_eq!(turn.metrics.recomputed_field_count, 1);
+    assert_eq!(
+        turn.metrics.recomputed_targets,
+        vec![ValueTarget::Field(FieldId(0))]
+    );
+    assert_eq!(
+        turn.deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                Delta::SetValue {
+                    target: ValueTarget::Field(FieldId(0)),
+                    value,
+                } => Some(value.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![expected.clone()]
+    );
+    assert_eq!(
+        turn.deltas
+            .iter()
+            .filter(|delta| matches!(delta, Delta::SetDistributedImport { .. }))
+            .count(),
+        2
+    );
+    assert!(turn.transient_effects.is_empty());
+    assert!(turn.cancelled_transient_effects.is_empty());
+    assert_eq!(
+        session
+            .root_value_current("store.distributed_context")
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.first_import_id),
+        Some(3)
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.second_import_id),
+        Some(7)
+    );
+}
+
+#[test]
+fn distributed_context_patch_makes_session_available_and_preserves_omitted_imports() {
+    let fixture = atomic_distributed_context_fixture();
+    let mut session = MachineInstance::new(
+        fixture.plan,
+        SessionOptions {
+            session_context: SessionContext::Unavailable,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+    session
+        .update_distributed_context(
+            SessionConnectionStatus::Current,
+            SessionPrincipal::authenticated("origin-a", ["viewer"]).unwrap(),
+            vec![
+                DistributedImportUpdate::new(fixture.first_import_id, 5, number(11)),
+                DistributedImportUpdate::new(fixture.second_import_id, 5, number(22)),
+                DistributedImportUpdate::new(fixture.call_result_import_id, 5, number(33)),
+            ],
+        )
+        .unwrap()
+        .expect("the patch API must install an available Session context");
+
+    session
+        .update_session_context(SessionConnectionStatus::Stale, SessionPrincipal::Anonymous)
+        .unwrap()
+        .expect("the context-only patch must become visible");
+
+    assert_eq!(
+        session
+            .root_value_current("store.distributed_context")
+            .unwrap(),
+        distributed_context_value(
+            Value::Text("Stale".to_owned()),
+            Value::Text("Anonymous".to_owned()),
+            number(11),
+            number(22),
+            number(33),
+        )
+    );
+    for import_id in [
+        fixture.first_import_id,
+        fixture.second_import_id,
+        fixture.call_result_import_id,
+    ] {
+        assert_eq!(session.distributed_import_revision(import_id), Some(5));
+    }
+}
+
+#[test]
+fn distributed_context_replacement_resets_omitted_bindings_and_the_revision_namespace() {
+    let fixture = atomic_distributed_context_fixture();
+    let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
+    session
+        .replace_distributed_context(
+            SessionContext::Available {
+                status: SessionConnectionStatus::Current,
+                principal: SessionPrincipal::authenticated("origin-a", ["viewer"]).unwrap(),
+            },
+            vec![
+                DistributedImportUpdate::new(fixture.first_import_id, 5, number(11)),
+                DistributedImportUpdate::new(fixture.second_import_id, 5, number(22)),
+                DistributedImportUpdate::new(fixture.call_result_import_id, 5, number(33)),
+            ],
+        )
+        .unwrap()
+        .expect("origin A must install a complete context");
+
+    let expected = distributed_context_value(
+        Value::Text("Current".to_owned()),
+        authenticated_principal_value("origin-b", &["operator"]),
+        remote_not_current(),
+        number(222),
+        remote_not_current(),
+    );
+    let turn = session
+        .replace_distributed_context(
+            SessionContext::Available {
+                status: SessionConnectionStatus::Current,
+                principal: SessionPrincipal::authenticated("origin-b", ["operator"]).unwrap(),
+            },
+            vec![DistributedImportUpdate::new(
+                fixture.second_import_id,
+                1,
+                number(222),
+            )],
+        )
+        .unwrap()
+        .expect("origin B revision one must not be compared with origin A revision five");
+
+    assert_eq!(turn.metrics.recomputed_field_count, 1);
+    assert_eq!(
+        turn.deltas
+            .iter()
+            .filter(|delta| matches!(delta, Delta::SetDistributedImport { .. }))
+            .count(),
+        3
+    );
+    assert_eq!(
+        session.distributed_import_value_current(fixture.first_import_id),
+        Ok(remote_not_current())
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.first_import_id),
+        None
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.second_import_id),
+        Some(1)
+    );
+    assert_eq!(
+        session.distributed_import_value_current(fixture.call_result_import_id),
+        Ok(remote_not_current())
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.call_result_import_id),
+        None
+    );
+    assert_eq!(
+        session
+            .root_value_current("store.distributed_context")
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn distributed_execution_context_does_not_consume_an_authority_turn_sequence() {
+    let fixture = atomic_distributed_context_fixture();
+    let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
+
+    let execution = session
+        .replace_distributed_execution_context(
+            SessionContext::Available {
+                status: SessionConnectionStatus::Current,
+                principal: SessionPrincipal::authenticated("origin-a", ["viewer"]).unwrap(),
+            },
+            vec![DistributedImportUpdate::new(
+                fixture.first_import_id,
+                1,
+                number(11),
+            )],
+        )
+        .unwrap()
+        .expect("execution context must become current");
+    assert_eq!(execution.sequence, 0);
+    session.settle_turn();
+
+    let authority = session
+        .update_session_context(SessionConnectionStatus::Stale, SessionPrincipal::Anonymous)
+        .unwrap()
+        .expect("authority context patch must emit a turn");
+    assert_eq!(authority.sequence, 1);
+}
+
+#[test]
+fn unavailable_distributed_context_clears_all_imports_and_session_info() {
+    let fixture = atomic_distributed_context_fixture();
+    let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
+    session
+        .replace_distributed_context(
+            SessionContext::Available {
+                status: SessionConnectionStatus::Current,
+                principal: SessionPrincipal::authenticated("origin-a", ["viewer"]).unwrap(),
+            },
+            vec![
+                DistributedImportUpdate::new(fixture.first_import_id, 5, number(11)),
+                DistributedImportUpdate::new(fixture.second_import_id, 5, number(22)),
+                DistributedImportUpdate::new(fixture.call_result_import_id, 5, number(33)),
+            ],
+        )
+        .unwrap()
+        .expect("origin A must install a complete context");
+
+    let turn = session
+        .replace_distributed_context(SessionContext::Unavailable, Vec::new())
+        .unwrap()
+        .expect("the global context must clear origin A");
+    assert_eq!(turn.metrics.recomputed_field_count, 1);
+    assert_eq!(
+        session
+            .root_value_current("store.distributed_context")
+            .unwrap(),
+        distributed_context_value(
+            session_scope_unavailable(),
+            session_scope_unavailable(),
+            remote_not_current(),
+            remote_not_current(),
+            remote_not_current(),
+        )
+    );
+    for import_id in [
+        fixture.first_import_id,
+        fixture.second_import_id,
+        fixture.call_result_import_id,
+    ] {
+        assert_eq!(
+            session.distributed_import_value_current(import_id),
+            Ok(remote_not_current())
+        );
+        assert_eq!(session.distributed_import_revision(import_id), None);
+    }
+}
+
+#[test]
+fn distributed_context_replacement_rejects_a_batch_without_exposing_its_valid_prefix() {
+    let fixture = atomic_distributed_context_fixture();
+    let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
+    let initial = distributed_context_value(
+        Value::Text("Current".to_owned()),
+        authenticated_principal_value("origin-a", &["viewer"]),
+        number(11),
+        number(22),
+        number(33),
+    );
+    session
+        .replace_distributed_context(
+            SessionContext::Available {
+                status: SessionConnectionStatus::Current,
+                principal: SessionPrincipal::authenticated("origin-a", ["viewer"]).unwrap(),
+            },
+            vec![
+                DistributedImportUpdate::new(fixture.first_import_id, 5, number(11)),
+                DistributedImportUpdate::new(fixture.second_import_id, 5, number(22)),
+                DistributedImportUpdate::new(fixture.call_result_import_id, 5, number(33)),
+            ],
+        )
+        .unwrap()
+        .expect("origin A must install a complete context");
+
+    assert!(matches!(
+        session.replace_distributed_context(
+            SessionContext::Available {
+                status: SessionConnectionStatus::Stale,
+                principal: SessionPrincipal::authenticated("origin-b", ["operator"]).unwrap(),
+            },
+            vec![
+                DistributedImportUpdate::new(fixture.first_import_id, 1, number(11)),
+                DistributedImportUpdate::new(fixture.undeclared_import_id, 1, number(99)),
+            ],
+        ),
+        Err(Error::InvalidEvent(detail)) if detail.contains("not declared")
+    ));
+    assert_eq!(
+        session.distributed_import_revision(fixture.first_import_id),
+        Some(5)
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.second_import_id),
+        Some(5)
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.call_result_import_id),
+        Some(5)
+    );
+    assert_eq!(
+        session
+            .root_value_current("store.distributed_context")
+            .unwrap(),
+        initial
+    );
+}
+
+#[test]
+fn distributed_context_replacement_rolls_back_context_values_and_revisions_together() {
+    let fixture = atomic_distributed_context_fixture();
+    let initial = distributed_context_value(
+        Value::Text("Current".to_owned()),
+        authenticated_principal_value("origin-a", &["viewer"]),
+        number(11),
+        number(22),
+        number(33),
+    );
+    let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
+
+    session
+        .replace_distributed_context(
+            SessionContext::Available {
+                status: SessionConnectionStatus::Current,
+                principal: SessionPrincipal::authenticated("origin-a", ["viewer"]).unwrap(),
+            },
+            vec![
+                DistributedImportUpdate::new(fixture.first_import_id, 5, number(11)),
+                DistributedImportUpdate::new(fixture.second_import_id, 5, number(22)),
+                DistributedImportUpdate::new(fixture.call_result_import_id, 5, number(33)),
+            ],
+        )
+        .unwrap()
+        .expect("origin A must install a complete context");
+    session.settle_turn();
+
+    session
+        .replace_distributed_context(
+            SessionContext::Available {
+                status: SessionConnectionStatus::Stale,
+                principal: SessionPrincipal::Anonymous,
+            },
+            vec![DistributedImportUpdate::new(
+                fixture.second_import_id,
+                1,
+                number(222),
+            )],
+        )
+        .unwrap()
+        .expect("origin B must replace the complete context");
+    session.rollback_unsettled_turn().unwrap();
+
+    assert_eq!(
+        session.distributed_import_revision(fixture.first_import_id),
+        Some(5)
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.second_import_id),
+        Some(5)
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.call_result_import_id),
+        Some(5)
+    );
+    assert_eq!(
+        session
+            .root_value_current("store.distributed_context")
+            .unwrap(),
+        initial
+    );
+}
+
 #[test]
 fn distributed_import_updates_are_current_monotonic_and_idempotent() {
     let fixture = distributed_session_fixture();
-    let mut session = Session::new(fixture.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
 
     assert_eq!(session.distributed_import_revision(fixture.import_id), None);
     assert_eq!(
@@ -4588,7 +6705,7 @@ fn distributed_import_updates_are_current_monotonic_and_idempotent() {
 #[test]
 fn distributed_pure_functions_use_typed_argument_ids_and_fail_closed() {
     let fixture = distributed_session_fixture();
-    let mut session = Session::new(fixture.plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
 
     assert_eq!(
         session

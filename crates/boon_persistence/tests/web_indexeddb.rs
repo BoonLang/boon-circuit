@@ -2,10 +2,11 @@
 
 use boon_persistence::{
     ActivationBatch, BrowserFailureKind, CheckpointBatch, DurableChange, DurableEffectRow,
-    DurableOutboxChange, DurableOutboxItem, InMemoryDriver, InspectRequest, PersistenceCommand,
-    PersistenceDriver, PersistenceResult, ResetApplicationBatch, RestoreImage, RestoreRequest,
-    RexieDriver, ShutdownRequest, StoreError, StoredList, StoredRow, StoredScalar, StoredValue,
-    browser_failure_kind,
+    DurableOutboxChange, DurableOutboxItem, DurableProtocolStateChange, ExportApplicationRequest,
+    InMemoryDriver, InspectRequest, LoadProtocolStateRequest, PersistenceCommand,
+    PersistenceDriver, PersistenceResult, ProtocolStateKey, ResetApplicationBatch, RestoreImage,
+    RestoreRequest, RexieDriver, ShutdownRequest, StoreError, StoredList, StoredRow, StoredScalar,
+    StoredValue, browser_failure_kind,
 };
 use boon_plan::{
     ApplicationIdentity, EffectId, EffectInvocationId, MemoryId, MemoryKind, MemoryLeafId,
@@ -65,6 +66,8 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
     let scalar_memory = memory("payload", MemoryKind::Scalar);
     let list_memory = memory("rows", MemoryKind::List);
     let missing_list = memory("missing", MemoryKind::List);
+    let protocol_key = ProtocolStateKey([0x71; 32]);
+    let deleted_protocol_key = ProtocolStateKey([0x72; 32]);
     let payload_field = MemoryLeafId::from_memory_path(list_memory, "payload").unwrap();
     let inserted_field = MemoryLeafId::from_memory_path(list_memory, "inserted").unwrap();
 
@@ -92,18 +95,27 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
     .await;
     assert!(!browser.storage_status().missing_or_evicted);
     assert_eq!(browser.storage_status().last_operation_failure, None);
+    assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::LoadProtocolState(LoadProtocolStateRequest {
+            application: app.clone(),
+        }),
+    )
+    .await;
 
     let shared_payload = vec![0x6a; boon_persistence::INLINE_BYTES_THRESHOLD + 1];
     let first_row = StoredRow {
         key: 0,
         generation: 1,
-        fields: BTreeMap::from([(payload_field, StoredValue::Bytes(shared_payload.clone()))]),
+        fields: BTreeMap::from([(
+            payload_field,
+            StoredValue::Bytes(shared_payload.clone().into()),
+        )]),
         touched_fields: BTreeSet::from([payload_field]),
     };
     let effect = EffectId::from_host_operation("Browser/send").unwrap();
-    let invocation =
-        EffectInvocationId::from_semantic_route(effect, "browser/source", "browser/target")
-            .unwrap();
+    let invocation = EffectInvocationId::from_result_owner(effect, "browser/target").unwrap();
     let outbox_key = StoredValue::Text("browser-key".to_owned());
     let outbox_intent = number(7);
     let outbox_item = DurableOutboxItem::pending(
@@ -130,7 +142,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
                 memory_id: scalar_memory,
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Bytes(shared_payload.clone()),
+                    value: StoredValue::Bytes(shared_payload.clone().into()),
                 },
             },
             DurableChange::SetList {
@@ -144,6 +156,13 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         ],
         outbox_changes: vec![DurableOutboxChange::Enqueue {
             item: outbox_item.clone(),
+        }],
+        protocol_state_changes: vec![DurableProtocolStateChange::Put {
+            key: protocol_key,
+            expected_revision: None,
+            next_revision: 1,
+            payload: b"first protocol state".to_vec().into(),
+            turn_sequence: 1,
         }],
         content_artifact_changes: Vec::new(),
         checksum: [0; 32],
@@ -171,6 +190,14 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         PersistenceCommand::Load(RestoreRequest {
             application: app.clone(),
             expected_schema_hash: Some(schema_v1),
+        }),
+    )
+    .await;
+    assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::LoadProtocolState(LoadProtocolStateRequest {
+            application: app.clone(),
         }),
     )
     .await;
@@ -239,6 +266,22 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
                 item: second_outbox_item,
             },
         ],
+        protocol_state_changes: vec![
+            DurableProtocolStateChange::Put {
+                key: protocol_key,
+                expected_revision: Some(1),
+                next_revision: 2,
+                payload: b"second protocol state".to_vec().into(),
+                turn_sequence: 2,
+            },
+            DurableProtocolStateChange::Put {
+                key: deleted_protocol_key,
+                expected_revision: None,
+                next_revision: 1,
+                payload: b"temporary protocol state".to_vec().into(),
+                turn_sequence: 2,
+            },
+        ],
         content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
@@ -292,6 +335,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
             attempt: 1,
             turn_sequence: 3,
         }],
+        protocol_state_changes: Vec::new(),
         content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
@@ -300,6 +344,67 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         &mut browser,
         &mut memory_driver,
         PersistenceCommand::Commit(third),
+    )
+    .await;
+
+    let before_protocol_abort = memory_driver.image(&app).unwrap().clone();
+    let before_protocol_state_abort = memory_driver.protocol_state(&app).unwrap().clone();
+    let failing_protocol = CheckpointBatch {
+        application: app.clone(),
+        schema_hash: schema_v1,
+        base_epoch: 3,
+        next_epoch: 4,
+        first_turn_sequence: 4,
+        last_turn_sequence: 4,
+        changes: vec![DurableChange::SetScalar {
+            memory_id: scalar_memory,
+            value: StoredScalar {
+                touched: true,
+                value: StoredValue::Text("protocol failure must roll back".to_owned()),
+            },
+        }],
+        outbox_changes: Vec::new(),
+        protocol_state_changes: vec![DurableProtocolStateChange::Put {
+            key: protocol_key,
+            expected_revision: Some(99),
+            next_revision: 100,
+            payload: b"must not commit".to_vec().into(),
+            turn_sequence: 4,
+        }],
+        content_artifact_changes: Vec::new(),
+        checksum: [0; 32],
+    }
+    .seal();
+    let failed = assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::Commit(failing_protocol),
+    )
+    .await;
+    assert!(matches!(
+        failed,
+        PersistenceResult::Committed(Err(StoreError::InvalidProtocolState(_)))
+    ));
+    assert_eq!(memory_driver.image(&app), Some(&before_protocol_abort));
+    assert_eq!(
+        memory_driver.protocol_state(&app),
+        Some(&before_protocol_state_abort)
+    );
+    assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::Load(RestoreRequest {
+            application: app.clone(),
+            expected_schema_hash: Some(schema_v1),
+        }),
+    )
+    .await;
+    assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::LoadProtocolState(LoadProtocolStateRequest {
+            application: app.clone(),
+        }),
     )
     .await;
 
@@ -332,6 +437,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
             },
         ],
         outbox_changes: Vec::new(),
+        protocol_state_changes: Vec::new(),
         content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
@@ -361,6 +467,14 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         &mut browser,
         &mut memory_driver,
         PersistenceCommand::Inspect(InspectRequest {
+            application: app.clone(),
+        }),
+    )
+    .await;
+    assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::ExportApplication(ExportApplicationRequest {
             application: app.clone(),
         }),
     )
@@ -408,6 +522,14 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         }),
     )
     .await;
+    assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::LoadProtocolState(LoadProtocolStateRequest {
+            application: app.clone(),
+        }),
+    )
+    .await;
 
     let completed = CheckpointBatch {
         application: app.clone(),
@@ -425,6 +547,11 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
             outcome: StoredValue::Text("done".to_owned()),
             turn_sequence: 4,
         }],
+        protocol_state_changes: vec![DurableProtocolStateChange::Delete {
+            key: deleted_protocol_key,
+            expected_revision: 1,
+            turn_sequence: 4,
+        }],
         content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
@@ -433,6 +560,14 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         &mut browser,
         &mut memory_driver,
         PersistenceCommand::Commit(completed),
+    )
+    .await;
+    assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::LoadProtocolState(LoadProtocolStateRequest {
+            application: app.clone(),
+        }),
     )
     .await;
 
@@ -456,9 +591,15 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         &mut browser,
         &mut memory_driver,
         PersistenceCommand::Load(RestoreRequest {
-            application: app,
+            application: app.clone(),
             expected_schema_hash: Some([0x44; 32]),
         }),
+    )
+    .await;
+    assert_parity(
+        &mut browser,
+        &mut memory_driver,
+        PersistenceCommand::LoadProtocolState(LoadProtocolStateRequest { application: app }),
     )
     .await;
     assert_parity(

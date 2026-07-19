@@ -6,14 +6,14 @@ use super::codec::{
 };
 #[cfg(target_arch = "wasm32")]
 use super::codec::{
-    decode_blob_record, decode_outbox_record, row_component_blob_references,
-    scalar_component_blob_references,
+    decode_blob_record, decode_outbox_record, decode_protocol_state_record,
+    encode_protocol_state_record, row_component_blob_references, scalar_component_blob_references,
 };
 use super::{
     ActivationBatch, CheckpointBatch, ContentArtifact, ContentArtifactBinding, ContentArtifactId,
     ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
-    DurableChange, DurableOutboxChange, OutboxItemId, PersistenceResult, RestoreImage, StoreError,
-    StoredRow, encode_restore_image, validate_content_artifact,
+    DurableChange, DurableOutboxChange, OutboxItemId, PersistenceResult, ProtocolStateKey,
+    RestoreImage, StoreError, StoredRow, encode_restore_image, validate_content_artifact,
 };
 use boon_plan::{ApplicationIdentity, MemoryId, MigrationEdgeId};
 use minicbor::{Decoder, Encoder};
@@ -25,13 +25,14 @@ use std::fmt;
 #[cfg(target_arch = "wasm32")]
 use super::{
     ActivationAck, ApplicationTransfer, BarrierAck, BarrierRequest, CommitAck, CompactAck,
-    CompactRequest, DurableContentArtifactChange, ExportApplicationRequest, InspectRequest,
-    LoadContentArtifactRequest, PersistenceCommand, PersistenceInspectorSnapshot,
-    PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch,
-    RestoreRequest, ShutdownAck, StoredList, apply_durable_content_artifact_changes,
-    exact_content_artifact_closure, inspector_snapshot_with_artifacts,
-    validate_application_transfer, validate_content_artifact_manifest,
-    validate_content_artifact_storage,
+    CompactRequest, DurableContentArtifactChange, DurableProtocolStateChange,
+    ExportApplicationRequest, InspectRequest, LoadContentArtifactRequest, PersistenceCommand,
+    PersistenceInspectorSnapshot, ProtocolStateSnapshot, PutContentArtifactAck,
+    PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreRequest,
+    ShutdownAck, StoredList, apply_durable_content_artifact_changes,
+    apply_durable_protocol_state_changes, exact_content_artifact_closure,
+    inspector_snapshot_with_artifacts, validate_application_transfer,
+    validate_content_artifact_manifest, validate_content_artifact_storage, validate_protocol_state,
 };
 #[cfg(target_arch = "wasm32")]
 use futures::channel::{mpsc, oneshot};
@@ -54,7 +55,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{DomException, StorageManager, WorkerGlobalScope};
 
-const DATABASE_VERSION: u32 = 2;
+const DATABASE_VERSION: u32 = 3;
 const COMPONENT_FORMAT: u32 = 1;
 const MAX_CHECKPOINT_RECORDS_PER_APPLICATION: usize = 64;
 const DEFAULT_UPGRADE_TIMEOUT_MS: u32 = 15_000;
@@ -71,11 +72,12 @@ const ROWS: &str = "rows";
 const CHECKPOINTS: &str = "checkpoints";
 const MIGRATIONS: &str = "migrations";
 const OUTBOX: &str = "outbox";
+const PROTOCOL_STATE: &str = "protocol_state";
 const BLOBS: &str = "blobs";
 const ARTIFACTS: &str = "artifacts";
 const ARTIFACT_OWNERS: &str = "artifact_owners";
 
-const STORE_NAMES: [&str; 10] = [
+const STORE_NAMES: [&str; 11] = [
     META,
     SLOTS,
     LISTS,
@@ -83,6 +85,7 @@ const STORE_NAMES: [&str; 10] = [
     CHECKPOINTS,
     MIGRATIONS,
     OUTBOX,
+    PROTOCOL_STATE,
     BLOBS,
     ARTIFACTS,
     ARTIFACT_OWNERS,
@@ -196,6 +199,7 @@ impl BrowserStorageStatus {
         self.missing_or_evicted = matches!(
             result,
             PersistenceResult::Loaded(Ok(None))
+                | PersistenceResult::ProtocolStateLoaded(Err(StoreError::MissingApplication))
                 | PersistenceResult::Committed(Err(StoreError::MissingApplication))
                 | PersistenceResult::Activated(Err(StoreError::MissingApplication))
                 | PersistenceResult::ApplicationReset(Err(StoreError::MissingApplication))
@@ -317,6 +321,9 @@ impl SparseTransactionPlan {
         }
         if !batch.outbox_changes.is_empty() {
             plan.stores.insert(OUTBOX);
+        }
+        if !batch.protocol_state_changes.is_empty() {
+            plan.stores.insert(PROTOCOL_STATE);
         }
         if !batch.content_artifact_changes.is_empty() {
             plan.stores.extend([ARTIFACTS, ARTIFACT_OWNERS]);
@@ -813,6 +820,14 @@ fn outbox_storage_key(application: &ApplicationIdentity, item_id: OutboxItemId) 
     )
 }
 
+fn protocol_state_storage_key(application: &ApplicationIdentity, key: ProtocolStateKey) -> String {
+    format!(
+        "{}{}",
+        application_storage_key(application),
+        encode_hex(key.as_bytes())
+    )
+}
+
 fn blob_storage_key(application: &ApplicationIdentity, digest: BlobDigest) -> String {
     format!(
         "{}{}",
@@ -848,6 +863,13 @@ fn outbox_from_storage_key(key: &str) -> Result<OutboxItemId, StoreError> {
         return Err(corrupt("invalid outbox key"));
     }
     Ok(OutboxItemId(decode_hex_digest(&key[64..])?))
+}
+
+fn protocol_state_from_storage_key(key: &str) -> Result<ProtocolStateKey, StoreError> {
+    if key.len() != 128 {
+        return Err(corrupt("invalid protocol-state key"));
+    }
+    Ok(ProtocolStateKey(decode_hex_digest(&key[64..])?))
 }
 
 fn blob_from_storage_key(key: &str) -> Result<BlobDigest, StoreError> {
@@ -994,6 +1016,7 @@ enum StoreMutation {
 #[derive(Clone, Copy)]
 enum CoordinatorResultKind {
     Load,
+    LoadProtocolState,
     Initialize,
     Commit,
     Activate,
@@ -1012,6 +1035,7 @@ impl CoordinatorResultKind {
     fn from_command(command: &PersistenceCommand) -> Self {
         match command {
             PersistenceCommand::Load(_) => Self::Load,
+            PersistenceCommand::LoadProtocolState(_) => Self::LoadProtocolState,
             PersistenceCommand::Initialize(_) => Self::Initialize,
             PersistenceCommand::Commit(_) => Self::Commit,
             PersistenceCommand::Activate(_) => Self::Activate,
@@ -1029,6 +1053,7 @@ impl CoordinatorResultKind {
     fn error_result(self, error: StoreError) -> PersistenceResult {
         match self {
             Self::Load => PersistenceResult::Loaded(Err(error)),
+            Self::LoadProtocolState => PersistenceResult::ProtocolStateLoaded(Err(error)),
             Self::Initialize => PersistenceResult::Initialized(Err(error)),
             Self::Commit => PersistenceResult::Committed(Err(error)),
             Self::Activate => PersistenceResult::Activated(Err(error)),
@@ -1336,6 +1361,11 @@ impl IndexedDbBackend {
             PersistenceCommand::Load(request) => {
                 PersistenceResult::Loaded(self.load(request).await)
             }
+            PersistenceCommand::LoadProtocolState(request) => {
+                PersistenceResult::ProtocolStateLoaded(
+                    self.load_protocol_state(&request.application).await,
+                )
+            }
             PersistenceCommand::Initialize(image) => {
                 PersistenceResult::Initialized(self.initialize(image).await)
             }
@@ -1398,6 +1428,27 @@ impl IndexedDbBackend {
             return abort_with(transaction, StoreError::SchemaMismatch).await;
         }
         commit_with(transaction, image).await
+    }
+
+    async fn load_protocol_state(
+        &self,
+        application: &ApplicationIdentity,
+    ) -> Result<ProtocolStateSnapshot, StoreError> {
+        let transaction = self
+            .database()?
+            .transaction(&[META, PROTOCOL_STATE], TransactionMode::ReadOnly)
+            .map_err(|error| indexed_db_error("start protocol-state load transaction", error))?;
+        match read_meta(&transaction, application, self.limits).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return abort_with(transaction, StoreError::MissingApplication).await,
+            Err(error) => return abort_with(transaction, error).await,
+        }
+        let snapshot =
+            match load_protocol_state_records(&transaction, application, self.limits).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => return abort_with(transaction, error).await,
+            };
+        commit_with(transaction, snapshot).await
     }
 
     async fn initialize(&self, image: RestoreImage) -> Result<CommitAck, StoreError> {
@@ -1503,6 +1554,17 @@ impl IndexedDbBackend {
             self.limits,
         )
         .await
+        {
+            return abort_with(transaction, error).await;
+        }
+        if !batch.protocol_state_changes.is_empty()
+            && let Err(error) = apply_sparse_protocol_state_changes(
+                &transaction,
+                &batch.application,
+                &batch.protocol_state_changes,
+                self.limits,
+            )
+            .await
         {
             return abort_with(transaction, error).await;
         }
@@ -1691,6 +1753,7 @@ impl IndexedDbBackend {
             ROWS,
             MIGRATIONS,
             OUTBOX,
+            PROTOCOL_STATE,
             BLOBS,
             ARTIFACTS,
             ARTIFACT_OWNERS,
@@ -2314,23 +2377,93 @@ async fn apply_sparse_outbox_changes(
         }
         super::apply_durable_outbox_changes(&mut outbox, std::slice::from_ref(change))?;
         super::validate_outbox(&outbox)?;
-        let item = outbox
-            .get(&item_id)
-            .ok_or_else(|| corrupt("outbox transition removed its target item"))?;
-        let value = encode_outbox_record(item).map_err(codec_backend)?;
-        if existing.as_deref() != Some(value.as_slice()) {
-            apply_mutations(
-                transaction,
-                vec![StoreMutation::Put {
-                    store: OUTBOX,
-                    key,
-                    value,
-                }],
-            )
-            .await?;
+        match outbox.get(&item_id) {
+            Some(item) => {
+                let value = encode_outbox_record(item).map_err(codec_backend)?;
+                if existing.as_deref() != Some(value.as_slice()) {
+                    apply_mutations(
+                        transaction,
+                        vec![StoreMutation::Put {
+                            store: OUTBOX,
+                            key,
+                            value,
+                        }],
+                    )
+                    .await?;
+                }
+            }
+            None if existing.is_some() => {
+                apply_mutations(
+                    transaction,
+                    vec![StoreMutation::Delete { store: OUTBOX, key }],
+                )
+                .await?;
+            }
+            None => return Err(corrupt("outbox transition has no target item")),
         }
     }
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_protocol_state_records(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    limits: DecodeLimits,
+) -> Result<ProtocolStateSnapshot, StoreError> {
+    let prefix = application_storage_key(application);
+    let mut records = BTreeMap::new();
+    let mut decoded_bytes = 0usize;
+    for (storage_key, bytes) in scan_prefix(transaction, PROTOCOL_STATE, &prefix, limits).await? {
+        decoded_bytes = decoded_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| corrupt("protocol-state byte count overflow"))?;
+        if decoded_bytes > limits.max_total_bytes {
+            return Err(corrupt("protocol-state records exceed decode limit"));
+        }
+        let key = protocol_state_from_storage_key(&storage_key)?;
+        let record = decode_protocol_state_record(&bytes, limits).map_err(codec_backend)?;
+        if records.insert(key, record).is_some() {
+            return Err(corrupt("duplicate protocol-state key"));
+        }
+    }
+    validate_protocol_state(&records)?;
+    Ok(ProtocolStateSnapshot { records })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn apply_sparse_protocol_state_changes(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    changes: &[DurableProtocolStateChange],
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    let current = load_protocol_state_records(transaction, application, limits).await?;
+    let mut candidate = current.clone();
+    apply_durable_protocol_state_changes(&mut candidate.records, changes)?;
+
+    let mut mutations = Vec::new();
+    for key in current
+        .records
+        .keys()
+        .filter(|key| !candidate.records.contains_key(key))
+    {
+        mutations.push(StoreMutation::Delete {
+            store: PROTOCOL_STATE,
+            key: protocol_state_storage_key(application, *key),
+        });
+    }
+    for (key, record) in &candidate.records {
+        if current.records.get(key) == Some(record) {
+            continue;
+        }
+        mutations.push(StoreMutation::Put {
+            store: PROTOCOL_STATE,
+            key: protocol_state_storage_key(application, *key),
+            value: encode_protocol_state_record(record).map_err(codec_backend)?,
+        });
+    }
+    apply_mutations(transaction, mutations).await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3780,6 +3913,7 @@ fn add_decode_bytes(
 fn persistence_result_error(result: &PersistenceResult) -> Option<&StoreError> {
     match result {
         PersistenceResult::Loaded(Err(error))
+        | PersistenceResult::ProtocolStateLoaded(Err(error))
         | PersistenceResult::Initialized(Err(error))
         | PersistenceResult::Committed(Err(error))
         | PersistenceResult::Activated(Err(error))
@@ -3863,7 +3997,9 @@ mod tests {
     use super::*;
     #[cfg(not(target_arch = "wasm32"))]
     use crate::codec::{decode_blob_record, decode_outbox_record};
-    use crate::{DurableContentArtifactChange, StoredScalar, StoredValue};
+    use crate::{
+        DurableContentArtifactChange, DurableProtocolStateChange, StoredScalar, StoredValue,
+    };
     #[cfg(not(target_arch = "wasm32"))]
     use crate::{DurableEffectRow, DurableOutboxItem, StoredList, StoredRow};
     use boon_plan::MemoryLeafId;
@@ -3926,7 +4062,7 @@ mod tests {
             generation: 3,
             fields: BTreeMap::from([
                 (first, StoredValue::Text("text".to_owned())),
-                (second, StoredValue::Bytes(vec![0, 1, 2, 255])),
+                (second, StoredValue::Bytes(vec![0, 1, 2, 255].into())),
             ]),
             touched_fields: BTreeSet::from([first, second]),
         };
@@ -4132,6 +4268,13 @@ mod tests {
                 attempt: 1,
                 turn_sequence: 8,
             }],
+            protocol_state_changes: vec![DurableProtocolStateChange::Put {
+                key: ProtocolStateKey([0x45; 32]),
+                expected_revision: None,
+                next_revision: 1,
+                payload: vec![0x46].into(),
+                turn_sequence: 8,
+            }],
             content_artifact_changes: vec![DurableContentArtifactChange::SetReplaceable {
                 owner_id: ContentArtifactOwnerId([0x42; 32]),
                 artifact_id: ContentArtifactId([0x43; 32]),
@@ -4147,6 +4290,7 @@ mod tests {
                 ROWS,
                 CHECKPOINTS,
                 OUTBOX,
+                PROTOCOL_STATE,
                 BLOBS,
                 ARTIFACTS,
                 ARTIFACT_OWNERS,
@@ -4304,7 +4448,7 @@ mod tests {
             scalar_memory,
             StoredScalar {
                 touched: true,
-                value: StoredValue::Bytes(payload.clone()),
+                value: StoredValue::Bytes(payload.clone().into()),
             },
         );
         candidate.lists.insert(
@@ -4315,14 +4459,13 @@ mod tests {
                 rows: vec![StoredRow {
                     key: 0,
                     generation: 1,
-                    fields: BTreeMap::from([(field, StoredValue::Bytes(payload))]),
+                    fields: BTreeMap::from([(field, StoredValue::Bytes(payload.into()))]),
                     touched_fields: BTreeSet::from([field]),
                 }],
             },
         );
         let effect = EffectId::from_host_operation("Test/send").unwrap();
-        let invocation =
-            EffectInvocationId::from_semantic_route(effect, "test/source", "test/target").unwrap();
+        let invocation = EffectInvocationId::from_result_owner(effect, "test/target").unwrap();
         let item = DurableOutboxItem::pending(
             invocation,
             effect,

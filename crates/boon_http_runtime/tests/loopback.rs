@@ -44,7 +44,7 @@ fn number(value: i64) -> Value {
     Value::Number(FiniteReal::from_i64_exact(value).unwrap())
 }
 
-fn request_payload(endpoint: &str, cancellation: &str) -> SourcePayload {
+fn request_payload(endpoint: &str) -> SourcePayload {
     SourcePayload {
         fields: BTreeMap::from([
             ("endpoint".to_owned(), Value::Text(endpoint.to_owned())),
@@ -69,17 +69,13 @@ fn request_payload(endpoint: &str, cancellation: &str) -> SourcePayload {
                     ("name".to_owned(), Value::Text("accept".to_owned())),
                     (
                         "value".to_owned(),
-                        Value::Bytes(b"application/json".to_vec()),
+                        Value::Bytes(b"application/json".to_vec().into()),
                     ),
                 ]))]),
             ),
-            ("body".to_owned(), Value::Bytes(Vec::new())),
+            ("body".to_owned(), Value::Bytes(Vec::new().into())),
             ("connect_timeout_ms".to_owned(), number(500)),
             ("overall_timeout_ms".to_owned(), number(2_000)),
-            (
-                "cancellation".to_owned(),
-                Value::Text(cancellation.to_owned()),
-            ),
         ]),
         ..SourcePayload::default()
     }
@@ -151,19 +147,15 @@ async fn compiled_boon_effect_uses_real_loopback_and_typed_correlated_completion
     let mut adapter = adapter(server.address);
 
     let dispatched = program
-        .dispatch(
-            "store.request",
-            None,
-            request_payload("catalog", "Independent"),
-        )
+        .dispatch("store.request", None, request_payload("catalog"))
         .unwrap();
     assert!(dispatched.runtime_turn.outbox_changes.is_empty());
     let [invocation] = dispatched.runtime_turn.transient_effects.as_slice() else {
         panic!("Boon turn must emit one transient outbound HTTP call");
     };
     assert_eq!(invocation.effect_id, adapter.effect_id());
+    adapter.route_runtime_turn(&dispatched.runtime_turn);
     let submission = adapter.submit(invocation.clone()).unwrap();
-    assert!(submission.cancelled_calls.is_empty());
     assert!(
         apply_submission(&mut program, submission)
             .unwrap()
@@ -176,7 +168,9 @@ async fn compiled_boon_effect_uses_real_loopback_and_typed_correlated_completion
     };
     assert_eq!(outcome["$tag"], Value::Text("HttpSucceeded".to_owned()));
     assert_eq!(outcome["status"], number(207));
-    assert!(matches!(&outcome["body"], Value::Bytes(bytes) if bytes == br#"{"items":[1]}"#));
+    assert!(
+        matches!(&outcome["body"], Value::Bytes(bytes) if bytes.as_ref() == br#"{"items":[1]}"#)
+    );
     let completion_turn = apply_completion(&mut program, completion).unwrap();
     assert!(completion_turn.outbox_changes.is_empty());
     assert_eq!(program.pending_transient_effect_count(), 0);
@@ -195,20 +189,20 @@ async fn transport_failure_is_typed_bounded_and_does_not_echo_request_secrets() 
     let server = RunningServer::start(Router::new()).await;
     let mut program = program();
     let mut adapter = adapter(server.address);
-    let mut payload = request_payload("not-configured", "Independent");
+    let mut payload = request_payload("not-configured");
     payload.fields.insert(
         "headers".to_owned(),
         Value::List(vec![Value::Record(BTreeMap::from([
             ("name".to_owned(), Value::Text("authorization".to_owned())),
             (
                 "value".to_owned(),
-                Value::Bytes(b"Bearer super-secret-token".to_vec()),
+                Value::Bytes(b"Bearer super-secret-token".to_vec().into()),
             ),
         ]))]),
     );
     payload.fields.insert(
         "body".to_owned(),
-        Value::Bytes(b"super-secret-body".to_vec()),
+        Value::Bytes(b"super-secret-body".to_vec().into()),
     );
 
     let dispatched = program.dispatch("store.request", None, payload).unwrap();
@@ -245,7 +239,7 @@ async fn transport_failure_is_typed_bounded_and_does_not_echo_request_secrets() 
 }
 
 #[tokio::test]
-async fn cancel_previous_removes_runtime_ownership_and_only_latest_completes() {
+async fn runtime_owner_replacement_cancels_the_exact_http_call_before_submission() {
     let server = RunningServer::start(Router::new().route(
         "/api/v1/items",
         get(|| async {
@@ -257,32 +251,25 @@ async fn cancel_previous_removes_runtime_ownership_and_only_latest_completes() {
     let mut program = program();
     let mut adapter = adapter(server.address);
 
-    let first = program
-        .dispatch(
-            "store.request",
-            None,
-            request_payload("catalog", "CancelPrevious"),
-        )
+    let first_turn = program
+        .dispatch("store.request", None, request_payload("catalog"))
         .unwrap()
-        .runtime_turn
-        .transient_effects
-        .remove(0);
+        .runtime_turn;
+    let first = first_turn.transient_effects[0].clone();
     let first_call = first.call_id;
+    adapter.route_runtime_turn(&first_turn);
     apply_submission(&mut program, adapter.submit(first).unwrap()).unwrap();
 
-    let second = program
-        .dispatch(
-            "store.request",
-            None,
-            request_payload("catalog", "CancelPrevious"),
-        )
+    let second_turn = program
+        .dispatch("store.request", None, request_payload("catalog"))
         .unwrap()
-        .runtime_turn
-        .transient_effects
-        .remove(0);
+        .runtime_turn;
+    assert_eq!(second_turn.cancelled_transient_effects, [first_call]);
+    adapter.route_runtime_turn(&second_turn);
+    assert_eq!(adapter.active_count(), 0);
+    let second = second_turn.transient_effects[0].clone();
     let second_call = second.call_id;
     let submission = adapter.submit(second).unwrap();
-    assert_eq!(submission.cancelled_calls, [first_call]);
     apply_submission(&mut program, submission).unwrap();
     assert_eq!(program.pending_transient_effect_count(), 1);
 

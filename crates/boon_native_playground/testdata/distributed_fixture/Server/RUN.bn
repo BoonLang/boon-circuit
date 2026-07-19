@@ -1,5 +1,5 @@
 store: [
-    request_received: SOURCE
+    request_received: Session/store.session_changed
 
     server_count:
         0 |> HOLD server_count {

@@ -9,20 +9,22 @@ pub use content_store::{
     ContentStoreLimits, ContentWriter,
 };
 
+use atomic_write_file::AtomicWriteFile;
 use boon_host_services::{
     CancellationHandle, HMAC_SHA256_TAG_BYTES, HmacSha256Tag, HostServiceError, HostServices,
     SecretMaterial, SecretRef, TimerReceiveError,
 };
 use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, FiniteReal};
 use boon_runtime::{
-    ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectCreditGrant,
-    TransientEffectInvocation, Value,
+    HostValueBinding, ProgramSession, RuntimeTurn, TransientEffectCallId,
+    TransientEffectCreditGrant, TransientEffectInvocation, Value,
 };
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -285,6 +287,28 @@ impl HostServiceEffectAdapter {
         }
     }
 
+    pub fn try_next_completion(
+        &mut self,
+    ) -> Result<Option<HostServiceEffectCompletion>, AdapterError> {
+        loop {
+            let completion = match self.completions_rx.try_recv() {
+                Ok(completion) => completion,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(None),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Closed,
+                        "host-service completion lane closed",
+                    ));
+                }
+            };
+            let Some(active) = self.active_deadlines.remove(&completion.call_id) else {
+                continue;
+            };
+            debug_assert_eq!(active.invocation_id, completion.invocation_id);
+            return Ok(Some(completion));
+        }
+    }
+
     pub fn cancel(&mut self, call_id: TransientEffectCallId) -> bool {
         let Some(active) = self.active_deadlines.remove(&call_id) else {
             return false;
@@ -340,7 +364,10 @@ impl HostServiceEffectAdapter {
         match self.services.secure_random(byte_count) {
             Ok(bytes) => tagged(
                 "RandomBytesReady",
-                BTreeMap::from([("bytes".to_owned(), Value::Bytes(bytes.as_bytes().to_vec()))]),
+                BTreeMap::from([(
+                    "bytes".to_owned(),
+                    Value::Bytes(bytes.as_bytes().to_vec().into()),
+                )]),
             ),
             Err(error) => host_failure(error),
         }
@@ -379,7 +406,10 @@ impl HostServiceEffectAdapter {
         match self.services.hmac_sha256_sign(secret, message) {
             Ok(tag) => tagged(
                 "HmacSigned",
-                BTreeMap::from([("tag".to_owned(), Value::Bytes(tag.into_bytes().to_vec()))]),
+                BTreeMap::from([(
+                    "tag".to_owned(),
+                    Value::Bytes(tag.into_bytes().to_vec().into()),
+                )]),
             ),
             Err(error) => host_failure(error),
         }
@@ -514,34 +544,64 @@ const FILE_WORKER_DISCARD: u8 = 2;
 const FILE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const FILE_CONTENT_TYPE: &str = "application/octet-stream";
 
+struct FileHostValueIssuer {
+    mint: Box<
+        dyn Fn([u8; FILE_CAPABILITY_TOKEN_BYTES], u32) -> Result<HostValueBinding, AdapterError>
+            + Send
+            + Sync,
+    >,
+    open: Box<
+        dyn Fn(&HostValueBinding) -> Option<([u8; FILE_CAPABILITY_TOKEN_BYTES], u32)> + Send + Sync,
+    >,
+}
+
+impl FileHostValueIssuer {
+    fn new(identity: [u8; FILE_CAPABILITY_TOKEN_BYTES]) -> Self {
+        let issuer = Arc::new(HostValueBinding::new_issuer(identity));
+        let mint_issuer = Arc::clone(&issuer);
+        Self {
+            mint: Box::new(move |handle, generation| {
+                mint_issuer
+                    .mint(handle, generation)
+                    .map_err(|error| AdapterError::new(AdapterErrorKind::Capability, error))
+            }),
+            open: Box::new(move |binding| issuer.open(binding)),
+        }
+    }
+
+    fn mint(
+        &self,
+        handle: [u8; FILE_CAPABILITY_TOKEN_BYTES],
+        generation: u32,
+    ) -> Result<HostValueBinding, AdapterError> {
+        (self.mint)(handle, generation)
+    }
+
+    fn open(&self, binding: &HostValueBinding) -> Option<([u8; FILE_CAPABILITY_TOKEN_BYTES], u32)> {
+        (self.open)(binding)
+    }
+}
+
 /// An opaque process-local reference to a host-owned file path.
 ///
-/// The token is intentionally not exposed through Rust accessors. The only
-/// public serialization route produces the typed value accepted by
-/// `File/read_stream`; no path is copied into Boon state.
+/// Boon observes only the structural `FileSelected` or `FileTarget` tag. The
+/// binding is carried by the executor outside ordinary serializable data and
+/// is accepted only by the registry that issued it.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileCapability {
-    token: [u8; FILE_CAPABILITY_TOKEN_BYTES],
-    generation: u32,
+    binding: HostValueBinding,
 }
 
 impl FileCapability {
-    pub const fn generation(&self) -> u32 {
-        self.generation
-    }
-
-    pub fn capability_value(&self) -> Value {
-        Value::Record(BTreeMap::from([
-            ("token".to_owned(), Value::Bytes(self.token.to_vec())),
-            ("generation".to_owned(), number(i64::from(self.generation))),
-        ]))
-    }
-
     pub fn file_selected_value(&self) -> Value {
-        tagged(
-            "FileSelected",
-            BTreeMap::from([("capability".to_owned(), self.capability_value())]),
+        Value::host_bound(
+            tagged("FileSelected", BTreeMap::new()),
+            self.binding.clone(),
         )
+    }
+
+    pub fn file_target_value(&self) -> Value {
+        Value::host_bound(tagged("FileTarget", BTreeMap::new()), self.binding.clone())
     }
 }
 
@@ -549,8 +609,7 @@ impl fmt::Debug for FileCapability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FileCapability")
-            .field("token", &"<opaque>")
-            .field("generation", &self.generation)
+            .field("binding", &self.binding)
             .finish()
     }
 }
@@ -591,11 +650,24 @@ fn package_asset_display_name(url: &str) -> String {
 struct RegisteredFile {
     generation: u32,
     path: PathBuf,
+    access: FileCapabilityAccess,
+}
+
+struct ResolvedFileCapability {
+    handle: [u8; FILE_CAPABILITY_TOKEN_BYTES],
+    path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileCapabilityAccess {
+    Source,
+    Target,
 }
 
 /// Bounded registry that keeps selected paths entirely on the host side.
 pub struct FileCapabilityRegistry {
     max_capabilities: usize,
+    issuer: FileHostValueIssuer,
     files: BTreeMap<[u8; FILE_CAPABILITY_TOKEN_BYTES], RegisteredFile>,
 }
 
@@ -607,8 +679,16 @@ impl FileCapabilityRegistry {
                 "file capability capacity must be positive",
             ));
         }
+        let mut issuer_identity = [0_u8; FILE_CAPABILITY_TOKEN_BYTES];
+        getrandom::fill(&mut issuer_identity).map_err(|error| {
+            AdapterError::new(
+                AdapterErrorKind::Capability,
+                format_args!("cannot initialize file capability issuer: {error}"),
+            )
+        })?;
         Ok(Self {
             max_capabilities,
+            issuer: FileHostValueIssuer::new(issuer_identity),
             files: BTreeMap::new(),
         })
     }
@@ -628,6 +708,21 @@ impl FileCapabilityRegistry {
     pub fn register_file(
         &mut self,
         path: impl Into<PathBuf>,
+    ) -> Result<FileCapability, AdapterError> {
+        self.register(path.into(), FileCapabilityAccess::Source)
+    }
+
+    pub fn register_target(
+        &mut self,
+        path: impl Into<PathBuf>,
+    ) -> Result<FileCapability, AdapterError> {
+        self.register(path.into(), FileCapabilityAccess::Target)
+    }
+
+    fn register(
+        &mut self,
+        path: PathBuf,
+        access: FileCapabilityAccess,
     ) -> Result<FileCapability, AdapterError> {
         if self.files.len() >= self.max_capabilities {
             return Err(AdapterError::new(
@@ -652,12 +747,11 @@ impl FileCapabilityRegistry {
                 RegisteredFile {
                     generation: FILE_CAPABILITY_FIRST_GENERATION,
                     path,
+                    access,
                 },
             );
-            return Ok(FileCapability {
-                token,
-                generation: FILE_CAPABILITY_FIRST_GENERATION,
-            });
+            let binding = self.issuer.mint(token, FILE_CAPABILITY_FIRST_GENERATION)?;
+            return Ok(FileCapability { binding });
         }
         Err(AdapterError::new(
             AdapterErrorKind::Capability,
@@ -671,13 +765,20 @@ impl FileCapabilityRegistry {
         path: impl Into<PathBuf>,
     ) -> Result<FileCapability, AdapterError> {
         let path = validated_host_path(path.into())?;
-        let entry = self.files.get_mut(&capability.token).ok_or_else(|| {
+        let (handle, binding_generation) =
+            self.issuer.open(&capability.binding).ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Capability,
+                    "file capability belongs to another host issuer",
+                )
+            })?;
+        let entry = self.files.get_mut(&handle).ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::Capability,
                 "file capability is unknown or revoked",
             )
         })?;
-        if entry.generation != capability.generation {
+        if entry.generation != binding_generation {
             return Err(AdapterError::new(
                 AdapterErrorKind::Capability,
                 "file capability generation is stale",
@@ -691,38 +792,71 @@ impl FileCapabilityRegistry {
         })?;
         entry.generation = generation;
         entry.path = path;
-        Ok(FileCapability {
-            token: capability.token,
-            generation,
-        })
+        let binding = self.issuer.mint(handle, generation)?;
+        Ok(FileCapability { binding })
     }
 
     pub fn revoke(&mut self, capability: &FileCapability) -> bool {
+        let Some((handle, generation)) = self.issuer.open(&capability.binding) else {
+            return false;
+        };
         if self
             .files
-            .get(&capability.token)
-            .is_none_or(|entry| entry.generation != capability.generation)
+            .get(&handle)
+            .is_none_or(|entry| entry.generation != generation)
         {
             return false;
         }
-        self.files.remove(&capability.token);
+        self.files.remove(&handle);
         true
     }
 
     pub fn contains(&self, capability: &FileCapability) -> bool {
-        self.files
-            .get(&capability.token)
-            .is_some_and(|entry| entry.generation == capability.generation)
+        self.issuer
+            .open(&capability.binding)
+            .is_some_and(|(handle, generation)| {
+                self.files
+                    .get(&handle)
+                    .is_some_and(|entry| entry.generation == generation)
+            })
     }
 
-    fn resolve(&self, capability: &FileCapability) -> Result<PathBuf, FileCapabilityLookup> {
-        let Some(entry) = self.files.get(&capability.token) else {
+    fn resolve_source(
+        &self,
+        capability: &FileCapability,
+    ) -> Result<ResolvedFileCapability, FileCapabilityLookup> {
+        self.resolve(capability, FileCapabilityAccess::Source)
+    }
+
+    fn resolve_target(
+        &self,
+        capability: &FileCapability,
+    ) -> Result<ResolvedFileCapability, FileCapabilityLookup> {
+        self.resolve(capability, FileCapabilityAccess::Target)
+    }
+
+    fn resolve(
+        &self,
+        capability: &FileCapability,
+        access: FileCapabilityAccess,
+    ) -> Result<ResolvedFileCapability, FileCapabilityLookup> {
+        let (handle, generation) = self
+            .issuer
+            .open(&capability.binding)
+            .ok_or(FileCapabilityLookup::Unknown)?;
+        let Some(entry) = self.files.get(&handle) else {
             return Err(FileCapabilityLookup::Unknown);
         };
-        if entry.generation != capability.generation {
+        if entry.generation != generation {
             return Err(FileCapabilityLookup::Stale);
         }
-        Ok(entry.path.clone())
+        if entry.access != access {
+            return Err(FileCapabilityLookup::WrongAccess);
+        }
+        Ok(ResolvedFileCapability {
+            handle,
+            path: entry.path.clone(),
+        })
     }
 }
 
@@ -740,16 +874,17 @@ fn validated_host_path(path: PathBuf) -> Result<PathBuf, AdapterError> {
 enum FileCapabilityLookup {
     Unknown,
     Stale,
+    WrongAccess,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FileReadStreamLimits {
+pub struct FileEffectLimits {
     pub max_active: usize,
     pub event_queue_capacity: usize,
     pub credit_queue_capacity: usize,
 }
 
-impl FileReadStreamLimits {
+impl FileEffectLimits {
     pub const fn new(
         max_active: usize,
         event_queue_capacity: usize,
@@ -763,7 +898,7 @@ impl FileReadStreamLimits {
     }
 }
 
-impl Default for FileReadStreamLimits {
+impl Default for FileEffectLimits {
     fn default() -> Self {
         Self {
             max_active: 8,
@@ -774,17 +909,22 @@ impl Default for FileReadStreamLimits {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileReadStreamEvent {
+pub struct FileEffectEvent {
     pub call_id: TransientEffectCallId,
     pub invocation_id: EffectInvocationId,
     pub result_sequence: u64,
     pub outcome: Value,
     terminal: bool,
+    stream: bool,
 }
 
-impl FileReadStreamEvent {
+impl FileEffectEvent {
     pub const fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    pub const fn is_stream(&self) -> bool {
+        self.stream
     }
 
     pub fn result_tag(&self) -> Option<&str> {
@@ -799,19 +939,85 @@ impl FileReadStreamEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileReadStreamSubmission {
+pub struct FileEffectSubmission {
     pub call_id: TransientEffectCallId,
-    pub replaced_call: Option<TransientEffectCallId>,
     pub queued_terminal: bool,
 }
 
-struct ActiveFileRead {
+struct ActiveFileOperation {
     invocation_id: EffectInvocationId,
     max_in_flight: u32,
     state: Arc<AtomicU8>,
     outstanding_credits: Arc<AtomicU32>,
     credit_tx: std_mpsc::SyncSender<()>,
     task: Option<thread::JoinHandle<()>>,
+    target_token: Option<[u8; FILE_CAPABILITY_TOKEN_BYTES]>,
+}
+
+struct FileWorkerControl {
+    call_id: TransientEffectCallId,
+    invocation_id: EffectInvocationId,
+    state: Arc<AtomicU8>,
+    outstanding_credits: Arc<AtomicU32>,
+    credit_rx: std_mpsc::Receiver<()>,
+    events_tx: mpsc::Sender<FileEffectEvent>,
+    stream: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FileEffectIds {
+    read_bytes: EffectId,
+    write_bytes: EffectId,
+    read_stream: EffectId,
+    content_import: EffectId,
+    content_save: EffectId,
+}
+
+impl FileEffectIds {
+    fn new() -> Result<Self, AdapterError> {
+        Ok(Self {
+            read_bytes: effect_id(boon_effect_schema::FILE_READ_BYTES_OPERATION)?,
+            write_bytes: effect_id(boon_effect_schema::FILE_WRITE_BYTES_OPERATION)?,
+            read_stream: effect_id(boon_effect_schema::FILE_READ_STREAM_OPERATION)?,
+            content_import: effect_id(boon_effect_schema::CONTENT_IMPORT_OPERATION)?,
+            content_save: effect_id(boon_effect_schema::CONTENT_SAVE_OPERATION)?,
+        })
+    }
+
+    fn operation(self, effect_id: EffectId) -> Option<FileOperation> {
+        if effect_id == self.read_bytes {
+            Some(FileOperation::ReadBytes)
+        } else if effect_id == self.write_bytes {
+            Some(FileOperation::WriteBytes)
+        } else if effect_id == self.read_stream {
+            Some(FileOperation::ReadStream)
+        } else if effect_id == self.content_import {
+            Some(FileOperation::ContentImport)
+        } else if effect_id == self.content_save {
+            Some(FileOperation::ContentSave)
+        } else {
+            None
+        }
+    }
+
+    const fn all(self) -> [EffectId; 5] {
+        [
+            self.read_bytes,
+            self.write_bytes,
+            self.read_stream,
+            self.content_import,
+            self.content_save,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileOperation {
+    ReadBytes,
+    WriteBytes,
+    ReadStream,
+    ContentImport,
+    ContentSave,
 }
 
 struct RegisteredPackageAsset {
@@ -819,38 +1025,44 @@ struct RegisteredPackageAsset {
     display_name: String,
 }
 
-/// Bounded host adapter for only the typed `File/read_stream` effect.
-pub struct FileReadStreamEffectAdapter {
+/// Bounded host adapter for the typed File and Content effects.
+pub struct FileEffectAdapter {
     capabilities: FileCapabilityRegistry,
     package_assets: BTreeMap<String, RegisteredPackageAsset>,
     content_store: ContentStore,
-    effect_id: EffectId,
-    limits: FileReadStreamLimits,
-    active: BTreeMap<TransientEffectCallId, ActiveFileRead>,
+    effects: FileEffectIds,
+    limits: FileEffectLimits,
+    active: BTreeMap<TransientEffectCallId, ActiveFileOperation>,
+    busy_targets: BTreeMap<[u8; FILE_CAPABILITY_TOKEN_BYTES], TransientEffectCallId>,
     queued_terminals: BTreeMap<TransientEffectCallId, EffectInvocationId>,
-    latest_by_invocation: BTreeMap<EffectInvocationId, TransientEffectCallId>,
-    events_tx: mpsc::Sender<FileReadStreamEvent>,
-    events_rx: mpsc::Receiver<FileReadStreamEvent>,
+    events_tx: mpsc::Sender<FileEffectEvent>,
+    events_rx: mpsc::Receiver<FileEffectEvent>,
 }
 
-impl FileReadStreamEffectAdapter {
+impl FileEffectAdapter {
     pub fn new(
         capabilities: FileCapabilityRegistry,
         content_store: ContentStore,
         max_active: usize,
     ) -> Result<Self, AdapterError> {
-        let event_queue_capacity = max_active
-            .checked_mul(boon_effect_schema::FILE_STREAM_MAX_IN_FLIGHT as usize)
+        let events_per_active = (boon_effect_schema::FILE_STREAM_MAX_IN_FLIGHT as usize)
+            .checked_add(1)
             .ok_or_else(|| {
                 AdapterError::new(
                     AdapterErrorKind::InvalidConfiguration,
                     "file stream event capacity overflow",
                 )
             })?;
+        let event_queue_capacity = max_active.checked_mul(events_per_active).ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::InvalidConfiguration,
+                "file stream event capacity overflow",
+            )
+        })?;
         Self::with_limits(
             capabilities,
             content_store,
-            FileReadStreamLimits::new(
+            FileEffectLimits::new(
                 max_active,
                 event_queue_capacity,
                 boon_effect_schema::FILE_STREAM_MAX_IN_FLIGHT as usize,
@@ -861,7 +1073,7 @@ impl FileReadStreamEffectAdapter {
     pub fn with_limits(
         capabilities: FileCapabilityRegistry,
         content_store: ContentStore,
-        limits: FileReadStreamLimits,
+        limits: FileEffectLimits,
     ) -> Result<Self, AdapterError> {
         if limits.max_active == 0
             || limits.event_queue_capacity == 0
@@ -872,30 +1084,31 @@ impl FileReadStreamEffectAdapter {
                 "file stream active, event, and credit capacities must be positive",
             ));
         }
-        let effect_id = EffectId::from_host_operation(
-            boon_effect_schema::FILE_READ_STREAM_OPERATION,
-        )
-        .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidConfiguration, error))?;
+        let effects = FileEffectIds::new()?;
         let (events_tx, events_rx) = mpsc::channel(limits.event_queue_capacity);
         Ok(Self {
             capabilities,
             package_assets: BTreeMap::new(),
             content_store,
-            effect_id,
+            effects,
             limits,
             active: BTreeMap::new(),
+            busy_targets: BTreeMap::new(),
             queued_terminals: BTreeMap::new(),
-            latest_by_invocation: BTreeMap::new(),
             events_tx,
             events_rx,
         })
     }
 
-    pub const fn effect_id(&self) -> EffectId {
-        self.effect_id
+    pub const fn effect_ids(&self) -> [EffectId; 5] {
+        self.effects.all()
     }
 
-    pub const fn limits(&self) -> FileReadStreamLimits {
+    pub fn owns_effect(&self, effect_id: EffectId) -> bool {
+        self.effects.operation(effect_id).is_some()
+    }
+
+    pub const fn limits(&self) -> FileEffectLimits {
         self.limits
     }
 
@@ -914,17 +1127,18 @@ impl FileReadStreamEffectAdapter {
     pub fn register_package_asset(
         &mut self,
         url: impl Into<String>,
+        media: impl Into<Arc<str>>,
         bytes: &[u8],
     ) -> Result<ContentRef, AdapterError> {
         let url = url.into();
         validate_package_asset_url(&url)?;
         let content = self
             .content_store
-            .insert_bytes(bytes)
+            .insert_bytes(bytes, media)
             .map_err(|error| AdapterError::new(AdapterErrorKind::Capacity, error))?;
         let lease = self
             .content_store
-            .resolve(content)
+            .resolve(&content)
             .map_err(|error| AdapterError::new(AdapterErrorKind::Capacity, error))?;
         let display_name = package_asset_display_name(&url);
         self.package_assets.insert(
@@ -962,97 +1176,267 @@ impl FileReadStreamEffectAdapter {
     pub fn submit(
         &mut self,
         invocation: TransientEffectInvocation,
-    ) -> Result<FileReadStreamSubmission, AdapterError> {
-        if invocation.effect_id != self.effect_id {
+    ) -> Result<FileEffectSubmission, AdapterError> {
+        let operation = self
+            .effects
+            .operation(invocation.effect_id)
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::NotOwned,
+                    format_args!("file adapter does not own effect {}", invocation.effect_id),
+                )
+            })?;
+        if self.active.contains_key(&invocation.call_id)
+            || self.queued_terminals.contains_key(&invocation.call_id)
+        {
             return Err(AdapterError::new(
                 AdapterErrorKind::NotOwned,
-                format_args!(
-                    "file stream adapter does not own effect {}",
-                    invocation.effect_id
-                ),
+                "file effect call ID is already owned by the adapter",
             ));
         }
-        let (initial_credits, max_in_flight) = validate_file_stream_delivery(&invocation.delivery)?;
 
-        let replaced_call = self
-            .latest_by_invocation
-            .get(&invocation.invocation_id)
-            .copied()
-            .filter(|call_id| *call_id != invocation.call_id);
-        if let Some(previous) = replaced_call {
-            self.cancel(previous);
+        match operation {
+            FileOperation::ReadBytes => self.submit_read_bytes(invocation),
+            FileOperation::WriteBytes => self.submit_write_bytes(invocation),
+            FileOperation::ReadStream => self.submit_read_stream(invocation),
+            FileOperation::ContentImport => self.submit_content_import(invocation),
+            FileOperation::ContentSave => self.submit_content_save(invocation),
         }
+    }
+
+    fn submit_read_bytes(
+        &mut self,
+        invocation: TransientEffectInvocation,
+    ) -> Result<FileEffectSubmission, AdapterError> {
+        validate_single_file_delivery(&invocation.delivery, "File/read_bytes")?;
+        let decoded = match decode_file_read_bytes_intent(&invocation.intent) {
+            Ok(decoded) => decoded,
+            Err(failure) => return self.queue_terminal_failure(invocation, failure),
+        };
+        let source = match self.resolve_source(decoded.source) {
+            Ok(source) => source,
+            Err(failure) => return self.queue_terminal_failure(invocation, failure),
+        };
+        self.start_operation(invocation, 0, 0, None, "file-read-bytes", move |control| {
+            run_file_read_bytes_worker(FileReadBytesWorker {
+                control,
+                source,
+                max_bytes: decoded.max_bytes,
+            })
+        })
+    }
+
+    fn submit_write_bytes(
+        &mut self,
+        invocation: TransientEffectInvocation,
+    ) -> Result<FileEffectSubmission, AdapterError> {
+        validate_single_file_delivery(&invocation.delivery, "File/write_bytes")?;
+        let decoded = match decode_file_write_bytes_intent(&invocation.intent) {
+            Ok(decoded) => decoded,
+            Err(failure) => return self.queue_terminal_failure(invocation, failure),
+        };
+        let target = match self.capabilities.resolve_target(&decoded.target) {
+            Ok(target) => target,
+            Err(error) => {
+                return self.queue_terminal_failure(invocation, file_target_lookup_failure(error));
+            }
+        };
+        let target_token = target.handle;
+        let target_path = target.path;
+        self.start_operation(
+            invocation,
+            0,
+            0,
+            Some(target_token),
+            "file-write-bytes",
+            move |control| {
+                run_file_write_bytes_worker(FileWriteBytesWorker {
+                    control,
+                    target_path,
+                    bytes: decoded.bytes,
+                })
+            },
+        )
+    }
+
+    fn submit_content_import(
+        &mut self,
+        invocation: TransientEffectInvocation,
+    ) -> Result<FileEffectSubmission, AdapterError> {
+        let (initial_credits, max_in_flight) = validate_content_stream_delivery(
+            &invocation.delivery,
+            &["Busy", "Cancelled", "Failed", "Imported"],
+            "Content/import",
+        )?;
+        let source = match decode_content_import_intent(&invocation.intent)
+            .and_then(|source| self.resolve_source(source))
+        {
+            Ok(source) => source,
+            Err(failure) => return self.queue_terminal_failure(invocation, failure),
+        };
+        let content_store = self.content_store.clone();
+        self.start_operation(
+            invocation,
+            initial_credits,
+            max_in_flight,
+            None,
+            "content-import",
+            move |control| {
+                run_content_import_worker(ContentImportWorker {
+                    control,
+                    source,
+                    content_store,
+                })
+            },
+        )
+    }
+
+    fn submit_content_save(
+        &mut self,
+        invocation: TransientEffectInvocation,
+    ) -> Result<FileEffectSubmission, AdapterError> {
+        let (initial_credits, max_in_flight) = validate_content_stream_delivery(
+            &invocation.delivery,
+            &["Busy", "Cancelled", "Failed", "Saved"],
+            "Content/save",
+        )?;
+        let decoded = match decode_content_save_intent(&invocation.intent) {
+            Ok(decoded) => decoded,
+            Err(failure) => return self.queue_terminal_failure(invocation, failure),
+        };
+        let target = match self.capabilities.resolve_target(&decoded.target) {
+            Ok(target) => target,
+            Err(error) => {
+                return self.queue_terminal_failure(invocation, file_target_lookup_failure(error));
+            }
+        };
+        let content = match self.content_store.resolve(&decoded.content) {
+            Ok(content) => content,
+            Err(error) => {
+                return self.queue_terminal_failure(invocation, content_store_failure(error));
+            }
+        };
+        let target_token = target.handle;
+        let target_path = target.path;
+        self.start_operation(
+            invocation,
+            initial_credits,
+            max_in_flight,
+            Some(target_token),
+            "content-save",
+            move |control| {
+                run_content_save_worker(ContentSaveWorker {
+                    control,
+                    content,
+                    target_path,
+                })
+            },
+        )
+    }
+
+    fn submit_read_stream(
+        &mut self,
+        invocation: TransientEffectInvocation,
+    ) -> Result<FileEffectSubmission, AdapterError> {
+        let (initial_credits, max_in_flight) = validate_file_stream_delivery(&invocation.delivery)?;
 
         let decoded = match decode_file_read_stream_intent(&invocation.intent) {
             Ok(decoded) => decoded,
             Err(failure) => {
-                return self.queue_terminal_failure(invocation, replaced_call, failure);
+                return self.queue_terminal_failure(invocation, failure);
             }
         };
-        let (path, display_name, source_lease) = match decoded.source {
+        let source = match self.resolve_source(decoded.source) {
+            Ok(source) => source,
+            Err(failure) => return self.queue_terminal_failure(invocation, failure),
+        };
+        let worker = FileReadWorkerInput {
+            path: source.path,
+            display_name: source.display_name,
+            _source_lease: source.lease,
+            media: source.media,
+            chunk_bytes: decoded.chunk_bytes,
+            retain_content: decoded.retain_content,
+            content_store: self.content_store.clone(),
+        };
+        self.start_operation(
+            invocation,
+            initial_credits,
+            max_in_flight,
+            None,
+            "file-read-stream",
+            move |control| {
+                run_file_read_worker(FileReadWorker {
+                    control,
+                    input: worker,
+                })
+            },
+        )
+    }
+
+    fn resolve_source(
+        &self,
+        source: DecodedFileSource,
+    ) -> Result<ResolvedFileSource, FileStreamFailure> {
+        match source {
             DecodedFileSource::Capability(capability) => {
-                let path = match self.capabilities.resolve(&capability) {
-                    Ok(path) => path,
-                    Err(FileCapabilityLookup::Unknown) => {
-                        return self.queue_terminal_failure(
-                            invocation,
-                            replaced_call,
-                            FileStreamFailure::new(
-                                "unknown_capability",
-                                "file capability is unknown or revoked",
-                            ),
-                        );
-                    }
-                    Err(FileCapabilityLookup::Stale) => {
-                        return self.queue_terminal_failure(
-                            invocation,
-                            replaced_call,
-                            FileStreamFailure::new(
-                                "stale_capability",
-                                "file capability generation is stale",
-                            ),
-                        );
-                    }
-                };
-                (path, None, None)
+                let source = self
+                    .capabilities
+                    .resolve_source(&capability)
+                    .map_err(file_source_lookup_failure)?;
+                Ok(ResolvedFileSource {
+                    path: source.path,
+                    display_name: None,
+                    lease: None,
+                    media: Arc::<str>::from(FILE_CONTENT_TYPE),
+                })
             }
             DecodedFileSource::PackageAsset(url) => {
-                let Some(asset) = self.package_assets.get(&url) else {
-                    return self.queue_terminal_failure(
-                        invocation,
-                        replaced_call,
-                        FileStreamFailure::new(
-                            "unknown_package_asset",
-                            "package asset is absent from the active application",
-                        ),
-                    );
-                };
-                let lease = match self.content_store.resolve(asset.content.content()) {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        return self.queue_terminal_failure(
-                            invocation,
-                            replaced_call,
-                            content_store_failure(error),
-                        );
-                    }
-                };
-                (
-                    lease.path().to_path_buf(),
-                    Some(asset.display_name.clone()),
-                    Some(lease),
-                )
+                let asset = self.package_assets.get(&url).ok_or_else(|| {
+                    FileStreamFailure::new(
+                        "unknown_package_asset",
+                        "package asset is absent from the active application",
+                    )
+                })?;
+                let lease = self
+                    .content_store
+                    .resolve(asset.content.content())
+                    .map_err(content_store_failure)?;
+                Ok(ResolvedFileSource {
+                    path: lease.path().to_path_buf(),
+                    display_name: Some(asset.display_name.clone()),
+                    media: Arc::<str>::from(asset.content.content().media()),
+                    lease: Some(lease),
+                })
             }
-        };
+        }
+    }
+
+    fn start_operation<F>(
+        &mut self,
+        invocation: TransientEffectInvocation,
+        initial_credits: u32,
+        max_in_flight: u32,
+        target_token: Option<[u8; FILE_CAPABILITY_TOKEN_BYTES]>,
+        worker_name: &'static str,
+        worker: F,
+    ) -> Result<FileEffectSubmission, AdapterError>
+    where
+        F: FnOnce(FileWorkerControl) + Send + 'static,
+    {
         if self.active.len() >= self.limits.max_active {
             return self.queue_terminal_failure(
                 invocation,
-                replaced_call,
                 FileStreamFailure::new(
                     "host_busy",
-                    "file stream host is at its configured active-read limit",
+                    "file host is at its configured active-operation limit",
                 ),
             );
+        }
+        if let Some(token) = target_token
+            && self.busy_targets.contains_key(&token)
+        {
+            return self.queue_terminal_outcome(invocation, tagged("Busy", BTreeMap::new()));
         }
 
         let call_id = invocation.call_id;
@@ -1060,29 +1444,23 @@ impl FileReadStreamEffectAdapter {
         let state = Arc::new(AtomicU8::new(FILE_WORKER_RUNNING));
         let outstanding_credits = Arc::new(AtomicU32::new(initial_credits));
         let (credit_tx, credit_rx) = std_mpsc::sync_channel(self.limits.credit_queue_capacity);
-        let worker = FileReadWorker {
+        let control = FileWorkerControl {
             call_id,
             invocation_id,
-            path,
-            display_name,
-            _source_lease: source_lease,
-            chunk_bytes: decoded.chunk_bytes,
-            retain_content: decoded.retain_content,
-            content_store: self.content_store.clone(),
             state: Arc::clone(&state),
             outstanding_credits: Arc::clone(&outstanding_credits),
             credit_rx,
             events_tx: self.events_tx.clone(),
+            stream: max_in_flight > 0,
         };
         let task = match thread::Builder::new()
-            .name(format!("boon-file-read-{}", call_id.sequence()))
-            .spawn(move || run_file_read_worker(worker))
+            .name(format!("boon-{worker_name}-{}", call_id.sequence()))
+            .spawn(move || worker(control))
         {
             Ok(task) => task,
             Err(error) => {
                 return self.queue_terminal_failure(
                     invocation,
-                    replaced_call,
                     FileStreamFailure::new(
                         "worker_unavailable",
                         format!("cannot start bounded file worker: {error}"),
@@ -1090,26 +1468,28 @@ impl FileReadStreamEffectAdapter {
                 );
             }
         };
+        if let Some(token) = target_token {
+            self.busy_targets.insert(token, call_id);
+        }
         self.active.insert(
             call_id,
-            ActiveFileRead {
+            ActiveFileOperation {
                 invocation_id,
                 max_in_flight,
                 state,
                 outstanding_credits,
                 credit_tx,
                 task: Some(task),
+                target_token,
             },
         );
-        self.latest_by_invocation.insert(invocation_id, call_id);
-        Ok(FileReadStreamSubmission {
+        Ok(FileEffectSubmission {
             call_id,
-            replaced_call,
             queued_terminal: false,
         })
     }
 
-    pub async fn next_event(&mut self) -> Result<FileReadStreamEvent, AdapterError> {
+    pub async fn next_event(&mut self) -> Result<FileEffectEvent, AdapterError> {
         loop {
             let event = self.events_rx.recv().await.ok_or_else(|| {
                 AdapterError::new(AdapterErrorKind::Closed, "file stream event lane closed")
@@ -1120,7 +1500,7 @@ impl FileReadStreamEffectAdapter {
         }
     }
 
-    pub fn try_next_event(&mut self) -> Result<Option<FileReadStreamEvent>, AdapterError> {
+    pub fn try_next_event(&mut self) -> Result<Option<FileEffectEvent>, AdapterError> {
         loop {
             match self.events_rx.try_recv() {
                 Ok(event) => {
@@ -1165,12 +1545,14 @@ impl FileReadStreamEffectAdapter {
         let mut found = false;
         if let Some(active) = self.active.remove(&call_id) {
             found = true;
+            if let Some(target_token) = active.target_token {
+                self.busy_targets.remove(&target_token);
+            }
             stop_file_worker(active);
         }
         if self.queued_terminals.remove(&call_id).is_some() {
             found = true;
         }
-        self.remove_latest_call(call_id);
         found
     }
 
@@ -1253,49 +1635,55 @@ impl FileReadStreamEffectAdapter {
     fn queue_terminal_failure(
         &mut self,
         invocation: TransientEffectInvocation,
-        replaced_call: Option<TransientEffectCallId>,
         failure: FileStreamFailure,
-    ) -> Result<FileReadStreamSubmission, AdapterError> {
-        let event = FileReadStreamEvent {
+    ) -> Result<FileEffectSubmission, AdapterError> {
+        self.queue_terminal_outcome(invocation, file_failure_outcome(failure))
+    }
+
+    fn queue_terminal_outcome(
+        &mut self,
+        invocation: TransientEffectInvocation,
+        outcome: Value,
+    ) -> Result<FileEffectSubmission, AdapterError> {
+        let event = FileEffectEvent {
             call_id: invocation.call_id,
             invocation_id: invocation.invocation_id,
             result_sequence: 0,
-            outcome: file_failure_outcome(failure),
+            outcome,
             terminal: true,
+            stream: matches!(
+                invocation.delivery,
+                EffectDeliveryCardinality::Stream { .. }
+            ),
         };
         match self.events_tx.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Capacity,
-                    "file stream event queue is full",
+                    "file effect event queue is full",
                 ));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Closed,
-                    "file stream event lane closed",
+                    "file effect event lane closed",
                 ));
             }
         }
         self.queued_terminals
             .insert(invocation.call_id, invocation.invocation_id);
-        self.latest_by_invocation
-            .insert(invocation.invocation_id, invocation.call_id);
-        Ok(FileReadStreamSubmission {
+        Ok(FileEffectSubmission {
             call_id: invocation.call_id,
-            replaced_call,
             queued_terminal: true,
         })
     }
 
-    fn accept_event(&mut self, event: FileReadStreamEvent) -> Option<FileReadStreamEvent> {
+    fn accept_event(&mut self, event: FileEffectEvent) -> Option<FileEffectEvent> {
         if let Some(invocation_id) = self.queued_terminals.remove(&event.call_id) {
             if invocation_id != event.invocation_id || !event.terminal {
-                self.remove_latest_call(event.call_id);
                 return None;
             }
-            self.remove_latest_call(event.call_id);
             return Some(event);
         }
         let Some(active) = self.active.get(&event.call_id) else {
@@ -1310,40 +1698,33 @@ impl FileReadStreamEffectAdapter {
                 .active
                 .remove(&event.call_id)
                 .expect("active file call was just observed");
+            if let Some(target_token) = active.target_token {
+                self.busy_targets.remove(&target_token);
+            }
             finish_file_worker(active);
-            self.remove_latest_call(event.call_id);
         }
         Some(event)
     }
-
-    fn remove_latest_call(&mut self, call_id: TransientEffectCallId) {
-        let invocation_id = self
-            .latest_by_invocation
-            .iter()
-            .find_map(|(invocation_id, latest)| (*latest == call_id).then_some(*invocation_id));
-        if let Some(invocation_id) = invocation_id {
-            self.latest_by_invocation.remove(&invocation_id);
-        }
-    }
 }
 
-impl Drop for FileReadStreamEffectAdapter {
+impl Drop for FileEffectAdapter {
     fn drop(&mut self) {
         self.cancel_all();
     }
 }
 
-pub fn apply_file_read_stream_event(
+pub fn apply_file_effect_event(
     program: &mut ProgramSession,
-    adapter: &mut FileReadStreamEffectAdapter,
-    event: FileReadStreamEvent,
+    adapter: &mut FileEffectAdapter,
+    event: FileEffectEvent,
 ) -> Result<RuntimeTurn, AdapterError> {
     let call_id = event.call_id;
-    let turn = match program.deliver_transient_effect_result(
-        event.call_id,
-        event.result_sequence,
-        event.outcome,
-    ) {
+    let delivered = if event.is_stream() {
+        program.deliver_transient_effect_result(event.call_id, event.result_sequence, event.outcome)
+    } else {
+        program.complete_transient_effect(event.call_id, event.outcome)
+    };
+    let turn = match delivered {
         Ok(turn) => turn,
         Err(error) => {
             adapter.cancel(call_id);
@@ -1356,10 +1737,10 @@ pub fn apply_file_read_stream_event(
 
 pub fn apply_event(
     program: &mut ProgramSession,
-    adapter: &mut FileReadStreamEffectAdapter,
-    event: FileReadStreamEvent,
+    adapter: &mut FileEffectAdapter,
+    event: FileEffectEvent,
 ) -> Result<RuntimeTurn, AdapterError> {
-    apply_file_read_stream_event(program, adapter, event)
+    apply_file_effect_event(program, adapter, event)
 }
 
 fn validate_file_stream_delivery(
@@ -1368,6 +1749,7 @@ fn validate_file_stream_delivery(
     let EffectDeliveryCardinality::Stream {
         initial_credits,
         max_in_flight,
+        credit_result_tags,
         terminal_result_tags,
     } = delivery
     else {
@@ -1379,6 +1761,7 @@ fn validate_file_stream_delivery(
     let expected_terminal_tags = ["Cancelled", "Failed", "Finished"];
     if *initial_credits != boon_effect_schema::FILE_STREAM_INITIAL_CREDITS
         || *max_in_flight != boon_effect_schema::FILE_STREAM_MAX_IN_FLIGHT
+        || !credit_result_tags.iter().map(String::as_str).eq(["Chunk"])
         || !terminal_result_tags
             .iter()
             .map(String::as_str)
@@ -1392,15 +1775,193 @@ fn validate_file_stream_delivery(
     Ok((*initial_credits, *max_in_flight))
 }
 
+fn validate_single_file_delivery(
+    delivery: &EffectDeliveryCardinality,
+    operation: &str,
+) -> Result<(), AdapterError> {
+    if !matches!(delivery, EffectDeliveryCardinality::Single) {
+        return Err(AdapterError::new(
+            AdapterErrorKind::InvalidDelivery,
+            format_args!("{operation} requires declared Single delivery"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_content_stream_delivery(
+    delivery: &EffectDeliveryCardinality,
+    expected_terminal_tags: &[&str],
+    operation: &str,
+) -> Result<(u32, u32), AdapterError> {
+    let EffectDeliveryCardinality::Stream {
+        initial_credits,
+        max_in_flight,
+        credit_result_tags,
+        terminal_result_tags,
+    } = delivery
+    else {
+        return Err(AdapterError::new(
+            AdapterErrorKind::InvalidDelivery,
+            format_args!("{operation} requires declared Stream delivery"),
+        ));
+    };
+    if *initial_credits != boon_effect_schema::FILE_STREAM_INITIAL_CREDITS
+        || *max_in_flight != boon_effect_schema::FILE_STREAM_MAX_IN_FLIGHT
+        || !credit_result_tags
+            .iter()
+            .map(String::as_str)
+            .eq(["Progress"])
+        || !terminal_result_tags
+            .iter()
+            .map(String::as_str)
+            .eq(expected_terminal_tags.iter().copied())
+    {
+        return Err(AdapterError::new(
+            AdapterErrorKind::InvalidDelivery,
+            format_args!("{operation} delivery differs from the bounded typed contract"),
+        ));
+    }
+    Ok((*initial_credits, *max_in_flight))
+}
+
 enum DecodedFileSource {
     Capability(FileCapability),
     PackageAsset(String),
+}
+
+struct ResolvedFileSource {
+    path: PathBuf,
+    display_name: Option<String>,
+    lease: Option<ContentLease>,
+    media: Arc<str>,
+}
+
+fn file_source_lookup_failure(error: FileCapabilityLookup) -> FileStreamFailure {
+    match error {
+        FileCapabilityLookup::Unknown => FileStreamFailure::new(
+            "unknown_capability",
+            "file capability is unknown or revoked",
+        ),
+        FileCapabilityLookup::Stale => {
+            FileStreamFailure::new("stale_capability", "file capability generation is stale")
+        }
+        FileCapabilityLookup::WrongAccess => FileStreamFailure::new(
+            "wrong_capability_access",
+            "file target capability cannot be used as a read source",
+        ),
+    }
+}
+
+fn file_target_lookup_failure(error: FileCapabilityLookup) -> FileStreamFailure {
+    match error {
+        FileCapabilityLookup::Unknown => FileStreamFailure::new(
+            "unknown_capability",
+            "file target capability is unknown or revoked",
+        ),
+        FileCapabilityLookup::Stale => FileStreamFailure::new(
+            "stale_capability",
+            "file target capability generation is stale",
+        ),
+        FileCapabilityLookup::WrongAccess => FileStreamFailure::new(
+            "wrong_capability_access",
+            "file source capability cannot be used as a write target",
+        ),
+    }
 }
 
 struct DecodedFileReadIntent {
     source: DecodedFileSource,
     chunk_bytes: usize,
     retain_content: bool,
+}
+
+struct DecodedFileReadBytesIntent {
+    source: DecodedFileSource,
+    max_bytes: usize,
+}
+
+struct DecodedFileWriteBytesIntent {
+    target: FileCapability,
+    bytes: Bytes,
+}
+
+struct DecodedContentSaveIntent {
+    content: ContentRef,
+    target: FileCapability,
+}
+
+fn decode_file_read_bytes_intent(
+    value: &Value,
+) -> Result<DecodedFileReadBytesIntent, FileStreamFailure> {
+    let fields = file_record(value, &["file", "max_bytes"], "file read-bytes intent")?;
+    let source = decode_file_source(
+        fields
+            .get("file")
+            .ok_or_else(|| FileStreamFailure::invalid("read-bytes intent is missing `file`"))?,
+    )?;
+    let max_bytes = file_positive_u64(fields, "max_bytes")?;
+    if !(boon_effect_schema::FILE_BYTES_MIN_LIMIT..=boon_effect_schema::FILE_BYTES_MAX_LIMIT)
+        .contains(&max_bytes)
+    {
+        return Err(FileStreamFailure::invalid(
+            "read-bytes max_bytes is outside the typed bounded range",
+        ));
+    }
+    let max_bytes = usize::try_from(max_bytes).map_err(|_| {
+        FileStreamFailure::invalid("read-bytes max_bytes exceeds the host platform range")
+    })?;
+    Ok(DecodedFileReadBytesIntent { source, max_bytes })
+}
+
+fn decode_file_write_bytes_intent(
+    value: &Value,
+) -> Result<DecodedFileWriteBytesIntent, FileStreamFailure> {
+    let fields = file_record(value, &["bytes", "file"], "file write-bytes intent")?;
+    let target = decode_file_target(
+        fields
+            .get("file")
+            .ok_or_else(|| FileStreamFailure::invalid("write-bytes intent is missing `file`"))?,
+    )?;
+    let bytes = match fields.get("bytes") {
+        Some(Value::Bytes(bytes)) => bytes.clone(),
+        _ => {
+            return Err(FileStreamFailure::invalid(
+                "write-bytes `bytes` must be Bytes",
+            ));
+        }
+    };
+    if bytes.len() as u64 > boon_effect_schema::FILE_BYTES_MAX_LIMIT {
+        return Err(FileStreamFailure::new(
+            "file_too_large",
+            "write-bytes payload exceeds the bounded small-file limit",
+        ));
+    }
+    Ok(DecodedFileWriteBytesIntent { target, bytes })
+}
+
+fn decode_content_import_intent(value: &Value) -> Result<DecodedFileSource, FileStreamFailure> {
+    let fields = file_record(value, &["file"], "content import intent")?;
+    decode_file_source(
+        fields
+            .get("file")
+            .ok_or_else(|| FileStreamFailure::invalid("content import intent is missing `file`"))?,
+    )
+}
+
+fn decode_content_save_intent(
+    value: &Value,
+) -> Result<DecodedContentSaveIntent, FileStreamFailure> {
+    let fields = file_record(value, &["content", "file"], "content save intent")?;
+    let content = fields
+        .get("content")
+        .ok_or_else(|| FileStreamFailure::invalid("content save intent is missing `content`"))
+        .and_then(|value| ContentRef::from_value(value).map_err(content_store_failure))?;
+    let target = decode_file_target(
+        fields
+            .get("file")
+            .ok_or_else(|| FileStreamFailure::invalid("content save intent is missing `file`"))?,
+    )?;
+    Ok(DecodedContentSaveIntent { content, target })
 }
 
 fn decode_file_read_stream_intent(
@@ -1414,55 +1975,7 @@ fn decode_file_read_stream_intent(
     let file = fields
         .get("file")
         .ok_or_else(|| FileStreamFailure::invalid("file stream intent is missing `file`"))?;
-    let file_fields = match file {
-        Value::Record(fields) => fields,
-        _ => {
-            return Err(FileStreamFailure::invalid(
-                "file input must be a tagged object",
-            ));
-        }
-    };
-    let source = match file_fields.get("$tag") {
-        Some(Value::Text(tag)) if tag == "FileSelected" => {
-            let file = file_record(file, &["$tag", "capability"], "selected file")?;
-            let capability = file.get("capability").ok_or_else(|| {
-                FileStreamFailure::invalid("selected file is missing its capability")
-            })?;
-            let capability = file_record(capability, &["generation", "token"], "file capability")?;
-            let token = match capability.get("token") {
-                Some(Value::Bytes(token)) => <[u8; FILE_CAPABILITY_TOKEN_BYTES]>::try_from(
-                    token.as_slice(),
-                )
-                .map_err(|_| {
-                    FileStreamFailure::invalid(
-                        "file capability token must contain exactly 32 bytes",
-                    )
-                })?,
-                _ => {
-                    return Err(FileStreamFailure::invalid(
-                        "file capability token must be Bytes",
-                    ));
-                }
-            };
-            let generation = file_positive_u32(capability, "generation")?;
-            DecodedFileSource::Capability(FileCapability { token, generation })
-        }
-        Some(Value::Text(tag)) if tag == "PackageAsset" => {
-            let file = file_record(file, &["$tag", "url"], "package asset")?;
-            let url = file_text(file, "url")?.to_owned();
-            if url.is_empty() || url.len() > MAX_PACKAGE_ASSET_URL_BYTES {
-                return Err(FileStreamFailure::invalid(
-                    "package asset URL is empty or exceeds the bounded contract",
-                ));
-            }
-            DecodedFileSource::PackageAsset(url)
-        }
-        _ => {
-            return Err(FileStreamFailure::invalid(
-                "file input must be FileSelected or PackageAsset",
-            ));
-        }
-    };
+    let source = decode_file_source(file)?;
     let chunk_bytes = file_positive_u64(fields, "chunk_bytes")?;
     if !(boon_effect_schema::FILE_STREAM_MIN_CHUNK_BYTES
         ..=boon_effect_schema::FILE_STREAM_MAX_CHUNK_BYTES)
@@ -1488,6 +2001,59 @@ fn decode_file_read_stream_intent(
         chunk_bytes,
         retain_content,
     })
+}
+
+fn decode_file_source(file: &Value) -> Result<DecodedFileSource, FileStreamFailure> {
+    let visible = file.visible();
+    let file_fields = match visible {
+        Value::Record(fields) => fields,
+        _ => {
+            return Err(FileStreamFailure::invalid(
+                "file input must be a tagged object",
+            ));
+        }
+    };
+    match file_fields.get("$tag") {
+        Some(Value::Text(tag)) if tag == "FileSelected" => {
+            file_record(visible, &["$tag"], "selected file")?;
+            let binding = file
+                .host_binding()
+                .cloned()
+                .ok_or_else(|| FileStreamFailure::invalid("selected file has no host binding"))?;
+            Ok(DecodedFileSource::Capability(FileCapability { binding }))
+        }
+        Some(Value::Text(tag)) if tag == "PackageAsset" => {
+            if file.host_binding().is_some() {
+                return Err(FileStreamFailure::invalid(
+                    "package assets must not carry a host binding",
+                ));
+            }
+            let fields = file_record(visible, &["$tag", "url"], "package asset")?;
+            let url = file_text(fields, "url")?.to_owned();
+            if url.is_empty() || url.len() > MAX_PACKAGE_ASSET_URL_BYTES {
+                return Err(FileStreamFailure::invalid(
+                    "package asset URL is empty or exceeds the bounded contract",
+                ));
+            }
+            Ok(DecodedFileSource::PackageAsset(url))
+        }
+        _ => Err(FileStreamFailure::invalid(
+            "file input must be FileSelected or PackageAsset",
+        )),
+    }
+}
+
+fn decode_file_target(value: &Value) -> Result<FileCapability, FileStreamFailure> {
+    let fields = file_record(value.visible(), &["$tag"], "file target")?;
+    match fields.get("$tag") {
+        Some(Value::Text(tag)) if tag == "FileTarget" => {}
+        _ => return Err(FileStreamFailure::invalid("file target must be FileTarget")),
+    }
+    let binding = value
+        .host_binding()
+        .cloned()
+        .ok_or_else(|| FileStreamFailure::invalid("file target has no host binding"))?;
+    Ok(FileCapability { binding })
 }
 
 fn file_record<'a>(
@@ -1520,18 +2086,6 @@ fn file_text<'a>(
             "file stream field `{name}` must be Text"
         ))),
     }
-}
-
-fn file_positive_u32(
-    fields: &BTreeMap<String, Value>,
-    name: &str,
-) -> Result<u32, FileStreamFailure> {
-    let value = file_positive_i64(fields, name)?;
-    u32::try_from(value).map_err(|_| {
-        FileStreamFailure::invalid(format!(
-            "file stream field `{name}` exceeds the capability generation range"
-        ))
-    })
 }
 
 fn file_positive_u64(
@@ -1592,6 +2146,7 @@ fn content_store_failure(error: ContentStoreError) -> FileStreamFailure {
         ContentStoreErrorKind::InvalidConfiguration | ContentStoreErrorKind::InvalidReference => {
             "content_invalid"
         }
+        ContentStoreErrorKind::Corrupt => "content_corrupt",
         ContentStoreErrorKind::Io => "content_io",
     };
     FileStreamFailure::new(code, error.diagnostic())
@@ -1612,18 +2167,42 @@ fn file_cancelled_outcome() -> Value {
 }
 
 struct FileReadWorker {
-    call_id: TransientEffectCallId,
-    invocation_id: EffectInvocationId,
+    control: FileWorkerControl,
+    input: FileReadWorkerInput,
+}
+
+struct FileReadWorkerInput {
     path: PathBuf,
     display_name: Option<String>,
     _source_lease: Option<ContentLease>,
+    media: Arc<str>,
     chunk_bytes: usize,
     retain_content: bool,
     content_store: ContentStore,
-    state: Arc<AtomicU8>,
-    outstanding_credits: Arc<AtomicU32>,
-    credit_rx: std_mpsc::Receiver<()>,
-    events_tx: mpsc::Sender<FileReadStreamEvent>,
+}
+
+struct FileReadBytesWorker {
+    control: FileWorkerControl,
+    source: ResolvedFileSource,
+    max_bytes: usize,
+}
+
+struct FileWriteBytesWorker {
+    control: FileWorkerControl,
+    target_path: PathBuf,
+    bytes: Bytes,
+}
+
+struct ContentImportWorker {
+    control: FileWorkerControl,
+    source: ResolvedFileSource,
+    content_store: ContentStore,
+}
+
+struct ContentSaveWorker {
+    control: FileWorkerControl,
+    content: ContentLease,
+    target_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1641,25 +2220,619 @@ enum CreditReservation {
     Stopped,
 }
 
+fn run_file_read_bytes_worker(worker: FileReadBytesWorker) {
+    let mut result_sequence = 0_u64;
+    if read_file_bytes(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
+        emit_cancelled(&worker.control, &mut result_sequence);
+    }
+}
+
+fn read_file_bytes(worker: &FileReadBytesWorker, result_sequence: &mut u64) -> WorkerFlow {
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+    let mut file = match File::open(&worker.source.path) {
+        Ok(file) => file,
+        Err(error) => {
+            return send_io_failure(
+                &worker.control,
+                result_sequence,
+                "open_failed",
+                "cannot open selected file",
+                error,
+            );
+        }
+    };
+    let size = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return send_io_failure(
+                &worker.control,
+                result_sequence,
+                "metadata_failed",
+                "cannot inspect selected file",
+                error,
+            );
+        }
+    };
+    if size > worker.max_bytes as u64 {
+        return send_outcome(
+            &worker.control,
+            result_sequence,
+            file_failure_outcome(FileStreamFailure::new(
+                "file_too_large",
+                "selected file exceeds the requested bounded byte limit",
+            )),
+            true,
+        );
+    }
+    let read_limit = worker.max_bytes.saturating_add(1);
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(read_limit).min(read_limit));
+    if let Err(error) = Read::by_ref(&mut file)
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+    {
+        return send_io_failure(
+            &worker.control,
+            result_sequence,
+            "read_failed",
+            "cannot read selected file",
+            error,
+        );
+    }
+    if bytes.len() > worker.max_bytes {
+        return send_outcome(
+            &worker.control,
+            result_sequence,
+            file_failure_outcome(FileStreamFailure::new(
+                "file_too_large",
+                "selected file grew beyond the requested bounded byte limit",
+            )),
+            true,
+        );
+    }
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+    let byte_count = match file_number(bytes.len() as u64, "read byte count") {
+        Ok(value) => value,
+        Err(failure) => {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(failure),
+                true,
+            );
+        }
+    };
+    send_outcome(
+        &worker.control,
+        result_sequence,
+        tagged(
+            "BytesRead",
+            BTreeMap::from([
+                ("bytes".to_owned(), Value::Bytes(bytes.into())),
+                ("byte_count".to_owned(), byte_count),
+                (
+                    "media".to_owned(),
+                    Value::Text(worker.source.media.to_string()),
+                ),
+                (
+                    "display_name".to_owned(),
+                    Value::Text(file_source_display_name(&worker.source)),
+                ),
+            ]),
+        ),
+        true,
+    )
+}
+
+fn run_file_write_bytes_worker(worker: FileWriteBytesWorker) {
+    let mut result_sequence = 0_u64;
+    if write_file_bytes(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
+        emit_cancelled(&worker.control, &mut result_sequence);
+    }
+}
+
+fn write_file_bytes(worker: &FileWriteBytesWorker, result_sequence: &mut u64) -> WorkerFlow {
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+    let mut file = match AtomicWriteFile::options().open(&worker.target_path) {
+        Ok(file) => file,
+        Err(error) => {
+            return send_io_failure(
+                &worker.control,
+                result_sequence,
+                "open_failed",
+                "cannot open file target",
+                error,
+            );
+        }
+    };
+    if let Err(error) = file.write_all(&worker.bytes) {
+        return send_io_failure(
+            &worker.control,
+            result_sequence,
+            "write_failed",
+            "cannot write file target",
+            error,
+        );
+    }
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+    if let Err(error) = file.commit() {
+        return send_io_failure(
+            &worker.control,
+            result_sequence,
+            "commit_failed",
+            "cannot atomically commit file target",
+            error,
+        );
+    }
+    let byte_count = match file_number(worker.bytes.len() as u64, "written byte count") {
+        Ok(value) => value,
+        Err(failure) => {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(failure),
+                true,
+            );
+        }
+    };
+    send_outcome(
+        &worker.control,
+        result_sequence,
+        tagged(
+            "BytesWritten",
+            BTreeMap::from([("byte_count".to_owned(), byte_count)]),
+        ),
+        true,
+    )
+}
+
+fn run_content_import_worker(worker: ContentImportWorker) {
+    let mut result_sequence = 0_u64;
+    if import_content(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
+        emit_cancelled(&worker.control, &mut result_sequence);
+    }
+}
+
+fn import_content(worker: &ContentImportWorker, result_sequence: &mut u64) -> WorkerFlow {
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+    let mut file = match File::open(&worker.source.path) {
+        Ok(file) => file,
+        Err(error) => {
+            return send_io_failure(
+                &worker.control,
+                result_sequence,
+                "open_failed",
+                "cannot open selected file",
+                error,
+            );
+        }
+    };
+    let total_bytes = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return send_io_failure(
+                &worker.control,
+                result_sequence,
+                "metadata_failed",
+                "cannot inspect selected file",
+                error,
+            );
+        }
+    };
+    let total_value = match file_number(total_bytes, "import byte count") {
+        Ok(value) => value,
+        Err(failure) => {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(failure),
+                true,
+            );
+        }
+    };
+    let mut content_writer = match worker.content_store.begin_write(total_bytes) {
+        Ok(writer) => writer,
+        Err(error) => {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(content_store_failure(error)),
+                true,
+            );
+        }
+    };
+    match send_outcome(
+        &worker.control,
+        result_sequence,
+        tagged(
+            "Started",
+            BTreeMap::from([
+                ("byte_count".to_owned(), total_value.clone()),
+                (
+                    "media".to_owned(),
+                    Value::Text(worker.source.media.to_string()),
+                ),
+                (
+                    "display_name".to_owned(),
+                    Value::Text(file_source_display_name(&worker.source)),
+                ),
+            ]),
+        ),
+        false,
+    ) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+
+    let mut digest = Sha256::new();
+    let mut completed_bytes = 0_u64;
+    let mut buffer = vec![0_u8; boon_effect_schema::FILE_STREAM_DEFAULT_CHUNK_BYTES as usize];
+    loop {
+        match worker_state(&worker.control) {
+            WorkerFlow::Continue => {}
+            other => return other,
+        }
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                return send_io_failure(
+                    &worker.control,
+                    result_sequence,
+                    "read_failed",
+                    "cannot read selected file",
+                    error,
+                );
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        if let Err(error) = content_writer.write_chunk(&buffer[..read]) {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(content_store_failure(error)),
+                true,
+            );
+        }
+        digest.update(&buffer[..read]);
+        completed_bytes = match completed_bytes.checked_add(read as u64) {
+            Some(value) => value,
+            None => {
+                return send_outcome(
+                    &worker.control,
+                    result_sequence,
+                    file_failure_outcome(FileStreamFailure::new(
+                        "file_too_large",
+                        "import byte count exceeds the host range",
+                    )),
+                    true,
+                );
+            }
+        };
+        match reserve_credit(&worker.control) {
+            CreditReservation::Reserved => {}
+            CreditReservation::NeedCancelled => return WorkerFlow::NeedCancelled,
+            CreditReservation::Stopped => return WorkerFlow::Stopped,
+        }
+        let completed_value = match file_number(completed_bytes, "completed import bytes") {
+            Ok(value) => value,
+            Err(failure) => {
+                return send_outcome(
+                    &worker.control,
+                    result_sequence,
+                    file_failure_outcome(failure),
+                    true,
+                );
+            }
+        };
+        match send_outcome(
+            &worker.control,
+            result_sequence,
+            tagged(
+                "Progress",
+                BTreeMap::from([
+                    ("completed_bytes".to_owned(), completed_value),
+                    ("total_bytes".to_owned(), total_value.clone()),
+                ]),
+            ),
+            false,
+        ) {
+            WorkerFlow::Continue => {}
+            other => return other,
+        }
+    }
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+    let content = match ContentRef::new(
+        <[u8; 32]>::from(digest.finalize()),
+        completed_bytes,
+        Arc::clone(&worker.source.media),
+    ) {
+        Ok(content) => content,
+        Err(error) => {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(content_store_failure(error)),
+                true,
+            );
+        }
+    };
+    let content = match content_writer.finish(content) {
+        Ok(content) => content,
+        Err(error) => {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(content_store_failure(error)),
+                true,
+            );
+        }
+    };
+    let content = match content.value() {
+        Ok(content) => content,
+        Err(error) => {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(content_store_failure(error)),
+                true,
+            );
+        }
+    };
+    send_outcome(
+        &worker.control,
+        result_sequence,
+        tagged(
+            "Imported",
+            BTreeMap::from([("content".to_owned(), content)]),
+        ),
+        true,
+    )
+}
+
+fn run_content_save_worker(worker: ContentSaveWorker) {
+    let mut result_sequence = 0_u64;
+    if save_content(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
+        emit_cancelled(&worker.control, &mut result_sequence);
+    }
+}
+
+fn save_content(worker: &ContentSaveWorker, result_sequence: &mut u64) -> WorkerFlow {
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+    let total_bytes = worker.content.content().size();
+    let total_value = match file_number(total_bytes, "saved content byte count") {
+        Ok(value) => value,
+        Err(failure) => {
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(failure),
+                true,
+            );
+        }
+    };
+    let mut source = match File::open(worker.content.path()) {
+        Ok(file) => file,
+        Err(error) => {
+            return send_io_failure(
+                &worker.control,
+                result_sequence,
+                "content_missing",
+                "cannot open retained content",
+                error,
+            );
+        }
+    };
+    let mut target = match AtomicWriteFile::options().open(&worker.target_path) {
+        Ok(file) => file,
+        Err(error) => {
+            return send_io_failure(
+                &worker.control,
+                result_sequence,
+                "open_failed",
+                "cannot open file target",
+                error,
+            );
+        }
+    };
+    match send_outcome(
+        &worker.control,
+        result_sequence,
+        tagged(
+            "Started",
+            BTreeMap::from([("byte_count".to_owned(), total_value.clone())]),
+        ),
+        false,
+    ) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+
+    let mut digest = Sha256::new();
+    let mut completed_bytes = 0_u64;
+    let mut buffer = vec![0_u8; boon_effect_schema::FILE_STREAM_DEFAULT_CHUNK_BYTES as usize];
+    loop {
+        match worker_state(&worker.control) {
+            WorkerFlow::Continue => {}
+            other => return other,
+        }
+        let read = match source.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                return send_io_failure(
+                    &worker.control,
+                    result_sequence,
+                    "content_corrupt",
+                    "cannot read retained content",
+                    error,
+                );
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        if let Err(error) = target.write_all(&buffer[..read]) {
+            return send_io_failure(
+                &worker.control,
+                result_sequence,
+                "write_failed",
+                "cannot write file target",
+                error,
+            );
+        }
+        digest.update(&buffer[..read]);
+        completed_bytes = match completed_bytes.checked_add(read as u64) {
+            Some(value) => value,
+            None => return WorkerFlow::Stopped,
+        };
+        match reserve_credit(&worker.control) {
+            CreditReservation::Reserved => {}
+            CreditReservation::NeedCancelled => return WorkerFlow::NeedCancelled,
+            CreditReservation::Stopped => return WorkerFlow::Stopped,
+        }
+        let completed_value = match file_number(completed_bytes, "completed saved bytes") {
+            Ok(value) => value,
+            Err(failure) => {
+                return send_outcome(
+                    &worker.control,
+                    result_sequence,
+                    file_failure_outcome(failure),
+                    true,
+                );
+            }
+        };
+        match send_outcome(
+            &worker.control,
+            result_sequence,
+            tagged(
+                "Progress",
+                BTreeMap::from([
+                    ("completed_bytes".to_owned(), completed_value),
+                    ("total_bytes".to_owned(), total_value.clone()),
+                ]),
+            ),
+            false,
+        ) {
+            WorkerFlow::Continue => {}
+            other => return other,
+        }
+    }
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
+    }
+    if completed_bytes != total_bytes
+        || <[u8; 32]>::from(digest.finalize()) != worker.content.content().digest()
+    {
+        return send_outcome(
+            &worker.control,
+            result_sequence,
+            file_failure_outcome(FileStreamFailure::new(
+                "content_corrupt",
+                "retained content differs from its durable descriptor",
+            )),
+            true,
+        );
+    }
+    if let Err(error) = target.commit() {
+        return send_io_failure(
+            &worker.control,
+            result_sequence,
+            "commit_failed",
+            "cannot atomically commit file target",
+            error,
+        );
+    }
+    send_outcome(
+        &worker.control,
+        result_sequence,
+        tagged(
+            "Saved",
+            BTreeMap::from([("byte_count".to_owned(), total_value)]),
+        ),
+        true,
+    )
+}
+
+fn worker_state(control: &FileWorkerControl) -> WorkerFlow {
+    match control.state.load(Ordering::Acquire) {
+        FILE_WORKER_DISCARD => WorkerFlow::Stopped,
+        FILE_WORKER_CANCEL_REQUESTED => WorkerFlow::NeedCancelled,
+        _ => WorkerFlow::Continue,
+    }
+}
+
+fn file_source_display_name(source: &ResolvedFileSource) -> String {
+    source.display_name.clone().unwrap_or_else(|| {
+        source
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("selected-file")
+            .chars()
+            .take(256)
+            .collect()
+    })
+}
+
+fn send_io_failure(
+    control: &FileWorkerControl,
+    result_sequence: &mut u64,
+    code: &'static str,
+    action: &'static str,
+    error: std::io::Error,
+) -> WorkerFlow {
+    send_outcome(
+        control,
+        result_sequence,
+        file_failure_outcome(FileStreamFailure::new(
+            code,
+            format!("{action}: {:?}", error.kind()),
+        )),
+        true,
+    )
+}
+
 fn run_file_read_worker(worker: FileReadWorker) {
     let mut result_sequence = 0_u64;
     if stream_file(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
-        emit_cancelled(&worker, &mut result_sequence);
+        emit_cancelled(&worker.control, &mut result_sequence);
     }
 }
 
 fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow {
-    if worker.state.load(Ordering::Acquire) == FILE_WORKER_CANCEL_REQUESTED {
+    if worker.control.state.load(Ordering::Acquire) == FILE_WORKER_CANCEL_REQUESTED {
         return WorkerFlow::NeedCancelled;
     }
-    if worker.state.load(Ordering::Acquire) == FILE_WORKER_DISCARD {
+    if worker.control.state.load(Ordering::Acquire) == FILE_WORKER_DISCARD {
         return WorkerFlow::Stopped;
     }
-    let mut file = match File::open(&worker.path) {
+    let mut file = match File::open(&worker.input.path) {
         Ok(file) => file,
         Err(error) => {
-            return emit_outcome(
-                worker,
+            return send_outcome(
+                &worker.control,
                 result_sequence,
                 file_failure_outcome(FileStreamFailure::new(
                     "open_failed",
@@ -1672,8 +2845,8 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
     let size_bytes = match file.metadata() {
         Ok(metadata) => metadata.len(),
         Err(error) => {
-            return emit_outcome(
-                worker,
+            return send_outcome(
+                &worker.control,
                 result_sequence,
                 file_failure_outcome(FileStreamFailure::new(
                     "metadata_failed",
@@ -1686,11 +2859,17 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
     let size = match file_number(size_bytes, "selected file size") {
         Ok(size) => size,
         Err(failure) => {
-            return emit_outcome(worker, result_sequence, file_failure_outcome(failure), true);
+            return send_outcome(
+                &worker.control,
+                result_sequence,
+                file_failure_outcome(failure),
+                true,
+            );
         }
     };
-    let display_name = worker.display_name.clone().unwrap_or_else(|| {
+    let display_name = worker.input.display_name.clone().unwrap_or_else(|| {
         worker
+            .input
             .path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1699,12 +2878,12 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
             .take(256)
             .collect::<String>()
     });
-    let mut content_writer = if worker.retain_content {
-        match worker.content_store.begin_write(size_bytes) {
+    let mut content_writer = if worker.input.retain_content {
+        match worker.input.content_store.begin_write(size_bytes) {
             Ok(writer) => Some(writer),
             Err(error) => {
-                return emit_outcome(
-                    worker,
+                return send_outcome(
+                    &worker.control,
                     result_sequence,
                     file_failure_outcome(content_store_failure(error)),
                     true,
@@ -1714,8 +2893,8 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
     } else {
         None
     };
-    match emit_outcome(
-        worker,
+    match send_outcome(
+        &worker.control,
         result_sequence,
         tagged(
             "Opened",
@@ -1723,7 +2902,7 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
                 ("size".to_owned(), size),
                 (
                     "content_type".to_owned(),
-                    Value::Text(FILE_CONTENT_TYPE.to_owned()),
+                    Value::Text(worker.input.media.to_string()),
                 ),
                 ("display_name".to_owned(), Value::Text(display_name)),
             ]),
@@ -1737,21 +2916,18 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
     let mut digest = Sha256::new();
     let mut byte_count = 0_u64;
     let mut chunk_sequence = 0_u64;
-    let mut buffer = vec![0_u8; worker.chunk_bytes];
+    let mut buffer = vec![0_u8; worker.input.chunk_bytes];
     loop {
-        match reserve_credit(worker, true) {
-            CreditReservation::Reserved => {}
-            CreditReservation::NeedCancelled => return WorkerFlow::NeedCancelled,
-            CreditReservation::Stopped => return WorkerFlow::Stopped,
-        }
-        if worker.state.load(Ordering::Acquire) == FILE_WORKER_DISCARD {
-            return WorkerFlow::Stopped;
+        match worker.control.state.load(Ordering::Acquire) {
+            FILE_WORKER_DISCARD => return WorkerFlow::Stopped,
+            FILE_WORKER_CANCEL_REQUESTED => return WorkerFlow::NeedCancelled,
+            _ => {}
         }
         let read = match file.read(&mut buffer) {
             Ok(read) => read,
             Err(error) => {
-                return send_reserved_outcome(
-                    worker,
+                return send_outcome(
+                    &worker.control,
                     result_sequence,
                     file_failure_outcome(FileStreamFailure::new(
                         "read_failed",
@@ -1763,13 +2939,24 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
         };
         if read == 0 {
             let digest = <[u8; 32]>::from(digest.finalize());
-            let content = ContentRef::new(digest, byte_count);
+            let content = match ContentRef::new(digest, byte_count, Arc::clone(&worker.input.media))
+            {
+                Ok(content) => content,
+                Err(error) => {
+                    return send_outcome(
+                        &worker.control,
+                        result_sequence,
+                        file_failure_outcome(content_store_failure(error)),
+                        true,
+                    );
+                }
+            };
             let retained_content = if let Some(writer) = content_writer.take() {
                 match writer.finish(content) {
                     Ok(content) => Some(content),
                     Err(error) => {
-                        return send_reserved_outcome(
-                            worker,
+                        return send_outcome(
+                            &worker.control,
                             result_sequence,
                             file_failure_outcome(content_store_failure(error)),
                             true,
@@ -1782,37 +2969,40 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
             let byte_count_value = match file_number(byte_count, "stream byte count") {
                 Ok(value) => value,
                 Err(failure) => {
-                    return send_reserved_outcome(
-                        worker,
+                    return send_outcome(
+                        &worker.control,
                         result_sequence,
                         file_failure_outcome(failure),
                         true,
                     );
                 }
             };
-            let content_value = match content.value() {
-                Ok(value) => value,
-                Err(error) => {
-                    if let Some(content) = retained_content {
-                        worker.content_store.remove(content);
+            let retained_value = match retained_content.as_ref() {
+                Some(content) => match content.value() {
+                    Ok(value) => {
+                        tagged("Retained", BTreeMap::from([("content".to_owned(), value)]))
                     }
-                    return send_reserved_outcome(
-                        worker,
-                        result_sequence,
-                        file_failure_outcome(content_store_failure(error)),
-                        true,
-                    );
-                }
+                    Err(error) => {
+                        let _ = worker.input.content_store.remove(content);
+                        return send_outcome(
+                            &worker.control,
+                            result_sequence,
+                            file_failure_outcome(content_store_failure(error)),
+                            true,
+                        );
+                    }
+                },
+                None => tagged("NotRetained", BTreeMap::new()),
             };
-            let flow = send_reserved_outcome(
-                worker,
+            let flow = send_outcome(
+                &worker.control,
                 result_sequence,
                 tagged(
                     "Finished",
                     BTreeMap::from([
                         ("byte_count".to_owned(), byte_count_value),
-                        ("digest".to_owned(), Value::Bytes(digest.to_vec())),
-                        ("content".to_owned(), content_value),
+                        ("digest".to_owned(), Value::Bytes(digest.to_vec().into())),
+                        ("retained".to_owned(), retained_value),
                     ]),
                 ),
                 true,
@@ -1820,7 +3010,7 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
             if flow == WorkerFlow::Stopped
                 && let Some(content) = retained_content
             {
-                worker.content_store.remove(content);
+                let _ = worker.input.content_store.remove(&content);
             }
             return flow;
         }
@@ -1829,8 +3019,8 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
         byte_count = match byte_count.checked_add(read_u64) {
             Some(byte_count) => byte_count,
             None => {
-                return send_reserved_outcome(
-                    worker,
+                return send_outcome(
+                    &worker.control,
                     result_sequence,
                     file_failure_outcome(FileStreamFailure::new(
                         "file_too_large",
@@ -1844,8 +3034,8 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
         if let Some(writer) = content_writer.as_mut()
             && let Err(error) = writer.write_chunk(&buffer[..read])
         {
-            return send_reserved_outcome(
-                worker,
+            return send_outcome(
+                &worker.control,
                 result_sequence,
                 file_failure_outcome(content_store_failure(error)),
                 true,
@@ -1854,8 +3044,8 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
         let sequence = match file_number(chunk_sequence, "chunk sequence") {
             Ok(value) => value,
             Err(failure) => {
-                return send_reserved_outcome(
-                    worker,
+                return send_outcome(
+                    &worker.control,
                     result_sequence,
                     file_failure_outcome(failure),
                     true,
@@ -1865,23 +3055,31 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
         let offset = match file_number(offset, "chunk offset") {
             Ok(value) => value,
             Err(failure) => {
-                return send_reserved_outcome(
-                    worker,
+                return send_outcome(
+                    &worker.control,
                     result_sequence,
                     file_failure_outcome(failure),
                     true,
                 );
             }
         };
-        match send_reserved_outcome(
-            worker,
+        match reserve_credit(&worker.control) {
+            CreditReservation::Reserved => {}
+            CreditReservation::NeedCancelled => return WorkerFlow::NeedCancelled,
+            CreditReservation::Stopped => return WorkerFlow::Stopped,
+        }
+        match send_outcome(
+            &worker.control,
             result_sequence,
             tagged(
                 "Chunk",
                 BTreeMap::from([
                     ("sequence".to_owned(), sequence),
                     ("offset".to_owned(), offset),
-                    ("bytes".to_owned(), Value::Bytes(buffer[..read].to_vec())),
+                    (
+                        "bytes".to_owned(),
+                        Value::Bytes(buffer[..read].to_vec().into()),
+                    ),
                 ]),
             ),
             false,
@@ -1896,43 +3094,20 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
     }
 }
 
-fn emit_outcome(
-    worker: &FileReadWorker,
-    result_sequence: &mut u64,
-    outcome: Value,
-    terminal: bool,
-) -> WorkerFlow {
-    match reserve_credit(worker, true) {
-        CreditReservation::Reserved => {
-            send_reserved_outcome(worker, result_sequence, outcome, terminal)
-        }
-        CreditReservation::NeedCancelled => WorkerFlow::NeedCancelled,
-        CreditReservation::Stopped => WorkerFlow::Stopped,
-    }
+fn emit_cancelled(control: &FileWorkerControl, result_sequence: &mut u64) -> WorkerFlow {
+    send_outcome(control, result_sequence, file_cancelled_outcome(), true)
 }
 
-fn emit_cancelled(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow {
-    match reserve_credit(worker, false) {
-        CreditReservation::Reserved => {
-            send_reserved_outcome(worker, result_sequence, file_cancelled_outcome(), true)
-        }
-        CreditReservation::NeedCancelled => unreachable!("graceful cancellation is allowed"),
-        CreditReservation::Stopped => WorkerFlow::Stopped,
-    }
-}
-
-fn reserve_credit(worker: &FileReadWorker, stop_on_cancel_request: bool) -> CreditReservation {
+fn reserve_credit(control: &FileWorkerControl) -> CreditReservation {
     loop {
-        match worker.state.load(Ordering::Acquire) {
+        match control.state.load(Ordering::Acquire) {
             FILE_WORKER_DISCARD => return CreditReservation::Stopped,
-            FILE_WORKER_CANCEL_REQUESTED if stop_on_cancel_request => {
-                return CreditReservation::NeedCancelled;
-            }
+            FILE_WORKER_CANCEL_REQUESTED => return CreditReservation::NeedCancelled,
             _ => {}
         }
-        let mut current = worker.outstanding_credits.load(Ordering::Acquire);
+        let mut current = control.outstanding_credits.load(Ordering::Acquire);
         while current > 0 {
-            match worker.outstanding_credits.compare_exchange_weak(
+            match control.outstanding_credits.compare_exchange_weak(
                 current,
                 current - 1,
                 Ordering::AcqRel,
@@ -1942,7 +3117,7 @@ fn reserve_credit(worker: &FileReadWorker, stop_on_cancel_request: bool) -> Cred
                 Err(actual) => current = actual,
             }
         }
-        match worker.credit_rx.recv_timeout(FILE_WORKER_POLL_INTERVAL) {
+        match control.credit_rx.recv_timeout(FILE_WORKER_POLL_INTERVAL) {
             Ok(()) | Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 return CreditReservation::Stopped;
@@ -1951,21 +3126,22 @@ fn reserve_credit(worker: &FileReadWorker, stop_on_cancel_request: bool) -> Cred
     }
 }
 
-fn send_reserved_outcome(
-    worker: &FileReadWorker,
+fn send_outcome(
+    control: &FileWorkerControl,
     result_sequence: &mut u64,
     mut outcome: Value,
     mut terminal: bool,
 ) -> WorkerFlow {
-    let mut event = FileReadStreamEvent {
-        call_id: worker.call_id,
-        invocation_id: worker.invocation_id,
+    let mut event = FileEffectEvent {
+        call_id: control.call_id,
+        invocation_id: control.invocation_id,
         result_sequence: *result_sequence,
         outcome: outcome.clone(),
         terminal,
+        stream: control.stream,
     };
     loop {
-        match worker.state.load(Ordering::Acquire) {
+        match control.state.load(Ordering::Acquire) {
             FILE_WORKER_DISCARD => return WorkerFlow::Stopped,
             FILE_WORKER_CANCEL_REQUESTED if !terminal => {
                 outcome = file_cancelled_outcome();
@@ -1975,7 +3151,7 @@ fn send_reserved_outcome(
             }
             _ => {}
         }
-        match worker.events_tx.try_send(event) {
+        match control.events_tx.try_send(event) {
             Ok(()) => {
                 *result_sequence = result_sequence.saturating_add(1);
                 return if terminal {
@@ -2009,7 +3185,7 @@ fn file_number(value: u64, context: &str) -> Result<Value, FileStreamFailure> {
     Ok(Value::Number(value))
 }
 
-fn stop_file_worker(mut active: ActiveFileRead) {
+fn stop_file_worker(mut active: ActiveFileOperation) {
     active.state.store(FILE_WORKER_DISCARD, Ordering::Release);
     let _ = active.credit_tx.try_send(());
     drop(active.credit_tx);
@@ -2018,7 +3194,7 @@ fn stop_file_worker(mut active: ActiveFileRead) {
     }
 }
 
-fn finish_file_worker(mut active: ActiveFileRead) {
+fn finish_file_worker(mut active: ActiveFileOperation) {
     drop(active.credit_tx);
     if let Some(task) = active.task.take() {
         let _ = task.join();

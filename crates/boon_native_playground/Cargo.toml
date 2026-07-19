@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 boon_runtime.workspace = true
+boon_server_runtime.workspace = true
 boon_compiler.workspace = true
 boon_plan.workspace = true
 boon_persistence.workspace = true
@@ -19,6 +20,9 @@ boon_document_model.workspace = true
 boon_editor.workspace = true
 boon_host.workspace = true
 boon_host_runtime.workspace = true
+boon_host_services.workspace = true
+boon_http_client.workspace = true
+boon_http_runtime.workspace = true
 boon_wellen_host.workspace = true
 boon_native_gpu.workspace = true
 boon_web_host.workspace = true

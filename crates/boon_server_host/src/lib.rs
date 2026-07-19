@@ -4,6 +4,7 @@
 //! only act on the HTTP request or WebSocket connection for its current call.
 
 mod config;
+mod distributed_session;
 mod host;
 mod program;
 mod types;
@@ -11,6 +12,10 @@ mod types;
 pub use config::{
     ConfigError, OriginPolicy, ServerConfig, ServerLimits, ServerTimeouts, SlowClientPolicy,
     TrustedProxyPolicy,
+};
+pub use distributed_session::{
+    DISTRIBUTED_SESSION_TRANSPORT_PATH, DistributedSessionAction, DistributedSessionConnectionId,
+    DistributedSessionEvent, DistributedSessionOpen,
 };
 pub use host::{RunningServer, ServerError, ShutdownError, bind};
 pub use program::{CallCancellation, CancellationReason, ServerProgram};

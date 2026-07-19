@@ -655,6 +655,7 @@ impl WebPersistentRuntime {
             changes: turn.durable_changes.clone(),
             outbox_changes: turn.outbox_changes.clone(),
             content_artifact_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal())
@@ -861,6 +862,7 @@ mod tests {
             changes: Vec::new(),
             outbox_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();

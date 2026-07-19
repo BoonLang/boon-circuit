@@ -1,8 +1,9 @@
 use crate::catalog::{Catalog, LoadedExample};
 use crate::protocol::{
-    ApplicationIdentity, Connection, Message, MigrationStatus, PreviewIntent, Role, SourceUnit,
-    TestStep,
+    ApplicationIdentity, Connection, Message, MigrationStatus, PreviewIntent, PreviewSource,
+    ProgramSource, Role, SourceUnit, TestStep,
 };
+use boon_plan::ProgramRole;
 use std::fs;
 use std::io;
 use std::os::unix::net::UnixListener;
@@ -335,6 +336,7 @@ impl DesktopSupervisor {
         self.source.application = application;
         self.source.revision = revision;
         self.source.working_units = units;
+        self.source.sync_client_program()?;
         Ok(true)
     }
 
@@ -343,6 +345,7 @@ impl DesktopSupervisor {
         self.source
             .working_units
             .clone_from(&self.source.baseline_units);
+        self.source.sync_client_program()?;
         self.send_open_editor()?;
         self.send_preview(PreviewIntent::Reset, None)
     }
@@ -368,9 +371,17 @@ impl DesktopSupervisor {
         self.preview.send(&Message::PreviewApply {
             intent,
             request_id,
-            application: self.source.application.clone(),
             revision: self.source.revision,
-            units: self.source.working_units.clone(),
+            source: if self.source.programs.is_empty() {
+                PreviewSource::BuiltInSingleRole {
+                    application: self.source.application.clone(),
+                    units: self.source.working_units.clone(),
+                }
+            } else {
+                PreviewSource::DistributedPackage {
+                    programs: self.source.programs.clone(),
+                }
+            },
             test_steps: if intent == PreviewIntent::Test {
                 self.source.test_steps.clone()
             } else {
@@ -428,6 +439,7 @@ struct SourceState {
     application: ApplicationIdentity,
     baseline_units: Vec<SourceUnit>,
     working_units: Vec<SourceUnit>,
+    programs: Vec<ProgramSource>,
     migration_stage: Option<String>,
     revision: u64,
     test_steps: Vec<TestStep>,
@@ -438,6 +450,7 @@ impl SourceState {
         let baseline_units = active.units.clone();
         let test_steps = active.test_steps.clone();
         let application = active.application.clone();
+        let programs = active.programs.clone();
         let migration_stage = active
             .migration
             .as_ref()
@@ -446,6 +459,7 @@ impl SourceState {
             working_units: baseline_units.clone(),
             active,
             application,
+            programs,
             migration_stage,
             baseline_units,
             revision: 1,
@@ -458,6 +472,7 @@ impl SourceState {
         self.baseline_units = active.units.clone();
         self.working_units = active.units.clone();
         self.application = active.application.clone();
+        self.programs = active.programs.clone();
         self.migration_stage = active
             .migration
             .as_ref()
@@ -476,6 +491,26 @@ impl SourceState {
         self.baseline_units.clone_from(&stage.units);
         self.working_units.clone_from(&stage.units);
         self.migration_stage = Some(stage_id.to_owned());
+        Ok(())
+    }
+
+    fn sync_client_program(&mut self) -> DesktopResult<()> {
+        if self.programs.is_empty() {
+            return Ok(());
+        }
+        let client_indices = self
+            .programs
+            .iter()
+            .enumerate()
+            .filter(|(_, program)| program.role == ProgramRole::Client)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [client_index] = client_indices.as_slice() else {
+            return Err("distributed source must contain exactly one Client program".into());
+        };
+        let client = &mut self.programs[*client_index];
+        client.application = self.application.clone();
+        client.units.clone_from(&self.working_units);
         Ok(())
     }
 }

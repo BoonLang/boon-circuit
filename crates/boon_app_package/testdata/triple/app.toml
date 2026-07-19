@@ -80,6 +80,11 @@ id = "trusted-server-v1"
 role = "server"
 grants = ["server.http", "server.websocket", "persistence.redb"]
 
+[capability_profiles."unused-client-v1"]
+id = "unused-client-v1"
+role = "client"
+grants = ["browser.unused"]
+
 [browser]
 title = "Triple notes fixture"
 canvas_id = "boon-canvas"

@@ -1,7 +1,11 @@
+#[cfg(feature = "build")]
+use crate::CapabilityProfileManifest;
+use crate::manifest::validate_identifier;
 use crate::{
     BUNDLE_FORMAT, BrowserManifest, EnvironmentVariableManifest, HttpManifest, MAX_ARTIFACT_BYTES,
-    MAX_MANIFEST_BYTES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILES, NamespaceProfile, PackageError,
-    RunMode, StaticCachePolicy, validate_relative_path,
+    MAX_CAPABILITY_GRANTS_PER_PROFILE, MAX_MANIFEST_BYTES, MAX_PACKAGE_FILE_BYTES,
+    MAX_PACKAGE_FILES, NamespaceProfile, PackageError, RunMode, StaticCachePolicy,
+    validate_relative_path,
 };
 use boon_persistence::{ContentArtifact, ContentArtifactId};
 use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
@@ -25,6 +29,7 @@ pub struct BundleManifest {
     pub run_mode: RunMode,
     pub namespace_profile: NamespaceProfile,
     pub protocol_version: u32,
+    pub capability_profiles: Vec<CapabilityProfileDescriptor>,
     pub artifacts: Vec<ArtifactDescriptor>,
     pub files: Vec<BundleFileDescriptor>,
     pub browser: BrowserManifest,
@@ -51,6 +56,49 @@ pub struct ArtifactDescriptor {
     pub capability_profile_id: String,
     pub state_namespace: String,
     pub protocol_version: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityProfileDescriptor {
+    pub id: String,
+    pub role: ProgramRole,
+    pub grants: Vec<String>,
+}
+
+impl CapabilityProfileDescriptor {
+    #[cfg(feature = "build")]
+    pub(crate) fn canonical_from_manifest(profile: &CapabilityProfileManifest) -> Self {
+        let mut grants = profile.grants.clone();
+        grants.sort();
+        Self {
+            id: profile.id.clone(),
+            role: profile.role,
+            grants,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), PackageError> {
+        validate_identifier("capability profile id", &self.id, false)?;
+        if self.grants.len() > MAX_CAPABILITY_GRANTS_PER_PROFILE {
+            return Err(PackageError::new(format!(
+                "capability profile `{}` exceeds {MAX_CAPABILITY_GRANTS_PER_PROFILE} grants",
+                self.id
+            )));
+        }
+        let mut previous = None;
+        for grant in &self.grants {
+            validate_identifier("capability grant", grant, true)?;
+            if previous.is_some_and(|previous| previous >= grant.as_str()) {
+                return Err(PackageError::new(format!(
+                    "capability profile `{}` grants must be strictly sorted and unique",
+                    self.id
+                )));
+            }
+            previous = Some(grant.as_str());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -102,6 +150,40 @@ impl BundleManifest {
                 "bundle protocol_version must be greater than zero",
             ));
         }
+        if self.capability_profiles.len() != 3 {
+            return Err(PackageError::new(
+                "bundle must contain exactly one selected capability profile per artifact",
+            ));
+        }
+        let mut profile_ids = BTreeSet::new();
+        let mut profile_roles = BTreeSet::new();
+        let mut previous_profile_id = None;
+        for profile in &self.capability_profiles {
+            profile.validate()?;
+            if previous_profile_id.is_some_and(|previous| previous >= profile.id.as_str()) {
+                return Err(PackageError::new(
+                    "bundle capability profiles must be strictly sorted by id",
+                ));
+            }
+            previous_profile_id = Some(profile.id.as_str());
+            if !profile_ids.insert(profile.id.as_str()) {
+                return Err(PackageError::new(format!(
+                    "bundle repeats capability profile `{}`",
+                    profile.id
+                )));
+            }
+            if !profile_roles.insert(profile.role.as_str()) {
+                return Err(PackageError::new(format!(
+                    "bundle repeats {} capability profile",
+                    profile.role.as_str()
+                )));
+            }
+        }
+        if profile_roles != BTreeSet::from(["client", "session", "server"]) {
+            return Err(PackageError::new(
+                "bundle capability profiles are not the required client/session/server triple",
+            ));
+        }
         if self.artifacts.len() != 3 {
             return Err(PackageError::new(
                 "bundle must contain exactly one client, one session, and one server artifact",
@@ -109,6 +191,7 @@ impl BundleManifest {
         }
         let mut roles = BTreeSet::new();
         let mut artifact_paths = BTreeSet::new();
+        let mut referenced_profile_ids = BTreeSet::new();
         for artifact in &self.artifacts {
             if !roles.insert(artifact.role.as_str()) {
                 return Err(PackageError::new(format!(
@@ -131,6 +214,11 @@ impl BundleManifest {
             validate_sha256("source_bundle_sha256", &artifact.source_bundle_sha256)?;
             validate_sha256("source_digest", &artifact.source_digest)?;
             validate_sha256("plan_digest", &artifact.plan_digest)?;
+            validate_identifier(
+                "artifact capability_profile_id",
+                &artifact.capability_profile_id,
+                false,
+            )?;
             if artifact.bytes_len == 0 || artifact.bytes_len > MAX_ARTIFACT_BYTES {
                 return Err(PackageError::new(format!(
                     "{} artifact size is outside 1..={MAX_ARTIFACT_BYTES}",
@@ -141,8 +229,6 @@ impl BundleManifest {
                 || artifact.content_media_type.len() > 256
                 || artifact.compiler_id.is_empty()
                 || artifact.compiler_id.len() > 256
-                || artifact.capability_profile_id.is_empty()
-                || artifact.capability_profile_id.len() > 256
                 || artifact.state_namespace.is_empty()
                 || artifact.state_namespace.len() > 256
             {
@@ -169,6 +255,29 @@ impl BundleManifest {
                     artifact.capability_profile.name()
                 )));
             }
+            let selected_profile = self
+                .capability_profile(&artifact.capability_profile_id)
+                .ok_or_else(|| {
+                    PackageError::new(format!(
+                        "{} artifact references omitted capability profile `{}`",
+                        artifact.role.as_str(),
+                        artifact.capability_profile_id
+                    ))
+                })?;
+            if selected_profile.role != artifact.role {
+                return Err(PackageError::new(format!(
+                    "{} artifact capability profile `{}` has role {}",
+                    artifact.role.as_str(),
+                    selected_profile.id,
+                    selected_profile.role.as_str()
+                )));
+            }
+            if !referenced_profile_ids.insert(selected_profile.id.as_str()) {
+                return Err(PackageError::new(format!(
+                    "bundle capability profile `{}` is referenced by more than one artifact",
+                    selected_profile.id
+                )));
+            }
             if artifact.protocol_version != self.protocol_version {
                 return Err(PackageError::new(format!(
                     "{} artifact protocol version differs from bundle",
@@ -179,6 +288,11 @@ impl BundleManifest {
         if roles != BTreeSet::from(["client", "session", "server"]) {
             return Err(PackageError::new(
                 "bundle artifact roles are not the required client/session/server triple",
+            ));
+        }
+        if referenced_profile_ids != profile_ids {
+            return Err(PackageError::new(
+                "bundle contains a capability profile not selected by exactly one artifact",
             ));
         }
         if self.files.is_empty() || self.files.len() > MAX_PACKAGE_FILES {
@@ -238,6 +352,12 @@ impl BundleManifest {
 
     pub fn artifact(&self, role: ProgramRole) -> Option<&ArtifactDescriptor> {
         self.artifacts.iter().find(|artifact| artifact.role == role)
+    }
+
+    pub fn capability_profile(&self, id: &str) -> Option<&CapabilityProfileDescriptor> {
+        self.capability_profiles
+            .iter()
+            .find(|profile| profile.id == id)
     }
 
     pub fn public_files(&self) -> impl Iterator<Item = &BundleFileDescriptor> {

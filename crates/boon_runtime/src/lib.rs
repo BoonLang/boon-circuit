@@ -17,11 +17,12 @@ pub use boon_plan::{
 };
 use boon_plan::{MigrationEdgeId, OutputContractKind, OutputRootPlan, SourceId, TargetProfile};
 pub use boon_plan_executor::{
-    AuthorityDelta, Delta, RowId, RowSnapshot, SessionOptions, Snapshot, SourceEvent,
-    SourcePayload, TransientEffectCallId, TransientEffectCreditGrant, TransientEffectInvocation,
-    TurnMetrics, Value, ValueTarget,
+    AuthorityDelta, Delta, DistributedImportUpdate, HostValueBinding, MachineRecoveryImage,
+    MachineTemplate, RowId, RowSnapshot, SessionConnectionStatus, SessionContext, SessionOptions,
+    SessionPrincipal, Snapshot, SourceEvent, SourcePayload, TransientEffectCallId,
+    TransientEffectCreditGrant, TransientEffectInvocation, TurnMetrics, Value, ValueTarget,
 };
-use boon_plan_executor::{Session, SessionBuilder, Turn};
+use boon_plan_executor::{MachineInstance, Turn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +35,7 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
+mod distributed;
 mod document;
 mod program;
 
@@ -49,6 +51,7 @@ mod effects;
 #[cfg(not(target_arch = "wasm32"))]
 mod migration_scenario;
 
+pub use distributed::*;
 pub use document::{DocumentMaterializationStats, DocumentWindowDemand};
 #[cfg(not(target_arch = "wasm32"))]
 pub use effects::*;
@@ -118,7 +121,7 @@ pub struct RuntimePhaseTimings {
 }
 
 pub struct LiveRuntime {
-    session: Session,
+    session: MachineInstance,
     document: Option<document::DocumentRuntime>,
     pending_document_rollback: Option<document::DocumentRollback>,
     source_inventory: SourceInventory,
@@ -171,6 +174,51 @@ fn cached_plan(
 }
 
 impl LiveRuntime {
+    pub(crate) fn fork_distributed_server_evaluation(
+        &self,
+        settle_prepared_turn: bool,
+    ) -> RuntimeResult<Self> {
+        if self.document.is_some() {
+            return Err("distributed Server evaluation cannot fork a document runtime".into());
+        }
+        match (
+            self.pending_document_rollback.as_ref(),
+            settle_prepared_turn,
+        ) {
+            (Some(rollback), true) if rollback.is_unchanged() => {}
+            (Some(_), true) => {
+                return Err(
+                    "distributed Server evaluation found a document-changing prepared turn".into(),
+                );
+            }
+            (None, false) => {}
+            (Some(_), false) => {
+                return Err(
+                    "distributed Server evaluation found an unexpected prepared turn".into(),
+                );
+            }
+            (None, true) => {
+                return Err("distributed Server evaluation requires a prepared turn".into());
+            }
+        }
+
+        let mut session = self.session.clone();
+        if settle_prepared_turn {
+            session.settle_turn();
+        }
+        Ok(Self {
+            session,
+            document: None,
+            pending_document_rollback: None,
+            source_inventory: self.source_inventory.clone(),
+            source_ids_by_path: self.source_ids_by_path.clone(),
+        })
+    }
+
+    pub(crate) fn has_unsettled_turn(&self) -> bool {
+        self.pending_document_rollback.is_some()
+    }
+
     pub fn from_source(source_label: &str, source: &str) -> RuntimeResult<Self> {
         Self::from_source_with_identity(
             source_label,
@@ -382,18 +430,61 @@ impl LiveRuntime {
         options: SessionOptions,
         restore: Option<RestoreImage>,
     ) -> RuntimeResult<Self> {
+        let template = MachineTemplate::new_shared(plan)?;
+        Self::from_machine_template_with_restore(&template, options, restore)
+    }
+
+    pub fn from_machine_template(
+        template: &MachineTemplate,
+        options: SessionOptions,
+    ) -> RuntimeResult<Self> {
+        Self::from_machine_template_with_restore(template, options, None)
+    }
+
+    pub fn from_machine_template_with_restore(
+        template: &MachineTemplate,
+        options: SessionOptions,
+        restore: Option<RestoreImage>,
+    ) -> RuntimeResult<Self> {
+        let plan = template.shared_plan();
         let source_inventory = source_inventory(&plan);
         let source_ids_by_path = source_inventory
             .sources
             .iter()
             .map(|source| (source.path.clone(), source.id))
             .collect();
-        let builder = SessionBuilder::new_shared(plan, options)?;
+        let builder = template.instantiate(options)?;
         let mut session = match restore {
             Some(image) => builder.restore_durable(image)?,
             None => builder,
         }
         .build()?;
+        let document = document::DocumentRuntime::new(&mut session)?;
+        Ok(Self {
+            session,
+            document,
+            pending_document_rollback: None,
+            source_inventory,
+            source_ids_by_path,
+        })
+    }
+
+    pub fn from_machine_template_with_recovery(
+        template: &MachineTemplate,
+        options: SessionOptions,
+        recovery: MachineRecoveryImage,
+    ) -> RuntimeResult<Self> {
+        let plan = template.shared_plan();
+        let source_inventory = source_inventory(&plan);
+        let source_ids_by_path = source_inventory
+            .sources
+            .iter()
+            .map(|source| (source.path.clone(), source.id))
+            .collect();
+        let mut session = template
+            .instantiate(options)?
+            .restore_recovery(recovery)?
+            .build()?;
         let document = document::DocumentRuntime::new(&mut session)?;
         Ok(Self {
             session,
@@ -454,6 +545,15 @@ impl LiveRuntime {
         let turn = self.session.apply_with_demand(event, &demanded)?;
         let executor_us = duration_us(started.elapsed());
         self.runtime_turn(turn, executor_us)
+    }
+
+    pub fn protocol_checkpoint_unsettled(&mut self) -> RuntimeResult<RuntimeTurn> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let started = Instant::now();
+        let turn = self.session.protocol_checkpoint_turn()?;
+        self.runtime_turn(turn, duration_us(started.elapsed()))
     }
 
     pub fn begin_effect_dispatch_unsettled(
@@ -537,8 +637,38 @@ impl LiveRuntime {
             .map_err(Into::into)
     }
 
+    pub fn cancel_transient_effects(
+        &mut self,
+        call_ids: &[TransientEffectCallId],
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        let turn = self.cancel_transient_effects_unsettled(call_ids)?;
+        if turn.is_some() {
+            self.settle_turn();
+        }
+        Ok(turn)
+    }
+
+    pub fn cancel_transient_effects_unsettled(
+        &mut self,
+        call_ids: &[TransientEffectCallId],
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let started = Instant::now();
+        let Some(turn) = self.session.cancel_transient_effects(call_ids)? else {
+            return Ok(None);
+        };
+        let turn = self.runtime_turn(turn, duration_us(started.elapsed()))?;
+        Ok(Some(turn))
+    }
+
     pub fn pending_transient_effect_count(&self) -> usize {
         self.session.pending_transient_effect_count()
+    }
+
+    pub fn set_transient_effect_scope(&mut self, scope: u64) {
+        self.session.set_transient_effect_scope(scope);
     }
 
     pub fn pending_transient_effect_credits(&self, call_id: TransientEffectCallId) -> Option<u32> {
@@ -568,6 +698,113 @@ impl LiveRuntime {
         value: Value,
     ) -> RuntimeResult<Option<RuntimeTurn>> {
         let turn = self.update_distributed_import_unsettled(import_id, content_revision, value)?;
+        if turn.is_some() {
+            self.settle_turn();
+        }
+        Ok(turn)
+    }
+
+    pub fn update_distributed_context_unsettled(
+        &mut self,
+        connection_status: SessionConnectionStatus,
+        principal: SessionPrincipal,
+        import_updates: Vec<DistributedImportUpdate>,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let started = Instant::now();
+        self.session
+            .update_distributed_context(connection_status, principal, import_updates)?
+            .map(|turn| self.runtime_turn(turn, duration_us(started.elapsed())))
+            .transpose()
+    }
+
+    pub fn update_distributed_context(
+        &mut self,
+        connection_status: SessionConnectionStatus,
+        principal: SessionPrincipal,
+        import_updates: Vec<DistributedImportUpdate>,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        let turn = self.update_distributed_context_unsettled(
+            connection_status,
+            principal,
+            import_updates,
+        )?;
+        if turn.is_some() {
+            self.settle_turn();
+        }
+        Ok(turn)
+    }
+
+    pub fn replace_distributed_context_unsettled(
+        &mut self,
+        session_context: SessionContext,
+        import_updates: Vec<DistributedImportUpdate>,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let started = Instant::now();
+        self.session
+            .replace_distributed_context(session_context, import_updates)?
+            .map(|turn| self.runtime_turn(turn, duration_us(started.elapsed())))
+            .transpose()
+    }
+
+    pub fn replace_distributed_context(
+        &mut self,
+        session_context: SessionContext,
+        import_updates: Vec<DistributedImportUpdate>,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        let turn = self.replace_distributed_context_unsettled(session_context, import_updates)?;
+        if turn.is_some() {
+            self.settle_turn();
+        }
+        Ok(turn)
+    }
+
+    pub fn replace_distributed_execution_context(
+        &mut self,
+        session_context: SessionContext,
+        import_updates: Vec<DistributedImportUpdate>,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let started = Instant::now();
+        let turn = self
+            .session
+            .replace_distributed_execution_context(session_context, import_updates)?
+            .map(|turn| self.runtime_turn(turn, duration_us(started.elapsed())))
+            .transpose()?;
+        if turn.is_some() {
+            self.settle_turn();
+        }
+        Ok(turn)
+    }
+
+    pub fn update_session_context_unsettled(
+        &mut self,
+        connection_status: SessionConnectionStatus,
+        principal: SessionPrincipal,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let started = Instant::now();
+        self.session
+            .update_session_context(connection_status, principal)?
+            .map(|turn| self.runtime_turn(turn, duration_us(started.elapsed())))
+            .transpose()
+    }
+
+    pub fn update_session_context(
+        &mut self,
+        connection_status: SessionConnectionStatus,
+        principal: SessionPrincipal,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        let turn = self.update_session_context_unsettled(connection_status, principal)?;
         if turn.is_some() {
             self.settle_turn();
         }
@@ -606,7 +843,10 @@ impl LiveRuntime {
 
     fn effect_turn(
         &mut self,
-        build: impl FnOnce(&mut Session, &[ValueTarget]) -> Result<Turn, boon_plan_executor::Error>,
+        build: impl FnOnce(
+            &mut MachineInstance,
+            &[ValueTarget],
+        ) -> Result<Turn, boon_plan_executor::Error>,
     ) -> RuntimeResult<RuntimeTurn> {
         if self.pending_document_rollback.is_some() {
             return Err("previous runtime turn has not been settled".into());
@@ -663,6 +903,29 @@ impl LiveRuntime {
         })
     }
 
+    pub fn source_event_by_id(
+        &self,
+        sequence: u64,
+        source: SourceId,
+        target: Option<RowId>,
+        payload: SourcePayload,
+    ) -> RuntimeResult<SourceEvent> {
+        if !self
+            .source_inventory
+            .sources
+            .iter()
+            .any(|route| route.id == source)
+        {
+            return Err(format!("MachinePlan has no source ID {}", source.0).into());
+        }
+        Ok(SourceEvent {
+            sequence,
+            source,
+            target,
+            payload,
+        })
+    }
+
     pub fn snapshot(&self) -> RuntimeResult<Snapshot> {
         Ok(self.session.snapshot()?)
     }
@@ -687,6 +950,26 @@ impl LiveRuntime {
 
     pub fn semantic_value_image(&self) -> RuntimeResult<RestoreImage> {
         Ok(self.session.semantic_value_image()?)
+    }
+
+    pub fn recovery_image(&self) -> RuntimeResult<MachineRecoveryImage> {
+        if self.pending_document_rollback.is_some() {
+            return Err("cannot checkpoint a runtime with an unsettled document turn".into());
+        }
+        Ok(self.session.recovery_image()?)
+    }
+
+    pub(crate) fn fork_settled(&self) -> RuntimeResult<Self> {
+        if self.pending_document_rollback.is_some() {
+            return Err("cannot fork a runtime with an unsettled document turn".into());
+        }
+        Ok(Self {
+            session: self.session.fork_settled()?,
+            document: self.document.clone(),
+            pending_document_rollback: None,
+            source_inventory: self.source_inventory.clone(),
+            source_ids_by_path: self.source_ids_by_path.clone(),
+        })
     }
 
     pub fn root_value_current(&mut self, name: &str) -> RuntimeResult<Value> {
@@ -1702,10 +1985,13 @@ fn scenario_value_text(value: &Value) -> RuntimeResult<String> {
         Value::Bool(value) => Ok(if *value { "True" } else { "False" }.to_owned()),
         Value::Number(value) => Ok(value.to_string()),
         Value::Text(value) => Ok(value.clone()),
-        Value::Bytes(value) => Ok(String::from_utf8(value.clone())?),
+        Value::Bytes(value) => Ok(String::from_utf8(value.to_vec())?),
         Value::Error { code } => Ok(code.clone()),
         Value::List(_) | Value::Record(_) | Value::MappedRow { .. } | Value::Row { .. } => {
             Err("scenario text expectation targeted a structured value".into())
+        }
+        Value::HostBound { .. } => {
+            Err("scenario text expectation targeted a process-local host value".into())
         }
     }
 }

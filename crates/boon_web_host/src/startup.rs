@@ -1,13 +1,16 @@
-use crate::{WebHostError, WebHostResult};
+use crate::{DistributedSessionIdentity, WebHostError, WebHostResult};
 use boon_app_package::BrowserAppConfig;
-use boon_runtime::ProgramSession;
+use boon_plan::EffectContract;
+use boon_runtime::{ClientSessionQueueLimits, DistributedClientRuntime};
 
-/// A verified public Client artifact with its initial Boon session mounted.
-/// Browser platform adapters attach input, persistence, layout, and rendering
-/// to this single session rather than decoding package metadata independently.
+/// A verified public Client artifact mounted into the distributed Client
+/// endpoint. The browser adapter must move these parts into the resumable
+/// Client/Session socket owner; there is no local-session product fallback.
 pub struct BrowserAppStartup {
     config: BrowserAppConfig,
-    session: ProgramSession,
+    identity: DistributedSessionIdentity,
+    runtime: DistributedClientRuntime,
+    effect_contracts: Vec<EffectContract>,
 }
 
 impl BrowserAppStartup {
@@ -18,24 +21,61 @@ impl BrowserAppStartup {
         let artifact = config
             .decode_client_artifact(artifact_bytes)
             .map_err(package_input_error)?;
-        let session =
-            ProgramSession::start(artifact).map_err(|error| WebHostError::InvalidInput {
+        let endpoint = artifact
+            .plan()
+            .distributed_endpoint
+            .as_ref()
+            .ok_or_else(|| WebHostError::InvalidInput {
                 field: "browser client artifact".to_owned(),
-                reason: error.to_string(),
+                reason: "Client artifact has no distributed graph endpoint".to_owned(),
             })?;
-        Ok(Self { config, session })
+        let identity = DistributedSessionIdentity::new(
+            &config.package_id,
+            *endpoint.graph.graph_id.as_bytes(),
+            endpoint.graph.revision,
+            endpoint.wire_schema_hash,
+        )
+        .map_err(|error| WebHostError::InvalidInput {
+            field: "browser distributed Session identity".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let effect_contracts = artifact.plan().effects.clone();
+        let runtime =
+            DistributedClientRuntime::start(&artifact, ClientSessionQueueLimits::default())
+                .map_err(|error| WebHostError::InvalidInput {
+                    field: "browser client artifact".to_owned(),
+                    reason: error.to_string(),
+                })?;
+        Ok(Self {
+            config,
+            identity,
+            runtime,
+            effect_contracts,
+        })
     }
 
     pub fn config(&self) -> &BrowserAppConfig {
         &self.config
     }
 
-    pub fn session(&self) -> &ProgramSession {
-        &self.session
+    pub fn runtime(&self) -> &DistributedClientRuntime {
+        &self.runtime
     }
 
-    pub fn session_mut(&mut self) -> &mut ProgramSession {
-        &mut self.session
+    pub fn into_distributed_parts(
+        self,
+    ) -> (
+        BrowserAppConfig,
+        DistributedSessionIdentity,
+        DistributedClientRuntime,
+        Vec<EffectContract>,
+    ) {
+        (
+            self.config,
+            self.identity,
+            self.runtime,
+            self.effect_contracts,
+        )
     }
 }
 

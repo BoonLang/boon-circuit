@@ -1,4 +1,4 @@
-use boon_data::{NumberTextFormat, format_number_text};
+use boon_data::{Bytes, NumberTextFormat, format_number_text};
 use boon_plan::{
     DataTypePlan, DistributedArgumentId, EffectInvocationId, EffectInvocationPlan,
     EffectResultRoute, ExportId, FieldId, FiniteReal, ImportId, InitialValueKind, ListId,
@@ -6,9 +6,9 @@ use boon_plan::{
     PlanDerivedExpression, PlanDerivedKind, PlanExpressionKind, PlanIntrinsic,
     PlanListOperationKind, PlanListProjection, PlanListRemovePredicate, PlanOp, PlanOpId,
     PlanOpKind, PlanQueryResidual, PlanQuerySelection, PlanRowCallArg, PlanRowExpression,
-    PlanRowSelectPattern, PlanSourceGuard, ProgramRole, QueryCollectionId, QueryCollectionPlan,
-    QueryIndexId, QueryIndexPlan, QueryKeyType, RemoteCallSiteId, RootOutputDemand,
-    ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute, StateId, ValueRef,
+    PlanRowSelectPattern, PlanSourceGuard, QueryCollectionId, QueryCollectionPlan, QueryIndexId,
+    QueryIndexPlan, QueryKeyType, RemoteCallSiteId, RootOutputDemand, ScalarStorageSlot, ScopeId,
+    SourceId, SourcePayloadField, SourceRoute, StateId, ValueRef,
 };
 use boon_query::{
     Collection as QueryCollection, CursorToken as QueryCursorToken, IndexId as EngineIndexId,
@@ -16,6 +16,7 @@ use boon_query::{
     QuerySelection as EngineQuerySelection, ResidualPredicate as EngineResidualPredicate,
     RowId as EngineRowId,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -23,16 +24,70 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_SESSION_LAUNCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-pub const MAX_SESSION_INFO_ID_BYTES: usize = 1024;
+pub const MAX_SESSION_INFO_TEXT_BYTES: usize = 1024;
+pub const MAX_SESSION_INFO_ROLE_COUNT: usize = 64;
 pub const TRANSIENT_EFFECT_FIRST_RESULT_SEQUENCE: u64 = 0;
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HostValueIssuer {
+    issuer: [u8; 32],
+}
+
+impl HostValueIssuer {
+    pub const fn new(issuer: [u8; 32]) -> Self {
+        Self { issuer }
+    }
+
+    pub fn mint(&self, handle: [u8; 32], generation: u32) -> Result<HostValueBinding, Error> {
+        if generation == 0 {
+            return Err(Error::Evaluation(
+                "host value binding generation must be positive".to_owned(),
+            ));
+        }
+        Ok(HostValueBinding {
+            issuer: self.issuer,
+            handle,
+            generation,
+        })
+    }
+
+    pub fn open(&self, binding: &HostValueBinding) -> Option<([u8; 32], u32)> {
+        (binding.issuer == self.issuer).then_some((binding.handle, binding.generation))
+    }
+}
+
+impl fmt::Debug for HostValueIssuer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostValueIssuer(<opaque>)")
+    }
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HostValueBinding {
+    issuer: [u8; 32],
+    handle: [u8; 32],
+    generation: u32,
+}
+
+impl HostValueBinding {
+    #[doc(hidden)]
+    pub const fn new_issuer(issuer: [u8; 32]) -> HostValueIssuer {
+        HostValueIssuer::new(issuer)
+    }
+}
+
+impl fmt::Debug for HostValueBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostValueBinding(<opaque>)")
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
     Number(FiniteReal),
     Text(String),
-    Bytes(Vec<u8>),
+    Bytes(Bytes),
     List(Vec<Value>),
     Record(BTreeMap<String, Value>),
     MappedRow {
@@ -46,6 +101,11 @@ pub enum Value {
     Error {
         code: String,
     },
+    #[serde(skip)]
+    HostBound {
+        visible: Box<Value>,
+        binding: HostValueBinding,
+    },
 }
 
 impl Value {
@@ -54,9 +114,90 @@ impl Value {
             .map(Self::Number)
             .map_err(|error| Error::Evaluation(error.to_string()))
     }
+
+    pub fn from_data(value: &boon_data::Value) -> Self {
+        runtime_value_from_data(value)
+    }
+
+    pub fn to_data(&self) -> Result<boon_data::Value, Error> {
+        runtime_value_to_query_data(self)
+    }
+
+    pub fn host_bound(visible: Value, binding: HostValueBinding) -> Self {
+        Self::HostBound {
+            visible: Box::new(visible),
+            binding,
+        }
+    }
+
+    pub fn visible(&self) -> &Value {
+        match self {
+            Self::HostBound { visible, .. } => visible.visible(),
+            value => value,
+        }
+    }
+
+    pub fn host_binding(&self) -> Option<&HostValueBinding> {
+        match self {
+            Self::HostBound { binding, .. } => Some(binding),
+            _ => None,
+        }
+    }
+
+    pub fn contains_host_binding(&self) -> bool {
+        match self {
+            Self::HostBound { .. } => true,
+            Self::List(values) => values.iter().any(Self::contains_host_binding),
+            Self::Record(fields) | Self::MappedRow { fields, .. } => {
+                fields.values().any(Self::contains_host_binding)
+            }
+            Self::Row { fields, .. } => fields.values().any(Self::contains_host_binding),
+            Self::Null
+            | Self::Bool(_)
+            | Self::Number(_)
+            | Self::Text(_)
+            | Self::Bytes(_)
+            | Self::Error { .. } => false,
+        }
+    }
+
+    fn into_visible_facade(self) -> Self {
+        match self {
+            Self::HostBound { visible, .. } => visible.into_visible_facade(),
+            Self::List(values) => {
+                Self::List(values.into_iter().map(Self::into_visible_facade).collect())
+            }
+            Self::Record(fields) => Self::Record(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| (name, value.into_visible_facade()))
+                    .collect(),
+            ),
+            Self::MappedRow { id, fields } => Self::MappedRow {
+                id,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| (name, value.into_visible_facade()))
+                    .collect(),
+            },
+            Self::Row { id, fields } => Self::Row {
+                id,
+                fields: fields
+                    .into_iter()
+                    .map(|(field, value)| (field, value.into_visible_facade()))
+                    .collect(),
+            },
+            value @ (Self::Null
+            | Self::Bool(_)
+            | Self::Number(_)
+            | Self::Text(_)
+            | Self::Bytes(_)
+            | Self::Error { .. }) => value,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct RowId {
     pub list: ListId,
     pub key: u64,
@@ -184,7 +325,7 @@ pub struct Turn {
     pub metrics: TurnMetrics,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct TransientEffectCallId {
     launch_epoch: u64,
     sequence: u64,
@@ -255,7 +396,7 @@ pub struct ListAuthority {
     pub rows: Vec<RowAuthority>,
 }
 
-/// Runtime-ID authority image used at the Session boundary.
+/// Runtime-ID authority image used at the machine-instance boundary.
 ///
 /// Durable storage translates the runtime IDs through `MachinePlan::persistence`;
 /// derived values, indexes, source bindings, and currentness caches never enter
@@ -283,43 +424,174 @@ impl Snapshot {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SessionConnectionStatus {
+    Connecting,
+    #[default]
+    Current,
+    Stale,
+    Failed {
+        code: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SessionPrincipal {
+    #[default]
+    Anonymous,
+    Authenticated {
+        subject: String,
+        roles: Vec<String>,
+    },
+}
+
+impl SessionPrincipal {
+    pub fn authenticated(
+        subject: impl Into<String>,
+        roles: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, Error> {
+        let mut roles = roles.into_iter().map(Into::into).collect::<Vec<_>>();
+        roles.sort();
+        roles.dedup();
+        let principal = Self::Authenticated {
+            subject: subject.into(),
+            roles,
+        };
+        validate_session_principal(&principal)?;
+        Ok(principal)
+    }
+
+    pub fn validate(&self) -> Result<(), Error> {
+        validate_session_principal(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SessionContext {
+    Unavailable,
+    Available {
+        status: SessionConnectionStatus,
+        principal: SessionPrincipal,
+    },
+}
+
+impl Default for SessionContext {
+    fn default() -> Self {
+        Self::Available {
+            status: SessionConnectionStatus::Current,
+            principal: SessionPrincipal::Anonymous,
+        }
+    }
+}
+
+impl SessionContext {
+    pub fn validate(&self) -> Result<(), Error> {
+        validate_session_context(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedImportUpdate {
+    pub import_id: ImportId,
+    pub content_revision: u64,
+    pub value: Value,
+}
+
+impl DistributedImportUpdate {
+    pub fn new(import_id: ImportId, content_revision: u64, value: Value) -> Self {
+        Self {
+            import_id,
+            content_revision,
+            value,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionOptions {
     pub require_monotonic_sequences: bool,
-    /// Session identity exposed by `SessionInfo/status()`.
-    pub session_id: Option<String>,
-    /// Authenticated identity exposed by `SessionInfo/principal()`.
-    pub principal_id: Option<String>,
+    pub session_context: SessionContext,
     /// Deterministic executor work allowed for one startup, source turn, or
     /// host-owned currentness transaction. Trusted applications leave this
     /// unbounded; capability hosts set it for restricted programs.
     pub max_work_units_per_transaction: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryDistributedImport {
+    pub revision: Option<u64>,
+    pub value: boon_data::Value,
+}
+
+/// Host-private execution state needed to resume one exact compiled machine.
+///
+/// This image contains semantic authority and distributed imports, but never
+/// process-owned effect correlations. Restoring it always allocates fresh
+/// transient effect identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MachineRecoveryImage {
+    pub authority: boon_persistence::RestoreImage,
+    pub last_source_sequence: Option<u64>,
+    pub session_context: SessionContext,
+    pub distributed_imports: BTreeMap<ImportId, RecoveryDistributedImport>,
+}
+
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             require_monotonic_sequences: true,
-            session_id: None,
-            principal_id: None,
+            session_context: SessionContext::default(),
             max_work_units_per_transaction: None,
         }
     }
 }
 
 fn validate_session_options(options: &SessionOptions) -> Result<(), Error> {
-    for (name, value) in [
-        ("session_id", options.session_id.as_deref()),
-        ("principal_id", options.principal_id.as_deref()),
-    ] {
-        if let Some(value) = value
-            && value.len() > MAX_SESSION_INFO_ID_BYTES
-        {
-            return Err(Error::InvalidOptions(format!(
-                "{name} is {} UTF-8 bytes; limit is {MAX_SESSION_INFO_ID_BYTES}",
-                value.len()
-            )));
-        }
+    validate_session_context(&options.session_context)
+}
+
+fn validate_session_context(context: &SessionContext) -> Result<(), Error> {
+    let SessionContext::Available { status, principal } = context else {
+        return Ok(());
+    };
+    if let SessionConnectionStatus::Failed { code } = status
+        && (code.is_empty()
+            || code.len() > MAX_SESSION_INFO_TEXT_BYTES
+            || !code
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+    {
+        return Err(Error::InvalidOptions(format!(
+            "SessionInfo failure code must be 1..={MAX_SESSION_INFO_TEXT_BYTES} ASCII identifier bytes"
+        )));
+    }
+    validate_session_principal(principal)
+}
+
+fn validate_session_principal(principal: &SessionPrincipal) -> Result<(), Error> {
+    let SessionPrincipal::Authenticated { subject, roles } = principal else {
+        return Ok(());
+    };
+    if subject.is_empty() || subject.len() > MAX_SESSION_INFO_TEXT_BYTES {
+        return Err(Error::InvalidOptions(format!(
+            "SessionInfo principal subject must be 1..={MAX_SESSION_INFO_TEXT_BYTES} UTF-8 bytes"
+        )));
+    }
+    if roles.len() > MAX_SESSION_INFO_ROLE_COUNT {
+        return Err(Error::InvalidOptions(format!(
+            "SessionInfo principal has {} roles; limit is {MAX_SESSION_INFO_ROLE_COUNT}",
+            roles.len()
+        )));
+    }
+    if roles.windows(2).any(|pair| pair[0] >= pair[1])
+        || roles
+            .iter()
+            .any(|role| role.is_empty() || role.len() > MAX_SESSION_INFO_TEXT_BYTES)
+    {
+        return Err(Error::InvalidOptions(
+            "SessionInfo principal roles must be sorted, unique, and bounded non-empty text"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -419,7 +691,7 @@ enum ScalarKey {
     Bool(bool),
     Number(FiniteReal),
     Text(String),
-    Bytes(Vec<u8>),
+    Bytes(Bytes),
 }
 
 impl ScalarKey {
@@ -434,7 +706,8 @@ impl ScalarKey {
             | Value::Record(_)
             | Value::MappedRow { .. }
             | Value::Row { .. }
-            | Value::Error { .. } => None,
+            | Value::Error { .. }
+            | Value::HostBound { .. } => None,
         }
     }
 }
@@ -582,10 +855,19 @@ struct Metadata {
     mutations: Vec<Arc<PlanOp>>,
     mutations_by_state: BTreeMap<StateId, Vec<Arc<PlanOp>>>,
     source_derived_by_source: BTreeMap<SourceId, BTreeSet<FieldId>>,
+    state_derived_by_state: BTreeMap<StateId, BTreeSet<FieldId>>,
     transient_effect_result_states: BTreeSet<StateId>,
     transient_effect_result_fields: BTreeSet<FieldId>,
+    session_info_root_fields: BTreeSet<FieldId>,
+    session_info_row_fields: BTreeSet<FieldId>,
     published: BTreeSet<FieldId>,
     dependencies: Dependencies,
+}
+
+fn derived_expression_has_intrinsic(expression: &PlanDerivedExpression) -> bool {
+    let mut found = false;
+    expression.visit_intrinsics(&mut |_| found = true);
+    found
 }
 
 fn distributed_import_contracts(
@@ -815,20 +1097,27 @@ impl Metadata {
         let mut root_computations = BTreeMap::new();
         let mut row_computations = BTreeMap::new();
         let mut source_derived_by_source = BTreeMap::<SourceId, BTreeSet<FieldId>>::new();
+        let mut state_derived_by_state = BTreeMap::<StateId, BTreeSet<FieldId>>::new();
         let mut updates_by_source = BTreeMap::<SourceId, Vec<Arc<PlanOp>>>::new();
         let mut updates_by_state = BTreeMap::<StateId, Vec<Arc<PlanOp>>>::new();
-        let read_only_effects = plan
+        let transient_effects = plan
             .effects
             .iter()
-            .filter(|effect| matches!(effect.replay, boon_plan::EffectReplay::ReadOnly))
+            .filter(|effect| effect_replay_is_transient(&effect.replay))
             .map(|effect| effect.effect_id)
             .collect::<BTreeSet<_>>();
         let mut transient_effect_result_states = BTreeSet::new();
         let mut transient_effect_result_fields = BTreeSet::new();
+        let mut session_info_root_fields = BTreeSet::new();
+        let mut session_info_row_fields = BTreeSet::new();
         let mut mutations = Vec::new();
         for op in plan.regions.iter().flat_map(|region| &region.ops) {
             match &op.kind {
-                PlanOpKind::DerivedValue { derived_kind, .. } => {
+                PlanOpKind::DerivedValue {
+                    derived_kind,
+                    expression,
+                    ..
+                } => {
                     let Some(ValueRef::Field(field)) = op.output else {
                         return Err(Error::InvalidPlan(format!(
                             "derived op {} has no field output",
@@ -837,17 +1126,46 @@ impl Metadata {
                     };
                     if op.indexed {
                         row_computations.insert(field, Arc::new(op.clone()));
+                        if expression
+                            .as_ref()
+                            .is_some_and(derived_expression_has_intrinsic)
+                        {
+                            session_info_row_fields.insert(field);
+                        }
                     } else {
                         root_computations.insert(field, Arc::new(op.clone()));
-                        if *derived_kind == PlanDerivedKind::SourceEventTransform {
-                            for source in op.inputs.iter().filter_map(|input| match input {
-                                ValueRef::Source(source) => Some(*source),
-                                _ => None,
-                            }) {
-                                source_derived_by_source
-                                    .entry(source)
-                                    .or_default()
-                                    .insert(field);
+                        if expression
+                            .as_ref()
+                            .is_some_and(derived_expression_has_intrinsic)
+                        {
+                            session_info_root_fields.insert(field);
+                        }
+                        if *derived_kind == PlanDerivedKind::SourceEventTransform
+                            && let Some(PlanDerivedExpression::SourceEventTransform {
+                                arms, ..
+                            }) = expression
+                        {
+                            for arm in arms {
+                                match &arm.trigger {
+                                    ValueRef::Source(source) => {
+                                        source_derived_by_source
+                                            .entry(*source)
+                                            .or_default()
+                                            .insert(field);
+                                    }
+                                    ValueRef::State(state) => {
+                                        state_derived_by_state
+                                            .entry(*state)
+                                            .or_default()
+                                            .insert(field);
+                                    }
+                                    _ => {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "source-event transform field {} has a non-event arm trigger",
+                                            field.0
+                                        )));
+                                    }
+                                }
                             }
                         }
                     }
@@ -869,7 +1187,7 @@ impl Metadata {
                         result: EffectResultRoute::Target { target, .. },
                         ..
                     }) = effect
-                        && read_only_effects.contains(effect_id)
+                        && transient_effects.contains(effect_id)
                     {
                         match target {
                             ValueRef::State(state) => {
@@ -937,10 +1255,10 @@ impl Metadata {
             }
         }
         for ops in updates_by_source.values_mut() {
-            ops.sort_by_key(|op| op.id);
+            sort_update_ops_by_dependencies(ops);
         }
         for ops in updates_by_state.values_mut() {
-            ops.sort_by_key(|op| op.id);
+            sort_update_ops_by_dependencies(ops);
         }
         transient_effect_result_fields.extend(
             transient_effect_result_states
@@ -1030,8 +1348,11 @@ impl Metadata {
             mutations,
             mutations_by_state,
             source_derived_by_source,
+            state_derived_by_state,
             transient_effect_result_states,
             transient_effect_result_fields,
+            session_info_root_fields,
+            session_info_row_fields,
             published,
             dependencies: Dependencies::default(),
         };
@@ -1333,6 +1654,17 @@ fn debug_labels(entries: &[boon_plan::DebugEntry], prefix: &str) -> BTreeMap<usi
         .collect()
 }
 
+fn debug_label<'a>(
+    entries: &'a [boon_plan::DebugEntry],
+    prefix: &str,
+    id: usize,
+) -> Option<&'a str> {
+    let id = format!("{prefix}{id}");
+    entries
+        .iter()
+        .find_map(|entry| (entry.id == id).then_some(entry.label.as_str()))
+}
+
 fn local_name(label: &str) -> &str {
     label.rsplit('.').next().unwrap_or(label)
 }
@@ -1359,7 +1691,7 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
                     bytes.len()
                 )));
             }
-            Ok(Value::Bytes(bytes))
+            Ok(Value::Bytes(Bytes::from(bytes)))
         }
     }
 }
@@ -1441,6 +1773,11 @@ fn runtime_value_to_query_data(value: &Value) -> Result<boon_data::Value, Error>
                 "query authority cannot contain runtime row handles".to_owned(),
             ));
         }
+        Value::HostBound { .. } => {
+            return Err(Error::Evaluation(
+                "host-bound values cannot cross an ordinary data boundary".to_owned(),
+            ));
+        }
     })
 }
 
@@ -1509,7 +1846,7 @@ fn runtime_query_parts(
 fn query_cursor_from_runtime(value: Value) -> Result<Option<QueryCursorToken>, Error> {
     match value {
         Value::Bytes(bytes) if bytes.is_empty() => Ok(None),
-        Value::Bytes(bytes) => QueryCursorToken::from_bytes(bytes)
+        Value::Bytes(bytes) => QueryCursorToken::from_bytes(bytes.to_vec())
             .map(Some)
             .map_err(|error| Error::Evaluation(error.to_string())),
         Value::Null => Ok(None),
@@ -1650,28 +1987,18 @@ fn stored_row(
         .fields
         .iter()
         .filter(|(field, _)| !touched_only || row.touched_fields.contains(field))
-        .map(|(field, value)| {
-            let stable = stable_fields.get(field).copied().ok_or_else(|| {
-                Error::InvalidPlan(format!(
-                    "persistence list {} has no stable identity for field {}",
-                    memory.memory_id, field.0
-                ))
-            })?;
-            Ok((stable, stored_value(value)?))
+        .filter_map(|(field, value)| {
+            stable_fields
+                .get(field)
+                .copied()
+                .map(|stable| stored_value(value).map(|value| (stable, value)))
         })
         .collect::<Result<BTreeMap<_, _>, Error>>()?;
     let touched_fields = row
         .touched_fields
         .iter()
-        .map(|field| {
-            stable_fields.get(field).copied().ok_or_else(|| {
-                Error::InvalidPlan(format!(
-                    "persistence list {} has no stable identity for touched field {}",
-                    memory.memory_id, field.0
-                ))
-            })
-        })
-        .collect::<Result<BTreeSet<_>, Error>>()?;
+        .filter_map(|field| stable_fields.get(field).copied())
+        .collect::<BTreeSet<_>>();
     Ok(boon_persistence::StoredRow {
         key: row.id.key,
         generation: row.id.generation,
@@ -1716,6 +2043,9 @@ pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValu
         Value::MappedRow { .. } | Value::Row { .. } => Err(Error::Evaluation(
             "row handles and derived mapped rows are not durable authority".to_owned(),
         )),
+        Value::HostBound { .. } => Err(Error::Evaluation(
+            "host-bound values are transient and cannot be persisted".to_owned(),
+        )),
     }
 }
 
@@ -1751,6 +2081,10 @@ fn validate_value_for_data_type(
     path: &str,
 ) -> Result<(), Error> {
     use boon_plan::DataTypePlan;
+
+    if let Value::HostBound { visible, .. } = value {
+        return validate_value_for_data_type(visible, data_type, path);
+    }
 
     match (value, data_type) {
         (Value::Null, DataTypePlan::Null)
@@ -1811,8 +2145,25 @@ fn validate_value_for_data_type(
             "{path} has an unknown data type"
         ))),
         _ => Err(Error::Evaluation(format!(
-            "{path} does not match its declared data type"
+            "{path} has runtime kind {} but its declared data type is {data_type:?}",
+            runtime_value_kind(value)
         ))),
+    }
+}
+
+fn runtime_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "Null",
+        Value::Bool(_) => "Bool",
+        Value::Number(_) => "Number",
+        Value::Text(_) => "Text",
+        Value::Bytes(_) => "Bytes",
+        Value::List(_) => "List",
+        Value::Record(_) => "Record",
+        Value::MappedRow { .. } => "MappedRow",
+        Value::Row { .. } => "Row",
+        Value::Error { .. } => "Error",
+        Value::HostBound { visible, .. } => runtime_value_kind(visible),
     }
 }
 
@@ -1821,6 +2172,11 @@ fn validate_distributed_boundary_value(
     data_type: &DataTypePlan,
     path: &str,
 ) -> Result<(), Error> {
+    if value.contains_host_binding() {
+        return Err(Error::Evaluation(format!(
+            "{path} contains a process-local host binding"
+        )));
+    }
     // Cross-role reads preserve Boon's normal value type while allowing a
     // generated transport/currentness error to flow through existing error
     // propagation. Applications do not serialize or inspect transport frames.
@@ -1926,6 +2282,24 @@ enum AuthorityUndo {
     },
 }
 
+#[derive(Clone)]
+struct DistributedContextUndo {
+    session_context: SessionContext,
+    imports: BTreeMap<ImportId, (Option<Value>, Option<u64>)>,
+}
+
+#[derive(Clone, Copy)]
+enum DistributedContextInstall {
+    Patch,
+    Replace,
+}
+
+#[derive(Clone, Copy)]
+enum DistributedContextTurn {
+    Authority,
+    Execution,
+}
+
 #[derive(Clone, Default)]
 struct Work {
     emit: bool,
@@ -1940,6 +2314,7 @@ struct Work {
     updated_transient_effects: Vec<(TransientEffectCallId, PendingTransientEffect)>,
     metrics: TurnMetrics,
     dirty_states: HashSet<StateId>,
+    active_state_trigger: Option<StateId>,
     dirty_consumers: HashSet<Consumer>,
     changed_rows: HashSet<RowId>,
     suppress_row_deltas: HashSet<RowId>,
@@ -1947,6 +2322,7 @@ struct Work {
     authority_undo: Vec<AuthorityUndo>,
     undo_root_states: HashSet<StateId>,
     undo_row_fields: HashSet<(RowId, FieldId)>,
+    distributed_context_undo: Option<DistributedContextUndo>,
     pending_settle: bool,
     previous_last_sequence: Option<u64>,
     previous_turn_sequence: u64,
@@ -1984,6 +2360,7 @@ impl Work {
         self.authority_undo.clear();
         self.undo_root_states.clear();
         self.undo_row_fields.clear();
+        self.distributed_context_undo = None;
         self.pending_settle = false;
         self.previous_last_sequence = last_sequence;
         self.previous_turn_sequence = turn_sequence;
@@ -2020,6 +2397,7 @@ impl Work {
         self.committed_transient_effects.clear();
         self.completed_transient_effects.clear();
         self.updated_transient_effects.clear();
+        self.distributed_context_undo = None;
         self.pending_settle = false;
     }
 
@@ -2043,6 +2421,7 @@ struct PendingTransientEffect {
     invocation_id: EffectInvocationId,
     effect_id: boon_plan::EffectId,
     target: Option<RowId>,
+    execution_scope: u64,
     delivery: boon_plan::EffectDeliveryCardinality,
     next_result_sequence: u64,
     available_credits: u32,
@@ -2061,7 +2440,7 @@ enum EvalValue {
 }
 
 #[derive(Clone)]
-pub struct Session {
+pub struct MachineInstance {
     plan: Arc<MachinePlan>,
     options: SessionOptions,
     metadata: Arc<Metadata>,
@@ -2077,6 +2456,7 @@ pub struct Session {
     last_sequence: Option<u64>,
     turn_sequence: u64,
     launch_epoch: u64,
+    transient_effect_scope: u64,
     next_transient_effect_sequence: u64,
     pending_transient_effects: BTreeMap<TransientEffectCallId, PendingTransientEffect>,
     next_binding_id: u64,
@@ -2086,8 +2466,39 @@ pub struct Session {
     turn_work: Work,
 }
 
-pub struct SessionBuilder {
-    session: Session,
+#[derive(Clone)]
+pub struct MachineTemplate {
+    plan: Arc<MachinePlan>,
+    metadata: Arc<Metadata>,
+}
+
+impl MachineTemplate {
+    pub fn new(plan: MachinePlan) -> Result<Self, Error> {
+        Self::new_shared(Arc::new(plan))
+    }
+
+    pub fn new_shared(plan: Arc<MachinePlan>) -> Result<Self, Error> {
+        if plan.version.major != boon_plan::PLAN_MAJOR_VERSION {
+            return Err(Error::InvalidPlan(format!(
+                "plan major version {} is not supported",
+                plan.version.major
+            )));
+        }
+        let metadata = Arc::new(Metadata::new(&plan)?);
+        Ok(Self { plan, metadata })
+    }
+
+    pub fn shared_plan(&self) -> Arc<MachinePlan> {
+        Arc::clone(&self.plan)
+    }
+
+    pub fn instantiate(&self, options: SessionOptions) -> Result<MachineInstanceBuilder, Error> {
+        MachineInstanceBuilder::from_template(self.clone(), options)
+    }
+}
+
+pub struct MachineInstanceBuilder {
+    session: MachineInstance,
     authority: Option<AuthoritySnapshot>,
 }
 
@@ -2099,20 +2510,18 @@ fn next_session_launch_epoch() -> Result<u64, Error> {
         .map_err(|_| Error::Evaluation("session launch epoch exhausted".to_owned()))
 }
 
-impl SessionBuilder {
+impl MachineInstanceBuilder {
     pub fn new(plan: MachinePlan, options: SessionOptions) -> Result<Self, Error> {
         Self::new_shared(Arc::new(plan), options)
     }
 
     pub fn new_shared(plan: Arc<MachinePlan>, options: SessionOptions) -> Result<Self, Error> {
+        MachineTemplate::new_shared(plan)?.instantiate(options)
+    }
+
+    fn from_template(template: MachineTemplate, options: SessionOptions) -> Result<Self, Error> {
         validate_session_options(&options)?;
-        if plan.version.major != boon_plan::PLAN_MAJOR_VERSION {
-            return Err(Error::InvalidPlan(format!(
-                "plan major version {} is not supported",
-                plan.version.major
-            )));
-        }
-        let metadata = Arc::new(Metadata::new(&plan)?);
+        let MachineTemplate { plan, metadata } = template;
         let query_collections = empty_query_collections(&metadata)?;
         let distributed_imports = metadata
             .distributed_import_types
@@ -2129,7 +2538,7 @@ impl SessionBuilder {
             .collect();
         let turn_work = Work::with_limit(options.max_work_units_per_transaction);
         Ok(Self {
-            session: Session {
+            session: MachineInstance {
                 plan,
                 options,
                 metadata,
@@ -2145,6 +2554,7 @@ impl SessionBuilder {
                 last_sequence: None,
                 turn_sequence: 0,
                 launch_epoch: next_session_launch_epoch()?,
+                transient_effect_scope: 0,
                 next_transient_effect_sequence: 1,
                 pending_transient_effects: BTreeMap::new(),
                 next_binding_id: 1,
@@ -2167,7 +2577,77 @@ impl SessionBuilder {
         Ok(self)
     }
 
-    pub fn build(mut self) -> Result<Session, Error> {
+    pub fn restore_recovery(mut self, image: MachineRecoveryImage) -> Result<Self, Error> {
+        validate_session_context(&image.session_context)?;
+        if image.last_source_sequence == Some(0) {
+            return Err(Error::InvalidPlan(
+                "machine recovery source sequence must be positive".to_owned(),
+            ));
+        }
+        let declared_imports = self
+            .session
+            .metadata
+            .distributed_import_types
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let recovered_imports = image
+            .distributed_imports
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if declared_imports != recovered_imports {
+            return Err(Error::InvalidPlan(
+                "machine recovery distributed imports do not match the compiled endpoint"
+                    .to_owned(),
+            ));
+        }
+
+        let mut distributed_imports = BTreeMap::new();
+        let mut distributed_import_revisions = BTreeMap::new();
+        for (import_id, recovered) in image.distributed_imports {
+            if recovered.revision == Some(0) {
+                return Err(Error::InvalidPlan(
+                    "machine recovery import revision must be positive".to_owned(),
+                ));
+            }
+            let value = runtime_value_from_data(&recovered.value);
+            if recovered.revision.is_none()
+                && !matches!(&value, Value::Error { code } if code == "remote_not_current")
+            {
+                return Err(Error::InvalidPlan(
+                    "machine recovery import without a revision must be remote_not_current"
+                        .to_owned(),
+                ));
+            }
+            if recovered.revision.is_some() {
+                let data_type = self
+                    .session
+                    .metadata
+                    .distributed_import_types
+                    .get(&import_id)
+                    .expect("recovered import set was matched against compiled imports");
+                validate_distributed_boundary_value(
+                    &value,
+                    data_type,
+                    "machine recovery distributed import",
+                )?;
+            }
+            distributed_imports.insert(import_id, value);
+            if let Some(revision) = recovered.revision {
+                distributed_import_revisions.insert(import_id, revision);
+            }
+        }
+
+        self.authority = Some(self.session.authority_from_durable(image.authority)?);
+        self.session.last_sequence = image.last_source_sequence;
+        self.session.options.session_context = image.session_context;
+        self.session.distributed_imports = distributed_imports;
+        self.session.distributed_import_revisions = distributed_import_revisions;
+        Ok(self)
+    }
+
+    pub fn build(mut self) -> Result<MachineInstance, Error> {
         let mut work = self.session.fresh_work();
         self.session.initialize_storage_defaults(&mut work)?;
         if let Some(authority) = self.authority.take() {
@@ -2179,17 +2659,26 @@ impl SessionBuilder {
     }
 }
 
-impl Session {
+impl MachineInstance {
+    #[cfg(test)]
+    pub(crate) fn shares_template_metadata(&self, template: &MachineTemplate) -> bool {
+        Arc::ptr_eq(&self.metadata, &template.metadata) && Arc::ptr_eq(&self.plan, &template.plan)
+    }
+
     fn fresh_work(&self) -> Work {
         Work::with_limit(self.options.max_work_units_per_transaction)
     }
 
     pub fn new(plan: MachinePlan, options: SessionOptions) -> Result<Self, Error> {
-        SessionBuilder::new(plan, options)?.build()
+        MachineInstanceBuilder::new(plan, options)?.build()
     }
 
     pub fn new_shared(plan: Arc<MachinePlan>, options: SessionOptions) -> Result<Self, Error> {
-        SessionBuilder::new_shared(plan, options)?.build()
+        MachineInstanceBuilder::new_shared(plan, options)?.build()
+    }
+
+    pub fn set_transient_effect_scope(&mut self, scope: u64) {
+        self.transient_effect_scope = scope;
     }
 
     pub fn plan(&self) -> &MachinePlan {
@@ -2198,6 +2687,266 @@ impl Session {
 
     pub fn shared_plan(&self) -> Arc<MachinePlan> {
         Arc::clone(&self.plan)
+    }
+
+    pub fn update_session_context(
+        &mut self,
+        connection_status: SessionConnectionStatus,
+        principal: SessionPrincipal,
+    ) -> Result<Option<Turn>, Error> {
+        self.update_distributed_context(connection_status, principal, Vec::new())
+    }
+
+    /// Atomically installs all host-owned distributed context before making
+    /// any dependent value current. The batch is validated in full before the
+    /// transaction starts; duplicate import IDs fail closed.
+    pub fn update_distributed_context(
+        &mut self,
+        connection_status: SessionConnectionStatus,
+        principal: SessionPrincipal,
+        import_updates: Vec<DistributedImportUpdate>,
+    ) -> Result<Option<Turn>, Error> {
+        self.install_distributed_context(
+            SessionContext::Available {
+                status: connection_status,
+                principal,
+            },
+            import_updates,
+            DistributedContextInstall::Patch,
+            DistributedContextTurn::Authority,
+        )
+    }
+
+    /// Replaces the complete distributed execution context. Unlike patch
+    /// updates, revisions belong to the replacement context, so a newly
+    /// installed context may start again at revision one. Every omitted
+    /// declared import becomes `remote_not_current` and loses its revision.
+    pub fn replace_distributed_context(
+        &mut self,
+        session_context: SessionContext,
+        import_updates: Vec<DistributedImportUpdate>,
+    ) -> Result<Option<Turn>, Error> {
+        self.install_distributed_context(
+            session_context,
+            import_updates,
+            DistributedContextInstall::Replace,
+            DistributedContextTurn::Authority,
+        )
+    }
+
+    /// Replaces transient remote inputs for one execution scope without
+    /// consuming a durable authority turn sequence. Server origin/global
+    /// switching uses this path before a separately admitted source or effect
+    /// turn.
+    pub fn replace_distributed_execution_context(
+        &mut self,
+        session_context: SessionContext,
+        import_updates: Vec<DistributedImportUpdate>,
+    ) -> Result<Option<Turn>, Error> {
+        self.install_distributed_context(
+            session_context,
+            import_updates,
+            DistributedContextInstall::Replace,
+            DistributedContextTurn::Execution,
+        )
+    }
+
+    fn install_distributed_context(
+        &mut self,
+        session_context: SessionContext,
+        import_updates: Vec<DistributedImportUpdate>,
+        install: DistributedContextInstall,
+        turn: DistributedContextTurn,
+    ) -> Result<Option<Turn>, Error> {
+        validate_session_context(&session_context)?;
+
+        let mut seen_imports = BTreeSet::new();
+        let mut next_imports = match install {
+            DistributedContextInstall::Patch => self.distributed_imports.clone(),
+            DistributedContextInstall::Replace => self
+                .metadata
+                .distributed_import_types
+                .keys()
+                .copied()
+                .map(|import_id| {
+                    (
+                        import_id,
+                        Value::Error {
+                            code: "remote_not_current".to_owned(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let mut next_revisions = match install {
+            DistributedContextInstall::Patch => self.distributed_import_revisions.clone(),
+            DistributedContextInstall::Replace => BTreeMap::new(),
+        };
+        for update in import_updates {
+            let DistributedImportUpdate {
+                import_id,
+                content_revision,
+                value,
+            } = update;
+            if !seen_imports.insert(import_id) {
+                return Err(Error::InvalidEvent(format!(
+                    "distributed context update contains duplicate import {import_id}"
+                )));
+            }
+            let data_type = self
+                .metadata
+                .distributed_import_types
+                .get(&import_id)
+                .ok_or_else(|| {
+                    Error::InvalidEvent(format!(
+                        "distributed import {import_id} is not declared by this endpoint"
+                    ))
+                })?;
+            if content_revision == 0 {
+                return Err(Error::InvalidEvent(format!(
+                    "distributed import {import_id} content revision must be positive"
+                )));
+            }
+            validate_distributed_boundary_value(&value, data_type, "distributed import")?;
+
+            if matches!(install, DistributedContextInstall::Patch) {
+                let previous_revision = next_revisions.get(&import_id).copied().unwrap_or(0);
+                let previous_value = next_imports.get(&import_id);
+                if content_revision < previous_revision {
+                    return Err(Error::InvalidEvent(format!(
+                        "distributed import {import_id} revision {content_revision} is stale; current revision is {previous_revision}"
+                    )));
+                }
+                if content_revision == previous_revision {
+                    if previous_value == Some(&value) {
+                        continue;
+                    }
+                    return Err(Error::InvalidEvent(format!(
+                        "distributed import {import_id} revision {content_revision} conflicts with its current value"
+                    )));
+                }
+            }
+            next_imports.insert(import_id, value);
+            next_revisions.insert(import_id, content_revision);
+        }
+
+        let context_changed = self.options.session_context != session_context;
+        let changed_imports = self
+            .metadata
+            .distributed_import_types
+            .keys()
+            .copied()
+            .filter(|import_id| {
+                self.distributed_imports.get(import_id) != next_imports.get(import_id)
+                    || self.distributed_import_revisions.get(import_id)
+                        != next_revisions.get(import_id)
+            })
+            .collect::<Vec<_>>();
+        if !context_changed && changed_imports.is_empty() {
+            return Ok(None);
+        }
+
+        let sequence = match turn {
+            DistributedContextTurn::Authority => self.next_internal_turn_sequence()?,
+            DistributedContextTurn::Execution => self.turn_sequence,
+        };
+        let mut work = self.take_internal_turn_work();
+        work.distributed_context_undo = Some(DistributedContextUndo {
+            session_context: self.options.session_context.clone(),
+            imports: changed_imports
+                .iter()
+                .copied()
+                .map(|import_id| {
+                    (
+                        import_id,
+                        (
+                            self.distributed_imports.get(&import_id).cloned(),
+                            self.distributed_import_revisions.get(&import_id).copied(),
+                        ),
+                    )
+                })
+                .collect(),
+        });
+        self.options.session_context = session_context;
+        for import_id in &changed_imports {
+            self.distributed_imports.insert(
+                *import_id,
+                next_imports
+                    .get(import_id)
+                    .cloned()
+                    .expect("every declared distributed import has a replacement value"),
+            );
+            match next_revisions.get(import_id).copied() {
+                Some(content_revision) => {
+                    self.distributed_import_revisions
+                        .insert(*import_id, content_revision);
+                }
+                None => {
+                    self.distributed_import_revisions.remove(import_id);
+                }
+            }
+        }
+
+        let result = (|| {
+            if context_changed {
+                self.invalidate_session_info_fields(&mut work);
+            }
+            for import_id in changed_imports.iter().copied() {
+                work.deltas.push(Delta::SetDistributedImport {
+                    import_id,
+                    value: self
+                        .distributed_imports
+                        .get(&import_id)
+                        .cloned()
+                        .expect("updated distributed import exists"),
+                });
+                self.invalidate_distributed_import(import_id, &mut work);
+            }
+            self.ensure_published_current(None, &mut work)?;
+            self.turn_sequence = sequence;
+            work.finish_metrics();
+            let turn = Turn {
+                sequence,
+                source_sequence: None,
+                deltas: report_deltas(std::mem::take(&mut work.deltas)),
+                authority_deltas: Vec::new(),
+                durable_changes: Vec::new(),
+                outbox_changes: Vec::new(),
+                transient_effects: Vec::new(),
+                cancelled_transient_effects: Vec::new(),
+                transient_effect_credit_grants: Vec::new(),
+                metrics: std::mem::take(&mut work.metrics),
+            };
+            work.pending_settle = true;
+            Ok(turn)
+        })();
+        self.finish_internal_turn_work(work, result).map(Some)
+    }
+
+    fn invalidate_session_info_fields(&mut self, work: &mut Work) {
+        let root_fields = self
+            .metadata
+            .session_info_root_fields
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for field in root_fields {
+            self.mark_root_dirty(field, work);
+        }
+        let row_fields = self
+            .metadata
+            .session_info_row_fields
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for field in row_fields {
+            let Some(list) = self.metadata.row_field_owner.get(&field).copied() else {
+                continue;
+            };
+            for row in self.list_row_ids(list) {
+                self.mark_row_dirty(row, field, work);
+            }
+        }
     }
 
     pub fn distributed_import_revision(&self, import_id: ImportId) -> Option<u64> {
@@ -2224,93 +2973,16 @@ impl Session {
         content_revision: u64,
         value: Value,
     ) -> Result<Option<Turn>, Error> {
-        let data_type = self
-            .metadata
-            .distributed_import_types
-            .get(&import_id)
-            .cloned()
-            .ok_or_else(|| {
-                Error::InvalidEvent(format!(
-                    "distributed import {import_id} is not declared by this endpoint"
-                ))
-            })?;
-        if content_revision == 0 {
-            return Err(Error::InvalidEvent(format!(
-                "distributed import {import_id} content revision must be positive"
-            )));
-        }
-        validate_distributed_boundary_value(&value, &data_type, "distributed import")?;
-
-        let previous_revision = self
-            .distributed_import_revisions
-            .get(&import_id)
-            .copied()
-            .unwrap_or(0);
-        let previous_value = self.distributed_imports.get(&import_id).cloned();
-        if content_revision < previous_revision {
-            return Err(Error::InvalidEvent(format!(
-                "distributed import {import_id} revision {content_revision} is stale; current revision is {previous_revision}"
-            )));
-        }
-        if content_revision == previous_revision {
-            if previous_value.as_ref() == Some(&value) {
-                return Ok(None);
-            }
-            return Err(Error::InvalidEvent(format!(
-                "distributed import {import_id} revision {content_revision} conflicts with its current value"
-            )));
-        }
-
-        let sequence = self.next_internal_turn_sequence()?;
-        let mut work = self.take_internal_turn_work();
-        self.distributed_imports.insert(import_id, value);
-        self.distributed_import_revisions
-            .insert(import_id, content_revision);
-        let result = (|| {
-            work.deltas.push(Delta::SetDistributedImport {
+        self.install_distributed_context(
+            self.options.session_context.clone(),
+            vec![DistributedImportUpdate::new(
                 import_id,
-                value: self
-                    .distributed_imports
-                    .get(&import_id)
-                    .cloned()
-                    .expect("updated distributed import exists"),
-            });
-            self.invalidate_distributed_import(import_id, &mut work);
-            self.ensure_published_current(None, &mut work)?;
-            self.turn_sequence = sequence;
-            work.finish_metrics();
-            let turn = Turn {
-                sequence,
-                source_sequence: None,
-                deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: Vec::new(),
-                durable_changes: Vec::new(),
-                outbox_changes: Vec::new(),
-                transient_effects: Vec::new(),
-                cancelled_transient_effects: Vec::new(),
-                transient_effect_credit_grants: Vec::new(),
-                metrics: std::mem::take(&mut work.metrics),
-            };
-            work.pending_settle = true;
-            Ok(turn)
-        })();
-        if result.is_err() {
-            match previous_value {
-                Some(value) => {
-                    self.distributed_imports.insert(import_id, value);
-                }
-                None => {
-                    self.distributed_imports.remove(&import_id);
-                }
-            }
-            if previous_revision == 0 {
-                self.distributed_import_revisions.remove(&import_id);
-            } else {
-                self.distributed_import_revisions
-                    .insert(import_id, previous_revision);
-            }
-        }
-        self.finish_internal_turn_work(work, result).map(Some)
+                content_revision,
+                value,
+            )],
+            DistributedContextInstall::Patch,
+            DistributedContextTurn::Authority,
+        )
     }
 
     pub fn distributed_export_value_current(
@@ -2505,12 +3177,12 @@ impl Session {
                 .fields
                 .iter()
                 .filter(|(field, _)| {
-                    state.derived.get(field).is_none_or(|currentness| {
-                        *currentness == Currentness::Current
-                            || self.row_identity_has_raw_value(row, **field)
-                    })
+                    state
+                        .derived
+                        .get(field)
+                        .is_none_or(|currentness| *currentness == Currentness::Current)
                 })
-                .map(|(field, value)| (*field, value.clone()))
+                .map(|(field, value)| (*field, value.clone().into_visible_facade()))
                 .collect(),
         })
     }
@@ -2589,7 +3261,11 @@ impl Session {
 
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
         let mut snapshot = Snapshot {
-            states: self.root_states.clone(),
+            states: self
+                .root_states
+                .iter()
+                .map(|(state, value)| (*state, value.clone().into_visible_facade()))
+                .collect(),
             fields: BTreeMap::new(),
             lists: BTreeMap::new(),
         };
@@ -2605,9 +3281,12 @@ impl Session {
             }
             snapshot.fields.insert(
                 *field,
-                cell.value.clone().ok_or_else(|| {
-                    Error::Evaluation(format!("demanded field {} has no value", field.0))
-                })?,
+                cell.value
+                    .clone()
+                    .ok_or_else(|| {
+                        Error::Evaluation(format!("demanded field {} has no value", field.0))
+                    })?
+                    .into_visible_facade(),
             );
         }
         for (list, state) in &self.lists {
@@ -2624,12 +3303,11 @@ impl Session {
                             .fields
                             .iter()
                             .filter(|(field, _)| {
-                                row.derived.get(field).is_none_or(|currentness| {
-                                    *currentness == Currentness::Current
-                                        || self.row_identity_has_raw_value(*row_id, **field)
-                                })
+                                row.derived
+                                    .get(field)
+                                    .is_none_or(|currentness| *currentness == Currentness::Current)
                             })
-                            .map(|(field, value)| (*field, value.clone()))
+                            .map(|(field, value)| (*field, value.clone().into_visible_facade()))
                             .collect(),
                     })
                 })
@@ -2727,6 +3405,42 @@ impl Session {
 
     pub fn semantic_value_image(&self) -> Result<boon_persistence::RestoreImage, Error> {
         self.restore_image(0, BTreeSet::new(), true)
+    }
+
+    pub fn recovery_image(&self) -> Result<MachineRecoveryImage, Error> {
+        if self.turn_work.pending_settle {
+            return Err(Error::Evaluation(
+                "cannot checkpoint a machine with an unsettled turn".to_owned(),
+            ));
+        }
+        let distributed_imports = self
+            .distributed_imports
+            .iter()
+            .map(|(import_id, value)| {
+                Ok((
+                    *import_id,
+                    RecoveryDistributedImport {
+                        revision: self.distributed_import_revisions.get(import_id).copied(),
+                        value: runtime_value_to_query_data(value)?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        Ok(MachineRecoveryImage {
+            authority: self.durable_restore_image(0, BTreeSet::new())?,
+            last_source_sequence: self.last_sequence,
+            session_context: self.options.session_context.clone(),
+            distributed_imports,
+        })
+    }
+
+    pub fn fork_settled(&self) -> Result<Self, Error> {
+        if self.turn_work.pending_settle {
+            return Err(Error::Evaluation(
+                "cannot fork a machine with an unsettled turn".to_owned(),
+            ));
+        }
+        Ok(self.clone())
     }
 
     fn restore_image(
@@ -3162,7 +3876,7 @@ impl Session {
                 }
             };
             if let Some(value) = value {
-                values.insert(*target, value);
+                values.insert(*target, value.into_visible_facade());
             }
         }
         Ok(values)
@@ -3177,6 +3891,11 @@ impl Session {
     }
 
     pub fn root_value_current(&mut self, name: &str) -> Result<Value, Error> {
+        self.root_value_current_complete(name)
+            .map(Value::into_visible_facade)
+    }
+
+    fn root_value_current_complete(&mut self, name: &str) -> Result<Value, Error> {
         if let Some(field) =
             unique_root_name(&self.metadata.root_field_by_exact_name, name, "field")?
         {
@@ -3361,7 +4080,7 @@ impl Session {
                     "generation".to_owned(),
                     Value::integer(row.generation as i64)?,
                 ),
-                ("value".to_owned(), value),
+                ("value".to_owned(), value.into_visible_facade()),
             ])));
         }
         Ok(Value::List(values))
@@ -3825,7 +4544,7 @@ impl Session {
             })?;
         let value = match slot.initial_value_kind {
             InitialValueKind::RowInitialField => {
-                if let Some(expression) = &slot.initial_row_expression {
+                if let Some(expression) = &slot.initial_expression {
                     let mut bindings = BTreeMap::new();
                     let evaluated = self.eval_row_expression(
                         expression,
@@ -3844,7 +4563,12 @@ impl Session {
                             slot.state_id.0
                         ))
                     })?;
-                    let source = self.metadata.list_field(row.list, source)?;
+                    let source = self.metadata.list_field(row.list, source).map_err(|error| {
+                        Error::InvalidPlan(format!(
+                            "indexed state {} row initializer `{source}` could not resolve: {error}",
+                            slot.state_id.0
+                        ))
+                    })?;
                     self.ensure_row_field(row, source, None, work)?
                 }
             }
@@ -3869,7 +4593,7 @@ impl Session {
     }
 }
 
-impl Session {
+impl MachineInstance {
     pub fn apply(&mut self, event: SourceEvent) -> Result<Turn, Error> {
         self.apply_with_demand(event, &[])
     }
@@ -4045,8 +4769,10 @@ impl Session {
             let turn = Turn {
                 sequence,
                 source_sequence: None,
-                deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: std::mem::take(&mut work.authority_deltas),
+                deltas: report_deltas(std::mem::take(&mut work.deltas)),
+                authority_deltas: report_authority_deltas(std::mem::take(
+                    &mut work.authority_deltas,
+                )),
                 durable_changes,
                 outbox_changes: std::mem::take(&mut work.outbox_changes),
                 transient_effects: std::mem::take(&mut work.transient_effects),
@@ -4115,11 +4841,11 @@ impl Session {
                 "transient effect call {call_id} is a stream; deliver it with an explicit result sequence"
             )));
         }
-        if !matches!(contract.replay, boon_plan::EffectReplay::ReadOnly)
+        if !effect_replay_is_transient(&contract.replay)
             || contract.barrier != boon_plan::EffectBarrier::None
         {
             return Err(Error::InvalidPlan(format!(
-                "transient effect call {call_id} is not read-only and barrier-free"
+                "transient effect call {call_id} is not process-local and barrier-free"
             )));
         }
         let result_type = &contract
@@ -4161,8 +4887,10 @@ impl Session {
             let turn = Turn {
                 sequence,
                 source_sequence: None,
-                deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: std::mem::take(&mut work.authority_deltas),
+                deltas: report_deltas(std::mem::take(&mut work.deltas)),
+                authority_deltas: report_authority_deltas(std::mem::take(
+                    &mut work.authority_deltas,
+                )),
                 durable_changes,
                 outbox_changes: Vec::new(),
                 transient_effects: std::mem::take(&mut work.transient_effects),
@@ -4210,6 +4938,7 @@ impl Session {
             })?;
         let boon_plan::EffectDeliveryCardinality::Stream {
             max_in_flight,
+            credit_result_tags,
             terminal_result_tags,
             ..
         } = &pending.delivery
@@ -4224,12 +4953,6 @@ impl Session {
                 pending.next_result_sequence
             )));
         }
-        if pending.available_credits == 0 {
-            return Err(Error::InvalidEvent(format!(
-                "transient effect call {call_id} has no delivery credit"
-            )));
-        }
-
         let (op, effect) = self.effect_invocation(pending.invocation_id)?;
         if effect.effect_id != pending.effect_id {
             return Err(Error::InvalidPlan(format!(
@@ -4270,6 +4993,14 @@ impl Session {
         let terminal = terminal_result_tags
             .binary_search_by(|candidate| candidate.as_str().cmp(outcome_tag))
             .is_ok();
+        let consumes_credit = credit_result_tags
+            .binary_search_by(|candidate| candidate.as_str().cmp(outcome_tag))
+            .is_ok();
+        if consumes_credit && pending.available_credits == 0 {
+            return Err(Error::InvalidEvent(format!(
+                "transient effect call {call_id} has no delivery credit"
+            )));
+        }
         let stored_outcome = stored_value_for_data_type(&outcome, result_type)?;
         let max_in_flight = *max_in_flight;
         let sequence = self.next_internal_turn_sequence()?;
@@ -4307,23 +5038,25 @@ impl Session {
                             "transient effect call {call_id} was cancelled concurrently"
                         ))
                     })?;
-                active.available_credits = active.available_credits.saturating_sub(1);
                 active.next_result_sequence =
                     active.next_result_sequence.checked_add(1).ok_or_else(|| {
                         Error::Evaluation(format!(
                             "transient effect call {call_id} exhausted result sequences"
                         ))
                     })?;
-                active.available_credits = active
-                    .available_credits
-                    .checked_add(1)
-                    .unwrap_or(max_in_flight)
-                    .min(max_in_flight);
-                work.transient_effect_credit_grants
-                    .push(TransientEffectCreditGrant {
-                        call_id,
-                        credits: 1,
-                    });
+                if consumes_credit {
+                    active.available_credits = active.available_credits.saturating_sub(1);
+                    active.available_credits = active
+                        .available_credits
+                        .checked_add(1)
+                        .unwrap_or(max_in_flight)
+                        .min(max_in_flight);
+                    work.transient_effect_credit_grants
+                        .push(TransientEffectCreditGrant {
+                            call_id,
+                            credits: 1,
+                        });
+                }
             }
 
             self.commit_transient_effects(&mut work)?;
@@ -4332,8 +5065,10 @@ impl Session {
             let turn = Turn {
                 sequence,
                 source_sequence: None,
-                deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: std::mem::take(&mut work.authority_deltas),
+                deltas: report_deltas(std::mem::take(&mut work.deltas)),
+                authority_deltas: report_authority_deltas(std::mem::take(
+                    &mut work.authority_deltas,
+                )),
                 durable_changes,
                 outbox_changes: Vec::new(),
                 transient_effects: std::mem::take(&mut work.transient_effects),
@@ -4359,6 +5094,62 @@ impl Session {
             )));
         }
         Ok(self.pending_transient_effects.remove(&call_id).is_some())
+    }
+
+    pub fn cancel_transient_effects(
+        &mut self,
+        call_ids: &[TransientEffectCallId],
+    ) -> Result<Option<Turn>, Error> {
+        let call_ids = call_ids.iter().copied().collect::<BTreeSet<_>>();
+        for call_id in &call_ids {
+            if call_id.launch_epoch != self.launch_epoch {
+                return Err(Error::InvalidEvent(
+                    "transient effect cancellation belongs to a different session launch"
+                        .to_owned(),
+                ));
+            }
+        }
+        let call_ids = call_ids
+            .into_iter()
+            .filter(|call_id| self.pending_transient_effects.contains_key(call_id))
+            .collect::<Vec<_>>();
+        if call_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let sequence = self.next_internal_turn_sequence()?;
+        let mut work = self.take_internal_turn_work();
+        let result = (|| {
+            for call_id in call_ids {
+                let pending = self
+                    .pending_transient_effects
+                    .remove(&call_id)
+                    .ok_or_else(|| {
+                        Error::InvalidEvent(
+                            "transient effect was cancelled concurrently".to_owned(),
+                        )
+                    })?;
+                work.completed_transient_effects.push((call_id, pending));
+                work.cancelled_transient_effects.push(call_id);
+            }
+            self.turn_sequence = sequence;
+            work.finish_metrics();
+            let turn = Turn {
+                sequence,
+                source_sequence: None,
+                deltas: Vec::new(),
+                authority_deltas: Vec::new(),
+                durable_changes: Vec::new(),
+                outbox_changes: Vec::new(),
+                transient_effects: Vec::new(),
+                cancelled_transient_effects: std::mem::take(&mut work.cancelled_transient_effects),
+                transient_effect_credit_grants: Vec::new(),
+                metrics: std::mem::take(&mut work.metrics),
+            };
+            work.pending_settle = true;
+            Ok(turn)
+        })();
+        self.finish_internal_turn_work(work, result).map(Some)
     }
 
     pub fn pending_transient_effect_count(&self) -> usize {
@@ -4393,6 +5184,31 @@ impl Session {
             authority_deltas: Vec::new(),
             durable_changes: Vec::new(),
             outbox_changes: std::mem::take(&mut work.outbox_changes),
+            transient_effects: Vec::new(),
+            cancelled_transient_effects: Vec::new(),
+            transient_effect_credit_grants: Vec::new(),
+            metrics: std::mem::take(&mut work.metrics),
+        };
+        work.pending_settle = true;
+        self.turn_work = work;
+        Ok(turn)
+    }
+
+    /// Reserves one authority sequence for host-private state committed through
+    /// the same persistence transaction as application authority. This is not
+    /// a Boon source event and carries no observable dataflow delta.
+    pub fn protocol_checkpoint_turn(&mut self) -> Result<Turn, Error> {
+        let sequence = self.next_internal_turn_sequence()?;
+        let mut work = self.take_internal_turn_work();
+        self.turn_sequence = sequence;
+        work.finish_metrics();
+        let turn = Turn {
+            sequence,
+            source_sequence: None,
+            deltas: Vec::new(),
+            authority_deltas: Vec::new(),
+            durable_changes: Vec::new(),
+            outbox_changes: Vec::new(),
             transient_effects: Vec::new(),
             cancelled_transient_effects: Vec::new(),
             transient_effect_credit_grants: Vec::new(),
@@ -4596,26 +5412,53 @@ impl Session {
             target: row,
             payload: SourcePayload::default(),
         };
-        let updates = self
-            .metadata
-            .updates_by_state
-            .get(&state)
-            .cloned()
-            .unwrap_or_default();
-        for op in updates {
-            self.execute_update(&op, row, &event, work)?;
-        }
-        let mutations = self
-            .metadata
-            .mutations_by_state
-            .get(&state)
-            .cloned()
-            .unwrap_or_default();
-        let targets = row.into_iter().collect::<Vec<_>>();
-        for op in mutations {
-            self.execute_mutation(&op, &event, &targets, MutationCause::State(state), work)?;
-        }
-        Ok(())
+        let previous_state_trigger = work.active_state_trigger.replace(state);
+        let result = (|| {
+            let derived = self
+                .metadata
+                .state_derived_by_state
+                .get(&state)
+                .cloned()
+                .unwrap_or_default();
+            for field in &derived {
+                self.mark_root_dirty(*field, work);
+            }
+            for field in &derived {
+                self.ensure_root_field(*field, Some(&event), work)?;
+            }
+
+            let updates = self
+                .metadata
+                .updates_by_state
+                .get(&state)
+                .cloned()
+                .unwrap_or_default();
+            for op in updates.iter().filter(|op| !update_branch_has_effect(op)) {
+                self.execute_update(op, row, &event, work)?;
+            }
+            for field in &derived {
+                self.mark_root_dirty(*field, work);
+            }
+            for field in &derived {
+                self.ensure_root_field(*field, Some(&event), work)?;
+            }
+            let mutations = self
+                .metadata
+                .mutations_by_state
+                .get(&state)
+                .cloned()
+                .unwrap_or_default();
+            let targets = row.into_iter().collect::<Vec<_>>();
+            for op in mutations {
+                self.execute_mutation(&op, &event, &targets, MutationCause::State(state), work)?;
+            }
+            for op in updates.iter().filter(|op| update_branch_has_effect(op)) {
+                self.execute_update(op, row, &event, work)?;
+            }
+            Ok(())
+        })();
+        work.active_state_trigger = previous_state_trigger;
+        result
     }
 
     pub fn settle_turn(&mut self) {
@@ -4668,6 +5511,28 @@ impl Session {
 
     fn rollback_turn(&mut self, work: &mut Work) -> Result<(), Error> {
         work.allow_rollback();
+        if let Some(undo) = work.distributed_context_undo.take() {
+            self.options.session_context = undo.session_context;
+            for (import_id, (value, revision)) in undo.imports {
+                match value {
+                    Some(value) => {
+                        self.distributed_imports.insert(import_id, value);
+                    }
+                    None => {
+                        self.distributed_imports.remove(&import_id);
+                    }
+                }
+                match revision {
+                    Some(revision) => {
+                        self.distributed_import_revisions
+                            .insert(import_id, revision);
+                    }
+                    None => {
+                        self.distributed_import_revisions.remove(&import_id);
+                    }
+                }
+            }
+        }
         for call_id in work.committed_transient_effects.drain(..) {
             self.pending_transient_effects.remove(&call_id);
         }
@@ -4813,8 +5678,8 @@ impl Session {
         Ok(Turn {
             sequence: self.turn_sequence,
             source_sequence: Some(event.sequence),
-            deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
-            authority_deltas: std::mem::take(&mut work.authority_deltas),
+            deltas: report_deltas(std::mem::take(&mut work.deltas)),
+            authority_deltas: report_authority_deltas(std::mem::take(&mut work.authority_deltas)),
             durable_changes,
             outbox_changes: std::mem::take(&mut work.outbox_changes),
             transient_effects: std::mem::take(&mut work.transient_effects),
@@ -4841,31 +5706,26 @@ impl Session {
             })
             .collect();
 
-        for invocation in &work.transient_effects {
-            let replaced = self
-                .pending_transient_effects
-                .iter()
-                .filter_map(|(call_id, pending)| {
-                    (pending.invocation_id == invocation.invocation_id
-                        && pending.target == invocation.target)
-                        .then_some(*call_id)
-                })
-                .collect::<Vec<_>>();
-            for call_id in replaced {
-                if let Some(previous) = self.pending_transient_effects.remove(&call_id) {
-                    work.completed_transient_effects.push((call_id, previous));
-                    work.cancelled_transient_effects.push(call_id);
-                }
-            }
+        for index in 0..work.transient_effects.len() {
+            let invocation_id = work.transient_effects[index].invocation_id;
+            let effect_id = work.transient_effects[index].effect_id;
+            let target = work.transient_effects[index].target;
+            let call_id = work.transient_effects[index].call_id;
+            self.cancel_pending_transient_effect_owner(
+                invocation_id,
+                target,
+                self.transient_effect_scope,
+                work,
+            );
             let contract = self
                 .plan
                 .effects
                 .iter()
-                .find(|contract| contract.effect_id == invocation.effect_id)
+                .find(|contract| contract.effect_id == effect_id)
                 .ok_or_else(|| {
                     Error::InvalidPlan(format!(
                         "transient effect call {} has no effect contract",
-                        invocation.call_id
+                        call_id
                     ))
                 })?;
             let available_credits = match contract.delivery {
@@ -4875,26 +5735,66 @@ impl Session {
                 } => initial_credits,
             };
             let pending = PendingTransientEffect {
-                invocation_id: invocation.invocation_id,
-                effect_id: invocation.effect_id,
-                target: invocation.target,
+                invocation_id,
+                effect_id,
+                target,
+                execution_scope: self.transient_effect_scope,
                 delivery: contract.delivery.clone(),
                 next_result_sequence: TRANSIENT_EFFECT_FIRST_RESULT_SEQUENCE,
                 available_credits,
             };
             if self
                 .pending_transient_effects
-                .insert(invocation.call_id, pending)
+                .insert(call_id, pending)
                 .is_some()
             {
                 return Err(Error::Evaluation(format!(
                     "transient effect call {} was emitted more than once",
-                    invocation.call_id
+                    call_id
                 )));
             }
-            work.committed_transient_effects.push(invocation.call_id);
+            work.committed_transient_effects.push(call_id);
         }
         Ok(())
+    }
+
+    fn cancel_pending_transient_effect_owner(
+        &mut self,
+        invocation_id: EffectInvocationId,
+        target: Option<RowId>,
+        execution_scope: u64,
+        work: &mut Work,
+    ) {
+        let call_ids = self
+            .pending_transient_effects
+            .iter()
+            .filter_map(|(call_id, pending)| {
+                (pending.invocation_id == invocation_id
+                    && pending.target == target
+                    && pending.execution_scope == execution_scope)
+                    .then_some(*call_id)
+            })
+            .collect::<Vec<_>>();
+        for call_id in call_ids {
+            if let Some(previous) = self.pending_transient_effects.remove(&call_id) {
+                work.completed_transient_effects.push((call_id, previous));
+                work.cancelled_transient_effects.push(call_id);
+            }
+        }
+    }
+
+    fn cancel_pending_transient_effects_for_row(&mut self, row: RowId, work: &mut Work) {
+        let call_ids = self
+            .pending_transient_effects
+            .iter()
+            .filter_map(|(call_id, pending)| (pending.target == Some(row)).then_some(*call_id))
+            .collect::<Vec<_>>();
+        for call_id in call_ids {
+            if let Some(previous) = self.pending_transient_effects.remove(&call_id) {
+                work.completed_transient_effects.push((call_id, previous));
+                work.cancelled_transient_effects.push(call_id);
+            }
+        }
     }
 
     fn route_event_with_work(
@@ -4922,7 +5822,7 @@ impl Session {
             .and_then(|route| route.scope_id)
             .and_then(|_| event.target.or_else(|| targets.first().copied()));
         if let Some(updates) = metadata.updates_by_source.get(&event.source) {
-            for op in updates {
+            for op in updates.iter().filter(|op| !update_branch_has_effect(op)) {
                 if op.indexed {
                     let rows = self.indexed_update_targets(op, event, &targets)?;
                     self.execute_indexed_update_batch(op, &rows, event, work)?;
@@ -4940,6 +5840,17 @@ impl Session {
                 MutationCause::Source(event.source),
                 work,
             )?;
+        }
+
+        if let Some(updates) = metadata.updates_by_source.get(&event.source) {
+            for op in updates.iter().filter(|op| update_branch_has_effect(op)) {
+                if op.indexed {
+                    let rows = self.indexed_update_targets(op, event, &targets)?;
+                    self.execute_indexed_update_batch(op, &rows, event, work)?;
+                } else {
+                    self.execute_update(op, scoped_update_row, event, work)?;
+                }
+            }
         }
 
         self.ensure_demanded_current(demanded_targets, Some(event), work)?;
@@ -5107,6 +6018,18 @@ impl Session {
             )));
         };
         if !self.source_guard_matches(source_guard.as_ref(), row, event, work)? {
+            if let PlanOpKind::UpdateBranch {
+                effect: Some(effect),
+                ..
+            } = &op.kind
+            {
+                self.cancel_pending_transient_effect_owner(
+                    effect.invocation_id,
+                    row,
+                    self.transient_effect_scope,
+                    work,
+                );
+            }
             return Ok(());
         }
         if matches!(
@@ -5181,6 +6104,17 @@ impl Session {
             for row in rows {
                 if self.source_guard_matches(source_guard.as_ref(), Some(*row), event, work)? {
                     self.stage_effect_invocation(op, Some(*row), event, work)?;
+                } else if let PlanOpKind::UpdateBranch {
+                    effect: Some(effect),
+                    ..
+                } = &op.kind
+                {
+                    self.cancel_pending_transient_effect_owner(
+                        effect.invocation_id,
+                        Some(*row),
+                        self.transient_effect_scope,
+                        work,
+                    );
                 }
             }
             return Ok(());
@@ -5238,10 +6172,7 @@ impl Session {
                 op.id.0
             )));
         };
-        if !matches!(
-            expression_kind,
-            PlanExpressionKind::FileWriteBytes | PlanExpressionKind::HostEffect
-        ) {
+        if !matches!(expression_kind, PlanExpressionKind::HostEffect) {
             return Err(Error::Unsupported {
                 op: op.id,
                 detail: format!(
@@ -5296,7 +6227,7 @@ impl Session {
             .turn_sequence
             .checked_add(1)
             .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
-        if matches!(contract.replay, boon_plan::EffectReplay::ReadOnly) {
+        if effect_replay_is_transient(&contract.replay) {
             let call_id = TransientEffectCallId {
                 launch_epoch: self.launch_epoch,
                 sequence: self.next_transient_effect_sequence,
@@ -5410,26 +6341,82 @@ impl Session {
     ) -> Result<bool, Error> {
         match guard {
             None => Ok(true),
-            Some(PlanSourceGuard::SourcePayloadOneOf {
-                source_id,
-                field,
-                values,
-            }) => {
-                if *source_id != event.source {
-                    return Ok(false);
-                }
-                let Some(value) = source_payload_value(&event.payload, field) else {
+            Some(guard) => self.update_guard_matches(guard, row, event, work),
+        }
+    }
+
+    fn update_guard_matches(
+        &mut self,
+        guard: &PlanSourceGuard,
+        row: Option<RowId>,
+        event: &SourceEvent,
+        work: &mut Work,
+    ) -> Result<bool, Error> {
+        match guard {
+            PlanSourceGuard::ValueOneOf { input, values } => {
+                let Some(value) = self.eval_update_guard_ref(input, row, event, work)? else {
                     return Ok(false);
                 };
-                let text = value_to_text(&value)?;
-                Ok(values.contains(&text))
-            }
-            Some(PlanSourceGuard::TriggerValueOneOf { input, values }) => {
-                let value = self.eval_update_ref(input, row, event, work)?;
                 let label = value_to_match_label(&value)?;
                 Ok(values.contains(&label))
             }
+            PlanSourceGuard::ListIsNotEmpty { input, expected } => {
+                let Some(value) = self.eval_update_guard_ref(input, row, event, work)? else {
+                    return Ok(false);
+                };
+                let Value::List(items) = value else {
+                    return Err(Error::Evaluation(
+                        "List/is_not_empty source guard requires a List value".to_owned(),
+                    ));
+                };
+                Ok((!items.is_empty()) == *expected)
+            }
+            PlanSourceGuard::ValuesEqual { left, right }
+            | PlanSourceGuard::ValuesNotEqual { left, right } => {
+                let Some(left_value) = self.eval_update_guard_ref(left, row, event, work)? else {
+                    return Ok(false);
+                };
+                let Some(right_value) = self.eval_update_guard_ref(right, row, event, work)? else {
+                    return Ok(false);
+                };
+                let equal = left_value == right_value;
+                Ok(match guard {
+                    PlanSourceGuard::ValuesEqual { .. } => equal,
+                    PlanSourceGuard::ValuesNotEqual { .. } => !equal,
+                    PlanSourceGuard::ValueOneOf { .. }
+                    | PlanSourceGuard::ListIsNotEmpty { .. }
+                    | PlanSourceGuard::All { .. } => {
+                        unreachable!()
+                    }
+                })
+            }
+            PlanSourceGuard::All { guards } => {
+                for guard in guards {
+                    if !self.update_guard_matches(guard, row, event, work)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
         }
+    }
+
+    fn eval_update_guard_ref(
+        &mut self,
+        value_ref: &ValueRef,
+        row: Option<RowId>,
+        event: &SourceEvent,
+        work: &mut Work,
+    ) -> Result<Option<Value>, Error> {
+        if let ValueRef::StateProjection {
+            state_id,
+            field_path,
+        } = value_ref
+        {
+            let value = self.eval_update_ref(&ValueRef::State(*state_id), row, event, work)?;
+            return Ok(project_value(&value, field_path).cloned());
+        }
+        self.eval_update_ref(value_ref, row, event, work).map(Some)
     }
 
     fn ensure_root_field(
@@ -5615,9 +6602,6 @@ impl Session {
         match currentness {
             Currentness::Current => return self.row_value(row, field),
             Currentness::Evaluating => {
-                if self.row_identity_has_raw_value(row, field) {
-                    return self.row_value(row, field);
-                }
                 return Err(Error::Cycle {
                     field,
                     row: Some(row),
@@ -5649,29 +6633,6 @@ impl Session {
         work.recomputed_targets
             .insert(ValueTarget::RowField { row, field });
         Ok(value)
-    }
-
-    fn row_identity_has_raw_value(&self, row: RowId, field: FieldId) -> bool {
-        let Some(op) = self.metadata.row_computations.get(&field) else {
-            return false;
-        };
-        let identity = matches!(
-            &op.kind,
-            PlanOpKind::DerivedValue {
-                expression: Some(PlanDerivedExpression::RowExpression {
-                    expression: PlanRowExpression::Field {
-                        input: ValueRef::Field(input),
-                    },
-                }),
-                ..
-            } if *input == field
-        );
-        identity
-            && self
-                .lists
-                .get(&row.list)
-                .and_then(|list| list.rows.get(&row))
-                .is_some_and(|row| row.fields.contains_key(&field))
     }
 
     fn evaluate_root_computation(
@@ -5728,9 +6689,19 @@ impl Session {
             )));
         };
         let Some(expression) = expression else {
+            let output_label = match op.output.as_ref() {
+                Some(ValueRef::Field(field)) => {
+                    debug_label(&self.plan.debug_map.fields, "field:", field.0)
+                }
+                _ => None,
+            };
             return Err(Error::Unsupported {
                 op: op.id,
-                detail: format!("{derived_kind:?} derived value has no typed expression"),
+                detail: format!(
+                    "{derived_kind:?} derived value has no typed expression; output={:?}, path={}",
+                    op.output,
+                    output_label.unwrap_or("<unknown>")
+                ),
             });
         };
         self.eval_derived_expression(
@@ -5744,10 +6715,89 @@ impl Session {
             &mut BTreeMap::new(),
             work,
         )
+        .map_err(|error| match error {
+            Error::Evaluation(detail) => Error::Evaluation(format!(
+                "derived op {} output {:?}: {detail}",
+                op.id.0, op.output
+            )),
+            error => error,
+        })
     }
 }
 
-impl Session {
+fn update_branch_has_effect(op: &PlanOp) -> bool {
+    matches!(
+        &op.kind,
+        PlanOpKind::UpdateBranch {
+            effect: Some(_),
+            ..
+        }
+    )
+}
+
+fn sort_update_ops_by_dependencies(ops: &mut Vec<Arc<PlanOp>>) {
+    ops.sort_by_key(|op| op.id);
+    let mut producers = BTreeMap::<StateId, Vec<usize>>::new();
+    for (index, op) in ops.iter().enumerate() {
+        if update_branch_has_effect(op) {
+            continue;
+        }
+        if let Some(ValueRef::State(state)) = op.output {
+            producers.entry(state).or_default().push(index);
+        }
+    }
+
+    let mut outgoing = vec![BTreeSet::<usize>::new(); ops.len()];
+    let mut incoming = vec![0_usize; ops.len()];
+    for (consumer, op) in ops.iter().enumerate() {
+        let output = match op.output {
+            Some(ValueRef::State(state)) => Some(state),
+            _ => None,
+        };
+        for dependency in op.inputs.iter().filter_map(|input| match input {
+            ValueRef::State(state) => Some(*state),
+            _ => None,
+        }) {
+            if output == Some(dependency) {
+                continue;
+            }
+            for producer in producers.get(&dependency).into_iter().flatten() {
+                if *producer != consumer && outgoing[*producer].insert(consumer) {
+                    incoming[consumer] += 1;
+                }
+            }
+        }
+    }
+
+    let mut ready = BTreeSet::<(PlanOpId, usize)>::new();
+    for (index, count) in incoming.iter().enumerate() {
+        if *count == 0 {
+            ready.insert((ops[index].id, index));
+        }
+    }
+    let mut order = Vec::with_capacity(ops.len());
+    while let Some((_, index)) = ready.pop_first() {
+        order.push(index);
+        for consumer in outgoing[index].iter().copied() {
+            incoming[consumer] -= 1;
+            if incoming[consumer] == 0 {
+                ready.insert((ops[consumer].id, consumer));
+            }
+        }
+    }
+
+    if order.len() != ops.len() {
+        let scheduled = order.iter().copied().collect::<BTreeSet<_>>();
+        order.extend((0..ops.len()).filter(|index| !scheduled.contains(index)));
+    }
+    let previous = ops.clone();
+    *ops = order
+        .into_iter()
+        .map(|index| Arc::clone(&previous[index]))
+        .collect();
+}
+
+impl MachineInstance {
     fn row_value(&self, row: RowId, field: FieldId) -> Result<Value, Error> {
         let value = self
             .lists
@@ -6662,7 +7712,7 @@ impl Session {
     }
 }
 
-impl Session {
+impl MachineInstance {
     #[allow(clippy::too_many_arguments)]
     fn eval_derived_expression(
         &mut self,
@@ -6679,6 +7729,15 @@ impl Session {
             None => Consumer::Root(field),
         });
         match expression {
+            PlanDerivedExpression::MaterializeList {
+                target_list,
+                fields,
+                expression,
+            } => {
+                let value =
+                    self.eval_derived_expression(expression, row, event, output, bindings, work)?;
+                self.reconcile_materialized_list(*target_list, fields, value, work)
+            }
             PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
                 source_id,
                 key_field,
@@ -6709,12 +7768,29 @@ impl Session {
             }
             PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
                 if let Some(event) = event
-                    && let Some(arm) = arms.iter().find(|arm| arm.source_id == event.source)
+                    && let Some(arm) = arms.iter().find(
+                        |arm| matches!(&arm.trigger, ValueRef::Source(source) if *source == event.source),
+                    )
                 {
                     return self.eval_row_expression(
                         &arm.value,
                         row.or(event.target),
                         Some(event),
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    );
+                }
+                if let Some(state) = work.active_state_trigger
+                    && let Some(arm) = arms.iter().find(
+                        |arm| matches!(&arm.trigger, ValueRef::State(trigger) if *trigger == state),
+                    )
+                {
+                    return self.eval_row_expression(
+                        &arm.value,
+                        row.or_else(|| event.and_then(|event| event.target)),
+                        event,
                         output,
                         consumer,
                         bindings,
@@ -6776,6 +7852,103 @@ impl Session {
                 work,
             ),
         }
+    }
+
+    fn reconcile_materialized_list(
+        &mut self,
+        list_id: ListId,
+        field_ids: &BTreeMap<String, FieldId>,
+        value: EvalValue,
+        work: &mut Work,
+    ) -> Result<EvalValue, Error> {
+        let items = eval_to_list(value)?;
+        let desired_len = items.len();
+        let capacity = self
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.list_id == list_id)
+            .ok_or_else(|| Error::InvalidPlan(format!("missing list slot {}", list_id.0)))?
+            .capacity;
+        if capacity.is_some_and(|capacity| desired_len > capacity) {
+            return Err(Error::Evaluation(format!(
+                "materialized list {} contains {} rows, exceeding capacity {}",
+                list_id.0,
+                desired_len,
+                capacity.unwrap_or_default()
+            )));
+        }
+        work.consume(desired_len.try_into().unwrap_or(u64::MAX))?;
+        let desired = items
+            .into_iter()
+            .map(|item| self.materialized_row_fields(list_id, field_ids, item))
+            .collect::<Result<Vec<_>, _>>()?;
+        let state_fields = self
+            .metadata
+            .indexed_state_field
+            .iter()
+            .filter_map(|(state, field)| {
+                (self.metadata.indexed_state_owner.get(state) == Some(&list_id)).then_some(*field)
+            })
+            .collect::<BTreeSet<_>>();
+        let existing = self.list_row_ids(list_id);
+        for (index, fields) in desired.into_iter().enumerate() {
+            if let Some(row) = existing.get(index).copied() {
+                for (field, value) in fields {
+                    if state_fields.contains(&field) {
+                        continue;
+                    }
+                    self.record_row_field_undo(row, field, work);
+                    self.set_row_field(row, field, value, work)?;
+                }
+            } else {
+                self.append_row(list_id, fields, work)?;
+            }
+        }
+        for row in existing.into_iter().skip(desired_len).rev() {
+            self.remove_row(row, work)?;
+        }
+        Ok(EvalValue::List(
+            self.list_row_ids(list_id)
+                .into_iter()
+                .map(EvalValue::Row)
+                .collect(),
+        ))
+    }
+
+    fn materialized_row_fields(
+        &mut self,
+        list_id: ListId,
+        field_ids: &BTreeMap<String, FieldId>,
+        item: EvalValue,
+    ) -> Result<BTreeMap<FieldId, Value>, Error> {
+        let fields = match item {
+            EvalValue::Record(fields) | EvalValue::MappedRow { fields, .. } => fields,
+            EvalValue::Value(Value::Record(fields))
+            | EvalValue::Value(Value::MappedRow { fields, .. }) => fields
+                .into_iter()
+                .map(|(name, value)| (name, EvalValue::Value(value)))
+                .collect(),
+            other => {
+                return Err(Error::Evaluation(format!(
+                    "materialized list {} produced non-record row {other:?}",
+                    list_id.0
+                )));
+            }
+        };
+        fields
+            .into_iter()
+            .map(|(name, value)| {
+                let field = field_ids.get(&name).copied().ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "materialized list {} record field `{name}` has no compiled FieldId",
+                        list_id.0
+                    ))
+                })?;
+                Ok((field, self.materialize_eval(value)?))
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6931,9 +8104,6 @@ impl Session {
                     if !has_value && !self.metadata.row_computations.contains_key(field) {
                         return Ok(EvalValue::Value(Value::Null));
                     }
-                    if output == Some(*field) && self.row_identity_has_raw_value(row, *field) {
-                        return self.row_value(row, *field).map(EvalValue::Value);
-                    }
                     return self
                         .ensure_row_field(row, *field, event, work)
                         .map(EvalValue::Value);
@@ -7055,7 +8225,7 @@ impl Session {
                 let input =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
                 Ok(EvalValue::Value(Value::Bytes(
-                    eval_to_text(&input)?.into_bytes(),
+                    eval_to_text(&input)?.into_bytes().into(),
                 )))
             }
             PlanRowExpression::BytesToText { input, encoding } => {
@@ -7074,7 +8244,7 @@ impl Session {
                 let input =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
                 let bytes = eval_to_bytes(&input)?;
-                let text = String::from_utf8(bytes)
+                let text = String::from_utf8(bytes.to_vec())
                     .map_err(|error| Error::Evaluation(format!("invalid UTF-8: {error}")))?;
                 Ok(EvalValue::Value(Value::Text(text)))
             }
@@ -7121,7 +8291,9 @@ impl Session {
                 let value = bytes.get(index).copied().ok_or_else(|| {
                     Error::Evaluation(format!("byte index {index} is out of range"))
                 })?;
-                Ok(EvalValue::Value(Value::Bytes(vec![value])))
+                Ok(EvalValue::Value(Value::Bytes(Bytes::copy_from_slice(&[
+                    value,
+                ]))))
             }
             PlanRowExpression::BytesSlice {
                 input,
@@ -7156,7 +8328,7 @@ impl Session {
                     "byte count",
                 )?;
                 Ok(EvalValue::Value(Value::Bytes(
-                    bytes.into_iter().take(count).collect(),
+                    bytes.slice(..count.min(bytes.len())),
                 )))
             }
             PlanRowExpression::BytesDrop { input, byte_count } => {
@@ -7169,7 +8341,7 @@ impl Session {
                     "byte count",
                 )?;
                 Ok(EvalValue::Value(Value::Bytes(
-                    bytes.into_iter().skip(count).collect(),
+                    bytes.slice(count.min(bytes.len())..),
                 )))
             }
             PlanRowExpression::BytesZeros { byte_count } => {
@@ -7179,7 +8351,7 @@ impl Session {
                     )?,
                     "byte count",
                 )?;
-                Ok(EvalValue::Value(Value::Bytes(vec![0; count])))
+                Ok(EvalValue::Value(Value::Bytes(vec![0; count].into())))
             }
             PlanRowExpression::BytesReadUnsigned {
                 input,
@@ -7224,7 +8396,8 @@ impl Session {
                 value,
             } => {
                 let mut bytes = self
-                    .eval_expression_bytes(input, row, event, output, consumer, bindings, work)?;
+                    .eval_expression_bytes(input, row, event, output, consumer, bindings, work)?
+                    .to_vec();
                 let index = nonnegative_usize(
                     self.eval_expression_number(
                         index, row, event, output, consumer, bindings, work,
@@ -7233,7 +8406,7 @@ impl Session {
                 )?;
                 let value = self
                     .eval_expression_bytes(value, row, event, output, consumer, bindings, work)?;
-                let [value] = value.as_slice() else {
+                let [value] = value.as_ref() else {
                     return Err(Error::Evaluation(format!(
                         "Bytes/set value must be BYTES[1], found {} byte(s)",
                         value.len()
@@ -7243,7 +8416,7 @@ impl Session {
                     Error::Evaluation(format!("byte index {index} is out of range"))
                 })?;
                 *target = *value;
-                Ok(EvalValue::Value(Value::Bytes(bytes)))
+                Ok(EvalValue::Value(Value::Bytes(bytes.into())))
             }
             PlanRowExpression::BytesWriteUnsigned {
                 input,
@@ -7260,7 +8433,8 @@ impl Session {
                 value,
             } => {
                 let mut bytes = self
-                    .eval_expression_bytes(input, row, event, output, consumer, bindings, work)?;
+                    .eval_expression_bytes(input, row, event, output, consumer, bindings, work)?
+                    .to_vec();
                 let offset = nonnegative_usize(
                     self.eval_expression_number(
                         offset, row, event, output, consumer, bindings, work,
@@ -7278,7 +8452,7 @@ impl Session {
                 let value = self
                     .eval_expression_number(value, row, event, output, consumer, bindings, work)?;
                 write_integer(&mut bytes, offset, count, &eval_to_text(&endian)?, value)?;
-                Ok(EvalValue::Value(Value::Bytes(bytes)))
+                Ok(EvalValue::Value(Value::Bytes(bytes.into())))
             }
             PlanRowExpression::BytesFind { input, needle } => {
                 let input = self
@@ -7306,14 +8480,14 @@ impl Session {
                 Ok(EvalValue::Value(Value::Bool(input.ends_with(&suffix))))
             }
             PlanRowExpression::BytesConcat { left, right } => {
-                let mut left =
+                let left =
                     self.eval_expression_bytes(left, row, event, output, consumer, bindings, work)?;
-                left.extend(
-                    self.eval_expression_bytes(
-                        right, row, event, output, consumer, bindings, work,
-                    )?,
-                );
-                Ok(EvalValue::Value(Value::Bytes(left)))
+                let right = self
+                    .eval_expression_bytes(right, row, event, output, consumer, bindings, work)?;
+                let mut joined = Vec::with_capacity(left.len() + right.len());
+                joined.extend_from_slice(&left);
+                joined.extend_from_slice(&right);
+                Ok(EvalValue::Value(Value::Bytes(joined.into())))
             }
             PlanRowExpression::BytesEqual { left, right } => {
                 let left =
@@ -7460,6 +8634,37 @@ impl Session {
                 }
                 Ok(EvalValue::List(values))
             }
+            PlanRowExpression::ListFilterField {
+                input,
+                list_id,
+                field,
+                expected,
+                retain_equal,
+            } => {
+                let input =
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
+                let expected = self
+                    .eval_row_expression(expected, row, event, output, consumer, bindings, work)?;
+                let expected = self.materialize_eval(expected)?;
+                let items = eval_to_list(input)?;
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                let mut filtered = Vec::new();
+                for item in items {
+                    let actual = self.eval_list_row_field(
+                        item.clone(),
+                        *list_id,
+                        *field,
+                        event,
+                        consumer,
+                        work,
+                    )?;
+                    let actual = self.materialize_eval(actual)?;
+                    if (actual == expected) == *retain_equal {
+                        filtered.push(item);
+                    }
+                }
+                Ok(EvalValue::List(filtered))
+            }
             PlanRowExpression::ListMapItem { binding } => {
                 bindings.get(binding).cloned().ok_or_else(|| {
                     Error::Evaluation(format!("List/map binding `{binding}` is missing"))
@@ -7575,31 +8780,33 @@ impl Session {
     }
 
     fn eval_intrinsic(&self, intrinsic: PlanIntrinsic) -> Value {
+        let SessionContext::Available { status, principal } = &self.options.session_context else {
+            return Value::Error {
+                code: "session_scope_unavailable".to_owned(),
+            };
+        };
         match intrinsic {
-            PlanIntrinsic::SessionInfoStatus => Value::Record(BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("Active".to_owned())),
-                (
-                    "role".to_owned(),
-                    Value::Text(
-                        match self.plan.program_role {
-                            ProgramRole::Client => "Client",
-                            ProgramRole::Session => "Session",
-                            ProgramRole::Server => "Server",
-                        }
-                        .to_owned(),
-                    ),
-                ),
-                (
-                    "session_id".to_owned(),
-                    Value::Text(self.options.session_id.clone().unwrap_or_default()),
-                ),
-            ])),
-            PlanIntrinsic::SessionInfoPrincipal => match &self.options.principal_id {
-                Some(id) => Value::Record(BTreeMap::from([
-                    ("$tag".to_owned(), Value::Text("Authenticated".to_owned())),
-                    ("id".to_owned(), Value::Text(id.clone())),
+            PlanIntrinsic::SessionInfoStatus => match status {
+                SessionConnectionStatus::Connecting => Value::Text("Connecting".to_owned()),
+                SessionConnectionStatus::Current => Value::Text("Current".to_owned()),
+                SessionConnectionStatus::Stale => Value::Text("Stale".to_owned()),
+                SessionConnectionStatus::Failed { code } => Value::Record(BTreeMap::from([
+                    ("$tag".to_owned(), Value::Text("Failed".to_owned())),
+                    ("code".to_owned(), Value::Text(code.clone())),
                 ])),
-                None => Value::Text("Anonymous".to_owned()),
+            },
+            PlanIntrinsic::SessionInfoPrincipal => match principal {
+                SessionPrincipal::Authenticated { subject, roles } => {
+                    Value::Record(BTreeMap::from([
+                        ("$tag".to_owned(), Value::Text("Authenticated".to_owned())),
+                        ("subject".to_owned(), Value::Text(subject.clone())),
+                        (
+                            "roles".to_owned(),
+                            Value::List(roles.iter().cloned().map(Value::Text).collect()),
+                        ),
+                    ]))
+                }
+                SessionPrincipal::Anonymous => Value::Text("Anonymous".to_owned()),
             },
         }
     }
@@ -7630,7 +8837,7 @@ impl Session {
         consumer: Option<Consumer>,
         bindings: &mut BTreeMap<String, EvalValue>,
         work: &mut Work,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Bytes, Error> {
         let value =
             self.eval_row_expression(expression, row, event, output, consumer, bindings, work)?;
         eval_to_bytes(&value)
@@ -7665,23 +8872,42 @@ impl Session {
         consumer: Option<Consumer>,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
+        let missing = |keys: Vec<String>| {
+            Error::Evaluation(format!(
+                "record has no field `{field}` for consumer {consumer:?}; available fields: {}",
+                keys.join(", ")
+            ))
+        };
         match object {
-            EvalValue::Record(mut record) => record
-                .remove(field)
-                .ok_or_else(|| Error::Evaluation(format!("record has no field `{field}`"))),
-            EvalValue::MappedRow { mut fields, .. } => fields
-                .remove(field)
-                .ok_or_else(|| Error::Evaluation(format!("record has no field `{field}`"))),
-            EvalValue::Value(Value::Record(mut record)) => record
-                .remove(field)
-                .map(EvalValue::Value)
-                .ok_or_else(|| Error::Evaluation(format!("record has no field `{field}`"))),
-            EvalValue::Value(Value::MappedRow { mut fields, .. }) => fields
-                .remove(field)
-                .map(EvalValue::Value)
-                .ok_or_else(|| Error::Evaluation(format!("record has no field `{field}`"))),
+            EvalValue::Record(mut record) => {
+                let keys = record.keys().cloned().collect();
+                record.remove(field).ok_or_else(|| missing(keys))
+            }
+            EvalValue::MappedRow { mut fields, .. } => {
+                let keys = fields.keys().cloned().collect();
+                fields.remove(field).ok_or_else(|| missing(keys))
+            }
+            EvalValue::Value(Value::Record(mut record)) => {
+                let keys = record.keys().cloned().collect();
+                record
+                    .remove(field)
+                    .map(EvalValue::Value)
+                    .ok_or_else(|| missing(keys))
+            }
+            EvalValue::Value(Value::MappedRow { mut fields, .. }) => {
+                let keys = fields.keys().cloned().collect();
+                fields
+                    .remove(field)
+                    .map(EvalValue::Value)
+                    .ok_or_else(|| missing(keys))
+            }
             EvalValue::Row(row) | EvalValue::Value(Value::Row { id: row, .. }) => {
-                let field = self.metadata.list_field(row.list, field)?;
+                let field = self.metadata.list_field(row.list, field).map_err(|error| {
+                    Error::InvalidPlan(format!(
+                        "object member `{field}` on typed row from list {} for consumer {consumer:?} lost exact field identity: {error}",
+                        row.list.0,
+                    ))
+                })?;
                 self.register_row_dependency(consumer, row, field);
                 self.ensure_row_field(row, field, event, work)
                     .map(EvalValue::Value)
@@ -7741,6 +8967,23 @@ impl Session {
     ) -> Result<EvalValue, Error> {
         match function {
             "Text/empty" => Ok(EvalValue::Value(Value::Text(String::new()))),
+            "Text/all_chars_in" => {
+                let input = input.ok_or_else(|| {
+                    Error::Evaluation("Text/all_chars_in requires an input".to_owned())
+                })?;
+                let input =
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
+                let allowed = self
+                    .eval_named_arg(args, "chars", row, event, output, consumer, bindings, work)?
+                    .ok_or_else(|| {
+                        Error::Evaluation("Text/all_chars_in requires `chars`".to_owned())
+                    })?;
+                let input = eval_to_text(&input)?;
+                let allowed = eval_to_text(&allowed)?;
+                Ok(EvalValue::Value(Value::Bool(
+                    input.chars().all(|character| allowed.contains(character)),
+                )))
+            }
             "Number/to_text" => {
                 let value = if let Some(input) = input {
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
@@ -8120,6 +9363,78 @@ impl Session {
                     };
                 Ok(EvalValue::Value(Value::Number(value)))
             }
+            "List/get" => {
+                let input = input.ok_or_else(|| {
+                    Error::Evaluation("List/get requires an input list".to_owned())
+                })?;
+                let input =
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
+                let index = self
+                    .eval_named_arg(args, "index", row, event, output, consumer, bindings, work)?
+                    .ok_or_else(|| Error::Evaluation("List/get requires `index`".to_owned()))?;
+                let index = usize::try_from(eval_to_integer(&index)?).map_err(|_| {
+                    Error::Evaluation("List/get index must be a non-negative integer".to_owned())
+                })?;
+                work.consume(1)?;
+                eval_to_list(input)?.into_iter().nth(index).ok_or_else(|| {
+                    Error::Evaluation(format!("List/get index {index} is out of bounds"))
+                })
+            }
+            "List/find" | "List/find_value" => {
+                let input = input.ok_or_else(|| {
+                    Error::Evaluation(format!("{function} requires an input list"))
+                })?;
+                let input =
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
+                let field = self
+                    .named_text_arg(args, "field", row, event, output, consumer, bindings, work)?
+                    .ok_or_else(|| Error::Evaluation(format!("{function} requires `field`")))?;
+                let expected = self
+                    .eval_named_arg(args, "value", row, event, output, consumer, bindings, work)?
+                    .ok_or_else(|| Error::Evaluation(format!("{function} requires `value`")))?;
+                let expected = self.materialize_eval(expected)?;
+                let mut found = None;
+                for item in eval_to_list(input)? {
+                    work.consume(1)?;
+                    let actual =
+                        self.eval_object_field(item.clone(), &field, event, consumer, work)?;
+                    if self.materialize_eval(actual)? == expected {
+                        found = Some(item);
+                        break;
+                    }
+                }
+                if function == "List/find" {
+                    return Ok(
+                        found.unwrap_or_else(|| EvalValue::Value(Value::Text("NaN".to_owned())))
+                    );
+                }
+                if let Some(found) = found {
+                    let target = self
+                        .named_text_arg(
+                            args, "target", row, event, output, consumer, bindings, work,
+                        )?
+                        .ok_or_else(|| {
+                            Error::Evaluation("List/find_value requires `target`".to_owned())
+                        })?;
+                    return self.eval_object_field(found, &target, event, consumer, work);
+                }
+                if let Some(fallback) = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("fallback"))
+                {
+                    self.eval_row_expression(
+                        &fallback.value,
+                        row,
+                        event,
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    )
+                } else {
+                    Ok(EvalValue::Value(Value::Text("NaN".to_owned())))
+                }
+            }
             "List/count" | "List/length" => {
                 let input = input.ok_or_else(|| {
                     Error::Evaluation(format!("{function} requires an input list"))
@@ -8129,6 +9444,16 @@ impl Session {
                 Ok(EvalValue::Value(Value::integer(
                     eval_to_list(value)?.len() as i64,
                 )?))
+            }
+            "List/is_not_empty" => {
+                let input = input.ok_or_else(|| {
+                    Error::Evaluation("List/is_not_empty requires an input list".to_owned())
+                })?;
+                let value =
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
+                Ok(EvalValue::Value(Value::Bool(
+                    !eval_to_list(value)?.is_empty(),
+                )))
             }
             "List/any" => {
                 let input = input.ok_or_else(|| {
@@ -8435,7 +9760,7 @@ impl Session {
     }
 }
 
-impl Session {
+impl MachineInstance {
     fn evaluate_update(
         &mut self,
         op: &PlanOp,
@@ -8500,17 +9825,32 @@ impl Session {
                 self.constant(constant)?
             }
             PlanExpressionKind::PreviousValue => {
-                let input = self.single_update_input(op)?;
-                self.eval_update_ref(&input, row, event, work)?
+                let [input] = ordered_inputs.as_slice() else {
+                    return Err(Error::InvalidPlan(format!(
+                        "previous-value update {} requires one ordered input",
+                        op.id.0
+                    )));
+                };
+                self.eval_update_ref(input, row, event, work)?
             }
             PlanExpressionKind::ReadPath => {
-                let input = self.single_update_input(op)?;
-                self.eval_update_ref(&input, row, event, work)?
+                let [input] = ordered_inputs.as_slice() else {
+                    return Err(Error::InvalidPlan(format!(
+                        "read-path update {} requires one ordered input",
+                        op.id.0
+                    )));
+                };
+                self.eval_update_ref(input, row, event, work)?
             }
             PlanExpressionKind::BoolNot => {
-                let input = self.single_update_input(op)?;
+                let [input] = ordered_inputs.as_slice() else {
+                    return Err(Error::InvalidPlan(format!(
+                        "bool-not update {} requires one ordered input",
+                        op.id.0
+                    )));
+                };
                 Value::Bool(!value_to_bool(
-                    &self.eval_update_ref(&input, row, event, work)?,
+                    &self.eval_update_ref(input, row, event, work)?,
                 )?)
             }
             PlanExpressionKind::TextToNumber => {
@@ -8625,9 +9965,9 @@ impl Session {
                         Error::InvalidPlan(format!("BytesGet update {} has no index", op.id.0))
                     })?;
                 let index = nonnegative_usize(index, "byte index")?;
-                Value::Bytes(vec![*bytes.get(index).ok_or_else(|| {
-                    Error::Evaluation(format!("byte index {index} is out of range"))
-                })?])
+                Value::Bytes(Bytes::copy_from_slice(&[*bytes.get(index).ok_or_else(
+                    || Error::Evaluation(format!("byte index {index} is out of range")),
+                )?]))
             }
             PlanExpressionKind::BytesSet => {
                 let [input, index, value] = ordered_inputs.as_slice() else {
@@ -8636,13 +9976,14 @@ impl Session {
                         op.id.0
                     )));
                 };
-                let mut bytes = value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?;
+                let mut bytes =
+                    value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?.to_vec();
                 let index = nonnegative_usize(
                     value_to_integer(&self.eval_update_ref(index, row, event, work)?)?,
                     "byte index",
                 )?;
                 let value = value_to_bytes(&self.eval_update_ref(value, row, event, work)?)?;
-                let [value] = value.as_slice() else {
+                let [value] = value.as_ref() else {
                     return Err(Error::Evaluation(format!(
                         "BytesSet update {} value must be BYTES[1], found {} byte(s)",
                         op.id.0,
@@ -8652,7 +9993,7 @@ impl Session {
                 *bytes.get_mut(index).ok_or_else(|| {
                     Error::Evaluation(format!("byte index {index} is out of range"))
                 })? = *value;
-                Value::Bytes(bytes)
+                Value::Bytes(bytes.into())
             }
             PlanExpressionKind::BytesSlice => {
                 let [input, offset, count] = ordered_inputs.as_slice() else {
@@ -8685,9 +10026,9 @@ impl Session {
                     "byte count",
                 )?;
                 Value::Bytes(if *expression_kind == PlanExpressionKind::BytesTake {
-                    bytes.into_iter().take(count).collect()
+                    bytes.slice(..count.min(bytes.len()))
                 } else {
-                    bytes.into_iter().skip(count).collect()
+                    bytes.slice(count.min(bytes.len())..)
                 })
             }
             PlanExpressionKind::BytesZeros => {
@@ -8701,7 +10042,7 @@ impl Session {
                     value_to_integer(&self.eval_update_ref(count, row, event, work)?)?,
                     "byte count",
                 )?;
-                Value::Bytes(vec![0; count])
+                Value::Bytes(vec![0; count].into())
             }
             PlanExpressionKind::BytesToHex | PlanExpressionKind::BytesToBase64 => {
                 let input = ordered_inputs
@@ -8739,12 +10080,13 @@ impl Session {
                 if *expression_kind == PlanExpressionKind::TextToBytes {
                     Value::Bytes(
                         value_to_text(&self.eval_update_ref(input, row, event, work)?)?
-                            .into_bytes(),
+                            .into_bytes()
+                            .into(),
                     )
                 } else {
                     let bytes = value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?;
                     Value::Text(
-                        String::from_utf8(bytes).map_err(|error| {
+                        String::from_utf8(bytes.to_vec()).map_err(|error| {
                             Error::Evaluation(format!("invalid UTF-8: {error}"))
                         })?,
                     )
@@ -8757,13 +10099,15 @@ impl Session {
                         op.id.0
                     )));
                 };
-                let mut left = value_to_bytes(&self.eval_update_ref(left, row, event, work)?)?;
+                let left = value_to_bytes(&self.eval_update_ref(left, row, event, work)?)?;
                 let right = value_to_bytes(&self.eval_update_ref(right, row, event, work)?)?;
                 if *expression_kind == PlanExpressionKind::BytesEqual {
                     Value::Bool(left == right)
                 } else {
-                    left.extend(right);
-                    Value::Bytes(left)
+                    let mut joined = Vec::with_capacity(left.len() + right.len());
+                    joined.extend_from_slice(&left);
+                    joined.extend_from_slice(&right);
+                    Value::Bytes(joined.into())
                 }
             }
             PlanExpressionKind::BytesFind
@@ -8819,7 +10163,8 @@ impl Session {
                         op.id.0
                     )));
                 };
-                let mut bytes = value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?;
+                let mut bytes =
+                    value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?.to_vec();
                 let offset = nonnegative_usize(
                     value_to_integer(&self.eval_update_ref(offset, row, event, work)?)?,
                     "byte offset",
@@ -8831,7 +10176,7 @@ impl Session {
                 let endian = value_to_text(&self.eval_update_ref(endian, row, event, work)?)?;
                 let value = value_to_integer(&self.eval_update_ref(value, row, event, work)?)?;
                 write_integer(&mut bytes, offset, count, &endian, value)?;
-                Value::Bytes(bytes)
+                Value::Bytes(bytes.into())
             }
             PlanExpressionKind::MatchConst => {
                 self.evaluate_match_update(op, ordered_inputs, row, event, work)?
@@ -8851,13 +10196,11 @@ impl Session {
             PlanExpressionKind::ListFindValue => {
                 self.evaluate_list_find_update(op, ordered_inputs, row, event, work)?
             }
-            PlanExpressionKind::FileReadBytes
-            | PlanExpressionKind::FileWriteBytes
-            | PlanExpressionKind::HostEffect => {
+            PlanExpressionKind::HostEffect => {
                 return Err(Error::Unsupported {
                     op: op.id,
                     detail: format!(
-                        "{expression_kind:?} is excluded from the in-memory Session engine"
+                        "{expression_kind:?} is excluded from the in-memory machine engine"
                     ),
                 });
             }
@@ -9247,7 +10590,7 @@ impl Session {
     }
 }
 
-impl Session {
+impl MachineInstance {
     fn execute_mutation(
         &mut self,
         op: &PlanOp,
@@ -9552,6 +10895,7 @@ impl Session {
     }
 
     fn remove_row(&mut self, row: RowId, work: &mut Work) -> Result<(), Error> {
+        self.cancel_pending_transient_effects_for_row(row, work);
         let (removed_value, order_index, previous_next_key) = self
             .lists
             .get(&row.list)
@@ -9752,7 +11096,15 @@ impl Session {
                 field,
                 value,
             } => {
-                let field = self.metadata.list_field(*source_list, field)?;
+                let field = self
+                    .metadata
+                    .list_field(*source_list, field)
+                    .map_err(|error| {
+                        Error::InvalidPlan(format!(
+                            "list find projection {} field `{field}` could not resolve: {error}",
+                            op.0
+                        ))
+                    })?;
                 let selector =
                     self.eval_value_ref(value, None, event, Some(output), consumer, work)?;
                 let selector = self.materialize_eval(selector)?;
@@ -9833,7 +11185,7 @@ impl Session {
                     ),
                     (
                         "cursor".to_owned(),
-                        Value::Bytes(next_cursor.unwrap_or_default()),
+                        Value::Bytes(next_cursor.unwrap_or_default().into()),
                     ),
                 ])))
             }
@@ -9970,7 +11322,7 @@ fn row_identity_value(row: RowId) -> Value {
     }
 }
 
-fn normalize_host_output_value(value: Value) -> Result<Value, Error> {
+pub(crate) fn normalize_host_output_value(value: Value) -> Result<Value, Error> {
     match value {
         Value::List(values) => values
             .into_iter()
@@ -9990,6 +11342,9 @@ fn normalize_host_output_value(value: Value) -> Result<Value, Error> {
         Value::Row { .. } => Err(Error::Evaluation(
             "host list output exposes an unprojected runtime row; map it to explicit data fields"
                 .to_owned(),
+        )),
+        Value::HostBound { .. } => Err(Error::Evaluation(
+            "host outputs cannot expose process-local host bindings".to_owned(),
         )),
         Value::Null
         | Value::Bool(_)
@@ -10035,12 +11390,15 @@ fn value_to_text(value: &Value) -> Result<String, Error> {
         Value::Bool(value) => Ok(if *value { "True" } else { "False" }.to_owned()),
         Value::Number(value) => Ok(value.to_string()),
         Value::Text(value) => Ok(value.clone()),
-        Value::Bytes(bytes) => String::from_utf8(bytes.clone())
+        Value::Bytes(bytes) => String::from_utf8(bytes.to_vec())
             .map_err(|error| Error::Evaluation(format!("invalid UTF-8: {error}"))),
         Value::Error { code } => Ok(code.clone()),
         Value::List(_) | Value::Record(_) | Value::MappedRow { .. } | Value::Row { .. } => Err(
             Error::Evaluation("list or record cannot be converted to text".to_owned()),
         ),
+        Value::HostBound { .. } => Err(Error::Evaluation(
+            "host-bound values cannot be converted to text".to_owned(),
+        )),
     }
 }
 
@@ -10079,7 +11437,7 @@ fn value_to_bool(value: &Value) -> Result<bool, Error> {
     }
 }
 
-fn value_to_bytes(value: &Value) -> Result<Vec<u8>, Error> {
+fn value_to_bytes(value: &Value) -> Result<Bytes, Error> {
     match value {
         Value::Bytes(value) => Ok(value.clone()),
         other => Err(Error::Evaluation(format!("value {other:?} is not BYTES"))),
@@ -10111,7 +11469,7 @@ fn eval_to_bool(value: &EvalValue) -> Result<bool, Error> {
     }
 }
 
-fn eval_to_bytes(value: &EvalValue) -> Result<Vec<u8>, Error> {
+fn eval_to_bytes(value: &EvalValue) -> Result<Bytes, Error> {
     match value {
         EvalValue::Value(Value::Bytes(value)) => Ok(value.clone()),
         other => Err(Error::Evaluation(format!("value {other:?} is not BYTES"))),
@@ -10235,7 +11593,7 @@ fn select_pattern_matches(pattern: &PlanRowSelectPattern, value: &Value) -> bool
     }
 }
 
-fn value_to_match_label(value: &Value) -> Result<String, Error> {
+pub(crate) fn value_to_match_label(value: &Value) -> Result<String, Error> {
     tagged_value_label(value)
         .map(str::to_owned)
         .map(Ok)
@@ -10243,6 +11601,7 @@ fn value_to_match_label(value: &Value) -> Result<String, Error> {
 }
 
 fn tagged_value_label(value: &Value) -> Option<&str> {
+    let value = value.visible();
     let Value::Record(fields) = value else {
         return None;
     };
@@ -10280,20 +11639,21 @@ fn validate_encoding(encoding: Option<&str>) -> Result<(), Error> {
     }
 }
 
-fn checked_slice(bytes: &[u8], offset: usize, count: usize) -> Result<Vec<u8>, Error> {
+fn checked_slice(bytes: &Bytes, offset: usize, count: usize) -> Result<Bytes, Error> {
     let end = offset
         .checked_add(count)
         .ok_or_else(|| Error::Evaluation("byte range overflow".to_owned()))?;
-    bytes.get(offset..end).map(<[u8]>::to_vec).ok_or_else(|| {
-        Error::Evaluation(format!(
+    if end > bytes.len() {
+        return Err(Error::Evaluation(format!(
             "byte range {offset}..{end} exceeds length {}",
             bytes.len()
-        ))
-    })
+        )));
+    }
+    Ok(bytes.slice(offset..end))
 }
 
 fn read_integer(
-    bytes: &[u8],
+    bytes: &Bytes,
     offset: usize,
     count: usize,
     endian: &str,
@@ -10380,7 +11740,7 @@ fn encode_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn decode_hex(text: &str) -> Result<Vec<u8>, Error> {
+fn decode_hex(text: &str) -> Result<Bytes, Error> {
     let text = text.trim();
     if !text.len().is_multiple_of(2) {
         return Err(Error::Evaluation(
@@ -10394,7 +11754,8 @@ fn decode_hex(text: &str) -> Result<Vec<u8>, Error> {
             let low = hex_digit(pair[1])?;
             Ok((high << 4) | low)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Bytes::from)
 }
 
 fn hex_digit(digit: u8) -> Result<u8, Error> {
@@ -10432,7 +11793,7 @@ fn encode_base64(bytes: &[u8]) -> String {
     output
 }
 
-fn decode_base64(text: &str) -> Result<Vec<u8>, Error> {
+fn decode_base64(text: &str) -> Result<Bytes, Error> {
     let bytes = text.trim().as_bytes();
     if !bytes.len().is_multiple_of(4) {
         return Err(Error::Evaluation(
@@ -10463,7 +11824,7 @@ fn decode_base64(text: &str) -> Result<Vec<u8>, Error> {
             output.push(value as u8);
         }
     }
-    Ok(output)
+    Ok(Bytes::from(output))
 }
 
 fn base64_digit(digit: u8) -> Result<u8, Error> {
@@ -10477,6 +11838,94 @@ fn base64_digit(digit: u8) -> Result<u8, Error> {
             "invalid base64 digit `{}`",
             digit as char
         ))),
+    }
+}
+
+pub(crate) fn report_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
+    coalesce_deltas(deltas)
+        .into_iter()
+        .map(|delta| match delta {
+            Delta::SetValue { target, value } => Delta::SetValue {
+                target,
+                value: value.into_visible_facade(),
+            },
+            Delta::SetDistributedImport { import_id, value } => Delta::SetDistributedImport {
+                import_id,
+                value: value.into_visible_facade(),
+            },
+            Delta::InsertRow { row } => Delta::InsertRow {
+                row: report_row_snapshot(row),
+            },
+            delta @ (Delta::RemoveRow { .. }
+            | Delta::BindSource { .. }
+            | Delta::UnbindSource { .. }) => delta,
+        })
+        .collect()
+}
+
+fn report_authority_deltas(deltas: Vec<AuthorityDelta>) -> Vec<AuthorityDelta> {
+    deltas
+        .into_iter()
+        .map(|delta| match delta {
+            AuthorityDelta::SetRoot { state, value } => AuthorityDelta::SetRoot {
+                state,
+                value: value.into_visible_facade(),
+            },
+            AuthorityDelta::SetRowField { row, field, value } => AuthorityDelta::SetRowField {
+                row,
+                field,
+                value: value.into_visible_facade(),
+            },
+            AuthorityDelta::ReplaceList { list_id, authority } => AuthorityDelta::ReplaceList {
+                list_id,
+                authority: report_list_authority(authority),
+            },
+            AuthorityDelta::InsertRow {
+                row,
+                index,
+                next_key,
+            } => AuthorityDelta::InsertRow {
+                row: report_row_authority(row),
+                index,
+                next_key,
+            },
+            delta @ AuthorityDelta::RemoveRow { .. } => delta,
+        })
+        .collect()
+}
+
+fn report_row_snapshot(row: RowSnapshot) -> RowSnapshot {
+    RowSnapshot {
+        id: row.id,
+        fields: row
+            .fields
+            .into_iter()
+            .map(|(field, value)| (field, value.into_visible_facade()))
+            .collect(),
+    }
+}
+
+fn report_row_authority(row: RowAuthority) -> RowAuthority {
+    RowAuthority {
+        id: row.id,
+        fields: row
+            .fields
+            .into_iter()
+            .map(|(field, value)| (field, value.into_visible_facade()))
+            .collect(),
+        touched_fields: row.touched_fields,
+    }
+}
+
+fn report_list_authority(authority: ListAuthority) -> ListAuthority {
+    ListAuthority {
+        touched: authority.touched,
+        next_key: authority.next_key,
+        rows: authority
+            .rows
+            .into_iter()
+            .map(report_row_authority)
+            .collect(),
     }
 }
 
@@ -10522,7 +11971,7 @@ fn source_payload_value(payload: &SourcePayload, field: &SourcePayloadField) -> 
     }
 }
 
-fn project_value<'a>(value: &'a Value, field_path: &[String]) -> Option<&'a Value> {
+pub(crate) fn project_value<'a>(value: &'a Value, field_path: &[String]) -> Option<&'a Value> {
     let Some((field, rest)) = field_path.split_first() else {
         return Some(value);
     };
@@ -10531,6 +11980,13 @@ fn project_value<'a>(value: &'a Value, field_path: &[String]) -> Option<&'a Valu
         _ => return None,
     };
     project_value(nested, rest)
+}
+
+fn effect_replay_is_transient(replay: &boon_plan::EffectReplay) -> bool {
+    matches!(
+        replay,
+        boon_plan::EffectReplay::ReadOnly | boon_plan::EffectReplay::ProcessScoped
+    )
 }
 
 fn set_source_payload_value(

@@ -13,6 +13,7 @@ futures.workspace = true
 ipnet.workspace = true
 percent-encoding.workspace = true
 tokio.workspace = true
+boon_wire.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

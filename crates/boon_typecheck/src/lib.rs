@@ -216,6 +216,10 @@ pub struct ExternalTypeEnvironment {
     pub current_role: ProgramRole,
     pub values: BTreeMap<String, FlowType>,
     pub functions: BTreeMap<String, ExternalFunctionType>,
+    #[serde(default)]
+    pub allow_unresolved: bool,
+    #[serde(default)]
+    pub local_function_requirements: BTreeMap<String, BTreeMap<String, Type>>,
 }
 
 impl ExternalTypeEnvironment {
@@ -224,6 +228,15 @@ impl ExternalTypeEnvironment {
             current_role,
             values: BTreeMap::new(),
             functions: BTreeMap::new(),
+            allow_unresolved: false,
+            local_function_requirements: BTreeMap::new(),
+        }
+    }
+
+    pub fn provisional(current_role: ProgramRole) -> Self {
+        Self {
+            allow_unresolved: true,
+            ..Self::empty(current_role)
         }
     }
 }
@@ -500,16 +513,21 @@ impl TypeCheckReport {
 
 #[derive(Clone)]
 struct HostEffectSignature {
-    intent_fields: Vec<(String, Type)>,
+    intent_fields: Vec<HostEffectIntentFieldSignature>,
     result_type: Type,
+}
+
+#[derive(Clone)]
+struct HostEffectIntentFieldSignature {
+    name: String,
+    ty: Type,
+    has_default: bool,
 }
 
 fn host_effect_signature(operation: &str) -> Option<HostEffectSignature> {
     let spec = boon_effect_schema::host_effect_spec(operation)?;
     let schema = spec.schema?;
-    if operation == "File/write_bytes"
-        || spec.result_policy != boon_effect_schema::ResultPolicySpec::ReturnValue
-    {
+    if spec.result_policy != boon_effect_schema::ResultPolicySpec::ReturnValue {
         return None;
     }
     let boon_effect_schema::ValueType::Record {
@@ -521,11 +539,13 @@ fn host_effect_signature(operation: &str) -> Option<HostEffectSignature> {
     };
     let intent_fields = fields
         .iter()
-        .map(|field| {
-            (
-                field.name.to_owned(),
-                effect_schema_type_to_type(&field.value_type),
-            )
+        .map(|field| HostEffectIntentFieldSignature {
+            name: field.name.to_owned(),
+            ty: effect_schema_type_to_type(&field.value_type),
+            has_default: schema
+                .intent_defaults
+                .iter()
+                .any(|default| default.field_name == field.name),
         })
         .collect::<Vec<_>>();
     Some(HostEffectSignature {
@@ -912,10 +932,13 @@ pub fn check_runtime_profiled_with_external_types(
 }
 
 fn role_for_namespace(namespace: &str) -> Option<ProgramRole> {
-    match namespace {
-        "Client" => Some(ProgramRole::Client),
-        "Session" => Some(ProgramRole::Session),
-        "Server" => Some(ProgramRole::Server),
+    match boon_parser::standard_root_kind(namespace) {
+        Some(boon_parser::StandardRootKind::ProgramRole) => match namespace {
+            "Client" => Some(ProgramRole::Client),
+            "Session" => Some(ProgramRole::Session),
+            "Server" => Some(ProgramRole::Server),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -924,28 +947,23 @@ fn external_value_role(parts: &[String]) -> Option<ProgramRole> {
     parts.first().and_then(|part| role_for_namespace(part))
 }
 
+fn external_value_path(parts: &[String]) -> Option<String> {
+    external_value_role(parts)?;
+    (parts.len() > 1).then(|| boon_parser::canonical_value_path(parts))
+}
+
+fn external_value_uses_store_root(parts: &[String]) -> bool {
+    parts.len() > 2 && parts.get(1).is_some_and(|part| part == "store")
+}
+
 fn external_function_role(function: &str) -> Option<ProgramRole> {
     function
         .split_once('/')
         .and_then(|(namespace, _)| role_for_namespace(namespace))
 }
 
-fn role_can_read(current: ProgramRole, producer: ProgramRole) -> bool {
-    matches!(
-        (current, producer),
-        (
-            ProgramRole::Client,
-            ProgramRole::Session | ProgramRole::Server
-        ) | (ProgramRole::Session, ProgramRole::Server)
-    )
-}
-
 fn role_namespace(role: ProgramRole) -> &'static str {
-    match role {
-        ProgramRole::Client => "Client",
-        ProgramRole::Session => "Session",
-        ProgramRole::Server => "Server",
-    }
+    role.namespace()
 }
 
 fn external_data_type_is_closed(ty: &Type) -> bool {
@@ -954,6 +972,7 @@ fn external_data_type_is_closed(ty: &Type) -> bool {
         Type::Object(shape) => {
             !shape.open && shape.fields.values().all(external_data_type_is_closed)
         }
+        Type::List(item) => external_data_type_is_closed(item),
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {
@@ -962,7 +981,6 @@ fn external_data_type_is_closed(ty: &Type) -> bool {
         }),
         Type::Skip
         | Type::RenderContract
-        | Type::List(_)
         | Type::Function { .. }
         | Type::UnresolvedShape { .. }
         | Type::Var(_)
@@ -975,7 +993,7 @@ fn external_type_environment_diagnostics(
 ) -> Vec<TypeDiagnostic> {
     let mut diagnostics = Vec::new();
     for (path, flow_type) in &environment.values {
-        let valid_path = path.split_once('.').is_some_and(|(namespace, suffix)| {
+        let valid_path = path.split_once('/').is_some_and(|(namespace, suffix)| {
             role_for_namespace(namespace).is_some()
                 && !suffix.is_empty()
                 && !suffix.split('.').any(str::is_empty)
@@ -984,21 +1002,21 @@ fn external_type_environment_diagnostics(
             diagnostics.push(diagnostic_at_line(
                 1,
                 format!(
-                    "external value `{path}` must use an exact qualified path such as `Server.store.count`"
+                    "external value `{path}` must use an exact qualified path such as `Server/store.count`"
                 ),
             ));
         }
-        if flow_type.mode != FlowMode::Continuous {
+        if flow_type.mode == FlowMode::Absent {
             diagnostics.push(diagnostic_at_line(
                 1,
-                format!("external value `{path}` must be continuous"),
+                format!("external value `{path}` cannot be always absent"),
             ));
         }
-        if !external_data_type_is_closed(&flow_type.ty) {
+        if !environment.allow_unresolved && !external_data_type_is_closed(&flow_type.ty) {
             diagnostics.push(diagnostic_at_line(
                 1,
                 format!(
-                    "external value `{path}` must have a closed scalar, record, or variant type; found {}",
+                    "external value `{path}` must have a closed value type; found {}",
                     boon_facing_type_label(&flow_type.ty)
                 ),
             ));
@@ -1030,7 +1048,7 @@ fn external_type_environment_diagnostics(
                 format!("external function `{function}` must have a continuous result"),
             ));
         }
-        if !external_data_type_is_closed(&signature.result.ty) {
+        if !environment.allow_unresolved && !external_data_type_is_closed(&signature.result.ty) {
             diagnostics.push(diagnostic_at_line(
                 1,
                 format!(
@@ -1050,11 +1068,11 @@ fn external_type_environment_diagnostics(
                     ),
                 ));
             }
-            if !external_data_type_is_closed(&arg.ty) {
+            if !environment.allow_unresolved && !external_data_type_is_closed(&arg.ty) {
                 diagnostics.push(diagnostic_at_line(
                     1,
                     format!(
-                        "external function `{function}` argument `{}` must have a closed scalar, record, or variant type; found {}",
+                        "external function `{function}` argument `{}` must have a closed value type; found {}",
                         arg.name,
                         boon_facing_type_label(&arg.ty)
                     ),
@@ -1124,6 +1142,8 @@ struct Checker<'a> {
     function_return_type_cache: RefCell<BTreeMap<String, Option<Type>>>,
     object_bindings: BTreeMap<String, ObjectShape>,
     name_bindings: BTreeMap<String, Type>,
+    declaration_exprs: BTreeMap<String, usize>,
+    local_name_bindings: Vec<BTreeMap<String, Type>>,
     flow_bindings: BTreeMap<String, FlowMode>,
     function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
     expr_type_vars: BTreeMap<usize, TypeVar>,
@@ -1186,7 +1206,20 @@ impl<'a> Checker<'a> {
         let object_bindings = object_bindings(program);
         let object_bindings_ms = typecheck_elapsed_ms(object_bindings_started);
         let function_param_requirements_started = Instant::now();
-        let function_param_requirements = function_param_requirements(program);
+        let mut function_param_requirements = function_param_requirements(program);
+        for (function, requirements) in &external_types.local_function_requirements {
+            let target = function_param_requirements
+                .entry(function.clone())
+                .or_default();
+            for (argument, requirement) in requirements {
+                match target.get(argument) {
+                    Some(existing) if !is_value_placeholder_type(existing) => {}
+                    _ => {
+                        target.insert(argument.clone(), requirement.clone());
+                    }
+                }
+            }
+        }
         let function_param_requirements_ms =
             typecheck_elapsed_ms(function_param_requirements_started);
         let name_bindings_started = Instant::now();
@@ -1213,7 +1246,7 @@ impl<'a> Checker<'a> {
         }
         let passed_context_ms = typecheck_elapsed_ms(passed_context_started);
         let flow_bindings_started = Instant::now();
-        let flow_bindings = flow_bindings(program);
+        let flow_bindings = flow_bindings(program, external_types);
         let flow_bindings_ms = typecheck_elapsed_ms(flow_bindings_started);
         let render_contracts_started = Instant::now();
         let render_contracts =
@@ -1263,6 +1296,8 @@ impl<'a> Checker<'a> {
             function_return_type_cache: RefCell::new(BTreeMap::new()),
             object_bindings,
             name_bindings,
+            declaration_exprs: declaration_expression_index(program),
+            local_name_bindings: Vec::new(),
             flow_bindings,
             function_param_requirements,
             expr_type_vars: BTreeMap::new(),
@@ -1419,7 +1454,6 @@ impl<'a> Checker<'a> {
             eprintln!("boon_typecheck recursive_functions:start");
         }
         self.check_recursive_functions();
-        self.check_host_effect_calls();
         let recursive_functions_ms = typecheck_elapsed_ms(recursive_functions_started);
         trace_phase("recursive_functions", recursive_functions_ms);
         let check_statements_started = Instant::now();
@@ -1429,6 +1463,7 @@ impl<'a> Checker<'a> {
         for statement in &self.program.ast.statements {
             self.check_statement(statement, false);
         }
+        self.check_host_effect_calls();
         let check_statements_ms = typecheck_elapsed_ms(check_statements_started);
         trace_phase("check_statements", check_statements_ms);
         let ensure_all_expressions_started = Instant::now();
@@ -1815,6 +1850,14 @@ impl<'a> Checker<'a> {
             &mut Vec::new(),
             &mut paths,
         );
+        let mut inferred_types = BTreeMap::new();
+        collect_inferred_named_value_types(
+            &self.program.ast.statements,
+            &self.program.expressions,
+            &self.expr_type_cache,
+            &mut Vec::new(),
+            &mut inferred_types,
+        );
         let entries = paths
             .into_iter()
             .map(|path| {
@@ -1831,10 +1874,10 @@ impl<'a> Checker<'a> {
                 NamedValueTypeEntry {
                     flow_type: FlowType {
                         mode,
-                        ty: self
-                            .name_bindings
+                        ty: inferred_types
                             .get(&path)
                             .cloned()
+                            .or_else(|| self.name_bindings.get(&path).cloned())
                             .unwrap_or(Type::Unknown),
                     },
                     path,
@@ -2318,7 +2361,7 @@ impl<'a> Checker<'a> {
                 }
                 self.check_bytes_builtin_arguments(expr.id, function, args, None);
                 self.check_number_to_text_arguments(expr.id, function, args, false);
-                self.check_builtin_call_compatibility(function, None, args);
+                self.check_builtin_call_compatibility(expr.id, function, None, args);
                 self.check_user_function_arguments(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
                     self.check_style_args(args);
@@ -2349,21 +2392,37 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::Pipe { input, op, args } if external_function_role(op).is_some() => {
-                self.check_external_function_call(expr.id, op, Some(*input), args)
+                let input = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expr.id,
+                    *input,
+                    &self.program.expressions,
+                );
+                self.check_external_function_call(expr.id, op, Some(input), args)
             }
             AstExprKind::Pipe { input, op, args } => {
-                let input_flow = self.ensure_expr(*input);
-                let input_is_placeholder = self.expr_id_is_pipe_placeholder(*input);
+                let input_expr_id = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expr.id,
+                    *input,
+                    &self.program.expressions,
+                );
+                let input_flow = self.ensure_expr(input_expr_id);
+                let list_map_item_type = (op == "List/map")
+                    .then(|| self.infer_list_map_result_item_type(&input_flow.ty, args));
                 for arg in args {
+                    if op == "List/map" && arg.name.as_deref() == Some("new") {
+                        continue;
+                    }
                     if !builtin_argument_is_symbol(op, arg.name.as_deref()) {
                         self.ensure_expr(arg.value);
                     }
                 }
-                self.check_bytes_builtin_arguments(expr.id, op, args, Some(*input));
+                self.check_bytes_builtin_arguments(expr.id, op, args, Some(input_expr_id));
                 self.check_number_to_text_arguments(expr.id, op, args, true);
-                self.check_builtin_call_compatibility(op, Some(*input), args);
+                self.check_builtin_call_compatibility(expr.id, op, Some(input_expr_id), args);
                 if !op.starts_with("Field/") {
-                    self.check_user_function_arguments(expr.id, op, Some(*input), args);
+                    self.check_user_function_arguments(expr.id, op, Some(input_expr_id), args);
                 }
                 if self.render_contracts.is_render_constructor(op) {
                     self.check_style_args(args);
@@ -2378,8 +2437,14 @@ impl<'a> Checker<'a> {
                         _ => Type::Unknown,
                     }
                 } else if op == "List/map" {
-                    if let Some(new_expr_id) = list_map_new_expr_id(args) {
-                        let item_type = self.ensure_expr(new_expr_id).ty;
+                    if let (Some(new_expr_id), Some(item_type)) = (
+                        list_map_result_expr_id(
+                            &self.program.ast.statements,
+                            &self.program.expressions,
+                            args,
+                        ),
+                        list_map_item_type.as_ref(),
+                    ) {
                         if type_contains_skip(&item_type) {
                             self.diagnostics.push(self.diagnostic_for_expr(
                                 new_expr_id,
@@ -2387,25 +2452,17 @@ impl<'a> Checker<'a> {
                             ));
                         }
                     }
-                    self.record_runtime_list_map(expr.id, *input, args);
-                    Type::List(Box::new(self.list_map_result_item_type(args)))
+                    let item_type = list_map_item_type.unwrap_or_else(open_object_type);
+                    self.record_runtime_list_map(expr.id, input_expr_id, args, item_type.clone());
+                    Type::List(Box::new(item_type))
                 } else if matches!(op.as_str(), "List/every" | "List/any" | "List/is_not_empty") {
                     true_false_type()
                 } else if op == "List/latest" {
-                    if input_is_placeholder {
-                        open_object_type()
-                    } else {
-                        list_item_type_from_list_type(&input_flow.ty)
-                            .unwrap_or_else(open_object_type)
-                    }
+                    list_item_type_from_list_type(&input_flow.ty).unwrap_or_else(open_object_type)
                 } else if op == "SOURCE" {
                     input_flow.ty
                 } else if matches!(op.as_str(), "List/retain" | "List/remove") {
-                    if input_is_placeholder {
-                        Type::List(Box::new(open_object_type()))
-                    } else {
-                        input_flow.ty
-                    }
+                    input_flow.ty
                 } else if op == "List/append" {
                     let append_item = args
                         .iter()
@@ -2427,7 +2484,7 @@ impl<'a> Checker<'a> {
                             },
                         });
                         self.diagnostics.push(self.diagnostic_for_expr(
-                            *input,
+                            input_expr_id,
                             "`WHILE` requires a continuous selector".to_owned(),
                         ));
                     }
@@ -2436,20 +2493,18 @@ impl<'a> Checker<'a> {
                 } else if self.render_contracts.is_render_constructor(op) {
                     self.render_constructor_type_for_args(op, Some(&input_flow), args)
                 } else if op == "Bool/not" || op == "Bool/toggle" {
-                    if !input_is_placeholder {
-                        self.check_true_false_input(expr, op, &input_flow);
-                    }
+                    self.check_true_false_input(expr, op, &input_flow);
                     true_false_type()
                 } else if op == "Bool/and" {
-                    if !input_is_placeholder {
-                        self.check_true_false_input(expr, op, &input_flow);
-                    }
+                    self.check_true_false_input(expr, op, &input_flow);
                     for arg in args {
                         let arg_flow = self.ensure_expr(arg.value);
                         self.check_true_false_input(expr, op, &arg_flow);
                     }
                     true_false_type()
-                } else if let Some(ty) = self.contextual_bytes_result_type(op, Some(*input), args) {
+                } else if let Some(ty) =
+                    self.contextual_bytes_result_type(op, Some(input_expr_id), args)
+                {
                     ty
                 } else {
                     self.type_for_call_expr(expr.id, op)
@@ -3277,8 +3332,18 @@ impl<'a> Checker<'a> {
     }
 
     fn type_for_path(&mut self, expr_id: usize, parts: &[String]) -> Type {
-        let path = parts.join(".");
         if let Some(producer) = external_value_role(parts) {
+            let path = external_value_path(parts).expect("external path has a role and suffix");
+            if !external_value_uses_store_root(parts) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr_id,
+                    format!(
+                        "qualified external value `{path}` must use `{}/store.<value>`; role outputs are host boundaries, not distributed application state",
+                        role_namespace(producer)
+                    ),
+                ));
+                return self.expr_type_var(expr_id);
+            }
             if !self.check_external_role_access(expr_id, producer, &path) {
                 return self.expr_type_var(expr_id);
             }
@@ -3291,6 +3356,7 @@ impl<'a> Checker<'a> {
             ));
             return self.expr_type_var(expr_id);
         }
+        let path = parts.join(".");
         if path == "element.hovered" {
             return true_false_type();
         }
@@ -3320,8 +3386,20 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        if let Some(ty) = self.name_bindings.get(&path) {
-            return ty.clone();
+        if let Some(ty) = self
+            .local_name_bindings
+            .iter()
+            .rev()
+            .find_map(|bindings| type_from_longest_binding_prefix(bindings, parts))
+        {
+            return ty;
+        }
+        if let Some(declaration_expr_id) = declaration_expr_for_path(&self.declaration_exprs, &path)
+        {
+            return self.ensure_expr(declaration_expr_id).ty;
+        }
+        if let Some(ty) = type_from_longest_binding_prefix(&self.name_bindings, parts) {
+            return ty;
         }
         if parts.first().is_some_and(|part| part == "PASSED") && parts.len() > 1 {
             let passed_path = parts[1..].join(".");
@@ -3337,12 +3415,6 @@ impl<'a> Checker<'a> {
             if let Some(ty) = parts.last().and_then(|field| self.name_bindings.get(field)) {
                 return ty.clone();
             }
-        }
-        if let Some(base) = parts.first().and_then(|part| self.name_bindings.get(part))
-            && parts.len() > 1
-            && let Some(ty) = type_for_nested_path(base, &parts[1..])
-        {
-            return ty;
         }
         if parts.len() >= 2
             && let Some(shape) = self.object_bindings.get(&parts[0])
@@ -3390,7 +3462,7 @@ impl<'a> Checker<'a> {
             ));
             return false;
         }
-        if !role_can_read(current, producer) {
+        if !current.can_depend_on(producer) {
             self.diagnostics.push(self.diagnostic_for_expr(
                 expr_id,
                 format!(
@@ -3475,7 +3547,16 @@ impl<'a> Checker<'a> {
                 ));
                 continue;
             };
-            let actual = self.ensure_expr(actual_expr_id);
+            let mut actual = self.ensure_expr(actual_expr_id);
+            if !external_data_type_is_closed(&actual.ty)
+                && let Some(static_actual) = self.static_expr_type_for_pipeline_expr(
+                    actual_expr_id,
+                    &mut BTreeSet::new(),
+                    &self.name_bindings,
+                )
+            {
+                actual.ty = static_actual;
+            }
             self.constraints.push(Constraint::FlowCompatible {
                 actual: actual.clone(),
                 expected: FlowType {
@@ -3496,7 +3577,11 @@ impl<'a> Checker<'a> {
                 actual: actual.ty.clone(),
                 expected: expected.ty.clone(),
             });
-            if !external_data_type_is_closed(&actual.ty) {
+            if !matches!(
+                actual.ty,
+                Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+            ) && !external_data_type_is_closed(&actual.ty)
+            {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     actual_expr_id,
                     format!(
@@ -3521,8 +3606,11 @@ impl<'a> Checker<'a> {
     }
 
     fn static_type_for_path(&self, parts: &[String]) -> Option<Type> {
-        let path = parts.join(".");
         if external_value_role(parts).is_some() {
+            if !external_value_uses_store_root(parts) {
+                return None;
+            }
+            let path = external_value_path(parts)?;
             return self
                 .external_types
                 .values
@@ -3544,7 +3632,15 @@ impl<'a> Checker<'a> {
                 SourcePayloadAccess::UnknownField(_) => None,
             };
         }
-        self.name_bindings.get(&path).cloned().or_else(|| {
+        if let Some(ty) = self
+            .local_name_bindings
+            .iter()
+            .rev()
+            .find_map(|bindings| type_from_longest_binding_prefix(bindings, parts))
+        {
+            return Some(ty);
+        }
+        type_from_longest_binding_prefix(&self.name_bindings, parts).or_else(|| {
             if parts.first().is_some_and(|part| part == "PASSED") && parts.len() > 1 {
                 let passed_path = parts[1..].join(".");
                 if let Some(ty) = self.name_bindings.get(&passed_path) {
@@ -3559,10 +3655,7 @@ impl<'a> Checker<'a> {
                     return Some(ty.clone());
                 }
             }
-            parts
-                .first()
-                .and_then(|base| self.name_bindings.get(base))
-                .and_then(|base| type_for_nested_path(base, &parts[1..]))
+            None
         })
     }
 
@@ -3839,16 +3932,30 @@ impl<'a> Checker<'a> {
             .or_insert_with(|| self.vars.new_var())
     }
 
-    fn list_map_result_item_type(&self, args: &[AstCallArg]) -> Type {
-        let Some(new_expr) = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("new"))
-            .and_then(|arg| self.program.expressions.get(arg.value))
-        else {
+    fn infer_list_map_result_item_type(&mut self, input_type: &Type, args: &[AstCallArg]) -> Type {
+        let Some(new_expr_id) = list_map_result_expr_id(
+            &self.program.ast.statements,
+            &self.program.expressions,
+            args,
+        ) else {
             return open_object_type();
         };
-        self.static_expr_type(new_expr, &mut BTreeSet::new())
-            .unwrap_or_else(open_object_type)
+        let Some(binding_name) = args
+            .iter()
+            .find(|arg| arg.name.is_none())
+            .and_then(|arg| self.program.expressions.get(arg.value))
+            .and_then(expr_single_name)
+            .map(str::to_owned)
+        else {
+            return self.ensure_expr(new_expr_id).ty;
+        };
+        let input_item_type =
+            list_item_type_from_list_type(input_type).unwrap_or_else(open_object_type);
+        self.local_name_bindings
+            .push(BTreeMap::from([(binding_name, input_item_type)]));
+        let item_type = self.ensure_expr(new_expr_id).ty;
+        self.local_name_bindings.pop();
+        item_type
     }
 
     fn when_result_type(&mut self, expr_id: usize) -> Option<Type> {
@@ -4342,21 +4449,23 @@ impl<'a> Checker<'a> {
         }) {
             return Some(renderable);
         }
-        let mut fields = BTreeMap::new();
-        let mut field_order = Vec::new();
-        self.collect_static_statement_fields_with_bindings(
-            &statement.children,
-            active_functions,
-            &local_bindings,
-            &mut fields,
-            &mut field_order,
-        );
-        if !fields.is_empty() {
-            return Some(Type::Object(ObjectShape {
-                fields,
-                field_order,
-                open: false,
-            }));
+        if statements_define_explicit_record(&statement.children, &self.program.expressions) {
+            let mut fields = BTreeMap::new();
+            let mut field_order = Vec::new();
+            self.collect_static_statement_fields_with_bindings(
+                &statement.children,
+                active_functions,
+                &local_bindings,
+                &mut fields,
+                &mut field_order,
+            );
+            if !fields.is_empty() {
+                return Some(Type::Object(ObjectShape {
+                    fields,
+                    field_order,
+                    open: false,
+                }));
+            }
         }
         self.static_block_return_type_with_bindings(
             &statement.children,
@@ -4801,7 +4910,7 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::Path(parts) => {
-                let path = parts.join(".");
+                let path = external_value_path(parts).unwrap_or_else(|| parts.join("."));
                 if let Some(flow_type) = self.external_types.values.get(&path) {
                     flow_type.mode
                 } else if let Some(mode) = flow_binding_mode(&self.flow_bindings, &path) {
@@ -4832,14 +4941,20 @@ impl<'a> Checker<'a> {
                 .map(|arg| self.flow_mode_for_expr_id(arg.value))
                 .fold(FlowMode::Continuous, merge_flow_modes),
             AstExprKind::Pipe { input, op, args } => {
+                let input = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expr.id,
+                    *input,
+                    &self.program.expressions,
+                );
                 if op == "WHILE" {
                     FlowMode::Continuous
                 } else if op == "List/map" || op == "WHEN" {
-                    self.flow_mode_for_expr_id(*input)
+                    self.flow_mode_for_expr_id(input)
                 } else {
                     args.iter()
                         .map(|arg| self.flow_mode_for_expr_id(arg.value))
-                        .chain(std::iter::once(self.flow_mode_for_expr_id(*input)))
+                        .chain(std::iter::once(self.flow_mode_for_expr_id(input)))
                         .fold(FlowMode::Continuous, merge_flow_modes)
                 }
             }
@@ -4944,6 +5059,7 @@ impl<'a> Checker<'a> {
         map_expr_id: usize,
         list_expr_id: usize,
         args: &[AstCallArg],
+        item_type: Type,
     ) {
         if !self.runtime_list_map_exprs.insert(map_expr_id) {
             return;
@@ -4962,7 +5078,6 @@ impl<'a> Checker<'a> {
             .and_then(child_template)
             .map(|(function, args)| (Some(function), args))
             .unwrap_or((None, Vec::new()));
-        let item_type = self.list_map_result_item_type(args);
         let input_list_type = self.ensure_expr(list_expr_id).ty;
         let input_item_type =
             list_item_type_from_list_type(&input_list_type).unwrap_or_else(open_object_type);
@@ -5150,11 +5265,18 @@ impl<'a> Checker<'a> {
 
     fn check_builtin_call_compatibility(
         &mut self,
+        expr_id: usize,
         function: &str,
         pipe_input: Option<usize>,
         call_args: &[AstCallArg],
     ) {
         if session_info_intrinsic_type(function).is_some() {
+            if !session_info_intrinsic_allowed(function, self.external_types.current_role) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr_id,
+                    session_info_role_diagnostic(function, self.external_types.current_role),
+                ));
+            }
             if let Some(input_expr_id) = pipe_input {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     input_expr_id,
@@ -5167,6 +5289,9 @@ impl<'a> Checker<'a> {
                     format!("`{function}` does not accept arguments"),
                 ));
             }
+            return;
+        }
+        if host_effect_signature(function).is_some() {
             return;
         }
 
@@ -5342,6 +5467,20 @@ impl<'a> Checker<'a> {
         ) {
             return;
         }
+        let branch_expr_ids = statement
+            .children
+            .iter()
+            .flat_map(|child| statement_update_value_exprs(child, &self.program.expressions))
+            .collect::<Vec<_>>();
+        if branch_expr_ids.len() == 1 {
+            self.diagnostics.push(
+                self.diagnostic_for_expr(
+                    expr_id,
+                    "`LATEST` merges two or more branches; use its single expression directly"
+                        .to_owned(),
+                ),
+            );
+        }
         let mut direct_then_sources = BTreeMap::new();
         for child in &statement.children {
             let Some((trigger_expr_id, trigger)) =
@@ -5367,11 +5506,7 @@ impl<'a> Checker<'a> {
             }
         }
         let mut expected_type: Option<Type> = None;
-        for branch_expr_id in statement
-            .children
-            .iter()
-            .flat_map(|child| statement_update_value_exprs(child, &self.program.expressions))
-        {
+        for branch_expr_id in branch_expr_ids {
             let branch_type = self.ensure_expr(branch_expr_id).ty;
             if matches!(branch_type, Type::Skip) {
                 continue;
@@ -5663,7 +5798,7 @@ impl<'a> Checker<'a> {
             let expected = signature
                 .intent_fields
                 .iter()
-                .map(|(name, _)| name.as_str())
+                .map(|field| field.name.as_str())
                 .collect::<BTreeSet<_>>();
             for name in actual.keys().filter(|name| !expected.contains(**name)) {
                 self.diagnostics.push(self.diagnostic_for_expr(
@@ -5671,7 +5806,36 @@ impl<'a> Checker<'a> {
                     format!("typed host effect `{operation}` has no argument `{name}`"),
                 ));
             }
-            for name in expected.iter().filter(|name| !actual.contains_key(**name)) {
+            for (name, value_expr_id) in &arguments {
+                let Some(expected_field) = signature
+                    .intent_fields
+                    .iter()
+                    .find(|field| field.name == *name)
+                else {
+                    continue;
+                };
+                let actual = self.ensure_expr(*value_expr_id).ty;
+                self.constraints.push(Constraint::Assignable {
+                    actual: actual.clone(),
+                    expected: expected_field.ty.clone(),
+                });
+                if !type_is_assignable_to(&actual, &expected_field.ty) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        *value_expr_id,
+                        format!(
+                            "`{operation}` argument `{name}` has incompatible type\nexpected: {}\nfound: {}",
+                            boon_facing_type_label(&expected_field.ty),
+                            boon_facing_type_label(&actual)
+                        ),
+                    ));
+                }
+            }
+            for name in signature
+                .intent_fields
+                .iter()
+                .filter(|field| !field.has_default && !actual.contains_key(field.name.as_str()))
+                .map(|field| field.name.as_str())
+            {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     expr.id,
                     format!(
@@ -5725,6 +5889,25 @@ impl<'a> Checker<'a> {
                 .any(|child| visit_hold(child, expr_id, expressions))
         }
 
+        fn branch_contains(
+            statements: &[AstStatement],
+            root: usize,
+            expr_id: usize,
+            expressions: &[AstExpr],
+        ) -> bool {
+            if root == expr_id || expr_contains_expr_id(root, expr_id, expressions) {
+                return true;
+            }
+            statements.iter().any(|statement| {
+                let owns_root = statement.expr.is_some_and(|statement_expr| {
+                    statement_expr == root
+                        || expr_contains_expr_id(statement_expr, root, expressions)
+                });
+                (owns_root && contains(statement, expr_id, expressions))
+                    || branch_contains(&statement.children, root, expr_id, expressions)
+            })
+        }
+
         let expressions = &self.program.expressions;
         if !self
             .program
@@ -5744,7 +5927,7 @@ impl<'a> Checker<'a> {
                 matches!(
                     self.flow_mode_for_expr_id(*input),
                     FlowMode::TickPresent | FlowMode::PresentOrAbsent
-                ) && expr_contains_expr_id(*output, expr_id, expressions)
+                ) && branch_contains(&self.program.ast.statements, *output, expr_id, expressions)
             }
             AstExprKind::When { input }
                 if matches!(
@@ -5754,7 +5937,16 @@ impl<'a> Checker<'a> {
             {
                 when_arms(&self.program.ast.statements, trigger.id, expressions)
                     .into_iter()
-                    .any(|(_, output)| expr_contains_expr_id(output, expr_id, expressions))
+                    .any(|(_, output)| {
+                        branch_contains(&self.program.ast.statements, output, expr_id, expressions)
+                    })
+            }
+            AstExprKind::Pipe { op, .. } if op == "WHILE" => {
+                when_arms(&self.program.ast.statements, trigger.id, expressions)
+                    .into_iter()
+                    .any(|(_, output)| {
+                        branch_contains(&self.program.ast.statements, output, expr_id, expressions)
+                    })
             }
             _ => false,
         })
@@ -6571,6 +6763,14 @@ fn list_map_new_expr_id(args: &[AstCallArg]) -> Option<usize> {
         .map(|arg| arg.value)
 }
 
+fn list_map_result_expr_id(
+    _statements: &[AstStatement],
+    _expressions: &[AstExpr],
+    args: &[AstCallArg],
+) -> Option<usize> {
+    list_map_new_expr_id(args)
+}
+
 fn named_arg_expr(args: &[AstCallArg], name: &str) -> Option<usize> {
     args.iter()
         .find(|arg| arg.name.as_deref() == Some(name))
@@ -6883,7 +7083,6 @@ impl Default for BuiltinSignatureRegistry {
                 "Bytes/to_hex",
                 "Bytes/to_base64",
                 "File/read_text",
-                "File/write_bytes",
                 "Log/error",
                 "Log/info",
             ]
@@ -6929,7 +7128,6 @@ impl Default for BuiltinSignatureRegistry {
                 "Bytes/from_base64",
                 "Bytes/write_unsigned",
                 "Bytes/write_signed",
-                "File/read_bytes",
             ]
             .into_iter()
             .collect(),
@@ -8517,11 +8715,53 @@ fn statement_value_type_from_bindings(
             ) {
                 continue;
             }
-            let next = if matches!(expr.kind, AstExprKind::When { .. }) {
-                let when_statement = statement_for_expr(statement, *expr_id).unwrap_or(statement);
-                static_when_type_from_bindings(when_statement, *expr_id, expressions, bindings)
-            } else {
-                static_expr_type_from_bindings(expr, expressions, bindings)
+            let next = match &expr.kind {
+                AstExprKind::When { .. } => {
+                    let when_statement =
+                        statement_for_expr(statement, *expr_id).unwrap_or(statement);
+                    static_when_type_from_bindings(when_statement, *expr_id, expressions, bindings)
+                }
+                AstExprKind::Pipe { op, args, .. } if op == "List/map" => {
+                    let mut local_bindings = bindings.clone();
+                    if let Some(binding_name) = args
+                        .iter()
+                        .find(|arg| arg.name.is_none())
+                        .and_then(|arg| expressions.get(arg.value))
+                        .and_then(expr_single_name)
+                        && let Some(item_type) = list_item_type_from_list_type(&ty)
+                    {
+                        local_bindings.insert(binding_name.to_owned(), item_type);
+                    }
+                    let item_type =
+                        list_map_result_expr_id(std::slice::from_ref(statement), expressions, args)
+                            .and_then(|new_expr_id| expressions.get(new_expr_id))
+                            .and_then(|new_expr| {
+                                static_expr_type_from_bindings(
+                                    new_expr,
+                                    expressions,
+                                    &local_bindings,
+                                )
+                            })
+                            .unwrap_or_else(open_object_type);
+                    Some(Type::List(Box::new(item_type)))
+                }
+                AstExprKind::Pipe { op, .. } if op == "List/latest" => {
+                    list_item_type_from_list_type(&ty)
+                }
+                AstExprKind::Pipe { op, .. }
+                    if matches!(
+                        op.as_str(),
+                        "List/retain"
+                            | "List/remove"
+                            | "List/filter_field_equal"
+                            | "List/filter_field_not_equal"
+                            | "List/move_field_first"
+                            | "List/move_field_last"
+                    ) =>
+                {
+                    Some(ty.clone())
+                }
+                _ => static_expr_type_from_bindings(expr, expressions, bindings),
             };
             if let Some(next) = next.or_else(|| {
                 let ty = simple_expr_type(expr, expressions);
@@ -9196,11 +9436,9 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
         Some(Type::List(Box::new(open_object_type())))
     } else if matches!(
         function,
-        "Text/to_bytes" | "File/read_bytes" | "File/read_text" | "Log/error" | "Log/info"
+        "Text/to_bytes" | "File/read_text" | "Log/error" | "Log/info"
     ) {
         Some(Type::Text)
-    } else if function == "File/write_bytes" {
-        Some(Type::Bytes(BytesType::Dynamic))
     } else if function.starts_with("Text/") {
         Some(Type::Text)
     } else if matches!(
@@ -9242,10 +9480,8 @@ fn argument_expected_type(function: &str) -> Option<Type> {
         Some(true_false_type())
     } else if function == "Text/to_bytes" {
         None
-    } else if matches!(
-        function,
-        "File/read_bytes" | "File/read_text" | "File/write_bytes" | "Log/error" | "Log/info"
-    ) || function.starts_with("Text/")
+    } else if matches!(function, "File/read_text" | "Log/error" | "Log/info")
+        || function.starts_with("Text/")
     {
         Some(Type::Text)
     } else if function.starts_with("Number/") {
@@ -9265,21 +9501,13 @@ fn builtin_argument_expected_type(
             signature
                 .intent_fields
                 .into_iter()
-                .find_map(|(name, ty)| (name == arg_name).then_some(ty))
+                .find_map(|field| (field.name == arg_name).then_some(field.ty))
         });
     }
     if function == "Bool/toggle" && arg_name == Some("when") {
         return Some(Type::Unknown);
     }
-    if function == "File/write_bytes" {
-        return match (piped, arg_name) {
-            (true, Some("path") | None) => Some(Type::Text),
-            (false, Some("input") | None) => Some(Type::Bytes(BytesType::Dynamic)),
-            (false, Some("path")) => Some(Type::Text),
-            _ => None,
-        };
-    }
-    if matches!(function, "File/read_bytes" | "File/read_text") {
+    if function == "File/read_text" {
         return match arg_name {
             Some("path") | Some("input") | None => Some(Type::Text),
             _ => None,
@@ -9847,13 +10075,7 @@ fn static_path_type_from_bindings(
     parts: &[String],
     bindings: &BTreeMap<String, Type>,
 ) -> Option<Type> {
-    let path = parts.join(".");
-    bindings.get(&path).cloned().or_else(|| {
-        parts
-            .first()
-            .and_then(|base| bindings.get(base))
-            .and_then(|base| type_for_nested_path(base, &parts[1..]))
-    })
+    type_from_longest_binding_prefix(bindings, parts)
 }
 
 fn refresh_external_declaration_bindings(
@@ -9981,8 +10203,15 @@ fn static_expr_type_with_external_types(
     }
 }
 
-fn flow_bindings(program: &ParsedProgram) -> BTreeMap<String, FlowMode> {
-    let mut bindings = BTreeMap::new();
+fn flow_bindings(
+    program: &ParsedProgram,
+    external_types: &ExternalTypeEnvironment,
+) -> BTreeMap<String, FlowMode> {
+    let mut bindings = external_types
+        .values
+        .iter()
+        .map(|(path, flow_type)| (path.clone(), flow_type.mode))
+        .collect();
     collect_flow_bindings(
         &program.ast.statements,
         &program.expressions,
@@ -10035,6 +10264,173 @@ fn collect_canonical_named_value_paths(
             | AstStatementKind::Expression => {}
         }
     }
+}
+
+fn declaration_expression_index(program: &ParsedProgram) -> BTreeMap<String, usize> {
+    let mut declarations = BTreeMap::new();
+    collect_declaration_expressions(
+        &program.ast.statements,
+        &program.expressions,
+        &mut Vec::new(),
+        &mut declarations,
+    );
+    declarations
+}
+
+fn collect_declaration_expressions(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    scope: &mut Vec<String>,
+    declarations: &mut BTreeMap<String, usize>,
+) {
+    for statement in statements {
+        match &statement.kind {
+            AstStatementKind::Function { .. } => continue,
+            AstStatementKind::Field { name } if matches!(name.as_str(), "document" | "scene") => {
+                continue;
+            }
+            AstStatementKind::Field { name } => {
+                let path = scoped_path(scope, name);
+                if let Some(expr_id) = statement_pipeline_final_expr_id(statement, expressions)
+                    .or_else(|| direct_statement_value_expr_id(statement, expressions))
+                {
+                    declarations.insert(path, expr_id);
+                }
+                scope.push(name.clone());
+                collect_declaration_expressions(
+                    &statement.children,
+                    expressions,
+                    scope,
+                    declarations,
+                );
+                scope.pop();
+                continue;
+            }
+            AstStatementKind::Hold { field, name, .. } => {
+                if let Some(name) = field.as_ref().or(name.as_ref())
+                    && let Some(expr_id) = statement_pipeline_final_expr_id(statement, expressions)
+                        .or_else(|| direct_statement_value_expr_id(statement, expressions))
+                {
+                    let path = if scope.last() == Some(name) {
+                        scope.join(".")
+                    } else {
+                        scoped_path(scope, name)
+                    };
+                    declarations.insert(path, expr_id);
+                }
+            }
+            AstStatementKind::List {
+                field: Some(name), ..
+            }
+            | AstStatementKind::Source {
+                field: Some(name), ..
+            } => {
+                if let Some(expr_id) = statement_pipeline_final_expr_id(statement, expressions)
+                    .or_else(|| direct_statement_value_expr_id(statement, expressions))
+                {
+                    declarations.insert(scoped_path(scope, name), expr_id);
+                }
+            }
+            AstStatementKind::Block
+            | AstStatementKind::List { field: None, .. }
+            | AstStatementKind::Source { field: None, .. }
+            | AstStatementKind::Spread
+            | AstStatementKind::Expression => {}
+        }
+        collect_declaration_expressions(&statement.children, expressions, scope, declarations);
+    }
+}
+
+fn declaration_expr_for_path(declarations: &BTreeMap<String, usize>, path: &str) -> Option<usize> {
+    declarations.get(path).copied().or_else(|| {
+        let suffix = format!(".{path}");
+        let mut matches = declarations
+            .iter()
+            .filter(|(candidate, _)| candidate.ends_with(&suffix))
+            .map(|(_, expr_id)| *expr_id);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    })
+}
+
+fn collect_inferred_named_value_types(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    expr_type_cache: &[Option<FlowType>],
+    scope: &mut Vec<String>,
+    types: &mut BTreeMap<String, Type>,
+) {
+    for statement in statements {
+        match &statement.kind {
+            AstStatementKind::Function { .. } => continue,
+            AstStatementKind::Field { name } if matches!(name.as_str(), "document" | "scene") => {
+                continue;
+            }
+            AstStatementKind::Field { name } => {
+                let path = scoped_path(scope, name);
+                if let Some(ty) = inferred_statement_type(statement, expressions, expr_type_cache) {
+                    types.insert(path, ty);
+                }
+                scope.push(name.clone());
+                collect_inferred_named_value_types(
+                    &statement.children,
+                    expressions,
+                    expr_type_cache,
+                    scope,
+                    types,
+                );
+                scope.pop();
+                continue;
+            }
+            AstStatementKind::Hold { field, name, .. } => {
+                if let Some(name) = field.as_ref().or(name.as_ref())
+                    && let Some(ty) =
+                        inferred_statement_type(statement, expressions, expr_type_cache)
+                {
+                    let path = if scope.last() == Some(name) {
+                        scope.join(".")
+                    } else {
+                        scoped_path(scope, name)
+                    };
+                    types.insert(path, ty);
+                }
+            }
+            AstStatementKind::List {
+                field: Some(name), ..
+            }
+            | AstStatementKind::Source {
+                field: Some(name), ..
+            } => {
+                if let Some(ty) = inferred_statement_type(statement, expressions, expr_type_cache) {
+                    types.insert(scoped_path(scope, name), ty);
+                }
+            }
+            AstStatementKind::Block
+            | AstStatementKind::List { field: None, .. }
+            | AstStatementKind::Source { field: None, .. }
+            | AstStatementKind::Spread
+            | AstStatementKind::Expression => {}
+        }
+        collect_inferred_named_value_types(
+            &statement.children,
+            expressions,
+            expr_type_cache,
+            scope,
+            types,
+        );
+    }
+}
+
+fn inferred_statement_type(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    expr_type_cache: &[Option<FlowType>],
+) -> Option<Type> {
+    statement_pipeline_final_expr_id(statement, expressions)
+        .or_else(|| direct_statement_value_expr_id(statement, expressions))
+        .and_then(|expr_id| expr_type_cache.get(expr_id))
+        .and_then(Option::as_ref)
+        .map(|flow| flow.ty.clone())
 }
 
 fn collect_flow_bindings(
@@ -10155,7 +10551,8 @@ fn simple_flow_mode_with_bindings(
             flow_binding_mode(bindings, path).unwrap_or(FlowMode::Continuous)
         }
         AstExprKind::Path(parts) => {
-            flow_binding_mode(bindings, &parts.join(".")).unwrap_or(FlowMode::Continuous)
+            let path = external_value_path(parts).unwrap_or_else(|| parts.join("."));
+            flow_binding_mode(bindings, &path).unwrap_or(FlowMode::Continuous)
         }
         AstExprKind::Call { args, .. } => args
             .iter()
@@ -10823,6 +11220,9 @@ fn is_binding_name(value: &str) -> bool {
 
 fn function_result_shape(program: &ParsedProgram, function: &str) -> Option<ObjectShape> {
     let function = find_function_statement(&program.ast.statements, function)?;
+    if !statements_define_explicit_record(&function.children, &program.expressions) {
+        return None;
+    }
     let mut fields = BTreeMap::new();
     let mut field_order = Vec::new();
     collect_statement_shape_fields(
@@ -10835,6 +11235,21 @@ fn function_result_shape(program: &ParsedProgram, function: &str) -> Option<Obje
         fields,
         field_order,
         open: true,
+    })
+}
+
+fn statements_define_explicit_record(statements: &[AstStatement], expressions: &[AstExpr]) -> bool {
+    statements.iter().any(|statement| {
+        if semantic_block_statement(statement, expressions) {
+            return semantic_block_return_statement(&statement.children).is_some_and(|returned| {
+                statements_define_explicit_record(std::slice::from_ref(returned), expressions)
+            });
+        }
+        matches!(statement.kind, AstStatementKind::Block)
+            && statement
+                .children
+                .iter()
+                .any(|child| statement_field(child).is_some())
     })
 }
 
@@ -11126,6 +11541,22 @@ fn type_for_nested_path(base: &Type, parts: &[String]) -> Option<Type> {
     }
 }
 
+fn type_from_longest_binding_prefix(
+    bindings: &BTreeMap<String, Type>,
+    parts: &[String],
+) -> Option<Type> {
+    for prefix_len in (1..=parts.len()).rev() {
+        let prefix = boon_parser::canonical_value_path(&parts[..prefix_len]);
+        let Some(base) = bindings.get(&prefix) else {
+            continue;
+        };
+        if let Some(ty) = type_for_nested_path(base, &parts[prefix_len..]) {
+            return Some(ty);
+        }
+    }
+    None
+}
+
 fn drain_path_parts(path: &AstDrainPath) -> Vec<String> {
     match path {
         AstDrainPath::Binding { name } => vec![name.clone()],
@@ -11296,13 +11727,14 @@ fn source_payload_shape_table(
             continue;
         };
         for (argument_name, argument_value) in named_call_argument_exprs(program, expr.id, args) {
-            let Some((_, expected_type)) = signature
+            let Some(expected_field) = signature
                 .intent_fields
                 .iter()
-                .find(|(name, _)| name == &argument_name)
+                .find(|field| field.name == argument_name)
             else {
                 continue;
             };
+            let expected_type = &expected_field.ty;
             let Some(AstExpr {
                 kind: AstExprKind::Path(parts),
                 ..
@@ -11944,15 +12376,7 @@ fn hint_type_for_expr_id(
         .cloned()
         .or_else(|| match &program.expressions.get(expr_id)?.kind {
             AstExprKind::Identifier(name) => name_bindings.get(name).cloned(),
-            AstExprKind::Path(parts) => {
-                let path = parts.join(".");
-                name_bindings.get(&path).cloned().or_else(|| {
-                    parts
-                        .first()
-                        .and_then(|base| name_bindings.get(base))
-                        .and_then(|base| type_for_nested_path(base, &parts[1..]))
-                })
-            }
+            AstExprKind::Path(parts) => type_from_longest_binding_prefix(name_bindings, parts),
             _ => None,
         })
 }
@@ -12498,27 +12922,49 @@ fn true_false_type() -> Type {
 
 fn session_info_intrinsic_type(function: &str) -> Option<Type> {
     match function {
-        "SessionInfo/status" => Some(Type::VariantSet(vec![Variant::Tagged {
-            tag: "Active".to_owned(),
-            fields: ObjectShape::from_ordered_fields(
-                [
-                    (
-                        "role".to_owned(),
-                        tag_union_type(&["Client", "Session", "Server"]),
-                    ),
-                    ("session_id".to_owned(), Type::Text),
-                ],
-                false,
-            ),
-        }])),
+        "SessionInfo/status" => Some(Type::VariantSet(vec![
+            Variant::Tag("Connecting".to_owned()),
+            Variant::Tag("Current".to_owned()),
+            Variant::Tag("Stale".to_owned()),
+            Variant::Tagged {
+                tag: "Failed".to_owned(),
+                fields: ObjectShape::from_ordered_fields([("code".to_owned(), Type::Text)], false),
+            },
+        ])),
         "SessionInfo/principal" => Some(Type::VariantSet(vec![
             Variant::Tag("Anonymous".to_owned()),
             Variant::Tagged {
                 tag: "Authenticated".to_owned(),
-                fields: ObjectShape::from_ordered_fields([("id".to_owned(), Type::Text)], false),
+                fields: ObjectShape::from_ordered_fields(
+                    [
+                        ("subject".to_owned(), Type::Text),
+                        ("roles".to_owned(), Type::List(Box::new(Type::Text))),
+                    ],
+                    false,
+                ),
             },
         ])),
         _ => None,
+    }
+}
+
+fn session_info_intrinsic_allowed(function: &str, role: ProgramRole) -> bool {
+    match function {
+        "SessionInfo/status" => matches!(
+            role,
+            ProgramRole::Client | ProgramRole::Session | ProgramRole::Server
+        ),
+        "SessionInfo/principal" => matches!(role, ProgramRole::Session | ProgramRole::Server),
+        _ => false,
+    }
+}
+
+fn session_info_role_diagnostic(function: &str, role: ProgramRole) -> String {
+    match (function, role) {
+        ("SessionInfo/principal", ProgramRole::Client) => {
+            "`SessionInfo/principal()` is unavailable in Client; expose only explicitly selected account-facing data from Session".to_owned()
+        }
+        _ => format!("`{function}()` is unavailable in {}", role.namespace()),
     }
 }
 

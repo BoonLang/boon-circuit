@@ -2057,8 +2057,14 @@ FUNCTION selected_name_column_body() {
             height: Fill
             paint: False
         ]
-        items:
-            PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_name_column_row(row: row))
+        items: LIST {
+            PASSED.store.selected_signal_lane_rows
+            |> List/map(row, new: selected_name_column_row(row: row))
+            PASSED.store.comparison_visible |> WHEN {
+                True => comparison_name_column_row()
+                False => NoElement
+            }
+        }
     )
 }
 
@@ -2072,8 +2078,14 @@ FUNCTION selected_value_column_body() {
             height: Fill
             paint: False
         ]
-        items:
-            PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_value_column_row(row: row))
+        items: LIST {
+            PASSED.store.selected_signal_lane_rows
+            |> List/map(row, new: selected_value_column_row(row: row))
+            PASSED.store.comparison_visible |> WHEN {
+                True => comparison_value_column_row()
+                False => NoElement
+            }
+        }
     )
 }
 
@@ -2127,8 +2139,14 @@ FUNCTION selected_wave_rows_column() {
             height: Fill
             paint: False
         ]
-        items:
-            PASSED.store.selected_signal_lane_rows |> List/map(row, new: selected_wave_column_row(row: row))
+        items: LIST {
+            PASSED.store.selected_signal_lane_rows
+            |> List/map(row, new: selected_wave_column_row(row: row))
+            PASSED.store.comparison_visible |> WHEN {
+                True => comparison_wave_column_row()
+                False => NoElement
+            }
+        }
     )
 }
 
@@ -2222,6 +2240,61 @@ FUNCTION selected_wave_variable_row(row) {
         items: LIST {
             selected_wave_cell(signal: row)
             signal_row_divider(signal: row)
+        }
+    )
+}
+
+FUNCTION comparison_name_column_row() {
+    Scene/Element/stripe(
+        element: [target: TEXT { Real comparison waveform }]
+        direction: Column
+        gap: 0
+        style: [width: Fill, height: PASSED.store.row_height + 3, paint: False]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...NovyTheme/font(mode: PASSED.store.mode, of: Mono)
+                    width: Fill
+                    height: PASSED.store.row_height
+                    padding: [left: 10, right: 8]
+                    vertical_align: Center
+                    color: TEXT { #a5f3fc }
+                    background: [color: TEXT { #07162a }]
+                    border: [color: TEXT { #2f6f89 }]
+                    material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
+                ]
+                text:
+                    TEXT { Reference }
+                    |> Text/concat(with: PASSED.store.comparison_signal_name, separator: ": ")
+            )
+            selected_row_separator()
+        }
+    )
+}
+
+FUNCTION comparison_value_column_row() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [width: Fill, height: PASSED.store.row_height + 3, paint: False]
+        items: LIST {
+            value_pill_text(value_text: PASSED.store.comparison_current_value)
+            selected_row_separator()
+        }
+    )
+}
+
+FUNCTION comparison_wave_column_row() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [width: Fill, height: PASSED.store.row_height + 3, paint: False]
+        items: LIST {
+            selected_wave_area(signal: PASSED.store.comparison_signal_row)
+            selected_row_separator()
         }
     )
 }
@@ -2589,6 +2662,7 @@ FUNCTION timeline_navigation_controls() {
             zoom_reset_button()
             pan_left_button()
             pan_right_button()
+            signal_page_next_button()
             cursor_left_button()
             cursor_right_button()
             marker_button()
@@ -2604,13 +2678,14 @@ FUNCTION zoom_pan_controls() {
         element: []
         direction: Row
         gap: 6
-        style: control_group_style(group_width: 246)
+        style: control_group_style(group_width: 294)
         items: LIST {
             zoom_in_button()
             zoom_out_button()
             zoom_reset_button()
             pan_left_button()
             pan_right_button()
+            signal_page_next_button()
         }
     )
 }
@@ -3141,49 +3216,6 @@ FUNCTION collapsed_group() {
                 )
             }
         )
-    )
-}
-
-FUNCTION waveform_rows() {
-    PASSED.store.selected_group == Collapsed |> WHEN {
-        True => collapsed_group()
-        False => waveform_rows_expanded()
-    }
-}
-
-FUNCTION waveform_rows_expanded() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 0
-        style: [
-            width: Fill
-            height: Fill
-            padding: 0
-            rounded_corners: 0
-            scroll_y: True
-            background: [color: TEXT { #020817 }]
-            border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #1f2a3c }
-                Light => TEXT { #1f2a3c }
-            }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: WaveformGlass)
-        ]
-        items:
-            PASSED.store.selected_signal_rows |> List/map(selected_signal, new: selected_waveform_row(row: selected_signal))
-    )
-}
-
-FUNCTION selected_waveform_row(row) {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 0
-        style: [width: Fill, height: PASSED.store.row_height + 3, paint: False]
-        items: LIST {
-            waveform_row(signal: row)
-            signal_row_divider(signal: row)
-        }
     )
 }
 
@@ -5494,6 +5526,17 @@ FUNCTION pan_right_button() {
         element: [event: [press: PASSED.store.elements.pan_right], hovered: PASSED.store.elements.pan_right]
         style: compact_button_style(button_width: 42, hovered: element.hovered)
         label: button_label(button_text: TEXT { > })
+    )
+}
+
+FUNCTION signal_page_next_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: PASSED.store.elements.signal_page_next]
+            hovered: PASSED.store.elements.signal_page_next
+        ]
+        style: compact_button_style(button_width: 42, hovered: element.hovered)
+        label: button_label(button_text: TEXT { >> })
     )
 }
 

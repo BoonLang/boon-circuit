@@ -1,0 +1,26 @@
+store: [
+    register: SOURCE
+    result:
+        RegistrationNotRequested |> HOLD result {
+            store.register |> THEN {
+                DevelopmentPasskey/register(
+                    workspace_id: TEXT { workspace-test }
+                    workspace_grant_id: TEXT { grant-test }
+                    account_id: TEXT { account-test }
+                    credential_count: 0
+                    simulation: Success
+                )
+            }
+        }
+]
+
+outputs: [
+    result: store.result
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: TEXT { Persistent effect test }
+    )
+)

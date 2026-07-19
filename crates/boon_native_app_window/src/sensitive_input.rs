@@ -3,10 +3,9 @@ use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 
 use boon_host::{
-    DocumentNodeId, SensitiveInputEvent, SensitiveInputHandle, SourceBindingId, SurfaceId,
+    DocumentNodeId, MAX_SENSITIVE_INPUT_BYTES, SensitiveInputEvent, SensitiveInputHandle,
+    SourceBindingId, SurfaceId,
 };
-
-pub const MAX_SENSITIVE_INPUT_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SensitiveInputTarget {

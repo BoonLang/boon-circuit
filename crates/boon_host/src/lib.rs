@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 use std::time::Duration;
 
+pub const MAX_SENSITIVE_INPUT_BYTES: usize = 4096;
+
 pub use boon_document_model::{DocumentNodeId, Rect, SourceBindingId};
 
 macro_rules! string_ids {

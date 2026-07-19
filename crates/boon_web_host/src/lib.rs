@@ -5,7 +5,11 @@
 //! to a canvas, semantic accessibility nodes, and host-owned unsupported state.
 
 mod capability;
+#[cfg(any(target_arch = "wasm32", test))]
+mod client_effect_host;
 mod core;
+mod distributed_session;
+mod document_runtime;
 mod error;
 mod gpu;
 mod input;
@@ -13,6 +17,8 @@ mod map_interaction;
 mod map_tile;
 mod scheduler;
 mod semantic;
+#[cfg(any(target_arch = "wasm32", test))]
+mod sensitive_input;
 mod startup;
 mod storage;
 mod support;
@@ -22,6 +28,8 @@ pub mod wasm;
 
 pub use capability::*;
 pub use core::*;
+pub use distributed_session::*;
+pub use document_runtime::*;
 pub use error::*;
 pub use gpu::*;
 pub use input::*;

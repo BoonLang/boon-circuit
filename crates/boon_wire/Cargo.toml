@@ -6,4 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 boon_data.workspace = true
+getrandom.workspace = true
+minicbor.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+static_assertions.workspace = true

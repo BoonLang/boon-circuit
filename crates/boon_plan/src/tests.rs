@@ -97,6 +97,7 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         distributed_declaration("server.value.count"),
         1,
         ProgramRole::Server,
+        false,
         ValueRef::Constant(PlanConstantId(0)),
         DataTypePlan::Number,
     )
@@ -139,6 +140,8 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         ProgramRole::Server,
         vec![server_value.clone()],
         Vec::new(),
+        Vec::new(),
+        Vec::new(),
         vec![server_function.clone()],
         Vec::new(),
     )
@@ -160,12 +163,44 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         &server_value,
     )
     .unwrap();
+    let session_function_declaration = distributed_declaration("session.function.double");
+    let session_function_export_id = ExportId::from_identity(
+        graph.graph_id,
+        session_endpoint_id,
+        DistributedExportKind::PureFunction,
+        session_function_declaration,
+    )
+    .unwrap();
+    let session_function_argument_id =
+        DistributedArgumentId::from_parameter_name(session_function_export_id, "value").unwrap();
+    let session_function_argument = || PlanRowExpression::Field {
+        input: ValueRef::DistributedFunctionArgument {
+            export_id: session_function_export_id,
+            argument_id: session_function_argument_id,
+        },
+    };
+    let session_function = DistributedPureFunctionExportPlan::new(
+        graph.graph_id,
+        session_endpoint_id,
+        session_function_declaration,
+        1,
+        ProgramRole::Session,
+        vec![("value".to_owned(), DataTypePlan::Number)],
+        DataTypePlan::Number,
+        PlanRowExpression::NumberInfix {
+            op: "+".to_owned(),
+            left: Box::new(session_function_argument()),
+            right: Box::new(session_function_argument()),
+        },
+    )
+    .unwrap();
     let session_value = DistributedValueExportPlan::new(
         graph.graph_id,
         session_endpoint_id,
         distributed_declaration("session.value.server_count"),
         1,
         ProgramRole::Session,
+        false,
         ValueRef::DistributedImport(session_import.import_id),
         DataTypePlan::Number,
     )
@@ -178,6 +213,8 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         vec![session_value.clone()],
         vec![session_import],
         Vec::new(),
+        Vec::new(),
+        vec![session_function.clone()],
         Vec::new(),
     )
     .unwrap();
@@ -204,7 +241,7 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         distributed_declaration("client.call.double"),
         1,
         ProgramRole::Client,
-        &server_function,
+        &session_function,
         vec![(
             "value".to_owned(),
             ValueRef::DistributedImport(client_import.import_id),
@@ -219,6 +256,8 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         Vec::new(),
         vec![client_import],
         Vec::new(),
+        Vec::new(),
+        Vec::new(),
         vec![client_call],
     )
     .unwrap();
@@ -226,6 +265,48 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
     let graph =
         DistributedGraphPlan::new(&application, graph, vec![server, client, session]).unwrap();
     (application, graph)
+}
+
+fn distributed_graph_with_event(
+    application: &ApplicationIdentity,
+    base: &DistributedGraphPlan,
+    export_source_id: SourceId,
+    import_source_id: SourceId,
+    payload_type: DataTypePlan,
+) -> DistributedGraphPlan {
+    let mut endpoints = base.endpoints.clone();
+    let session_index = endpoints
+        .iter()
+        .position(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    let client_index = endpoints
+        .iter()
+        .position(|endpoint| endpoint.role == ProgramRole::Client)
+        .unwrap();
+    let event_export = DistributedEventExportPlan::new(
+        base.graph.graph_id,
+        endpoints[session_index].endpoint_id,
+        distributed_declaration("session.event.changed"),
+        1,
+        ProgramRole::Session,
+        export_source_id,
+        Some(SourcePayloadField::Named("payload".to_owned())),
+        payload_type,
+    )
+    .unwrap();
+    let event_import = DistributedEventImportPlan::new(
+        base.graph.graph_id,
+        endpoints[client_index].endpoint_id,
+        distributed_declaration("client.import.session_changed"),
+        1,
+        ProgramRole::Client,
+        &event_export,
+        import_source_id,
+    )
+    .unwrap();
+    endpoints[session_index].event_exports.push(event_export);
+    endpoints[client_index].event_imports.push(event_import);
+    DistributedGraphPlan::new(application, base.graph.clone(), endpoints).unwrap()
 }
 
 #[test]
@@ -263,6 +344,144 @@ fn distributed_graph_links_three_roles_and_each_machine_passes_the_distributed_c
             .unwrap();
         assert!(distributed_check.pass, "{}", distributed_check.detail);
     }
+
+    assert_eq!(
+        graph.wire_schema_hash,
+        distributed_graph_schema_hash(&graph).unwrap()
+    );
+    let endpoint_plans = [
+        ProgramRole::Client,
+        ProgramRole::Session,
+        ProgramRole::Server,
+    ]
+    .map(|role| graph.endpoint_plan(role).unwrap());
+    assert!(endpoint_plans.iter().all(|endpoint| {
+        endpoint.wire_schema == graph.wire_schema
+            && endpoint.wire_schema_hash == graph.wire_schema_hash
+    }));
+    for edge in &graph.wire_schema.value_edges {
+        let consumer = endpoint_plans
+            .iter()
+            .find(|endpoint| endpoint.endpoint.role == edge.consumer_role)
+            .unwrap();
+        assert_eq!(consumer.value_import_route(edge.import_id), Some(edge));
+    }
+    for edge in &graph.wire_schema.call_edges {
+        let caller = endpoint_plans
+            .iter()
+            .find(|endpoint| endpoint.endpoint.role == edge.caller_role)
+            .unwrap();
+        let callee = endpoint_plans
+            .iter()
+            .find(|endpoint| endpoint.endpoint.role == edge.callee_role)
+            .unwrap();
+        assert_eq!(caller.outbound_call_route(edge.call_site_id), Some(edge));
+        assert_eq!(callee.inbound_call_route(edge.call_site_id), Some(edge));
+        assert!(
+            callee
+                .endpoint
+                .pure_function_exports
+                .iter()
+                .any(|function| {
+                    function.export_id == edge.function_export_id
+                        && function.parameters == edge.parameters
+                        && function.result_type == edge.result_type
+                })
+        );
+    }
+}
+
+#[test]
+fn distributed_wire_hash_excludes_bodies_value_refs_and_source_ids() {
+    let (application, graph) = distributed_graph_fixture();
+    let mut changed_endpoints = graph.endpoints.clone();
+    let server = changed_endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.role == ProgramRole::Server)
+        .unwrap();
+    server.value_exports[0].value = ValueRef::State(StateId(41));
+    let session = changed_endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    session.value_exports[0].value = ValueRef::State(StateId(73));
+    let function = &mut session.pure_function_exports[0];
+    let argument = || PlanRowExpression::Field {
+        input: ValueRef::DistributedFunctionArgument {
+            export_id: function.export_id,
+            argument_id: function.parameters[0].argument_id,
+        },
+    };
+    function.body = PlanRowExpression::NumberInfix {
+        op: "*".to_owned(),
+        left: Box::new(argument()),
+        right: Box::new(argument()),
+    };
+    let changed =
+        DistributedGraphPlan::new(&application, graph.graph.clone(), changed_endpoints).unwrap();
+    assert_eq!(graph.wire_schema, changed.wire_schema);
+    assert_eq!(
+        distributed_graph_schema_hash(&graph).unwrap(),
+        distributed_graph_schema_hash(&changed).unwrap()
+    );
+
+    let first_event = distributed_graph_with_event(
+        &application,
+        &graph,
+        SourceId(3),
+        SourceId(5),
+        DataTypePlan::Text,
+    );
+    let renumbered_event = distributed_graph_with_event(
+        &application,
+        &graph,
+        SourceId(103),
+        SourceId(205),
+        DataTypePlan::Text,
+    );
+    assert_ne!(
+        first_event.endpoints[1].event_exports[0].source_id,
+        renumbered_event.endpoints[1].event_exports[0].source_id
+    );
+    assert_ne!(
+        first_event.endpoints[0].event_imports[0].local_source_id,
+        renumbered_event.endpoints[0].event_imports[0].local_source_id
+    );
+    assert_eq!(first_event.wire_schema, renumbered_event.wire_schema);
+    assert_eq!(
+        distributed_graph_schema_hash(&first_event).unwrap(),
+        distributed_graph_schema_hash(&renumbered_event).unwrap()
+    );
+}
+
+#[test]
+fn distributed_wire_hash_changes_with_edge_and_boundary_type() {
+    let (application, graph) = distributed_graph_fixture();
+    let with_event = distributed_graph_with_event(
+        &application,
+        &graph,
+        SourceId(3),
+        SourceId(5),
+        DataTypePlan::Text,
+    );
+    let changed_type = distributed_graph_with_event(
+        &application,
+        &graph,
+        SourceId(3),
+        SourceId(5),
+        DataTypePlan::Bytes { fixed_len: None },
+    );
+
+    assert_ne!(graph.wire_schema, with_event.wire_schema);
+    assert_ne!(
+        distributed_graph_schema_hash(&graph).unwrap(),
+        distributed_graph_schema_hash(&with_event).unwrap()
+    );
+    assert_ne!(with_event.wire_schema, changed_type.wire_schema);
+    assert_ne!(
+        distributed_graph_schema_hash(&with_event).unwrap(),
+        distributed_graph_schema_hash(&changed_type).unwrap()
+    );
 }
 
 #[test]
@@ -315,6 +534,26 @@ fn distributed_endpoint_verifier_rejects_a_machine_role_mismatch() {
         .unwrap();
     assert!(!distributed_check.pass);
     assert!(distributed_check.detail.contains("does not match"));
+    assert_eq!(verification.status, "fail");
+}
+
+#[test]
+fn distributed_endpoint_verifier_rejects_an_unlinked_wire_hash() {
+    let (_, graph) = distributed_graph_fixture();
+    let mut endpoint = graph.endpoint_plan(ProgramRole::Client).unwrap();
+    endpoint.wire_schema_hash[0] ^= 0xff;
+    let mut plan = empty_plan();
+    plan.program_role = ProgramRole::Client;
+    plan.distributed_endpoint = Some(endpoint);
+
+    let verification = verify_plan(&plan).unwrap();
+    let distributed_check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "distributed-endpoint-canonical-and-resolved")
+        .unwrap();
+    assert!(!distributed_check.pass);
+    assert!(distributed_check.detail.contains("wire schema hash"));
     assert_eq!(verification.status, "fail");
 }
 
@@ -504,15 +743,16 @@ fn effect_ids_and_builtin_contracts_are_stable_and_safe_by_construction() {
     let write = builtin_effect_contract("File/write_bytes")
         .unwrap()
         .unwrap();
+    assert_eq!(write.replay, EffectReplay::ProcessScoped);
+    assert_eq!(write.barrier, EffectBarrier::None);
     assert_eq!(
-        write.replay,
-        EffectReplay::Idempotent {
-            key_type: DataTypePlan::Bytes {
-                fixed_len: Some(32),
-            },
-        }
+        write.schema.as_ref().unwrap().intent_constraints,
+        vec![EffectIntentConstraintPlan::BytesLengthRange {
+            field_path: vec!["bytes".to_owned()],
+            min_inclusive: 0,
+            max_inclusive: boon_effect_schema::FILE_BYTES_MAX_LIMIT,
+        }]
     );
-    assert_eq!(write.barrier, EffectBarrier::BeforeAndAfter);
     assert!(write.validate().is_ok());
 }
 
@@ -529,6 +769,7 @@ fn file_read_stream_contract_preserves_delivery_and_intent_bounds() {
         EffectDeliveryCardinality::Stream {
             initial_credits: boon_effect_schema::FILE_STREAM_INITIAL_CREDITS,
             max_in_flight: boon_effect_schema::FILE_STREAM_MAX_IN_FLIGHT,
+            credit_result_tags: vec!["Chunk".to_owned()],
             terminal_result_tags: vec![
                 "Cancelled".to_owned(),
                 "Failed".to_owned(),
@@ -543,6 +784,18 @@ fn file_read_stream_contract_preserves_delivery_and_intent_bounds() {
             field_path: vec!["chunk_bytes".to_owned()],
             min_inclusive: boon_effect_schema::FILE_STREAM_MIN_CHUNK_BYTES,
             max_inclusive: boon_effect_schema::FILE_STREAM_MAX_CHUNK_BYTES,
+        }]
+    );
+    assert_eq!(
+        schema.intent_defaults,
+        vec![EffectIntentDefaultPlan {
+            field_name: "chunk_bytes".to_owned(),
+            value: EffectIntentDefaultValuePlan::Number {
+                value: FiniteReal::from_i64_exact(
+                    boon_effect_schema::FILE_STREAM_DEFAULT_CHUNK_BYTES,
+                )
+                .unwrap(),
+            },
         }]
     );
     let DataTypePlan::Variant { variants } = &schema.result_type else {
@@ -593,6 +846,7 @@ fn effect_verifier_rejects_unsafe_stream_contracts() {
     invalid_limit.delivery = EffectDeliveryCardinality::Stream {
         initial_credits: 0,
         max_in_flight: 1,
+        credit_result_tags: vec!["Chunk".to_owned()],
         terminal_result_tags: vec![
             "Cancelled".to_owned(),
             "Failed".to_owned(),
@@ -605,9 +859,23 @@ fn effect_verifier_rejects_unsafe_stream_contracts() {
     invalid_terminal.delivery = EffectDeliveryCardinality::Stream {
         initial_credits: 1,
         max_in_flight: 1,
+        credit_result_tags: vec!["Chunk".to_owned()],
         terminal_result_tags: vec!["Missing".to_owned()],
     };
     assert!(invalid_terminal.validate().is_err());
+
+    let mut invalid_credit = valid.clone();
+    invalid_credit.delivery = EffectDeliveryCardinality::Stream {
+        initial_credits: 1,
+        max_in_flight: 1,
+        credit_result_tags: vec!["Missing".to_owned()],
+        terminal_result_tags: vec![
+            "Cancelled".to_owned(),
+            "Failed".to_owned(),
+            "Finished".to_owned(),
+        ],
+    };
+    assert!(invalid_credit.validate().is_err());
 
     let mut invalid_replay = valid.clone();
     invalid_replay.replay = EffectReplay::NonReplayable;
@@ -838,11 +1106,11 @@ fn verifier_rejects_unresolved_outputs_and_unsafe_effects() {
         )
         .unwrap(),
     );
-    plan.effects.push(
-        builtin_effect_contract("File/write_bytes")
-            .unwrap()
-            .unwrap(),
-    );
+    let mut unsafe_effect = builtin_effect_contract("File/write_bytes")
+        .unwrap()
+        .unwrap();
+    unsafe_effect.barrier = EffectBarrier::BeforeAndAfter;
+    plan.effects.push(unsafe_effect);
 
     let verification = verify_plan(&plan).unwrap();
     assert!(

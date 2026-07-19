@@ -498,13 +498,15 @@ fn single_execution_path(workspace: &Path) -> Result<String, String> {
         }
     }
     let executor_source = read_text(&workspace.join("crates/boon_plan_executor/src/lib.rs"))?;
-    let executor_session = read_text(&workspace.join("crates/boon_plan_executor/src/session.rs"))?;
+    let executor_machine = read_text(&workspace.join("crates/boon_plan_executor/src/machine.rs"))?;
     let runtime_source = read_text(&workspace.join("crates/boon_runtime/src/lib.rs"))?;
-    let session_owned_by_executor =
-        executor_source.contains("Session") && executor_session.contains("pub struct Session");
-    let runtime_uses_session = runtime_source.contains("boon_plan_executor::Session")
+    let machine_owned_by_executor = executor_source.contains("MachineInstance")
+        && executor_source.contains("MachineTemplate")
+        && executor_machine.contains("pub struct MachineInstance")
+        && executor_machine.contains("pub struct MachineTemplate");
+    let runtime_uses_machine = runtime_source.contains("boon_plan_executor::MachineInstance")
         || (runtime_source.contains("use boon_plan_executor")
-            && runtime_source.contains("Session"));
+            && runtime_source.contains("MachineInstance"));
 
     let mut direct_executor_dependents = Vec::new();
     for entry in fs::read_dir(workspace.join("crates")).map_err(|error| error.to_string())? {
@@ -535,14 +537,14 @@ fn single_execution_path(workspace: &Path) -> Result<String, String> {
 
     let valid = machine_plan_definitions == vec!["crates/boon_plan/src/lib.rs".to_owned()]
         && duplicate_runtime_types.is_empty()
-        && session_owned_by_executor
-        && runtime_uses_session
+        && machine_owned_by_executor
+        && runtime_uses_machine
         && direct_executor_dependents == vec!["boon_runtime".to_owned()];
     if valid {
-        Ok("one MachinePlan definition and one boon_plan_executor::Session path".to_owned())
+        Ok("one MachinePlan definition and one boon_plan_executor MachineTemplate/MachineInstance path".to_owned())
     } else {
         Err(format!(
-            "MachinePlan defs={}; duplicate runtime executors={}; executor Session={session_owned_by_executor}; runtime uses Session={runtime_uses_session}; direct dependents={}",
+            "MachinePlan defs={}; duplicate runtime executors={}; executor machine={machine_owned_by_executor}; runtime uses machine={runtime_uses_machine}; direct dependents={}",
             bounded_list(&machine_plan_definitions),
             bounded_list(&duplicate_runtime_types),
             bounded_list(&direct_executor_dependents)

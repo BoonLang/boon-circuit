@@ -13,7 +13,6 @@ store: [
                     body: request.body
                     connect_timeout_ms: request.connect_timeout_ms
                     overall_timeout_ms: request.overall_timeout_ms
-                    cancellation: request.cancellation
                 )
             }
         }

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -316,7 +317,7 @@ pub enum Value {
     Bool(bool),
     Number(FiniteReal),
     Text(String),
-    Bytes(Vec<u8>),
+    Bytes(Bytes),
     List(Vec<Value>),
     Record(BTreeMap<String, Value>),
     Variant {
@@ -358,6 +359,19 @@ mod tests {
         assert!(FiniteReal::from_i64_exact(9_007_199_254_740_993).is_err());
         assert!(FiniteReal::new(f64::NAN).is_err());
         assert!(FiniteReal::new(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn byte_values_clone_shared_immutable_storage() {
+        let bytes = Bytes::from_static(b"shared-byte-value");
+        let value = Value::Bytes(bytes.clone());
+        let cloned = value.clone();
+        let Value::Bytes(cloned_bytes) = cloned else {
+            panic!("cloned byte value changed kind");
+        };
+
+        assert_eq!(cloned_bytes, bytes);
+        assert_eq!(cloned_bytes.as_ptr(), bytes.as_ptr());
     }
 
     #[test]
@@ -429,7 +443,7 @@ mod tests {
     #[test]
     fn structural_value_contains_only_recursive_language_data() {
         let value = Value::Record(BTreeMap::from([
-            ("bytes".to_owned(), Value::Bytes(vec![1, 2, 3])),
+            ("bytes".to_owned(), Value::Bytes(vec![1, 2, 3].into())),
             (
                 "list".to_owned(),
                 Value::List(vec![

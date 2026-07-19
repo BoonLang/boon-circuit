@@ -20,9 +20,31 @@ use std::error::Error;
 use std::fmt;
 use std::str;
 
+mod client_session_frame;
+mod session_control;
+
+pub use client_session_frame::{
+    CLIENT_SESSION_PROTOCOL_VERSION, ClientSessionFrame, ClientSessionFrameError,
+    ClientSessionFrameField, ClientSessionFrameLimits, decode_client_session_frame,
+    encode_client_session_frame,
+};
+pub use session_control::{
+    ClientCommit, ClientHello, ClientRevoke, RESUME_LOOKUP_KEY_BYTES, RESUME_TOKEN_BYTES,
+    ResumeLookupKey, ResumeLookupKeyError, ResumeToken, ResumeTokenGenerationError,
+    SESSION_CONTROL_MAX_FRAME_BYTES, SESSION_CONTROL_PROTOCOL_VERSION, SESSION_ID_BYTES,
+    ServerOffer, ServerReady, ServerReject, ServerRevoked, SessionControlField,
+    SessionControlFrame, SessionControlFrameError, SessionId, SessionIdGenerationError,
+    decode_session_control_frame, encode_session_control_frame,
+};
+
 const MAGIC: [u8; 3] = *b"BWV";
 pub const FORMAT_VERSION: u8 = 1;
 pub const HEADER: [u8; 4] = [MAGIC[0], MAGIC[1], MAGIC[2], FORMAT_VERSION];
+
+/// The protocol-owned same-origin WebSocket path for Client/Session traffic.
+/// Both browser and server adapters consume this constant so the route cannot
+/// silently drift between the two transport endpoints.
+pub const DISTRIBUTED_SESSION_TRANSPORT_PATH: &str = "/_boon/distributed-session";
 
 const TAG_NULL: u8 = 0;
 const TAG_FALSE: u8 = 1;
@@ -339,7 +361,7 @@ impl Decoder<'_> {
             TAG_TRUE => Ok(Value::Bool(true)),
             TAG_NUMBER => self.number().map(Value::Number),
             TAG_TEXT => self.text().map(Value::Text),
-            TAG_BYTES => self.byte_string().map(Value::Bytes),
+            TAG_BYTES => self.byte_string().map(|bytes| Value::Bytes(bytes.into())),
             TAG_LIST => {
                 let count = self.collection_len(1)?;
                 let mut values = Vec::with_capacity(count);
@@ -480,7 +502,7 @@ mod tests {
 
     fn all_shapes() -> Value {
         Value::Record(BTreeMap::from([
-            ("bytes".into(), Value::Bytes(vec![0, 127, 128, 255])),
+            ("bytes".into(), Value::Bytes(vec![0, 127, 128, 255].into())),
             (
                 "error".into(),
                 Value::Error {
@@ -597,7 +619,7 @@ mod tests {
     fn enforces_every_decode_limit() {
         let value = Value::List(vec![
             Value::Text("abcd".into()),
-            Value::Bytes(vec![1, 2, 3, 4]),
+            Value::Bytes(vec![1, 2, 3, 4].into()),
             Value::List(vec![Value::Null]),
         ]);
         let encoded = encode(&value).unwrap();

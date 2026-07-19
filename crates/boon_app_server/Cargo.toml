@@ -12,11 +12,17 @@ path = "src/main.rs"
 [dependencies]
 async-trait.workspace = true
 boon_app_package.workspace = true
+boon_effect_schema.workspace = true
+boon_host_runtime.workspace = true
+boon_host_services.workspace = true
+boon_http_client.workspace = true
+boon_http_runtime.workspace = true
 boon_persistence.workspace = true
 boon_plan.workspace = true
 boon_server_host.workspace = true
 boon_server_runtime.workspace = true
 boon_runtime.workspace = true
+boon_wellen_host.workspace = true
 fs2.workspace = true
 ipnet.workspace = true
 tokio.workspace = true

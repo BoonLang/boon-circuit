@@ -10,23 +10,30 @@ use boon_plan::{
     DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, TargetProfile,
 };
 use boon_runtime::{
-    ApplicationIdentity, ProgramArtifact, ProgramDiagnostic, ProgramHostRequest, ProgramRequestId,
-    ProgramSessionId, compile_program_artifact,
+    ApplicationIdentity, DistributedProgramBundle, ProgramArtifact, ProgramDiagnostic,
+    ProgramHostRequest, ProgramRequestId, ProgramSessionId, compile_program_artifact,
 };
 use futures::channel::mpsc;
 
-use crate::protocol::{MigrationBundle, PreviewIntent, SourceUnit, TestStep};
+use crate::distributed_program::compile_distributed_program;
+#[cfg(test)]
+use crate::protocol::ProgramSource;
+use crate::protocol::{MigrationBundle, PreviewIntent, PreviewSource, SourceUnit, TestStep};
 
 #[derive(Clone)]
 pub struct CompileRequest {
     pub intent: PreviewIntent,
     pub request_id: Option<u64>,
-    pub application: ApplicationIdentity,
     pub revision: u64,
-    pub units: Vec<SourceUnit>,
+    pub source: PreviewSource,
     pub test_steps: Vec<TestStep>,
     pub migration: Option<MigrationBundle>,
     pub migration_stage: Option<String>,
+}
+
+pub enum CompiledExecutable {
+    BuiltInSingleRole(Arc<MachinePlan>),
+    DistributedPackage(DistributedProgramBundle),
 }
 
 pub struct CompiledPreview {
@@ -35,7 +42,7 @@ pub struct CompiledPreview {
     pub revision: u64,
     pub elapsed: Duration,
     pub source_key: String,
-    pub plan: Arc<MachinePlan>,
+    pub executable: CompiledExecutable,
     pub test_steps: Vec<TestStep>,
 }
 
@@ -300,46 +307,60 @@ fn compile_loop(
 }
 
 fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
-    if request.units.is_empty() {
-        return Err("preview source bundle is empty".to_owned());
-    }
     let started = Instant::now();
-    let source_key = project_key_for_stage(
-        &request.application,
-        &request.units,
-        request.migration_stage.as_deref(),
-    );
-    let label = request
-        .units
-        .last()
-        .map(|unit| unit.path.clone())
-        .unwrap_or_else(|| "preview.bn".to_owned());
-    let plan = match (&request.migration, request.migration_stage.as_deref()) {
-        (Some(migration), Some(stage_id)) => compile_migration_stage_with_units(
-            &request.application,
-            migration,
-            stage_id,
-            Some(&request.units),
-        )?,
-        (None, None) => {
-            let units = compiler_units(&request.units);
-            Arc::new(
-                compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
-                    &label,
-                    &units,
-                    TargetProfile::SoftwareDefault,
-                    request.application,
-                    DEFAULT_PERSISTENCE_SCHEMA_VERSION,
-                    &[] as &[MigrationPredecessorBinding],
-                )
-                .map_err(|error| error.to_string())?
-                .plan,
-            )
+    let source_key = preview_project_key(&request.source, request.migration_stage.as_deref());
+    let executable = match &request.source {
+        PreviewSource::BuiltInSingleRole { application, units } => {
+            if units.is_empty() {
+                return Err("preview source bundle is empty".to_owned());
+            }
+            let label = units
+                .last()
+                .map(|unit| unit.path.clone())
+                .unwrap_or_else(|| "preview.bn".to_owned());
+            let plan = match (&request.migration, request.migration_stage.as_deref()) {
+                (Some(migration), Some(stage_id)) => compile_migration_stage_with_units(
+                    application,
+                    migration,
+                    stage_id,
+                    Some(units),
+                )?,
+                (None, None) => {
+                    let units = compiler_units(units);
+                    Arc::new(
+                        compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
+                            &label,
+                            &units,
+                            TargetProfile::SoftwareDefault,
+                            application.clone(),
+                            DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+                            &[] as &[MigrationPredecessorBinding],
+                        )
+                        .map_err(|error| error.to_string())?
+                        .plan,
+                    )
+                }
+                _ => {
+                    return Err(
+                        "migration source compile requires both a bundle and an active stage"
+                            .to_owned(),
+                    );
+                }
+            };
+            CompiledExecutable::BuiltInSingleRole(plan)
         }
-        _ => {
-            return Err(
-                "migration source compile requires both a bundle and an active stage".to_owned(),
-            );
+        PreviewSource::DistributedPackage { programs } => {
+            if programs.is_empty() {
+                return Err("distributed package source is empty".to_owned());
+            }
+            if request.migration.is_some() || request.migration_stage.is_some() {
+                return Err(
+                    "distributed packages cannot use single-role migration bundles".to_owned(),
+                );
+            }
+            CompiledExecutable::DistributedPackage(
+                compile_distributed_program(programs.clone()).map_err(|error| error.to_string())?,
+            )
         }
     };
     Ok(CompiledPreview {
@@ -348,7 +369,7 @@ fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
         revision: request.revision,
         elapsed: started.elapsed(),
         source_key,
-        plan,
+        executable,
         test_steps: request.test_steps,
     })
 }
@@ -442,6 +463,54 @@ pub fn project_key_for_stage(
     ])
 }
 
+pub fn preview_project_key(source: &PreviewSource, migration_stage: Option<&str>) -> String {
+    let programs = match source {
+        PreviewSource::BuiltInSingleRole { application, units } => {
+            return project_key_for_stage(application, units, migration_stage);
+        }
+        PreviewSource::DistributedPackage { programs } => programs,
+    };
+    let mut programs = programs.iter().collect::<Vec<_>>();
+    programs.sort_by_key(|program| match program.role {
+        boon_plan::ProgramRole::Client => 0,
+        boon_plan::ProgramRole::Session => 1,
+        boon_plan::ProgramRole::Server => 2,
+    });
+    let mut owned = Vec::<(String, String)>::new();
+    for (program_index, program) in programs.into_iter().enumerate() {
+        let prefix = format!("program.{program_index}");
+        owned.push((format!("{prefix}.role"), program.role.as_str().to_owned()));
+        owned.push((format!("{prefix}.entry"), program.entry_path.clone()));
+        owned.push((
+            format!("{prefix}.package_id"),
+            program.application.package_id.clone(),
+        ));
+        owned.push((
+            format!("{prefix}.state_namespace"),
+            program.application.state_namespace.clone(),
+        ));
+        owned.push((
+            format!("{prefix}.deployment_domain"),
+            program.application.deployment_domain.clone(),
+        ));
+        for (unit_index, unit) in program.units.iter().enumerate() {
+            owned.push((
+                format!("{prefix}.unit.{unit_index}.path"),
+                unit.path.clone(),
+            ));
+            owned.push((
+                format!("{prefix}.unit.{unit_index}.source"),
+                unit.source.clone(),
+            ));
+        }
+    }
+    let parts = owned
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    boon_runtime::source_unit_parts_hash(&parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,9 +526,11 @@ mod tests {
             worker.replace(CompileRequest {
                 intent: PreviewIntent::Replace,
                 request_id: None,
-                application: application(&format!("mailbox-{revision}")),
                 revision,
-                units: Vec::new(),
+                source: PreviewSource::BuiltInSingleRole {
+                    application: application(&format!("mailbox-{revision}")),
+                    units: Vec::new(),
+                },
                 test_steps: Vec::new(),
                 migration: None,
                 migration_stage: None,
@@ -517,25 +588,149 @@ mod tests {
     }
 
     #[test]
+    fn distributed_project_key_covers_non_client_role_source() {
+        let client_units = vec![SourceUnit {
+            path: "Client/RUN.bn".to_owned(),
+            source: "value: 1\n".to_owned(),
+        }];
+        let mut programs = vec![
+            ProgramSource {
+                role: boon_plan::ProgramRole::Client,
+                entry_path: "Client/RUN.bn".to_owned(),
+                units: client_units.clone(),
+                application: application("client"),
+            },
+            ProgramSource {
+                role: boon_plan::ProgramRole::Session,
+                entry_path: "Session/RUN.bn".to_owned(),
+                units: vec![SourceUnit {
+                    path: "Session/RUN.bn".to_owned(),
+                    source: "value: 2\n".to_owned(),
+                }],
+                application: application("session"),
+            },
+            ProgramSource {
+                role: boon_plan::ProgramRole::Server,
+                entry_path: "Server/RUN.bn".to_owned(),
+                units: vec![SourceUnit {
+                    path: "Server/RUN.bn".to_owned(),
+                    source: "value: 3\n".to_owned(),
+                }],
+                application: application("server"),
+            },
+        ];
+        let before = preview_project_key(
+            &PreviewSource::DistributedPackage {
+                programs: programs.clone(),
+            },
+            None,
+        );
+        programs[2].units[0].source = "value: 4\n".to_owned();
+        let after = preview_project_key(&PreviewSource::DistributedPackage { programs }, None);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn distributed_preview_compiles_one_three_role_executable() {
+        const SHARED_PATH: &str = "distributed_fixture/Shared/DistributedContract.bn";
+        const CLIENT_PATH: &str = "distributed_fixture/Client/RUN.bn";
+        const SESSION_PATH: &str = "distributed_fixture/Session/RUN.bn";
+        const SERVER_PATH: &str = "distributed_fixture/Server/RUN.bn";
+        let shared = SourceUnit {
+            path: SHARED_PATH.to_owned(),
+            source: include_str!("../testdata/distributed_fixture/Shared/DistributedContract.bn")
+                .to_owned(),
+        };
+        let client_units = vec![
+            shared.clone(),
+            SourceUnit {
+                path: CLIENT_PATH.to_owned(),
+                source: include_str!("../testdata/distributed_fixture/Client/RUN.bn").to_owned(),
+            },
+        ];
+        let client_application = application("distributed-client");
+        let programs = vec![
+            ProgramSource {
+                role: boon_plan::ProgramRole::Client,
+                entry_path: CLIENT_PATH.to_owned(),
+                units: client_units.clone(),
+                application: client_application.clone(),
+            },
+            ProgramSource {
+                role: boon_plan::ProgramRole::Session,
+                entry_path: SESSION_PATH.to_owned(),
+                units: vec![
+                    shared.clone(),
+                    SourceUnit {
+                        path: SESSION_PATH.to_owned(),
+                        source: include_str!("../testdata/distributed_fixture/Session/RUN.bn")
+                            .to_owned(),
+                    },
+                ],
+                application: application("distributed-session"),
+            },
+            ProgramSource {
+                role: boon_plan::ProgramRole::Server,
+                entry_path: SERVER_PATH.to_owned(),
+                units: vec![
+                    shared,
+                    SourceUnit {
+                        path: SERVER_PATH.to_owned(),
+                        source: include_str!("../testdata/distributed_fixture/Server/RUN.bn")
+                            .to_owned(),
+                    },
+                ],
+                application: application("distributed-server"),
+            },
+        ];
+        let compiled = compile(CompileRequest {
+            intent: PreviewIntent::Replace,
+            request_id: None,
+            revision: 7,
+            source: PreviewSource::DistributedPackage { programs },
+            test_steps: Vec::new(),
+            migration: None,
+            migration_stage: None,
+        })
+        .expect("compile distributed preview");
+        let CompiledExecutable::DistributedPackage(bundle) = compiled.executable else {
+            panic!("distributed source collapsed to a single-role executable");
+        };
+        assert_eq!(bundle.artifacts().len(), 3);
+        for role in [
+            boon_plan::ProgramRole::Client,
+            boon_plan::ProgramRole::Session,
+            boon_plan::ProgramRole::Server,
+        ] {
+            assert!(bundle.artifact(role).is_some(), "missing {role:?} artifact");
+        }
+    }
+
+    #[test]
     fn compile_installs_the_host_application_identity_in_the_machine_plan() {
         let application = application("compile-propagation");
         let compiled = compile(CompileRequest {
             intent: PreviewIntent::Replace,
             request_id: None,
-            application: application.clone(),
             revision: 1,
-            units: vec![SourceUnit {
-                path: "examples/minimal.bn".to_owned(),
-                source: include_str!("../../../examples/minimal.bn").to_owned(),
-            }],
+            source: PreviewSource::BuiltInSingleRole {
+                application: application.clone(),
+                units: vec![SourceUnit {
+                    path: "examples/minimal.bn".to_owned(),
+                    source: include_str!("../../../examples/minimal.bn").to_owned(),
+                }],
+            },
             test_steps: Vec::new(),
             migration: None,
             migration_stage: None,
         })
         .expect("compile preview with host identity");
-        assert_eq!(compiled.plan.application.identity, application);
+        let CompiledExecutable::BuiltInSingleRole(plan) = compiled.executable else {
+            panic!("single-role source compiled as a distributed package");
+        };
+        assert_eq!(plan.application.identity, application);
         assert_eq!(
-            compiled.plan.persistence.schema_version,
+            plan.persistence.schema_version,
             DEFAULT_PERSISTENCE_SCHEMA_VERSION
         );
     }

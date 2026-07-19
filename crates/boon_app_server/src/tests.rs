@@ -1,7 +1,7 @@
 use super::*;
 use boon_app_package::{
-    ArtifactDescriptor, BrowserManifest, EnvironmentVariableManifest, HttpManifest,
-    NamespaceProfile,
+    ArtifactDescriptor, BrowserManifest, CapabilityProfileDescriptor, EnvironmentVariableManifest,
+    HttpManifest, NamespaceProfile,
 };
 use boon_plan::{ProgramRole, TargetProfile};
 use boon_runtime::ProgramCapabilityProfile;
@@ -43,6 +43,11 @@ fn manifest(environment: Vec<EnvironmentVariableManifest>) -> BundleManifest {
         run_mode: RunMode::Deterministic,
         namespace_profile: NamespaceProfile::Deterministic,
         protocol_version: 1,
+        capability_profiles: vec![CapabilityProfileDescriptor {
+            id: "server-v1".to_owned(),
+            role: ProgramRole::Server,
+            grants: vec!["server.http".to_owned()],
+        }],
         artifacts: vec![server_descriptor("server-test-v1")],
         files: Vec::new(),
         browser: BrowserManifest {
@@ -208,6 +213,60 @@ impl ServerProgram for MockProgram {
     }
 
     async fn on_http_cancelled(&mut self, _reason: CancellationReason) {}
+}
+
+struct InternalWorkProgram {
+    pending: Arc<AtomicBool>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl ServerProgram for InternalWorkProgram {
+    async fn on_http(
+        &mut self,
+        _request: HttpRequest,
+        _cancellation: CallCancellation,
+    ) -> HttpResponse {
+        HttpResponse::new(200, "delegated")
+    }
+
+    async fn on_websocket(
+        &mut self,
+        _event: WebSocketEvent,
+        _cancellation: CallCancellation,
+    ) -> Vec<WebSocketAction> {
+        Vec::new()
+    }
+
+    fn has_pending_internal_work(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    async fn on_internal_work(&mut self) -> Vec<boon_server_host::DistributedSessionAction> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.pending.store(false, Ordering::Release);
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn production_wrapper_preserves_the_internal_work_wake_lane() {
+    let pending = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut program = ProductionProgram::new(
+        InternalWorkProgram {
+            pending: Arc::clone(&pending),
+            calls: Arc::clone(&calls),
+        },
+        static_assets(),
+        LifecycleState::new(),
+        &manifest(Vec::new()),
+    );
+
+    assert!(program.has_pending_internal_work());
+    assert!(program.on_internal_work().await.is_empty());
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert!(!program.has_pending_internal_work());
 }
 
 fn static_assets() -> StaticAssets {

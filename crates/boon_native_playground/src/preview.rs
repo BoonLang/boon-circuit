@@ -22,8 +22,8 @@ use boon_runtime::{
 };
 
 use crate::compile::{
-    CompileRequest, CompileWorker, ProgramCompileReceipt, ProgramCompileWorker,
-    compile_migration_stage, project_key_for_stage,
+    CompileRequest, CompileWorker, CompiledExecutable, ProgramCompileReceipt, ProgramCompileWorker,
+    compile_migration_stage, preview_project_key, project_key_for_stage,
 };
 use crate::frame::{
     NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, host_event_digest,
@@ -44,8 +44,8 @@ use crate::protocol::{
     ApplicationIdentity, AssetBlob, CanonicalStateArtifact, Connection, FrameMode,
     MAX_PERSISTENCE_ARTIFACT_BYTES, Message, MigrationBundle, MigrationCommand, MigrationOperation,
     MigrationStatus, PersistenceCommand, PersistenceOperation, PersistenceOperationStatus,
-    PreviewIntent, PreviewStats, ProofMode, Role, StateArtifactFormat, StateArtifactPreviewSummary,
-    TestStep,
+    PreviewIntent, PreviewSource, PreviewStats, ProofMode, Role, StateArtifactFormat,
+    StateArtifactPreviewSummary, TestStep,
 };
 use crate::runtime_view::{
     ProgramCompletionObservation, RuntimeAsyncLaneKind, RuntimeAsyncLaneObservation,
@@ -1136,9 +1136,8 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                     Message::PreviewApply {
                         intent,
                         request_id,
-                        application,
                         revision,
-                        units,
+                        source,
                         test_steps,
                         migration: incoming_migration,
                         migration_stage,
@@ -1152,6 +1151,18 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 ok: false,
                                 message: "migration bundle and active stage must travel together"
                                     .to_owned(),
+                            })?;
+                            continue;
+                        }
+                        if incoming_migration.is_some()
+                            && !matches!(&source, PreviewSource::BuiltInSingleRole { .. })
+                        {
+                            output.send(Message::PreviewStatus {
+                                revision,
+                                ok: false,
+                                message:
+                                    "distributed packages cannot use single-role migration bundles"
+                                        .to_owned(),
                             })?;
                             continue;
                         }
@@ -1171,12 +1182,19 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             && bundle.test_driver == crate::protocol::MigrationTestDriver::Migration
                         {
                             let request_id = request_id.unwrap_or(0);
-                            let result = if revision == source_revision {
-                                run_migration_test(bundle, &application, request_id, revision)
-                            } else {
-                                Err(format!(
+                            let result = match &source {
+                                PreviewSource::BuiltInSingleRole { application, .. }
+                                    if revision == source_revision =>
+                                {
+                                    run_migration_test(bundle, application, request_id, revision)
+                                }
+                                PreviewSource::BuiltInSingleRole { .. } => Err(format!(
                                     "migration TEST revision {revision} is stale; preview is at {source_revision}"
-                                ))
+                                )),
+                                PreviewSource::DistributedPackage { .. } => {
+                                    Err("distributed package migration TEST is unavailable"
+                                        .to_owned())
+                                }
                             };
                             let (passed, semantic_assertions_proven, completed, message) =
                                 match result {
@@ -1210,8 +1228,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         migration = incoming_migration.clone();
                         active_migration_stage.clone_from(&migration_stage);
                         previewed_migration_stage = None;
-                        let key =
-                            project_key_for_stage(&application, &units, migration_stage.as_deref());
+                        let key = preview_project_key(&source, migration_stage.as_deref());
                         if intent == PreviewIntent::Replace {
                             switch_started = Some((revision, accepted_at));
                             emit(
@@ -1268,9 +1285,8 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         compiler.replace(CompileRequest {
                             intent,
                             request_id,
-                            application,
                             revision,
-                            units,
+                            source,
                             test_steps,
                             migration: incoming_migration,
                             migration_stage,
@@ -1462,13 +1478,14 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         let isolated_test = test && state_evidence.native_workflow_steps.is_empty();
                         let deterministic_runtime =
                             test || !state_evidence.scenario_steps.is_empty();
-                        match activate_compatible(
+                        let activation = activate_executable(
                             &mut runtime,
-                            compiled_preview.plan,
+                            compiled_preview.executable,
                             deterministic_runtime,
                             isolated_test,
                             &package_assets,
-                        ) {
+                        );
+                        match activation {
                             Ok(activation) => {
                                 let capture_mount = state_evidence.mount && !state_mount_captured;
                                 let mut startup_async_lanes = Vec::new();
@@ -3479,7 +3496,33 @@ enum RuntimeActivation {
     Updated,
 }
 
-fn activate_compatible(
+fn activate_executable(
+    runtime: &mut Option<RuntimeView>,
+    executable: CompiledExecutable,
+    deterministic_scenario: bool,
+    isolated_scenario: bool,
+    assets: &[AssetBlob],
+) -> Result<RuntimeActivation, String> {
+    match executable {
+        CompiledExecutable::BuiltInSingleRole(plan) => activate_compatible_single_role(
+            runtime,
+            plan,
+            deterministic_scenario,
+            isolated_scenario,
+            assets,
+        ),
+        CompiledExecutable::DistributedPackage(bundle) => {
+            RuntimeView::open_distributed_with_assets(
+                bundle,
+                deterministic_scenario || isolated_scenario,
+                assets,
+            )
+            .map(|runtime| RuntimeActivation::Opened(Box::new(runtime)))
+        }
+    }
+}
+
+fn activate_compatible_single_role(
     runtime: &mut Option<RuntimeView>,
     plan: Arc<boon_plan::MachinePlan>,
     deterministic_scenario: bool,
@@ -3757,8 +3800,8 @@ fn capture_state_mounted(
         observer,
         ObserverEvent::StateMounted {
             disposition,
-            schema_version: startup.restore_image.schema_version,
-            schema_hash: digest_hex(&startup.restore_image.schema_hash),
+            schema_version: startup.schema_version,
+            schema_hash: digest_hex(&startup.schema_hash),
             migration,
             source_revision,
             runtime_sequence: runtime.runtime_turn_sequence(),

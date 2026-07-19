@@ -3,10 +3,10 @@ use super::effects::{
     HostEffectWorker, HostEffectWorkerOperation, HostEffectWorkerOutcome,
 };
 use super::{
-    DocumentPatch, LiveRuntime, ProgramArtifact, ProgramArtifactOwnership, ProgramCompletion,
-    ProgramDiagnostic, ProgramDocumentHost, ProgramHostCompletion, ProgramHostRequest,
-    ProgramHostUpdate, ProgramRejection, ProgramRequestId, ProgramSessionId, RuntimeTurn,
-    SourcePayload, TransientEffectCallId,
+    DistributedImportUpdate, DocumentPatch, LiveRuntime, ProgramArtifact, ProgramArtifactOwnership,
+    ProgramCompletion, ProgramDiagnostic, ProgramDocumentHost, ProgramHostCompletion,
+    ProgramHostRequest, ProgramHostUpdate, ProgramRejection, ProgramRequestId, ProgramSessionId,
+    RuntimeTurn, SessionContext, SourcePayload, TransientEffectCallId,
 };
 use boon_persistence::{
     ActivationAck, ActivationBatch, AuthorityTurn, AuthorityTurnReservation, BarrierAck, CommitAck,
@@ -21,7 +21,7 @@ use boon_persistence::{
     TurnEnqueueError, TurnReservationError, apply_durable_outbox_changes,
     decode_application_transfer, encode_application_transfer, stage_migration,
 };
-use boon_plan::{MachinePlan, MemoryKind};
+use boon_plan::{DistributedArgumentId, ExportId, MachinePlan, MemoryKind, RemoteCallSiteId};
 use boon_plan_executor::{SessionOptions, SourceEvent, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -221,6 +221,12 @@ pub struct PersistentRuntime {
     last_rebuild_derived_us: u64,
     generation: u64,
     program_artifacts: ProgramArtifactLanes,
+    prepared_distributed_admission: Option<PreparedDistributedAdmission>,
+}
+
+enum PreparedDistributedAdmission {
+    Buffered(AuthorityTurnReservation),
+    Immediate,
 }
 
 const MAX_PENDING_EFFECT_DURABILITY: usize = 8;
@@ -305,6 +311,7 @@ pub enum PersistentRuntimeStartupDisposition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistentRuntimeStartup {
     pub restore_image: RestoreImage,
+    pub protocol_state: boon_persistence::ProtocolStateSnapshot,
     pub disposition: PersistentRuntimeStartupDisposition,
 }
 
@@ -674,6 +681,7 @@ impl PersistentRuntime {
 
         let startup = PersistentRuntimeStartup {
             restore_image: startup.restore_image,
+            protocol_state: startup.protocol_state,
             disposition,
         };
         let effect_work = EffectWorkIndex::from_items(startup.restore_image.outbox.clone());
@@ -689,6 +697,7 @@ impl PersistentRuntime {
                 last_rebuild_derived_us,
                 generation: 1,
                 program_artifacts: ProgramArtifactLanes::default(),
+                prepared_distributed_admission: None,
             },
             startup,
         ))
@@ -696,6 +705,31 @@ impl PersistentRuntime {
 
     pub fn runtime(&self) -> &LiveRuntime {
         &self.runtime
+    }
+
+    pub(crate) fn validate_distributed_server_evaluation(
+        &self,
+        runtime: &LiveRuntime,
+        expects_prepared_turn: bool,
+    ) -> Result<(), PersistentDispatchError> {
+        if self.prepared_distributed_admission.is_some() != expects_prepared_turn {
+            return Err(PersistentDispatchError::Runtime(
+                "distributed Server persistence admission changed before evaluation commit"
+                    .to_owned(),
+            ));
+        }
+        if runtime.has_unsettled_turn() {
+            return Err(PersistentDispatchError::Runtime(
+                "distributed Server evaluation must be settled before installation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_distributed_server_evaluation(&mut self, runtime: LiveRuntime) {
+        debug_assert!(self.prepared_distributed_admission.is_none());
+        debug_assert!(!runtime.has_unsettled_turn());
+        self.runtime = runtime;
     }
 
     pub fn reset_program_artifacts(&mut self) {
@@ -815,6 +849,57 @@ impl PersistentRuntime {
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
     }
 
+    pub fn replace_distributed_context(
+        &mut self,
+        session_context: SessionContext,
+        imports: Vec<DistributedImportUpdate>,
+    ) -> Result<Option<RuntimeTurn>, PersistentDispatchError> {
+        self.runtime
+            .replace_distributed_execution_context(session_context, imports)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    pub fn distributed_export_value_current(
+        &mut self,
+        export_id: ExportId,
+    ) -> Result<Value, PersistentDispatchError> {
+        self.runtime
+            .distributed_export_value_current(export_id)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    pub fn evaluate_distributed_function(
+        &mut self,
+        export_id: ExportId,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+    ) -> Result<Value, PersistentDispatchError> {
+        self.runtime
+            .evaluate_distributed_function(export_id, arguments)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    pub fn distributed_call_arguments_current(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+    ) -> Result<BTreeMap<DistributedArgumentId, Value>, PersistentDispatchError> {
+        self.runtime
+            .distributed_call_arguments_current(call_site_id)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    pub fn set_transient_effect_scope(&mut self, scope: u64) {
+        self.runtime.set_transient_effect_scope(scope);
+    }
+
+    pub fn cancel_transient_effects(
+        &mut self,
+        call_ids: &[TransientEffectCallId],
+    ) -> Result<Option<RuntimeTurn>, PersistentDispatchError> {
+        self.runtime
+            .cancel_transient_effects(call_ids)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
     pub fn assert_scenario_step(
         &mut self,
         step: &crate::ScenarioStep,
@@ -834,6 +919,131 @@ impl PersistentRuntime {
         self.runtime
             .demand_document_window_by_id(materialization, visible, overscan)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    pub(crate) fn prepare_distributed_dispatch(
+        &mut self,
+        event: SourceEvent,
+        immediate: bool,
+    ) -> Result<RuntimeTurn, PersistentDispatchError> {
+        self.prepare_distributed_turn(immediate, |runtime| runtime.dispatch_unsettled(event))
+    }
+
+    pub(crate) fn prepare_distributed_effect_completion(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+        immediate: bool,
+    ) -> Result<RuntimeTurn, PersistentDispatchError> {
+        self.prepare_distributed_turn(immediate, |runtime| {
+            runtime.complete_transient_effect_unsettled(call_id, outcome)
+        })
+    }
+
+    pub(crate) fn prepare_distributed_effect_result(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+        immediate: bool,
+    ) -> Result<RuntimeTurn, PersistentDispatchError> {
+        self.prepare_distributed_turn(immediate, |runtime| {
+            runtime.deliver_transient_effect_result_unsettled(call_id, result_sequence, outcome)
+        })
+    }
+
+    pub(crate) fn prepare_distributed_effect_cancellation(
+        &mut self,
+        call_ids: &[TransientEffectCallId],
+        immediate: bool,
+    ) -> Result<Option<RuntimeTurn>, PersistentDispatchError> {
+        self.begin_distributed_admission(immediate)?;
+        match self.runtime.cancel_transient_effects_unsettled(call_ids) {
+            Ok(Some(turn)) => Ok(Some(turn)),
+            Ok(None) => {
+                self.prepared_distributed_admission = None;
+                Ok(None)
+            }
+            Err(error) => {
+                self.prepared_distributed_admission = None;
+                Err(PersistentDispatchError::Runtime(error.to_string()))
+            }
+        }
+    }
+
+    pub(crate) fn prepare_distributed_protocol_checkpoint(
+        &mut self,
+    ) -> Result<RuntimeTurn, PersistentDispatchError> {
+        self.prepare_distributed_turn(true, LiveRuntime::protocol_checkpoint_unsettled)
+    }
+
+    pub(crate) fn commit_prepared_distributed_turn(
+        &mut self,
+        turn: RuntimeTurn,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
+    ) -> Result<(RuntimeTurn, Option<CommitAck>), PersistentDispatchError> {
+        let admission = self.prepared_distributed_admission.take().ok_or_else(|| {
+            PersistentDispatchError::Runtime(
+                "distributed persistent turn was not prepared before commit".to_owned(),
+            )
+        })?;
+        match admission {
+            PreparedDistributedAdmission::Buffered(reservation) => self
+                .admit_buffered_turn_with_protocol_state(reservation, turn, protocol_state_changes)
+                .map(|turn| (turn, None)),
+            PreparedDistributedAdmission::Immediate => self
+                .commit_unsettled_immediate_with_protocol_state(turn, protocol_state_changes)
+                .map(|acknowledged| (acknowledged.turn, Some(acknowledged.acknowledgement))),
+        }
+    }
+
+    pub(crate) fn rollback_prepared_distributed_turn(
+        &mut self,
+    ) -> Result<(), PersistentDispatchError> {
+        self.prepared_distributed_admission.take().ok_or_else(|| {
+            PersistentDispatchError::Runtime(
+                "distributed persistent turn was not prepared before rollback".to_owned(),
+            )
+        })?;
+        self.runtime
+            .rollback_unsettled_turn()
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    fn prepare_distributed_turn(
+        &mut self,
+        immediate: bool,
+        build: impl FnOnce(&mut LiveRuntime) -> crate::RuntimeResult<RuntimeTurn>,
+    ) -> Result<RuntimeTurn, PersistentDispatchError> {
+        self.begin_distributed_admission(immediate)?;
+        match build(&mut self.runtime) {
+            Ok(turn) => Ok(turn),
+            Err(error) => {
+                self.prepared_distributed_admission = None;
+                Err(PersistentDispatchError::Runtime(error.to_string()))
+            }
+        }
+    }
+
+    fn begin_distributed_admission(
+        &mut self,
+        immediate: bool,
+    ) -> Result<(), PersistentDispatchError> {
+        if self.prepared_distributed_admission.is_some() {
+            return Err(PersistentDispatchError::Runtime(
+                "previous distributed persistent turn is still prepared".to_owned(),
+            ));
+        }
+        self.prepared_distributed_admission = Some(if immediate {
+            PreparedDistributedAdmission::Immediate
+        } else {
+            PreparedDistributedAdmission::Buffered(
+                self.persistence
+                    .try_reserve_turn()
+                    .map_err(PersistentDispatchError::Backpressure)?,
+            )
+        });
+        Ok(())
     }
 
     pub fn dispatch(&mut self, event: SourceEvent) -> Result<RuntimeTurn, PersistentDispatchError> {
@@ -888,7 +1098,16 @@ impl PersistentRuntime {
     fn admit_buffered_turn(
         &mut self,
         reservation: AuthorityTurnReservation,
+        turn: RuntimeTurn,
+    ) -> Result<RuntimeTurn, PersistentDispatchError> {
+        self.admit_buffered_turn_with_protocol_state(reservation, turn, Vec::new())
+    }
+
+    fn admit_buffered_turn_with_protocol_state(
+        &mut self,
+        reservation: AuthorityTurnReservation,
         mut turn: RuntimeTurn,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
     ) -> Result<RuntimeTurn, PersistentDispatchError> {
         let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
         if next_effect_work.is_some()
@@ -909,7 +1128,8 @@ impl PersistentRuntime {
         }
         let persistence_started = Instant::now();
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
-            .with_outbox_changes(turn.outbox_changes.clone());
+            .with_outbox_changes(turn.outbox_changes.clone())
+            .with_protocol_state_changes(protocol_state_changes);
         if let Err(error) = reservation.enqueue(authority) {
             turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
             let rollback_error = self
@@ -1060,12 +1280,21 @@ impl PersistentRuntime {
 
     fn commit_unsettled_immediate(
         &mut self,
+        turn: RuntimeTurn,
+    ) -> Result<DurablyAcknowledgedTurn, PersistentDispatchError> {
+        self.commit_unsettled_immediate_with_protocol_state(turn, Vec::new())
+    }
+
+    fn commit_unsettled_immediate_with_protocol_state(
+        &mut self,
         mut turn: RuntimeTurn,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
     ) -> Result<DurablyAcknowledgedTurn, PersistentDispatchError> {
         let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
         let persistence_started = Instant::now();
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
-            .with_outbox_changes(turn.outbox_changes.clone());
+            .with_outbox_changes(turn.outbox_changes.clone())
+            .with_protocol_state_changes(protocol_state_changes);
         let acknowledgement = match self.persistence.commit_immediate(authority) {
             Ok(acknowledgement) => acknowledgement,
             Err(error) => {
@@ -3293,7 +3522,6 @@ fn reject_unfinished_outbox(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FileEffectDriver;
     use boon_persistence::{
         CheckpointBatch, ContentArtifactOwnerId, InMemoryDriver, PersistenceCommand,
         PersistenceResult, ShutdownAck, StoreError,
@@ -3403,10 +3631,7 @@ mod tests {
             let StoredValue::Record(intent) = &request.intent else {
                 return Err(HostEffectError::rejected("effect intent is not a record"));
             };
-            let Some(StoredValue::Text(path)) = intent.get("path") else {
-                return Err(HostEffectError::rejected("effect path is not Text"));
-            };
-            let outcome = StoredValue::Text(path.clone());
+            let outcome = successful_registration_stored(intent)?;
             self.applied.insert(request.item_id, outcome.clone());
             if let Some(fail) = &self.fail_next_persistence_commit_after_dispatch {
                 fail.store(true, Ordering::Release);
@@ -3428,11 +3653,36 @@ mod tests {
         }
     }
 
+    struct BackgroundEffectDriver {
+        dispatch_count: Arc<AtomicUsize>,
+    }
+
+    impl HostEffectDriver for BackgroundEffectDriver {
+        fn dispatch(
+            &mut self,
+            request: &HostEffectRequest,
+        ) -> Result<StoredValue, HostEffectError> {
+            let StoredValue::Record(intent) = &request.intent else {
+                return Err(HostEffectError::rejected("effect intent is not a record"));
+            };
+            let result = successful_registration_stored(intent)?;
+            self.dispatch_count.fetch_add(1, Ordering::AcqRel);
+            Ok(result)
+        }
+
+        fn reconcile(
+            &mut self,
+            _request: &HostEffectRequest,
+        ) -> Result<HostEffectReconciliation, HostEffectError> {
+            Ok(HostEffectReconciliation::NotApplied)
+        }
+    }
+
     fn effect_plan(identity: boon_plan::ApplicationIdentity) -> Arc<MachinePlan> {
         Arc::new(
             boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
-                "bytes-file-write-effect.bn",
-                include_str!("../../../examples/bytes_file_write_effect.bn"),
+                "persistent-idempotent-effect.bn",
+                include_str!("../../../testdata/persistent_idempotent_effect.bn"),
                 boon_plan::TargetProfile::SoftwareDefault,
                 identity,
                 1,
@@ -3445,8 +3695,60 @@ mod tests {
     fn effect_source_event(runtime: &PersistentRuntime, sequence: u64) -> SourceEvent {
         runtime
             .runtime()
-            .source_event(sequence, "store.save.press", None, SourcePayload::default())
+            .source_event(sequence, "store.register", None, SourcePayload::default())
             .unwrap()
+    }
+
+    fn successful_registration_stored(
+        intent: &BTreeMap<String, StoredValue>,
+    ) -> Result<StoredValue, HostEffectError> {
+        let Some(StoredValue::Text(account_id)) = intent.get("account_id") else {
+            return Err(HostEffectError::rejected("effect account_id is not Text"));
+        };
+        Ok(StoredValue::Variant {
+            tag: "RegistrationSucceeded".to_owned(),
+            fields: BTreeMap::from([
+                (
+                    "account_id".to_owned(),
+                    StoredValue::Text(account_id.clone()),
+                ),
+                (
+                    "credential_id".to_owned(),
+                    StoredValue::Text("credential-test".to_owned()),
+                ),
+                (
+                    "label".to_owned(),
+                    StoredValue::Text("Test credential".to_owned()),
+                ),
+                ("workspace_grant_bound".to_owned(), StoredValue::Bool(true)),
+            ]),
+        })
+    }
+
+    fn pending_registration_value() -> Value {
+        Value::Text("RegistrationNotRequested".to_owned())
+    }
+
+    fn successful_registration_value() -> Value {
+        Value::Record(BTreeMap::from([
+            (
+                "$tag".to_owned(),
+                Value::Text("RegistrationSucceeded".to_owned()),
+            ),
+            (
+                "account_id".to_owned(),
+                Value::Text("account-test".to_owned()),
+            ),
+            (
+                "credential_id".to_owned(),
+                Value::Text("credential-test".to_owned()),
+            ),
+            (
+                "label".to_owned(),
+                Value::Text("Test credential".to_owned()),
+            ),
+            ("workspace_grant_bound".to_owned(), Value::Bool(true)),
+        ]))
     }
 
     #[test]
@@ -3949,7 +4251,7 @@ mod tests {
         );
         assert_eq!(
             runtime.runtime.root_value_current("store.result").unwrap(),
-            Value::Text("not written".to_owned())
+            pending_registration_value()
         );
         let startup_loads = load_count.load(Ordering::Acquire);
         assert!(!runtime.has_effect_work());
@@ -3961,7 +4263,7 @@ mod tests {
         assert_eq!(turn.outbox_changes.len(), 1);
         assert_eq!(
             runtime.runtime.root_value_current("store.result").unwrap(),
-            Value::Text("not written".to_owned())
+            pending_registration_value()
         );
         let pending = runtime.effect_work_items().unwrap();
         assert_eq!(pending.len(), 1);
@@ -4004,7 +4306,7 @@ mod tests {
                 .runtime
                 .root_value_current("store.result")
                 .unwrap(),
-            Value::Text("not written".to_owned())
+            pending_registration_value()
         );
         assert_eq!(
             restarted.effect_work_items().unwrap()[0].kind,
@@ -4025,7 +4327,7 @@ mod tests {
                 .runtime
                 .root_value_current("store.result")
                 .unwrap(),
-            Value::Text("output.bin".to_owned())
+            successful_registration_value()
         );
         assert!(restarted.effect_work_items().unwrap().is_empty());
         assert!(!restarted.has_effect_work());
@@ -4047,7 +4349,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             restored.runtime.root_value_current("store.result").unwrap(),
-            Value::Text("output.bin".to_owned())
+            successful_registration_value()
         );
         assert!(restored.effect_work_items().unwrap().is_empty());
         restored.shutdown().unwrap();
@@ -4084,7 +4386,7 @@ mod tests {
         ));
         assert_eq!(
             runtime.runtime.root_value_current("store.result").unwrap(),
-            Value::Text("not written".to_owned())
+            pending_registration_value()
         );
         assert_eq!(
             runtime.effect_work_items().unwrap()[0].kind,
@@ -4097,7 +4399,7 @@ mod tests {
         assert_eq!(host.reconcile_count, 1);
         assert_eq!(
             runtime.runtime.root_value_current("store.result").unwrap(),
-            Value::Text("output.bin".to_owned())
+            successful_registration_value()
         );
         runtime.shutdown().unwrap();
     }
@@ -4109,11 +4411,7 @@ mod tests {
             "test",
             "local",
         );
-        let root = std::env::temp_dir().join(format!(
-            "boon-persistent-effect-worker-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
         let plan = effect_plan(identity);
         let (mut runtime, _) = PersistentRuntime::from_shared_machine_plan(
             plan,
@@ -4123,7 +4421,10 @@ mod tests {
         )
         .unwrap();
         runtime.dispatch(effect_source_event(&runtime, 1)).unwrap();
-        let mut worker = HostEffectWorker::start(FileEffectDriver::new(&root).unwrap()).unwrap();
+        let mut worker = HostEffectWorker::start(BackgroundEffectDriver {
+            dispatch_count: Arc::clone(&dispatch_count),
+        })
+        .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
 
         let mut completion = None;
@@ -4131,9 +4432,9 @@ mod tests {
             if let Some(turn) = runtime.poll_effect_worker(&mut worker).unwrap() {
                 completion = Some(turn);
             }
-            if root.join("output.bin").is_file()
+            if dispatch_count.load(Ordering::Acquire) == 1
                 && runtime.runtime.root_value_current("store.result").unwrap()
-                    == Value::Text("output.bin".to_owned())
+                    == successful_registration_value()
                 && !runtime.has_effect_work()
             {
                 break;
@@ -4146,17 +4447,13 @@ mod tests {
         }
 
         assert_eq!(completion.unwrap().source_sequence, None);
-        assert_eq!(
-            std::fs::read(root.join("output.bin")).unwrap(),
-            [1, 2, 3, 4]
-        );
+        assert_eq!(dispatch_count.load(Ordering::Acquire), 1);
         assert_eq!(
             runtime.runtime.root_value_current("store.result").unwrap(),
-            Value::Text("output.bin".to_owned())
+            successful_registration_value()
         );
         worker.shutdown().unwrap();
         runtime.shutdown().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4166,11 +4463,7 @@ mod tests {
             "test",
             "local",
         );
-        let root = std::env::temp_dir().join(format!(
-            "boon-persistent-effect-durability-gate-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(AtomicBool::new(false));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let driver = BlockingCommitDriver {
@@ -4205,9 +4498,12 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        let mut worker = HostEffectWorker::start(FileEffectDriver::new(&root).unwrap()).unwrap();
+        let mut worker = HostEffectWorker::start(BackgroundEffectDriver {
+            dispatch_count: Arc::clone(&dispatch_count),
+        })
+        .unwrap();
         assert!(runtime.poll_effect_worker(&mut worker).unwrap().is_none());
-        assert!(!root.join("output.bin").exists());
+        assert_eq!(dispatch_count.load(Ordering::Acquire), 0);
 
         release_commit_gate(&gate);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -4219,15 +4515,11 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert_eq!(
-            std::fs::read(root.join("output.bin")).unwrap(),
-            [1, 2, 3, 4]
-        );
+        assert_eq!(dispatch_count.load(Ordering::Acquire), 1);
 
         safety_release.join().unwrap();
         worker.shutdown().unwrap();
         runtime.shutdown().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4587,6 +4879,7 @@ mod tests {
             last_turn_sequence: 1,
             changes: Vec::new(),
             outbox_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: vec![DurableContentArtifactChange::InsertImmutable {
                 owner_id,
                 artifact_id: content.id,

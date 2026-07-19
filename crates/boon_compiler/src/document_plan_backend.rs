@@ -474,6 +474,15 @@ impl<'a> DocumentCompiler<'a> {
                         statement.id
                     )));
                 }
+                let is_pipeline = statement.children.len() > 1
+                    && statement
+                        .children
+                        .iter()
+                        .skip(1)
+                        .all(|child| child_is_pipeline_continuation(child, self.program));
+                if is_pipeline {
+                    return self.compile_child_sequence(&statement.children, context, statement.id);
+                }
                 if is_child_list_field(name) {
                     return self.compile_child_sequence(&statement.children, context, statement.id);
                 }
@@ -521,7 +530,9 @@ impl<'a> DocumentCompiler<'a> {
         let kind = self.expr_kind(expr_id)?.clone();
         match kind {
             AstExprKind::Identifier(value) => self.compile_identifier(expr_id, &value, context),
-            AstExprKind::Path(parts) => self.compile_path(expr_id, &parts.join("."), context),
+            AstExprKind::Path(parts) => {
+                self.compile_path(expr_id, &boon_parser::canonical_value_path(&parts), context)
+            }
             AstExprKind::StringLiteral(value) => {
                 if let Some(path) = value.strip_prefix('$') {
                     self.compile_path(expr_id, path, context)
@@ -2516,7 +2527,6 @@ fn document_builtin(function: &str) -> Option<DocumentBuiltin> {
         "Directory/entries" => DocumentBuiltin::DirectoryEntries,
         "Error/new" => DocumentBuiltin::ErrorNew,
         "Error/text" => DocumentBuiltin::ErrorText,
-        "File/read_bytes" => DocumentBuiltin::FileReadBytes,
         "Light/ambient" => DocumentBuiltin::LightAmbient,
         "Light/directional" => DocumentBuiltin::LightDirectional,
         "Light/spot" => DocumentBuiltin::LightSpot,

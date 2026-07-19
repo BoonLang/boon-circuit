@@ -1,4 +1,7 @@
-use crate::{APP_MANIFEST_FORMAT, MAX_MANIFEST_BYTES, PackageError};
+use crate::{
+    APP_MANIFEST_FORMAT, MAX_CAPABILITY_GRANTS_PER_PROFILE, MAX_CAPABILITY_PROFILES,
+    MAX_MANIFEST_BYTES, PackageError,
+};
 use boon_plan::{ProgramRole, TargetProfile};
 use boon_runtime::ProgramCapabilityProfile;
 use serde::{Deserialize, Serialize};
@@ -392,6 +395,13 @@ impl AppManifest {
     }
 
     fn validate_capability_profiles(&self) -> Result<(), PackageError> {
+        if self.capability_profiles.is_empty()
+            || self.capability_profiles.len() > MAX_CAPABILITY_PROFILES
+        {
+            return Err(PackageError::new(format!(
+                "capability profile count is outside 1..={MAX_CAPABILITY_PROFILES}"
+            )));
+        }
         for (key, profile) in &self.capability_profiles {
             validate_identifier("capability profile key", key, false)?;
             validate_identifier("capability profile id", &profile.id, false)?;
@@ -399,6 +409,11 @@ impl AppManifest {
                 return Err(PackageError::new(format!(
                     "capability profile map key `{key}` differs from id `{}`",
                     profile.id
+                )));
+            }
+            if profile.grants.len() > MAX_CAPABILITY_GRANTS_PER_PROFILE {
+                return Err(PackageError::new(format!(
+                    "capability profile `{key}` exceeds {MAX_CAPABILITY_GRANTS_PER_PROFILE} grants"
                 )));
             }
             let mut grants = BTreeSet::new();
@@ -627,7 +642,11 @@ pub(crate) fn validate_relative_path(label: &str, value: &str) -> Result<(), Pac
     Ok(())
 }
 
-fn validate_identifier(label: &str, value: &str, dots: bool) -> Result<(), PackageError> {
+pub(crate) fn validate_identifier(
+    label: &str,
+    value: &str,
+    dots: bool,
+) -> Result<(), PackageError> {
     if value.is_empty()
         || value.len() > 256
         || value.trim() != value

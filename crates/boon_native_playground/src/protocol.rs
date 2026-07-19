@@ -4,6 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use boon_plan::ProgramRole;
 use serde::Serialize;
 
 pub use boon_runtime::{
@@ -12,11 +13,12 @@ pub use boon_runtime::{
 };
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 11;
+const VERSION: u16 = 12;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_UNITS: usize = 1_024;
+const MAX_DISTRIBUTED_PROGRAMS: usize = 3;
 const MAX_CATALOG_ENTRIES: usize = 1_024;
 const MAX_TEST_STEPS: usize = 4_096;
 const MAX_TEST_EXPECTATIONS_PER_STEP: usize = 128;
@@ -55,6 +57,25 @@ impl Role {
 pub struct SourceUnit {
     pub path: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramSource {
+    pub role: ProgramRole,
+    pub entry_path: String,
+    pub units: Vec<SourceUnit>,
+    pub application: ApplicationIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreviewSource {
+    BuiltInSingleRole {
+        application: ApplicationIdentity,
+        units: Vec<SourceUnit>,
+    },
+    DistributedPackage {
+        programs: Vec<ProgramSource>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -791,9 +812,8 @@ pub enum Message {
     PreviewApply {
         intent: PreviewIntent,
         request_id: Option<u64>,
-        application: ApplicationIdentity,
         revision: u64,
-        units: Vec<SourceUnit>,
+        source: PreviewSource,
         test_steps: Vec<TestStep>,
         migration: Option<MigrationBundle>,
         migration_stage: Option<String>,
@@ -955,18 +975,16 @@ impl Message {
             Self::PreviewApply {
                 intent,
                 request_id,
-                application,
                 revision,
-                units,
+                source,
                 test_steps,
                 migration,
                 migration_stage,
             } => {
                 out.u8(*intent as u8);
                 out.optional_u64(*request_id);
-                out.application_identity(application)?;
                 out.u64(*revision);
-                out.source_units(units)?;
+                out.preview_source(source)?;
                 out.test_steps(test_steps)?;
                 out.optional_migration_bundle(migration.as_ref())?;
                 out.optional_string(migration_stage.as_deref())?;
@@ -1146,9 +1164,8 @@ impl Message {
             10 => Self::PreviewApply {
                 intent: PreviewIntent::decode(input.u8()?)?,
                 request_id: input.optional_u64()?,
-                application: input.application_identity()?,
                 revision: input.u64()?,
-                units: input.source_units()?,
+                source: input.preview_source()?,
                 test_steps: input.test_steps()?,
                 migration: input.optional_migration_bundle()?,
                 migration_stage: input.optional_string()?,
@@ -1458,6 +1475,41 @@ impl Encoder {
             self.string(&unit.source)?;
         }
         Ok(())
+    }
+
+    fn program_sources(&mut self, programs: &[ProgramSource]) -> Result<(), ProtocolError> {
+        if programs.len() > MAX_DISTRIBUTED_PROGRAMS {
+            return Err(ProtocolError::LimitExceeded(
+                "distributed program count",
+                programs.len(),
+            ));
+        }
+        self.u32(programs.len() as u32);
+        for program in programs {
+            self.u8(match program.role {
+                ProgramRole::Client => 1,
+                ProgramRole::Session => 2,
+                ProgramRole::Server => 3,
+            });
+            self.string(&program.entry_path)?;
+            self.source_units(&program.units)?;
+            self.application_identity(&program.application)?;
+        }
+        Ok(())
+    }
+
+    fn preview_source(&mut self, source: &PreviewSource) -> Result<(), ProtocolError> {
+        match source {
+            PreviewSource::BuiltInSingleRole { application, units } => {
+                self.u8(1);
+                self.application_identity(application)?;
+                self.source_units(units)
+            }
+            PreviewSource::DistributedPackage { programs } => {
+                self.u8(2);
+                self.program_sources(programs)
+            }
+        }
     }
 
     fn application_identity(
@@ -2061,6 +2113,45 @@ impl<'a> Decoder<'a> {
             .collect()
     }
 
+    fn program_sources(&mut self) -> Result<Vec<ProgramSource>, ProtocolError> {
+        let count = self.u32()? as usize;
+        if count > MAX_DISTRIBUTED_PROGRAMS {
+            return Err(ProtocolError::LimitExceeded(
+                "distributed program count",
+                count,
+            ));
+        }
+        (0..count)
+            .map(|_| {
+                let role = match self.u8()? {
+                    1 => ProgramRole::Client,
+                    2 => ProgramRole::Session,
+                    3 => ProgramRole::Server,
+                    value => return Err(ProtocolError::InvalidEnum("program role", value)),
+                };
+                Ok(ProgramSource {
+                    role,
+                    entry_path: self.string()?,
+                    units: self.source_units()?,
+                    application: self.application_identity()?,
+                })
+            })
+            .collect()
+    }
+
+    fn preview_source(&mut self) -> Result<PreviewSource, ProtocolError> {
+        match self.u8()? {
+            1 => Ok(PreviewSource::BuiltInSingleRole {
+                application: self.application_identity()?,
+                units: self.source_units()?,
+            }),
+            2 => Ok(PreviewSource::DistributedPackage {
+                programs: self.program_sources()?,
+            }),
+            value => Err(ProtocolError::InvalidEnum("preview source", value)),
+        }
+    }
+
     fn application_identity(&mut self) -> Result<ApplicationIdentity, ProtocolError> {
         Ok(ApplicationIdentity::new(
             self.string()?,
@@ -2600,6 +2691,29 @@ mod tests {
         ]
     }
 
+    fn program_sources() -> Vec<ProgramSource> {
+        [
+            ProgramRole::Client,
+            ProgramRole::Session,
+            ProgramRole::Server,
+        ]
+        .into_iter()
+        .map(|role| ProgramSource {
+            role,
+            entry_path: format!("{}/RUN.bn", role.as_str()),
+            units: vec![SourceUnit {
+                path: format!("{}/RUN.bn", role.as_str()),
+                source: format!("value: TEXT {{ {} }}\n", role.as_str()),
+            }],
+            application: ApplicationIdentity::new(
+                "dev.boon.distributed",
+                format!("distributed:{}", role.as_str()),
+                "test",
+            ),
+        })
+        .collect()
+    }
+
     fn roundtrip(message: Message) {
         let mut bytes = Vec::new();
         write_message(&mut bytes, &message).expect("encode message");
@@ -2671,9 +2785,10 @@ mod tests {
             Message::PreviewApply {
                 intent: PreviewIntent::Test,
                 request_id: Some(91),
-                application: application(),
                 revision: 10,
-                units: units(),
+                source: PreviewSource::DistributedPackage {
+                    programs: program_sources(),
+                },
                 test_steps: vec![TestStep {
                     id: "increment".to_owned(),
                     source_path: "store.increment.press".to_owned(),
@@ -2845,9 +2960,11 @@ mod tests {
                 &Message::PreviewApply {
                     intent: PreviewIntent::Replace,
                     request_id: None,
-                    application: application(),
                     revision: 1,
-                    units: units(),
+                    source: PreviewSource::BuiltInSingleRole {
+                        application: application(),
+                        units: units(),
+                    },
                     test_steps: Vec::new(),
                     migration: Some(oversized),
                     migration_stage: Some("v1".to_owned()),

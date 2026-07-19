@@ -10,31 +10,58 @@
 
 #![forbid(unsafe_code)]
 
+mod distributed_sessions;
+mod exact_call_host;
+mod in_process;
+
+pub use distributed_sessions::{
+    DEFAULT_SESSION_RESUME_WINDOW, DistributedSessionConnectionId,
+    DistributedSessionHandshakeOffer, DistributedSessionHandshakeRejection,
+    DistributedSessionHandshakeRejectionReason, DistributedSessionHandshakeStart,
+    DistributedSessionRegistry, DistributedSessionRegistryConfig, DistributedSessionRegistryError,
+    DistributedSessionRegistryIdentity, DistributedSessionRegistryPoll, PoisonedDistributedSession,
+    PreparedDistributedSessionDeliveries,
+};
+pub use exact_call_host::ExactCallHostCore;
+pub use in_process::{
+    DEFAULT_IN_PROCESS_POLL_STEPS, InProcessDistributedRuntime, InProcessDistributedRuntimeConfig,
+    InProcessDistributedRuntimeError, InProcessFrameProgress, InProcessFrameTransferProgress,
+    InProcessPoll, InProcessResumeState, InProcessTransientEffectCancellation,
+    InProcessTransientEffectCreditGrant, InProcessTransientEffectInvocation,
+    InProcessTransientEffectOwner,
+};
+
 use async_trait::async_trait;
 use boon_persistence::{
     CommitAck, PersistenceDriver, PersistenceWorkerConfig, PersistenceWorkerStatus,
     TurnEnqueueError, TurnReservationError,
 };
 use boon_plan::{
-    DataTypeFieldPlan, DataTypePlan, DataVariantPlan, EffectReplay, HostPortPlan, MachinePlan,
+    DataTypeFieldPlan, DataTypePlan, DataVariantPlan, HostPortPlan, MachinePlan,
     OutputContractKind, OutputRootId, OutputRootPlan, ProgramRole, SourceId, SourcePayloadField,
     SourceRoute,
 };
 use boon_runtime::{
+    DistributedImportUpdate, DistributedProgramBundle, DistributedRuntimeError,
+    DistributedServerMachine, DistributedServerRuntime, DistributedServerUpdate,
     PersistentDispatchError, PersistentProgramSession, PersistentRuntimeStartupDisposition,
-    ProgramArtifact, ProgramCapabilityProfile, ProgramSession, ProgramSessionDispatch, RuntimeTurn,
-    SourcePayload, TransientEffectCallId, TransientEffectInvocation, Value,
+    PreparedDistributedServerTransaction, PreparedDistributedServerUpdate, ProgramArtifact,
+    ProgramCapabilityProfile, ProgramSession, ProgramSessionDispatch, RuntimeTurn, SessionContext,
+    SessionPrincipal, SourceEvent, SourcePayload, TransientEffectCallId, TransientEffectInvocation,
+    Value,
 };
 use boon_server_host::{
-    CallCancellation, CancellationReason, Header, HttpRequest, HttpResponse, PeerAddress,
-    ServerProgram, WebSocketAction, WebSocketClose, WebSocketEvent, WebSocketFrame, WebSocketOpen,
-    WebSocketTransportError,
+    CallCancellation, CancellationReason, DistributedSessionAction,
+    DistributedSessionConnectionId as HostDistributedSessionConnectionId, DistributedSessionEvent,
+    Header, HttpRequest, HttpResponse, PeerAddress, ServerProgram, WebSocketAction, WebSocketClose,
+    WebSocketEvent, WebSocketFrame, WebSocketOpen, WebSocketTransportError,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use boon_wire::{SessionControlFrame, decode_session_control_frame};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_ADAPTER_DIAGNOSTIC_BYTES: usize = 512;
 pub const MAX_WEBSOCKET_ACTIONS: usize = 256;
@@ -42,6 +69,7 @@ pub const MAX_WEBSOCKET_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_WEBSOCKET_REJECT_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_WEBSOCKET_ROOM_BYTES: usize = 512;
 pub const MAX_WEBSOCKET_CLOSE_REASON_BYTES: usize = 123;
+const MAX_DISTRIBUTED_SESSION_POLL_STEPS: usize = 256;
 const MAX_EXACT_INTEGER: u128 = 9_007_199_254_740_992;
 const MAX_ACTION_KIND_BYTES: usize = 32;
 const ACTION_FIELD_STATUS: u16 = 1 << 0;
@@ -53,47 +81,53 @@ const ACTION_FIELD_CLOSE: u16 = 1 << 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransientEffectLimits {
-    pub max_calls_per_round: usize,
+    pub max_active_calls: usize,
     pub max_calls_per_transaction: usize,
-    pub max_chained_rounds: usize,
+    pub max_events_per_transaction: usize,
 }
 
 impl Default for TransientEffectLimits {
     fn default() -> Self {
         Self {
-            max_calls_per_round: 64,
+            max_active_calls: 64,
             max_calls_per_transaction: 256,
-            max_chained_rounds: 32,
+            max_events_per_transaction: 65_536,
         }
     }
 }
 
 impl TransientEffectLimits {
     fn validate(self) -> Result<Self, AdapterError> {
-        if self.max_calls_per_round == 0
+        if self.max_active_calls == 0
             || self.max_calls_per_transaction == 0
-            || self.max_chained_rounds == 0
-            || self.max_calls_per_round > self.max_calls_per_transaction
+            || self.max_events_per_transaction == 0
+            || self.max_active_calls > self.max_calls_per_transaction
         {
             return Err(AdapterError::new(
                 AdapterErrorKind::InvalidArtifact,
-                "transient effect limits must be positive and the round limit must not exceed the transaction limit",
+                "transient effect limits must be positive and the active-call limit must not exceed the transaction call limit",
             ));
         }
         Ok(self)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransientEffectCompletion {
-    pub call_id: TransientEffectCallId,
-    pub outcome: Value,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransientEffectHostDelivery {
+    Single,
+    Stream { result_sequence: u64 },
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct TransientEffectBatchResult {
-    pub completions: Vec<TransientEffectCompletion>,
-    pub cancelled: Vec<TransientEffectCallId>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransientEffectHostEvent {
+    Result {
+        call_id: TransientEffectCallId,
+        delivery: TransientEffectHostDelivery,
+        outcome: Value,
+    },
+    Cancelled {
+        call_id: TransientEffectCallId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,13 +159,28 @@ impl Error for TransientEffectHostError {}
 pub trait TransientEffectHost: Send + 'static {
     fn owns(&self, effect_id: boon_plan::EffectId) -> bool;
 
-    /// Executes one bounded set concurrently where the concrete transports
-    /// permit it. Every input call must appear exactly once in either
-    /// `completions` or `cancelled`.
-    async fn execute_batch(
+    /// Accepts exact runtime-owned calls without inferring replacement from
+    /// invocation IDs or application values.
+    fn submit(
         &mut self,
         calls: Vec<TransientEffectInvocation>,
-    ) -> Result<TransientEffectBatchResult, TransientEffectHostError>;
+    ) -> Result<(), TransientEffectHostError>;
+
+    /// Returns one bounded single-result or stream-result event.
+    async fn next_event(&mut self) -> Result<TransientEffectHostEvent, TransientEffectHostError>;
+
+    fn grant_credits(
+        &mut self,
+        grants: &[boon_runtime::TransientEffectCreditGrant],
+    ) -> Result<(), TransientEffectHostError> {
+        if grants.is_empty() {
+            Ok(())
+        } else {
+            Err(TransientEffectHostError::new(
+                "transient effect host does not accept stream credits",
+            ))
+        }
+    }
 
     fn cancel(&mut self, call_id: TransientEffectCallId);
 
@@ -183,6 +232,7 @@ pub struct ServerDurabilityPolicy {
     pub http: ServerTurnDurability,
     pub websocket: ServerTurnDurability,
     pub disconnect: ServerTurnDurability,
+    pub distributed: ServerTurnDurability,
 }
 
 impl ServerDurabilityPolicy {
@@ -190,12 +240,14 @@ impl ServerDurabilityPolicy {
         http: ServerTurnDurability::Immediate,
         websocket: ServerTurnDurability::Immediate,
         disconnect: ServerTurnDurability::Immediate,
+        distributed: ServerTurnDurability::Immediate,
     };
 
     pub const BUFFERED: Self = Self {
         http: ServerTurnDurability::Buffered,
         websocket: ServerTurnDurability::Buffered,
         disconnect: ServerTurnDurability::Buffered,
+        distributed: ServerTurnDurability::Buffered,
     };
 }
 
@@ -361,7 +413,11 @@ struct ResolvedBindings {
 
 enum ServerRuntimeSession {
     Ephemeral(Box<ProgramSession>),
-    Persistent(Box<PersistentProgramSession>),
+    Persistent {
+        session: Box<PersistentProgramSession>,
+        distributed_durability: ServerTurnDurability,
+        distributed_acknowledgements: Vec<CommitAck>,
+    },
 }
 
 struct ServerSessionDispatch {
@@ -378,7 +434,7 @@ impl ServerRuntimeSession {
     fn artifact(&self) -> &ProgramArtifact {
         match self {
             Self::Ephemeral(session) => session.artifact(),
-            Self::Persistent(session) => session.artifact(),
+            Self::Persistent { session, .. } => session.artifact(),
         }
     }
 
@@ -396,7 +452,7 @@ impl ServerRuntimeSession {
                     acknowledgement: None,
                 })
                 .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error)),
-            Self::Persistent(session) => match durability {
+            Self::Persistent { session, .. } => match durability {
                 ServerTurnDurability::Immediate => session
                     .dispatch_durably(source_path, None, payload)
                     .map(|(dispatched, acknowledgement)| ServerSessionDispatch {
@@ -420,7 +476,7 @@ impl ServerRuntimeSession {
             Self::Ephemeral(session) => session
                 .output_value_current(name)
                 .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error)),
-            Self::Persistent(session) => session
+            Self::Persistent { session, .. } => session
                 .output_value_current(name)
                 .map_err(persistent_dispatch_error),
         }
@@ -440,7 +496,7 @@ impl ServerRuntimeSession {
                     acknowledgement: None,
                 })
                 .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error)),
-            Self::Persistent(session) => match durability {
+            Self::Persistent { session, .. } => match durability {
                 ServerTurnDurability::Immediate => session
                     .complete_transient_effect_durably(call_id, outcome)
                     .map(|acknowledged| ServerSessionEffectTurn {
@@ -459,6 +515,40 @@ impl ServerRuntimeSession {
         }
     }
 
+    fn deliver_transient_effect_result(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+        durability: ServerTurnDurability,
+    ) -> Result<ServerSessionEffectTurn, AdapterError> {
+        match self {
+            Self::Ephemeral(session) => session
+                .deliver_transient_effect_result(call_id, result_sequence, outcome)
+                .map(|runtime_turn| ServerSessionEffectTurn {
+                    runtime_turn,
+                    acknowledgement: None,
+                })
+                .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error)),
+            Self::Persistent { session, .. } => match durability {
+                ServerTurnDurability::Immediate => session
+                    .deliver_transient_effect_result_durably(call_id, result_sequence, outcome)
+                    .map(|acknowledged| ServerSessionEffectTurn {
+                        runtime_turn: acknowledged.turn,
+                        acknowledgement: Some(acknowledged.acknowledgement),
+                    })
+                    .map_err(persistent_dispatch_error),
+                ServerTurnDurability::Buffered => session
+                    .deliver_transient_effect_result(call_id, result_sequence, outcome)
+                    .map(|runtime_turn| ServerSessionEffectTurn {
+                        runtime_turn,
+                        acknowledgement: None,
+                    })
+                    .map_err(persistent_dispatch_error),
+            },
+        }
+    }
+
     fn cancel_transient_effect(
         &mut self,
         call_id: TransientEffectCallId,
@@ -467,30 +557,31 @@ impl ServerRuntimeSession {
             Self::Ephemeral(session) => session
                 .cancel_transient_effect(call_id)
                 .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error)),
-            Self::Persistent(session) => session
+            Self::Persistent { session, .. } => session
                 .cancel_transient_effect(call_id)
                 .map_err(persistent_dispatch_error),
         }
     }
 
+    #[cfg(test)]
     fn pending_transient_effect_count(&self) -> usize {
         match self {
             Self::Ephemeral(session) => session.pending_transient_effect_count(),
-            Self::Persistent(session) => session.pending_transient_effect_count(),
+            Self::Persistent { session, .. } => session.pending_transient_effect_count(),
         }
     }
 
     fn persistence_status(&self) -> Option<PersistenceWorkerStatus> {
         match self {
             Self::Ephemeral(_) => None,
-            Self::Persistent(session) => Some(session.persistence_status()),
+            Self::Persistent { session, .. } => Some(session.persistence_status()),
         }
     }
 
     fn barrier(&self) -> Result<(), AdapterError> {
         match self {
             Self::Ephemeral(_) => Ok(()),
-            Self::Persistent(session) => session
+            Self::Persistent { session, .. } => session
                 .barrier()
                 .map(|_| ())
                 .map_err(|error| AdapterError::new(AdapterErrorKind::Persistence, error)),
@@ -500,10 +591,447 @@ impl ServerRuntimeSession {
     fn shutdown(&self) -> Result<(), AdapterError> {
         match self {
             Self::Ephemeral(_) => Ok(()),
-            Self::Persistent(session) => session
+            Self::Persistent { session, .. } => session
                 .shutdown()
                 .map(|_| ())
                 .map_err(|error| AdapterError::new(AdapterErrorKind::Persistence, error)),
+        }
+    }
+
+    fn take_distributed_acknowledgements(&mut self) -> Vec<CommitAck> {
+        match self {
+            Self::Ephemeral(_) => Vec::new(),
+            Self::Persistent {
+                distributed_acknowledgements,
+                ..
+            } => std::mem::take(distributed_acknowledgements),
+        }
+    }
+}
+
+impl DistributedServerMachine for ServerRuntimeSession {
+    type EvaluationMachine = ProgramSession;
+
+    fn artifact(&self) -> &ProgramArtifact {
+        ServerRuntimeSession::artifact(self)
+    }
+
+    fn fork_prepared_evaluation(
+        &self,
+        turn: Option<&RuntimeTurn>,
+    ) -> Result<Self::EvaluationMachine, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.fork_prepared_evaluation(turn),
+            Self::Persistent { session, .. } => {
+                session.fork_prepared_distributed_server_evaluation(turn)
+            }
+        }
+    }
+
+    fn install_evaluation(
+        &mut self,
+        evaluation: Self::EvaluationMachine,
+    ) -> Result<(), DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.install_evaluation(evaluation),
+            Self::Persistent { session, .. } => session
+                .install_distributed_server_evaluation(evaluation)
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn commit_prepared_evaluation(
+        &mut self,
+        turn: RuntimeTurn,
+        evaluation: Self::EvaluationMachine,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.commit_prepared_evaluation(turn, evaluation),
+            Self::Persistent {
+                session,
+                distributed_acknowledgements,
+                ..
+            } => {
+                let (turn, acknowledgement) = session
+                    .commit_prepared_distributed_server_evaluation(turn, evaluation, Vec::new())
+                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))?;
+                if let Some(acknowledgement) = acknowledgement {
+                    distributed_acknowledgements.push(acknowledgement);
+                }
+                Ok(turn)
+            }
+        }
+    }
+
+    fn commit_prepared_evaluation_with_protocol_state(
+        &mut self,
+        turn: RuntimeTurn,
+        evaluation: Self::EvaluationMachine,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                if !protocol_state_changes.is_empty() {
+                    return Err(DistributedRuntimeError::Runtime(
+                        "ephemeral Server authority cannot persist protocol recovery state"
+                            .to_owned(),
+                    ));
+                }
+                session.commit_prepared_evaluation(turn, evaluation)
+            }
+            Self::Persistent {
+                session,
+                distributed_acknowledgements,
+                ..
+            } => {
+                let (turn, acknowledgement) = session
+                    .commit_prepared_distributed_server_evaluation(
+                        turn,
+                        evaluation,
+                        protocol_state_changes,
+                    )
+                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))?;
+                if let Some(acknowledgement) = acknowledgement {
+                    distributed_acknowledgements.push(acknowledgement);
+                }
+                Ok(turn)
+            }
+        }
+    }
+
+    fn event_for_path(
+        &self,
+        path: &str,
+        payload: SourcePayload,
+    ) -> Result<SourceEvent, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.event_for_path(path, payload),
+            Self::Persistent { session, .. } => session.event_for_path(path, payload),
+        }
+    }
+
+    fn event_for_source(
+        &self,
+        source: SourceId,
+        payload: SourcePayload,
+    ) -> Result<SourceEvent, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.event_for_source(source, payload),
+            Self::Persistent { session, .. } => session.event_for_source(source, payload),
+        }
+    }
+
+    fn prepare_dispatch(
+        &mut self,
+        event: SourceEvent,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                DistributedServerMachine::prepare_dispatch(&mut **session, event)
+            }
+            Self::Persistent {
+                session,
+                distributed_durability,
+                ..
+            } => session
+                .prepare_distributed_dispatch(
+                    event,
+                    *distributed_durability == ServerTurnDurability::Immediate,
+                )
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn prepare_dispatch_with_durability(
+        &mut self,
+        event: SourceEvent,
+        durable: bool,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                DistributedServerMachine::prepare_dispatch(&mut **session, event)
+            }
+            Self::Persistent { session, .. } => session
+                .prepare_distributed_dispatch(event, durable)
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn export_current(
+        &mut self,
+        export_id: boon_plan::ExportId,
+    ) -> Result<Value, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.export_current(export_id),
+            Self::Persistent { session, .. } => session.export_current(export_id),
+        }
+    }
+
+    fn call_arguments(
+        &mut self,
+        call: &boon_plan::RemoteCallSitePlan,
+    ) -> Result<BTreeMap<boon_plan::DistributedArgumentId, Value>, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.call_arguments(call),
+            Self::Persistent { session, .. } => session.call_arguments(call),
+        }
+    }
+
+    fn evaluate_function(
+        &mut self,
+        export_id: boon_plan::ExportId,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, Value>,
+    ) -> Result<Value, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.evaluate_function(export_id, arguments),
+            Self::Persistent { session, .. } => session.evaluate_function(export_id, arguments),
+        }
+    }
+
+    fn replace_distributed_context(
+        &mut self,
+        session_context: SessionContext,
+        imports: Vec<DistributedImportUpdate>,
+    ) -> Result<Option<RuntimeTurn>, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                session.replace_distributed_context(session_context, imports)
+            }
+            Self::Persistent { session, .. } => {
+                session.replace_distributed_context(session_context, imports)
+            }
+        }
+    }
+
+    fn prepare_transient_effect_completion(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                DistributedServerMachine::prepare_transient_effect_completion(
+                    &mut **session,
+                    call_id,
+                    outcome,
+                )
+            }
+            Self::Persistent {
+                session,
+                distributed_durability,
+                ..
+            } => session
+                .prepare_distributed_effect_completion(
+                    call_id,
+                    outcome,
+                    *distributed_durability == ServerTurnDurability::Immediate,
+                )
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn prepare_transient_effect_completion_with_durability(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+        durable: bool,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                DistributedServerMachine::prepare_transient_effect_completion(
+                    &mut **session,
+                    call_id,
+                    outcome,
+                )
+            }
+            Self::Persistent { session, .. } => session
+                .prepare_distributed_effect_completion(call_id, outcome, durable)
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn prepare_transient_effect_result(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => DistributedServerMachine::prepare_transient_effect_result(
+                &mut **session,
+                call_id,
+                result_sequence,
+                outcome,
+            ),
+            Self::Persistent {
+                session,
+                distributed_durability,
+                ..
+            } => session
+                .prepare_distributed_effect_result(
+                    call_id,
+                    result_sequence,
+                    outcome,
+                    *distributed_durability == ServerTurnDurability::Immediate,
+                )
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn prepare_transient_effect_result_with_durability(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+        durable: bool,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => DistributedServerMachine::prepare_transient_effect_result(
+                &mut **session,
+                call_id,
+                result_sequence,
+                outcome,
+            ),
+            Self::Persistent { session, .. } => session
+                .prepare_distributed_effect_result(call_id, result_sequence, outcome, durable)
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn prepare_transient_effect_cancellation(
+        &mut self,
+        call_ids: &[TransientEffectCallId],
+    ) -> Result<Option<RuntimeTurn>, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.prepare_transient_effect_cancellation(call_ids),
+            Self::Persistent {
+                session,
+                distributed_durability,
+                ..
+            } => session
+                .prepare_distributed_effect_cancellation(
+                    call_ids,
+                    *distributed_durability == ServerTurnDurability::Immediate,
+                )
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn prepare_transient_effect_cancellation_with_durability(
+        &mut self,
+        call_ids: &[TransientEffectCallId],
+        durable: bool,
+    ) -> Result<Option<RuntimeTurn>, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.prepare_transient_effect_cancellation(call_ids),
+            Self::Persistent { session, .. } => session
+                .prepare_distributed_effect_cancellation(call_ids, durable)
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn commit_prepared_turn(
+        &mut self,
+        turn: RuntimeTurn,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.commit_prepared_turn(turn),
+            Self::Persistent {
+                session,
+                distributed_acknowledgements,
+                ..
+            } => {
+                let (turn, acknowledgement) = session
+                    .commit_prepared_distributed_turn(turn)
+                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))?;
+                if let Some(acknowledgement) = acknowledgement {
+                    distributed_acknowledgements.push(acknowledgement);
+                }
+                Ok(turn)
+            }
+        }
+    }
+
+    fn commit_prepared_turn_with_protocol_state(
+        &mut self,
+        turn: RuntimeTurn,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
+    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                if !protocol_state_changes.is_empty() {
+                    return Err(DistributedRuntimeError::Runtime(
+                        "ephemeral Server authority cannot persist protocol recovery state"
+                            .to_owned(),
+                    ));
+                }
+                session.commit_prepared_turn(turn)
+            }
+            Self::Persistent {
+                session,
+                distributed_acknowledgements,
+                ..
+            } => {
+                let (turn, acknowledgement) = session
+                    .commit_prepared_distributed_turn_with_protocol_state(
+                        turn,
+                        protocol_state_changes,
+                    )
+                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))?;
+                if let Some(acknowledgement) = acknowledgement {
+                    distributed_acknowledgements.push(acknowledgement);
+                }
+                Ok(turn)
+            }
+        }
+    }
+
+    fn prepare_protocol_checkpoint(&mut self) -> Result<RuntimeTurn, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(_) => Err(DistributedRuntimeError::Runtime(
+                "ephemeral Server authority cannot persist protocol recovery state".to_owned(),
+            )),
+            Self::Persistent { session, .. } => session
+                .prepare_protocol_checkpoint()
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn supports_protocol_state(&self) -> bool {
+        matches!(self, Self::Persistent { .. })
+    }
+
+    fn rollback_prepared_turn(&mut self) -> Result<(), DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.rollback_prepared_turn(),
+            Self::Persistent { session, .. } => session
+                .rollback_prepared_distributed_turn()
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn has_pending_transient_effect(&self, call_id: TransientEffectCallId) -> bool {
+        match self {
+            Self::Ephemeral(session) => session.has_pending_transient_effect(call_id),
+            Self::Persistent { session, .. } => session.has_pending_transient_effect(call_id),
+        }
+    }
+
+    fn set_transient_effect_scope(&mut self, scope: u64) {
+        match self {
+            Self::Ephemeral(session) => session.set_transient_effect_scope(scope),
+            Self::Persistent { session, .. } => session.set_transient_effect_scope(scope),
+        }
+    }
+
+    fn root_value_current(&mut self, name: &str) -> Result<Value, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                DistributedServerMachine::root_value_current(&mut **session, name)
+            }
+            Self::Persistent { session, .. } => {
+                DistributedServerMachine::root_value_current(&mut **session, name)
+            }
         }
     }
 }
@@ -531,6 +1059,28 @@ fn persistent_dispatch_error(error: PersistentDispatchError) -> AdapterError {
     AdapterError::new(kind, error)
 }
 
+fn distributed_runtime_adapter_error(error: DistributedRuntimeError) -> AdapterError {
+    let kind = match error {
+        DistributedRuntimeError::QueueFull { .. }
+        | DistributedRuntimeError::QueueBytesFull { .. }
+        | DistributedRuntimeError::SessionCapacity { .. } => AdapterErrorKind::Backpressure,
+        _ => AdapterErrorKind::Runtime,
+    };
+    AdapterError::new(kind, error)
+}
+
+fn distributed_registry_adapter_error(error: DistributedSessionRegistryError) -> AdapterError {
+    let kind = match &error {
+        DistributedSessionRegistryError::Runtime(
+            DistributedRuntimeError::QueueFull { .. }
+            | DistributedRuntimeError::QueueBytesFull { .. }
+            | DistributedRuntimeError::SessionCapacity { .. },
+        ) => AdapterErrorKind::Backpressure,
+        _ => AdapterErrorKind::Runtime,
+    };
+    AdapterError::new(kind, error)
+}
+
 struct PersistentServerState {
     durability: ServerDurabilityPolicy,
     lifecycle: ServerLifecycleHandle,
@@ -538,58 +1088,37 @@ struct PersistentServerState {
     shutdown_complete: bool,
 }
 
-#[derive(Clone, Copy)]
+struct ServerAuthority {
+    machine: ServerRuntimeSession,
+    routing: Option<DistributedServerRuntime>,
+    persistence: Option<PersistentServerState>,
+}
+
+#[derive(Clone)]
+struct ActiveTransientEffect {
+    delivery: boon_plan::EffectDeliveryCardinality,
+    owner: TransientRuntimeOwner,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ServerTurnClass {
     Http,
     WebSocket,
+    Distributed,
     Disconnect,
 }
 
-enum SettledTransientEffect {
-    Completed(Value),
-    Cancelled,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TransientRuntimeOwner {
+    DirectServer(ServerTurnClass),
+    DistributedServer(boon_runtime::SessionOrigin),
+    DistributedSession(boon_runtime::SessionOrigin),
 }
 
-fn validate_effect_batch_result(
-    expected: &[TransientEffectCallId],
-    result: TransientEffectBatchResult,
-) -> Result<BTreeMap<TransientEffectCallId, SettledTransientEffect>, AdapterError> {
-    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
-    let mut settled = BTreeMap::new();
-    for completion in result.completions {
-        if !expected.contains(&completion.call_id)
-            || settled
-                .insert(
-                    completion.call_id,
-                    SettledTransientEffect::Completed(completion.outcome),
-                )
-                .is_some()
-        {
-            return Err(AdapterError::new(
-                AdapterErrorKind::Runtime,
-                "transient effect host returned an unknown or duplicate completion",
-            ));
-        }
-    }
-    for call_id in result.cancelled {
-        if !expected.contains(&call_id)
-            || settled
-                .insert(call_id, SettledTransientEffect::Cancelled)
-                .is_some()
-        {
-            return Err(AdapterError::new(
-                AdapterErrorKind::Runtime,
-                "transient effect host returned an unknown or duplicate cancellation",
-            ));
-        }
-    }
-    if settled.len() != expected.len() {
-        return Err(AdapterError::new(
-            AdapterErrorKind::Runtime,
-            "transient effect host did not settle every submitted call",
-        ));
-    }
-    Ok(settled)
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TransientEffectBudget {
+    submitted_calls: usize,
+    delivered_events: usize,
 }
 
 /// One serialized trusted-server session owned by [`boon_server_host`].
@@ -597,37 +1126,104 @@ fn validate_effect_batch_result(
 /// Host-port names are never conventions at this boundary. The constructor
 /// resolves the IDs embedded in `HostPortPlan` to runtime handles once, before
 /// the native listener can be started.
+#[derive(Clone, Copy)]
+enum DistributedTransportPhase {
+    AwaitingHello,
+    AwaitingCommit(DistributedSessionConnectionId),
+    Current(DistributedSessionConnectionId),
+}
+
+impl DistributedTransportPhase {
+    fn registry_connection(self) -> Option<DistributedSessionConnectionId> {
+        match self {
+            Self::AwaitingHello => None,
+            Self::AwaitingCommit(connection) | Self::Current(connection) => Some(connection),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DistributedTransportSend {
+    Control,
+    Data,
+}
+
+struct DistributedTransportConnection {
+    phase: DistributedTransportPhase,
+    pending_send: Option<DistributedTransportSend>,
+}
+
 pub struct BoonServerProgram {
-    session: ServerRuntimeSession,
+    authority: ServerAuthority,
+    restored_protocol_state: boon_persistence::ProtocolStateSnapshot,
+    restored_authority_turn_sequence: u64,
+    distributed_sessions: Option<DistributedSessionRegistry>,
+    distributed_clock_origin: Option<Instant>,
+    distributed_wall_clock_origin: Option<Duration>,
+    distributed_transport_connections:
+        BTreeMap<HostDistributedSessionConnectionId, DistributedTransportConnection>,
     http: Option<HttpPortBinding>,
     websocket: Option<WebSocketPortBinding>,
     last_diagnostic: Option<AdapterError>,
-    persistent: Option<PersistentServerState>,
     transient_effect_host: Option<Box<dyn TransientEffectHost>>,
     transient_effect_limits: TransientEffectLimits,
-    active_transient_effects: BTreeSet<TransientEffectCallId>,
+    required_transient_effects: BTreeMap<boon_plan::EffectId, String>,
+    active_transient_effects: BTreeMap<TransientEffectCallId, ActiveTransientEffect>,
+    transient_effect_budgets: BTreeMap<TransientRuntimeOwner, TransientEffectBudget>,
+    pending_distributed_actions: VecDeque<DistributedSessionAction>,
 }
 
 impl BoonServerProgram {
     pub fn new(artifact: ProgramArtifact) -> Result<Self, AdapterError> {
         validate_server_artifact(&artifact)?;
         let bindings = resolve_bindings(artifact.plan())?;
+        let required_transient_effects = collect_required_transient_effects([&artifact])?;
         let session = ProgramSession::start(artifact)
             .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
         Ok(Self {
-            session: ServerRuntimeSession::Ephemeral(Box::new(session)),
+            authority: ServerAuthority {
+                machine: ServerRuntimeSession::Ephemeral(Box::new(session)),
+                routing: None,
+                persistence: None,
+            },
+            restored_protocol_state: boon_persistence::ProtocolStateSnapshot::default(),
+            restored_authority_turn_sequence: 0,
+            distributed_sessions: None,
+            distributed_clock_origin: None,
+            distributed_wall_clock_origin: None,
+            distributed_transport_connections: BTreeMap::new(),
             http: bindings.http,
             websocket: bindings.websocket,
             last_diagnostic: None,
-            persistent: None,
             transient_effect_host: None,
             transient_effect_limits: TransientEffectLimits::default(),
-            active_transient_effects: BTreeSet::new(),
+            required_transient_effects,
+            active_transient_effects: BTreeMap::new(),
+            transient_effect_budgets: BTreeMap::new(),
+            pending_distributed_actions: VecDeque::new(),
         })
     }
 
     pub fn from_artifact(artifact: ProgramArtifact) -> Result<Self, AdapterError> {
         Self::new(artifact)
+    }
+
+    pub fn new_distributed(
+        bundle: &DistributedProgramBundle,
+        config: DistributedSessionRegistryConfig,
+    ) -> Result<Self, AdapterError> {
+        let artifact = bundle
+            .artifact(ProgramRole::Server)
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::InvalidArtifact,
+                    "distributed bundle has no Server artifact",
+                )
+            })?
+            .clone();
+        let mut program = Self::new(artifact)?;
+        program.attach_distributed_sessions(bundle, config)?;
+        Ok(program)
     }
 
     pub fn with_persistence<D>(
@@ -640,10 +1236,15 @@ impl BoonServerProgram {
     {
         validate_server_artifact(&artifact)?;
         let bindings = resolve_bindings(artifact.plan())?;
+        let required_transient_effects = collect_required_transient_effects([&artifact])?;
         let (session, startup) =
             PersistentProgramSession::start(artifact, driver, config.worker.clone())
                 .map_err(|error| AdapterError::new(AdapterErrorKind::Persistence, error))?;
-        let session = ServerRuntimeSession::Persistent(Box::new(session));
+        let session = ServerRuntimeSession::Persistent {
+            session: Box::new(session),
+            distributed_durability: config.durability.distributed,
+            distributed_acknowledgements: Vec::new(),
+        };
         let persistence = session
             .persistence_status()
             .expect("persistent session reports persistence status");
@@ -656,6 +1257,8 @@ impl BoonServerProgram {
         }
 
         let startup_disposition = startup.disposition.clone();
+        let restored_protocol_state = startup.protocol_state.clone();
+        let restored_authority_turn_sequence = startup.restore_image.through_turn_sequence;
         let restore_epoch = startup.restore_image.epoch;
         let lifecycle = ServerLifecycleHandle {
             status: Arc::new(Mutex::new(PersistentServerStatus {
@@ -679,26 +1282,884 @@ impl BoonServerProgram {
         };
         Ok((
             Self {
-                session,
+                authority: ServerAuthority {
+                    machine: session,
+                    routing: None,
+                    persistence: Some(PersistentServerState {
+                        durability: config.durability,
+                        lifecycle,
+                        admission_open: true,
+                        shutdown_complete: false,
+                    }),
+                },
+                restored_protocol_state,
+                restored_authority_turn_sequence,
+                distributed_sessions: None,
+                distributed_clock_origin: None,
+                distributed_wall_clock_origin: None,
+                distributed_transport_connections: BTreeMap::new(),
                 http: bindings.http,
                 websocket: bindings.websocket,
                 last_diagnostic: None,
-                persistent: Some(PersistentServerState {
-                    durability: config.durability,
-                    lifecycle,
-                    admission_open: true,
-                    shutdown_complete: false,
-                }),
                 transient_effect_host: None,
                 transient_effect_limits: TransientEffectLimits::default(),
-                active_transient_effects: BTreeSet::new(),
+                required_transient_effects,
+                active_transient_effects: BTreeMap::new(),
+                transient_effect_budgets: BTreeMap::new(),
+                pending_distributed_actions: VecDeque::new(),
             },
             server_startup,
         ))
     }
 
+    pub fn with_distributed_persistence<D>(
+        bundle: &DistributedProgramBundle,
+        driver: D,
+        persistence: PersistentServerConfig,
+        sessions: DistributedSessionRegistryConfig,
+    ) -> Result<(Self, PersistentServerStartup), AdapterError>
+    where
+        D: PersistenceDriver + Send + 'static,
+    {
+        let artifact = bundle
+            .artifact(ProgramRole::Server)
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::InvalidArtifact,
+                    "distributed bundle has no Server artifact",
+                )
+            })?
+            .clone();
+        let (mut program, startup) = Self::with_persistence(artifact, driver, persistence)?;
+        program.attach_distributed_sessions(bundle, sessions)?;
+        Ok((program, startup))
+    }
+
+    pub fn attach_distributed_sessions(
+        &mut self,
+        bundle: &DistributedProgramBundle,
+        config: DistributedSessionRegistryConfig,
+    ) -> Result<(), AdapterError> {
+        if self.authority.routing.is_some() || self.distributed_sessions.is_some() {
+            return Err(AdapterError::new(
+                AdapterErrorKind::InvalidArtifact,
+                "trusted Server already has a distributed Session registry",
+            ));
+        }
+        let required_transient_effects =
+            collect_required_transient_effects(bundle.artifacts().iter())?;
+        if let Some(host) = self.transient_effect_host.as_ref() {
+            validate_transient_effect_host(host.as_ref(), &required_transient_effects)?;
+        }
+        let artifact = bundle.artifact(ProgramRole::Server).ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::InvalidArtifact,
+                "distributed bundle has no Server artifact",
+            )
+        })?;
+        if artifact.id() != self.artifact().id()
+            || artifact.revision() != self.artifact().revision()
+            || artifact.plan_digest() != self.artifact().plan_digest()
+        {
+            return Err(AdapterError::new(
+                AdapterErrorKind::InvalidArtifact,
+                "distributed bundle Server artifact is not the program authority artifact",
+            ));
+        }
+        let clock_origin = Instant::now();
+        let wall_clock_origin = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+            AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "system clock is before the Unix epoch",
+            )
+        })?;
+        let (mut sessions, router_recovery) = DistributedSessionRegistry::start_with_recovery(
+            bundle,
+            config,
+            &self.restored_protocol_state,
+            self.restored_authority_turn_sequence,
+            wall_clock_origin,
+        )
+        .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
+        let mut server = match router_recovery.as_deref() {
+            Some(payload) => DistributedServerRuntime::start_with_recovery(artifact, payload),
+            None => DistributedServerRuntime::start(artifact),
+        }
+        .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
+        sessions
+            .validate_router_recovery(&server)
+            .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
+        if router_recovery.is_some() {
+            let prepared = sessions
+                .prepare_recovery_checkpoint(
+                    server
+                        .recovery_payload()
+                        .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error))?,
+                )
+                .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error))?;
+            {
+                let mut authority = server.bind(&mut self.authority.machine);
+                authority
+                    .commit_protocol_checkpoint(|turn_sequence| {
+                        prepared
+                            .changes(turn_sequence)
+                            .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
+                    })
+                    .map_err(|error| AdapterError::new(AdapterErrorKind::Persistence, error))?;
+            }
+            sessions.commit_recovery_checkpoint(prepared);
+            let acknowledgements = self.authority.machine.take_distributed_acknowledgements();
+            if acknowledgements.len() != 1 {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Persistence,
+                    "restored distributed recovery checkpoint did not produce one durable acknowledgement",
+                ));
+            }
+            self.record_persistent_accept(acknowledgements.first())?;
+        }
+        self.authority.routing = Some(server);
+        self.distributed_sessions = Some(sessions);
+        self.distributed_clock_origin = Some(clock_origin);
+        self.distributed_wall_clock_origin = Some(wall_clock_origin);
+        self.restored_protocol_state = boon_persistence::ProtocolStateSnapshot::default();
+        self.restored_authority_turn_sequence = 0;
+        self.distributed_transport_connections.clear();
+        self.required_transient_effects = required_transient_effects;
+        Ok(())
+    }
+
+    pub fn distributed_identity(&self) -> Option<DistributedSessionRegistryIdentity> {
+        self.distributed_sessions
+            .as_ref()
+            .map(DistributedSessionRegistry::identity)
+    }
+
+    pub fn distributed_session_count(&self) -> Option<usize> {
+        self.distributed_sessions
+            .as_ref()
+            .map(DistributedSessionRegistry::session_count)
+    }
+
+    pub fn begin_distributed_handshake(
+        &mut self,
+        now: Duration,
+        principal: SessionPrincipal,
+        client_frame: &[u8],
+    ) -> Result<DistributedSessionHandshakeStart, DistributedSessionRegistryError> {
+        let server = self
+            .authority
+            .routing
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+        let sessions = self
+            .distributed_sessions
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+        let mut authority = server.bind(&mut self.authority.machine);
+        sessions.begin_handshake(&mut authority, now, principal, client_frame)
+    }
+
+    pub fn commit_distributed_handshake(
+        &mut self,
+        now: Duration,
+        connection_id: DistributedSessionConnectionId,
+        client_frame: &[u8],
+    ) -> Result<Vec<u8>, DistributedSessionRegistryError> {
+        if self.authority.machine.supports_protocol_state() {
+            let mut sessions = self
+                .distributed_sessions
+                .as_ref()
+                .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
+                .fork_settled()?;
+            let mut server = self
+                .authority
+                .routing
+                .as_ref()
+                .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
+                .clone();
+            let turn = self.authority.machine.prepare_protocol_checkpoint()?;
+            let mut evaluation = match self.authority.machine.fork_prepared_evaluation(Some(&turn))
+            {
+                Ok(evaluation) => evaluation,
+                Err(error) => {
+                    let _ = self.authority.machine.rollback_prepared_turn();
+                    return Err(error.into());
+                }
+            };
+            let ready = match {
+                let mut authority = server.bind(&mut evaluation);
+                sessions.commit_handshake(&mut authority, now, connection_id, client_frame)
+            } {
+                Ok(ready) => ready,
+                Err(error) => {
+                    let _ = self.authority.machine.rollback_prepared_turn();
+                    return Err(error);
+                }
+            };
+            self.commit_distributed_recovery_candidate(sessions, server, evaluation, turn)?;
+            return Ok(ready);
+        }
+        let server = self
+            .authority
+            .routing
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+        let sessions = self
+            .distributed_sessions
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+        let mut authority = server.bind(&mut self.authority.machine);
+        sessions.commit_handshake(&mut authority, now, connection_id, client_frame)
+    }
+
+    fn commit_distributed_recovery_candidate(
+        &mut self,
+        mut sessions: DistributedSessionRegistry,
+        server: DistributedServerRuntime,
+        evaluation: ProgramSession,
+        turn: RuntimeTurn,
+    ) -> Result<(), DistributedSessionRegistryError> {
+        let prepared = match server
+            .recovery_payload()
+            .map_err(DistributedSessionRegistryError::from)
+            .and_then(|payload| sessions.prepare_recovery_checkpoint(payload))
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = self.authority.machine.rollback_prepared_turn();
+                return Err(error);
+            }
+        };
+        let changes = match prepared.changes(turn.sequence) {
+            Ok(changes) => changes,
+            Err(error) => {
+                let _ = self.authority.machine.rollback_prepared_turn();
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .authority
+            .machine
+            .commit_prepared_evaluation_with_protocol_state(turn, evaluation, changes)
+        {
+            let _ = self.authority.machine.rollback_prepared_turn();
+            return Err(error.into());
+        }
+        sessions.commit_recovery_checkpoint(prepared);
+        self.authority.routing = Some(server);
+        self.distributed_sessions = Some(sessions);
+
+        let acknowledgements = self.authority.machine.take_distributed_acknowledgements();
+        if acknowledgements.len() != 1 {
+            return Err(DistributedSessionRegistryError::Runtime(
+                DistributedRuntimeError::Runtime(
+                    "distributed recovery transaction did not produce one durable acknowledgement"
+                        .to_owned(),
+                ),
+            ));
+        }
+        self.record_persistent_accept(acknowledgements.first())
+            .map_err(|error| {
+                DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
+                    error.to_string(),
+                ))
+            })?;
+        Ok(())
+    }
+
+    pub fn disconnect_distributed_session(
+        &mut self,
+        now: Duration,
+        connection_id: DistributedSessionConnectionId,
+    ) -> Result<(), DistributedSessionRegistryError> {
+        let result = {
+            let server = self
+                .authority
+                .routing
+                .as_mut()
+                .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+            let sessions = self
+                .distributed_sessions
+                .as_mut()
+                .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+            let mut authority = server.bind(&mut self.authority.machine);
+            sessions.disconnect(&mut authority, now, connection_id)
+        };
+        self.finish_distributed_lifecycle_operation(result)
+    }
+
+    pub fn revoke_distributed_session(
+        &mut self,
+        connection_id: DistributedSessionConnectionId,
+        client_frame: &[u8],
+    ) -> Result<Vec<u8>, DistributedSessionRegistryError> {
+        let result = {
+            let server = self
+                .authority
+                .routing
+                .as_mut()
+                .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+            let sessions = self
+                .distributed_sessions
+                .as_mut()
+                .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+            let mut authority = server.bind(&mut self.authority.machine);
+            sessions.revoke(&mut authority, connection_id, client_frame)
+        };
+        self.finish_distributed_lifecycle_operation(result)
+    }
+
+    fn finish_distributed_lifecycle_operation<T>(
+        &mut self,
+        result: Result<T, DistributedSessionRegistryError>,
+    ) -> Result<T, DistributedSessionRegistryError> {
+        let durable_admissions = self
+            .distributed_sessions
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
+            .take_direct_lifecycle_durable_admissions()?;
+        let acknowledgements = self.authority.machine.take_distributed_acknowledgements();
+        let acknowledgement_result = if acknowledgements.len() > durable_admissions {
+            Err(DistributedSessionRegistryError::Runtime(
+                DistributedRuntimeError::Runtime(
+                    "distributed lifecycle acknowledgements exceed durable admissions".to_owned(),
+                ),
+            ))
+        } else {
+            let mut acknowledgements = acknowledgements.iter();
+            (0..durable_admissions).try_for_each(|_| {
+                self.record_persistent_accept(acknowledgements.next())
+                    .map_err(|error| {
+                        DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
+                            error.to_string(),
+                        ))
+                    })
+            })
+        };
+        match (result, acknowledgement_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(operation), Err(acknowledgement)) => {
+                Err(DistributedSessionRegistryError::Runtime(
+                    DistributedRuntimeError::Runtime(format!(
+                        "distributed lifecycle failed: {operation}; acknowledgement accounting failed: {acknowledgement}"
+                    )),
+                ))
+            }
+        }
+    }
+
+    pub fn admit_distributed_client_frame(
+        &mut self,
+        connection_id: DistributedSessionConnectionId,
+        frame: &[u8],
+    ) -> Result<(), DistributedSessionRegistryError> {
+        self.distributed_sessions
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
+            .admit_client_frame(connection_id, frame)
+    }
+
+    pub fn next_distributed_client_frame(
+        &mut self,
+        connection_id: DistributedSessionConnectionId,
+    ) -> Result<Option<Vec<u8>>, DistributedSessionRegistryError> {
+        self.distributed_sessions
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
+            .next_client_frame(connection_id)
+    }
+
+    pub fn acknowledge_distributed_client_frame(
+        &mut self,
+        connection_id: DistributedSessionConnectionId,
+    ) -> Result<bool, DistributedSessionRegistryError> {
+        self.distributed_sessions
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
+            .acknowledge_client_frame(connection_id)
+    }
+
+    pub fn poll_distributed_sessions(
+        &mut self,
+        now: Duration,
+        maximum_steps: usize,
+    ) -> Result<DistributedSessionRegistryPoll, DistributedSessionRegistryError> {
+        let server = self
+            .authority
+            .routing
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+        let sessions = self
+            .distributed_sessions
+            .as_mut()
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+        let poll = {
+            let mut authority = server.bind(&mut self.authority.machine);
+            sessions.poll(&mut authority, now, maximum_steps)?
+        };
+        let mutation_count = poll
+            .server_turns
+            .iter()
+            .filter(|(_, turn)| turn.source_sequence.is_some())
+            .count();
+        let durable_admission_count = mutation_count
+            .checked_add(poll.durable_protocol_checkpoints)
+            .ok_or_else(|| {
+                DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
+                    "distributed durability acknowledgement count overflowed".to_owned(),
+                ))
+            })?;
+        let acknowledgements = self.authority.machine.take_distributed_acknowledgements();
+        if acknowledgements.len() > durable_admission_count {
+            return Err(DistributedSessionRegistryError::Runtime(
+                DistributedRuntimeError::Runtime(
+                    "distributed persistence acknowledgements exceed admitted Server turns"
+                        .to_owned(),
+                ),
+            ));
+        }
+        let mut acknowledgements = acknowledgements.into_iter();
+        for _ in 0..durable_admission_count {
+            self.record_persistent_accept(acknowledgements.next().as_ref())
+                .map_err(|error| {
+                    DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
+                        error.to_string(),
+                    ))
+                })?;
+        }
+        Ok(poll)
+    }
+
+    pub fn distributed_next_deadline(&self) -> Option<Instant> {
+        let sessions = self.distributed_sessions.as_ref()?;
+        self.distributed_clock_origin?;
+        let instant_now = Instant::now();
+        let wall_now = self.distributed_now(instant_now).ok()?;
+        let lifecycle_deadline = sessions.next_deadline().and_then(|deadline| {
+            if deadline <= wall_now {
+                Some(instant_now)
+            } else {
+                instant_now.checked_add(deadline - wall_now)
+            }
+        });
+        let writer_admission_pending = self
+            .distributed_transport_connections
+            .values()
+            .any(|connection| connection.pending_send.is_some());
+        if writer_admission_pending {
+            return lifecycle_deadline;
+        }
+        let sendable_output = self
+            .distributed_transport_connections
+            .values()
+            .any(|connection| {
+                let DistributedTransportPhase::Current(registry_connection) = connection.phase
+                else {
+                    return false;
+                };
+                sessions
+                    .has_sendable_client_frame(registry_connection)
+                    .is_ok_and(|sendable| sendable)
+            });
+        if sessions.has_runnable_work() || sendable_output {
+            return Some(Instant::now());
+        }
+        lifecycle_deadline
+    }
+
+    fn distributed_now(&self, now: Instant) -> Result<Duration, DistributedSessionRegistryError> {
+        let origin = self
+            .distributed_clock_origin
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
+        let elapsed = now
+            .checked_duration_since(origin)
+            .ok_or(DistributedSessionRegistryError::TimeRegression)?;
+        self.distributed_wall_clock_origin
+            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
+            .checked_add(elapsed)
+            .ok_or(DistributedSessionRegistryError::TimeOverflow)
+    }
+
+    fn record_distributed_transport_failure(&mut self, error: impl Display) {
+        self.last_diagnostic = Some(AdapterError::new(AdapterErrorKind::Runtime, error));
+    }
+
+    fn queue_distributed_control_send(
+        &mut self,
+        connection: HostDistributedSessionConnectionId,
+        bytes: Vec<u8>,
+    ) -> DistributedSessionAction {
+        self.distributed_transport_connections
+            .get_mut(&connection)
+            .expect("distributed transport connection remains registered")
+            .pending_send = Some(DistributedTransportSend::Control);
+        DistributedSessionAction::send(connection, bytes)
+    }
+
+    fn fail_distributed_transport_connection(
+        &mut self,
+        connection: HostDistributedSessionConnectionId,
+        now: Duration,
+        error: impl Display,
+    ) -> Vec<DistributedSessionAction> {
+        let registry_connection = self
+            .distributed_transport_connections
+            .remove(&connection)
+            .and_then(|state| state.phase.registry_connection());
+        self.record_distributed_transport_failure(error);
+        if let Some(registry_connection) = registry_connection
+            && let Err(cleanup_error) =
+                self.disconnect_distributed_session(now, registry_connection)
+        {
+            self.record_distributed_transport_failure(format_args!(
+                "distributed transport cleanup failed: {cleanup_error}"
+            ));
+        }
+        vec![DistributedSessionAction::close(
+            connection,
+            WebSocketClose::new(1002, "invalid distributed Session transport"),
+        )]
+    }
+
+    fn fail_all_distributed_transport_connections(
+        &mut self,
+        now: Duration,
+        error: impl Display,
+    ) -> Vec<DistributedSessionAction> {
+        self.record_distributed_transport_failure(error);
+        let connections = self
+            .distributed_transport_connections
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut actions = Vec::with_capacity(connections.len());
+        for connection in connections {
+            let registry_connection = self
+                .distributed_transport_connections
+                .remove(&connection)
+                .and_then(|state| state.phase.registry_connection());
+            if let Some(registry_connection) = registry_connection
+                && let Err(cleanup_error) =
+                    self.disconnect_distributed_session(now, registry_connection)
+            {
+                self.record_distributed_transport_failure(format_args!(
+                    "distributed transport cleanup failed: {cleanup_error}"
+                ));
+            }
+            actions.push(DistributedSessionAction::close(
+                connection,
+                WebSocketClose::new(1011, "distributed Session runtime failed"),
+            ));
+        }
+        actions
+    }
+
+    fn collect_distributed_client_frames(
+        &mut self,
+        now: Duration,
+    ) -> Vec<DistributedSessionAction> {
+        let candidates = self
+            .distributed_transport_connections
+            .iter()
+            .filter_map(|(host_connection, state)| {
+                let DistributedTransportPhase::Current(registry_connection) = state.phase else {
+                    return None;
+                };
+                state
+                    .pending_send
+                    .is_none()
+                    .then_some((*host_connection, registry_connection))
+            })
+            .collect::<Vec<_>>();
+        let mut actions = Vec::new();
+        for (host_connection, registry_connection) in candidates {
+            match self.next_distributed_client_frame(registry_connection) {
+                Ok(Some(bytes)) => {
+                    self.distributed_transport_connections
+                        .get_mut(&host_connection)
+                        .expect("collected distributed transport connection remains registered")
+                        .pending_send = Some(DistributedTransportSend::Data);
+                    actions.push(DistributedSessionAction::send(host_connection, bytes));
+                }
+                Ok(None) => {}
+                Err(error) => actions.extend(self.fail_distributed_transport_connection(
+                    host_connection,
+                    now,
+                    error,
+                )),
+            }
+        }
+        actions
+    }
+
+    fn poll_distributed_transport(&mut self, now: Duration) -> Vec<DistributedSessionAction> {
+        let poll = match self.poll_distributed_sessions(now, MAX_DISTRIBUTED_SESSION_POLL_STEPS) {
+            Ok(poll) => poll,
+            Err(error) => return self.fail_all_distributed_transport_connections(now, error),
+        };
+        let DistributedSessionRegistryPoll {
+            poisoned_sessions,
+            session_turns,
+            server_turns,
+            ..
+        } = poll;
+        let mut actions = Vec::new();
+        for poisoned in poisoned_sessions {
+            self.record_distributed_transport_failure(&poisoned.diagnostic);
+            let Some(registry_connection) = poisoned.connection_id else {
+                continue;
+            };
+            let host_connection = self.distributed_transport_connections.iter().find_map(
+                |(host_connection, state)| {
+                    (state.phase.registry_connection() == Some(registry_connection))
+                        .then_some(*host_connection)
+                },
+            );
+            if let Some(host_connection) = host_connection {
+                self.distributed_transport_connections
+                    .remove(&host_connection);
+                actions.push(DistributedSessionAction::close(
+                    host_connection,
+                    WebSocketClose::new(1002, "invalid distributed Session frame"),
+                ));
+            }
+        }
+        for (origin, turn) in session_turns {
+            if let Err(error) = self.route_transient_runtime_turn(
+                &turn,
+                TransientRuntimeOwner::DistributedSession(origin),
+            ) {
+                actions.extend(self.fail_all_distributed_transport_connections(now, error));
+                return actions;
+            }
+        }
+        for (origin, turn) in server_turns {
+            if let Err(error) = self.route_transient_runtime_turn(
+                &turn,
+                TransientRuntimeOwner::DistributedServer(origin),
+            ) {
+                actions.extend(self.fail_all_distributed_transport_connections(now, error));
+                return actions;
+            }
+        }
+        actions.extend(self.collect_distributed_client_frames(now));
+        actions
+    }
+
+    fn handle_distributed_transport_event(
+        &mut self,
+        connection: HostDistributedSessionConnectionId,
+        event: DistributedSessionEvent,
+    ) -> Vec<DistributedSessionAction> {
+        match event {
+            DistributedSessionEvent::Open(_) => {
+                if self
+                    .distributed_transport_connections
+                    .contains_key(&connection)
+                {
+                    return vec![DistributedSessionAction::close(
+                        connection,
+                        WebSocketClose::new(1002, "duplicate distributed Session connection"),
+                    )];
+                }
+                self.distributed_transport_connections.insert(
+                    connection,
+                    DistributedTransportConnection {
+                        phase: DistributedTransportPhase::AwaitingHello,
+                        pending_send: None,
+                    },
+                );
+                Vec::new()
+            }
+            DistributedSessionEvent::Close(_) => {
+                let Some(state) = self.distributed_transport_connections.remove(&connection) else {
+                    return Vec::new();
+                };
+                let Ok(now) = self.distributed_now(Instant::now()) else {
+                    return Vec::new();
+                };
+                if let Some(registry_connection) = state.phase.registry_connection()
+                    && let Err(error) =
+                        self.disconnect_distributed_session(now, registry_connection)
+                {
+                    self.record_distributed_transport_failure(error);
+                }
+                self.poll_distributed_transport(now)
+            }
+            DistributedSessionEvent::Binary(bytes) => {
+                let now = match self.distributed_now(Instant::now()) {
+                    Ok(now) => now,
+                    Err(error) => {
+                        self.record_distributed_transport_failure(error);
+                        return vec![DistributedSessionAction::close(
+                            connection,
+                            WebSocketClose::new(1011, "distributed Session clock failed"),
+                        )];
+                    }
+                };
+                let Some(phase) = self
+                    .distributed_transport_connections
+                    .get(&connection)
+                    .map(|state| state.phase)
+                else {
+                    return vec![DistributedSessionAction::close(
+                        connection,
+                        WebSocketClose::new(1002, "unknown distributed Session connection"),
+                    )];
+                };
+                match phase {
+                    DistributedTransportPhase::AwaitingHello => {
+                        match self.begin_distributed_handshake(
+                            now,
+                            SessionPrincipal::Anonymous,
+                            &bytes,
+                        ) {
+                            Ok(DistributedSessionHandshakeStart::Offer(offer)) => {
+                                let (registry_connection, server_frame) = offer.into_parts();
+                                self.distributed_transport_connections
+                                    .get_mut(&connection)
+                                    .expect("distributed transport connection remains registered")
+                                    .phase =
+                                    DistributedTransportPhase::AwaitingCommit(registry_connection);
+                                vec![self.queue_distributed_control_send(connection, server_frame)]
+                            }
+                            Ok(DistributedSessionHandshakeStart::Reject(rejection)) => {
+                                let server_frame = rejection.server_frame().to_vec();
+                                self.distributed_transport_connections.remove(&connection);
+                                vec![
+                                    DistributedSessionAction::send(connection, server_frame),
+                                    DistributedSessionAction::close(
+                                        connection,
+                                        WebSocketClose::new(1008, "distributed Session rejected"),
+                                    ),
+                                ]
+                            }
+                            Err(error) => {
+                                self.fail_distributed_transport_connection(connection, now, error)
+                            }
+                        }
+                    }
+                    DistributedTransportPhase::AwaitingCommit(registry_connection) => {
+                        match self.commit_distributed_handshake(now, registry_connection, &bytes) {
+                            Ok(server_frame) => {
+                                self.distributed_transport_connections
+                                    .get_mut(&connection)
+                                    .expect("distributed transport connection remains registered")
+                                    .phase =
+                                    DistributedTransportPhase::Current(registry_connection);
+                                vec![self.queue_distributed_control_send(connection, server_frame)]
+                            }
+                            Err(error) => {
+                                self.fail_distributed_transport_connection(connection, now, error)
+                            }
+                        }
+                    }
+                    DistributedTransportPhase::Current(registry_connection) => {
+                        match decode_session_control_frame(&bytes) {
+                            Ok(SessionControlFrame::ClientRevoke(_)) => {
+                                match self.revoke_distributed_session(registry_connection, &bytes) {
+                                    Ok(server_frame) => {
+                                        self.distributed_transport_connections.remove(&connection);
+                                        vec![
+                                            DistributedSessionAction::send(
+                                                connection,
+                                                server_frame,
+                                            ),
+                                            DistributedSessionAction::close(
+                                                connection,
+                                                WebSocketClose::new(
+                                                    1000,
+                                                    "distributed Session revoked",
+                                                ),
+                                            ),
+                                        ]
+                                    }
+                                    Err(error) => self.fail_distributed_transport_connection(
+                                        connection, now, error,
+                                    ),
+                                }
+                            }
+                            Ok(_) => self.fail_distributed_transport_connection(
+                                connection,
+                                now,
+                                DistributedSessionRegistryError::UnexpectedControlFrame,
+                            ),
+                            Err(_) => {
+                                if let Err(error) =
+                                    self.admit_distributed_client_frame(registry_connection, &bytes)
+                                {
+                                    return self.fail_distributed_transport_connection(
+                                        connection, now, error,
+                                    );
+                                }
+                                self.poll_distributed_transport(now)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn acknowledge_distributed_transport_send(
+        &mut self,
+        connection: HostDistributedSessionConnectionId,
+    ) {
+        let pending = self
+            .distributed_transport_connections
+            .get_mut(&connection)
+            .and_then(|state| state.pending_send.take().map(|send| (send, state.phase)));
+        let Some((DistributedTransportSend::Data, phase)) = pending else {
+            return;
+        };
+        let DistributedTransportPhase::Current(registry_connection) = phase else {
+            self.record_distributed_transport_failure(
+                "distributed data send completed outside Current phase",
+            );
+            return;
+        };
+        match self.acknowledge_distributed_client_frame(registry_connection) {
+            Ok(true) => {}
+            Ok(false) => self.record_distributed_transport_failure(
+                "distributed data writer acknowledged a missing frame lease",
+            ),
+            Err(error) => self.record_distributed_transport_failure(error),
+        }
+    }
+
+    fn cancel_distributed_transport_connection(
+        &mut self,
+        connection: HostDistributedSessionConnectionId,
+    ) {
+        let Some(state) = self.distributed_transport_connections.remove(&connection) else {
+            return;
+        };
+        let Some(registry_connection) = state.phase.registry_connection() else {
+            return;
+        };
+        let Ok(now) = self.distributed_now(Instant::now()) else {
+            return;
+        };
+        if let Err(error) = self.disconnect_distributed_session(now, registry_connection) {
+            self.record_distributed_transport_failure(error);
+        }
+    }
+
+    fn cancel_all_distributed_transport_connections(&mut self) {
+        let connections = self
+            .distributed_transport_connections
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for connection in connections {
+            self.cancel_distributed_transport_connection(connection);
+        }
+    }
+
     pub fn artifact(&self) -> &ProgramArtifact {
-        self.session.artifact()
+        self.authority.machine.artifact()
     }
 
     pub fn has_http_port(&self) -> bool {
@@ -714,7 +2175,8 @@ impl BoonServerProgram {
     }
 
     pub fn lifecycle_handle(&self) -> Option<ServerLifecycleHandle> {
-        self.persistent
+        self.authority
+            .persistence
             .as_ref()
             .map(|state| state.lifecycle.clone())
     }
@@ -731,24 +2193,7 @@ impl BoonServerProgram {
             ));
         }
         let limits = limits.validate()?;
-        let missing = self
-            .artifact()
-            .plan()
-            .effects
-            .iter()
-            .filter(|effect| matches!(effect.replay, EffectReplay::ReadOnly))
-            .filter(|effect| !host.owns(effect.effect_id))
-            .map(|effect| effect.host_operation.as_str())
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(AdapterError::new(
-                AdapterErrorKind::InvalidArtifact,
-                format_args!(
-                    "transient effect host does not own required operations: {}",
-                    missing.join(", ")
-                ),
-            ));
-        }
+        validate_transient_effect_host(host.as_ref(), &self.required_transient_effects)?;
         self.transient_effect_limits = limits;
         self.transient_effect_host = Some(host);
         Ok(())
@@ -756,7 +2201,8 @@ impl BoonServerProgram {
 
     fn ensure_admission_open(&mut self) -> Result<(), AdapterError> {
         if self
-            .persistent
+            .authority
+            .persistence
             .as_ref()
             .is_some_and(|state| !state.admission_open)
         {
@@ -765,7 +2211,7 @@ impl BoonServerProgram {
                 "persistent server admission is closed",
             ));
         }
-        if let Some(persistence) = self.session.persistence_status()
+        if let Some(persistence) = self.authority.machine.persistence_status()
             && (!persistence.worker_alive
                 || !persistence.accepting_turns
                 || persistence.last_error.is_some())
@@ -782,14 +2228,261 @@ impl BoonServerProgram {
     }
 
     fn durability(&self, class: ServerTurnClass) -> ServerTurnDurability {
-        let Some(state) = &self.persistent else {
+        let Some(state) = &self.authority.persistence else {
             return ServerTurnDurability::Buffered;
         };
         match class {
             ServerTurnClass::Http => state.durability.http,
             ServerTurnClass::WebSocket => state.durability.websocket,
+            ServerTurnClass::Distributed => state.durability.distributed,
             ServerTurnClass::Disconnect => state.durability.disconnect,
         }
+    }
+
+    fn commit_prepared_distributed_update(
+        &mut self,
+        prepared: PreparedDistributedServerUpdate,
+    ) -> Result<DistributedServerUpdate, AdapterError> {
+        let prepares_machine_turn = prepared.prepares_machine_turn();
+        let prepared_deliveries = match self
+            .distributed_sessions
+            .as_ref()
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Runtime,
+                    "distributed Server routing has no Session registry",
+                )
+            })?
+            .prepare_deliveries(prepared.deliveries())
+        {
+            Ok(prepared_deliveries) => prepared_deliveries,
+            Err(error) => {
+                let rollback = self
+                    .authority
+                    .routing
+                    .as_mut()
+                    .expect("distributed preparation requires routing")
+                    .bind(&mut self.authority.machine)
+                    .rollback_prepared_update(prepared);
+                return match rollback {
+                    Ok(()) => Err(distributed_registry_adapter_error(error)),
+                    Err(rollback) => Err(AdapterError::new(
+                        AdapterErrorKind::Runtime,
+                        format_args!(
+                            "distributed delivery reservation failed: {error}; rollback failed: {rollback}"
+                        ),
+                    )),
+                };
+            }
+        };
+        let prepared_recovery = if self.authority.machine.supports_protocol_state() {
+            let router_payload = match prepared.candidate_recovery_payload() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    self.authority
+                        .routing
+                        .as_mut()
+                        .expect("distributed preparation requires routing")
+                        .bind(&mut self.authority.machine)
+                        .rollback_prepared_update(prepared)
+                        .map_err(distributed_runtime_adapter_error)?;
+                    return Err(distributed_runtime_adapter_error(error));
+                }
+            };
+            match self
+                .distributed_sessions
+                .as_ref()
+                .expect("distributed preparation requires a Session registry")
+                .prepare_recovery_checkpoint_with_deliveries(router_payload, &prepared_deliveries)
+            {
+                Ok(checkpoint) => Some(checkpoint),
+                Err(error) => {
+                    self.authority
+                        .routing
+                        .as_mut()
+                        .expect("distributed preparation requires routing")
+                        .bind(&mut self.authority.machine)
+                        .rollback_prepared_update(prepared)
+                        .map_err(distributed_runtime_adapter_error)?;
+                    return Err(distributed_registry_adapter_error(error));
+                }
+            }
+        } else {
+            None
+        };
+        let update = {
+            let mut authority = self
+                .authority
+                .routing
+                .as_mut()
+                .expect("distributed preparation requires routing")
+                .bind(&mut self.authority.machine);
+            match prepared_recovery.as_ref() {
+                Some(recovery) => authority.commit_prepared_update_with_protocol_state(
+                    prepared,
+                    |turn_sequence| {
+                        recovery
+                            .changes(turn_sequence)
+                            .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
+                    },
+                ),
+                None => authority.commit_prepared_update(prepared),
+            }
+            .map_err(distributed_runtime_adapter_error)?
+        };
+        self.distributed_sessions
+            .as_mut()
+            .expect("distributed preparation requires a Session registry")
+            .commit_deliveries(prepared_deliveries);
+        if let Some(recovery) = prepared_recovery {
+            self.distributed_sessions
+                .as_mut()
+                .expect("distributed preparation requires a Session registry")
+                .commit_recovery_checkpoint(recovery);
+        }
+
+        let mut acknowledgements = self.authority.machine.take_distributed_acknowledgements();
+        let durable_admission =
+            prepares_machine_turn || self.authority.machine.supports_protocol_state();
+        if acknowledgements.len() > usize::from(durable_admission) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Persistence,
+                "distributed persistence acknowledgements exceeded the committed machine turn",
+            ));
+        }
+        if durable_admission {
+            self.record_persistent_accept(acknowledgements.pop().as_ref())?;
+        }
+        Ok(update)
+    }
+
+    fn commit_prepared_distributed_transaction(
+        &mut self,
+        prepared: PreparedDistributedServerTransaction<ProgramSession>,
+    ) -> Result<DistributedServerUpdate, AdapterError> {
+        let prepares_machine_turn = prepared.prepares_machine_turn();
+        let prepared_deliveries = match self
+            .distributed_sessions
+            .as_ref()
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Runtime,
+                    "distributed Server routing has no Session registry",
+                )
+            })?
+            .prepare_deliveries(prepared.deliveries())
+        {
+            Ok(prepared_deliveries) => prepared_deliveries,
+            Err(error) => {
+                let rollback = self
+                    .authority
+                    .routing
+                    .as_mut()
+                    .expect("distributed transaction requires routing")
+                    .bind(&mut self.authority.machine)
+                    .rollback_prepared_transaction(prepared);
+                return match rollback {
+                    Ok(()) => Err(distributed_registry_adapter_error(error)),
+                    Err(rollback) => Err(AdapterError::new(
+                        AdapterErrorKind::Runtime,
+                        format_args!(
+                            "distributed delivery reservation failed: {error}; rollback failed: {rollback}"
+                        ),
+                    )),
+                };
+            }
+        };
+        let prepared_recovery = if self.authority.machine.supports_protocol_state() {
+            let router_payload = match prepared.candidate_recovery_payload() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    self.authority
+                        .routing
+                        .as_mut()
+                        .expect("distributed transaction requires routing")
+                        .bind(&mut self.authority.machine)
+                        .rollback_prepared_transaction(prepared)
+                        .map_err(distributed_runtime_adapter_error)?;
+                    return Err(distributed_runtime_adapter_error(error));
+                }
+            };
+            match self
+                .distributed_sessions
+                .as_ref()
+                .expect("distributed transaction requires a Session registry")
+                .prepare_recovery_checkpoint_with_deliveries(router_payload, &prepared_deliveries)
+            {
+                Ok(checkpoint) => Some(checkpoint),
+                Err(error) => {
+                    self.authority
+                        .routing
+                        .as_mut()
+                        .expect("distributed transaction requires routing")
+                        .bind(&mut self.authority.machine)
+                        .rollback_prepared_transaction(prepared)
+                        .map_err(distributed_runtime_adapter_error)?;
+                    return Err(distributed_registry_adapter_error(error));
+                }
+            }
+        } else {
+            None
+        };
+        let update = {
+            let mut authority = self
+                .authority
+                .routing
+                .as_mut()
+                .expect("distributed transaction requires routing")
+                .bind(&mut self.authority.machine);
+            match prepared_recovery.as_ref() {
+                Some(recovery) => authority.commit_prepared_transaction_with_protocol_state(
+                    prepared,
+                    |turn_sequence| {
+                        recovery
+                            .changes(turn_sequence)
+                            .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
+                    },
+                ),
+                None => authority.commit_prepared_transaction(prepared),
+            }
+            .map_err(distributed_runtime_adapter_error)?
+        };
+        self.distributed_sessions
+            .as_mut()
+            .expect("distributed transaction requires a Session registry")
+            .commit_deliveries(prepared_deliveries);
+        if let Some(recovery) = prepared_recovery {
+            self.distributed_sessions
+                .as_mut()
+                .expect("distributed transaction requires a Session registry")
+                .commit_recovery_checkpoint(recovery);
+        }
+
+        let mut acknowledgements = self.authority.machine.take_distributed_acknowledgements();
+        let durable_admission =
+            prepares_machine_turn || self.authority.machine.supports_protocol_state();
+        if acknowledgements.len() > usize::from(durable_admission) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Persistence,
+                "distributed persistence acknowledgements exceeded the committed machine turn",
+            ));
+        }
+        if durable_admission {
+            self.record_persistent_accept(acknowledgements.pop().as_ref())?;
+        }
+        Ok(update)
+    }
+
+    fn prepare_distributed_global_read(&mut self) -> Result<(), AdapterError> {
+        let Some(routing) = self.authority.routing.as_mut() else {
+            return Ok(());
+        };
+        let prepared = routing
+            .bind(&mut self.authority.machine)
+            .prepare_global_read_update()
+            .map_err(distributed_runtime_adapter_error)?;
+        self.commit_prepared_distributed_update(prepared)?;
+        Ok(())
     }
 
     fn dispatch_turn(
@@ -800,7 +2493,55 @@ impl BoonServerProgram {
     ) -> Result<ProgramSessionDispatch, AdapterError> {
         self.ensure_admission_open()?;
         let durability = self.durability(class);
-        let result = self.session.dispatch(source_path, payload, durability);
+        if self.authority.routing.is_some() {
+            let result = (|| {
+                let prepared = self
+                    .authority
+                    .routing
+                    .as_mut()
+                    .expect("checked distributed routing")
+                    .bind(&mut self.authority.machine)
+                    .prepare_global_source_transaction(
+                        source_path,
+                        payload,
+                        durability == ServerTurnDurability::Immediate,
+                    )
+                    .map_err(distributed_runtime_adapter_error)?;
+                let update = self.commit_prepared_distributed_transaction(prepared)?;
+                let mut source_turns = update
+                    .turns
+                    .into_iter()
+                    .filter(|turn| turn.source_sequence.is_some());
+                let runtime_turn = source_turns.next().ok_or_else(|| {
+                    AdapterError::new(
+                        AdapterErrorKind::Runtime,
+                        "distributed Global source committed without a source turn",
+                    )
+                })?;
+                if source_turns.next().is_some() {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Runtime,
+                        "distributed Global source committed multiple source turns",
+                    ));
+                }
+                let source_sequence = runtime_turn
+                    .source_sequence
+                    .expect("filtered distributed source turn has a sequence");
+                Ok(ProgramSessionDispatch {
+                    source_sequence,
+                    source_path: source_path.to_owned(),
+                    runtime_turn,
+                })
+            })();
+            if let Err(error) = &result {
+                self.record_persistent_rejection(error);
+            }
+            return result;
+        }
+        let result = self
+            .authority
+            .machine
+            .dispatch(source_path, payload, durability);
         match result {
             Ok(result) => {
                 self.record_persistent_accept(result.acknowledgement.as_ref())?;
@@ -813,144 +2554,312 @@ impl BoonServerProgram {
         }
     }
 
+    fn complete_server_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+        class: ServerTurnClass,
+    ) -> Result<RuntimeTurn, AdapterError> {
+        let durability = self.durability(class);
+        let result = if self.authority.routing.is_some() {
+            (|| {
+                let prepared = self
+                    .authority
+                    .routing
+                    .as_mut()
+                    .expect("checked distributed routing")
+                    .bind(&mut self.authority.machine)
+                    .prepare_transient_effect_completion_transaction(
+                        call_id,
+                        outcome,
+                        durability == ServerTurnDurability::Immediate,
+                    )
+                    .map_err(distributed_runtime_adapter_error)?;
+                let mut update = self.commit_prepared_distributed_transaction(prepared)?;
+                update.turns.pop().ok_or_else(|| {
+                    AdapterError::new(
+                        AdapterErrorKind::Runtime,
+                        "distributed transient effect committed without a runtime turn",
+                    )
+                })
+            })()
+        } else {
+            self.authority
+                .machine
+                .complete_transient_effect(call_id, outcome, durability)
+                .and_then(|turn| {
+                    self.record_persistent_accept(turn.acknowledgement.as_ref())?;
+                    Ok(turn.runtime_turn)
+                })
+        };
+        if let Err(error) = &result {
+            self.record_persistent_rejection(error);
+        }
+        result
+    }
+
+    fn deliver_server_transient_effect_result(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+        class: ServerTurnClass,
+    ) -> Result<RuntimeTurn, AdapterError> {
+        let durability = self.durability(class);
+        let result = if self.authority.routing.is_some() {
+            (|| {
+                let prepared = self
+                    .authority
+                    .routing
+                    .as_mut()
+                    .expect("checked distributed routing")
+                    .bind(&mut self.authority.machine)
+                    .prepare_transient_effect_result_transaction(
+                        call_id,
+                        result_sequence,
+                        outcome,
+                        durability == ServerTurnDurability::Immediate,
+                    )
+                    .map_err(distributed_runtime_adapter_error)?;
+                let mut update = self.commit_prepared_distributed_transaction(prepared)?;
+                update.turns.pop().ok_or_else(|| {
+                    AdapterError::new(
+                        AdapterErrorKind::Runtime,
+                        "distributed stream effect committed without a runtime turn",
+                    )
+                })
+            })()
+        } else {
+            self.authority
+                .machine
+                .deliver_transient_effect_result(call_id, result_sequence, outcome, durability)
+                .and_then(|turn| {
+                    self.record_persistent_accept(turn.acknowledgement.as_ref())?;
+                    Ok(turn.runtime_turn)
+                })
+        };
+        if let Err(error) = &result {
+            self.record_persistent_rejection(error);
+        }
+        result
+    }
+
+    fn cancel_server_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+        class: ServerTurnClass,
+    ) -> Result<bool, AdapterError> {
+        if !self.authority.machine.has_pending_transient_effect(call_id) {
+            return Ok(false);
+        }
+        let durability = self.durability(class);
+        if let Some(routing) = self.authority.routing.as_mut() {
+            let prepared = routing
+                .bind(&mut self.authority.machine)
+                .prepare_transient_effect_cancellation_transaction(
+                    call_id,
+                    durability == ServerTurnDurability::Immediate,
+                )
+                .map_err(distributed_runtime_adapter_error)?;
+            self.commit_prepared_distributed_transaction(prepared)?;
+            return Ok(true);
+        }
+        self.authority.machine.cancel_transient_effect(call_id)
+    }
+
     async fn settle_transient_effects(
         &mut self,
-        initial: Vec<TransientEffectInvocation>,
+        initial: RuntimeTurn,
         class: ServerTurnClass,
     ) -> Result<(), AdapterError> {
-        if initial.is_empty() {
-            return Ok(());
-        }
-        if !self.active_transient_effects.is_empty() {
+        let owner = TransientRuntimeOwner::DirectServer(class);
+        if self.owner_has_active_transient_effects(owner) {
             return Err(AdapterError::new(
                 AdapterErrorKind::Runtime,
-                "a server transaction started while transient effects from another transaction remained active",
+                "a direct server transaction started while its previous transient effects remained active",
             ));
         }
-        if let Err(error) = self.register_transient_calls(&initial) {
-            self.cancel_unregistered_transient_effects(&initial);
+        if let Err(error) = self.route_transient_runtime_turn(&initial, owner) {
+            self.cancel_unregistered_transient_effects(&initial.transient_effects, owner);
+            self.cancel_transient_effect_owner(owner);
             return Err(error);
         }
-        let mut calls = initial;
-        let mut completed_count = 0usize;
-        let mut round_count = 0usize;
 
-        while !calls.is_empty() {
-            round_count = round_count.saturating_add(1);
-            if round_count > self.transient_effect_limits.max_chained_rounds
-                || calls.len() > self.transient_effect_limits.max_calls_per_round
-                || completed_count.saturating_add(calls.len())
-                    > self.transient_effect_limits.max_calls_per_transaction
-            {
-                self.cancel_active_transient_effects();
-                return Err(AdapterError::new(
-                    AdapterErrorKind::Runtime,
-                    "transient effect transaction exceeded its bounded call or chained-round limit",
-                ));
-            }
-            let call_order = calls.iter().map(|call| call.call_id).collect::<Vec<_>>();
-            let result = match self.transient_effect_host.as_mut() {
-                Some(host) => host.execute_batch(calls).await,
+        while self.owner_has_active_transient_effects(owner) {
+            let event = match self.transient_effect_host.as_mut() {
+                Some(host) => host.next_event().await,
                 None => {
-                    self.cancel_active_transient_effects();
+                    self.cancel_transient_effect_owner(owner);
                     return Err(AdapterError::new(
                         AdapterErrorKind::Unsupported,
                         "trusted server emitted a transient effect without an attached host",
                     ));
                 }
             };
-            let result = match result {
-                Ok(result) => result,
+            let event = match event {
+                Ok(event) => event,
                 Err(error) => {
-                    self.cancel_active_transient_effects();
+                    self.cancel_transient_effect_owner(owner);
                     return Err(AdapterError::new(AdapterErrorKind::Runtime, error));
                 }
             };
-            let settled = match validate_effect_batch_result(&call_order, result) {
-                Ok(settled) => settled,
-                Err(error) => {
-                    self.cancel_active_transient_effects();
-                    return Err(error);
-                }
-            };
-            let mut chained = Vec::new();
-            for call_id in call_order {
-                match settled
-                    .get(&call_id)
-                    .expect("validated effect batch covers every call")
-                {
-                    SettledTransientEffect::Cancelled => {
-                        if let Err(error) = self.session.cancel_transient_effect(call_id) {
-                            self.cancel_active_transient_effects();
-                            return Err(error);
-                        }
-                        self.active_transient_effects.remove(&call_id);
-                    }
-                    SettledTransientEffect::Completed(outcome) => {
-                        let durability = self.durability(class);
-                        let turn = match self.session.complete_transient_effect(
-                            call_id,
-                            outcome.clone(),
-                            durability,
-                        ) {
-                            Ok(turn) => turn,
-                            Err(error) => {
-                                self.cancel_active_transient_effects();
-                                return Err(error);
-                            }
-                        };
-                        self.active_transient_effects.remove(&call_id);
-                        if let Err(error) =
-                            self.record_persistent_accept(turn.acknowledgement.as_ref())
-                        {
-                            self.cancel_unregistered_transient_effects(
-                                &turn.runtime_turn.transient_effects,
-                            );
-                            self.cancel_active_transient_effects();
-                            return Err(error);
-                        }
-                        if let Err(error) =
-                            self.register_transient_calls(&turn.runtime_turn.transient_effects)
-                        {
-                            self.cancel_unregistered_transient_effects(
-                                &turn.runtime_turn.transient_effects,
-                            );
-                            self.cancel_active_transient_effects();
-                            return Err(error);
-                        }
-                        chained.extend(turn.runtime_turn.transient_effects);
-                    }
-                }
-                completed_count = completed_count.saturating_add(1);
+            if let Err(error) = self.apply_transient_host_event(event) {
+                self.cancel_transient_effect_owner(owner);
+                return Err(error);
             }
-            calls = chained;
         }
-
-        if !self.active_transient_effects.is_empty()
-            || self.session.pending_transient_effect_count() != 0
-        {
-            self.cancel_active_transient_effects();
-            return Err(AdapterError::new(
-                AdapterErrorKind::Runtime,
-                "transient effect host completed a transaction with pending runtime calls",
-            ));
-        }
+        self.transient_effect_budgets.remove(&owner);
         Ok(())
     }
 
-    fn register_transient_calls(
+    fn apply_transient_host_event(
         &mut self,
-        calls: &[TransientEffectInvocation],
+        event: TransientEffectHostEvent,
     ) -> Result<(), AdapterError> {
-        let Some(host) = self.transient_effect_host.as_ref() else {
+        let call_id = match &event {
+            TransientEffectHostEvent::Result { call_id, .. }
+            | TransientEffectHostEvent::Cancelled { call_id } => *call_id,
+        };
+        let active = self
+            .active_transient_effects
+            .get(&call_id)
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::Runtime,
+                    "transient effect host returned an event for an unknown call",
+                )
+            })?;
+        let budget = self
+            .transient_effect_budgets
+            .get_mut(&active.owner)
+            .expect("an active transient effect has an owner budget");
+        budget.delivered_events = budget.delivered_events.saturating_add(1);
+        if budget.delivered_events > self.transient_effect_limits.max_events_per_transaction {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "transient effect owner exceeded its bounded event limit",
+            ));
+        }
+
+        match event {
+            TransientEffectHostEvent::Cancelled { call_id } => {
+                self.active_transient_effects.remove(&call_id);
+                self.cancel_runtime_transient_effect(call_id, active.owner)?;
+            }
+            TransientEffectHostEvent::Result {
+                call_id,
+                delivery,
+                outcome,
+            } => {
+                let (turn, pending) = match (&active.delivery, delivery) {
+                    (
+                        boon_plan::EffectDeliveryCardinality::Single,
+                        TransientEffectHostDelivery::Single,
+                    ) => self.complete_runtime_transient_effect(call_id, outcome, active.owner)?,
+                    (
+                        boon_plan::EffectDeliveryCardinality::Stream { .. },
+                        TransientEffectHostDelivery::Stream { result_sequence },
+                    ) => self.deliver_runtime_transient_effect_result(
+                        call_id,
+                        result_sequence,
+                        outcome,
+                        active.owner,
+                    )?,
+                    _ => {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Runtime,
+                            "transient effect host used the wrong delivery shape for a call",
+                        ));
+                    }
+                };
+                if !pending {
+                    self.active_transient_effects.remove(&call_id);
+                }
+                if let Some(turn) = turn {
+                    self.route_transient_runtime_turn(&turn, active.owner)?;
+                }
+            }
+        }
+        if matches!(
+            active.owner,
+            TransientRuntimeOwner::DistributedServer(_)
+                | TransientRuntimeOwner::DistributedSession(_)
+        ) {
+            self.queue_distributed_follow_up();
+        }
+        self.remove_idle_transient_effect_budget(active.owner);
+        Ok(())
+    }
+
+    fn route_transient_runtime_turn(
+        &mut self,
+        turn: &RuntimeTurn,
+        owner: TransientRuntimeOwner,
+    ) -> Result<(), AdapterError> {
+        if turn.transient_effects.is_empty()
+            && turn.cancelled_transient_effects.is_empty()
+            && turn.transient_effect_credit_grants.is_empty()
+        {
+            return Ok(());
+        }
+        if self.transient_effect_host.is_none() {
             return Err(AdapterError::new(
                 AdapterErrorKind::Unsupported,
                 "trusted server emitted a transient effect without an attached host",
             ));
-        };
+        }
+
+        let mut cancelled_owners = BTreeSet::new();
+        for call_id in &turn.cancelled_transient_effects {
+            let Some(cancelled) = self.active_transient_effects.remove(call_id) else {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Runtime,
+                    "runtime cancelled a transient effect not owned by the host",
+                ));
+            };
+            cancelled_owners.insert(cancelled.owner);
+        }
+        if let Some(host) = self.transient_effect_host.as_mut() {
+            for call_id in &turn.cancelled_transient_effects {
+                host.cancel(*call_id);
+            }
+            host.grant_credits(&turn.transient_effect_credit_grants)
+                .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error))?;
+        }
+
+        let calls = &turn.transient_effects;
+        if calls.is_empty() {
+            for cancelled_owner in cancelled_owners {
+                self.remove_idle_transient_effect_budget(cancelled_owner);
+            }
+            return Ok(());
+        }
+        let submitted_calls = self
+            .transient_effect_budgets
+            .get(&owner)
+            .map_or(0, |budget| budget.submitted_calls);
+        if submitted_calls.saturating_add(calls.len())
+            > self.transient_effect_limits.max_calls_per_transaction
+            || self
+                .active_transient_effects
+                .len()
+                .saturating_add(calls.len())
+                > self.transient_effect_limits.max_active_calls
+        {
+            return Err(AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "transient effect transaction exceeded its bounded call limit",
+            ));
+        }
         let mut batch = BTreeSet::new();
         for call in calls {
-            if !host.owns(call.effect_id) {
+            if !self
+                .transient_effect_host
+                .as_ref()
+                .expect("host checked above")
+                .owns(call.effect_id)
+            {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Unsupported,
                     format_args!(
@@ -959,7 +2868,8 @@ impl BoonServerProgram {
                     ),
                 ));
             }
-            if self.active_transient_effects.contains(&call.call_id) || !batch.insert(call.call_id)
+            if self.active_transient_effects.contains_key(&call.call_id)
+                || !batch.insert(call.call_id)
             {
                 return Err(AdapterError::new(
                     AdapterErrorKind::Runtime,
@@ -967,14 +2877,38 @@ impl BoonServerProgram {
                 ));
             }
         }
-        self.active_transient_effects.extend(batch);
+        for call in calls {
+            self.active_transient_effects.insert(
+                call.call_id,
+                ActiveTransientEffect {
+                    delivery: call.delivery.clone(),
+                    owner,
+                },
+            );
+        }
+        self.transient_effect_budgets
+            .entry(owner)
+            .or_default()
+            .submitted_calls = submitted_calls.saturating_add(calls.len());
+        self.transient_effect_host
+            .as_mut()
+            .expect("host checked above")
+            .submit(calls.clone())
+            .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error))?;
+        for cancelled_owner in cancelled_owners {
+            self.remove_idle_transient_effect_budget(cancelled_owner);
+        }
         Ok(())
     }
 
-    fn cancel_unregistered_transient_effects(&mut self, calls: &[TransientEffectInvocation]) {
+    fn cancel_unregistered_transient_effects(
+        &mut self,
+        calls: &[TransientEffectInvocation],
+        owner: TransientRuntimeOwner,
+    ) {
         for call in calls {
-            if !self.active_transient_effects.contains(&call.call_id) {
-                let _ = self.session.cancel_transient_effect(call.call_id);
+            if !self.active_transient_effects.contains_key(&call.call_id) {
+                self.cancel_runtime_transient_effect_best_effort(call.call_id, owner);
             }
         }
     }
@@ -982,21 +2916,320 @@ impl BoonServerProgram {
     fn cancel_active_transient_effects(&mut self) {
         let active = std::mem::take(&mut self.active_transient_effects);
         if let Some(host) = self.transient_effect_host.as_mut() {
-            for call_id in &active {
+            for call_id in active.keys() {
                 host.cancel(*call_id);
             }
         }
-        for call_id in active {
-            let _ = self.session.cancel_transient_effect(call_id);
+        for (call_id, active) in active {
+            self.cancel_runtime_transient_effect_best_effort(call_id, active.owner);
         }
+        self.transient_effect_budgets.clear();
+    }
+
+    fn cancel_transient_effect_owner(&mut self, owner: TransientRuntimeOwner) {
+        let calls = self
+            .active_transient_effects
+            .iter()
+            .filter_map(|(call_id, active)| (active.owner == owner).then_some(*call_id))
+            .collect::<Vec<_>>();
+        if let Some(host) = self.transient_effect_host.as_mut() {
+            for call_id in &calls {
+                host.cancel(*call_id);
+            }
+        }
+        for call_id in calls {
+            self.active_transient_effects.remove(&call_id);
+            self.cancel_runtime_transient_effect_best_effort(call_id, owner);
+        }
+        self.transient_effect_budgets.remove(&owner);
+    }
+
+    fn owner_has_active_transient_effects(&self, owner: TransientRuntimeOwner) -> bool {
+        self.active_transient_effects
+            .values()
+            .any(|active| active.owner == owner)
+    }
+
+    fn remove_idle_transient_effect_budget(&mut self, owner: TransientRuntimeOwner) {
+        if !self.owner_has_active_transient_effects(owner) {
+            self.transient_effect_budgets.remove(&owner);
+        }
+    }
+
+    fn complete_runtime_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+        owner: TransientRuntimeOwner,
+    ) -> Result<(Option<RuntimeTurn>, bool), AdapterError> {
+        match owner {
+            TransientRuntimeOwner::DirectServer(class) => {
+                let turn = self.complete_server_transient_effect(call_id, outcome, class)?;
+                let pending = self.authority.machine.has_pending_transient_effect(call_id);
+                Ok((Some(turn), pending))
+            }
+            TransientRuntimeOwner::DistributedServer(_) => {
+                let turn = self.complete_server_transient_effect(
+                    call_id,
+                    outcome,
+                    ServerTurnClass::Distributed,
+                )?;
+                let pending = self.authority.machine.has_pending_transient_effect(call_id);
+                Ok((Some(turn), pending))
+            }
+            TransientRuntimeOwner::DistributedSession(origin) => {
+                let pending =
+                    self.complete_distributed_session_transient_effect(origin, call_id, outcome)?;
+                Ok((None, pending))
+            }
+        }
+    }
+
+    fn deliver_runtime_transient_effect_result(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+        owner: TransientRuntimeOwner,
+    ) -> Result<(Option<RuntimeTurn>, bool), AdapterError> {
+        match owner {
+            TransientRuntimeOwner::DirectServer(class) => {
+                let turn = self.deliver_server_transient_effect_result(
+                    call_id,
+                    result_sequence,
+                    outcome,
+                    class,
+                )?;
+                let pending = self.authority.machine.has_pending_transient_effect(call_id);
+                Ok((Some(turn), pending))
+            }
+            TransientRuntimeOwner::DistributedServer(_) => {
+                let turn = self.deliver_server_transient_effect_result(
+                    call_id,
+                    result_sequence,
+                    outcome,
+                    ServerTurnClass::Distributed,
+                )?;
+                let pending = self.authority.machine.has_pending_transient_effect(call_id);
+                Ok((Some(turn), pending))
+            }
+            TransientRuntimeOwner::DistributedSession(origin) => {
+                let pending = self.deliver_distributed_session_transient_effect_result(
+                    origin,
+                    call_id,
+                    result_sequence,
+                    outcome,
+                )?;
+                Ok((None, pending))
+            }
+        }
+    }
+
+    fn cancel_runtime_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+        owner: TransientRuntimeOwner,
+    ) -> Result<(), AdapterError> {
+        match owner {
+            TransientRuntimeOwner::DirectServer(class) => {
+                self.cancel_server_transient_effect(call_id, class)?;
+            }
+            TransientRuntimeOwner::DistributedServer(_) => {
+                self.cancel_server_transient_effect(call_id, ServerTurnClass::Distributed)?;
+            }
+            TransientRuntimeOwner::DistributedSession(origin) => {
+                self.cancel_distributed_session_transient_effect(origin, call_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_distributed_session_transient_effect(
+        &mut self,
+        origin: boon_runtime::SessionOrigin,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+    ) -> Result<bool, AdapterError> {
+        let routing = self.authority.routing.as_mut().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "distributed Session effect completion has no Server router",
+            )
+        })?;
+        let sessions = self.distributed_sessions.as_mut().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "distributed Session effect completion has no Session registry",
+            )
+        })?;
+        let mut authority = routing.bind(&mut self.authority.machine);
+        sessions
+            .complete_session_transient_effect(&mut authority, origin, call_id, outcome)
+            .map_err(distributed_registry_adapter_error)
+    }
+
+    fn deliver_distributed_session_transient_effect_result(
+        &mut self,
+        origin: boon_runtime::SessionOrigin,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+    ) -> Result<bool, AdapterError> {
+        let routing = self.authority.routing.as_mut().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "distributed Session stream completion has no Server router",
+            )
+        })?;
+        let sessions = self.distributed_sessions.as_mut().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "distributed Session stream completion has no Session registry",
+            )
+        })?;
+        let mut authority = routing.bind(&mut self.authority.machine);
+        sessions
+            .deliver_session_transient_effect_result(
+                &mut authority,
+                origin,
+                call_id,
+                result_sequence,
+                outcome,
+            )
+            .map_err(distributed_registry_adapter_error)
+    }
+
+    fn cancel_distributed_session_transient_effect(
+        &mut self,
+        origin: boon_runtime::SessionOrigin,
+        call_id: TransientEffectCallId,
+    ) -> Result<(), AdapterError> {
+        let routing = self.authority.routing.as_mut().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "distributed Session effect cancellation has no Server router",
+            )
+        })?;
+        let sessions = self.distributed_sessions.as_mut().ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::Runtime,
+                "distributed Session effect cancellation has no Session registry",
+            )
+        })?;
+        let mut authority = routing.bind(&mut self.authority.machine);
+        sessions
+            .cancel_session_transient_effect(&mut authority, origin, call_id)
+            .map_err(distributed_registry_adapter_error)
+    }
+
+    fn cancel_runtime_transient_effect_best_effort(
+        &mut self,
+        call_id: TransientEffectCallId,
+        owner: TransientRuntimeOwner,
+    ) {
+        let _ = self.cancel_runtime_transient_effect(call_id, owner);
+    }
+
+    fn has_distributed_transient_effect_work(&self) -> bool {
+        self.active_transient_effects.values().any(|active| {
+            matches!(
+                active.owner,
+                TransientRuntimeOwner::DistributedServer(_)
+                    | TransientRuntimeOwner::DistributedSession(_)
+            )
+        })
+    }
+
+    fn queue_distributed_follow_up(&mut self) {
+        let now = match self.distributed_now(Instant::now()) {
+            Ok(now) => now,
+            Err(error) => {
+                self.fail_distributed_transient_work(error);
+                return;
+            }
+        };
+        let actions = self.poll_distributed_transport(now);
+        self.pending_distributed_actions.extend(actions);
+    }
+
+    fn take_pending_distributed_actions(&mut self) -> Vec<DistributedSessionAction> {
+        self.pending_distributed_actions.drain(..).collect()
+    }
+
+    fn cancel_distributed_transient_effects(&mut self) {
+        let owners = self
+            .active_transient_effects
+            .values()
+            .filter_map(|active| {
+                matches!(
+                    active.owner,
+                    TransientRuntimeOwner::DistributedServer(_)
+                        | TransientRuntimeOwner::DistributedSession(_)
+                )
+                .then_some(active.owner)
+            })
+            .collect::<BTreeSet<_>>();
+        for owner in owners {
+            self.cancel_transient_effect_owner(owner);
+        }
+    }
+
+    fn fail_distributed_transient_work(&mut self, error: impl Display) {
+        let diagnostic = error.to_string();
+        self.cancel_distributed_transient_effects();
+        self.pending_distributed_actions.clear();
+        let actions = match self.distributed_now(Instant::now()) {
+            Ok(now) => self.fail_all_distributed_transport_connections(now, &diagnostic),
+            Err(clock_error) => {
+                self.record_distributed_transport_failure(format_args!(
+                    "{diagnostic}; distributed cleanup clock failed: {clock_error}"
+                ));
+                std::mem::take(&mut self.distributed_transport_connections)
+                    .into_keys()
+                    .map(|connection| {
+                        DistributedSessionAction::close(
+                            connection,
+                            WebSocketClose::new(1011, "distributed Session runtime failed"),
+                        )
+                    })
+                    .collect()
+            }
+        };
+        self.pending_distributed_actions.extend(actions);
+    }
+
+    async fn service_distributed_transient_effect_work(&mut self) -> Vec<DistributedSessionAction> {
+        if !self.pending_distributed_actions.is_empty() {
+            return self.take_pending_distributed_actions();
+        }
+        if !self.has_distributed_transient_effect_work() {
+            return Vec::new();
+        }
+        let event = match self.transient_effect_host.as_mut() {
+            Some(host) => host.next_event().await,
+            None => Err(TransientEffectHostError::new(
+                "distributed runtime emitted a transient effect without an attached host",
+            )),
+        };
+        match event {
+            Ok(event) => {
+                if let Err(error) = self.apply_transient_host_event(event) {
+                    self.fail_distributed_transient_work(error);
+                }
+            }
+            Err(error) => {
+                self.fail_distributed_transient_work(error);
+            }
+        }
+        self.take_pending_distributed_actions()
     }
 
     fn record_persistent_accept(
         &mut self,
         acknowledgement: Option<&CommitAck>,
     ) -> Result<(), AdapterError> {
-        let persistence = self.session.persistence_status();
-        let Some(state) = self.persistent.as_mut() else {
+        let persistence = self.authority.machine.persistence_status();
+        let Some(state) = self.authority.persistence.as_mut() else {
             return Ok(());
         };
         let worker_failure = persistence.as_ref().and_then(|persistence| {
@@ -1032,8 +3265,8 @@ impl BoonServerProgram {
     }
 
     fn record_persistent_rejection(&mut self, error: &AdapterError) {
-        let persistence = self.session.persistence_status();
-        let Some(state) = self.persistent.as_mut() else {
+        let persistence = self.authority.machine.persistence_status();
+        let Some(state) = self.authority.persistence.as_mut() else {
             return;
         };
         let terminal = matches!(error.kind(), AdapterErrorKind::Persistence);
@@ -1057,8 +3290,8 @@ impl BoonServerProgram {
     }
 
     fn fail_persistent(&mut self, error: &AdapterError) {
-        let persistence = self.session.persistence_status();
-        let Some(state) = self.persistent.as_mut() else {
+        let persistence = self.authority.machine.persistence_status();
+        let Some(state) = self.authority.persistence.as_mut() else {
             return;
         };
         state.admission_open = false;
@@ -1100,12 +3333,10 @@ impl BoonServerProgram {
             self.fail_persistent(&error);
             return Err(error);
         }
-        self.settle_transient_effects(
-            dispatched.runtime_turn.transient_effects,
-            ServerTurnClass::Http,
-        )
-        .await?;
-        let value = match self.session.output_value_current(&output_name) {
+        self.settle_transient_effects(dispatched.runtime_turn, ServerTurnClass::Http)
+            .await?;
+        self.prepare_distributed_global_read()?;
+        let value = match self.authority.machine.output_value_current(&output_name) {
             Ok(value) => value,
             Err(error) => {
                 self.fail_persistent(&error);
@@ -1183,12 +3414,10 @@ impl BoonServerProgram {
             self.fail_persistent(&error);
             return Err(error);
         }
-        self.settle_transient_effects(
-            dispatched.runtime_turn.transient_effects,
-            ServerTurnClass::WebSocket,
-        )
-        .await?;
-        let value = match self.session.output_value_current(&output_name) {
+        self.settle_transient_effects(dispatched.runtime_turn, ServerTurnClass::WebSocket)
+            .await?;
+        self.prepare_distributed_global_read()?;
+        let value = match self.authority.machine.output_value_current(&output_name) {
             Ok(value) => value,
             Err(error) => {
                 self.fail_persistent(&error);
@@ -1249,7 +3478,7 @@ impl BoonServerProgram {
     }
 
     fn shutdown_persistent(&mut self) -> Result<(), AdapterError> {
-        let Some(state) = self.persistent.as_mut() else {
+        let Some(state) = self.authority.persistence.as_mut() else {
             return Ok(());
         };
         if state.shutdown_complete {
@@ -1266,9 +3495,9 @@ impl BoonServerProgram {
             status.accepting_turns = false;
         }
 
-        let barrier = self.session.barrier();
-        let shutdown = self.session.shutdown();
-        let persistence = self.session.persistence_status();
+        let barrier = self.authority.machine.barrier();
+        let shutdown = self.authority.machine.shutdown();
+        let persistence = self.authority.machine.persistence_status();
         let result = match (barrier, shutdown) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(barrier), Ok(())) => Err(barrier),
@@ -1292,7 +3521,7 @@ impl BoonServerProgram {
             Ok(()) => {
                 status.phase = ServerLifecyclePhase::Stopped;
                 status.last_error = None;
-                if let Some(state) = self.persistent.as_mut() {
+                if let Some(state) = self.authority.persistence.as_mut() {
                     state.shutdown_complete = true;
                 }
             }
@@ -1308,6 +3537,71 @@ impl BoonServerProgram {
 
 #[async_trait]
 impl ServerProgram for BoonServerProgram {
+    fn has_distributed_session_transport(&self) -> bool {
+        self.distributed_sessions.is_some()
+    }
+
+    async fn on_distributed_session(
+        &mut self,
+        connection: HostDistributedSessionConnectionId,
+        event: DistributedSessionEvent,
+        cancellation: CallCancellation,
+    ) -> Vec<DistributedSessionAction> {
+        if cancellation.reason().is_some() {
+            self.cancel_distributed_transport_connection(connection);
+            return Vec::new();
+        }
+        self.handle_distributed_transport_event(connection, event)
+    }
+
+    fn distributed_session_next_deadline(&self) -> Option<Instant> {
+        self.distributed_next_deadline()
+    }
+
+    async fn on_distributed_session_timer(
+        &mut self,
+        now: Instant,
+        cancellation: CallCancellation,
+    ) -> Vec<DistributedSessionAction> {
+        if cancellation.reason().is_some() {
+            return Vec::new();
+        }
+        match self.distributed_now(now) {
+            Ok(now) => self.poll_distributed_transport(now),
+            Err(error) => {
+                self.record_distributed_transport_failure(error);
+                Vec::new()
+            }
+        }
+    }
+
+    fn has_pending_internal_work(&self) -> bool {
+        !self.pending_distributed_actions.is_empty() || self.has_distributed_transient_effect_work()
+    }
+
+    async fn on_internal_work(&mut self) -> Vec<DistributedSessionAction> {
+        self.service_distributed_transient_effect_work().await
+    }
+
+    fn on_distributed_session_send_accepted(
+        &mut self,
+        connection: HostDistributedSessionConnectionId,
+    ) {
+        self.acknowledge_distributed_transport_send(connection);
+    }
+
+    async fn on_distributed_session_cancelled(
+        &mut self,
+        connection: Option<HostDistributedSessionConnectionId>,
+        _reason: CancellationReason,
+    ) {
+        if let Some(connection) = connection {
+            self.cancel_distributed_transport_connection(connection);
+        } else {
+            self.cancel_all_distributed_transport_connections();
+        }
+    }
+
     async fn on_http(
         &mut self,
         request: HttpRequest,
@@ -1371,6 +3665,7 @@ impl ServerProgram for BoonServerProgram {
     }
 
     async fn on_shutdown(&mut self) {
+        self.cancel_all_distributed_transport_connections();
         self.cancel_active_transient_effects();
         if let Some(host) = self.transient_effect_host.as_mut() {
             host.shutdown();
@@ -1398,6 +3693,49 @@ fn validate_server_artifact(artifact: &ProgramArtifact) -> Result<(), AdapterErr
         ));
     }
     Ok(())
+}
+
+fn collect_required_transient_effects<'a>(
+    artifacts: impl IntoIterator<Item = &'a ProgramArtifact>,
+) -> Result<BTreeMap<boon_plan::EffectId, String>, AdapterError> {
+    let mut required = BTreeMap::new();
+    for artifact in artifacts {
+        for effect in &artifact.plan().effects {
+            let operation = effect.host_operation.to_string();
+            if let Some(previous) = required.insert(effect.effect_id, operation.clone())
+                && previous != operation
+            {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::InvalidArtifact,
+                    format_args!(
+                        "effect {} maps to both `{previous}` and `{operation}` across distributed roles",
+                        effect.effect_id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(required)
+}
+
+fn validate_transient_effect_host(
+    host: &dyn TransientEffectHost,
+    required: &BTreeMap<boon_plan::EffectId, String>,
+) -> Result<(), AdapterError> {
+    let missing = required
+        .iter()
+        .filter_map(|(effect_id, operation)| (!host.owns(*effect_id)).then_some(operation.as_str()))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(AdapterError::new(
+        AdapterErrorKind::InvalidArtifact,
+        format_args!(
+            "transient effect host does not own required operations: {}",
+            missing.join(", ")
+        ),
+    ))
 }
 
 fn resolve_bindings(plan: &MachinePlan) -> Result<ResolvedBindings, AdapterError> {
@@ -1494,7 +3832,10 @@ fn resolve_bindings(plan: &MachinePlan) -> Result<ResolvedBindings, AdapterError
             }
         }
     }
-    if bindings.http.is_none() && bindings.websocket.is_none() {
+    if bindings.http.is_none()
+        && bindings.websocket.is_none()
+        && plan.distributed_endpoint.is_none()
+    {
         return Err(AdapterError::new(
             AdapterErrorKind::InvalidHostPort,
             "trusted server artifact declares no host ports",
@@ -1911,7 +4252,7 @@ fn http_request_payload(request: HttpRequest) -> Result<SourcePayload, AdapterEr
 
     Ok(SourcePayload {
         fields: BTreeMap::from([
-            ("body".to_owned(), Value::Bytes(request.body)),
+            ("body".to_owned(), Value::Bytes(request.body.into())),
             ("cookies".to_owned(), Value::List(Vec::new())),
             ("deadline_ms".to_owned(), deadline_ms),
             ("headers".to_owned(), Value::List(headers)),
@@ -1982,7 +4323,7 @@ fn websocket_message_payload(text: Option<String>, bytes: Option<Vec<u8>>) -> So
     SourcePayload {
         text: Some(text),
         fields: BTreeMap::from([
-            ("bytes".to_owned(), Value::Bytes(bytes)),
+            ("bytes".to_owned(), Value::Bytes(bytes.into())),
             ("kind".to_owned(), Value::Text(kind.to_owned())),
         ]),
         ..SourcePayload::default()
@@ -2321,7 +4662,7 @@ fn take_action_bytes(
     index: usize,
 ) -> Result<Vec<u8>, AdapterError> {
     match fields.remove(name) {
-        Some(Value::Bytes(value)) => Ok(value),
+        Some(Value::Bytes(value)) => Ok(value.to_vec()),
         _ => Err(invalid_action(index, format_args!("`{name}` is not Bytes"))),
     }
 }
@@ -2523,7 +4864,7 @@ fn decode_headers(value: Value, value_type: &HeaderValueType) -> Result<Vec<Head
             let value = match (value_type, value) {
                 (HeaderValueType::Text, Value::Text(value)) => value.into_bytes(),
                 (HeaderValueType::Bytes { fixed_len }, Value::Bytes(value)) => {
-                    validate_fixed_bytes(value, *fixed_len, "HTTP response header value")?
+                    validate_fixed_bytes(value.to_vec(), *fixed_len, "HTTP response header value")?
                 }
                 _ => {
                     return Err(AdapterError::new(
@@ -2539,7 +4880,9 @@ fn decode_headers(value: Value, value_type: &HeaderValueType) -> Result<Vec<Head
 
 fn decode_body(value: Value, fixed_len: Option<u64>) -> Result<Vec<u8>, AdapterError> {
     match value {
-        Value::Bytes(value) => validate_fixed_bytes(value, fixed_len, "HTTP response body"),
+        Value::Bytes(value) => {
+            validate_fixed_bytes(value.to_vec(), fixed_len, "HTTP response body")
+        }
         _ => Err(AdapterError::new(
             AdapterErrorKind::InvalidOutput,
             "HTTP response body differs from its declared Bytes type",
@@ -2592,4 +4935,1082 @@ fn bounded_text(mut text: String, max_bytes: usize) -> String {
     text.truncate(end);
     text.push_str(suffix);
     text
+}
+
+#[cfg(test)]
+mod transient_host_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use boon_runtime::{
+        ApplicationIdentity, ProgramCapabilityProfile, ProgramCompileRequest, RuntimeSourceUnit,
+        compile_program_artifact,
+    };
+    use std::collections::VecDeque;
+
+    const PROGRAM: &str = r#"
+store: [
+    http_request: SOURCE
+    read: SOURCE
+    stream_result:
+        NotStarted |> HOLD stream_result {
+            read |> THEN {
+                File/read_stream(
+                    file: read.file
+                    chunk_bytes: 4
+                    retain_content: False
+                )
+            }
+        }
+]
+
+outputs: [
+    stream_result: store.stream_result
+    response: [
+        status: 200
+        body: BYTES {}
+    ]
+]
+
+host_ports: [
+    http: [
+        request: store.http_request
+        response: response
+    ]
+]
+"#;
+
+    #[derive(Default)]
+    struct HostState {
+        submitted: Vec<TransientEffectCallId>,
+        credits: Vec<boon_runtime::TransientEffectCreditGrant>,
+        cancelled: Vec<TransientEffectCallId>,
+    }
+
+    struct ScriptedStreamHost {
+        effect_id: boon_plan::EffectId,
+        state: Arc<Mutex<HostState>>,
+        events: VecDeque<TransientEffectHostEvent>,
+    }
+
+    impl ScriptedStreamHost {
+        fn new(state: Arc<Mutex<HostState>>) -> Self {
+            Self {
+                effect_id: boon_plan::EffectId::from_host_operation(
+                    boon_effect_schema::FILE_READ_STREAM_OPERATION,
+                )
+                .unwrap(),
+                state,
+                events: VecDeque::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TransientEffectHost for ScriptedStreamHost {
+        fn owns(&self, effect_id: boon_plan::EffectId) -> bool {
+            effect_id == self.effect_id
+        }
+
+        fn submit(
+            &mut self,
+            calls: Vec<TransientEffectInvocation>,
+        ) -> Result<(), TransientEffectHostError> {
+            if calls.len() != 1 {
+                return Err(TransientEffectHostError::new(
+                    "scripted stream host expects one call",
+                ));
+            }
+            let call_id = calls[0].call_id;
+            self.state.lock().unwrap().submitted.push(call_id);
+            self.events.extend([
+                TransientEffectHostEvent::Result {
+                    call_id,
+                    delivery: TransientEffectHostDelivery::Stream { result_sequence: 0 },
+                    outcome: tagged_value(
+                        "Opened",
+                        [
+                            ("size", Value::integer(3).unwrap()),
+                            (
+                                "content_type",
+                                Value::Text("application/octet-stream".to_owned()),
+                            ),
+                            ("display_name", Value::Text("fixture.bin".to_owned())),
+                        ],
+                    ),
+                },
+                TransientEffectHostEvent::Result {
+                    call_id,
+                    delivery: TransientEffectHostDelivery::Stream { result_sequence: 1 },
+                    outcome: tagged_value(
+                        "Chunk",
+                        [
+                            ("sequence", Value::integer(0).unwrap()),
+                            ("offset", Value::integer(0).unwrap()),
+                            ("bytes", Value::Bytes(vec![1, 2, 3].into())),
+                        ],
+                    ),
+                },
+                TransientEffectHostEvent::Result {
+                    call_id,
+                    delivery: TransientEffectHostDelivery::Stream { result_sequence: 2 },
+                    outcome: tagged_value(
+                        "Finished",
+                        [
+                            ("byte_count", Value::integer(3).unwrap()),
+                            ("digest", Value::Bytes(vec![9; 32].into())),
+                            ("retained", tagged_value("NotRetained", [])),
+                        ],
+                    ),
+                },
+            ]);
+            Ok(())
+        }
+
+        async fn next_event(
+            &mut self,
+        ) -> Result<TransientEffectHostEvent, TransientEffectHostError> {
+            self.events
+                .pop_front()
+                .ok_or_else(|| TransientEffectHostError::new("scripted event queue is empty"))
+        }
+
+        fn grant_credits(
+            &mut self,
+            grants: &[boon_runtime::TransientEffectCreditGrant],
+        ) -> Result<(), TransientEffectHostError> {
+            self.state.lock().unwrap().credits.extend_from_slice(grants);
+            Ok(())
+        }
+
+        fn cancel(&mut self, call_id: TransientEffectCallId) {
+            self.state.lock().unwrap().cancelled.push(call_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn server_host_lane_delivers_a_bounded_multishot_stream_with_credit() {
+        let artifact = compile_program_artifact(&ProgramCompileRequest {
+            revision: 1,
+            entry_path: "stream-server.bn".to_owned(),
+            units: vec![RuntimeSourceUnit {
+                path: "stream-server.bn".to_owned(),
+                source: PROGRAM.to_owned(),
+            }],
+            application: ApplicationIdentity::new("dev.boon.server-stream-test", "test", "local"),
+            role: boon_plan::ProgramRole::Server,
+            capability_profile: ProgramCapabilityProfile::TrustedServer,
+        })
+        .unwrap();
+        let mut program = BoonServerProgram::new(artifact).unwrap();
+        let state = Arc::new(Mutex::new(HostState::default()));
+        program
+            .attach_transient_effect_host(
+                Box::new(ScriptedStreamHost::new(Arc::clone(&state))),
+                TransientEffectLimits::default(),
+            )
+            .unwrap();
+        let dispatched = program
+            .dispatch_turn(
+                "store.read",
+                SourcePayload {
+                    fields: BTreeMap::from([("file".to_owned(), selected_file_value())]),
+                    ..SourcePayload::default()
+                },
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        let call_id = dispatched.runtime_turn.transient_effects[0].call_id;
+
+        program
+            .settle_transient_effects(dispatched.runtime_turn, ServerTurnClass::Http)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            program.authority.machine.pending_transient_effect_count(),
+            0
+        );
+        assert!(matches!(
+            program
+                .authority
+                .machine
+                .output_value_current("stream_result")
+                .unwrap(),
+            Value::Record(fields)
+                if fields.get("$tag") == Some(&Value::Text("Finished".to_owned()))
+        ));
+        let state = state.lock().unwrap();
+        assert_eq!(state.submitted, [call_id]);
+        assert_eq!(state.credits.len(), 1);
+        assert_eq!(state.credits[0].call_id, call_id);
+        assert_eq!(state.credits[0].credits, 1);
+        assert!(state.cancelled.is_empty());
+    }
+
+    fn selected_file_value() -> Value {
+        let mut registry = boon_host_runtime::FileCapabilityRegistry::new(1).unwrap();
+        registry
+            .register_file("/scripted/fixture.bin")
+            .unwrap()
+            .file_selected_value()
+    }
+
+    fn tagged_value(tag: &str, fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+        let mut record = BTreeMap::from([("$tag".to_owned(), Value::Text(tag.to_owned()))]);
+        record.extend(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value)),
+        );
+        Value::Record(record)
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use boon_persistence::InMemoryDriver;
+    use boon_runtime::{
+        ApplicationIdentity, DistributedClientRuntime, DistributedQueueLimits,
+        ProgramCompileRequest, RuntimeSourceUnit, compile_distributed_program_bundle,
+    };
+    use boon_wire::{
+        ClientCommit, ClientHello, ServerReady, SessionControlFrame, SessionId,
+        decode_session_control_frame, encode_session_control_frame,
+    };
+
+    const CLIENT: &str = r#"
+store: [
+    increment: SOURCE
+    count: Session/store.count
+]
+
+scene: Scene/Element/text(
+    element: [events: [press: store.increment]]
+    style: [width: Fill]
+    text: TEXT { Client }
+)
+"#;
+
+    fn connect_and_limit_delivery_queue(
+        program: &mut BoonServerProgram,
+    ) -> (DistributedSessionConnectionId, SessionId, u64, u64) {
+        let identity = program.distributed_identity().unwrap();
+        let hello =
+            encode_session_control_frame(&SessionControlFrame::ClientHello(ClientHello::new(
+                identity.graph_id,
+                identity.graph_revision,
+                identity.schema_hash,
+                None,
+                0,
+            )))
+            .unwrap();
+        let DistributedSessionHandshakeStart::Offer(offer) = program
+            .begin_distributed_handshake(Duration::ZERO, SessionPrincipal::Anonymous, &hello)
+            .unwrap()
+        else {
+            panic!("fresh Session should be offered");
+        };
+        let connection = offer.connection_id();
+        let SessionControlFrame::ServerOffer(server_offer) =
+            decode_session_control_frame(offer.server_frame()).unwrap()
+        else {
+            panic!("fresh Session should provide an offer");
+        };
+        let (_, session_id, offered_generation, applied_client_through) = server_offer.into_parts();
+        let commit = encode_session_control_frame(&SessionControlFrame::ClientCommit(
+            ClientCommit::new(session_id, offered_generation, 0),
+        ))
+        .unwrap();
+        let ready = program
+            .commit_distributed_handshake(Duration::ZERO, connection, &commit)
+            .unwrap();
+        let SessionControlFrame::ServerReady(ready) = decode_session_control_frame(&ready).unwrap()
+        else {
+            panic!("fresh Session should become current");
+        };
+        let generation = ServerReady::generation(&ready);
+        let initial = program
+            .poll_distributed_sessions(Duration::ZERO, 64)
+            .unwrap();
+        assert!(
+            initial.poisoned_sessions.is_empty(),
+            "post-handshake Session was poisoned: {}",
+            initial
+                .poisoned_sessions
+                .iter()
+                .map(|poisoned| poisoned.diagnostic.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        assert!(!initial.serviced_connections.is_empty());
+        assert!(
+            initial
+                .serviced_connections
+                .iter()
+                .all(|serviced| *serviced == connection)
+        );
+        program
+            .distributed_sessions
+            .as_mut()
+            .unwrap()
+            .set_session_queue_limits_for_test(boon_runtime::DistributedQueueLimits {
+                max_messages: 1,
+                max_bytes: 1024 * 1024,
+            });
+        assert_eq!(generation, offered_generation);
+        (connection, session_id, generation, applied_client_through)
+    }
+
+    const SESSION: &str = r#"
+store: [
+    increment: Client/store.increment
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+    first: Server/store.first
+    second: Server/store.second
+    random: Server/store.random
+]
+"#;
+
+    const SERVER: &str = r#"
+store: [
+    bump: SOURCE
+    global_randomize: SOURCE
+    session_randomize: Session/store.increment
+    count:
+        0 |> HOLD count {
+            bump |> THEN { count + 1 }
+        }
+    first: count > 0
+    second: count > 1
+    random:
+        NotRequested |> HOLD random {
+            LATEST {
+                global_randomize |> THEN { Random/bytes(byte_count: 1) }
+                session_randomize |> THEN { Random/bytes(byte_count: 1) }
+            }
+        }
+]
+"#;
+
+    const SESSION_WITH_EFFECT: &str = r#"
+store: [
+    increment: Client/store.increment
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+    random:
+        NotRequested |> HOLD random {
+            increment |> THEN { Random/bytes(byte_count: 1) }
+        }
+    first: Server/store.first
+    second: Server/store.second
+    server_random: Server/store.random
+]
+"#;
+
+    const SERVER_WITHOUT_EFFECTS: &str = r#"
+store: [
+    first: False
+    second: False
+    random: NotRequested
+]
+"#;
+
+    #[derive(Default)]
+    struct RandomHostState {
+        submitted: Vec<TransientEffectCallId>,
+        cancelled: Vec<TransientEffectCallId>,
+    }
+
+    struct ScriptedRandomHost {
+        effect_id: boon_plan::EffectId,
+        state: Arc<Mutex<RandomHostState>>,
+        events: VecDeque<TransientEffectHostEvent>,
+        next_byte: u8,
+    }
+
+    impl ScriptedRandomHost {
+        fn new(state: Arc<Mutex<RandomHostState>>) -> Self {
+            Self {
+                effect_id: boon_plan::EffectId::from_host_operation(
+                    boon_effect_schema::SECURE_RANDOM_BYTES_OPERATION,
+                )
+                .unwrap(),
+                state,
+                events: VecDeque::new(),
+                next_byte: 17,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TransientEffectHost for ScriptedRandomHost {
+        fn owns(&self, effect_id: boon_plan::EffectId) -> bool {
+            effect_id == self.effect_id
+        }
+
+        fn submit(
+            &mut self,
+            calls: Vec<TransientEffectInvocation>,
+        ) -> Result<(), TransientEffectHostError> {
+            for call in calls {
+                self.state.lock().unwrap().submitted.push(call.call_id);
+                let outcome = Value::Record(BTreeMap::from([
+                    (
+                        "$tag".to_owned(),
+                        Value::Text("RandomBytesReady".to_owned()),
+                    ),
+                    (
+                        "bytes".to_owned(),
+                        Value::Bytes(vec![self.next_byte].into()),
+                    ),
+                ]));
+                self.next_byte = self.next_byte.saturating_add(12);
+                self.events.push_back(TransientEffectHostEvent::Result {
+                    call_id: call.call_id,
+                    delivery: TransientEffectHostDelivery::Single,
+                    outcome,
+                });
+            }
+            Ok(())
+        }
+
+        async fn next_event(
+            &mut self,
+        ) -> Result<TransientEffectHostEvent, TransientEffectHostError> {
+            self.events
+                .pop_front()
+                .ok_or_else(|| TransientEffectHostError::new("scripted random queue is empty"))
+        }
+
+        fn cancel(&mut self, call_id: TransientEffectCallId) {
+            self.state.lock().unwrap().cancelled.push(call_id);
+        }
+    }
+
+    struct NoEffectsHost;
+
+    #[async_trait]
+    impl TransientEffectHost for NoEffectsHost {
+        fn owns(&self, _effect_id: boon_plan::EffectId) -> bool {
+            false
+        }
+
+        fn submit(
+            &mut self,
+            _calls: Vec<TransientEffectInvocation>,
+        ) -> Result<(), TransientEffectHostError> {
+            Err(TransientEffectHostError::new(
+                "host without effects cannot accept calls",
+            ))
+        }
+
+        async fn next_event(
+            &mut self,
+        ) -> Result<TransientEffectHostEvent, TransientEffectHostError> {
+            Err(TransientEffectHostError::new(
+                "host without effects cannot produce events",
+            ))
+        }
+
+        fn cancel(&mut self, _call_id: TransientEffectCallId) {}
+    }
+
+    #[test]
+    fn distributed_host_admission_includes_session_only_effect_requirements() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION_WITH_EFFECT),
+            request(ProgramRole::Server, SERVER_WITHOUT_EFFECTS),
+        ])
+        .unwrap();
+        let mut program = BoonServerProgram::new_distributed(
+            &bundle,
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+
+        let error = program
+            .attach_transient_effect_host(Box::new(NoEffectsHost), TransientEffectLimits::default())
+            .unwrap_err();
+        assert_eq!(error.kind(), AdapterErrorKind::InvalidArtifact);
+        assert!(error.diagnostic().contains("Random/bytes"));
+    }
+
+    #[tokio::test]
+    async fn distributed_session_and_server_effects_settle_on_their_exact_owners() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION_WITH_EFFECT),
+            request(ProgramRole::Server, SERVER),
+        ])
+        .unwrap();
+        let mut program = BoonServerProgram::new_distributed(
+            &bundle,
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let host_state = Arc::new(Mutex::new(RandomHostState::default()));
+        program
+            .attach_transient_effect_host(
+                Box::new(ScriptedRandomHost::new(Arc::clone(&host_state))),
+                TransientEffectLimits::default(),
+            )
+            .unwrap();
+        let (connection, session_id, generation, applied_client_through) =
+            connect_and_limit_delivery_queue(&mut program);
+        program
+            .distributed_sessions
+            .as_mut()
+            .unwrap()
+            .set_session_queue_limits_for_test(DistributedQueueLimits::default());
+
+        let mut client = DistributedClientRuntime::start(
+            bundle.artifact(ProgramRole::Client).unwrap(),
+            DistributedQueueLimits::default(),
+        )
+        .unwrap();
+        client
+            .bind(session_id, generation, applied_client_through)
+            .unwrap();
+        client.mark_current().unwrap();
+        client
+            .dispatch("store.increment", SourcePayload::default())
+            .unwrap();
+        let frame = client.next_session_frame().unwrap().unwrap();
+        program
+            .admit_distributed_client_frame(connection, &frame)
+            .unwrap();
+        assert!(client.acknowledge_session_frame());
+
+        assert!(
+            program
+                .poll_distributed_transport(Duration::ZERO)
+                .is_empty()
+        );
+        assert_eq!(program.active_transient_effects.len(), 2);
+        assert!(program.active_transient_effects.values().any(|active| {
+            matches!(active.owner, TransientRuntimeOwner::DistributedSession(_))
+        }));
+        assert!(
+            program.active_transient_effects.values().any(|active| {
+                matches!(active.owner, TransientRuntimeOwner::DistributedServer(_))
+            })
+        );
+        assert!(program.has_pending_internal_work());
+
+        assert!(program.on_internal_work().await.is_empty());
+        let session_random = program
+            .distributed_sessions
+            .as_mut()
+            .unwrap()
+            .session_root_value_current(connection, "store.random")
+            .unwrap();
+        assert_eq!(random_bytes(&session_random), &[17]);
+        assert!(random_bytes(&global_root(&mut program, "store.random")).is_empty());
+
+        assert!(program.on_internal_work().await.is_empty());
+        assert_eq!(
+            random_bytes(&global_root(&mut program, "store.random")),
+            &[29]
+        );
+        assert!(program.active_transient_effects.is_empty());
+        assert!(!program.has_pending_internal_work());
+        let host_state = host_state.lock().unwrap();
+        assert_eq!(host_state.submitted.len(), 2);
+        assert!(host_state.cancelled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn distributed_effect_completions_are_durably_acknowledged_per_owner() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION_WITH_EFFECT),
+            request(ProgramRole::Server, SERVER),
+        ])
+        .unwrap();
+        let (mut program, startup) = BoonServerProgram::with_distributed_persistence(
+            &bundle,
+            InMemoryDriver::default(),
+            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let host_state = Arc::new(Mutex::new(RandomHostState::default()));
+        program
+            .attach_transient_effect_host(
+                Box::new(ScriptedRandomHost::new(host_state)),
+                TransientEffectLimits::default(),
+            )
+            .unwrap();
+        let (connection, session_id, generation, applied_client_through) =
+            connect_and_limit_delivery_queue(&mut program);
+        program
+            .distributed_sessions
+            .as_mut()
+            .unwrap()
+            .set_session_queue_limits_for_test(DistributedQueueLimits::default());
+        let mut client = DistributedClientRuntime::start(
+            bundle.artifact(ProgramRole::Client).unwrap(),
+            DistributedQueueLimits::default(),
+        )
+        .unwrap();
+        client
+            .bind(session_id, generation, applied_client_through)
+            .unwrap();
+        client.mark_current().unwrap();
+        client
+            .dispatch("store.increment", SourcePayload::default())
+            .unwrap();
+        let frame = client.next_session_frame().unwrap().unwrap();
+        program
+            .admit_distributed_client_frame(connection, &frame)
+            .unwrap();
+        assert!(client.acknowledge_session_frame());
+        assert!(
+            program
+                .poll_distributed_transport(Duration::ZERO)
+                .is_empty()
+        );
+        let before = startup.lifecycle.status();
+
+        assert!(program.on_internal_work().await.is_empty());
+        assert!(program.on_internal_work().await.is_empty());
+        let after = startup.lifecycle.status();
+        let accepted = after.accepted_turns - before.accepted_turns;
+        let acknowledged = after.durably_acknowledged_turns - before.durably_acknowledged_turns;
+        assert!(accepted >= 2);
+        assert_eq!(acknowledged, accepted);
+        assert!(program.active_transient_effects.is_empty());
+        program.shutdown_persistent().unwrap();
+    }
+
+    fn random_bytes(value: &Value) -> &[u8] {
+        let Value::Record(fields) = value else {
+            return &[];
+        };
+        let Some(Value::Bytes(bytes)) = fields.get("bytes") else {
+            return &[];
+        };
+        bytes.as_ref()
+    }
+
+    #[test]
+    fn global_source_rolls_back_before_bounded_delivery_pressure() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION),
+            request(ProgramRole::Server, SERVER),
+        ])
+        .unwrap();
+        let mut program = BoonServerProgram::new_distributed(
+            &bundle,
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let (connection, _, _, _) = connect_and_limit_delivery_queue(&mut program);
+
+        program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        assert_eq!(global_count(&mut program), Value::integer(1).unwrap());
+
+        let blocked = program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap_err();
+        assert_eq!(blocked.kind(), AdapterErrorKind::Backpressure);
+        assert_eq!(global_count(&mut program), Value::integer(1).unwrap());
+
+        let released = program
+            .poll_distributed_sessions(Duration::ZERO, 1)
+            .unwrap();
+        assert_eq!(released.serviced_connections, vec![connection]);
+        program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        assert_eq!(global_count(&mut program), Value::integer(2).unwrap());
+    }
+
+    #[test]
+    fn persistent_global_source_has_no_accept_or_ack_before_delivery_capacity() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION),
+            request(ProgramRole::Server, SERVER),
+        ])
+        .unwrap();
+        let (mut program, startup) = BoonServerProgram::with_distributed_persistence(
+            &bundle,
+            InMemoryDriver::default(),
+            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let (connection, _, _, _) = connect_and_limit_delivery_queue(&mut program);
+        let baseline = startup.lifecycle.status();
+
+        program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        let accepted = startup.lifecycle.status();
+        assert_eq!(accepted.accepted_turns, baseline.accepted_turns + 1);
+        assert_eq!(
+            accepted.durably_acknowledged_turns,
+            baseline.durably_acknowledged_turns + 1
+        );
+        assert_eq!(global_count(&mut program), Value::integer(1).unwrap());
+
+        let blocked = program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap_err();
+        assert_eq!(blocked.kind(), AdapterErrorKind::Backpressure);
+        let rejected = startup.lifecycle.status();
+        assert_eq!(rejected.accepted_turns, accepted.accepted_turns);
+        assert_eq!(
+            rejected.durably_acknowledged_turns,
+            accepted.durably_acknowledged_turns
+        );
+        assert_eq!(rejected.rejected_turns, 1);
+        assert!(
+            rejected
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("overloaded"))
+        );
+        assert_eq!(global_count(&mut program), Value::integer(1).unwrap());
+
+        let released = program
+            .poll_distributed_sessions(Duration::ZERO, 1)
+            .unwrap();
+        assert_eq!(released.serviced_connections, vec![connection]);
+        let after_release = startup.lifecycle.status();
+        program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        let retried = startup.lifecycle.status();
+        assert_eq!(retried.accepted_turns, after_release.accepted_turns + 1);
+        assert_eq!(
+            retried.durably_acknowledged_turns,
+            after_release.durably_acknowledged_turns + 1
+        );
+        assert_eq!(global_count(&mut program), Value::integer(2).unwrap());
+        program.shutdown_persistent().unwrap();
+    }
+
+    #[test]
+    fn global_effect_completion_rolls_back_before_bounded_delivery_pressure() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION),
+            request(ProgramRole::Server, SERVER),
+        ])
+        .unwrap();
+        let mut program = BoonServerProgram::new_distributed(
+            &bundle,
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let (connection, _, _, _) = connect_and_limit_delivery_queue(&mut program);
+        program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        let started = program
+            .dispatch_turn(
+                "store.global_randomize",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        let [invocation] = started.runtime_turn.transient_effects.as_slice() else {
+            panic!("randomize should emit exactly one transient effect");
+        };
+        let call_id = invocation.call_id;
+        let outcome = Value::Record(BTreeMap::from([
+            (
+                "$tag".to_owned(),
+                Value::Text("RandomBytesReady".to_owned()),
+            ),
+            ("bytes".to_owned(), Value::Bytes(vec![7].into())),
+        ]));
+
+        let blocked = program
+            .complete_server_transient_effect(call_id, outcome.clone(), ServerTurnClass::Http)
+            .unwrap_err();
+        assert_eq!(blocked.kind(), AdapterErrorKind::Backpressure);
+        assert!(
+            program
+                .authority
+                .machine
+                .has_pending_transient_effect(call_id)
+        );
+
+        let released = program
+            .poll_distributed_sessions(Duration::ZERO, 1)
+            .unwrap();
+        assert_eq!(released.serviced_connections, vec![connection]);
+        program
+            .complete_server_transient_effect(call_id, outcome.clone(), ServerTurnClass::Http)
+            .unwrap();
+        assert!(
+            !program
+                .authority
+                .machine
+                .has_pending_transient_effect(call_id)
+        );
+        assert_eq!(global_root(&mut program, "store.random"), outcome);
+    }
+
+    #[test]
+    fn persistent_effect_completion_has_no_ack_before_delivery_capacity() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION),
+            request(ProgramRole::Server, SERVER),
+        ])
+        .unwrap();
+        let (mut program, startup) = BoonServerProgram::with_distributed_persistence(
+            &bundle,
+            InMemoryDriver::default(),
+            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let (connection, _, _, _) = connect_and_limit_delivery_queue(&mut program);
+        let baseline = startup.lifecycle.status();
+        program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        let started = program
+            .dispatch_turn(
+                "store.global_randomize",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        let [invocation] = started.runtime_turn.transient_effects.as_slice() else {
+            panic!("randomize should emit exactly one transient effect");
+        };
+        let call_id = invocation.call_id;
+        let outcome = Value::Record(BTreeMap::from([
+            (
+                "$tag".to_owned(),
+                Value::Text("RandomBytesReady".to_owned()),
+            ),
+            ("bytes".to_owned(), Value::Bytes(vec![9].into())),
+        ]));
+        let before_completion = startup.lifecycle.status();
+        assert_eq!(
+            before_completion.accepted_turns,
+            baseline.accepted_turns + 2
+        );
+        assert_eq!(
+            before_completion.durably_acknowledged_turns,
+            baseline.durably_acknowledged_turns + 2
+        );
+
+        let blocked = program
+            .complete_server_transient_effect(call_id, outcome.clone(), ServerTurnClass::Http)
+            .unwrap_err();
+        assert_eq!(blocked.kind(), AdapterErrorKind::Backpressure);
+        let after_rejection = startup.lifecycle.status();
+        assert_eq!(
+            after_rejection.accepted_turns,
+            before_completion.accepted_turns
+        );
+        assert_eq!(
+            after_rejection.durably_acknowledged_turns,
+            before_completion.durably_acknowledged_turns
+        );
+        assert_eq!(after_rejection.rejected_turns, 1);
+        assert!(
+            program
+                .authority
+                .machine
+                .has_pending_transient_effect(call_id)
+        );
+
+        let released = program
+            .poll_distributed_sessions(Duration::ZERO, 1)
+            .unwrap();
+        assert_eq!(released.serviced_connections, vec![connection]);
+        let after_release = startup.lifecycle.status();
+        program
+            .complete_server_transient_effect(call_id, outcome.clone(), ServerTurnClass::Http)
+            .unwrap();
+        let committed = startup.lifecycle.status();
+        assert_eq!(committed.accepted_turns, after_release.accepted_turns + 1);
+        assert_eq!(
+            committed.durably_acknowledged_turns,
+            after_release.durably_acknowledged_turns + 1
+        );
+        assert!(
+            !program
+                .authority
+                .machine
+                .has_pending_transient_effect(call_id)
+        );
+        assert_eq!(global_root(&mut program, "store.random"), outcome);
+        program.shutdown_persistent().unwrap();
+    }
+
+    #[test]
+    fn origin_effect_completion_rolls_back_before_bounded_delivery_pressure() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION),
+            request(ProgramRole::Server, SERVER),
+        ])
+        .unwrap();
+        let mut program = BoonServerProgram::new_distributed(
+            &bundle,
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let (connection, session_id, generation, applied_client_through) =
+            connect_and_limit_delivery_queue(&mut program);
+        let mut client = DistributedClientRuntime::start(
+            bundle.artifact(ProgramRole::Client).unwrap(),
+            DistributedQueueLimits::default(),
+        )
+        .unwrap();
+        client
+            .bind(session_id, generation, applied_client_through)
+            .unwrap();
+        client.mark_current().unwrap();
+        client
+            .dispatch("store.increment", SourcePayload::default())
+            .unwrap();
+        let frame = client.next_session_frame().unwrap().unwrap();
+        program
+            .admit_distributed_client_frame(connection, &frame)
+            .unwrap();
+        assert!(client.acknowledge_session_frame());
+        let origin_turn = program
+            .poll_distributed_sessions(Duration::ZERO, 64)
+            .unwrap();
+        let invocations = origin_turn
+            .server_turns
+            .iter()
+            .flat_map(|(_, turn)| turn.transient_effects.iter())
+            .collect::<Vec<_>>();
+        let [invocation] = invocations.as_slice() else {
+            panic!("Session event should emit exactly one Server transient effect");
+        };
+        let call_id = invocation.call_id;
+
+        program
+            .dispatch_turn(
+                "store.bump",
+                SourcePayload::default(),
+                ServerTurnClass::Http,
+            )
+            .unwrap();
+        let outcome = Value::Record(BTreeMap::from([
+            (
+                "$tag".to_owned(),
+                Value::Text("RandomBytesReady".to_owned()),
+            ),
+            ("bytes".to_owned(), Value::Bytes(vec![11].into())),
+        ]));
+        let blocked = program
+            .complete_server_transient_effect(call_id, outcome.clone(), ServerTurnClass::Http)
+            .unwrap_err();
+        assert_eq!(blocked.kind(), AdapterErrorKind::Backpressure);
+        assert!(
+            program
+                .authority
+                .machine
+                .has_pending_transient_effect(call_id)
+        );
+
+        let released = program
+            .poll_distributed_sessions(Duration::ZERO, 1)
+            .unwrap();
+        assert_eq!(released.serviced_connections, vec![connection]);
+        program
+            .complete_server_transient_effect(call_id, outcome, ServerTurnClass::Http)
+            .unwrap();
+        assert!(
+            !program
+                .authority
+                .machine
+                .has_pending_transient_effect(call_id)
+        );
+    }
+
+    fn global_count(program: &mut BoonServerProgram) -> Value {
+        global_root(program, "store.count")
+    }
+
+    fn global_root(program: &mut BoonServerProgram, name: &str) -> Value {
+        let ServerAuthority {
+            machine, routing, ..
+        } = &mut program.authority;
+        routing
+            .as_mut()
+            .unwrap()
+            .bind(machine)
+            .root_value_current_global(name)
+            .unwrap()
+    }
+
+    fn request(role: ProgramRole, source: &str) -> ProgramCompileRequest {
+        ProgramCompileRequest {
+            revision: 1,
+            role,
+            entry_path: "RUN.bn".to_owned(),
+            units: vec![RuntimeSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: source.to_owned(),
+            }],
+            application: ApplicationIdentity::new(
+                "dev.boon.distributed-transaction-test",
+                format!("test-{}", role.as_str()),
+                "distributed-transaction-test",
+            ),
+            capability_profile: match role {
+                ProgramRole::Client => ProgramCapabilityProfile::PublicClient,
+                ProgramRole::Session => ProgramCapabilityProfile::TrustedSession,
+                ProgramRole::Server => ProgramCapabilityProfile::TrustedServer,
+            },
+        }
+    }
 }

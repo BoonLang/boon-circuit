@@ -1,11 +1,11 @@
 use super::{
     ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, BarrierRequest,
     CheckpointBatch, CommitAck, CompactAck, CompactRequest, ContentArtifact, ContentArtifactId,
-    DurableChange, DurableContentArtifactChange, DurableOutboxChange, ExportApplicationRequest,
-    InspectRequest, LoadContentArtifactRequest, PersistenceCommand, PersistenceDriver,
-    PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
-    PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
-    RestoreRequest, ShutdownAck, ShutdownRequest, StoreError,
+    DurableChange, DurableContentArtifactChange, DurableOutboxChange, DurableProtocolStateChange,
+    ExportApplicationRequest, InspectRequest, LoadContentArtifactRequest, LoadProtocolStateRequest,
+    PersistenceCommand, PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult,
+    ProtocolStateSnapshot, PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck,
+    ResetApplicationBatch, RestoreImage, RestoreRequest, ShutdownAck, ShutdownRequest, StoreError,
 };
 use boon_plan::ApplicationIdentity;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,8 @@ pub struct AuthorityTurn {
     pub changes: Vec<DurableChange>,
     pub outbox_changes: Vec<DurableOutboxChange>,
     #[serde(default)]
+    pub protocol_state_changes: Vec<DurableProtocolStateChange>,
+    #[serde(default)]
     pub content_artifact_changes: Vec<DurableContentArtifactChange>,
 }
 
@@ -37,12 +39,18 @@ impl AuthorityTurn {
             turn_sequence,
             changes,
             outbox_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
         }
     }
 
     pub fn with_outbox_changes(mut self, changes: Vec<DurableOutboxChange>) -> Self {
         self.outbox_changes = changes;
+        self
+    }
+
+    pub fn with_protocol_state_changes(mut self, changes: Vec<DurableProtocolStateChange>) -> Self {
+        self.protocol_state_changes = changes;
         self
     }
 
@@ -78,6 +86,7 @@ impl Default for PersistenceWorkerConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistenceStartup {
     pub restore_image: RestoreImage,
+    pub protocol_state: ProtocolStateSnapshot,
     pub initialized: bool,
 }
 
@@ -1218,33 +1227,47 @@ where
         application: initial_image.application.clone(),
         expected_schema_hash: None,
     };
-    match driver.execute(PersistenceCommand::Load(request)) {
+    let (restore_image, initialized) = match driver.execute(PersistenceCommand::Load(request)) {
         PersistenceResult::Loaded(Ok(Some(image))) => {
             if image.application != initial_image.application {
                 return Err(StoreError::IdentityMismatch);
             }
-            Ok(PersistenceStartup {
-                restore_image: image,
-                initialized: false,
-            })
+            (image, false)
         }
         PersistenceResult::Loaded(Ok(None)) => {
             match driver.execute(PersistenceCommand::Initialize(initial_image.clone())) {
-                PersistenceResult::Initialized(Ok(_)) => Ok(PersistenceStartup {
-                    restore_image: initial_image,
-                    initialized: true,
-                }),
+                PersistenceResult::Initialized(Ok(_)) => Ok((initial_image, true)),
                 PersistenceResult::Initialized(Err(error)) => Err(error),
                 _ => Err(StoreError::Backend(
                     "driver returned the wrong result for Initialize".to_owned(),
                 )),
-            }
+            }?
         }
-        PersistenceResult::Loaded(Err(error)) => Err(error),
-        _ => Err(StoreError::Backend(
-            "driver returned the wrong result for Load".to_owned(),
-        )),
-    }
+        PersistenceResult::Loaded(Err(error)) => return Err(error),
+        _ => {
+            return Err(StoreError::Backend(
+                "driver returned the wrong result for Load".to_owned(),
+            ));
+        }
+    };
+    let protocol_state = match driver.execute(PersistenceCommand::LoadProtocolState(
+        LoadProtocolStateRequest {
+            application: restore_image.application.clone(),
+        },
+    )) {
+        PersistenceResult::ProtocolStateLoaded(Ok(snapshot)) => snapshot,
+        PersistenceResult::ProtocolStateLoaded(Err(error)) => return Err(error),
+        _ => {
+            return Err(StoreError::Backend(
+                "driver returned the wrong result for LoadProtocolState".to_owned(),
+            ));
+        }
+    };
+    Ok(PersistenceStartup {
+        restore_image,
+        protocol_state,
+        initialized,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1412,6 +1435,10 @@ where
             .iter()
             .flat_map(|queued| queued.turn.outbox_changes.iter().cloned())
             .collect();
+        let protocol_state_changes = pending
+            .iter()
+            .flat_map(|queued| queued.turn.protocol_state_changes.iter().cloned())
+            .collect();
         let content_artifact_changes = pending
             .iter()
             .flat_map(|queued| queued.turn.content_artifact_changes.iter().cloned())
@@ -1425,6 +1452,7 @@ where
             last_turn_sequence,
             changes,
             outbox_changes,
+            protocol_state_changes,
             content_artifact_changes,
             checksum: [0; 32],
         }
@@ -1499,6 +1527,7 @@ where
         last_turn_sequence: turn.turn_sequence,
         changes: turn.changes,
         outbox_changes: turn.outbox_changes,
+        protocol_state_changes: turn.protocol_state_changes,
         content_artifact_changes: turn.content_artifact_changes,
         checksum: [0; 32],
     }

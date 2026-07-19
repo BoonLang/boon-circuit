@@ -81,6 +81,68 @@ store: [
 }
 
 #[test]
+fn list_collection_changes_do_not_become_row_event_causes() {
+    let parsed = boon_parser::parse_source(
+        "list-collection-event-cause.bn",
+        r#"
+store: [
+    clear: SOURCE
+    active_file:
+        TEXT { first } |> HOLD active_file {
+            LATEST {
+                clear |> THEN { TEXT { none } }
+            }
+        }
+    rows:
+        LIST {
+            [file: TEXT { first }]
+            [file: TEXT { second }]
+        }
+        |> List/map(row, new: selectable_row(row: row))
+    visible_rows:
+        rows
+        |> List/filter_field_equal(field: "file", value: active_file)
+    selected:
+        visible_rows
+        |> List/map(visible_row, new:
+            visible_row.controls.select.event.press
+                |> THEN { visible_row.file }
+        )
+        |> List/latest()
+]
+
+FUNCTION selectable_row(row) {
+    [
+        controls: [select: SOURCE]
+        file: row.file
+    ]
+}
+"#,
+    )
+    .unwrap();
+    let ir = lower(&parsed).unwrap();
+    let selected = ir
+        .derived_values
+        .iter()
+        .find(|value| value.path == "store.selected")
+        .expect("selected row event projection");
+
+    assert!(
+        selected
+            .sources
+            .iter()
+            .any(|source| source.ends_with(".controls.select")),
+        "row selection source is missing: {:?}",
+        selected.sources
+    );
+    assert!(
+        !selected.sources.iter().any(|source| source == "store.clear"),
+        "changing list membership must not masquerade as a row selection event: {:?}",
+        selected.sources
+    );
+}
+
+#[test]
 fn press_payload_fields_are_bool_typed() {
     assert_eq!(
         source_payload_data_type(&SourcePayloadField::Named("press".to_owned())),
@@ -267,20 +329,16 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
 }
 
 #[test]
-fn event_press_pulse_is_not_payload_guard_field() {
+fn nested_event_payload_paths_resolve_to_their_typed_field() {
     let variants = source_ref_variants("store.elements.select_clk");
     assert_eq!(
         source_payload_field_from_path("store.elements.select_clk.event.press", &variants),
         Some("press".to_owned())
     );
     assert_eq!(
-        source_payload_guard_field_from_path("store.elements.select_clk.event.press", &variants),
-        None
-    );
-    assert_eq!(
-        source_payload_guard_field_from_path(
+        source_payload_field_from_path(
             "store.elements.select_clk.event.key_down.key",
-            &variants
+            &variants,
         ),
         Some("key".to_owned())
     );
@@ -566,6 +624,95 @@ store: [
 }
 
 #[test]
+fn match_arm_payload_dependencies_do_not_become_event_causes() {
+    let source = r#"
+store: [
+    elements: [ready: SOURCE, fire: SOURCE, payload: SOURCE]
+    payload_value:
+        TEXT { initial } |> HOLD payload_value {
+            elements.payload.text
+        }
+    fingerprint:
+        TEXT { request }
+        |> Text/concat(with: payload_value, separator: ":")
+    request:
+        LATEST {
+            elements.ready.event.press |> WHEN {
+                True => fingerprint
+                False => SKIP
+            }
+            elements.fire.event.press |> THEN { fingerprint }
+        }
+]
+"#;
+    let parsed = boon_parser::parse_source("match-arm-sampled-payload.bn", source).unwrap();
+    let ir = lower(&parsed).expect("match-arm payload sampling must lower");
+
+    let request = ir
+        .derived_values
+        .iter()
+        .find(|value| value.path == "store.request")
+        .expect("request transform");
+    assert_eq!(
+        request.sources,
+        vec!["store.elements.fire", "store.elements.ready"],
+        "sources sampled from WHEN/THEN outputs must not become event causes"
+    );
+}
+
+#[test]
+fn derived_when_input_remains_an_event_cause_beside_sampled_then_outputs() {
+    let source = r#"
+store: [
+    start: SOURCE
+    reset: SOURCE
+    seed_rows: LIST { [key: TEXT { row }] }
+    rows:
+        seed_rows |> List/map(seed_row, new: selectable_row(seed_row: seed_row))
+    clock_result:
+        ClockNotRequested |> HOLD clock_result {
+            start |> THEN { Clock/wall() }
+        }
+    projected:
+        clock_result |> WHEN {
+            WallClockRead => TEXT { canonical }
+            __ => TEXT { none }
+        }
+    active:
+        TEXT { fallback } |> HOLD active {
+            LATEST {
+                projected |> WHEN {
+                    TEXT { none } => SKIP
+                    __ => projected
+                }
+                reset |> THEN { TEXT { fallback } }
+                rows
+                    |> List/map(row, new: LATEST {
+                        row.select |> THEN { row.key }
+                    })
+                    |> List/latest()
+            }
+        }
+]
+
+FUNCTION selectable_row(seed_row) {
+    [key: seed_row.key, select: SOURCE]
+}
+"#;
+    let parsed = boon_parser::parse_source("derived-when-event-cause.bn", source).unwrap();
+    let ir = lower(&parsed).expect("derived WHEN input must lower as an event cause");
+
+    assert!(
+        ir.update_branches.iter().any(|branch| {
+            branch.source == "store.clock_result"
+                && branch.target == "store.active"
+        }),
+        "derived WHEN input lost its transitive event source: {:#?}",
+        ir.update_branches
+    );
+}
+
+#[test]
 fn nested_match_over_grouped_key_event_uses_the_canonical_source_path() {
     let source = r#"
 store: [
@@ -594,6 +741,63 @@ store: [
         "grouped key event did not produce a typed static update: {:#?}",
         ir.update_branches
     );
+}
+
+#[test]
+fn nested_event_match_preserves_structured_effect_result_projection_reads() {
+    let source = r#"
+store: [
+    start: SOURCE
+    next: SOURCE
+    clock_result:
+        NotStarted |> HOLD clock_result {
+            start |> THEN { Clock/wall() }
+        }
+    offset:
+        0 |> HOLD offset {
+            next.event.press |> THEN {
+                clock_result |> WHEN {
+                    WallClockRead => clock_result.nanoseconds == 0 |> WHEN {
+                        True => clock_result.unix_seconds
+                        False => clock_result.nanoseconds
+                    }
+                    __ => SKIP
+                }
+            }
+        }
+]
+"#;
+    let parsed = boon_parser::parse_source("structured-effect-projection-read.bn", source).unwrap();
+    let ir = lower(&parsed).expect("structured effect projections must remain typed reads");
+    let branch = ir
+        .update_branches
+        .iter()
+        .find(|branch| branch.source == "store.next" && branch.target == "store.offset")
+        .expect("next event must update offset");
+    let UpdateExpression::MatchValueConst { arms, .. } = &branch.expression else {
+        panic!("outer effect-result match was not lowered: {branch:#?}");
+    };
+    let nested = arms
+        .iter()
+        .find(|arm| arm.pattern == "WallClockRead")
+        .expect("WallClockRead arm");
+    let UpdateValueExpression::MatchInfixConst { arms, .. } = &nested.output else {
+        panic!("nested numeric match was not lowered: {nested:#?}");
+    };
+    for expected in [
+        "clock_result.unix_seconds",
+        "clock_result.nanoseconds",
+    ] {
+        assert!(
+            arms.iter().any(|arm| {
+                arm.output
+                    == UpdateValueExpression::ReadPath {
+                        path: expected.to_owned(),
+                    }
+            }),
+            "structured projection `{expected}` became a literal: {arms:#?}"
+        );
+    }
 }
 
 #[test]

@@ -42,25 +42,19 @@ store: [
     selected_station:
         TEXT { station-oslo }
         |> HOLD selected_station {
-            LATEST {
-                sources.station_input.events.change.text
-            }
+            sources.station_input.events.change.text
         }
 
     watch_descriptor:
         TEXT { station-oslo:temperature }
         |> HOLD watch_descriptor {
-            LATEST {
-                sources.station_input.events.change.text
-            }
+            sources.station_input.events.change.text
         }
 
     last_known_snapshot:
         TEXT { unavailable }
         |> HOLD last_known_snapshot {
-            LATEST {
-                sources.snapshot.events.receive.text
-            }
+            sources.snapshot.events.receive.text
         }
 
     connection_status:

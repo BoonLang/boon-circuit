@@ -108,7 +108,7 @@ async fn compiled_boon_uses_typed_clock_random_secret_hmac_and_deadline_services
             ("secret", Value::Text("session".to_owned())),
             (
                 "candidate",
-                Value::Bytes(b"correct horse battery staple".to_vec()),
+                Value::Bytes(b"correct horse battery staple".to_vec().into()),
             ),
         ],
     );
@@ -124,7 +124,7 @@ async fn compiled_boon_uses_typed_clock_random_secret_hmac_and_deadline_services
         "store.sign_message",
         [
             ("secret", Value::Text("session".to_owned())),
-            ("message", Value::Bytes(message.clone())),
+            ("message", Value::Bytes(message.clone().into())),
         ],
     );
     apply_immediate(&mut program, &mut adapter, sign);
@@ -138,7 +138,7 @@ async fn compiled_boon_uses_typed_clock_random_secret_hmac_and_deadline_services
         "store.verify_signature",
         [
             ("secret", Value::Text("session".to_owned())),
-            ("message", Value::Bytes(message)),
+            ("message", Value::Bytes(message.into())),
             ("tag", Value::Bytes(tag)),
         ],
     );
@@ -178,7 +178,7 @@ async fn unknown_secrets_and_deadline_capacity_fail_as_typed_results() {
         "store.verify_secret",
         [
             ("secret", Value::Text("absent".to_owned())),
-            ("candidate", Value::Bytes(Vec::new())),
+            ("candidate", Value::Bytes(Vec::new().into())),
         ],
     );
     apply_immediate(&mut program, &mut adapter, unknown);

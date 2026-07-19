@@ -2,7 +2,9 @@
 //! application policy remains in the compiled Boon document program.
 
 mod canvas;
+mod client_effect_host;
 mod clipboard;
+mod distributed_session;
 mod history;
 mod input;
 mod map_host;
@@ -13,7 +15,9 @@ mod startup;
 mod storage;
 
 pub use canvas::*;
+pub(crate) use client_effect_host::*;
 pub use clipboard::*;
+pub use distributed_session::*;
 pub use history::*;
 pub use input::*;
 pub use map_host::*;

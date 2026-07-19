@@ -10,17 +10,25 @@ use boon_persistence::{
     InMemoryDriver, MigrationPreview, OutboxInspectorState, PersistenceInspectorSnapshot,
     PersistenceWorkerConfig, PersistenceWorkerStatus, RedbDriver,
 };
-use boon_plan::{ApplicationIdentity, ApplicationPlan, FiniteReal, MachinePlan, MemoryKind};
+use boon_plan::{
+    ApplicationIdentity, ApplicationPlan, EffectReplay, FiniteReal, MachinePlan, MemoryKind,
+    ProgramRole,
+};
 pub(crate) use boon_runtime::ProgramCompletionObservation;
 use boon_runtime::{
-    DocumentPatch, DocumentPatchStatus, FileEffectDriver, HostEffectRouter, HostEffectWorker,
-    LiveRuntime, ObservedProgramCompletion, PersistentRuntime, PersistentRuntimeStartup,
-    ProgramArtifact, ProgramArtifactDrive, ProgramArtifactLaneKind, ProgramArtifactLaneOutcome,
+    DistributedProgramBundle, DocumentPatch, DocumentPatchStatus, HostEffectRouter,
+    HostEffectWorker, LiveRuntime, ObservedProgramCompletion, PersistentRuntime,
+    PersistentRuntimeStartup, PersistentRuntimeStartupDisposition, ProgramArtifact,
+    ProgramArtifactDrive, ProgramArtifactLaneKind, ProgramArtifactLaneOutcome,
     ProgramArtifactTurnKind, ProgramDiagnostic, ProgramDocumentHost, ProgramHostDiagnostic,
     ProgramHostRequest, ProgramRejection, ProgramRequestId, ProgramSessionId, RowId,
     RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload, Value,
 };
-use std::collections::BTreeMap;
+use boon_server_runtime::{
+    InProcessDistributedRuntime, InProcessPoll, InProcessTransientEffectOwner,
+    PersistentServerConfig, PersistentServerStartup,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,7 +50,6 @@ const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const PERSISTENCE_ACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STATE_DIRECTORY: &str = "playground/state";
 pub(crate) const STATE_ROOT_ENV: &str = "BOON_PLAYGROUND_STATE_ROOT";
-const EFFECT_DIRECTORY: &str = "playground/effects";
 const EFFECT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_TRANSIENT_COMPLETIONS_PER_POLL: usize = 8;
 const HOST_LIFECYCLE_STARTED_SOURCE: &str = "host.lifecycle.started";
@@ -113,12 +120,13 @@ struct InputModifiers {
 }
 
 pub struct RuntimeView {
-    runtime: PersistentRuntime,
+    runtime: RuntimeBackend,
+    machine_plan: Arc<MachinePlan>,
     program_host: ProgramDocumentHost,
     application: ApplicationIdentity,
     persistence_schema_version: u64,
     persistence_schema_hash: [u8; 32],
-    startup: PersistentRuntimeStartup,
+    startup: RuntimeStartup,
     authority_plan_counts: AuthorityPlanCounts,
     authority_selections: std::collections::BTreeMap<String, AuthoritySelection>,
     persistence_status: PersistenceWorkerStatus,
@@ -146,12 +154,64 @@ pub struct RuntimeView {
     effect_worker: HostEffectWorker,
     transient_host: NativeTransientHost,
     next_effect_poll: Option<Instant>,
+    distributed_started: Option<Instant>,
+    distributed_effect_owners:
+        BTreeMap<boon_runtime::TransientEffectCallId, InProcessTransientEffectOwner>,
     host_identity_mode: HostIdentityMode,
     host_identity_generation: u64,
     scenario_trigger_source: Option<String>,
     scenario_trigger_turn: Option<RuntimeTurn>,
     pending_durable_lanes: BTreeMap<u64, PendingDurableLane>,
     async_lane_observations: Vec<RuntimeAsyncLaneObservation>,
+}
+
+enum RuntimeBackend {
+    Single(PersistentRuntime),
+    Distributed(InProcessDistributedRuntime),
+}
+
+enum RuntimeStartup {
+    Single(PersistentRuntimeStartup),
+    Distributed(PersistentServerStartup),
+}
+
+pub(crate) struct RuntimeStartupEvidence {
+    pub disposition: PersistentRuntimeStartupDisposition,
+    pub schema_version: u64,
+    pub schema_hash: [u8; 32],
+}
+
+impl RuntimeBackend {
+    fn single(&self) -> ViewResult<&PersistentRuntime> {
+        match self {
+            Self::Single(runtime) => Ok(runtime),
+            Self::Distributed(_) => Err(
+                "single-role persistence operation is unavailable for a distributed package"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    fn single_mut(&mut self) -> ViewResult<&mut PersistentRuntime> {
+        match self {
+            Self::Single(runtime) => Ok(runtime),
+            Self::Distributed(_) => Err(
+                "single-role persistence operation is unavailable for a distributed package"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    fn distributed_mut(&mut self) -> Option<&mut InProcessDistributedRuntime> {
+        match self {
+            Self::Single(_) => None,
+            Self::Distributed(runtime) => Some(runtime),
+        }
+    }
+
+    fn is_distributed(&self) -> bool {
+        matches!(self, Self::Distributed(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,6 +324,182 @@ impl RuntimeView {
         )
     }
 
+    pub fn open_distributed_with_assets(
+        bundle: DistributedProgramBundle,
+        deterministic: bool,
+        assets: &[AssetBlob],
+    ) -> ViewResult<Self> {
+        let client_artifact = bundle
+            .artifact(ProgramRole::Client)
+            .ok_or_else(|| "distributed package has no Client artifact".to_owned())?;
+        let server_artifact = bundle
+            .artifact(ProgramRole::Server)
+            .ok_or_else(|| "distributed package has no Server artifact".to_owned())?;
+        let machine_plan = client_artifact.plan().clone();
+        validate_preview_plan(&machine_plan)?;
+        let application = client_artifact.application().clone();
+        let authority_plan = server_artifact.plan().clone();
+        let required_effects = bundle
+            .artifacts()
+            .iter()
+            .flat_map(|artifact| transient_effect_ids(artifact.plan()))
+            .collect::<BTreeSet<_>>();
+        let state_root = if deterministic {
+            transient_content_root(&repository_root().join("target/boon-distributed-state"))
+        } else {
+            configured_state_root()
+        };
+        let database_path = state_database_path_in(&state_root, server_artifact.application())?;
+        let database_parent = database_path
+            .parent()
+            .ok_or_else(|| "distributed Server database has no parent directory".to_owned())?;
+        fs::create_dir_all(database_parent).map_err(|error| {
+            format!(
+                "create distributed Server state directory `{}`: {error}",
+                database_parent.display()
+            )
+        })?;
+        let driver = RedbDriver::open(&database_path).map_err(|error| {
+            format!(
+                "open distributed Server state database `{}`: {error}",
+                database_path.display()
+            )
+        })?;
+        let (mut runtime, startup) = InProcessDistributedRuntime::start_persistent(
+            &bundle,
+            driver,
+            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
+        )
+        .map_err(|error| error.to_string())?;
+        let persistence_status = startup.lifecycle.status().persistence;
+        let content_root = transient_content_root(&state_root.join("transient"));
+        let mut transient_host = NativeTransientHost::new(
+            content_root,
+            assets.iter().map(|asset| PackageAsset {
+                url: &asset.url,
+                media: &asset.media_type,
+                bytes: &asset.bytes,
+            }),
+            required_effects,
+        )?;
+        let distributed_started = Instant::now();
+        let mut distributed_effect_owners = BTreeMap::new();
+        let mut initial_client_turns = Vec::new();
+        for _ in 0..1_024 {
+            let poll = runtime
+                .poll(Duration::ZERO)
+                .map_err(|error| error.to_string())?;
+            route_distributed_transient_effects(
+                &mut transient_host,
+                &mut distributed_effect_owners,
+                &poll,
+            )?;
+            initial_client_turns.extend(poll.client_turns);
+            if !poll.has_more_work {
+                break;
+            }
+        }
+        if runtime.next_deadline() == Some(Duration::ZERO) {
+            return Err("distributed package mount exceeded the bounded startup pump".to_owned());
+        }
+        let frame = runtime
+            .document_frame()
+            .cloned()
+            .ok_or_else(|| "distributed Client produced no retained document".to_owned())?;
+        let (program_host, program_requests) =
+            ProgramDocumentHost::mount(application.clone(), &frame);
+        if !program_requests.is_empty() {
+            return Err(
+                "distributed Client document requested nested Program artifacts before that owner is installed"
+                    .to_owned(),
+            );
+        }
+        let text_inputs = frame
+            .nodes
+            .values()
+            .filter(|node| {
+                node.kind == DocumentNodeKind::TextInput && !node.is_sensitive_text_input()
+            })
+            .map(|node| {
+                (
+                    node.id.0.clone(),
+                    TextInputState::new(
+                        node.text
+                            .as_ref()
+                            .map(|text| text.text.as_str())
+                            .unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect();
+        let runtime_turn_sequence = initial_client_turns
+            .iter()
+            .map(|turn| turn.sequence)
+            .max()
+            .unwrap_or(0);
+        let sequence = initial_client_turns
+            .iter()
+            .filter_map(|turn| turn.source_sequence)
+            .max()
+            .unwrap_or(0);
+        let last_runtime_phase = initial_client_turns
+            .last()
+            .map_or_else(RuntimePhaseTimings::default, |turn| turn.phase_timings);
+        let host_identity_mode = if deterministic {
+            HostIdentityMode::Deterministic
+        } else {
+            HostIdentityMode::Interactive
+        };
+        let mut view = Self {
+            runtime: RuntimeBackend::Distributed(runtime),
+            machine_plan: machine_plan.clone(),
+            program_host,
+            application,
+            persistence_schema_version: authority_plan.persistence.schema_version,
+            persistence_schema_hash: authority_plan.persistence.schema_hash,
+            startup: RuntimeStartup::Distributed(startup),
+            authority_plan_counts: authority_plan_counts(&authority_plan),
+            authority_selections: authority_selections(&authority_plan),
+            persistence_status,
+            persistence_inspector: None,
+            persistence_inspector_error: None,
+            next_persistence_poll: None,
+            runtime_turn_sequence,
+            hovered: None,
+            pressed: None,
+            focused: None,
+            text_inputs,
+            text_drag: None,
+            modifiers: InputModifiers::default(),
+            clipboard_fallback: None,
+            clipboard_system_synchronized: false,
+            scroll_offsets: BTreeMap::new(),
+            materialization_overscan: BTreeMap::new(),
+            pending_patches: Vec::new(),
+            sequence,
+            event_dispatches: None,
+            pending_external_url: None,
+            last_primary_click: None,
+            last_runtime_phase,
+            scheduled_sources: scheduled_sources_from_plan(&machine_plan)?,
+            effect_worker: native_effect_worker()?,
+            transient_host,
+            next_effect_poll: None,
+            distributed_started: Some(distributed_started),
+            distributed_effect_owners,
+            host_identity_mode,
+            host_identity_generation: 1,
+            scenario_trigger_source: None,
+            scenario_trigger_turn: None,
+            pending_durable_lanes: BTreeMap::new(),
+            async_lane_observations: Vec::new(),
+        };
+        view.dispatch_host_lifecycle_started()?;
+        view.schedule_effect_poll()?;
+        view.pending_patches.clear();
+        Ok(view)
+    }
+
     pub(crate) fn open_with_state_root_deterministic(
         plan: Arc<MachinePlan>,
         state_root: impl AsRef<Path>,
@@ -349,8 +585,10 @@ impl RuntimeView {
             content_root,
             assets.iter().map(|asset| PackageAsset {
                 url: &asset.url,
+                media: &asset.media_type,
                 bytes: &asset.bytes,
             }),
+            transient_effect_ids(runtime.runtime().machine_plan()),
         )?;
         if let Some(host_started) = &host_started {
             transient_host.route_turn(host_started)?;
@@ -395,7 +633,8 @@ impl RuntimeView {
             })
             .collect();
         let scheduled_sources = scheduled_sources(runtime.runtime())?;
-        let plan = runtime.runtime().machine_plan();
+        let machine_plan = runtime.runtime().shared_machine_plan();
+        let plan = machine_plan.as_ref();
         let persistence_schema_version = plan.persistence.schema_version;
         let persistence_schema_hash = plan.persistence.schema_hash;
         let authority_plan_counts = authority_plan_counts(plan);
@@ -409,12 +648,13 @@ impl RuntimeView {
         let next_effect_poll =
             (runtime.has_effect_work() || transient_host.has_work()).then_some(Instant::now());
         let mut view = Self {
-            runtime,
+            runtime: RuntimeBackend::Single(runtime),
+            machine_plan,
             program_host,
             application,
             persistence_schema_version,
             persistence_schema_hash,
-            startup,
+            startup: RuntimeStartup::Single(startup),
             authority_plan_counts,
             authority_selections,
             persistence_status,
@@ -445,6 +685,8 @@ impl RuntimeView {
             effect_worker,
             transient_host,
             next_effect_poll,
+            distributed_started: None,
+            distributed_effect_owners: BTreeMap::new(),
             host_identity_mode,
             host_identity_generation,
             scenario_trigger_source: None,
@@ -462,7 +704,7 @@ impl RuntimeView {
     }
 
     pub(crate) fn shared_machine_plan(&self) -> Arc<MachinePlan> {
-        self.runtime.runtime().shared_machine_plan()
+        self.machine_plan.clone()
     }
 
     pub fn plan_schema_matches(&self, plan: &MachinePlan) -> bool {
@@ -479,6 +721,7 @@ impl RuntimeView {
             return Err("preview plan belongs to a different application identity".to_owned());
         }
         self.runtime
+            .single()?
             .preview_machine_plan(plan, SessionOptions::default())
             .map_err(|error| error.to_string())
     }
@@ -494,6 +737,7 @@ impl RuntimeView {
         let target_schema_version = plan.persistence.schema_version;
         let activation = self
             .runtime
+            .single_mut()?
             .activate_machine_plan(plan, SessionOptions::default())
             .map_err(|error| error.to_string())?;
         let acknowledgement = activation.acknowledgement;
@@ -515,15 +759,16 @@ impl RuntimeView {
     }
 
     pub fn restart(&mut self) -> ViewResult<RuntimePlanChange> {
-        let plan = self.runtime.runtime().shared_machine_plan();
+        let plan = self.machine_plan.clone();
         self.activate_machine_plan(plan)
     }
 
     pub fn start_over(&mut self) -> ViewResult<RuntimePlanChange> {
-        let plan = self.runtime.runtime().shared_machine_plan();
+        let plan = self.machine_plan.clone();
         let target_schema_version = plan.persistence.schema_version;
         let reset = self
             .runtime
+            .single_mut()?
             .start_over_machine_plan(plan, SessionOptions::default())
             .map_err(|error| error.to_string())?;
         let durable_epoch = reset.acknowledgement.epoch;
@@ -539,7 +784,7 @@ impl RuntimeView {
 
     fn install_runtime_mount(&mut self, mount: RuntimeTurn) -> ViewResult<()> {
         self.transient_host.route_turn(&mount)?;
-        self.runtime.reset_program_artifacts();
+        self.runtime.single_mut()?.reset_program_artifacts();
         let runtime_turn_sequence = mount.sequence;
         if mount.document_patch_status != DocumentPatchStatus::Complete {
             return Err("MachinePlan did not produce complete typed document bindings".to_owned());
@@ -547,6 +792,7 @@ impl RuntimeView {
         let mounted = state_from_mount(mount.document_patches)?;
         let frame = self
             .runtime
+            .single()?
             .runtime()
             .primary_retained_output_frame()
             .map_err(|error| error.to_string())?
@@ -557,6 +803,7 @@ impl RuntimeView {
             ProgramDocumentHost::mount(self.application.clone(), &frame);
         self.program_host = program_host;
         self.runtime
+            .single_mut()?
             .queue_program_requests(pending_program_requests);
         self.resolve_program_artifact_requests_blocking()?;
         self.pending_patches.clear();
@@ -565,9 +812,9 @@ impl RuntimeView {
         self.materialization_overscan.clear();
         self.pending_patches.clear();
         self.last_runtime_phase = RuntimePhaseTimings::default();
-        self.scheduled_sources = scheduled_sources(self.runtime.runtime())?;
-        self.runtime_turn_sequence = runtime_turn_sequence;
         self.refresh_plan_metadata();
+        self.scheduled_sources = scheduled_sources_from_plan(&self.machine_plan)?;
+        self.runtime_turn_sequence = runtime_turn_sequence;
         self.refresh_persistence_after_control();
         self.schedule_effect_poll()?;
         Ok(())
@@ -593,12 +840,26 @@ impl RuntimeView {
         self.persistence_schema_version
     }
 
-    pub(crate) fn startup_evidence(&self) -> &PersistentRuntimeStartup {
-        &self.startup
+    pub(crate) fn startup_evidence(&self) -> RuntimeStartupEvidence {
+        match &self.startup {
+            RuntimeStartup::Single(startup) => RuntimeStartupEvidence {
+                disposition: startup.disposition.clone(),
+                schema_version: startup.restore_image.schema_version,
+                schema_hash: startup.restore_image.schema_hash,
+            },
+            RuntimeStartup::Distributed(startup) => RuntimeStartupEvidence {
+                disposition: startup.disposition.clone(),
+                schema_version: self.persistence_schema_version,
+                schema_hash: self.persistence_schema_hash,
+            },
+        }
     }
 
     pub(crate) fn parent_runtime_generation(&self) -> u64 {
-        self.runtime.generation()
+        match &self.runtime {
+            RuntimeBackend::Single(runtime) => runtime.generation(),
+            RuntimeBackend::Distributed(_) => 1,
+        }
     }
 
     pub fn authority_selection_for_path(&self, path: &str) -> Option<AuthoritySelection> {
@@ -610,13 +871,14 @@ impl RuntimeView {
     }
 
     pub fn semantic_value_image(&self) -> ViewResult<boon_persistence::RestoreImage> {
-        self.runtime.semantic_value_image()
+        self.runtime.single()?.semantic_value_image()
     }
 
     pub fn assert_scenario_step(&mut self, step: &boon_runtime::ScenarioStep) -> ViewResult<()> {
         self.scenario_trigger_source = None;
         let turn = self.scenario_trigger_turn.take();
         self.runtime
+            .single_mut()?
             .assert_scenario_step(step, turn.as_ref())
             .map_err(|error| error.to_string())
     }
@@ -638,32 +900,132 @@ impl RuntimeView {
         if self.next_effect_poll.is_none_or(|deadline| deadline > now) {
             return Ok(false);
         }
-        let turn = self
-            .runtime
-            .poll_effect_worker(&mut self.effect_worker)
-            .map_err(|error| error.to_string())?;
-        let mut changed = turn.map_or(Ok(false), |turn| self.finish_parent_runtime_turn(turn))?;
+        let mut changed = if self.runtime.is_distributed() {
+            self.poll_distributed_runtime(now)?
+        } else {
+            let turn = self
+                .runtime
+                .single_mut()?
+                .poll_effect_worker(&mut self.effect_worker)
+                .map_err(|error| error.to_string())?;
+            turn.map_or(Ok(false), |turn| self.finish_parent_runtime_turn(turn))?
+        };
         for _ in 0..MAX_TRANSIENT_COMPLETIONS_PER_POLL {
             let Some(completion) = self.transient_host.try_completion()? else {
                 break;
             };
-            let turn = match completion {
-                TransientHostCompletion::Single { call_id, outcome } => self
-                    .runtime
-                    .complete_transient_effect(call_id, outcome)
-                    .map_err(|error| error.to_string())?,
-                TransientHostCompletion::Stream(event) => self
-                    .runtime
-                    .deliver_transient_effect_result(
-                        event.call_id,
-                        event.result_sequence,
-                        event.outcome,
-                    )
-                    .map_err(|error| error.to_string())?,
-            };
-            changed |= self.finish_parent_runtime_turn(turn)?;
+            if self.runtime.is_distributed() {
+                self.complete_distributed_transient_effect(completion)?;
+                changed |= self.poll_distributed_runtime(now)?;
+            } else {
+                let turn = match completion {
+                    TransientHostCompletion::Single { call_id, outcome } => self
+                        .runtime
+                        .single_mut()?
+                        .complete_transient_effect(call_id, outcome)
+                        .map_err(|error| error.to_string())?,
+                    TransientHostCompletion::File(event) => {
+                        if event.is_stream() {
+                            self.runtime
+                                .single_mut()?
+                                .deliver_transient_effect_result(
+                                    event.call_id,
+                                    event.result_sequence,
+                                    event.outcome,
+                                )
+                                .map_err(|error| error.to_string())?
+                        } else {
+                            self.runtime
+                                .single_mut()?
+                                .complete_transient_effect(event.call_id, event.outcome)
+                                .map_err(|error| error.to_string())?
+                        }
+                    }
+                };
+                changed |= self.finish_parent_runtime_turn(turn)?;
+            }
         }
         self.schedule_effect_poll()?;
+        Ok(changed)
+    }
+
+    fn complete_distributed_transient_effect(
+        &mut self,
+        completion: TransientHostCompletion,
+    ) -> ViewResult<()> {
+        let (call_id, terminal) = match &completion {
+            TransientHostCompletion::Single { call_id, .. } => (*call_id, true),
+            TransientHostCompletion::File(event) => (event.call_id, event.is_terminal()),
+        };
+        let owner = self
+            .distributed_effect_owners
+            .get(&call_id)
+            .copied()
+            .ok_or_else(|| format!("native host completed unowned distributed call {call_id}"))?;
+        let runtime = self.runtime.distributed_mut().ok_or_else(|| {
+            "distributed effect completion reached a single-role runtime".to_owned()
+        })?;
+        match completion {
+            TransientHostCompletion::Single { outcome, .. } => runtime
+                .complete_transient_effect(owner, call_id, outcome)
+                .map_err(|error| error.to_string())?,
+            TransientHostCompletion::File(event) if event.is_stream() => runtime
+                .deliver_transient_effect_result(
+                    owner,
+                    call_id,
+                    event.result_sequence,
+                    event.outcome,
+                )
+                .map_err(|error| error.to_string())?,
+            TransientHostCompletion::File(event) => runtime
+                .complete_transient_effect(owner, call_id, event.outcome)
+                .map_err(|error| error.to_string())?,
+        }
+        if terminal {
+            self.distributed_effect_owners.remove(&call_id);
+        }
+        Ok(())
+    }
+
+    fn poll_distributed_runtime(&mut self, now: Instant) -> ViewResult<bool> {
+        let started = self
+            .distributed_started
+            .ok_or_else(|| "distributed runtime has no logical clock origin".to_owned())?;
+        let logical_now = now.saturating_duration_since(started);
+        let poll = self
+            .runtime
+            .distributed_mut()
+            .ok_or_else(|| "distributed poll reached a single-role runtime".to_owned())?
+            .poll(logical_now)
+            .map_err(|error| error.to_string())?;
+        route_distributed_transient_effects(
+            &mut self.transient_host,
+            &mut self.distributed_effect_owners,
+            &poll,
+        )?;
+        let mut parent_patches = Vec::new();
+        for turn in poll.client_turns {
+            self.runtime_turn_sequence = self.runtime_turn_sequence.max(turn.sequence);
+            self.sequence = source_sequence_after_turn(self.sequence, turn.source_sequence);
+            self.last_runtime_phase = turn.phase_timings;
+            parent_patches.extend(turn.document_patches);
+        }
+        let parent = self
+            .runtime
+            .distributed_mut()
+            .and_then(|runtime| runtime.document_frame().cloned())
+            .ok_or_else(|| "distributed Client lost its retained document".to_owned())?;
+        let update = self
+            .program_host
+            .reconcile_with_parent_patches(&parent, parent_patches);
+        if !update.requests.is_empty() {
+            return Err(
+                "distributed Client requested nested Program artifacts without a distributed owner"
+                    .to_owned(),
+            );
+        }
+        let mut changed = self.queue_program_update(update.patches, Vec::new());
+        changed |= self.dispatch_rejections(update.rejections)?;
         Ok(changed)
     }
 
@@ -685,7 +1047,10 @@ impl RuntimeView {
             && self.persistence_status.reserved_slots == 0
             && self.persistence_status.pending_content_artifact_stores == 0
             && self.persistence_status.pending_content_artifact_loads == 0
-            && !self.runtime.program_artifacts_pending();
+            && match &self.runtime {
+                RuntimeBackend::Single(runtime) => !runtime.program_artifacts_pending(),
+                RuntimeBackend::Distributed(_) => true,
+            };
         let inspector_is_stale = self.persistence_inspector.as_ref().is_none_or(|inspector| {
             inspector.epoch < self.persistence_status.durable_epoch
                 || inspector.through_turn_sequence
@@ -817,15 +1182,18 @@ impl RuntimeView {
                 barrier_us: self.persistence_status.timings.barrier_us,
                 restore_us: self.persistence_status.timings.restore_us,
                 migration_us: self.persistence_status.timings.migration_us,
-                rebuild_derived_us: self.runtime.last_rebuild_derived_us(),
+                rebuild_derived_us: match &self.runtime {
+                    RuntimeBackend::Single(runtime) => runtime.last_rebuild_derived_us(),
+                    RuntimeBackend::Distributed(_) => 0,
+                },
             },
             outbox,
             worker_alive: self.persistence_status.worker_alive,
             capabilities: PersistenceCapabilities {
-                clear_selected: available_capability(),
-                export_state: available_capability(),
-                import_preview: available_capability(),
-                activate_import: available_capability(),
+                clear_selected: self.persistence_capability(),
+                export_state: self.persistence_capability(),
+                import_preview: self.persistence_capability(),
+                activate_import: self.persistence_capability(),
             },
             import_preview,
             last_actionable_error,
@@ -836,8 +1204,24 @@ impl RuntimeView {
         }
     }
 
+    fn persistence_capability(&self) -> PersistenceCapability {
+        if self.runtime.is_distributed() {
+            PersistenceCapability {
+                available: false,
+                reason: "distributed Server persistence controls are not mounted in this preview"
+                    .to_owned(),
+            }
+        } else {
+            available_capability()
+        }
+    }
+
     pub fn flush_persistence(&mut self) -> ViewResult<(u64, u64)> {
-        let acknowledgement = self.runtime.flush().map_err(|error| error.to_string())?;
+        let acknowledgement = self
+            .runtime
+            .single()?
+            .flush()
+            .map_err(|error| error.to_string())?;
         self.refresh_persistence_after_control();
         Ok((
             acknowledgement.epoch,
@@ -846,7 +1230,11 @@ impl RuntimeView {
     }
 
     pub fn compact_persistence(&mut self) -> ViewResult<u64> {
-        let acknowledgement = self.runtime.compact().map_err(|error| error.to_string())?;
+        let acknowledgement = self
+            .runtime
+            .single()?
+            .compact()
+            .map_err(|error| error.to_string())?;
         self.refresh_persistence_after_control();
         Ok(acknowledgement.epoch)
     }
@@ -854,6 +1242,7 @@ impl RuntimeView {
     pub fn export_state_artifact(&mut self) -> ViewResult<Vec<u8>> {
         let artifact = self
             .runtime
+            .single()?
             .export_state_artifact()
             .map_err(|error| error.to_string())?;
         self.refresh_persistence_after_control();
@@ -866,6 +1255,7 @@ impl RuntimeView {
     ) -> ViewResult<boon_runtime::PersistentStateArtifactPreview> {
         let preview = self
             .runtime
+            .single()?
             .preview_state_artifact(artifact, SessionOptions::default())
             .map_err(|error| error.to_string())?;
         self.refresh_persistence_after_control();
@@ -878,6 +1268,7 @@ impl RuntimeView {
     ) -> ViewResult<(boon_runtime::PersistentStateArtifactPreview, u64)> {
         let activation = self
             .runtime
+            .single_mut()?
             .activate_state_artifact(artifact, SessionOptions::default())
             .map_err(|error| error.to_string())?;
         let epoch = activation.acknowledgement.epoch;
@@ -889,6 +1280,7 @@ impl RuntimeView {
     pub fn clear_authority_path(&mut self, semantic_path: &str) -> ViewResult<(u64, u64)> {
         let activation = self
             .runtime
+            .single_mut()?
             .clear_authority_path(semantic_path, SessionOptions::default())
             .map_err(|error| error.to_string())?;
         let acknowledgement = activation
@@ -901,7 +1293,11 @@ impl RuntimeView {
     }
 
     fn refresh_plan_metadata(&mut self) {
-        let plan = self.runtime.runtime().machine_plan();
+        let Ok(runtime) = self.runtime.single() else {
+            return;
+        };
+        self.machine_plan = runtime.runtime().shared_machine_plan();
+        let plan = self.machine_plan.as_ref();
         self.application = plan.application.identity.clone();
         self.persistence_schema_version = plan.persistence.schema_version;
         self.persistence_schema_hash = plan.persistence.schema_hash;
@@ -921,7 +1317,11 @@ impl RuntimeView {
     fn refresh_persistence_inspector(&mut self) -> bool {
         let previous = self.persistence_inspector.clone();
         let previous_error = self.persistence_inspector_error.clone();
-        match self.runtime.inspect() {
+        let inspection = match self.runtime.single() {
+            Ok(runtime) => runtime.inspect(),
+            Err(_) => return false,
+        };
+        match inspection {
             Ok(inspector) => {
                 self.persistence_inspector = inspector;
                 self.persistence_inspector_error = None;
@@ -934,7 +1334,13 @@ impl RuntimeView {
     }
 
     fn query_persistence_status(&mut self) -> PersistenceWorkerStatus {
-        self.runtime.status()
+        match &self.runtime {
+            RuntimeBackend::Single(runtime) => runtime.status(),
+            RuntimeBackend::Distributed(runtime) => runtime
+                .persistent_server_status()
+                .map(|status| status.persistence)
+                .unwrap_or_else(unavailable_persistence_status),
+        }
     }
 
     fn retain_view_state(&mut self, frame: &DocumentFrame, reset_input: bool) {
@@ -1066,8 +1472,12 @@ impl RuntimeView {
     }
 
     fn resolve_program_artifact_requests_blocking(&mut self) -> ViewResult<bool> {
+        if self.runtime.is_distributed() {
+            return Ok(false);
+        }
         let drive = self
             .runtime
+            .single_mut()?
             .resolve_program_artifact_requests_blocking(&mut self.program_host, &mut self.sequence)
             .map_err(|error| error.to_string())?;
         self.apply_program_artifact_drive(drive)
@@ -1075,8 +1485,12 @@ impl RuntimeView {
     }
 
     pub fn resolve_program_artifact_requests(&mut self) -> ViewResult<bool> {
+        if self.runtime.is_distributed() {
+            return Ok(false);
+        }
         let drive = self
             .runtime
+            .single_mut()?
             .resolve_program_artifact_requests(&mut self.program_host, &mut self.sequence)
             .map_err(|error| error.to_string())?;
         self.apply_program_artifact_drive(drive)
@@ -1084,11 +1498,17 @@ impl RuntimeView {
     }
 
     pub fn take_program_requests(&mut self) -> Vec<ProgramHostRequest> {
-        self.runtime.take_program_requests()
+        match &mut self.runtime {
+            RuntimeBackend::Single(runtime) => runtime.take_program_requests(),
+            RuntimeBackend::Distributed(_) => Vec::new(),
+        }
     }
 
     pub(crate) fn program_artifact_lane_counts(&self) -> (usize, usize) {
-        self.runtime.program_artifact_lane_counts()
+        match &self.runtime {
+            RuntimeBackend::Single(runtime) => runtime.program_artifact_lane_counts(),
+            RuntimeBackend::Distributed(_) => (0, 0),
+        }
     }
 
     pub(crate) fn take_async_lane_observations(&mut self) -> Vec<RuntimeAsyncLaneObservation> {
@@ -1111,8 +1531,14 @@ impl RuntimeView {
         request_id: &ProgramRequestId,
         result: Result<ProgramArtifact, ProgramDiagnostic>,
     ) -> ViewResult<ObservedProgramCompletion> {
+        if self.runtime.is_distributed() {
+            return Err(
+                "nested Program completion has no owner in a distributed Client".to_owned(),
+            );
+        }
         let drive = self
             .runtime
+            .single_mut()?
             .complete_program_observed(
                 &mut self.program_host,
                 &mut self.sequence,
@@ -1131,8 +1557,12 @@ impl RuntimeView {
     }
 
     pub fn poll_program_artifact_stores(&mut self) -> ViewResult<bool> {
+        if self.runtime.is_distributed() {
+            return Ok(false);
+        }
         let drive = self
             .runtime
+            .single_mut()?
             .poll_program_artifacts(&mut self.program_host, &mut self.sequence)
             .map_err(|error| error.to_string())?;
         self.apply_program_artifact_drive(drive)
@@ -1205,11 +1635,45 @@ impl RuntimeView {
     }
 
     pub fn inspect_root_current(&mut self, path: &str) -> ViewResult<String> {
-        let value = self
-            .runtime
-            .inspect_value_current(path, 8)
-            .map_err(|error| error.to_string())?;
+        let value = match &mut self.runtime {
+            RuntimeBackend::Single(runtime) => runtime
+                .inspect_value_current(path, 8)
+                .map_err(|error| error.to_string())?,
+            RuntimeBackend::Distributed(runtime) => runtime
+                .inspect_client_value_current(path, 8)
+                .map_err(|error| error.to_string())?,
+        };
         Ok(format_inspection_value(&value, 0))
+    }
+
+    #[cfg(test)]
+    fn root_value_current(&mut self, path: &str) -> ViewResult<Value> {
+        match &mut self.runtime {
+            RuntimeBackend::Single(runtime) => runtime
+                .root_value_current(path)
+                .map_err(|error| error.to_string()),
+            RuntimeBackend::Distributed(runtime) => runtime
+                .client_root_value_current(path)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    fn row_target_for_source_text(
+        &self,
+        path: &str,
+        text: &str,
+        occurrence: usize,
+    ) -> ViewResult<Option<RowId>> {
+        match &self.runtime {
+            RuntimeBackend::Single(runtime) => runtime
+                .runtime()
+                .row_target_for_source_text(path, text, occurrence)
+                .map_err(|error| error.to_string()),
+            RuntimeBackend::Distributed(runtime) => runtime
+                .client_row_target_for_source_text(path, text, occurrence)
+                .map_err(|error| error.to_string()),
+        }
     }
 
     pub fn scenario_target_row(
@@ -1224,12 +1688,16 @@ impl RuntimeView {
         };
         let occurrence = usize::try_from(occurrence.unwrap_or(0))
             .map_err(|_| "scenario target occurrence exceeds usize".to_owned())?;
-        Ok(self
-            .runtime
-            .runtime()
-            .row_target_for_source_text(source_path, target_text, occurrence)
-            .map_err(|error| error.to_string())?
-            .map(|row| (row.key, row.generation)))
+        let row = match &self.runtime {
+            RuntimeBackend::Single(runtime) => runtime
+                .runtime()
+                .row_target_for_source_text(source_path, target_text, occurrence)
+                .map_err(|error| error.to_string())?,
+            RuntimeBackend::Distributed(runtime) => runtime
+                .client_row_target_for_source_text(source_path, target_text, occurrence)
+                .map_err(|error| error.to_string())?,
+        };
+        Ok(row.map(|row| (row.key, row.generation)))
     }
 
     pub fn take_patches(&mut self) -> Vec<DocumentPatch> {
@@ -1267,15 +1735,34 @@ impl RuntimeView {
                     .demand_document_window(materialization, visible, overscan.clone())
                     .map_err(|error| error.to_string())?
             } else {
-                self.runtime
-                    .demand_document_window_by_id(materialization, visible, overscan.clone())
-                    .map_err(|error| error.to_string())?;
-                let parent = self
-                    .runtime
-                    .runtime()
-                    .primary_retained_output_frame()
-                    .map_err(|error| error.to_string())?
-                    .clone();
+                let parent = match &mut self.runtime {
+                    RuntimeBackend::Single(runtime) => {
+                        runtime
+                            .demand_document_window_by_id(
+                                materialization,
+                                visible,
+                                overscan.clone(),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        runtime
+                            .runtime()
+                            .primary_retained_output_frame()
+                            .map_err(|error| error.to_string())?
+                            .clone()
+                    }
+                    RuntimeBackend::Distributed(runtime) => {
+                        runtime
+                            .demand_client_document_window_by_id(
+                                materialization,
+                                visible,
+                                overscan.clone(),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        runtime.document_frame().cloned().ok_or_else(|| {
+                            "distributed Client lost its retained document".to_owned()
+                        })?
+                    }
+                };
                 self.program_host.reconcile(&parent).patches
             };
             self.materialization_overscan
@@ -1637,11 +2124,7 @@ impl RuntimeView {
             return Ok(false);
         };
         if target.row_key.is_none()
-            && let Some(field) = self
-                .runtime
-                .runtime()
-                .source_row_lookup_field(path)
-                .map(str::to_owned)
+            && let Some(field) = self.source_row_lookup_field(path).map(str::to_owned)
             && let Some(value) = self
                 .retained_frame()
                 .nodes
@@ -1661,7 +2144,7 @@ impl RuntimeView {
         let row_scoped = self
             .program_host
             .source_is_row_scoped(path)
-            .or_else(|| self.runtime.runtime().source_is_row_scoped(path));
+            .or_else(|| self.source_is_row_scoped(path));
         let row = if row_scoped == Some(true) {
             self.row_target(path, target.row_key, target.row_generation)?
         } else {
@@ -1691,23 +2174,51 @@ impl RuntimeView {
             self.record_event_dispatch(path, source_sequence);
             return Ok(self.queue_program_update(patches, Vec::new()));
         }
-        let event = self
-            .runtime
-            .runtime()
-            .source_event(next_sequence, path, row, payload)
-            .map_err(|error| error.to_string())?;
-        let turn = self
-            .runtime
-            .dispatch(event)
-            .map_err(|error| error.to_string())?;
-        self.capture_scenario_turn(path, &turn);
-        let source_sequence = turn
-            .source_sequence
-            .ok_or_else(|| format!("source dispatch `{path}` produced no source sequence"))?;
-        let changed = self.finish_parent_runtime_turn(turn)?;
-        self.record_event_dispatch(path, source_sequence);
-        self.schedule_effect_poll()?;
-        Ok(changed)
+        match &mut self.runtime {
+            RuntimeBackend::Single(runtime) => {
+                let event = runtime
+                    .runtime()
+                    .source_event(next_sequence, path, row, payload)
+                    .map_err(|error| error.to_string())?;
+                let turn = runtime.dispatch(event).map_err(|error| error.to_string())?;
+                self.capture_scenario_turn(path, &turn);
+                let source_sequence = turn.source_sequence.ok_or_else(|| {
+                    format!("source dispatch `{path}` produced no source sequence")
+                })?;
+                let changed = self.finish_parent_runtime_turn(turn)?;
+                self.record_event_dispatch(path, source_sequence);
+                self.schedule_effect_poll()?;
+                Ok(changed)
+            }
+            RuntimeBackend::Distributed(runtime) => {
+                runtime
+                    .dispatch_client_scoped(path, row, payload)
+                    .map_err(|error| error.to_string())?;
+                let changed = self.poll_distributed_runtime(Instant::now())?;
+                if self.sequence < next_sequence {
+                    return Err(format!(
+                        "distributed source dispatch `{path}` produced no Client source sequence"
+                    ));
+                }
+                self.record_event_dispatch(path, self.sequence);
+                self.schedule_effect_poll()?;
+                Ok(changed)
+            }
+        }
+    }
+
+    fn source_row_lookup_field(&self, path: &str) -> Option<&str> {
+        match &self.runtime {
+            RuntimeBackend::Single(runtime) => runtime.runtime().source_row_lookup_field(path),
+            RuntimeBackend::Distributed(runtime) => runtime.client_source_row_lookup_field(path),
+        }
+    }
+
+    fn source_is_row_scoped(&self, path: &str) -> Option<bool> {
+        match &self.runtime {
+            RuntimeBackend::Single(runtime) => runtime.runtime().source_is_row_scoped(path),
+            RuntimeBackend::Distributed(runtime) => runtime.client_source_is_row_scoped(path),
+        }
     }
 
     fn record_event_dispatch(&mut self, source_path: &str, source_sequence: u64) {
@@ -2242,11 +2753,17 @@ impl RuntimeView {
                 .map(Some)
                 .map_err(|error| error.to_string());
         }
-        self.runtime
-            .runtime()
-            .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
-            .map(Some)
-            .map_err(|error| error.to_string())
+        match &self.runtime {
+            RuntimeBackend::Single(runtime) => runtime
+                .runtime()
+                .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            RuntimeBackend::Distributed(runtime) => runtime
+                .client_row_target_for_source_path(source_path, key, generation.unwrap_or(1))
+                .map(Some)
+                .map_err(|error| error.to_string()),
+        }
     }
 
     fn queue_program_update(
@@ -2265,7 +2782,12 @@ impl RuntimeView {
                     | DocumentPatch::MoveChild { .. }
             )
         });
-        self.runtime.queue_program_requests(requests);
+        match &mut self.runtime {
+            RuntimeBackend::Single(runtime) => runtime.queue_program_requests(requests),
+            RuntimeBackend::Distributed(_) => {
+                debug_assert!(requests.is_empty());
+            }
+        }
         for patch in patches {
             let patch = self.with_view_state(patch);
             self.sync_text_input_patch(&patch);
@@ -2319,6 +2841,7 @@ impl RuntimeView {
         self.last_runtime_phase = turn.phase_timings;
         let parent = self
             .runtime
+            .single()?
             .runtime()
             .primary_retained_output_frame()
             .map_err(|error| error.to_string())?;
@@ -2370,10 +2893,29 @@ impl RuntimeView {
     }
 
     fn schedule_effect_poll(&mut self) -> ViewResult<()> {
-        let has_work = self.effect_worker.is_busy()
-            || self.runtime.has_effect_work()
-            || self.transient_host.has_work();
-        self.next_effect_poll = has_work.then_some(Instant::now() + EFFECT_POLL_INTERVAL);
+        self.next_effect_poll = match &self.runtime {
+            RuntimeBackend::Single(runtime) => {
+                let has_work = self.effect_worker.is_busy()
+                    || runtime.has_effect_work()
+                    || self.transient_host.has_work();
+                has_work.then_some(Instant::now() + EFFECT_POLL_INTERVAL)
+            }
+            RuntimeBackend::Distributed(runtime) => {
+                let started = self
+                    .distributed_started
+                    .ok_or_else(|| "distributed runtime has no logical clock origin".to_owned())?;
+                let deadline = runtime.next_deadline().map(|deadline| started + deadline);
+                if self.transient_host.has_work() {
+                    Some(
+                        deadline
+                            .unwrap_or_else(Instant::now)
+                            .min(Instant::now() + EFFECT_POLL_INTERVAL),
+                    )
+                } else {
+                    deadline
+                }
+            }
+        };
         Ok(())
     }
 
@@ -2393,7 +2935,7 @@ impl RuntimeView {
     }
 
     fn dispatch_host_lifecycle_started(&mut self) -> ViewResult<()> {
-        if !has_host_lifecycle_started_source(self.runtime.runtime()) {
+        if !has_host_lifecycle_started_source_plan(&self.machine_plan) {
             return Ok(());
         }
         let payload =
@@ -2428,9 +2970,11 @@ fn dispatch_host_lifecycle_started(
 }
 
 fn has_host_lifecycle_started_source(runtime: &LiveRuntime) -> bool {
-    runtime
-        .source_inventory()
-        .sources
+    has_host_lifecycle_started_source_plan(runtime.machine_plan())
+}
+
+fn has_host_lifecycle_started_source_plan(plan: &MachinePlan) -> bool {
+    plan.source_routes
         .iter()
         .any(|source| source.path == HOST_LIFECYCLE_STARTED_SOURCE)
 }
@@ -2467,13 +3011,6 @@ fn native_effect_worker() -> ViewResult<HostEffectWorker> {
     let mut router = HostEffectRouter::new();
     router
         .register(
-            "File/write_bytes",
-            FileEffectDriver::new(repository_root().join(EFFECT_DIRECTORY))
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-    router
-        .register(
             crate::passkey_simulator::REGISTER_OPERATION,
             crate::passkey_simulator::DevelopmentPasskeySimulator::registration(),
         )
@@ -2497,10 +3034,23 @@ fn validate_preview_plan(plan: &MachinePlan) -> ViewResult<()> {
     Ok(())
 }
 
+fn transient_effect_ids(plan: &MachinePlan) -> impl Iterator<Item = boon_plan::EffectId> + '_ {
+    plan.effects.iter().filter_map(|contract| {
+        matches!(
+            contract.replay,
+            EffectReplay::ReadOnly | EffectReplay::ProcessScoped
+        )
+        .then_some(contract.effect_id)
+    })
+}
+
 fn scheduled_sources(runtime: &LiveRuntime) -> ViewResult<Vec<ScheduledSource>> {
-    if let Some(source) = runtime
-        .source_inventory()
-        .sources
+    scheduled_sources_from_plan(runtime.machine_plan())
+}
+
+fn scheduled_sources_from_plan(plan: &MachinePlan) -> ViewResult<Vec<ScheduledSource>> {
+    if let Some(source) = plan
+        .source_routes
         .iter()
         .find(|source| source.interval_ms == Some(0))
     {
@@ -2510,9 +3060,8 @@ fn scheduled_sources(runtime: &LiveRuntime) -> ViewResult<Vec<ScheduledSource>> 
         ));
     }
     let now = Instant::now();
-    Ok(runtime
-        .source_inventory()
-        .sources
+    Ok(plan
+        .source_routes
         .iter()
         .filter_map(|source| {
             let interval = Duration::from_millis(source.interval_ms?);
@@ -2523,6 +3072,80 @@ fn scheduled_sources(runtime: &LiveRuntime) -> ViewResult<Vec<ScheduledSource>> 
             })
         })
         .collect())
+}
+
+fn route_distributed_transient_effects(
+    host: &mut NativeTransientHost,
+    owners: &mut BTreeMap<boon_runtime::TransientEffectCallId, InProcessTransientEffectOwner>,
+    poll: &InProcessPoll,
+) -> ViewResult<()> {
+    for effect in &poll.transient_effects {
+        if owners.contains_key(&effect.invocation.call_id) {
+            return Err(format!(
+                "distributed runtime repeated active transient call {}",
+                effect.invocation.call_id
+            ));
+        }
+    }
+    for cancellation in &poll.cancelled_transient_effects {
+        if owners.get(&cancellation.call_id) != Some(&cancellation.owner) {
+            return Err(format!(
+                "distributed runtime cancelled transient call {} through the wrong owner",
+                cancellation.call_id
+            ));
+        }
+    }
+    for credit in &poll.transient_effect_credit_grants {
+        if owners.get(&credit.grant.call_id) != Some(&credit.owner) {
+            return Err(format!(
+                "distributed runtime granted credit to transient call {} through the wrong owner",
+                credit.grant.call_id
+            ));
+        }
+    }
+    let cancelled = poll
+        .cancelled_transient_effects
+        .iter()
+        .map(|cancellation| cancellation.call_id)
+        .collect::<Vec<_>>();
+    let credits = poll
+        .transient_effect_credit_grants
+        .iter()
+        .map(|credit| credit.grant)
+        .collect::<Vec<_>>();
+    let invocations = poll
+        .transient_effects
+        .iter()
+        .map(|effect| effect.invocation.clone())
+        .collect::<Vec<_>>();
+    host.route_batch(&cancelled, &credits, &invocations)?;
+    for call_id in cancelled {
+        owners.remove(&call_id);
+    }
+    for effect in &poll.transient_effects {
+        owners.insert(effect.invocation.call_id, effect.owner);
+    }
+    Ok(())
+}
+
+fn unavailable_persistence_status() -> PersistenceWorkerStatus {
+    PersistenceWorkerStatus {
+        pending: None,
+        checkpoint_batch_in_flight: false,
+        queued_checkpoint_batches: 0,
+        pending_checkpoint_batches: 0,
+        pending_checkpoint_batches_peak: 0,
+        durable_epoch: 0,
+        durable_through_turn_sequence: 0,
+        queue_depth: 0,
+        pending_content_artifact_stores: 0,
+        pending_content_artifact_loads: 0,
+        reserved_slots: 0,
+        accepting_turns: false,
+        worker_alive: false,
+        timings: Default::default(),
+        last_error: None,
+    }
 }
 
 fn authority_plan_counts(plan: &MachinePlan) -> AuthorityPlanCounts {
@@ -2795,6 +3418,7 @@ fn format_inspection_value(value: &Value, depth: usize) -> String {
             fields.len()
         ),
         Value::Error { code } => format!("Error[{code}]"),
+        Value::HostBound { visible, .. } => format_inspection_value(visible, depth),
     }
 }
 
@@ -2947,7 +3571,342 @@ fn duration_us(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::thread;
+
+    fn dispatch_press(view: &mut RuntimeView, source: &str) {
+        view.dispatch_source(
+            source,
+            None,
+            SourcePayload {
+                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                ..SourcePayload::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn settle_host_effects(view: &mut RuntimeView, context: &str) {
+        let started = Instant::now();
+        while view.effect_poll_deadline().is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{context} did not settle"
+            );
+            view.poll_host_effects(Instant::now() + Duration::from_millis(2))
+                .unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            view.transient_host.active_call_count(),
+            0,
+            "{context} left a native host call active"
+        );
+    }
+
+    fn assert_real_waveform_reaches_retained_document(
+        view: &mut RuntimeView,
+        expected_format: &str,
+    ) {
+        assert_eq!(
+            view.root_value_current("store.waveform_format_label")
+                .unwrap(),
+            Value::Text(expected_format.to_owned())
+        );
+        assert_eq!(
+            view.root_value_current("store.format_label").unwrap(),
+            Value::Text("Hex".to_owned()),
+            "waveform container format must not replace the selected signal formatter"
+        );
+        let active_signal = view.root_value_current("store.active_signal").unwrap();
+        let Value::Text(active_signal) = active_signal else {
+            panic!("real active signal is not text: {active_signal:?}");
+        };
+        assert!(
+            !active_signal.is_empty() && active_signal != "none",
+            "{expected_format} hierarchy produced no active signal"
+        );
+        let requested_signal_ids = view
+            .root_value_current("store.real_signal_page_signal_ids")
+            .unwrap();
+        let signal_page = view
+            .root_value_current("store.real_signal_page_result")
+            .unwrap();
+        let Value::Record(signal_page) = signal_page else {
+            panic!("real signal page is not a tagged record: {signal_page:?}");
+        };
+        let Some(Value::List(signals)) = signal_page.get("signals") else {
+            panic!(
+                "real signal page has no bounded signal rows for active signal {active_signal:?} \
+                 and requested IDs {requested_signal_ids:?}: {signal_page:?}"
+            );
+        };
+        assert_eq!(
+            signal_page.get("signal_ids"),
+            Some(&Value::List(vec![Value::Text(active_signal.clone())])),
+            "{expected_format} page must contain only the selected signal"
+        );
+        let current_page_fingerprint = view
+            .root_value_current("store.real_signal_page_request_fingerprint")
+            .unwrap();
+        assert_eq!(
+            signal_page.get("request_fingerprint"),
+            Some(&current_page_fingerprint),
+            "{expected_format} page response is stale"
+        );
+        let transition_count = signals
+            .iter()
+            .filter_map(|signal| match signal {
+                Value::Record(signal) => match signal.get("transitions") {
+                    Some(Value::List(transitions)) => Some(transitions.len()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .sum::<usize>();
+        assert!(
+            transition_count > 0,
+            "{expected_format} bounded signal page produced no waveform transitions"
+        );
+        let selected_rows = view
+            .root_value_current("store.selected_rows_count")
+            .unwrap();
+        let Value::Number(selected_rows) = selected_rows else {
+            panic!("real selected row count is not a Number: {selected_rows:?}");
+        };
+        assert!(
+            selected_rows.to_i64_exact().unwrap() > 0,
+            "{expected_format} real hierarchy produced no retained signal rows"
+        );
+
+        let cursor_values = view
+            .root_value_current("store.real_cursor_values_result")
+            .unwrap();
+        let Value::Record(cursor_values) = cursor_values else {
+            panic!("real cursor response is not a tagged record: {cursor_values:?}");
+        };
+        assert_eq!(
+            cursor_values.get("$tag"),
+            Some(&Value::Text("CursorValues".to_owned())),
+            "{expected_format} cursor request failed: {cursor_values:?}"
+        );
+        let current_cursor_fingerprint = view
+            .root_value_current("store.real_cursor_request_fingerprint")
+            .unwrap();
+        assert_eq!(
+            cursor_values.get("request_fingerprint"),
+            Some(&current_cursor_fingerprint),
+            "{expected_format} cursor response is stale"
+        );
+        let current_cursor_time = view
+            .root_value_current("store.real_cursor_time_tick")
+            .unwrap();
+        assert_eq!(
+            cursor_values.get("cursor_time"),
+            Some(&current_cursor_time),
+            "{expected_format} cursor response used the wrong timeline position"
+        );
+
+        let hierarchy = view
+            .root_value_current("store.real_hierarchy_page_result")
+            .unwrap();
+        let Value::Record(hierarchy) = hierarchy else {
+            panic!("real hierarchy page is not a tagged record: {hierarchy:?}");
+        };
+        let Some(Value::List(hierarchy_rows)) = hierarchy.get("rows") else {
+            panic!("real hierarchy page has no rows: {hierarchy:?}");
+        };
+        let active_signal_name = hierarchy_rows.iter().find_map(|row| {
+            let Value::Record(row) = row else {
+                return None;
+            };
+            (row.get("signal_id") == Some(&Value::Text(active_signal.clone())))
+                .then(|| row.get("name"))
+                .flatten()
+                .and_then(|name| match name {
+                    Value::Text(name) => Some(name.as_str()),
+                    _ => None,
+                })
+        });
+        let active_signal_name = active_signal_name
+            .unwrap_or_else(|| panic!("{expected_format} active signal is absent from hierarchy"));
+
+        let visible_text = view
+            .retained_frame()
+            .nodes
+            .values()
+            .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert!(
+            visible_text
+                .iter()
+                .any(|text| text.contains(expected_format)),
+            "{expected_format} container format did not reach retained UI text"
+        );
+        assert!(
+            visible_text.contains(active_signal_name),
+            "{expected_format} real active signal did not reach retained UI text"
+        );
+    }
+
+    #[test]
+    fn distributed_package_mounts_and_dispatches_through_one_aggregate() {
+        let bundle = crate::distributed_program::compile_distributed_program(
+            crate::distributed_program::distributed_fixture_sources(),
+        )
+        .expect("compile distributed fixture");
+        let mut view = RuntimeView::open_distributed_with_assets(bundle, true, &[])
+            .expect("mount distributed fixture");
+
+        assert!(view.runtime.is_distributed());
+        assert!(matches!(
+            view.startup_evidence().disposition,
+            PersistentRuntimeStartupDisposition::Fresh
+        ));
+        assert!(view.persistence_status().worker_alive);
+        assert!(view.persistence_status().accepting_turns);
+        assert_eq!(
+            view.root_value_current("store.client_count").unwrap(),
+            Value::integer(0).unwrap()
+        );
+        assert!(view.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Distributed program fixture")
+        }));
+
+        view.dispatch_source("store.increment", None, SourcePayload::default())
+            .expect("dispatch Client event through distributed aggregate");
+        assert_eq!(
+            view.root_value_current("store.client_count").unwrap(),
+            Value::integer(1).unwrap()
+        );
+    }
+
+    #[test]
+    fn distributed_client_effect_completes_through_native_exact_call_host() {
+        let mut sources = crate::distributed_program::distributed_fixture_sources();
+        let client = sources
+            .iter_mut()
+            .find(|source| source.role == ProgramRole::Client)
+            .expect("distributed Client source");
+        client
+            .units
+            .iter_mut()
+            .find(|unit| unit.path.ends_with("Client/RUN.bn"))
+            .expect("distributed Client entry unit")
+            .source = r#"
+store: [
+    increment: SOURCE
+    randomize: SOURCE
+    random:
+        RandomNotRead |> HOLD random {
+            randomize |> THEN { Random/bytes(byte_count: 1) }
+        }
+    random_size:
+        random |> WHEN {
+            RandomBytesReady => random.bytes |> Bytes/length()
+            __ => 0
+        }
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: DistributedContract/client_label()
+    )
+)
+"#
+        .to_owned();
+        let bundle = crate::distributed_program::compile_distributed_program(sources)
+            .expect("compile distributed Client effect fixture");
+        let mut view = RuntimeView::open_distributed_with_assets(bundle, true, &[])
+            .expect("mount distributed Client effect fixture");
+
+        view.dispatch_source("store.randomize", None, SourcePayload::default())
+            .expect("dispatch Client random effect");
+        let started = Instant::now();
+        while view.effect_poll_deadline().is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "native Client effect did not settle"
+            );
+            view.poll_host_effects(Instant::now() + Duration::from_millis(2))
+                .expect("poll native Client effect host");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            view.root_value_current("store.random_size").unwrap(),
+            Value::integer(1).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_package_stream_enforces_four_credit_backpressure_and_cleans_up() {
+        let source = r#"
+store: [
+    read: SOURCE
+    asset: PackageAsset[url: TEXT { asset://fixture/bounded.bin }]
+    stream_result:
+        NotStarted |> HOLD stream_result {
+            read |> THEN {
+                File/read_stream(
+                    file: asset
+                    chunk_bytes: 65536
+                    retain_content: True
+                )
+            }
+        }
+    byte_count:
+        stream_result |> WHEN {
+            Finished => stream_result.byte_count
+            __ => 0
+        }
+    byte_count_label: byte_count |> Number/to_text(radix: 10)
+]
+
+document: Document/new(
+    root: Element/label(element: [], label: store.byte_count_label)
+)
+"#;
+        let runtime = LiveRuntime::from_source("native-stream-backpressure.bn", source).unwrap();
+        let bytes = vec![0x5a; 5 * 65536 + 17];
+        let asset = AssetBlob {
+            url: "asset://fixture/bounded.bin".to_owned(),
+            media_type: "application/octet-stream".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            bytes: bytes.clone(),
+        };
+        let mut view =
+            RuntimeView::open_for_scenario_with_assets(runtime.shared_machine_plan(), &[asset])
+                .unwrap();
+
+        view.dispatch_source("store.read", None, SourcePayload::default())
+            .unwrap();
+        assert_eq!(view.transient_host.active_call_count(), 1);
+        let started = Instant::now();
+        loop {
+            let credits = view.transient_host.file_stream_outstanding_credits();
+            assert_eq!(credits.len(), 1);
+            assert!(credits[0] <= 4, "stream exceeded its four-credit bound");
+            if credits[0] == 0 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "native package stream did not consume its initial bounded credits"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        settle_host_effects(&mut view, "native package stream backpressure");
+        assert_eq!(
+            view.root_value_current("store.byte_count").unwrap(),
+            Value::integer(bytes.len() as i64).unwrap()
+        );
+        assert_eq!(view.transient_host.file_stream_owned_call_count(), 0);
+        assert_eq!(view.transient_host.pending_content_writer_count(), 0);
+    }
 
     #[test]
     fn novywave_package_asset_runs_through_file_and_wellen_effect_chain() {
@@ -2969,21 +3928,31 @@ mod tests {
             &example.assets,
         )
         .unwrap();
-        let mut payload = SourcePayload::default();
-        payload.fields.insert("press".to_owned(), Value::Bool(true));
-        view.dispatch_source("store.elements.load_default_file", None, payload)
-            .unwrap();
+        dispatch_press(&mut view, "store.elements.load_default_file");
+        assert_eq!(view.transient_host.active_call_count(), 1);
+        dispatch_press(&mut view, "store.elements.show_empty");
+        assert_eq!(
+            view.transient_host.active_call_count(),
+            0,
+            "leaving NovyWave's active WHILE branch must cancel the file stream immediately"
+        );
+        dispatch_press(&mut view, "store.elements.load_default_file");
+        assert_eq!(view.transient_host.active_call_count(), 1);
 
-        let started = Instant::now();
-        while view.effect_poll_deadline().is_some() {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "real NovyWave host-effect chain did not settle"
-            );
-            view.poll_host_effects(Instant::now() + Duration::from_millis(2))
-                .unwrap();
-            thread::sleep(Duration::from_millis(1));
-        }
+        dispatch_press(&mut view, "store.elements.select_uart_compare_file");
+        assert_eq!(
+            view.transient_host.active_call_count(),
+            2,
+            "comparison mode must own exactly one FST stream and one VCD reference stream"
+        );
+        dispatch_press(&mut view, "store.elements.select_ghw_file");
+        assert_eq!(
+            view.transient_host.active_call_count(),
+            1,
+            "replacing FST with GHW must keep only the newest file stream"
+        );
+        settle_host_effects(&mut view, "rapid NovyWave VCD/FST/GHW replacement");
+        assert_real_waveform_reaches_retained_document(&mut view, "GHW");
 
         for (path, expected_tag) in [
             ("store.real_file_stream_result", "Finished"),
@@ -2992,7 +3961,7 @@ mod tests {
             ("store.real_signal_page_result", "SignalPage"),
             ("store.real_cursor_values_result", "CursorValues"),
         ] {
-            let value = view.runtime.root_value_current(path).unwrap();
+            let value = view.root_value_current(path).unwrap();
             assert!(
                 matches!(&value,
                     Value::Record(fields)
@@ -3001,14 +3970,7 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            view.runtime
-                .root_value_current("store.format_label")
-                .unwrap(),
-            Value::Text("VCD".to_owned())
-        );
         let hierarchy = view
-            .runtime
             .root_value_current("store.bridge_hierarchy_page_label")
             .unwrap();
         let Value::Text(hierarchy) = hierarchy else {
@@ -3026,19 +3988,14 @@ mod tests {
             .values()
             .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
             .collect::<Vec<_>>();
-        assert!(
-            visible_text.iter().any(|text| *text == "VCD"),
-            "real waveform format did not reach retained UI text: {visible_text:?}"
-        );
+        assert!(visible_text.iter().any(|text| text.contains("GHW")));
 
         for (file, expected_format) in [
+            ("simple.vcd", "VCD"),
             ("wave_27.fst", "FST"),
             ("simple_test.ghw", "GHW"),
-            ("simple.vcd", "VCD"),
         ] {
             let target = view
-                .runtime
-                .runtime()
                 .row_target_for_source_text("file_tree_row.file_row_elements.select_file", file, 0)
                 .unwrap()
                 .unwrap();
@@ -3046,29 +4003,332 @@ mod tests {
                 "file_tree_row.file_row_elements.select_file",
                 Some(target),
                 SourcePayload {
+                    address: Some(file.to_owned()),
                     fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
                     ..SourcePayload::default()
                 },
             )
             .unwrap();
-            let started = Instant::now();
-            while view.effect_poll_deadline().is_some() {
-                assert!(
-                    started.elapsed() < Duration::from_secs(5),
-                    "real NovyWave host-effect replacement did not settle for {file}"
+            if expected_format == "FST" {
+                assert_eq!(
+                    view.root_value_current("store.comparison_waveform_mode")
+                        .unwrap(),
+                    Value::Text("Active".to_owned()),
+                    "the FST row must enter comparison mode"
                 );
-                view.poll_host_effects(Instant::now() + Duration::from_millis(2))
-                    .unwrap();
-                thread::sleep(Duration::from_millis(1));
+                assert_eq!(
+                    view.transient_host.active_call_count(),
+                    2,
+                    "the FST row must start one primary and one comparison stream"
+                );
             }
-            assert_eq!(
-                view.runtime
-                    .root_value_current("store.format_label")
-                    .unwrap(),
-                Value::Text(expected_format.to_owned()),
-                "selected package asset did not replace the active Wellen artifact for {file}"
+            settle_host_effects(
+                &mut view,
+                &format!("real NovyWave host-effect replacement for {file}"),
             );
+            assert_real_waveform_reaches_retained_document(&mut view, expected_format);
+            if expected_format == "FST" {
+                for (path, expected_tag) in [
+                    ("store.comparison_file_stream_result", "Finished"),
+                    ("store.comparison_waveform_open_result", "WaveformOpened"),
+                    ("store.comparison_hierarchy_page_result", "HierarchyPage"),
+                    ("store.comparison_signal_page_result", "SignalPage"),
+                    ("store.comparison_cursor_values_result", "CursorValues"),
+                ] {
+                    let value = view.root_value_current(path).unwrap();
+                    assert!(
+                        matches!(&value,
+                            Value::Record(fields)
+                                if fields.get("$tag")
+                                    == Some(&Value::Text(expected_tag.to_owned()))),
+                        "{path} did not reach {expected_tag}: {value:?}"
+                    );
+                }
+                assert_eq!(
+                    view.root_value_current("store.compare_file").unwrap(),
+                    Value::Text("simple.vcd".to_owned())
+                );
+                let comparison_visible =
+                    view.root_value_current("store.comparison_visible").unwrap();
+                let comparison_first_signal_id = view
+                    .root_value_current("store.comparison_first_signal_id")
+                    .unwrap();
+                let comparison_signal_name = view
+                    .root_value_current("store.comparison_signal_name")
+                    .unwrap();
+                let reference_texts = view
+                    .retained_frame()
+                    .nodes
+                    .values()
+                    .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+                    .filter(|text| text.contains("Reference"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    view.retained_frame().nodes.values().any(|node| {
+                        node.text
+                            .as_ref()
+                            .is_some_and(|text| text.text.contains("Reference: simple_tb.s.A"))
+                    }),
+                    "retained NovyWave frame omitted the real comparison lane: visible={comparison_visible:?}, first_signal={comparison_first_signal_id:?}, signal_name={comparison_signal_name:?}, reference_texts={reference_texts:?}"
+                );
+            } else {
+                assert_eq!(
+                    view.root_value_current("store.compare_file").unwrap(),
+                    Value::Text("none".to_owned()),
+                    "leaving comparison mode must clear the retained reference artifact"
+                );
+            }
         }
+
+        let vcd_target = view
+            .row_target_for_source_text(
+                "file_tree_row.file_row_elements.select_file",
+                "simple.vcd",
+                0,
+            )
+            .unwrap()
+            .unwrap();
+        view.dispatch_source(
+            "file_tree_row.file_row_elements.select_file",
+            Some(vcd_target),
+            SourcePayload {
+                address: Some("simple.vcd".to_owned()),
+                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                ..SourcePayload::default()
+            },
+        )
+        .unwrap();
+        settle_host_effects(&mut view, "real VCD analog selection setup");
+
+        let hierarchy = view
+            .root_value_current("store.real_hierarchy_page_result")
+            .unwrap();
+        let Value::Record(hierarchy) = hierarchy else {
+            panic!("real VCD hierarchy is not a record: {hierarchy:?}");
+        };
+        let Some(Value::List(hierarchy_rows)) = hierarchy.get("rows") else {
+            panic!("real VCD hierarchy has no rows: {hierarchy:?}");
+        };
+        let (analog_signal_id, analog_signal_name) = hierarchy_rows
+            .iter()
+            .find_map(|row| {
+                let Value::Record(row) = row else {
+                    return None;
+                };
+                if row.get("encoding") != Some(&Value::Text("Real".to_owned())) {
+                    return None;
+                }
+                let (Some(Value::Text(signal_id)), Some(Value::Text(name))) =
+                    (row.get("signal_id"), row.get("name"))
+                else {
+                    return None;
+                };
+                Some((signal_id.clone(), name.clone()))
+            })
+            .expect("committed VCD must expose a real-valued signal");
+        let analog_target = view
+            .row_target_for_source_text(
+                "signal_row.signal_elements.select_signal",
+                &analog_signal_id,
+                0,
+            )
+            .unwrap()
+            .unwrap();
+        view.dispatch_source(
+            "signal_row.signal_elements.select_signal",
+            Some(analog_target),
+            SourcePayload {
+                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                ..SourcePayload::default()
+            },
+        )
+        .unwrap();
+        settle_host_effects(&mut view, "real VCD analog signal page");
+        assert_eq!(
+            view.root_value_current("store.active_signal").unwrap(),
+            Value::Text(analog_signal_id.clone())
+        );
+        let analog_page = view
+            .root_value_current("store.real_signal_page_result")
+            .unwrap();
+        let Value::Record(analog_page) = &analog_page else {
+            panic!("real analog signal page is not a record: {analog_page:?}");
+        };
+        let has_real_value = analog_page
+            .get("signals")
+            .and_then(|signals| match signals {
+                Value::List(signals) => Some(signals),
+                _ => None,
+            })
+            .into_iter()
+            .flatten()
+            .filter_map(|signal| match signal {
+                Value::Record(signal) => signal.get("transitions"),
+                _ => None,
+            })
+            .filter_map(|transitions| match transitions {
+                Value::List(transitions) => Some(transitions),
+                _ => None,
+            })
+            .flatten()
+            .any(|transition| {
+                matches!(transition,
+                    Value::Record(transition)
+                        if matches!(transition.get("value"),
+                            Some(Value::Record(value))
+                                if value.get("$tag")
+                                    == Some(&Value::Text("RealValue".to_owned()))))
+            });
+        assert!(has_real_value, "real VCD analog page contains no RealValue");
+        assert!(view.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.contains(&analog_signal_name))
+        }));
+        assert_eq!(analog_page.get("has_more"), Some(&Value::Bool(true)));
+        let first_analog_page_fingerprint = analog_page
+            .get("request_fingerprint")
+            .cloned()
+            .expect("first analog page fingerprint");
+        dispatch_press(&mut view, "store.elements.signal_page_next");
+        settle_host_effects(&mut view, "real VCD analog continuation page");
+        assert_eq!(
+            view.root_value_current("store.real_signal_page_offset")
+                .unwrap(),
+            Value::integer(2).unwrap()
+        );
+        let next_analog_page = view
+            .root_value_current("store.real_signal_page_result")
+            .unwrap();
+        let Value::Record(next_analog_page) = next_analog_page else {
+            panic!("continued analog page is not a record: {next_analog_page:?}");
+        };
+        assert_eq!(
+            next_analog_page.get("offset"),
+            Some(&Value::integer(2).unwrap())
+        );
+        assert_ne!(
+            next_analog_page.get("request_fingerprint"),
+            Some(&first_analog_page_fingerprint)
+        );
+
+        let initial_page_fingerprint = view
+            .root_value_current("store.real_signal_page_request_fingerprint")
+            .unwrap();
+        dispatch_press(&mut view, "store.elements.zoom_in");
+        settle_host_effects(&mut view, "real VCD zoom signal page replacement");
+        let zoom_page_fingerprint = view
+            .root_value_current("store.real_signal_page_request_fingerprint")
+            .unwrap();
+        assert_ne!(zoom_page_fingerprint, initial_page_fingerprint);
+        let page_before_cursor = view
+            .root_value_current("store.real_signal_page_result")
+            .unwrap();
+        let cursor_before = view
+            .root_value_current("store.real_cursor_request_fingerprint")
+            .unwrap();
+        dispatch_press(&mut view, "store.elements.cursor_right");
+        settle_host_effects(&mut view, "real VCD cursor-only replacement");
+        assert_eq!(
+            view.root_value_current("store.real_signal_page_result")
+                .unwrap(),
+            page_before_cursor,
+            "cursor movement must not replace the retained signal page"
+        );
+        assert_ne!(
+            view.root_value_current("store.real_cursor_request_fingerprint")
+                .unwrap(),
+            cursor_before,
+            "cursor movement must replace the cursor request"
+        );
+        dispatch_press(&mut view, "store.elements.pan_right");
+        settle_host_effects(&mut view, "real VCD pan signal page replacement");
+        assert_ne!(
+            view.root_value_current("store.real_signal_page_request_fingerprint")
+                .unwrap(),
+            zoom_page_fingerprint,
+            "pan must replace the bounded signal page request"
+        );
+        assert_eq!(view.transient_host.active_call_count(), 0);
+
+        dispatch_press(&mut view, "store.elements.show_empty");
+        view.root_value_current("store.external_file_tree_selected_file")
+            .expect("empty-state list membership change must remain a current non-event value");
+    }
+
+    #[test]
+    fn novywave_semantic_scenario_runs_through_real_host_effects() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("novywave")
+            .unwrap();
+        let units = example
+            .units
+            .iter()
+            .map(|unit| boon_runtime::RuntimeSourceUnit {
+                path: unit.path.clone(),
+                source: unit.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/novywave/RUN.bn", &units).unwrap();
+        let mut view = RuntimeView::open_for_scenario_with_assets(
+            runtime.shared_machine_plan(),
+            &example.assets,
+        )
+        .unwrap();
+        let scenario_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave.scn");
+        let scenario = boon_runtime::parse_scenario(&scenario_path).unwrap();
+        let mut failures = Vec::new();
+
+        for step in &scenario.steps {
+            if let Some(event) = &step.source_event {
+                view.begin_scenario_step(&event.source);
+                let target_text = event
+                    .target_text
+                    .as_deref()
+                    .or(event.payload.address.as_deref());
+                let row_result = if let Some(target_text) = target_text {
+                    view.row_target_for_source_text(
+                        &event.source,
+                        target_text,
+                        event.target_occurrence.unwrap_or(0),
+                    )
+                } else if let Some(key) = event.target_key {
+                    view.row_target(&event.source, Some(key), event.target_generation)
+                } else {
+                    Ok(None)
+                };
+                let row = match row_result {
+                    Ok(row) => row,
+                    Err(error) => {
+                        failures.push(format!("{} target: {error}", step.id));
+                        continue;
+                    }
+                };
+                if let Err(error) = view.dispatch_source(&event.source, row, event.payload.clone())
+                {
+                    failures.push(format!("{} dispatch: {error}", step.id));
+                    continue;
+                }
+            }
+            settle_host_effects(&mut view, &step.id);
+            if let Err(error) = view.assert_scenario_step(step) {
+                let error = error.to_string();
+                let boundary = error
+                    .char_indices()
+                    .nth(1200)
+                    .map_or(error.len(), |(index, _)| index);
+                failures.push(error[..boundary].to_owned());
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "NovyWave semantic scenario failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     #[test]
@@ -3092,9 +4352,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            view.runtime
-                .root_value_current("store.credential_count")
-                .unwrap(),
+            view.root_value_current("store.credential_count").unwrap(),
             Value::Number(FiniteReal::from_i64_exact(0).unwrap())
         );
         view.dispatch_source(
@@ -3118,9 +4376,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(
-            view.runtime
-                .root_value_current("store.credential_count")
-                .unwrap(),
+            view.root_value_current("store.credential_count").unwrap(),
             Value::Number(FiniteReal::from_i64_exact(0).unwrap()),
             "cancelled registration must not append a credential"
         );
@@ -3130,7 +4386,7 @@ mod tests {
             ("store.account_state", "Anonymous"),
         ] {
             assert_eq!(
-                view.runtime.root_value_current(path).unwrap(),
+                view.root_value_current(path).unwrap(),
                 Value::Text(expected.to_owned()),
                 "passkey cancellation changed `{path}` incorrectly"
             );
@@ -3156,9 +4412,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(
-            view.runtime
-                .root_value_current("store.credential_count")
-                .unwrap(),
+            view.root_value_current("store.credential_count").unwrap(),
             Value::Number(FiniteReal::from_i64_exact(1).unwrap()),
             "one successful registration must append exactly one credential"
         );
@@ -3168,7 +4422,7 @@ mod tests {
             ("store.account_state", "OnePasskey"),
         ] {
             assert_eq!(
-                view.runtime.root_value_current(path).unwrap(),
+                view.root_value_current(path).unwrap(),
                 Value::Text(expected.to_owned()),
                 "passkey registration did not update `{path}`"
             );

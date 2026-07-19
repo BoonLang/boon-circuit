@@ -1,4 +1,4 @@
-use boon_data::{NumberTextFormat, format_number_text};
+use boon_data::{Bytes, NumberTextFormat, format_number_text};
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
     DocumentPatch, EmbeddedProgramDescriptor, EmbeddedProgramSourceUnit, MapCamera, MapCoordinate,
@@ -15,7 +15,7 @@ use boon_plan::{
     DocumentNameId, DocumentPattern, DocumentRead, DocumentScalarOp, DocumentTemplateId, FieldId,
     FiniteReal, ImportId, ListId, MachinePlan, ScopeId, SourceId,
 };
-use boon_plan_executor::{Delta, RowId, Session, Value, ValueTarget};
+use boon_plan_executor::{Delta, MachineInstance, RowId, Value, ValueTarget};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
@@ -150,7 +150,7 @@ impl fmt::Display for DocumentError {
 impl std::error::Error for DocumentError {}
 
 impl DocumentRuntime {
-    pub(crate) fn new(session: &mut Session) -> Result<Option<Self>, DocumentError> {
+    pub(crate) fn new(session: &mut MachineInstance) -> Result<Option<Self>, DocumentError> {
         let machine = session.shared_plan();
         let Some(plan) = machine.document_plan() else {
             return Ok(None);
@@ -314,7 +314,7 @@ impl DocumentRuntime {
 
     pub(crate) fn apply_turn(
         &mut self,
-        session: &mut Session,
+        session: &mut MachineInstance,
         deltas: &[Delta],
     ) -> Result<(Vec<DocumentPatch>, DocumentRollback), DocumentError> {
         if self.turn_affects_structure(deltas) {
@@ -393,7 +393,7 @@ impl DocumentRuntime {
 
     pub(crate) fn demand_window(
         &mut self,
-        session: &mut Session,
+        session: &mut MachineInstance,
         demand: DocumentWindowDemand,
     ) -> Result<Vec<DocumentPatch>, DocumentError> {
         if !self
@@ -438,7 +438,10 @@ impl DocumentRuntime {
         self.rebuild(session)
     }
 
-    fn rebuild(&mut self, session: &mut Session) -> Result<Vec<DocumentPatch>, DocumentError> {
+    fn rebuild(
+        &mut self,
+        session: &mut MachineInstance,
+    ) -> Result<Vec<DocumentPatch>, DocumentError> {
         let evaluated = self.evaluate(session)?;
         let patches = diff_frames(&self.frame, &evaluated.frame);
         self.install_evaluated(evaluated);
@@ -448,7 +451,7 @@ impl DocumentRuntime {
 
     fn rebuild_transactional(
         &mut self,
-        session: &mut Session,
+        session: &mut MachineInstance,
     ) -> Result<(Vec<DocumentPatch>, DocumentRollback), DocumentError> {
         let evaluated = self.evaluate(session)?;
         let patches = diff_frames(&self.frame, &evaluated.frame);
@@ -464,7 +467,7 @@ impl DocumentRuntime {
         ))
     }
 
-    fn evaluate(&self, session: &mut Session) -> Result<EvaluatedDocument, DocumentError> {
+    fn evaluate(&self, session: &mut MachineInstance) -> Result<EvaluatedDocument, DocumentError> {
         Evaluator::new(self, session).evaluate()
     }
 
@@ -586,7 +589,7 @@ impl DocumentRuntime {
 
     fn patch_scalars(
         &mut self,
-        session: &mut Session,
+        session: &mut MachineInstance,
         affected: BTreeSet<RetainedBindingKey>,
     ) -> Result<ScalarPatchOutcome, DocumentError> {
         let requests = affected
@@ -912,7 +915,7 @@ enum EvalValue {
     Bool(bool),
     Number(f64),
     Text(String),
-    Bytes(Vec<u8>),
+    Bytes(Bytes),
     Enum(String),
     Record(BTreeMap<String, EvalValue>),
     MappedRow {
@@ -1000,7 +1003,7 @@ struct EvaluatedArgument {
 
 struct Evaluator<'a> {
     runtime: &'a DocumentRuntime,
-    session: &'a mut Session,
+    session: &'a mut MachineInstance,
     frame: DocumentFrame,
     projection_cache: BTreeMap<DocumentDependency, Value>,
     static_value_cache: BTreeMap<DocumentExprId, EvalValue>,
@@ -1014,7 +1017,7 @@ struct Evaluator<'a> {
 }
 
 impl<'a> Evaluator<'a> {
-    fn new(runtime: &'a DocumentRuntime, session: &'a mut Session) -> Self {
+    fn new(runtime: &'a DocumentRuntime, session: &'a mut MachineInstance) -> Self {
         let root = frame_node_id(runtime.plan().root.node.0, None);
         Self {
             runtime,
@@ -1299,7 +1302,7 @@ impl<'a> Evaluator<'a> {
                 EvalValue::Number(*coefficient as f64 / 10f64.powi(*scale as i32))
             }
             DocumentConstantValue::Bool { value } => EvalValue::Bool(*value),
-            DocumentConstantValue::Bytes { value } => EvalValue::Bytes(value.clone()),
+            DocumentConstantValue::Bytes { value } => EvalValue::Bytes(value.clone().into()),
             DocumentConstantValue::Enum { name } => EvalValue::Enum(self.name(*name)?.to_owned()),
         })
     }
@@ -1824,6 +1827,7 @@ impl<'a> Evaluator<'a> {
                 fields,
             },
             Value::Error { code } => EvalValue::Text(code),
+            Value::HostBound { visible, .. } => self.value(*visible),
         }
     }
 
@@ -3109,7 +3113,7 @@ fn eval_builtin(
         DocumentBuiltin::TextLength => EvalValue::Number(first.text().chars().count() as f64),
         DocumentBuiltin::TextSpace => EvalValue::Text(" ".to_owned()),
         DocumentBuiltin::TextTimeRangeLabel => EvalValue::Text(first.text()),
-        DocumentBuiltin::TextToBytes => EvalValue::Bytes(first.text().into_bytes()),
+        DocumentBuiltin::TextToBytes => EvalValue::Bytes(first.text().into_bytes().into()),
         DocumentBuiltin::TextToNumber => {
             EvalValue::Number(first.text().parse().unwrap_or_default())
         }
@@ -3126,7 +3130,6 @@ fn eval_builtin(
         ),
         DocumentBuiltin::RouterGoTo | DocumentBuiltin::RouterRoute => first,
         DocumentBuiltin::DirectoryEntries
-        | DocumentBuiltin::FileReadBytes
         | DocumentBuiltin::FileWriteText
         | DocumentBuiltin::LogError
         | DocumentBuiltin::LogInfo

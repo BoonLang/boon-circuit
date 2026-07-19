@@ -41,7 +41,8 @@ xtask                    report-v2 validation and six-gate aggregate
 Hard rules:
 
 - `MachinePlan` is the only executable artifact.
-- `boon_plan_executor::Session` is the only execution owner.
+- `boon_plan_executor::MachineInstance` is the only mutable execution owner;
+  instances share one verified `MachineTemplate` per compiled role plan.
 - Runtime and product IPC contain no JSON.
 - `boon_document` consumes typed patches; it does not inspect parser AST.
 - `boon_native_gpu` does not depend on runtime, examples, or window events.

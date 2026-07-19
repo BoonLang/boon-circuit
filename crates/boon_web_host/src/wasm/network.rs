@@ -384,12 +384,21 @@ pub struct BrowserWebSocketConnector {
     capabilities: BrowserWebSocketCapabilities,
     active: Rc<Cell<usize>>,
     max_connections: usize,
+    event_wake: Rc<dyn Fn()>,
 }
 
 impl BrowserWebSocketConnector {
     pub fn new(
         capabilities: BrowserWebSocketCapabilities,
         max_connections: usize,
+    ) -> WebHostResult<Self> {
+        Self::new_with_event_wake(capabilities, max_connections, Rc::new(|| {}))
+    }
+
+    pub fn new_with_event_wake(
+        capabilities: BrowserWebSocketCapabilities,
+        max_connections: usize,
+        event_wake: Rc<dyn Fn()>,
     ) -> WebHostResult<Self> {
         if max_connections == 0 {
             return Err(WebHostError::InvalidInput {
@@ -401,6 +410,7 @@ impl BrowserWebSocketConnector {
             capabilities,
             active: Rc::new(Cell::new(0)),
             max_connections,
+            event_wake,
         })
     }
 
@@ -414,7 +424,7 @@ impl BrowserWebSocketConnector {
             self.max_connections,
             "browser WebSocket connections",
         )?;
-        BrowserWebSocketAdapter::connect_validated(validated, permit)
+        BrowserWebSocketAdapter::connect_validated(validated, permit, Rc::clone(&self.event_wake))
     }
 
     pub fn active_connection_count(&self) -> usize {
@@ -426,6 +436,7 @@ impl BrowserWebSocketAdapter {
     fn connect_validated(
         validated: ValidatedWebSocketRequest,
         permit: HostResourcePermit,
+        event_wake: Rc<dyn Fn()>,
     ) -> WebHostResult<Self> {
         let location = window()?.location();
         let scheme = match location
@@ -470,16 +481,19 @@ impl BrowserWebSocketAdapter {
         {
             let queue = Rc::clone(&queue);
             let socket_for_callback = socket.clone();
+            let event_wake = Rc::clone(&event_wake);
             listeners.push(socket_listener(&target, "open", move |_event| {
                 queue.borrow_mut().push(BrowserWebSocketEvent::Open {
                     protocol: socket_for_callback.protocol(),
                 });
+                event_wake();
             })?);
         }
         {
             let queue = Rc::clone(&queue);
             let socket_for_callback = socket.clone();
             let max_message_bytes = validated.max_message_bytes;
+            let event_wake = Rc::clone(&event_wake);
             listeners.push(socket_listener(&target, "message", move |event| {
                 let Some(message) = event.dyn_ref::<MessageEvent>() else {
                     return;
@@ -495,6 +509,7 @@ impl BrowserWebSocketAdapter {
                     queue.borrow_mut().push(BrowserWebSocketEvent::Error {
                         message: "unsupported WebSocket frame value".to_owned(),
                     });
+                    event_wake();
                     let _ = socket_for_callback
                         .close_with_code_and_reason(1003, "unsupported frame value");
                     return;
@@ -503,14 +518,16 @@ impl BrowserWebSocketAdapter {
                     queue.borrow_mut().push(BrowserWebSocketEvent::Error {
                         message: "WebSocket message exceeded the declared byte limit".to_owned(),
                     });
+                    event_wake();
                     let _ =
                         socket_for_callback.close_with_code_and_reason(1009, "message too large");
                     return;
                 }
-                if !queue
+                let admitted = queue
                     .borrow_mut()
-                    .push(BrowserWebSocketEvent::Message { frame })
-                {
+                    .push(BrowserWebSocketEvent::Message { frame });
+                event_wake();
+                if !admitted {
                     let _ =
                         socket_for_callback.close_with_code_and_reason(1009, "receive queue full");
                 }
@@ -518,6 +535,7 @@ impl BrowserWebSocketAdapter {
         }
         {
             let queue = Rc::clone(&queue);
+            let event_wake = Rc::clone(&event_wake);
             listeners.push(socket_listener(&target, "close", move |event| {
                 let Some(close) = event.dyn_ref::<CloseEvent>() else {
                     return;
@@ -527,14 +545,17 @@ impl BrowserWebSocketAdapter {
                     reason: close.reason(),
                     clean: close.was_clean(),
                 });
+                event_wake();
             })?);
         }
         {
             let queue = Rc::clone(&queue);
+            let event_wake = Rc::clone(&event_wake);
             listeners.push(socket_listener(&target, "error", move |event| {
                 queue.borrow_mut().push(BrowserWebSocketEvent::Error {
                     message: js_message(event.as_ref()),
                 });
+                event_wake();
             })?);
         }
 

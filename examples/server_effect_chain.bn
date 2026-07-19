@@ -17,7 +17,6 @@ store: [
                     body: request.body
                     connect_timeout_ms: 500
                     overall_timeout_ms: 2000
-                    cancellation: Independent
                 )
             }
         }

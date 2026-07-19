@@ -12,8 +12,13 @@ boon_plan.workspace = true
 boon_persistence.workspace = true
 boon_runtime.workspace = true
 boon_server_host.workspace = true
+boon_wire.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
+boon_host_runtime.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 tokio.workspace = true

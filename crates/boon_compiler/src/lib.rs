@@ -357,7 +357,9 @@ fn expr_tree_mentions_source(expressions: &[AstExpr], id: usize, source: &str) -
 fn expr_path(expressions: &[AstExpr], id: usize) -> Option<String> {
     match &expressions.iter().find(|expr| expr.id == id)?.kind {
         AstExprKind::Identifier(value) => Some(value.clone()),
-        AstExprKind::Path(parts) if !parts.is_empty() => Some(parts.join(".")),
+        AstExprKind::Path(parts) if !parts.is_empty() => {
+            Some(boon_parser::canonical_value_path(parts))
+        }
         _ => None,
     }
 }

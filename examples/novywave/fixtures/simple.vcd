@@ -11,6 +11,7 @@ $scope module simple_tb $end
 $scope module s $end
 $var wire 4 ! A [3:0] $end
 $var wire 4 " B [3:0] $end
+$var real 1 # temperature $end
 $upscope $end
 $upscope $end
 $enddefinitions $end
@@ -18,11 +19,14 @@ $enddefinitions $end
 $dumpvars
 b11 "
 b1010 !
+r39.5 #
 $end
 #50
 b101 "
 b1100 !
+r42.8 #
 #150
 b0 "
 b0 !
+r40.1 #
 #250

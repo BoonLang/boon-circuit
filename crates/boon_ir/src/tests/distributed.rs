@@ -26,13 +26,13 @@ fn distributed_test_function(
 
 fn distributed_test_environment() -> boon_typecheck::ExternalTypeEnvironment {
     let mut environment =
-        boon_typecheck::ExternalTypeEnvironment::empty(boon_typecheck::ProgramRole::Client);
+        boon_typecheck::ExternalTypeEnvironment::empty(boon_typecheck::ProgramRole::Session);
     environment.values.insert(
-        "Server.store.count".to_owned(),
+        "Server/store.count".to_owned(),
         distributed_test_flow(boon_typecheck::Type::Number),
     );
     environment.values.insert(
-        "Session.outputs.x".to_owned(),
+        "Client/store.x".to_owned(),
         distributed_test_flow(boon_typecheck::Type::Text),
     );
     environment.functions.insert(
@@ -56,7 +56,7 @@ fn distributed_test_environment() -> boon_typecheck::ExternalTypeEnvironment {
 fn qualified_distributed_values_and_pure_calls_have_explicit_typed_metadata() {
     let parsed = boon_parser::parse_source(
         "distributed-ir.bn",
-        "count: Server.store.count\nsession_value: Session.outputs.x\nsum: Server/add(value: 2)\nformatted: Server/Module/format(value: sum)\n",
+        "count: Server/store.count\nclient_value: Client/store.x\nsum: Server/add(value: 2)\nformatted: Server/Module/format(value: sum)\n",
     )
     .unwrap();
     let environment = distributed_test_environment();
@@ -67,7 +67,7 @@ fn qualified_distributed_values_and_pure_calls_have_explicit_typed_metadata() {
         .distributed_references
         .value_references
         .iter()
-        .find(|reference| reference.canonical_path == "Server.store.count")
+        .find(|reference| reference.canonical_path == "Server/store.count")
         .unwrap();
     assert_eq!(
         server_count.producer_role,
@@ -83,11 +83,11 @@ fn qualified_distributed_values_and_pure_calls_have_explicit_typed_metadata() {
         .distributed_references
         .value_references
         .iter()
-        .find(|reference| reference.canonical_path == "Session.outputs.x")
+        .find(|reference| reference.canonical_path == "Client/store.x")
         .unwrap();
     assert_eq!(
         session_output.producer_role,
-        boon_typecheck::ProgramRole::Session
+        boon_typecheck::ProgramRole::Client
     );
     assert_eq!(session_output.value_type, boon_typecheck::Type::Text);
 
@@ -140,69 +140,70 @@ fn qualified_distributed_values_and_pure_calls_have_explicit_typed_metadata() {
 fn empty_environment_lowering_and_external_typecheck_errors_fail_closed() {
     let parsed = boon_parser::parse_source(
         "missing-distributed-ir.bn",
-        "value: Server.store.missing\ncall: Server/missing(value: 1)\n",
+        "value: Session/store.missing\ncall: Session/missing(value: 1)\n",
     )
     .unwrap();
     let error = lower(&parsed).unwrap_err();
     assert!(
-        error.contains("unknown qualified external value `Server.store.missing`")
-            && error.contains("unknown qualified external function `Server/missing`"),
+        error.contains("unknown qualified external value `Session/store.missing`")
+            && error.contains("unknown qualified external function `Session/missing`"),
         "unexpected empty-environment error: {error}"
     );
 
     let parsed = boon_parser::parse_source(
         "invalid-distributed-direction.bn",
-        "value: Client.store.count\n",
+        "value: Server/store.count\n",
     )
     .unwrap();
     let mut environment =
-        boon_typecheck::ExternalTypeEnvironment::empty(boon_typecheck::ProgramRole::Session);
+        boon_typecheck::ExternalTypeEnvironment::empty(boon_typecheck::ProgramRole::Client);
     environment.values.insert(
-        "Client.store.count".to_owned(),
+        "Server/store.count".to_owned(),
         distributed_test_flow(boon_typecheck::Type::Number),
     );
     let error = lower_with_external_types(&parsed, &environment).unwrap_err();
     assert!(
-        error.contains("Session cannot depend on Client through `Client.store.count`"),
+        error.contains("Client cannot depend on Server through `Server/store.count`"),
         "unexpected direction error: {error}"
     );
 
     let parsed =
-        boon_parser::parse_source("same-role-distributed-ir.bn", "value: Server.store.count\n")
+        boon_parser::parse_source("same-role-distributed-ir.bn", "value: Server/store.count\n")
             .unwrap();
     let mut environment =
         boon_typecheck::ExternalTypeEnvironment::empty(boon_typecheck::ProgramRole::Server);
     environment.values.insert(
-        "Server.store.count".to_owned(),
+        "Server/store.count".to_owned(),
         distributed_test_flow(boon_typecheck::Type::Number),
     );
     let error = lower_with_external_types(&parsed, &environment).unwrap_err();
     assert!(
-        error.contains("same-role qualification `Server.store.count` is not allowed in Server"),
+        error.contains("same-role qualification `Server/store.count` is not allowed in Server"),
         "unexpected same-role error: {error}"
     );
 }
 
 #[test]
-fn distributed_metadata_excludes_source_list_effect_and_open_types() {
+fn distributed_metadata_accepts_closed_lists_and_event_flows_but_excludes_effects_and_open_types()
+{
     let parsed = boon_parser::parse_source("invalid-distributed-types.bn", "local: 1\n").unwrap();
     let mut environment =
-        boon_typecheck::ExternalTypeEnvironment::empty(boon_typecheck::ProgramRole::Client);
+        boon_typecheck::ExternalTypeEnvironment::empty(boon_typecheck::ProgramRole::Session);
     environment.values.insert(
-        "Server.store.source".to_owned(),
+        "Server/store.source".to_owned(),
         boon_typecheck::FlowType {
             mode: boon_typecheck::FlowMode::PresentOrAbsent,
             ty: boon_typecheck::Type::Number,
         },
     );
     environment.values.insert(
-        "Server.store.list".to_owned(),
+        "Server/store.list".to_owned(),
         distributed_test_flow(boon_typecheck::Type::List(Box::new(
             boon_typecheck::Type::Number,
         ))),
     );
     environment.values.insert(
-        "Server.store.open".to_owned(),
+        "Server/store.open".to_owned(),
         distributed_test_flow(boon_typecheck::Type::Object(boon_typecheck::ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
@@ -220,11 +221,10 @@ fn distributed_metadata_excludes_source_list_effect_and_open_types() {
 
     let error = lower_with_external_types(&parsed, &environment).unwrap_err();
     for expected in [
-        "external value `Server.store.source` must be continuous",
-        "external value `Server.store.list` must have a closed scalar, record, or variant type",
-        "external value `Server.store.open` must have a closed scalar, record, or variant type",
+        "external value `Server/store.open` must have a closed value type",
         "external function `Server/effect` must be pure",
     ] {
         assert!(error.contains(expected), "missing `{expected}` in: {error}");
     }
+    assert!(!error.contains("Server/store.source"), "unexpected event-flow error: {error}");
 }

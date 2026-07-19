@@ -12,8 +12,9 @@ use boon_runtime::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
+use tokio::sync::mpsc::{self as tokio_mpsc, Receiver, error::TryRecvError};
 use wellen::{FileFormat, Hierarchy, SignalEncoding, SignalValue, TimescaleUnit};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
@@ -134,7 +135,7 @@ impl WaveformEffectWorker {
         let adapter = WaveformEffectAdapter::with_limits(content_store, limits)?;
         let effects = adapter.effects;
         let (commands, command_rx) = mpsc::sync_channel(max_pending);
-        let (result_tx, results) = mpsc::channel();
+        let (result_tx, results) = tokio_mpsc::channel(max_pending);
         let worker = thread::Builder::new()
             .name("boon-wellen-host".to_owned())
             .spawn(move || {
@@ -148,7 +149,7 @@ impl WaveformEffectWorker {
                         .submit(invocation)
                         .map(|submission| submission.completion);
                     if result_tx
-                        .send(WaveformWorkerResult { call_id, result })
+                        .blocking_send(WaveformWorkerResult { call_id, result })
                         .is_err()
                     {
                         break;
@@ -230,6 +231,23 @@ impl WaveformEffectWorker {
                 continue;
             }
             return result.result.map(Some);
+        }
+    }
+
+    pub async fn next_completion(
+        &mut self,
+    ) -> Result<WaveformEffectCompletion, WaveformAdapterError> {
+        loop {
+            let result = self.results.recv().await.ok_or_else(|| {
+                WaveformAdapterError::new(
+                    WaveformAdapterErrorKind::Closed,
+                    "waveform worker completion lane is closed",
+                )
+            })?;
+            if !self.pending.remove(&result.call_id) {
+                continue;
+            }
+            return result.result;
         }
     }
 
@@ -464,12 +482,12 @@ impl WaveformEffectAdapter {
         let fields = exact_record(intent, &["content"], "Wellen/open intent")?;
         let content =
             ContentRef::from_value(required(fields, "content")?).map_err(content_failure)?;
-        self.ensure_content_loaded(content)?;
+        self.ensure_content_loaded(&content)?;
         let waveform = self
             .waveforms
             .get(&content)
             .expect("content was loaded before open response");
-        opened_value(content, &waveform.waveform)
+        opened_value(&content, &waveform.waveform)
     }
 
     fn hierarchy_page(&mut self, intent: &Value) -> Value {
@@ -640,7 +658,8 @@ impl WaveformEffectAdapter {
             })?;
             let mut transitions = Vec::new();
             let mut page_full = false;
-            for (time_index, value) in signal.iter_changes() {
+            let mut changes = signal.iter_changes().peekable();
+            while let Some((time_index, value)) = changes.next() {
                 let time = *time_table.get(time_index as usize).ok_or_else(|| {
                     WaveformFailure::new(
                         "invalid_waveform",
@@ -665,8 +684,18 @@ impl WaveformEffectAdapter {
                 }
                 payload_bytes += row_bytes;
                 emitted += 1;
+                let transition_end = changes
+                    .peek()
+                    .and_then(|(next_time_index, _)| time_table.get(*next_time_index as usize))
+                    .copied()
+                    .unwrap_or(end_time)
+                    .min(end_time);
                 transitions.push(Value::Record(BTreeMap::from([
                     ("time".to_owned(), number_from_u64(time)?),
+                    (
+                        "end_time".to_owned(),
+                        number_from_u64(transition_end.max(time))?,
+                    ),
                     ("value".to_owned(), value),
                 ])));
             }
@@ -787,7 +816,7 @@ impl WaveformEffectAdapter {
                 "waveform artifact parser version is unsupported",
             ));
         }
-        self.ensure_content_loaded(artifact.content)?;
+        self.ensure_content_loaded(&artifact.content)?;
         let open = self
             .waveforms
             .get(&artifact.content)
@@ -801,9 +830,9 @@ impl WaveformEffectAdapter {
         Ok(())
     }
 
-    fn ensure_content_loaded(&mut self, content: ContentRef) -> Result<(), WaveformFailure> {
+    fn ensure_content_loaded(&mut self, content: &ContentRef) -> Result<(), WaveformFailure> {
         let use_sequence = self.next_use_sequence();
-        if let Some(open) = self.waveforms.get_mut(&content) {
+        if let Some(open) = self.waveforms.get_mut(content) {
             open.last_used = use_sequence;
             return Ok(());
         }
@@ -824,7 +853,7 @@ impl WaveformEffectAdapter {
             self.evict_least_recently_used();
         }
         self.waveforms.insert(
-            content,
+            content.clone(),
             OpenWaveform {
                 _content_lease: lease,
                 waveform,
@@ -844,7 +873,7 @@ impl WaveformEffectAdapter {
             .waveforms
             .iter()
             .min_by_key(|(_, waveform)| waveform.last_used)
-            .map(|(content, _)| *content);
+            .map(|(content, _)| content.clone());
         if let Some(victim) = victim {
             self.waveforms.remove(&victim);
         }
@@ -867,13 +896,13 @@ fn effect_id(operation: &str) -> Result<EffectId, WaveformAdapterError> {
 }
 
 fn opened_value(
-    content: ContentRef,
+    content: &ContentRef,
     waveform: &wellen::simple::Waveform,
 ) -> Result<Value, WaveformFailure> {
     let hierarchy = waveform.hierarchy();
     let format = file_format(hierarchy.file_format()).to_owned();
     let artifact = Artifact {
-        content,
+        content: content.clone(),
         format: format.clone(),
         schema_version: boon_effect_schema::WELLEN_BRIDGE_SCHEMA_VERSION.to_owned(),
         parser_version: wellen::VERSION.to_owned(),
@@ -888,10 +917,7 @@ fn opened_value(
         BTreeMap::from([
             ("artifact".to_owned(), artifact_value(&artifact)?),
             ("format".to_owned(), Value::Text(format)),
-            (
-                "byte_length".to_owned(),
-                number_from_u64(content.byte_count())?,
-            ),
+            ("byte_length".to_owned(), number_from_u64(content.size())?),
             ("start_time".to_owned(), number_from_u64(start_time)?),
             ("end_time".to_owned(), number_from_u64(end_time)?),
             (
@@ -937,6 +963,7 @@ fn hierarchy_scope_row(
         ("id".to_owned(), Value::Text(format!("scope:{full_name}"))),
         ("parent_id".to_owned(), Value::Text(parent)),
         ("name".to_owned(), Value::Text(name)),
+        ("full_name".to_owned(), Value::Text(full_name)),
         ("signal_id".to_owned(), Value::Text(String::new())),
         ("width".to_owned(), number(0)),
         ("encoding".to_owned(), Value::Text("Scope".to_owned())),
@@ -963,6 +990,7 @@ fn hierarchy_signal_row(
         ("id".to_owned(), Value::Text(format!("signal:{full_name}"))),
         ("parent_id".to_owned(), Value::Text(parent)),
         ("name".to_owned(), Value::Text(name)),
+        ("full_name".to_owned(), Value::Text(full_name.clone())),
         ("signal_id".to_owned(), Value::Text(full_name)),
         ("width".to_owned(), number_from_u64(width)?),
         ("encoding".to_owned(), Value::Text(encoding.to_owned())),
@@ -1305,6 +1333,7 @@ fn content_failure(error: ContentStoreError) -> WaveformFailure {
         ContentStoreErrorKind::Missing => "content_missing",
         ContentStoreErrorKind::Capacity => "content_store_full",
         ContentStoreErrorKind::InvalidReference => "invalid_content_ref",
+        ContentStoreErrorKind::Corrupt => "content_corrupt",
         ContentStoreErrorKind::InvalidConfiguration => "content_store_invalid",
         ContentStoreErrorKind::Io => "content_io",
     };

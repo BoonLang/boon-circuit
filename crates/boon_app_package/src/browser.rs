@@ -1,5 +1,5 @@
 use crate::{
-    APP_MANIFEST_FORMAT, ArtifactDescriptor, MAX_ARTIFACT_BYTES, PackageError, sha256_bytes,
+    ArtifactDescriptor, CapabilityProfileDescriptor, MAX_ARTIFACT_BYTES, PackageError, sha256_bytes,
 };
 use boon_persistence::{ContentArtifact, ContentArtifactId};
 use boon_plan::{ProgramRole, TargetProfile};
@@ -7,7 +7,7 @@ use boon_runtime::{ProgramArtifact, ProgramCapabilityProfile};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
-pub const BROWSER_APP_CONFIG_FORMAT: u32 = APP_MANIFEST_FORMAT;
+pub const BROWSER_APP_CONFIG_FORMAT: u32 = 2;
 pub const MAX_BROWSER_APP_CONFIG_BYTES: usize = 16 * 1024;
 pub const MAX_BROWSER_ARTIFACT_PATH_BYTES: usize = 2 * 1024;
 
@@ -27,6 +27,8 @@ pub struct BrowserAppConfig {
     pub client_artifact_revision: u64,
     pub client_artifact_media_type: String,
     pub client_artifact_bytes_len: usize,
+    pub client_capability_profile_id: String,
+    pub client_capability_profile: CapabilityProfileDescriptor,
     pub canvas_id: String,
 }
 
@@ -36,7 +38,23 @@ impl BrowserAppConfig {
         protocol_version: u32,
         canvas_id: &str,
         client: &ArtifactDescriptor,
+        client_capability_profile: &CapabilityProfileDescriptor,
     ) -> Result<Self, PackageError> {
+        if client.role != ProgramRole::Client {
+            return Err(PackageError::new(
+                "browser bootstrap artifact must have the client role",
+            ));
+        }
+        if client_capability_profile.role != ProgramRole::Client {
+            return Err(PackageError::new(
+                "browser bootstrap capability profile must have the client role",
+            ));
+        }
+        if client.capability_profile_id != client_capability_profile.id {
+            return Err(PackageError::new(
+                "browser bootstrap artifact and capability profile differ",
+            ));
+        }
         let config = Self {
             format: BROWSER_APP_CONFIG_FORMAT,
             package_id: package_id.to_owned(),
@@ -47,13 +65,10 @@ impl BrowserAppConfig {
             client_artifact_revision: client.revision,
             client_artifact_media_type: client.content_media_type.clone(),
             client_artifact_bytes_len: client.bytes_len,
+            client_capability_profile_id: client.capability_profile_id.clone(),
+            client_capability_profile: client_capability_profile.clone(),
             canvas_id: canvas_id.to_owned(),
         };
-        if client.role != ProgramRole::Client {
-            return Err(PackageError::new(
-                "browser bootstrap artifact must have the client role",
-            ));
-        }
         config.validate()?;
         Ok(config)
     }
@@ -128,6 +143,17 @@ impl BrowserAppConfig {
             return Err(PackageError::new(format!(
                 "browser client artifact size is outside 1..={MAX_ARTIFACT_BYTES} bytes"
             )));
+        }
+        self.client_capability_profile.validate()?;
+        if self.client_capability_profile.role != ProgramRole::Client {
+            return Err(PackageError::new(
+                "browser app config contains a non-Client capability profile",
+            ));
+        }
+        if self.client_capability_profile_id != self.client_capability_profile.id {
+            return Err(PackageError::new(
+                "browser client capability profile reference is missing or mismatched",
+            ));
         }
         Ok(())
     }

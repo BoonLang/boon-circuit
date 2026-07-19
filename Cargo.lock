@@ -335,6 +335,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "atomic-write-file"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84790c55b5704b0d35130bf16a4ce22a8e70eb0ea773522557524d9a4852663d"
+dependencies = [
+ "nix 0.30.1",
+ "rand 0.9.5",
+]
+
+[[package]]
 name = "atomic_float"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -628,11 +638,17 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "boon_app_package",
+ "boon_effect_schema",
+ "boon_host_runtime",
+ "boon_host_services",
+ "boon_http_client",
+ "boon_http_runtime",
  "boon_persistence",
  "boon_plan",
  "boon_runtime",
  "boon_server_host",
  "boon_server_runtime",
+ "boon_wellen_host",
  "fs2",
  "futures",
  "ipnet",
@@ -675,6 +691,7 @@ dependencies = [
 name = "boon_data"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "serde",
  "wasm-bindgen-test",
 ]
@@ -731,10 +748,12 @@ dependencies = [
 name = "boon_host_runtime"
 version = "0.1.0"
 dependencies = [
+ "atomic-write-file",
  "boon_effect_schema",
  "boon_host_services",
  "boon_plan",
  "boon_runtime",
+ "bytes",
  "getrandom 0.3.4",
  "sha2",
  "tempfile",
@@ -823,6 +842,9 @@ dependencies = [
  "boon_editor",
  "boon_host",
  "boon_host_runtime",
+ "boon_host_services",
+ "boon_http_client",
+ "boon_http_runtime",
  "boon_ir",
  "boon_native_app_window",
  "boon_native_gpu",
@@ -830,6 +852,7 @@ dependencies = [
  "boon_persistence",
  "boon_plan",
  "boon_runtime",
+ "boon_server_runtime",
  "boon_typecheck",
  "boon_web_host",
  "boon_wellen_host",
@@ -902,6 +925,7 @@ dependencies = [
  "boon_persistence",
  "boon_plan",
  "boon_query",
+ "serde",
 ]
 
 [[package]]
@@ -939,6 +963,7 @@ dependencies = [
  "boon_persistence",
  "boon_plan",
  "boon_plan_executor",
+ "boon_wire",
  "ciborium",
  "futures",
  "js-sys",
@@ -955,6 +980,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "boon_wire",
  "form_urlencoded",
  "futures",
  "ipnet",
@@ -970,12 +996,17 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "boon_effect_schema",
+ "boon_host_runtime",
  "boon_persistence",
  "boon_plan",
  "boon_runtime",
  "boon_server_host",
+ "boon_wire",
+ "ciborium",
  "futures",
  "reqwest",
+ "serde",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
@@ -1000,14 +1031,19 @@ version = "0.1.0"
 dependencies = [
  "boon_app_package",
  "boon_document",
+ "boon_effect_schema",
  "boon_host",
  "boon_native_gpu",
  "boon_plan",
  "boon_runtime",
+ "boon_wire",
+ "getrandom 0.3.4",
  "idb",
  "js-sys",
  "percent-encoding",
  "serde",
+ "serde_json",
+ "sha2",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -1033,7 +1069,13 @@ dependencies = [
 name = "boon_wire"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "boon_data",
+ "getrandom 0.3.4",
+ "minicbor",
+ "serde",
+ "static_assertions",
+ "zeroize",
 ]
 
 [[package]]
@@ -1083,6 +1125,9 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "case"
@@ -1735,7 +1780,7 @@ dependencies = [
  "bitvec",
  "cfg-if",
  "libc",
- "nix",
+ "nix 0.29.0",
 ]
 
 [[package]]
@@ -2051,9 +2096,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3015,6 +3062,18 @@ name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",

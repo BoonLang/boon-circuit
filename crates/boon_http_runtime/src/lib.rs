@@ -18,12 +18,6 @@ use tokio::task::JoinHandle;
 
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CancellationIntent {
-    Independent,
-    CancelPrevious,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpEffectCompletion {
     pub call_id: TransientEffectCallId,
@@ -34,7 +28,6 @@ pub struct HttpEffectCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpEffectSubmission {
     pub call_id: TransientEffectCallId,
-    pub cancelled_calls: Vec<TransientEffectCallId>,
     pub immediate_completion: Option<HttpEffectCompletion>,
 }
 
@@ -93,7 +86,6 @@ pub struct OutboundHttpEffectAdapter {
     effect_id: EffectId,
     max_active: usize,
     active: BTreeMap<TransientEffectCallId, ActiveRequest>,
-    latest_by_invocation: BTreeMap<EffectInvocationId, TransientEffectCallId>,
     completions_tx: mpsc::Sender<HttpEffectCompletion>,
     completions_rx: mpsc::Receiver<HttpEffectCompletion>,
 }
@@ -115,7 +107,6 @@ impl OutboundHttpEffectAdapter {
             effect_id,
             max_active,
             active: BTreeMap::new(),
-            latest_by_invocation: BTreeMap::new(),
             completions_tx,
             completions_rx,
         })
@@ -142,12 +133,17 @@ impl OutboundHttpEffectAdapter {
                 ),
             ));
         }
+        if self.active.contains_key(&invocation.call_id) {
+            return Err(AdapterError::new(
+                AdapterErrorKind::InvalidIntent,
+                "outbound HTTP call ID is already owned by the adapter",
+            ));
+        }
         let decoded = match decode_intent(&invocation.intent) {
             Ok(decoded) => decoded,
             Err(failure) => {
                 return Ok(HttpEffectSubmission {
                     call_id: invocation.call_id,
-                    cancelled_calls: Vec::new(),
                     immediate_completion: Some(HttpEffectCompletion {
                         call_id: invocation.call_id,
                         invocation_id: invocation.invocation_id,
@@ -156,21 +152,9 @@ impl OutboundHttpEffectAdapter {
                 });
             }
         };
-
-        let mut cancelled_calls = Vec::new();
-        if decoded.cancellation == CancellationIntent::CancelPrevious
-            && let Some(previous) = self
-                .latest_by_invocation
-                .get(&invocation.invocation_id)
-                .copied()
-            && self.cancel(previous)
-        {
-            cancelled_calls.push(previous);
-        }
         if self.active.len() >= self.max_active {
             return Ok(HttpEffectSubmission {
                 call_id: invocation.call_id,
-                cancelled_calls,
                 immediate_completion: Some(HttpEffectCompletion {
                     call_id: invocation.call_id,
                     invocation_id: invocation.invocation_id,
@@ -217,10 +201,8 @@ impl OutboundHttpEffectAdapter {
                 task,
             },
         );
-        self.latest_by_invocation.insert(invocation_id, call_id);
         Ok(HttpEffectSubmission {
             call_id,
-            cancelled_calls,
             immediate_completion: None,
         })
     }
@@ -236,10 +218,36 @@ impl OutboundHttpEffectAdapter {
             let Some(active) = self.active.remove(&completion.call_id) else {
                 continue;
             };
-            if self.latest_by_invocation.get(&active.invocation_id) == Some(&completion.call_id) {
-                self.latest_by_invocation.remove(&active.invocation_id);
+            if active.invocation_id != completion.invocation_id {
+                continue;
             }
             return Ok(completion);
+        }
+    }
+
+    pub fn try_next_completion(&mut self) -> Result<Option<HttpEffectCompletion>, AdapterError> {
+        loop {
+            let completion = match self.completions_rx.try_recv() {
+                Ok(completion) => completion,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(None),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(AdapterError::new(
+                        AdapterErrorKind::Closed,
+                        "outbound HTTP completion lane closed",
+                    ));
+                }
+            };
+            let Some(active) = self.active.remove(&completion.call_id) else {
+                continue;
+            };
+            debug_assert_eq!(active.invocation_id, completion.invocation_id);
+            return Ok(Some(completion));
+        }
+    }
+
+    pub fn route_runtime_turn(&mut self, turn: &RuntimeTurn) {
+        for call_id in &turn.cancelled_transient_effects {
+            self.cancel(*call_id);
         }
     }
 
@@ -249,9 +257,6 @@ impl OutboundHttpEffectAdapter {
         };
         active.cancellation.cancel();
         active.task.abort();
-        if self.latest_by_invocation.get(&active.invocation_id) == Some(&call_id) {
-            self.latest_by_invocation.remove(&active.invocation_id);
-        }
         true
     }
 
@@ -274,11 +279,6 @@ pub fn apply_submission(
     program: &mut ProgramSession,
     submission: HttpEffectSubmission,
 ) -> Result<Option<RuntimeTurn>, AdapterError> {
-    for cancelled in submission.cancelled_calls {
-        program
-            .cancel_transient_effect(cancelled)
-            .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error))?;
-    }
     submission
         .immediate_completion
         .map(|completion| apply_completion(program, completion))
@@ -297,7 +297,6 @@ pub fn apply_completion(
 struct DecodedIntent {
     request: HttpRequest,
     timeouts: RequestTimeouts,
-    cancellation: CancellationIntent,
 }
 
 fn decode_intent(value: &Value) -> Result<DecodedIntent, Failure> {
@@ -306,7 +305,6 @@ fn decode_intent(value: &Value) -> Result<DecodedIntent, Failure> {
         fields,
         &[
             "body",
-            "cancellation",
             "connect_timeout_ms",
             "endpoint",
             "headers",
@@ -366,17 +364,6 @@ fn decode_intent(value: &Value) -> Result<DecodedIntent, Failure> {
             "connect timeout exceeds overall timeout",
         ));
     }
-    let cancellation = match text_field(fields, "cancellation")? {
-        "Independent" => CancellationIntent::Independent,
-        "CancelPrevious" => CancellationIntent::CancelPrevious,
-        _ => {
-            return Err(Failure::invalid(
-                endpoint.as_str(),
-                "invalid_cancellation",
-                "cancellation intent is outside the typed contract",
-            ));
-        }
-    };
     let mut request = HttpRequest::new(endpoint, method);
     request.path_segments = path_segments;
     request.query = query;
@@ -385,7 +372,6 @@ fn decode_intent(value: &Value) -> Result<DecodedIntent, Failure> {
     Ok(DecodedIntent {
         request,
         timeouts: RequestTimeouts { connect, overall },
-        cancellation,
     })
 }
 
@@ -407,13 +393,13 @@ fn success_outcome(response: HttpResponse) -> Value {
                         .map(|header| {
                             Value::Record(BTreeMap::from([
                                 ("name".to_owned(), Value::Text(header.name)),
-                                ("value".to_owned(), Value::Bytes(header.value)),
+                                ("value".to_owned(), Value::Bytes(header.value.into())),
                             ]))
                         })
                         .collect(),
                 ),
             ),
-            ("body".to_owned(), Value::Bytes(response.body)),
+            ("body".to_owned(), Value::Bytes(response.body.into())),
             (
                 "redirects_followed".to_owned(),
                 number(i64::from(response.redirects_followed)),

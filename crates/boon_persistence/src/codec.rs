@@ -2,8 +2,9 @@ use super::{
     ApplicationTransfer, CheckpointBatch, ContentArtifact, ContentArtifactBinding,
     ContentArtifactId, ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention,
     DurableChange, DurableContentArtifactChange, DurableEffectRow, DurableOutboxChange,
-    DurableOutboxItem, DurableOutboxState, OutboxItemId, RestoreImage, StoredList, StoredRow,
-    StoredScalar, StoredValue, validate_application_transfer, validate_content_artifact_manifest,
+    DurableOutboxItem, DurableOutboxState, DurableProtocolStateChange, OutboxItemId,
+    ProtocolStateKey, ProtocolStateRecord, RestoreImage, StoredList, StoredRow, StoredScalar,
+    StoredValue, validate_application_transfer, validate_content_artifact_manifest,
 };
 use boon_plan::{
     ApplicationIdentity, EffectId, EffectInvocationId, MemoryId, MemoryLeafId, MigrationEdgeId,
@@ -15,8 +16,9 @@ use std::fmt;
 
 const RESTORE_IMAGE_FORMAT: u32 = 5;
 const APPLICATION_TRANSFER_FORMAT: u32 = 3;
-const CHECKPOINT_BATCH_FORMAT: u32 = 4;
+const CHECKPOINT_BATCH_FORMAT: u32 = 5;
 const OUTBOX_RECORD_FORMAT: u32 = 2;
+const PROTOCOL_STATE_RECORD_FORMAT: u32 = 1;
 const BLOB_RECORD_FORMAT: u32 = 1;
 pub const INLINE_BYTES_THRESHOLD: usize = 16 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 80 * 1024 * 1024;
@@ -331,7 +333,7 @@ pub fn encode_checkpoint_batch(batch: &CheckpointBatch) -> Result<Vec<u8>, Codec
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
     encoder
-        .array(11)
+        .array(12)
         .and_then(|encoder| encoder.u32(CHECKPOINT_BATCH_FORMAT))
         .map_err(encode_error)?;
     encode_application(&mut encoder, &batch.application)?;
@@ -353,6 +355,12 @@ pub fn encode_checkpoint_batch(batch: &CheckpointBatch) -> Result<Vec<u8>, Codec
         encode_outbox_change(&mut encoder, change)?;
     }
     encoder
+        .array(batch.protocol_state_changes.len() as u64)
+        .map_err(encode_error)?;
+    for change in &batch.protocol_state_changes {
+        encode_protocol_state_change(&mut encoder, change)?;
+    }
+    encoder
         .array(batch.content_artifact_changes.len() as u64)
         .map_err(encode_error)?;
     for change in &batch.content_artifact_changes {
@@ -372,7 +380,7 @@ pub fn decode_checkpoint_batch(
     let format = decoder.u32().map_err(decode_error)?;
     if !matches!(
         (format, root_len),
-        (2, 10) | (3, 11) | (CHECKPOINT_BATCH_FORMAT, 11)
+        (2, 10) | (3 | 4, 11) | (CHECKPOINT_BATCH_FORMAT, 12)
     ) {
         return Err(CodecError::new(format!(
             "unsupported checkpoint batch format {format} with {root_len} fields"
@@ -394,6 +402,15 @@ pub fn decode_checkpoint_batch(
     for _ in 0..outbox_count {
         outbox_changes.push(decode_outbox_change(&mut decoder, limits)?);
     }
+    let mut protocol_state_changes = Vec::new();
+    if format >= 5 {
+        let protocol_change_count =
+            collection_len(&mut decoder, limits, "protocol-state changes", true)?;
+        protocol_state_changes.reserve(protocol_change_count);
+        for _ in 0..protocol_change_count {
+            protocol_state_changes.push(decode_protocol_state_change(&mut decoder, limits)?);
+        }
+    }
     let mut content_artifact_changes = Vec::new();
     if format >= 3 {
         let artifact_change_count =
@@ -414,8 +431,48 @@ pub fn decode_checkpoint_batch(
         last_turn_sequence,
         changes,
         outbox_changes,
+        protocol_state_changes,
         content_artifact_changes,
         checksum,
+    })
+}
+
+pub(crate) fn encode_protocol_state_record(
+    record: &ProtocolStateRecord,
+) -> Result<Vec<u8>, CodecError> {
+    let mut bytes = Vec::with_capacity(record.payload.len().saturating_add(32));
+    Encoder::new(&mut bytes)
+        .array(3)
+        .and_then(|encoder| encoder.u32(PROTOCOL_STATE_RECORD_FORMAT))
+        .and_then(|encoder| encoder.u64(record.revision))
+        .and_then(|encoder| encoder.bytes(&record.payload))
+        .map_err(encode_error)?;
+    component_size(&bytes, DecodeLimits::default(), "protocol-state record")?;
+    Ok(bytes)
+}
+
+pub(crate) fn decode_protocol_state_record(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<ProtocolStateRecord, CodecError> {
+    component_size(bytes, limits, "protocol-state record")?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 3, "protocol-state record")?;
+    let format = decoder.u32().map_err(decode_error)?;
+    if format != PROTOCOL_STATE_RECORD_FORMAT {
+        return Err(CodecError::new(format!(
+            "unsupported protocol-state record format {format}"
+        )));
+    }
+    let revision = decoder.u64().map_err(decode_error)?;
+    let payload = decoder.bytes().map_err(decode_error)?;
+    if payload.len() > super::MAX_PROTOCOL_STATE_RECORD_BYTES {
+        return Err(CodecError::new("protocol-state record exceeds byte limit"));
+    }
+    reject_trailing(&decoder, bytes, "protocol-state record")?;
+    Ok(ProtocolStateRecord {
+        revision,
+        payload: payload.to_vec().into(),
     })
 }
 
@@ -782,6 +839,100 @@ fn decode_content_artifact_change(
         }),
         _ => Err(CodecError::new(format!(
             "unknown content artifact change tag {tag}"
+        ))),
+    }
+}
+
+fn encode_protocol_state_change(
+    encoder: &mut CborEncoder<'_>,
+    change: &DurableProtocolStateChange,
+) -> Result<(), CodecError> {
+    match change {
+        DurableProtocolStateChange::Put {
+            key,
+            expected_revision,
+            next_revision,
+            payload,
+            turn_sequence,
+        } => {
+            encoder
+                .array(6)
+                .and_then(|encoder| encoder.u8(0))
+                .map_err(encode_error)?;
+            encode_digest(encoder, key.as_bytes())?;
+            match expected_revision {
+                Some(revision) => encoder.u64(*revision).map_err(encode_error)?,
+                None => encoder.null().map_err(encode_error)?,
+            };
+            encoder
+                .u64(*next_revision)
+                .and_then(|encoder| encoder.u64(*turn_sequence))
+                .and_then(|encoder| encoder.bytes(payload))
+                .map_err(encode_error)?;
+        }
+        DurableProtocolStateChange::Delete {
+            key,
+            expected_revision,
+            turn_sequence,
+        } => {
+            encoder
+                .array(4)
+                .and_then(|encoder| encoder.u8(1))
+                .map_err(encode_error)?;
+            encode_digest(encoder, key.as_bytes())?;
+            encoder
+                .u64(*expected_revision)
+                .and_then(|encoder| encoder.u64(*turn_sequence))
+                .map_err(encode_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_protocol_state_change(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+) -> Result<DurableProtocolStateChange, CodecError> {
+    let len = definite_len(
+        decoder.array().map_err(decode_error)?,
+        "protocol-state change",
+    )?;
+    let tag = decoder.u8().map_err(decode_error)?;
+    match (tag, len) {
+        (0, 6) => {
+            let key = ProtocolStateKey(decode_digest(decoder)?);
+            let expected_revision =
+                if decoder.datatype().map_err(decode_error)? == minicbor::data::Type::Null {
+                    decoder.null().map_err(decode_error)?;
+                    None
+                } else {
+                    Some(decoder.u64().map_err(decode_error)?)
+                };
+            let next_revision = decoder.u64().map_err(decode_error)?;
+            let turn_sequence = decoder.u64().map_err(decode_error)?;
+            let payload = decoder.bytes().map_err(decode_error)?;
+            if payload.len() > super::MAX_PROTOCOL_STATE_RECORD_BYTES
+                || payload.len() > limits.max_total_bytes
+            {
+                return Err(CodecError::new(
+                    "protocol-state change payload exceeds byte limit",
+                ));
+            }
+            Ok(DurableProtocolStateChange::Put {
+                key,
+                expected_revision,
+                next_revision,
+                payload: payload.to_vec().into(),
+                turn_sequence,
+            })
+        }
+        (1, 4) => Ok(DurableProtocolStateChange::Delete {
+            key: ProtocolStateKey(decode_digest(decoder)?),
+            expected_revision: decoder.u64().map_err(decode_error)?,
+            turn_sequence: decoder.u64().map_err(decode_error)?,
+        }),
+        _ => Err(CodecError::new(format!(
+            "unknown protocol-state change tag {tag} with {len} fields"
         ))),
     }
 }
@@ -1325,7 +1476,7 @@ fn encode_component_value(
                         digest,
                         length: value.len() as u64,
                         reference_count: 1,
-                        bytes: value.clone(),
+                        bytes: value.to_vec(),
                     });
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
@@ -1458,7 +1609,7 @@ fn decode_component_value(
             if bytes.len() > limits.max_blob_bytes {
                 return Err(CodecError::new("stored byte value exceeds decode limit"));
             }
-            Ok(StoredValue::Bytes(bytes.to_vec()))
+            Ok(StoredValue::Bytes(bytes.to_vec().into()))
         }
         (5, 2) => {
             let count = collection_len(decoder, limits, "stored value list", true)?;
@@ -1497,7 +1648,7 @@ fn decode_component_value(
                 .checked_add(1)
                 .ok_or_else(|| CodecError::new("blob reference count overflow"))?;
             let Some(blobs) = blobs else {
-                return Ok(StoredValue::Bytes(Vec::new()));
+                return Ok(StoredValue::Bytes(Vec::new().into()));
             };
             let record = blobs
                 .get(&digest)
@@ -1507,7 +1658,7 @@ fn decode_component_value(
                     "stored value blob length does not match blob metadata",
                 ));
             }
-            Ok(StoredValue::Bytes(record.bytes.clone()))
+            Ok(StoredValue::Bytes(record.bytes.clone().into()))
         }
         _ => Err(CodecError::new(format!(
             "unknown stored value tag {tag} with array length {len}"
@@ -1643,7 +1794,7 @@ fn decode_value(
             if bytes.len() > limits.max_blob_bytes {
                 return Err(CodecError::new("stored byte value exceeds decode limit"));
             }
-            Ok(StoredValue::Bytes(bytes.to_vec()))
+            Ok(StoredValue::Bytes(bytes.to_vec().into()))
         }
         (5, 2) => {
             let count = collection_len(decoder, limits, "stored value list", true)?;
@@ -1792,7 +1943,7 @@ mod tests {
     fn outbox_item(turn_sequence: u64) -> DurableOutboxItem {
         let effect = EffectId::from_host_operation("Test/send").unwrap();
         DurableOutboxItem::pending(
-            EffectInvocationId::from_semantic_route(effect, "test.send", "store.result").unwrap(),
+            EffectInvocationId::from_result_owner(effect, "store.result").unwrap(),
             effect,
             StoredValue::Text("stable-key".to_owned()),
             number(42),
@@ -1982,6 +2133,7 @@ mod tests {
                 },
             }],
             outbox_changes: vec![DurableOutboxChange::Enqueue { item }],
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: vec![
                 DurableContentArtifactChange::SetReplaceable {
                     owner_id: ContentArtifactOwnerId([0x51; 32]),
@@ -2007,7 +2159,7 @@ mod tests {
     fn large_bytes_externalize_and_blob_records_validate_content() {
         let inline = StoredScalar {
             touched: true,
-            value: StoredValue::Bytes(vec![1; INLINE_BYTES_THRESHOLD]),
+            value: StoredValue::Bytes(vec![1; INLINE_BYTES_THRESHOLD].into()),
         };
         assert!(encode_scalar_component(&inline).unwrap().blobs.is_empty());
 
@@ -2015,8 +2167,14 @@ mod tests {
         let scalar = StoredScalar {
             touched: true,
             value: StoredValue::Record(BTreeMap::from([
-                ("first".to_owned(), StoredValue::Bytes(payload.clone())),
-                ("second".to_owned(), StoredValue::Bytes(payload.clone())),
+                (
+                    "first".to_owned(),
+                    StoredValue::Bytes(payload.clone().into()),
+                ),
+                (
+                    "second".to_owned(),
+                    StoredValue::Bytes(payload.clone().into()),
+                ),
             ])),
         };
         let encoded = encode_scalar_component(&scalar).unwrap();

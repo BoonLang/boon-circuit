@@ -20,19 +20,56 @@ fn distributed_function(args: &[(&str, Type)], result: Type) -> ExternalFunction
 }
 
 #[test]
-fn distributed_external_values_and_calls_have_exact_static_types() {
-    let parsed = boon_parser::parse_source(
-        "distributed-client.bn",
-        "count: Server.store.count\nsession_value: Session.outputs.x\nsum: Server/add(value: 2)\nformatted: Server/Module/format(value: sum)\n",
+fn session_info_intrinsics_enforce_role_visibility_and_closed_types() {
+    let status = boon_parser::parse_source(
+        "session-status.bn",
+        "status: SessionInfo/status()\n",
     )
     .unwrap();
-    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Client);
+    for role in [
+        ProgramRole::Client,
+        ProgramRole::Session,
+        ProgramRole::Server,
+    ] {
+        let report = check_with_external_types(&status, &ExternalTypeEnvironment::empty(role));
+        assert!(!report.has_errors(), "{role:?}: {:#?}", report.diagnostics);
+    }
+
+    let principal = boon_parser::parse_source(
+        "session-principal.bn",
+        "principal: SessionInfo/principal()\n",
+    )
+    .unwrap();
+    let session = check_with_external_types(
+        &principal,
+        &ExternalTypeEnvironment::empty(ProgramRole::Session),
+    );
+    assert!(!session.has_errors(), "{:#?}", session.diagnostics);
+    for role in [ProgramRole::Client] {
+        let report = check_with_external_types(&principal, &ExternalTypeEnvironment::empty(role));
+        assert!(report.has_errors(), "{role:?} unexpectedly accepted principal");
+    }
+    let server = check_with_external_types(
+        &principal,
+        &ExternalTypeEnvironment::empty(ProgramRole::Server),
+    );
+    assert!(!server.has_errors(), "{:#?}", server.diagnostics);
+}
+
+#[test]
+fn distributed_external_values_and_calls_have_exact_static_types() {
+    let parsed = boon_parser::parse_source(
+        "distributed-session.bn",
+        "count: Server/store.count\nclient_value: Client/store.x\nsum: Server/add(value: 2)\nformatted: Server/Module/format(value: sum)\n",
+    )
+    .unwrap();
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Session);
     environment.values.insert(
-        "Server.store.count".to_owned(),
+        "Server/store.count".to_owned(),
         distributed_continuous(Type::Number),
     );
     environment.values.insert(
-        "Session.outputs.x".to_owned(),
+        "Client/store.x".to_owned(),
         distributed_continuous(Type::Text),
     );
     environment.functions.insert(
@@ -74,31 +111,26 @@ fn distributed_external_values_and_calls_have_exact_static_types() {
 fn distributed_role_direction_and_same_role_qualification_fail_closed() {
     for (current_role, producer, source, expected) in [
         (
-            ProgramRole::Session,
             ProgramRole::Client,
-            "value: Client.store.count\n",
-            "Session cannot depend on Client",
+            ProgramRole::Server,
+            "value: Server/store.count\n",
+            "Client cannot depend on Server",
         ),
         (
             ProgramRole::Server,
-            ProgramRole::Session,
-            "value: Session.outputs.count\n",
-            "Server cannot depend on Session",
+            ProgramRole::Client,
+            "value: Client/store.count\n",
+            "Server cannot depend on Client",
         ),
         (
             ProgramRole::Client,
             ProgramRole::Client,
-            "value: Client.store.count\n",
+            "value: Client/store.count\n",
             "same-role qualification",
         ),
     ] {
         let parsed = boon_parser::parse_source("invalid-direction.bn", source).unwrap();
-        let qualified = format!("{}.store.count", role_namespace(producer));
-        let qualified = if producer == ProgramRole::Session {
-            "Session.outputs.count".to_owned()
-        } else {
-            qualified
-        };
+        let qualified = format!("{}/store.count", role_namespace(producer));
         let mut environment = ExternalTypeEnvironment::empty(current_role);
         environment
             .values
@@ -119,7 +151,7 @@ fn distributed_role_direction_and_same_role_qualification_fail_closed() {
         "value: Client/add(value: 1)\n",
     )
     .unwrap();
-    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Session);
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Server);
     environment.functions.insert(
         "Client/add".to_owned(),
         distributed_function(&[("value", Type::Number)], Type::Number),
@@ -128,12 +160,61 @@ fn distributed_role_direction_and_same_role_qualification_fail_closed() {
     assert!(report
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.message.contains("Session cannot depend on Client")));
+        .any(|diagnostic| diagnostic.message.contains("Server cannot depend on Client")));
+}
+
+#[test]
+fn distributed_values_reject_role_outputs_and_non_store_roots() {
+    for source in [
+        "value: Client/outputs.count\n",
+        "value: Client/model.count\n",
+        "value: Client/store\n",
+    ] {
+        let parsed = boon_parser::parse_source("invalid-external-root.bn", source).unwrap();
+        let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Session);
+        let path = source
+            .trim()
+            .strip_prefix("value: ")
+            .expect("fixture value path");
+        environment
+            .values
+            .insert(path.to_owned(), distributed_continuous(Type::Number));
+        let report = check_with_external_types(&parsed, &environment);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("must use `Client/store.<value>`")),
+            "{source}: {:#?}",
+            report.diagnostics
+        );
+    }
+}
+
+#[test]
+fn distributed_adjacent_roles_can_read_in_both_directions() {
+    for (consumer, producer, path) in [
+        (ProgramRole::Client, ProgramRole::Session, "Session/store.value"),
+        (ProgramRole::Session, ProgramRole::Client, "Client/store.value"),
+        (ProgramRole::Session, ProgramRole::Server, "Server/store.value"),
+        (ProgramRole::Server, ProgramRole::Session, "Session/store.value"),
+    ] {
+        let parsed = boon_parser::parse_source(
+            "adjacent-role.bn",
+            &format!("value: {path}\n"),
+        )
+        .unwrap();
+        let mut environment = ExternalTypeEnvironment::empty(consumer);
+        environment
+            .values
+            .insert(path.to_owned(), distributed_continuous(Type::Number));
+        let report = check_with_external_types(&parsed, &environment);
+        assert!(!report.has_errors(), "{consumer:?} <- {producer:?}: {:#?}", report.diagnostics);
+    }
 }
 
 #[test]
 fn distributed_unknown_symbols_and_wrong_arguments_are_errors() {
-    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Client);
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Session);
     environment.functions.insert(
         "Server/add".to_owned(),
         distributed_function(&[("value", Type::Number)], Type::Number),
@@ -141,8 +222,8 @@ fn distributed_unknown_symbols_and_wrong_arguments_are_errors() {
 
     for (source, expected) in [
         (
-            "value: Server.store.missing\n",
-            "unknown qualified external value `Server.store.missing`",
+            "value: Server/store.missing\n",
+            "unknown qualified external value `Server/store.missing`",
         ),
         (
             "value: Server/missing(value: 1)\n",
@@ -183,26 +264,33 @@ fn distributed_unknown_symbols_and_wrong_arguments_are_errors() {
 }
 
 #[test]
-fn distributed_external_interfaces_reject_sources_lists_open_and_unknown_types() {
+fn distributed_external_interfaces_accept_closed_event_and_list_values() {
     let parsed = boon_parser::parse_source("invalid-interface.bn", "value: 1\n").unwrap();
-    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Client);
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Session);
     environment.values.insert(
-        "Server.store.source".to_owned(),
+        "Server/store.source".to_owned(),
         FlowType {
             mode: FlowMode::PresentOrAbsent,
             ty: Type::Number,
         },
     );
     environment.values.insert(
-        "Server.store.list".to_owned(),
+        "Server/store.list".to_owned(),
         distributed_continuous(Type::List(Box::new(Type::Number))),
     );
     environment.values.insert(
-        "Server.store.open".to_owned(),
+        "Server/store.absent".to_owned(),
+        FlowType {
+            mode: FlowMode::Absent,
+            ty: Type::Number,
+        },
+    );
+    environment.values.insert(
+        "Server/store.open".to_owned(),
         distributed_continuous(open_object_type()),
     );
     environment.values.insert(
-        "Server.store.unknown".to_owned(),
+        "Server/store.unknown".to_owned(),
         distributed_continuous(Type::Unknown),
     );
     environment.functions.insert(
@@ -234,13 +322,11 @@ fn distributed_external_interfaces_reject_sources_lists_open_and_unknown_types()
 
     let report = check_with_external_types(&parsed, &environment);
     for expected in [
-        "external value `Server.store.source` must be continuous",
-        "external value `Server.store.list` must have a closed scalar, record, or variant type",
-        "external value `Server.store.open` must have a closed scalar, record, or variant type",
-        "external value `Server.store.unknown` must have a closed scalar, record, or variant type",
+        "external value `Server/store.absent` cannot be always absent",
+        "external value `Server/store.open` must have a closed value type",
+        "external value `Server/store.unknown` must have a closed value type",
         "external function `Server/impure` must be pure",
         "external function `Server/noncontinuous` must have a continuous result",
-        "external function `Server/list_arg` argument `items` must have a closed scalar, record, or variant type",
     ] {
         assert!(
             report
@@ -260,7 +346,7 @@ fn distributed_calls_reject_noncontinuous_source_arguments() {
         "trigger: SOURCE\nvalue: Server/add(value: trigger)\n",
     )
     .unwrap();
-    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Client);
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Session);
     environment.functions.insert(
         "Server/add".to_owned(),
         distributed_function(&[("value", exact_empty_object_type())], Type::Number),

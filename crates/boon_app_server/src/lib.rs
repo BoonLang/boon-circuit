@@ -4,6 +4,10 @@
 //! binding, and wraps the structural HTTP/WebSocket host with generic static,
 //! health, and readiness handling.
 
+mod transient_host;
+
+pub use transient_host::ServerTransientEffectHost;
+
 use async_trait::async_trait;
 use boon_app_package::{
     BundleFileDescriptor, BundleManifest, EnvironmentRedaction, EnvironmentValueKind,
@@ -634,8 +638,67 @@ impl<P: ServerProgram> ServerProgram for ProductionProgram<P> {
         self.delegate.on_websocket(event, cancellation).await
     }
 
+    fn has_distributed_session_transport(&self) -> bool {
+        self.delegate.has_distributed_session_transport()
+    }
+
+    async fn on_distributed_session(
+        &mut self,
+        connection: boon_server_host::DistributedSessionConnectionId,
+        event: boon_server_host::DistributedSessionEvent,
+        cancellation: CallCancellation,
+    ) -> Vec<boon_server_host::DistributedSessionAction> {
+        self.delegate
+            .on_distributed_session(connection, event, cancellation)
+            .await
+    }
+
+    fn distributed_session_next_deadline(&self) -> Option<std::time::Instant> {
+        self.delegate.distributed_session_next_deadline()
+    }
+
+    async fn on_distributed_session_timer(
+        &mut self,
+        now: std::time::Instant,
+        cancellation: CallCancellation,
+    ) -> Vec<boon_server_host::DistributedSessionAction> {
+        self.delegate
+            .on_distributed_session_timer(now, cancellation)
+            .await
+    }
+
+    fn has_pending_internal_work(&self) -> bool {
+        self.delegate.has_pending_internal_work()
+    }
+
+    async fn on_internal_work(&mut self) -> Vec<boon_server_host::DistributedSessionAction> {
+        self.delegate.on_internal_work().await
+    }
+
+    fn on_distributed_session_send_accepted(
+        &mut self,
+        connection: boon_server_host::DistributedSessionConnectionId,
+    ) {
+        self.delegate
+            .on_distributed_session_send_accepted(connection);
+    }
+
+    async fn on_distributed_session_cancelled(
+        &mut self,
+        connection: Option<boon_server_host::DistributedSessionConnectionId>,
+        reason: boon_server_host::CancellationReason,
+    ) {
+        self.delegate
+            .on_distributed_session_cancelled(connection, reason)
+            .await;
+    }
+
     async fn on_http_cancelled(&mut self, reason: boon_server_host::CancellationReason) {
         self.delegate.on_http_cancelled(reason).await;
+    }
+
+    async fn on_websocket_cancelled(&mut self, reason: boon_server_host::CancellationReason) {
+        self.delegate.on_websocket_cancelled(reason).await;
     }
 
     async fn on_shutdown(&mut self) {

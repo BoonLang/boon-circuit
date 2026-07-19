@@ -16,16 +16,70 @@ Implemented generically in the engine and native host:
   `wellen`, requests bounded hierarchy/signal/cursor pages, and exposes the
   resulting format and status through retained NovyWave UI fields;
 - generic parser, typechecker, plan, and executor support for multiline calls
-  in `WHEN` arms, state-triggered effect chains, and tagged structural values.
+  in `WHEN` arms, state-triggered effect chains, and tagged structural values;
+- generic immutable scalar `LIST` values beside keyed list memories, including
+  typed `List/is_not_empty()` effect guards without materializing a collection;
+- typed event-transform arms whose trigger is either a `SOURCE` or a retained
+  effect-result state. Candidate sampled dependencies that have no branch body
+  are excluded instead of deleting valid arms;
+- synchronous effect transactions that settle ordinary held-state updates and
+  current event transforms before staging host-effect sinks, so one invocation
+  cannot combine a new artifact with a previous selected signal or request;
+- one result-owner identity across all possible trigger-specialized host-effect
+  branches, so replacing VCD with FST and then GHW cancels superseded readers
+  instead of accumulating independent calls;
+- host effects may be owned by a live `WHILE` arm inside a triggered `HOLD`.
+  Entering the arm starts the effect, argument replacement replaces the same
+  owner, and leaving the arm emits cancellation without starting a replacement;
+- a generic native `RuntimeView` scenario streams a 327,697-byte package asset
+  with 64 KiB chunks, proves the producer exhausts and respects the four-credit
+  bound before host polling, then proves the exact terminal byte count, zero
+  owned calls, and zero pending content writers;
+- one authoritative writer for materialized list fields: the exact `List/map`
+  materializer owns each projected row field and redundant indexed pure writers
+  are removed before execution;
+- a normal-stack native integration test that rapidly replaces VCD with FST and
+  GHW, proves one active host call, proves the empty-state `WHILE` transition
+  immediately cancels it, then selects all three formats through real row events
+  and observes matching hierarchy, bounded signal pages, cursor values,
+  selected signal identity, and retained document text;
+- the same native integration path selects a real-valued VCD signal through its
+  materialized row source, proves typed `RealValue` transitions and retained
+  analog text, and verifies that zoom/pan replace signal pages while cursor
+  movement replaces only cursor values;
+- bounded signal-page continuation is app-owned: Boon retains the host-provided
+  `next_offset`, emits a new request only while `has_more` is true, and resets
+  the cursor when hierarchy, signal, zoom, or pan ownership changes. A real VCD
+  test proves the second page starts at offset 2 and has a distinct request
+  fingerprint;
+- nested event-match outputs now preserve typed projections of structured
+  effect results. The generic IR/compiler/executor path reads fields such as
+  `result.next_offset` instead of turning dotted paths into text literals;
+- an explicit continuous-pointer to discrete-waveform boundary: visual cursor
+  geometry remains fractional while Wellen requests use a rounded finite tick;
+- removal of decoded bootstrap waveform pages from the active signal-row and
+  trace model. Committed fixture metadata still selects deterministic package
+  assets, while hierarchy, transitions, cursor values, and retained rows come
+  from real Wellen results.
 
 Still required before NovyWave is complete:
 
+- enforce one canonical, non-renamable parameter schema for every function and
+  operator. Standard-library signatures define built-in parameter names;
+  `FUNCTION` declarations define application-function parameter names; every
+  call site must use those exact names. A pipe supplies the first declared
+  receiver parameter; a non-piped call must name that receiver, and ordinary
+  unnamed positional call arguments are compiler errors. Contextual operators
+  are typed compiler primitives rather than ordinary function calls:
+  `List/map` accepts only `List/map(old, new: ...)`, where `old` is the fixed
+  per-row binding and `new` is its result expression. Migrate all examples,
+  fixtures, tests, and documentation atomically, with no alias fallback;
 - app-owned native visual scenarios that prove real VCD, FST, and GHW data in
-  the rendered waveform surface, not only the inspector/status fields;
-- replacement/cancellation and bounded-backpressure scenarios through the
-  complete native application path;
-- removal of the remaining bootstrap waveform-page data after the real page
-  results drive the same signal-row and trace model.
+  the rendered waveform surface and link their proof to the interaction frame;
+- app-owned report integration for the already-tested bounded-backpressure,
+  inactive-branch cancellation, and terminal-resource diagnostics;
+- the remaining navigation, comparison, analog-display, and physical
+  visual acceptance scenarios listed below.
 
 ## Goal
 

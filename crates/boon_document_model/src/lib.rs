@@ -75,6 +75,27 @@ impl ProgramRole {
             Self::Server => "server",
         }
     }
+
+    pub const fn namespace(self) -> &'static str {
+        match self {
+            Self::Client => "Client",
+            Self::Session => "Session",
+            Self::Server => "Server",
+        }
+    }
+
+    /// Distributed application data may cross only one adjacent island edge.
+    /// Same-role references stay unqualified and Client never reaches Server
+    /// directly in either direction.
+    pub const fn can_depend_on(self, producer: Self) -> bool {
+        matches!(
+            (self, producer),
+            (Self::Client, Self::Session)
+                | (Self::Session, Self::Client)
+                | (Self::Session, Self::Server)
+                | (Self::Server, Self::Session)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

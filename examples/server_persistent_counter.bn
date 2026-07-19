@@ -3,9 +3,7 @@ store: [
 
     request_count:
         0 |> HOLD request_count {
-            LATEST {
-                request.method |> THEN { request_count + 1 }
-            }
+            request.method |> THEN { request_count + 1 }
         }
 ]
 

@@ -272,7 +272,6 @@ pub enum DocumentBuiltin {
     DirectoryEntries,
     ErrorNew,
     ErrorText,
-    FileReadBytes,
     FileWriteText,
     LightAmbient,
     LightDirectional,

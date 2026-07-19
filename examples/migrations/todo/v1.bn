@@ -12,9 +12,7 @@ store: [
 
     show_help:
         False |> HOLD show_help {
-            LATEST {
-                sources.help_button.events.press |> THEN { True }
-            }
+            sources.help_button.events.press |> THEN { True }
         }
 
     todos:
@@ -34,18 +32,14 @@ FUNCTION new_todo(todo) {
 
         title:
             todo.title |> HOLD title {
-                LATEST {
-                    sources.rename_button.events.press |> THEN {
-                        TEXT { Plan release (edited) }
-                    }
+                sources.rename_button.events.press |> THEN {
+                    TEXT { Plan release (edited) }
                 }
             }
 
         completed:
             todo.completed |> HOLD completed {
-                LATEST {
-                    sources.toggle_button.events.press |> THEN { completed |> Bool/not() }
-                }
+                sources.toggle_button.events.press |> THEN { completed |> Bool/not() }
             }
     ]
 }

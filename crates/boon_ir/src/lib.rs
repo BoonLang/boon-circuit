@@ -37,6 +37,8 @@ pub struct TypedProgram {
     pub migration_edges: Vec<MigrationEdge>,
     pub output_values: Vec<OutputRootValue>,
     pub derived_values: Vec<DerivedValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub immediate_dependencies: Vec<ImmediateDependency>,
     pub dependencies: Vec<DependencyEdge>,
     pub possible_causes: Vec<PossibleCause>,
     pub update_branches: Vec<UpdateBranch>,
@@ -61,8 +63,15 @@ pub struct DistributedReferences {
 pub struct DistributedValueReference {
     pub expr_id: ExprId,
     pub canonical_path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_alias_paths: Vec<String>,
     pub producer_role: boon_typecheck::ProgramRole,
+    pub flow_mode: boon_typecheck::FlowMode,
     pub value_type: boon_typecheck::Type,
+}
+
+pub fn distributed_event_source_path(canonical_path: &str) -> String {
+    format!("@distributed/{canonical_path}")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -491,6 +500,8 @@ pub struct StateCell {
     pub hold_name: String,
     pub initial_value: InitialValue,
     pub initial_expr_id: Option<ExprId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expression_ids: Vec<ExprId>,
     pub indexed: bool,
     pub source_line: usize,
 }
@@ -706,6 +717,12 @@ pub struct DependencyEdge {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImmediateDependency {
+    pub dependent: String,
+    pub dependency: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PossibleCause {
     pub target: String,
     pub sources: Vec<String>,
@@ -722,13 +739,11 @@ pub struct UpdateBranch {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UpdateGuard {
-    SourcePayloadOneOf {
-        field: SourcePayloadField,
-        values: Vec<String>,
-    },
-    TriggerValueOneOf {
-        values: Vec<String>,
-    },
+    ValueOneOf { input: String, values: Vec<String> },
+    ListIsNotEmpty { input: String, expected: bool },
+    ValuesEqual { left: String, right: String },
+    ValuesNotEqual { left: String, right: String },
+    All { guards: Vec<UpdateGuard> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -770,12 +785,6 @@ pub enum UpdateValueExpression {
         right: String,
         arms: Vec<UpdateValueMatchArm>,
     },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum FileBytesPath {
-    StaticText(String),
-    StatePath(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -899,13 +908,6 @@ pub enum UpdateExpression {
         byte_count: u64,
         endian: String,
         value: i64,
-    },
-    FileReadBytes {
-        path: FileBytesPath,
-    },
-    FileWriteBytes {
-        bytes_path: String,
-        path: FileBytesPath,
     },
     HostEffect {
         operation: String,
@@ -1089,7 +1091,27 @@ fn lower_with_typecheck(
             .diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error)
-            .map(|diagnostic| format!("line {}: {}", diagnostic.line, diagnostic.message))
+            .map(|diagnostic| {
+                let location = program
+                    .files
+                    .iter()
+                    .filter(|file| file.start_line <= diagnostic.line)
+                    .max_by_key(|file| file.start_line)
+                    .map_or_else(
+                        || format!("line {}", diagnostic.line),
+                        |file| {
+                            format!(
+                                "{}:{}",
+                                file.path,
+                                diagnostic
+                                    .line
+                                    .saturating_sub(file.start_line)
+                                    .saturating_add(1)
+                            )
+                        },
+                    );
+                format!("{location}: {}", diagnostic.message)
+            })
             .collect::<Vec<_>>();
         failures.extend(
             typecheck_report
@@ -1116,7 +1138,7 @@ fn lower_with_typecheck(
             failures.len(),
         ));
     }
-    let distributed_references =
+    let mut distributed_references =
         distributed_references(program, external_types, &typecheck_report)?;
     let nodes_started = Instant::now();
     let nodes = source_driven_nodes(program);
@@ -1124,10 +1146,16 @@ fn lower_with_typecheck(
     trace_phase("source_driven_nodes", nodes_ms);
     let fields_started = Instant::now();
     let fields = typed_field_defs(program);
+    bind_distributed_reference_aliases(&fields, &mut distributed_references.value_references);
     let fields_ms = lower_elapsed_ms(fields_started);
     trace_phase("typed_field_defs", fields_ms);
     let direct_sources_started = Instant::now();
-    let direct_sources = direct_source_refs_by_path(&fields, program);
+    let mut direct_sources = direct_source_refs_by_path(&fields, program);
+    add_distributed_event_source_refs(
+        &fields,
+        &distributed_references.value_references,
+        &mut direct_sources,
+    );
     let direct_sources_ms = lower_elapsed_ms(direct_sources_started);
     trace_phase("direct_source_refs", direct_sources_ms);
     let row_scopes_started = Instant::now();
@@ -1135,7 +1163,7 @@ fn lower_with_typecheck(
     let row_scopes_ms = lower_elapsed_ms(row_scopes_started);
     trace_phase("row_scopes", row_scopes_ms);
     let sources_started = Instant::now();
-    let sources = program
+    let mut sources = program
         .source_ports
         .iter()
         .enumerate()
@@ -1154,6 +1182,37 @@ fn lower_with_typecheck(
             path: source.path.clone(),
         })
         .collect::<Vec<_>>();
+    let mut source_paths = sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<BTreeSet<_>>();
+    for reference in distributed_references
+        .value_references
+        .iter()
+        .filter(|reference| {
+            matches!(
+                reference.flow_mode,
+                boon_typecheck::FlowMode::TickPresent | boon_typecheck::FlowMode::PresentOrAbsent
+            )
+        })
+    {
+        let path = distributed_event_source_path(&reference.canonical_path);
+        if !source_paths.insert(path.clone()) {
+            continue;
+        }
+        sources.push(SourcePort {
+            id: SourceId(sources.len()),
+            path,
+            scoped: false,
+            scope_id: None,
+            interval_ms: None,
+            payload_schema: SourcePayloadSchema {
+                fields: Vec::new(),
+                typed_fields: Vec::new(),
+                row_lookup_field: None,
+            },
+        });
+    }
     let sources_ms = lower_elapsed_ms(sources_started);
     trace_phase("sources", sources_ms);
     let state_cells_started = Instant::now();
@@ -1169,13 +1228,18 @@ fn lower_with_typecheck(
                 scope_id: scope_id_for_path(&row_scopes, &cell.path),
                 hold_name: cell.hold_name.clone(),
                 initial_value: field
-                    .map(|field| field_initial_value(field, &row_scopes))
+                    .map(|field| field_initial_value(field, &row_scopes, &fields))
                     .unwrap_or_else(|| InitialValue::Unknown {
                         summary: "missing initial value".to_owned(),
                     }),
                 initial_expr_id: field
                     .and_then(field_initial_expr)
                     .map(|expr| ExprId(expr.id)),
+                expression_ids: field
+                    .into_iter()
+                    .flat_map(|field| field.ast_exprs.iter())
+                    .map(|expr| ExprId(expr.id))
+                    .collect(),
                 indexed: cell.indexed,
                 source_line: cell.line,
             }
@@ -1183,6 +1247,8 @@ fn lower_with_typecheck(
         .collect::<Vec<_>>();
     let state_cells_ms = lower_elapsed_ms(state_cells_started);
     trace_phase("state_cells", state_cells_ms);
+    let immediate_dependencies =
+        immediate_field_dependencies(&fields, &state_cells, &typecheck_report);
     let verify_cycles_started = Instant::now();
     verify_combinational_field_cycles(program, &fields, &state_cells)?;
     let verify_cycles_ms = lower_elapsed_ms(verify_cycles_started);
@@ -1258,6 +1324,7 @@ fn lower_with_typecheck(
         &state_cells,
         &direct_sources,
         &mut candidate_sources,
+        &distributed_references.value_references,
     );
     let derived_values_ms = lower_elapsed_ms(derived_values_started);
     trace_phase("derived_values", derived_values_ms);
@@ -1332,6 +1399,7 @@ fn lower_with_typecheck(
         view_bindings,
         typecheck_report,
         derived_values,
+        immediate_dependencies,
         state_cells,
         lists,
         semantic_memory,
@@ -1362,25 +1430,34 @@ fn distributed_references(
                 let Some(producer_role) = distributed_value_role(parts) else {
                     continue;
                 };
-                let canonical_path = parts.join(".");
+                let canonical_path = distributed_value_path(parts).ok_or_else(|| {
+                    "qualified external value has no path below its role root".to_owned()
+                })?;
                 let declared = external_types.values.get(&canonical_path).ok_or_else(|| {
                     format!(
                         "typecheck accepted qualified external value `{canonical_path}` without an external type"
                     )
                 })?;
                 let actual = distributed_expr_type(typecheck_report, expr.id)?;
-                ensure_distributed_flow_is_closed(
+                ensure_distributed_value_flow_is_closed(
                     actual,
                     &format!("qualified external value `{canonical_path}`"),
                 )?;
-                ensure_distributed_flow_is_closed(
+                ensure_distributed_value_flow_is_closed(
                     declared,
                     &format!("external value declaration `{canonical_path}`"),
                 )?;
+                if actual.mode != declared.mode {
+                    return Err(format!(
+                        "qualified external value `{canonical_path}` flow does not match its declaration"
+                    ));
+                }
                 references.value_references.push(DistributedValueReference {
                     expr_id: ExprId(expr.id),
                     canonical_path,
+                    local_alias_paths: Vec::new(),
                     producer_role,
+                    flow_mode: declared.mode,
                     value_type: declared.ty.clone(),
                 });
             }
@@ -1472,6 +1549,12 @@ fn distributed_value_role(parts: &[String]) -> Option<boon_typecheck::ProgramRol
         .and_then(|namespace| distributed_role(namespace))
 }
 
+fn distributed_value_path(parts: &[String]) -> Option<String> {
+    distributed_value_role(parts)?;
+    let (namespace, suffix) = parts.split_first()?;
+    (!suffix.is_empty()).then(|| format!("{namespace}/{}", suffix.join(".")))
+}
+
 fn distributed_function_role(function: &str) -> Option<boon_typecheck::ProgramRole> {
     function
         .split_once('/')
@@ -1497,6 +1580,16 @@ fn ensure_distributed_flow_is_closed(
     ensure_distributed_type_is_closed(&flow_type.ty, context)
 }
 
+fn ensure_distributed_value_flow_is_closed(
+    flow_type: &boon_typecheck::FlowType,
+    context: &str,
+) -> Result<(), String> {
+    if flow_type.mode == boon_typecheck::FlowMode::Absent {
+        return Err(format!("{context} is always absent"));
+    }
+    ensure_distributed_type_is_closed(&flow_type.ty, context)
+}
+
 fn ensure_distributed_type_is_closed(
     data_type: &boon_typecheck::Type,
     context: &str,
@@ -1516,6 +1609,7 @@ fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
         boon_typecheck::Type::Object(shape) => {
             !shape.open && shape.fields.values().all(distributed_type_is_closed)
         }
+        boon_typecheck::Type::List(item) => distributed_type_is_closed(item),
         boon_typecheck::Type::VariantSet(variants) => {
             variants.iter().all(|variant| match variant {
                 boon_typecheck::Variant::Tag(_) => true,
@@ -1526,7 +1620,6 @@ fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
         }
         boon_typecheck::Type::Skip
         | boon_typecheck::Type::RenderContract
-        | boon_typecheck::Type::List(_)
         | boon_typecheck::Type::Function { .. }
         | boon_typecheck::Type::UnresolvedShape { .. }
         | boon_typecheck::Type::Var(_)
@@ -2536,6 +2629,18 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         require_known_symbol("dependency source", &edge.from, &known_symbols)?;
         require_known_symbol("dependency target", &edge.to, &known_symbols)?;
     }
+    for edge in &program.immediate_dependencies {
+        require_known_symbol(
+            "immediate dependency dependent",
+            &edge.dependent,
+            &known_symbols,
+        )?;
+        require_known_symbol(
+            "immediate dependency dependency",
+            &edge.dependency,
+            &known_symbols,
+        )?;
+    }
     for cause in &program.possible_causes {
         require_known_symbol("cause target", &cause.target, &known_symbols)?;
         for source in &cause.sources {
@@ -2636,7 +2741,7 @@ fn verify_distributed_reference_schedule(program: &TypedProgram) -> Result<(), S
                 reference.expr_id
             ));
         };
-        if parts.join(".") != reference.canonical_path {
+        if distributed_value_path(parts).as_deref() != Some(&reference.canonical_path) {
             return Err(format!(
                 "distributed value expression {} does not match canonical path `{}`",
                 reference.expr_id, reference.canonical_path
@@ -2651,6 +2756,7 @@ fn verify_distributed_reference_schedule(program: &TypedProgram) -> Result<(), S
         verify_distributed_metadata_type(
             program,
             reference.expr_id,
+            reference.flow_mode,
             &reference.value_type,
             &format!("distributed value `{}`", reference.canonical_path),
         )?;
@@ -2686,6 +2792,7 @@ fn verify_distributed_reference_schedule(program: &TypedProgram) -> Result<(), S
         verify_distributed_metadata_type(
             program,
             call.expr_id,
+            boon_typecheck::FlowMode::Continuous,
             &call.result_type,
             &format!("distributed call `{}` result", call.canonical_function),
         )?;
@@ -2751,13 +2858,14 @@ fn distributed_ast_expr(program: &TypedProgram, expr_id: ExprId) -> Result<&AstE
 fn verify_distributed_metadata_type(
     program: &TypedProgram,
     expr_id: ExprId,
+    flow_mode: boon_typecheck::FlowMode,
     metadata_type: &boon_typecheck::Type,
     context: &str,
 ) -> Result<(), String> {
     ensure_distributed_type_is_closed(metadata_type, context)?;
     let checked = distributed_expr_type(&program.typecheck_report, expr_id.as_usize())?;
-    if checked.mode != boon_typecheck::FlowMode::Continuous {
-        return Err(format!("{context} is not continuous"));
+    if checked.mode != flow_mode {
+        return Err(format!("{context} flow mode does not match its metadata"));
     }
     if &checked.ty != metadata_type {
         return Err(format!(
@@ -5569,7 +5677,7 @@ fn document_path_value(
         value.push_str(&parts[1..].join("."));
         return Some(context.canonicalize_row_path(&value));
     }
-    Some(context.canonicalize_row_path(&parts.join(".")))
+    Some(context.canonicalize_row_path(&boon_parser::canonical_value_path(parts)))
 }
 
 fn expr_is_same_identifier_path(expr: &AstExpr, name: &str) -> bool {
@@ -5810,43 +5918,6 @@ fn verify_scheduled_update_expression(
             require_known_bytes_scalar_arg("bytes count", byte_count, known_symbols)
         }
         UpdateExpression::BytesZeros { .. } => Ok(()),
-        UpdateExpression::FileReadBytes { path } => match path {
-            FileBytesPath::StaticText(path) => {
-                if path.is_empty()
-                    || path.starts_with('/')
-                    || path.split('/').any(|part| part == "..")
-                {
-                    Err(format!(
-                        "File/read_bytes path for `{target}` from `{source}` must be a non-empty relative path without parent-directory segments"
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-            FileBytesPath::StatePath(path) => {
-                require_known_symbol("file read bytes path state", path, known_symbols)
-            }
-        },
-        UpdateExpression::FileWriteBytes { bytes_path, path } => {
-            require_known_symbol("bytes update path", bytes_path, known_symbols)?;
-            match path {
-                FileBytesPath::StaticText(path) => {
-                    if path.is_empty()
-                        || path.starts_with('/')
-                        || path.split('/').any(|part| part == "..")
-                    {
-                        Err(format!(
-                            "File/write_bytes path for `{target}` from `{source}` must be a non-empty relative path without parent-directory segments"
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                }
-                FileBytesPath::StatePath(path) => {
-                    require_known_symbol("file write bytes path state", path, known_symbols)
-                }
-            }
-        }
         UpdateExpression::BytesConcat { left, right } => {
             require_known_symbol("bytes concat left path", left, known_symbols)?;
             require_known_symbol("bytes concat right path", right, known_symbols)
@@ -6182,6 +6253,42 @@ fn field_symbol_dependency_graph(
     (excluded_field, dependency_edges)
 }
 
+fn immediate_field_dependencies(
+    fields: &[FieldDef],
+    state_cells: &[StateCell],
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> Vec<ImmediateDependency> {
+    let state_paths = state_cells
+        .iter()
+        .map(|state| state.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let flow_modes = typecheck_report
+        .named_value_type_table
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.flow_type.mode))
+        .collect::<BTreeMap<_, _>>();
+    let (_, dependencies) = field_symbol_dependency_graph(fields, &BTreeSet::new());
+    let mut result = Vec::new();
+    for (field_index, dependency_indexes) in dependencies.into_iter().enumerate() {
+        let field = &fields[field_index];
+        if state_paths.contains(field.path.as_str())
+            || flow_modes.get(field.path.as_str()) != Some(&boon_typecheck::FlowMode::Continuous)
+        {
+            continue;
+        }
+        result.extend(
+            dependency_indexes
+                .into_iter()
+                .map(|dependency| ImmediateDependency {
+                    dependent: field.path.clone(),
+                    dependency: fields[dependency].path.clone(),
+                }),
+        );
+    }
+    result
+}
+
 fn scoped_field_reference_candidates(parent_path: &str, path: &str) -> Vec<String> {
     let mut candidates = vec![path.to_owned()];
     let mut scope = Some(parent_path);
@@ -6496,25 +6603,6 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
             reject_bytes_scalar_arg_identity("bytes count", byte_count)
         }
         UpdateExpression::BytesZeros { .. } => Ok(()),
-        UpdateExpression::FileReadBytes { path } => match path {
-            FileBytesPath::StaticText(path) => {
-                reject_hidden_identity_identifier("file read bytes path", path)
-            }
-            FileBytesPath::StatePath(path) => {
-                reject_hidden_identity_identifier("file read bytes path state", path)
-            }
-        },
-        UpdateExpression::FileWriteBytes { bytes_path, path } => {
-            reject_hidden_identity_identifier("file write bytes input path", bytes_path)?;
-            match path {
-                FileBytesPath::StaticText(path) => {
-                    reject_hidden_identity_identifier("file write bytes path", path)
-                }
-                FileBytesPath::StatePath(path) => {
-                    reject_hidden_identity_identifier("file write bytes path state", path)
-                }
-            }
-        }
         UpdateExpression::BytesConcat { left, right } => {
             reject_hidden_identity_identifier("bytes concat left path", left)?;
             reject_hidden_identity_identifier("bytes concat right path", right)
@@ -7022,7 +7110,7 @@ fn ast_expr_label(expr: &AstExpr) -> String {
         | AstExprKind::Tag(name) => format!("{:?}", name),
         AstExprKind::Unknown(tokens) => tokens.join("_"),
         AstExprKind::Delimiter => "delimiter".to_owned(),
-        AstExprKind::Path(parts) => parts.join("."),
+        AstExprKind::Path(parts) => boon_parser::canonical_value_path(parts),
         AstExprKind::Drain { .. } => "drain".to_owned(),
         AstExprKind::Draining { .. } => "draining".to_owned(),
         AstExprKind::StringLiteral(_) => "string_literal".to_owned(),
@@ -7199,6 +7287,9 @@ fn derived_dependency_update_branches(
             continue;
         }
         for source in candidate_sources.event_sources_for_dependency(&dependency.path) {
+            if cell.indexed && candidate_sources.is_effect_result_state(&source) {
+                continue;
+            }
             if existing_branches
                 .iter()
                 .chain(branches.iter())
@@ -7965,6 +8056,7 @@ fn derived_values(
     state_cells: &[StateCell],
     direct_sources: &BTreeMap<String, Vec<String>>,
     candidate_sources: &mut CandidateSourceIndex<'_>,
+    distributed_value_references: &[DistributedValueReference],
 ) -> Vec<DerivedValue> {
     fields
         .iter()
@@ -7977,6 +8069,13 @@ fn derived_values(
                     .source_ports
                     .iter()
                     .any(|source| source.path == field.path)
+                && !distributed_value_references.iter().any(|reference| {
+                    matches!(
+                        reference.flow_mode,
+                        boon_typecheck::FlowMode::TickPresent
+                            | boon_typecheck::FlowMode::PresentOrAbsent
+                    ) && reference.local_alias_paths.contains(&field.path)
+                })
                 && (indexed_field
                     || !list_memory_path
                     || field_is_derived_list_memory_view(field, program))
@@ -8232,7 +8331,11 @@ fn list_scalar_reducer_operator(operator: &str) -> bool {
     matches!(operator, "List/join_field" | "List/count" | "List/sum")
 }
 
-fn field_initial_value(field: &FieldDef, row_scopes: &[RowScope]) -> InitialValue {
+fn field_initial_value(
+    field: &FieldDef,
+    row_scopes: &[RowScope],
+    fields: &[FieldDef],
+) -> InitialValue {
     let initial_expr = field_initial_expr(field);
     let Some(expr) = initial_expr else {
         return InitialValue::Unknown {
@@ -8243,7 +8346,21 @@ fn field_initial_value(field: &FieldDef, row_scopes: &[RowScope]) -> InitialValu
         .iter()
         .find(|scope| field.path.starts_with(&format!("{}.", scope.row_scope)))
         .map(|scope| scope.row_scope.as_str());
-    ast_initial_value(expr, &field.ast_exprs, row_scopes, current_row_scope)
+    let value = ast_initial_value(expr, &field.ast_exprs, row_scopes, current_row_scope);
+    let InitialValue::RootInitialField { path } = value else {
+        return value;
+    };
+    let Some(current_row_scope) = current_row_scope else {
+        return InitialValue::RootInitialField { path };
+    };
+    let Some(canonical) = canonical_current_row_member_path(field, &path, fields) else {
+        return InitialValue::RootInitialField { path };
+    };
+    if canonical.starts_with(&format!("{current_row_scope}.")) {
+        InitialValue::RowInitialField { path: canonical }
+    } else {
+        InitialValue::RootInitialField { path }
+    }
 }
 
 fn field_initial_expr(field: &FieldDef) -> Option<&AstExpr> {
@@ -8491,7 +8608,7 @@ fn initial_value_from_data(value: boon_data::Value) -> InitialValue {
         boon_data::Value::Text(value) => InitialValue::Text { value },
         boon_data::Value::Bytes(bytes) => InitialValue::Bytes {
             fixed_len: Some(bytes.len()),
-            bytes,
+            bytes: bytes.to_vec(),
         },
         boon_data::Value::Variant { tag, fields } if fields.is_empty() => {
             InitialValue::Enum { value: tag }
@@ -8522,7 +8639,7 @@ fn static_initial_data_expr(
             else {
                 return None;
             };
-            Some(boon_data::Value::Bytes(bytes))
+            Some(boon_data::Value::Bytes(bytes.into()))
         }
         AstExprKind::Bool(value) => Some(boon_data::Value::Bool(*value)),
         AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => Some(boon_data::Value::Variant {
@@ -9164,7 +9281,7 @@ fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<Stri
         | AstExprKind::Tag(value)
         | AstExprKind::Number(value) => value.clone(),
         AstExprKind::ByteLiteral { value, .. } => value.to_string(),
-        AstExprKind::Path(parts) => parts.join("."),
+        AstExprKind::Path(parts) => boon_parser::canonical_value_path(parts),
         AstExprKind::Bool(true) => "True".to_owned(),
         AstExprKind::Bool(false) => "False".to_owned(),
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => value.clone(),
@@ -9187,14 +9304,6 @@ fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<Stri
         | AstExprKind::BytesLiteral { .. }
         | AstExprKind::ListLiteral { .. } => ast_expr_label(expr),
     })
-}
-
-fn ast_static_text_literal_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
-    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => Some(value.clone()),
-        _ => None,
-    }
 }
 
 struct ResolvedConstantLookup<'a> {
@@ -9254,32 +9363,6 @@ fn bytes_arg_expr_id<'a>(
                 .filter(|arg| arg.name.is_none())
                 .nth(positional_index)
         })
-}
-
-fn file_bytes_path_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<FileBytesPath> {
-    let arg = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some("path"))
-        .or_else(|| args.iter().find(|arg| arg.name.as_deref() == Some("input")))
-        .or_else(|| args.iter().find(|arg| arg.name.is_none()))?;
-    if let Some(path) = ast_static_text_literal_in_exprs(exprs, arg.value) {
-        return Some(FileBytesPath::StaticText(path));
-    }
-    ast_argument_value_in_exprs(exprs, arg.value).map(FileBytesPath::StatePath)
-}
-
-fn file_write_bytes_path_arg_in_exprs(
-    exprs: &[AstExpr],
-    args: &[AstCallArg],
-) -> Option<FileBytesPath> {
-    let arg = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some("path"))
-        .or_else(|| args.iter().find(|arg| arg.name.is_none()))?;
-    if let Some(path) = ast_static_text_literal_in_exprs(exprs, arg.value) {
-        return Some(FileBytesPath::StaticText(path));
-    }
-    ast_argument_value_in_exprs(exprs, arg.value).map(FileBytesPath::StatePath)
 }
 
 fn bytes_get_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
@@ -9838,7 +9921,7 @@ fn list_append_function_constructor_fields(
         .filter(|candidate| candidate.path.starts_with(&prefix))
         .filter_map(|candidate| {
             let InitialValue::RowInitialField { path } =
-                field_initial_value(candidate, &row_scopes)
+                field_initial_value(candidate, &row_scopes, fields)
             else {
                 return None;
             };
@@ -10722,7 +10805,7 @@ fn symbol_is_list_operator(symbol: &str) -> bool {
 }
 
 fn canonical_local_path(path: &str, parent_path: &str) -> String {
-    if path.contains('.') || parent_path.is_empty() {
+    if path.contains('.') || path.contains('/') || parent_path.is_empty() {
         path.to_owned()
     } else {
         format!("{parent_path}.{path}")
@@ -10803,6 +10886,24 @@ fn update_guard_for_routed_branch(
     source: &str,
     branch: &RoutedBranch,
 ) -> Option<UpdateGuard> {
+    let effect_calls = branch
+        .ast_exprs
+        .iter()
+        .filter_map(|expr| match &expr.kind {
+            AstExprKind::Call { function, .. }
+                if boon_typecheck::is_typed_host_effect(function) =>
+            {
+                Some(expr.id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let [effect_call] = effect_calls.as_slice()
+        && let Some(guard) = update_guard_for_effect_call(field, source, *effect_call)
+    {
+        return Some(guard);
+    }
+
     let variants = source_ref_variants(source);
     for expr in &branch.ast_exprs {
         let AstExprKind::When { input } = expr.kind else {
@@ -10813,74 +10914,180 @@ fn update_guard_for_routed_branch(
         if values.is_empty() {
             continue;
         }
-        if input_path
-            .as_deref()
-            .is_some_and(|input| variants.iter().any(|variant| variant == input))
-        {
-            return Some(UpdateGuard::TriggerValueOneOf { values });
-        }
-        let Some(payload_field) = input_path
-            .and_then(|input| source_payload_guard_field_from_path(&input, &variants))
-            .or_else(|| source_payload_field_near_when(branch, expr.line, &variants))
-        else {
+        let Some(input) = input_path else {
             continue;
         };
-        return Some(UpdateGuard::SourcePayloadOneOf {
-            field: SourcePayloadField::from_name(&payload_field),
-            values,
-        });
+        let source_related = variants.iter().any(|variant| {
+            input == *variant
+                || input
+                    .strip_prefix(variant)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        }) || source_payload_field_from_path(&input, &variants).is_some();
+        if !source_related {
+            continue;
+        }
+        let input = canonical_update_guard_input(field, source, &input, &variants);
+        return Some(UpdateGuard::ValueOneOf { input, values });
     }
     None
 }
 
-fn source_payload_field_near_when(
-    branch: &RoutedBranch,
-    when_line: usize,
-    variants: &[String],
-) -> Option<String> {
-    source_payload_field_in_exprs_on_lines(
-        branch
-            .ast_exprs
-            .iter()
-            .filter(|expr| expr.line == when_line),
-        variants,
-    )
-    .or_else(|| {
-        let lower_bound = branch
-            .ast_exprs
-            .iter()
-            .filter(|expr| {
-                expr.line < when_line
-                    && matches!(
-                        expr.kind,
-                        AstExprKind::When { .. } | AstExprKind::Then { .. }
-                    )
-            })
-            .map(|expr| expr.line)
-            .max()
-            .unwrap_or(0);
-        source_payload_field_in_exprs_on_lines(
-            branch
-                .ast_exprs
-                .iter()
-                .filter(|expr| expr.line > lower_bound && expr.line < when_line)
-                .rev(),
-            variants,
-        )
+fn update_guard_for_effect_call(
+    field: &FieldDef,
+    source: &str,
+    effect_call_expr_id: usize,
+) -> Option<UpdateGuard> {
+    let mut guards = Vec::new();
+    collect_effect_call_guard_path(
+        field,
+        source,
+        &field.statement,
+        effect_call_expr_id,
+        &mut guards,
+    );
+    match guards.len() {
+        0 => None,
+        1 => guards.pop(),
+        _ => Some(UpdateGuard::All { guards }),
+    }
+}
+
+fn collect_effect_call_guard_path(
+    field: &FieldDef,
+    source: &str,
+    statement: &AstStatement,
+    effect_call_expr_id: usize,
+    guards: &mut Vec<UpdateGuard>,
+) -> bool {
+    if !statement_subtree_contains_expr(statement, effect_call_expr_id, &field.ast_exprs) {
+        return false;
+    }
+
+    if let Some(when_expr) = statement
+        .expr
+        .and_then(|root| first_when_expr_in_graph(field, root))
+    {
+        let matching_arm = statement.children.iter().find(|child| {
+            child
+                .expr
+                .and_then(|expr_id| field_expr(field, expr_id))
+                .is_some_and(|expr| matches!(expr.kind, AstExprKind::MatchArm { .. }))
+                && statement_subtree_contains_expr(child, effect_call_expr_id, &field.ast_exprs)
+        });
+        if let Some(arm) = matching_arm {
+            if let Some(guard) = update_guard_for_when_arm(field, source, when_expr, arm) {
+                guards.push(guard);
+            }
+            collect_effect_call_guard_path(field, source, arm, effect_call_expr_id, guards);
+            return true;
+        }
+    }
+
+    if let Some(child) = statement
+        .children
+        .iter()
+        .find(|child| statement_subtree_contains_expr(child, effect_call_expr_id, &field.ast_exprs))
+    {
+        collect_effect_call_guard_path(field, source, child, effect_call_expr_id, guards);
+    }
+    true
+}
+
+fn first_when_expr_in_graph(field: &FieldDef, root: usize) -> Option<usize> {
+    let mut expr_ids = vec![root];
+    collect_expr_ids_recursive(root, &field.ast_exprs, &mut expr_ids);
+    expr_ids.into_iter().find(|expr_id| {
+        field_expr(field, *expr_id).is_some_and(|expr| when_input_expr_id(expr).is_some())
     })
 }
 
-fn source_payload_field_in_exprs_on_lines<'a>(
-    mut exprs: impl Iterator<Item = &'a AstExpr>,
-    variants: &[String],
-) -> Option<String> {
-    exprs.find_map(|expr| match &expr.kind {
-        AstExprKind::Path(parts) => {
-            source_payload_guard_field_from_path(&parts.join("."), variants)
+fn when_input_expr_id(expr: &AstExpr) -> Option<usize> {
+    match &expr.kind {
+        AstExprKind::When { input } => Some(*input),
+        AstExprKind::Pipe { input, op, .. } if matches!(op.as_str(), "WHEN" | "WHILE") => {
+            Some(*input)
         }
-        AstExprKind::Identifier(value) => source_payload_guard_field_from_path(value, variants),
         _ => None,
+    }
+}
+
+fn update_guard_for_when_arm(
+    field: &FieldDef,
+    source: &str,
+    when_expr_id: usize,
+    arm: &AstStatement,
+) -> Option<UpdateGuard> {
+    let input = when_input_expr_id(field_expr(field, when_expr_id)?)?;
+    let AstExprKind::MatchArm { pattern, .. } = &field_expr(field, arm.expr?)?.kind else {
+        return None;
+    };
+    let value = match_const_pattern_label(pattern)?;
+    if value == "__" || value_starts_lowercase_identifier(&value) {
+        return None;
+    }
+    let variants = source_ref_variants(source);
+    if let AstExprKind::Pipe {
+        input: list_input,
+        op,
+        ..
+    } = &field_expr(field, input)?.kind
+        && op == "List/is_not_empty"
+        && matches!(value.as_str(), "True" | "False")
+    {
+        let raw_input = ast_argument_value(field, *list_input)?;
+        return Some(UpdateGuard::ListIsNotEmpty {
+            input: canonical_update_guard_input(field, source, &raw_input, &variants),
+            expected: value == "True",
+        });
+    }
+    if let AstExprKind::Infix { left, op, right } = &field_expr(field, input)?.kind {
+        let equality_required = match (op.as_str(), value.as_str()) {
+            ("==", "True") | ("!=", "False") => true,
+            ("!=", "True") | ("==", "False") => false,
+            _ => return None,
+        };
+        let left = canonical_update_guard_input(
+            field,
+            source,
+            &ast_argument_value(field, *left)?,
+            &variants,
+        );
+        let right = canonical_update_guard_input(
+            field,
+            source,
+            &ast_argument_value(field, *right)?,
+            &variants,
+        );
+        return Some(if equality_required {
+            UpdateGuard::ValuesEqual { left, right }
+        } else {
+            UpdateGuard::ValuesNotEqual { left, right }
+        });
+    }
+    let raw_input = ast_argument_value(field, input)?;
+    Some(UpdateGuard::ValueOneOf {
+        input: canonical_update_guard_input(field, source, &raw_input, &variants),
+        values: vec![value],
     })
+}
+
+fn canonical_update_guard_input(
+    field: &FieldDef,
+    source: &str,
+    input: &str,
+    source_variants: &[String],
+) -> String {
+    for variant in source_variants {
+        if input == variant {
+            return source.to_owned();
+        }
+        if let Some(suffix) = input.strip_prefix(variant)
+            && suffix.starts_with('.')
+        {
+            return format!("{source}{suffix}");
+        }
+    }
+    canonical_local_path(input, &field.parent_path)
 }
 
 fn update_guard_for_field_source(field: &FieldDef, source: &str) -> Option<UpdateGuard> {
@@ -11149,12 +11356,6 @@ fn update_expression_for_routed_branch(
         return expression;
     }
     if let Some(expression) = branch.host_effect_expression(field) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_file_read_bytes_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_file_write_bytes_expression(field, target, fields) {
         return expression;
     }
     if let Some(expression) = branch.then_text_to_number_expression(field, target, fields) {
@@ -12553,7 +12754,9 @@ fn update_value_expression_from_expr(
             |source| canonical_scalar_update_path_for_source(field, target, &raw, fields, source),
         );
         if path == target
-            || fields.iter().any(|candidate| candidate.path == path)
+            || fields
+                .iter()
+                .any(|candidate| symbol_is_rooted_in(&path, &candidate.path))
             || source.is_some_and(|source| source_payload_input_matches(&path, source))
         {
             return Some(UpdateValueExpression::ReadPath { path });
@@ -12829,6 +13032,8 @@ fn canonical_scalar_update_path_with_fields(
         || field_hold_name(field).as_deref() == Some(value)
     {
         target.to_owned()
+    } else if let Some(path) = canonical_current_row_member_path(field, value, fields) {
+        path
     } else if !value.contains('.') {
         let child_path = format!("{}.{}", field.path, value);
         if fields.iter().any(|candidate| candidate.path == child_path) {
@@ -12852,6 +13057,28 @@ fn canonical_scalar_update_path_with_fields(
         }
     } else {
         canonical_local_path(value, &field.parent_path)
+    }
+}
+
+fn canonical_current_row_member_path(
+    field: &FieldDef,
+    value: &str,
+    fields: &[FieldDef],
+) -> Option<String> {
+    if fields.iter().any(|candidate| candidate.path == value) {
+        return Some(value.to_owned());
+    }
+    let (_, tail) = value.split_once('.')?;
+    let mut parent = field.parent_path.as_str();
+    loop {
+        let candidate = format!("{parent}.{tail}");
+        if fields.iter().any(|field| field.path == candidate) {
+            return Some(candidate);
+        }
+        let Some((ancestor, _)) = parent.rsplit_once('.') else {
+            return None;
+        };
+        parent = ancestor;
     }
 }
 
@@ -13098,6 +13325,10 @@ impl<'a> CandidateSourceIndex<'a> {
         self.candidate_sources(dependency)
     }
 
+    fn is_effect_result_state(&self, path: &str) -> bool {
+        self.effect_result_states.contains(path)
+    }
+
     fn candidate_sources_for_index(
         &mut self,
         field_index: usize,
@@ -13140,6 +13371,7 @@ fn field_dependency_is_event_cause(field: &FieldDef, dependency: &FieldDef) -> b
         .iter()
         .filter(|expr| expression_references_field(field, expr, dependency))
         .map(|expr| expr.id)
+        .filter(|reference| !reference_is_list_map_collection(field, *reference))
         .collect::<Vec<_>>();
     if references.is_empty() {
         return false;
@@ -13169,25 +13401,153 @@ fn field_dependency_is_event_cause(field: &FieldDef, dependency: &FieldDef) -> b
             AstExprKind::Then {
                 output: Some(output),
                 ..
+            }
+            | AstExprKind::MatchArm {
+                output: Some(output),
+                ..
             } => Some(output),
             _ => None,
         })
         .collect::<Vec<_>>();
-    let dependency_is_event_stream = !dependency
-        .ast_exprs
+    references.into_iter().any(|reference| {
+        !sampled_outputs
+            .iter()
+            .any(|output| expr_contains_expr_id_in_exprs(&field.ast_exprs, *output, reference))
+    })
+}
+
+fn reference_is_list_map_collection(field: &FieldDef, reference: usize) -> bool {
+    field.ast_exprs.iter().any(|expr| match &expr.kind {
+        AstExprKind::Pipe { input, op, .. } if op == "List/map" => {
+            expr_contains_expr_id_in_exprs(&field.ast_exprs, *input, reference)
+                || list_map_pipeline_prefix_contains_reference(field, expr.id, reference)
+        }
+        AstExprKind::Call { function, args } if function == "List/map" => {
+            args.first().is_some_and(|input| {
+                expr_contains_expr_id_in_exprs(&field.ast_exprs, input.value, reference)
+            })
+        }
+        _ => false,
+    })
+}
+
+fn list_map_pipeline_prefix_contains_reference(
+    field: &FieldDef,
+    map_expr_id: usize,
+    reference: usize,
+) -> bool {
+    let statements = std::slice::from_ref(&field.statement);
+    let mut cursor = map_expr_id;
+    let mut visited = BTreeSet::new();
+    while visited.insert(cursor) {
+        let Some(previous) = previous_pipeline_expression_id(statements, cursor, &field.ast_exprs)
+        else {
+            return false;
+        };
+        if expr_contains_expr_id_in_exprs(&field.ast_exprs, previous, reference) {
+            return true;
+        }
+        cursor = previous;
+    }
+    false
+}
+
+fn previous_pipeline_expression_id(
+    statements: &[AstStatement],
+    marker_expr_id: usize,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    for statement in statements {
+        if let Some(expr_ids) = statement_pipeline_expression_ids(statement, expressions)
+            && let Some(position) = expr_ids
+                .iter()
+                .position(|expr_id| *expr_id == marker_expr_id)
+            && position > 0
+        {
+            return expr_ids.get(position - 1).copied();
+        }
+        if statement.expr == Some(marker_expr_id) {
+            return None;
+        }
+        if let Some(found) =
+            previous_pipeline_expression_id(&statement.children, marker_expr_id, expressions)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn statement_pipeline_expression_ids(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<Vec<usize>> {
+    let mut expr_ids = statement.expr.into_iter().collect::<Vec<_>>();
+    collect_pipeline_continuation_expr_ids(statement, expressions, &mut expr_ids);
+    (expr_ids.len() > 1
+        && !expression_is_pipeline_continuation(expr_ids[0], expressions)
+        && expr_ids
+            .iter()
+            .skip(1)
+            .all(|expr_id| expression_is_pipeline_continuation(*expr_id, expressions)))
+    .then_some(expr_ids)
+}
+
+fn collect_pipeline_continuation_expr_ids(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    expr_ids: &mut Vec<usize>,
+) {
+    for child in statement.children.iter().filter(|child| {
+        matches!(child.kind, AstStatementKind::Expression)
+            && child
+                .expr
+                .is_some_and(|expr_id| expression_is_pipeline_continuation(expr_id, expressions))
+    }) {
+        if let Some(expr_id) = child.expr {
+            expr_ids.push(expr_id);
+        }
+        collect_pipeline_continuation_expr_ids(child, expressions, expr_ids);
+    }
+}
+
+fn expression_is_pipeline_continuation(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    let input = match expressions
         .iter()
-        .any(|expr| matches!(expr.kind, AstExprKind::Hold { .. }))
-        && (dependency.has_then_expr()
-            || dependency
-                .ast_exprs
-                .iter()
-                .any(|expr| matches!(expr.kind, AstExprKind::Latest)));
-    dependency_is_event_stream
-        && references.into_iter().any(|reference| {
-            !sampled_outputs
-                .iter()
-                .any(|output| expr_contains_expr_id_in_exprs(&field.ast_exprs, *output, reference))
-        })
+        .find(|expr| expr.id == expr_id)
+        .map(|expr| &expr.kind)
+    {
+        Some(AstExprKind::Pipe { input, .. })
+        | Some(AstExprKind::Then { input, .. })
+        | Some(AstExprKind::When { input })
+        | Some(AstExprKind::Draining { input })
+        | Some(AstExprKind::Hold { initial: input, .. }) => *input,
+        _ => return false,
+    };
+    expression_chain_starts_with_pipeline_placeholder(input, expressions)
+}
+
+fn expression_chain_starts_with_pipeline_placeholder(
+    expr_id: usize,
+    expressions: &[AstExpr],
+) -> bool {
+    let Some(expr) = expressions.iter().find(|expr| expr.id == expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Delimiter => true,
+        AstExprKind::Unknown(tokens) => !tokens
+            .iter()
+            .any(|token| token.trim_start().starts_with('"')),
+        AstExprKind::Pipe { input, .. }
+        | AstExprKind::Then { input, .. }
+        | AstExprKind::When { input }
+        | AstExprKind::Draining { input }
+        | AstExprKind::Hold { initial: input, .. } => {
+            expression_chain_starts_with_pipeline_placeholder(*input, expressions)
+        }
+        _ => false,
+    }
 }
 
 fn expression_references_field(field: &FieldDef, expr: &AstExpr, dependency: &FieldDef) -> bool {
@@ -14087,97 +14447,6 @@ impl RoutedBranch {
         })
     }
 
-    fn then_file_read_bytes_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let path = match &output.kind {
-                AstExprKind::Pipe { input, op, .. } if op == "File/read_bytes" => {
-                    if let Some(path) = ast_static_text_literal_in_exprs(&self.ast_exprs, *input) {
-                        FileBytesPath::StaticText(path)
-                    } else {
-                        FileBytesPath::StatePath(ast_argument_value_in_exprs(
-                            &self.ast_exprs,
-                            *input,
-                        )?)
-                    }
-                }
-                AstExprKind::Call { function, args } if function == "File/read_bytes" => {
-                    file_bytes_path_arg_in_exprs(&self.ast_exprs, args)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::FileReadBytes {
-                path: match path {
-                    FileBytesPath::StaticText(path) => FileBytesPath::StaticText(path),
-                    FileBytesPath::StatePath(raw_path) => FileBytesPath::StatePath(
-                        canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                    ),
-                },
-            })
-        })
-    }
-
-    fn then_file_write_bytes_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_bytes_path, path) = match &output.kind {
-                AstExprKind::Pipe { input, op, args } if op == "File/write_bytes" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    file_write_bytes_path_arg_in_exprs(&self.ast_exprs, args)?,
-                ),
-                AstExprKind::Call { function, args } if function == "File/write_bytes" => (
-                    bytes_get_input_arg_in_exprs(&self.ast_exprs, args)?,
-                    file_write_bytes_path_arg_in_exprs(&self.ast_exprs, args)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::FileWriteBytes {
-                bytes_path: canonical_scalar_update_path_with_fields(
-                    field,
-                    target,
-                    &raw_bytes_path,
-                    fields,
-                ),
-                path: match path {
-                    FileBytesPath::StaticText(path) => FileBytesPath::StaticText(path),
-                    FileBytesPath::StatePath(raw_path) => FileBytesPath::StatePath(
-                        canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                    ),
-                },
-            })
-        })
-    }
-
     fn then_text_to_number_expression(
         &self,
         field: &FieldDef,
@@ -14840,34 +15109,6 @@ fn source_payload_field_from_path(path: &str, source_variants: &[String]) -> Opt
     })
 }
 
-fn source_payload_guard_field_from_path(path: &str, source_variants: &[String]) -> Option<String> {
-    source_variants.iter().find_map(|variant| {
-        let suffix = source_payload_suffix_from_variant(path, variant)?;
-        Some(match suffix {
-            "change.text" | "event.change.text" | "events.change.text" => "text".to_owned(),
-            "change.bytes" | "event.change.bytes" | "events.change.bytes" => "bytes".to_owned(),
-            "key_down.key" | "event.key_down.key" | "events.key_down.key" => "key".to_owned(),
-            "event.address" | "events.address" => "address".to_owned(),
-            _ if !suffix.contains('.') => suffix.to_owned(),
-            _ if suffix.starts_with("event.") => {
-                let event_suffix = &suffix["event.".len()..];
-                event_suffix
-                    .contains('.')
-                    .then(|| source_payload_field_from_event_suffix(event_suffix))
-                    .flatten()?
-            }
-            _ if suffix.starts_with("events.") => {
-                let event_suffix = &suffix["events.".len()..];
-                event_suffix
-                    .contains('.')
-                    .then(|| source_payload_field_from_event_suffix(event_suffix))
-                    .flatten()?
-            }
-            _ => return None,
-        })
-    })
-}
-
 fn source_payload_field_from_event_suffix(suffix: &str) -> Option<String> {
     if !suffix.contains('.') {
         return Some(suffix.to_owned());
@@ -15198,6 +15439,41 @@ fn direct_source_refs_by_path(
         .iter()
         .map(|field| (field.path.clone(), direct_source_refs(field, program)))
         .collect()
+}
+
+fn add_distributed_event_source_refs(
+    fields: &[FieldDef],
+    references: &[DistributedValueReference],
+    direct_sources: &mut BTreeMap<String, Vec<String>>,
+) {
+    for reference in references.iter().filter(|reference| {
+        matches!(
+            reference.flow_mode,
+            boon_typecheck::FlowMode::TickPresent | boon_typecheck::FlowMode::PresentOrAbsent
+        )
+    }) {
+        let source_path = distributed_event_source_path(&reference.canonical_path);
+        for field in fields
+            .iter()
+            .filter(|field| reference.local_alias_paths.contains(&field.path))
+        {
+            let sources = direct_sources.entry(field.path.clone()).or_default();
+            push_unique(sources, source_path.clone());
+        }
+    }
+}
+
+fn bind_distributed_reference_aliases(
+    fields: &[FieldDef],
+    references: &mut [DistributedValueReference],
+) {
+    for reference in references {
+        reference.local_alias_paths = fields
+            .iter()
+            .filter(|field| field.statement.expr == Some(reference.expr_id.as_usize()))
+            .map(|field| field.path.clone())
+            .collect();
+    }
 }
 
 fn direct_sources_for_field<'a>(

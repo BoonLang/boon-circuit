@@ -3,18 +3,14 @@ store: [
 
     first_path_segment:
         TEXT { none } |> HOLD first_path_segment {
-            LATEST {
-                request.method |> THEN {
-                    List/get(request.path_segments, index: 0)
-                }
+            request.method |> THEN {
+                List/get(request.path_segments, index: 0)
             }
         }
 
     request_method:
         TEXT { NONE } |> HOLD request_method {
-            LATEST {
-                request.method |> THEN { request.method }
-            }
+            request.method |> THEN { request.method }
         }
 ]
 

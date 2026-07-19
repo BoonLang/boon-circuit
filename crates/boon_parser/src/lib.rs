@@ -3,7 +3,170 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESERVED_STANDARD_NAMESPACES: &[&str] = &["Client", "Server", "Session", "SessionInfo"];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StandardRootKind {
+    ProgramRole,
+    Runtime,
+    Library,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandardRoot {
+    pub name: &'static str,
+    pub kind: StandardRootKind,
+}
+
+/// The single source of truth for names owned by the language and standard
+/// library. Application modules and root declarations may not shadow them.
+pub const STANDARD_ROOTS: &[StandardRoot] = &[
+    StandardRoot {
+        name: "Browser",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Bool",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Bytes",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Client",
+        kind: StandardRootKind::ProgramRole,
+    },
+    StandardRoot {
+        name: "Clock",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Content",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Crypto",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Directory",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Document",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Element",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Error",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "File",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Http",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Light",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "List",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Log",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Number",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Passkey",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Random",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Router",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Scene",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Secret",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Server",
+        kind: StandardRootKind::ProgramRole,
+    },
+    StandardRoot {
+        name: "Session",
+        kind: StandardRootKind::ProgramRole,
+    },
+    StandardRoot {
+        name: "SessionInfo",
+        kind: StandardRootKind::Runtime,
+    },
+    StandardRoot {
+        name: "Text",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Timer",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Ulid",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Url",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Wellen",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Widget",
+        kind: StandardRootKind::Library,
+    },
+];
+
+pub fn standard_root_kind(name: &str) -> Option<StandardRootKind> {
+    STANDARD_ROOTS
+        .iter()
+        .find_map(|root| (root.name == name).then_some(root.kind))
+}
+
+pub fn is_program_role_root(name: &str) -> bool {
+    standard_root_kind(name) == Some(StandardRootKind::ProgramRole)
+}
+
+pub fn is_reserved_standard_root(name: &str) -> bool {
+    standard_root_kind(name).is_some()
+}
+
+pub fn canonical_value_path(parts: &[String]) -> String {
+    match parts.split_first() {
+        Some((root, suffix)) if is_program_role_root(root) && !suffix.is_empty() => {
+            format!("{root}/{}", suffix.join("."))
+        }
+        _ => parts.join("."),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProgramKind {
@@ -525,7 +688,7 @@ fn reject_reserved_module_path(path: &str) -> Result<(), ParseError> {
     let module = std::path::Path::new(path)
         .file_stem()
         .and_then(|stem| stem.to_str());
-    if module.is_some_and(is_reserved_standard_namespace) {
+    if module.is_some_and(is_reserved_standard_root) {
         return Err(ParseError {
             path: path.to_owned(),
             line: None,
@@ -537,10 +700,6 @@ fn reject_reserved_module_path(path: &str) -> Result<(), ParseError> {
         });
     }
     Ok(())
-}
-
-fn is_reserved_standard_namespace(name: &str) -> bool {
-    RESERVED_STANDARD_NAMESPACES.contains(&name)
 }
 
 fn namespace_project_modules(ast: &mut AstProgram, files: &[ParsedSourceFile]) {
@@ -936,6 +1095,7 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let mut expressions = Vec::new();
     let statements = ast_statement_tree(&items, &mut expressions, source);
     link_multiline_block_outputs(&statements, &mut expressions);
+    link_multiline_list_map_new_args(&statements, &mut expressions);
     Ok(AstProgram {
         tokens,
         lines,
@@ -945,33 +1105,87 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     })
 }
 
+fn link_multiline_list_map_new_args(statements: &[AstStatement], expressions: &mut [AstExpr]) {
+    for statement in statements {
+        link_multiline_list_map_new_args(&statement.children, expressions);
+        let Some(parent_expr) = statement.expr else {
+            continue;
+        };
+        let Some(value_expr) = last_statement_expression(&statement.children, expressions) else {
+            continue;
+        };
+        let marker = expressions
+            .get(parent_expr)
+            .and_then(|expression| match &expression.kind {
+                AstExprKind::Pipe { op, args, .. } if op == "List/map" => {
+                    args.iter().enumerate().find_map(|(index, arg)| {
+                        (arg.name.is_none()
+                            && expressions.get(arg.value).is_some_and(|expr| {
+                                matches!(&expr.kind, AstExprKind::Identifier(name) if name == "new")
+                            }))
+                        .then_some((index, arg.value))
+                    })
+                }
+                _ => None,
+            });
+        let Some((marker_index, marker_expr)) = marker else {
+            continue;
+        };
+        expressions[marker_expr].kind = AstExprKind::Delimiter;
+        let Some(AstExpr {
+            kind: AstExprKind::Pipe { args, .. },
+            ..
+        }) = expressions.get_mut(parent_expr)
+        else {
+            continue;
+        };
+        args[marker_index].name = Some("new".to_owned());
+        args[marker_index].value = value_expr;
+    }
+}
+
 fn link_multiline_block_outputs(statements: &[AstStatement], expressions: &mut [AstExpr]) {
     for statement in statements {
         link_multiline_block_outputs(&statement.children, expressions);
         let Some(parent_expr) = statement.expr else {
             continue;
         };
-        let Some(output) = first_statement_expression(&statement.children) else {
+        let Some(output) = last_statement_expression(&statement.children, expressions) else {
             continue;
         };
         let Some(expression) = expressions.get_mut(parent_expr) else {
             continue;
         };
-        if let AstExprKind::Then {
-            output: current, ..
-        } = &mut expression.kind
-            && current.is_none()
-        {
-            *current = Some(output);
+        match &mut expression.kind {
+            AstExprKind::Then {
+                output: current, ..
+            }
+            | AstExprKind::MatchArm {
+                output: current, ..
+            } if current.is_none() => {
+                *current = Some(output);
+            }
+            _ => {}
         }
     }
 }
 
-fn first_statement_expression(statements: &[AstStatement]) -> Option<usize> {
-    statements.iter().find_map(|statement| {
+fn last_statement_expression(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    statements.iter().rev().find_map(|statement| {
+        if !statement.children.is_empty()
+            && statement
+                .children
+                .iter()
+                .all(|child| statement_is_pipeline_continuation(child, expressions))
+        {
+            return last_statement_expression(&statement.children, expressions);
+        }
         statement
             .expr
-            .or_else(|| first_statement_expression(&statement.children))
+            .or_else(|| last_statement_expression(&statement.children, expressions))
     })
 }
 
@@ -1700,7 +1914,9 @@ fn ast_expr_kind(
     if let Some((function, args)) = ast_call(tokens, item, expressions, source) {
         return AstExprKind::Call { function, args };
     }
-    if tokens.len() == 1 && is_name(&tokens[0]) {
+    if tokens.len() == 1 && split_role_value_head(&tokens[0]).is_some() {
+        AstExprKind::Path(path_segments(tokens))
+    } else if tokens.len() == 1 && is_name(&tokens[0]) {
         let token = tokens[0].clone();
         if value_starts_uppercase_identifier(&token) {
             AstExprKind::Tag(token)
@@ -2196,12 +2412,21 @@ fn split_top_level(tokens: &[String], separator: &str) -> Vec<Vec<String>> {
 }
 
 fn path_segments(tokens: &[String]) -> Vec<String> {
-    tokens
-        .iter()
-        .filter(|token| token.as_str() != ".")
-        .filter(|token| is_name(token))
-        .cloned()
-        .collect()
+    let mut segments = Vec::new();
+    for token in tokens.iter().filter(|token| token.as_str() != ".") {
+        if let Some((role, first)) = split_role_value_head(token) {
+            segments.push(role.to_owned());
+            segments.push(first.to_owned());
+        } else if is_name(token) {
+            segments.push(token.clone());
+        }
+    }
+    segments
+}
+
+fn split_role_value_head(value: &str) -> Option<(&str, &str)> {
+    let (role, first) = value.split_once('/')?;
+    (is_program_role_root(role) && is_name(first)).then_some((role, first))
 }
 
 fn text_literal_value(tokens: &[String], item: &ParserItem, source: &str) -> Option<String> {
@@ -2573,6 +2798,7 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
         }
     }
     validate_reserved_standard_namespaces(path, &ast.statements)?;
+    validate_role_qualified_value_syntax(path, &ast.tokens)?;
     if example_source && let Some(document) = document_statement(ast) {
         let document_is_canonical = document.expr.is_some_and(|expr_id| {
             ast.expressions.get(expr_id).is_some_and(|expr| {
@@ -2605,11 +2831,32 @@ fn validate_reserved_standard_namespaces(
     statements: &[AstStatement],
 ) -> Result<(), ParseError> {
     for statement in statements {
+        if let AstStatementKind::Field { name } = &statement.kind
+            && is_reserved_standard_root(name)
+        {
+            return Err(error(
+                path,
+                statement.line,
+                statement.indent + 1,
+                &format!(
+                    "`{name}` is a reserved Boon standard root and cannot be declared by an application"
+                ),
+            ));
+        }
+    }
+    validate_reserved_standard_function_names(path, statements)
+}
+
+fn validate_reserved_standard_function_names(
+    path: &str,
+    statements: &[AstStatement],
+) -> Result<(), ParseError> {
+    for statement in statements {
         if let AstStatementKind::Function { name, .. } = &statement.kind
             && name
                 .split('/')
                 .next()
-                .is_some_and(is_reserved_standard_namespace)
+                .is_some_and(is_reserved_standard_root)
         {
             return Err(error(
                 path,
@@ -2620,7 +2867,30 @@ fn validate_reserved_standard_namespaces(
                 ),
             ));
         }
-        validate_reserved_standard_namespaces(path, &statement.children)?;
+        validate_reserved_standard_function_names(path, &statement.children)?;
+    }
+    Ok(())
+}
+
+fn validate_role_qualified_value_syntax(path: &str, tokens: &[AstToken]) -> Result<(), ParseError> {
+    for window in tokens.windows(2) {
+        let [role, separator] = window else {
+            continue;
+        };
+        if role.kind == AstTokenKind::Identifier
+            && is_program_role_root(&role.lexeme)
+            && separator.lexeme == "."
+        {
+            return Err(error(
+                path,
+                role.line,
+                role.column,
+                &format!(
+                    "qualified role values use `{}/value.field`, not `{}.value.field`",
+                    role.lexeme, role.lexeme
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -3304,6 +3574,7 @@ struct StructureTables {
     source_ports: Vec<ParsedSourcePort>,
     state_cells: Vec<ParsedStateCell>,
     list_memories: Vec<ParsedListMemory>,
+    scalar_list_value_scopes: BTreeSet<String>,
 }
 
 fn derive_program_tables(
@@ -3499,9 +3770,14 @@ fn collect_list_memory_name_statements(
     for statement in statements {
         match &statement.kind {
             AstStatementKind::List {
-                field: Some(name), ..
+                field: Some(name),
+                capacity,
             } => {
-                names.insert(name.clone());
+                if capacity.is_some()
+                    || !list_statement_is_scalar_value(statement, &ast.expressions)
+                {
+                    names.insert(name.clone());
+                }
                 scope.push(name.clone());
                 collect_list_memory_name_statements(ast, &statement.children, scope, names);
                 scope.pop();
@@ -3515,8 +3791,11 @@ fn collect_list_memory_name_statements(
                 collect_list_memory_name_statements(ast, &statement.children, scope, names);
             }
             AstStatementKind::Field { name } => {
+                let scalar_list_value =
+                    field_statement_is_scalar_list_value(statement, &ast.expressions);
                 if name != "document"
                     && !field_name_is_nested_render_slot(name, scope)
+                    && !scalar_list_value
                     && (statement
                         .expr
                         .is_some_and(|expr_id| expr_returns_list_collection(expr_id, ast, names))
@@ -3526,7 +3805,7 @@ fn collect_list_memory_name_statements(
                 {
                     names.insert(name.clone());
                 }
-                if !statement.children.is_empty() && name != "document" {
+                if !statement.children.is_empty() && name != "document" && !scalar_list_value {
                     scope.push(name.clone());
                     collect_list_memory_name_statements(ast, &statement.children, scope, names);
                     scope.pop();
@@ -3652,6 +3931,11 @@ fn derive_structure_from_statements(
                     row_scopes,
                     tables,
                 );
+                if field_statement_is_scalar_list_value(statement, expressions) {
+                    tables
+                        .scalar_list_value_scopes
+                        .insert(join_path(scope, [name.as_str()]));
+                }
                 if !statement.children.is_empty() {
                     scope.push(name.clone());
                     derive_structure_from_statements(
@@ -3729,6 +4013,26 @@ fn derive_structure_from_statements(
                 );
             }
             AstStatementKind::List { field, capacity } => {
+                let belongs_to_scalar_value = field.is_none()
+                    && scope_path(scope).is_some_and(|path| {
+                        tables.scalar_list_value_scopes.contains(path.as_str())
+                    });
+                if capacity.is_none()
+                    && (field.is_some() && list_statement_is_scalar_value(statement, expressions)
+                        || belongs_to_scalar_value)
+                {
+                    derive_structure_from_statements(
+                        &statement.children,
+                        expressions,
+                        lines,
+                        row_scopes,
+                        function_bodies,
+                        function_stack,
+                        scope,
+                        tables,
+                    );
+                    continue;
+                }
                 let name = match field.as_deref() {
                     Some("items" | "children") if scope_is_indexed(scope, row_scopes) => {
                         generated_local_list_memory_name(
@@ -3771,6 +4075,163 @@ fn derive_structure_from_statements(
             }
         }
     }
+}
+
+fn list_statement_is_scalar_value(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    let Some(AstExpr {
+        kind: AstExprKind::ListLiteral { items, .. },
+        ..
+    }) = statement.expr.and_then(|expr_id| expressions.get(expr_id))
+    else {
+        return false;
+    };
+    !items.is_empty()
+        && items.iter().all(|item| {
+            expressions.get(*item).is_some_and(|expr| {
+                matches!(
+                    expr.kind,
+                    AstExprKind::Identifier(_)
+                        | AstExprKind::Path(_)
+                        | AstExprKind::StringLiteral(_)
+                        | AstExprKind::TextLiteral(_)
+                        | AstExprKind::Number(_)
+                        | AstExprKind::ByteLiteral { .. }
+                        | AstExprKind::BytesLiteral { .. }
+                        | AstExprKind::Bool(_)
+                        | AstExprKind::Enum(_)
+                        | AstExprKind::Tag(_)
+                )
+            })
+        })
+}
+
+fn field_statement_is_scalar_list_value(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    let mut facts = ListValueFacts::default();
+    collect_statement_list_value_facts(statement, expressions, &mut facts);
+    facts.saw_scalar_items && !facts.saw_row_items && !facts.saw_list_operator
+}
+
+#[derive(Default)]
+struct ListValueFacts {
+    saw_scalar_items: bool,
+    saw_row_items: bool,
+    saw_list_operator: bool,
+}
+
+fn collect_statement_list_value_facts(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    facts: &mut ListValueFacts,
+) {
+    if let Some(expr_id) = statement.expr {
+        collect_expr_list_value_facts(expr_id, expressions, facts);
+    }
+    for child in &statement.children {
+        collect_statement_list_value_facts(child, expressions, facts);
+    }
+}
+
+fn collect_expr_list_value_facts(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    facts: &mut ListValueFacts,
+) {
+    let Some(expr) = expressions.get(expr_id) else {
+        return;
+    };
+    match &expr.kind {
+        AstExprKind::ListLiteral { items, .. } => {
+            if items.is_empty() {
+                return;
+            }
+            if items
+                .iter()
+                .all(|item| expr_is_scalar_list_item(*item, expressions))
+            {
+                facts.saw_scalar_items = true;
+            } else {
+                facts.saw_row_items = true;
+            }
+        }
+        AstExprKind::Call { function, args } => {
+            facts.saw_list_operator |= list_returning_operator(function);
+            for arg in args {
+                collect_expr_list_value_facts(arg.value, expressions, facts);
+            }
+        }
+        AstExprKind::Pipe { input, op, args } => {
+            facts.saw_list_operator |= list_returning_operator(op);
+            collect_expr_list_value_facts(*input, expressions, facts);
+            for arg in args {
+                collect_expr_list_value_facts(arg.value, expressions, facts);
+            }
+        }
+        AstExprKind::Draining { input }
+        | AstExprKind::Hold { initial: input, .. }
+        | AstExprKind::When { input } => {
+            collect_expr_list_value_facts(*input, expressions, facts);
+        }
+        AstExprKind::Then { input, output } => {
+            collect_expr_list_value_facts(*input, expressions, facts);
+            if let Some(output) = output {
+                collect_expr_list_value_facts(*output, expressions, facts);
+            }
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            collect_expr_list_value_facts(*left, expressions, facts);
+            collect_expr_list_value_facts(*right, expressions, facts);
+        }
+        AstExprKind::MatchArm { output, .. } => {
+            if let Some(output) = output {
+                collect_expr_list_value_facts(*output, expressions, facts);
+            }
+        }
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                collect_expr_list_value_facts(field.value, expressions, facts);
+            }
+        }
+        AstExprKind::BytesLiteral { items, .. } => {
+            for item in items {
+                collect_expr_list_value_facts(*item, expressions, facts);
+            }
+        }
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::ByteLiteral { .. }
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => {}
+    }
+}
+
+fn expr_is_scalar_list_item(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    expressions.get(expr_id).is_some_and(|expr| {
+        matches!(
+            expr.kind,
+            AstExprKind::Identifier(_)
+                | AstExprKind::Path(_)
+                | AstExprKind::StringLiteral(_)
+                | AstExprKind::TextLiteral(_)
+                | AstExprKind::Number(_)
+                | AstExprKind::ByteLiteral { .. }
+                | AstExprKind::BytesLiteral { .. }
+                | AstExprKind::Bool(_)
+                | AstExprKind::Enum(_)
+                | AstExprKind::Tag(_)
+                | AstExprKind::TaggedObject { .. }
+        )
+    })
 }
 
 fn field_statement_contains_list_literal(
@@ -4701,6 +5162,14 @@ fn statement_row_scope_function(
                 args.iter()
                     .find(|arg| arg.name.as_deref() == Some("new"))
                     .and_then(|arg| function_name_from_expr(arg.value, ast))
+                    .or_else(|| {
+                        statement
+                            .children
+                            .iter()
+                            .find(|child| matches!(child.kind, AstStatementKind::Expression))
+                            .and_then(|child| child.expr)
+                            .and_then(|expr_id| function_name_from_expr(expr_id, ast))
+                    })
             } else {
                 args.iter()
                     .find(|arg| arg.name.as_deref() == Some("item"))
@@ -4845,7 +5314,12 @@ fn expr_returns_list_collection_inner(
                     .last()
                     .is_some_and(|value| list_names.contains(value.as_str()))
         }
-        AstExprKind::ListLiteral { .. } => true,
+        AstExprKind::ListLiteral { items, .. } => {
+            items.is_empty()
+                || !items
+                    .iter()
+                    .all(|item| expr_is_scalar_list_item(*item, &ast.expressions))
+        }
         AstExprKind::Call { function, .. } => list_returning_operator(function),
         AstExprKind::Pipe { op, .. } => list_returning_operator(op),
         AstExprKind::Draining { input } => {
@@ -4991,5 +5465,227 @@ fn error(path: &str, line: usize, column: usize, message: &str) -> ParseError {
         line: Some(line),
         column: Some(column),
         message: format!("{message} at line {line}, column {column}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiline_list_map_new_call_creates_a_keyed_row_scope() {
+        let parsed = parse_source(
+            "multiline-dynamic-map.bn",
+            r#"
+store: [
+    input_rows:
+        True |> WHEN {
+            True => LIST { [id: TEXT { a }] }
+            False => LIST {}
+        }
+    mapped_rows:
+        input_rows
+        |> List/map(row, new:
+            new_row(row: row)
+        )
+]
+
+FUNCTION new_row(row) {
+    [
+        select: SOURCE
+        id: row.id
+    ]
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            parsed
+                .list_memories
+                .iter()
+                .any(|list| list.name == "mapped_rows")
+        );
+        assert!(parsed.row_scope_functions.iter().any(|scope| {
+            scope.list == "mapped_rows" && scope.function == "new_row" && scope.row_scope == "row"
+        }));
+        let new_arg = parsed
+            .expressions
+            .iter()
+            .find_map(|expr| match &expr.kind {
+                AstExprKind::Pipe { op, args, .. } if op == "List/map" => {
+                    args.iter().find(|arg| arg.name.as_deref() == Some("new"))
+                }
+                _ => None,
+            })
+            .expect("multiline new argument is normalized in the AST");
+        assert!(matches!(
+            parsed.expressions[new_arg.value].kind,
+            AstExprKind::Call { ref function, .. } if function == "new_row"
+        ));
+    }
+
+    #[test]
+    fn multiline_then_uses_the_final_pipeline_expression_as_its_output() {
+        let parsed = parse_source(
+            "multiline-then-pipeline.bn",
+            r#"
+store: [
+    submit: SOURCE
+    normalized:
+        submit |> THEN {
+            submit.text
+                |> Text/trim()
+                |> Text/to_uppercase()
+        }
+]
+"#,
+        )
+        .unwrap();
+        let output = parsed
+            .expressions
+            .iter()
+            .find_map(|expr| match &expr.kind {
+                AstExprKind::Then {
+                    output: Some(output),
+                    ..
+                } => Some(*output),
+                _ => None,
+            })
+            .expect("multiline THEN has an output");
+        assert!(matches!(
+            parsed.expressions[output].kind,
+            AstExprKind::Pipe { ref op, .. } if op == "Text/to_uppercase"
+        ));
+    }
+
+    #[test]
+    fn multiline_when_arm_uses_the_final_pipeline_expression_as_its_output() {
+        let parsed = parse_source(
+            "multiline-when-arm-pipeline.bn",
+            r#"
+store: [
+    status:
+        result |> WHEN {
+            Ready =>
+                result.name
+                |> Text/concat(with: TEXT { ready }, separator: " ")
+            __ => TEXT { pending }
+        }
+]
+"#,
+        )
+        .unwrap();
+        let concat = parsed
+            .expressions
+            .iter()
+            .find(|expr| matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "Text/concat"))
+            .expect("concat continuation exists");
+        assert!(parsed.expressions.iter().any(|expr| {
+            matches!(expr.kind, AstExprKind::MatchArm { output: Some(output), .. } if output == concat.id)
+        }));
+    }
+
+    #[test]
+    fn multiline_when_arm_call_pipeline_uses_the_final_operator_as_its_output() {
+        let parsed = parse_source(
+            "multiline-when-arm-call-pipeline.bn",
+            r#"
+store: [
+    rows: LIST { [id: TEXT { one }, values: LIST {}] }
+    selected:
+        result |> WHEN {
+            Ready =>
+                List/find_value(
+                    rows
+                    field: "id"
+                    value: TEXT { one }
+                    target: "values"
+                    fallback: LIST {}
+                )
+                |> List/map(old, new: old)
+            __ => LIST {}
+        }
+]
+"#,
+        )
+        .unwrap();
+        let map = parsed
+            .expressions
+            .iter()
+            .find(|expr| matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "List/map"))
+            .expect("map continuation exists");
+        let ready_output = parsed.expressions.iter().find_map(|expr| match &expr.kind {
+            AstExprKind::MatchArm {
+                pattern,
+                output: Some(output),
+            } if pattern.iter().any(|part| part == "Ready") => Some(*output),
+            _ => None,
+        });
+        assert_eq!(ready_output, Some(map.id));
+    }
+
+    #[test]
+    fn scalar_list_literals_are_values_not_keyed_list_memories() {
+        let parsed = parse_source(
+            "scalar-list-value.bn",
+            r#"
+store: [
+    selected: TEXT { alpha }
+    selected_ids: LIST { selected }
+    optional_selected_ids:
+        True |> WHEN {
+            True => LIST {}
+            False => LIST { selected }
+        }
+    rows: LIST { [id: selected] }
+    optional_rows:
+        True |> WHEN {
+            True => LIST {}
+            False => LIST { [id: selected] }
+        }
+    empty_rows: LIST {}
+    bounded_rows: LIST(capacity: 4) {}
+]
+"#,
+        )
+        .unwrap();
+        let list_names = parsed
+            .list_memories
+            .iter()
+            .map(|list| list.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !parsed
+                .list_memories
+                .iter()
+                .any(|list| list.name == "selected_ids")
+        );
+        assert!(
+            !parsed.list_memories.iter().any(|list| {
+                list.name == "optional_selected_ids"
+                    || list.name.starts_with("store_optional_selected_ids_list_")
+            }),
+            "unexpected scalar list memories: {list_names:?}"
+        );
+        assert!(parsed.list_memories.iter().any(|list| list.name == "rows"));
+        assert!(
+            parsed
+                .list_memories
+                .iter()
+                .any(|list| list.name == "optional_rows")
+        );
+        assert!(
+            parsed
+                .list_memories
+                .iter()
+                .any(|list| list.name == "empty_rows")
+        );
+        assert!(
+            parsed
+                .list_memories
+                .iter()
+                .any(|list| list.name == "bounded_rows")
+        );
     }
 }

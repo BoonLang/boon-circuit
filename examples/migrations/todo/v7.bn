@@ -8,24 +8,20 @@ store: [
 
     theme:
         Light |> HOLD theme {
-            LATEST {
-                sources.theme_button.events.press |> THEN {
-                    theme |> WHEN {
-                        Light => Dark
-                        Dark => Light
-                    }
+            sources.theme_button.events.press |> THEN {
+                theme |> WHEN {
+                    Light => Dark
+                    Dark => Light
                 }
             }
         }
 
     density:
         Comfortable |> HOLD density {
-            LATEST {
-                sources.density_button.events.press |> THEN {
-                    density |> WHEN {
-                        Comfortable => Compact
-                        Compact => Comfortable
-                    }
+            sources.density_button.events.press |> THEN {
+                density |> WHEN {
+                    Comfortable => Compact
+                    Compact => Comfortable
                 }
             }
         }
@@ -48,33 +44,27 @@ FUNCTION new_task(task) {
 
         text:
             task.text |> HOLD text {
-                LATEST {
-                    sources.rename_button.events.press |> THEN {
-                        TEXT { Plan release (edited) }
-                    }
+                sources.rename_button.events.press |> THEN {
+                    TEXT { Plan release (edited) }
                 }
             }
 
         status:
             task.status |> HOLD status {
-                LATEST {
-                    sources.toggle_button.events.press |> THEN {
-                        status |> WHEN {
-                            Open => Done
-                            Done => Open
-                        }
+                sources.toggle_button.events.press |> THEN {
+                    status |> WHEN {
+                        Open => Done
+                        Done => Open
                     }
                 }
             }
 
         priority:
             task.priority |> HOLD priority {
-                LATEST {
-                    sources.priority_button.events.press |> THEN {
-                        priority |> WHEN {
-                            Normal => High
-                            High => Normal
-                        }
+                sources.priority_button.events.press |> THEN {
+                    priority |> WHEN {
+                        Normal => High
+                        High => Normal
                     }
                 }
             }

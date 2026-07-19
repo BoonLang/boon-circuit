@@ -1,9 +1,11 @@
 use crate::config::valid_application_close_code;
 use crate::program::CancellationSource;
 use crate::{
-    CallCancellation, CancellationReason, CookieMetadata, Header, HttpRequest, HttpResponse,
-    PeerAddress, RequestScheme, ServerConfig, ServerProgram, SlowClientPolicy, WebSocketAction,
-    WebSocketClose, WebSocketEvent, WebSocketFrame, WebSocketOpen, WebSocketTransportError,
+    CallCancellation, CancellationReason, CookieMetadata, DISTRIBUTED_SESSION_TRANSPORT_PATH,
+    DistributedSessionAction, DistributedSessionConnectionId, DistributedSessionEvent,
+    DistributedSessionOpen, Header, HttpRequest, HttpResponse, PeerAddress, RequestScheme,
+    ServerConfig, ServerProgram, SlowClientPolicy, WebSocketAction, WebSocketClose, WebSocketEvent,
+    WebSocketFrame, WebSocketOpen, WebSocketTransportError,
 };
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -32,6 +34,7 @@ struct AppState {
     owner: mpsc::Sender<OwnerCommand>,
     accepting: Arc<AtomicBool>,
     next_connection: Arc<AtomicU64>,
+    has_distributed_session_transport: bool,
     config: Arc<ServerConfig>,
 }
 
@@ -61,9 +64,31 @@ enum OwnerCommand {
         cancellation_source: CancellationSource,
         reply: oneshot::Sender<WebSocketEventReply>,
     },
+    DistributedSessionOpen {
+        connection: DistributedSessionConnectionId,
+        event: DistributedSessionOpen,
+        writer: BoundedWriter,
+        close: CloseSender,
+        cancellation: CallCancellation,
+        cancellation_source: CancellationSource,
+        reply: oneshot::Sender<DistributedSessionOpenReply>,
+    },
+    DistributedSessionEvent {
+        connection: DistributedSessionConnectionId,
+        event: DistributedSessionEvent,
+        cancellation: CallCancellation,
+        cancellation_source: CancellationSource,
+        reply: oneshot::Sender<DistributedSessionEventReply>,
+    },
     BeginShutdown {
         reply: oneshot::Sender<()>,
     },
+}
+
+enum OwnerWake {
+    InternalWork,
+    DistributedSessionTimer(Instant),
+    Command,
 }
 
 enum HttpOwnerReply {
@@ -79,7 +104,21 @@ enum WebSocketOpenReply {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DistributedSessionOpenReply {
+    Accepted,
+    TimedOut,
+    ConnectionGone,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WebSocketEventReply {
+    Processed,
+    TimedOut,
+    ConnectionGone,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DistributedSessionEventReply {
     Processed,
     TimedOut,
     ConnectionGone,
@@ -144,18 +183,89 @@ struct ConnectionState {
     rooms: BTreeSet<String>,
 }
 
+struct DistributedSessionConnectionState {
+    writer: BoundedWriter,
+    close: CloseSender,
+    closing: bool,
+}
+
 struct Owner<P> {
     program: P,
     config: Arc<ServerConfig>,
     receiver: mpsc::Receiver<OwnerCommand>,
     connections: HashMap<ConnectionId, ConnectionState>,
     rooms: HashMap<String, BTreeSet<ConnectionId>>,
+    distributed_connections:
+        HashMap<DistributedSessionConnectionId, DistributedSessionConnectionState>,
+    has_distributed_session_transport: bool,
+    blocked_distributed_timer_deadline: Option<Instant>,
     shutdown_reply: Option<oneshot::Sender<()>>,
 }
 
 impl<P: ServerProgram> Owner<P> {
     async fn run(mut self) {
-        while let Some(command) = self.receiver.recv().await {
+        let mut yield_to_owner_command = false;
+        loop {
+            let has_pending_internal_work =
+                self.shutdown_reply.is_none() && self.program.has_pending_internal_work();
+            let timer_deadline = self.next_distributed_timer_deadline();
+            let mut internal_actions = None;
+            let mut owner_command = None;
+            let claimed_command = if yield_to_owner_command {
+                match self.receiver.try_recv() {
+                    Ok(command) => Some(Some(command)),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => Some(None),
+                }
+            } else {
+                None
+            };
+            let wake = if let Some(command) = claimed_command {
+                owner_command = Some(command);
+                OwnerWake::Command
+            } else {
+                let internal_work = async { self.program.on_internal_work().await };
+                tokio::pin!(internal_work);
+                tokio::select! {
+                    biased;
+                    actions = &mut internal_work, if has_pending_internal_work => {
+                        internal_actions = Some(actions);
+                        OwnerWake::InternalWork
+                    }
+                    _ = wait_for_deadline(timer_deadline), if timer_deadline.is_some() => {
+                        OwnerWake::DistributedSessionTimer(
+                            timer_deadline.expect("guarded distributed timer deadline"),
+                        )
+                    }
+                    command = self.receiver.recv() => {
+                        owner_command = Some(command);
+                        OwnerWake::Command
+                    }
+                }
+            };
+            let command = match wake {
+                OwnerWake::InternalWork => {
+                    yield_to_owner_command = true;
+                    self.apply_distributed_session_actions(
+                        None,
+                        internal_actions.expect("internal work branch stores actions"),
+                    );
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                OwnerWake::DistributedSessionTimer(scheduled) => {
+                    yield_to_owner_command = true;
+                    self.handle_distributed_session_timer(scheduled).await;
+                    continue;
+                }
+                OwnerWake::Command => {
+                    yield_to_owner_command = false;
+                    owner_command.expect("owner command branch stores result")
+                }
+            };
+            let Some(command) = command else {
+                break;
+            };
             match command {
                 OwnerCommand::Http {
                     request,
@@ -202,6 +312,42 @@ impl<P: ServerProgram> Owner<P> {
                     )
                     .await;
                 }
+                OwnerCommand::DistributedSessionOpen {
+                    connection,
+                    event,
+                    writer,
+                    close,
+                    cancellation,
+                    cancellation_source,
+                    reply,
+                } => {
+                    self.handle_distributed_session_open(
+                        connection,
+                        event,
+                        writer,
+                        close,
+                        cancellation,
+                        cancellation_source,
+                        reply,
+                    )
+                    .await;
+                }
+                OwnerCommand::DistributedSessionEvent {
+                    connection,
+                    event,
+                    cancellation,
+                    cancellation_source,
+                    reply,
+                } => {
+                    self.handle_distributed_session_event(
+                        connection,
+                        event,
+                        cancellation,
+                        cancellation_source,
+                        reply,
+                    )
+                    .await;
+                }
                 OwnerCommand::BeginShutdown { reply } => {
                     self.receiver.close();
                     self.shutdown_reply = Some(reply);
@@ -216,12 +362,37 @@ impl<P: ServerProgram> Owner<P> {
         }
         self.connections.clear();
         self.rooms.clear();
+        for connection in self.distributed_connections.values_mut() {
+            connection.closing = true;
+            connection
+                .close
+                .close(WebSocketClose::new(1001, "server shutdown"));
+        }
+        self.distributed_connections.clear();
 
         let shutdown = self.program.on_shutdown();
         let _ = tokio::time::timeout(self.config.timeouts.program_call, shutdown).await;
         if let Some(reply) = self.shutdown_reply.take() {
             let _ = reply.send(());
         }
+    }
+
+    fn next_distributed_timer_deadline(&mut self) -> Option<Instant> {
+        if !self.has_distributed_session_transport || self.shutdown_reply.is_some() {
+            return None;
+        }
+        let Some(deadline) = self.program.distributed_session_next_deadline() else {
+            self.blocked_distributed_timer_deadline = None;
+            return None;
+        };
+        if self
+            .blocked_distributed_timer_deadline
+            .is_some_and(|blocked| deadline <= blocked)
+        {
+            return None;
+        }
+        self.blocked_distributed_timer_deadline = None;
+        Some(deadline)
     }
 
     async fn handle_http(
@@ -278,7 +449,9 @@ impl<P: ServerProgram> Owner<P> {
         cancellation_source: CancellationSource,
         reply: oneshot::Sender<WebSocketOpenReply>,
     ) {
-        if self.connections.len() >= self.config.limits.max_connections {
+        if self.connections.len() + self.distributed_connections.len()
+            >= self.config.limits.max_connections
+        {
             let _ = reply.send(WebSocketOpenReply::Rejected(host_http_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "connection capacity reached",
@@ -401,6 +574,308 @@ impl<P: ServerProgram> Owner<P> {
                 WebSocketCallOutcome::TimedOut
             }
             actions = &mut call => WebSocketCallOutcome::Actions(actions),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_distributed_session_open(
+        &mut self,
+        connection: DistributedSessionConnectionId,
+        event: DistributedSessionOpen,
+        writer: BoundedWriter,
+        close: CloseSender,
+        cancellation: CallCancellation,
+        cancellation_source: CancellationSource,
+        reply: oneshot::Sender<DistributedSessionOpenReply>,
+    ) {
+        if !self.has_distributed_session_transport
+            || self.connections.len() + self.distributed_connections.len()
+                >= self.config.limits.max_connections
+            || self.distributed_connections.contains_key(&connection)
+        {
+            let _ = reply.send(DistributedSessionOpenReply::ConnectionGone);
+            return;
+        }
+
+        let deadline = event.deadline;
+        self.distributed_connections.insert(
+            connection,
+            DistributedSessionConnectionState {
+                writer,
+                close,
+                closing: false,
+            },
+        );
+        let outcome = self
+            .call_distributed_session(
+                connection,
+                DistributedSessionEvent::Open(event),
+                cancellation,
+                deadline,
+            )
+            .await;
+        match outcome {
+            DistributedSessionCallOutcome::Actions(actions) => {
+                if reply.send(DistributedSessionOpenReply::Accepted).is_err() {
+                    self.distributed_connections.remove(&connection);
+                    self.notify_distributed_session_cancelled(
+                        Some(connection),
+                        CancellationReason::PeerDisconnected,
+                    )
+                    .await;
+                    return;
+                }
+                self.apply_distributed_session_actions(Some(connection), actions);
+            }
+            DistributedSessionCallOutcome::TimedOut => {
+                cancellation_source.cancel(CancellationReason::DeadlineExceeded);
+                self.distributed_connections.remove(&connection);
+                self.notify_distributed_session_cancelled(
+                    Some(connection),
+                    CancellationReason::DeadlineExceeded,
+                )
+                .await;
+                let _ = reply.send(DistributedSessionOpenReply::TimedOut);
+            }
+            DistributedSessionCallOutcome::Cancelled(reason) => {
+                self.distributed_connections.remove(&connection);
+                self.notify_distributed_session_cancelled(Some(connection), reason)
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_distributed_session_event(
+        &mut self,
+        connection: DistributedSessionConnectionId,
+        event: DistributedSessionEvent,
+        cancellation: CallCancellation,
+        cancellation_source: CancellationSource,
+        reply: oneshot::Sender<DistributedSessionEventReply>,
+    ) {
+        let is_close = matches!(event, DistributedSessionEvent::Close(_));
+        let connection_is_live = self
+            .distributed_connections
+            .get(&connection)
+            .is_some_and(|state| !state.closing);
+        if is_close {
+            if self.distributed_connections.remove(&connection).is_none() {
+                let _ = reply.send(DistributedSessionEventReply::ConnectionGone);
+                return;
+            }
+        } else if !connection_is_live {
+            let _ = reply.send(DistributedSessionEventReply::ConnectionGone);
+            return;
+        }
+
+        let deadline = Instant::now() + self.config.timeouts.program_call;
+        match self
+            .call_distributed_session(connection, event, cancellation, deadline)
+            .await
+        {
+            DistributedSessionCallOutcome::Actions(actions) => {
+                self.apply_distributed_session_actions(Some(connection), actions);
+                let _ = reply.send(DistributedSessionEventReply::Processed);
+            }
+            DistributedSessionCallOutcome::TimedOut => {
+                cancellation_source.cancel(CancellationReason::DeadlineExceeded);
+                self.notify_distributed_session_cancelled(
+                    Some(connection),
+                    CancellationReason::DeadlineExceeded,
+                )
+                .await;
+                if !is_close {
+                    self.close_distributed_session_connection(
+                        connection,
+                        WebSocketClose::new(1011, "program timeout"),
+                    );
+                }
+                let _ = reply.send(DistributedSessionEventReply::TimedOut);
+            }
+            DistributedSessionCallOutcome::Cancelled(reason) => {
+                self.notify_distributed_session_cancelled(Some(connection), reason)
+                    .await;
+                self.distributed_connections.remove(&connection);
+            }
+        }
+    }
+
+    async fn call_distributed_session(
+        &mut self,
+        connection: DistributedSessionConnectionId,
+        event: DistributedSessionEvent,
+        cancellation: CallCancellation,
+        deadline: Instant,
+    ) -> DistributedSessionCallOutcome {
+        let call_cancellation = cancellation.clone();
+        let call = self
+            .program
+            .on_distributed_session(connection, event, call_cancellation);
+        tokio::pin!(call);
+        tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => {
+                DistributedSessionCallOutcome::Cancelled(reason)
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                DistributedSessionCallOutcome::TimedOut
+            }
+            actions = &mut call => DistributedSessionCallOutcome::Actions(actions),
+        }
+    }
+
+    async fn handle_distributed_session_timer(&mut self, scheduled: Instant) {
+        let now = Instant::now();
+        let (cancellation_source, cancellation) = CallCancellation::channel();
+        let call = self.program.on_distributed_session_timer(now, cancellation);
+        match tokio::time::timeout(self.config.timeouts.program_call, call).await {
+            Ok(actions) => {
+                self.apply_distributed_session_actions(None, actions);
+                if self
+                    .program
+                    .distributed_session_next_deadline()
+                    .is_some_and(|next| next <= scheduled)
+                {
+                    self.blocked_distributed_timer_deadline = Some(scheduled);
+                    self.close_all_distributed_session_connections(WebSocketClose::new(
+                        1011,
+                        "invalid distributed Session timer lifecycle",
+                    ));
+                }
+            }
+            Err(_) => {
+                cancellation_source.cancel(CancellationReason::DeadlineExceeded);
+                self.notify_distributed_session_cancelled(
+                    None,
+                    CancellationReason::DeadlineExceeded,
+                )
+                .await;
+                self.blocked_distributed_timer_deadline = Some(scheduled);
+                self.close_all_distributed_session_connections(WebSocketClose::new(
+                    1011,
+                    "distributed Session timer timeout",
+                ));
+            }
+        }
+    }
+
+    async fn notify_distributed_session_cancelled(
+        &mut self,
+        connection: Option<DistributedSessionConnectionId>,
+        reason: CancellationReason,
+    ) {
+        let callback = self
+            .program
+            .on_distributed_session_cancelled(connection, reason);
+        let _ = tokio::time::timeout(self.config.timeouts.program_call, callback).await;
+    }
+
+    fn apply_distributed_session_actions(
+        &mut self,
+        current: Option<DistributedSessionConnectionId>,
+        actions: Vec<DistributedSessionAction>,
+    ) {
+        if self.validate_distributed_session_actions(&actions).is_err() {
+            self.fail_invalid_distributed_session_lifecycle(current);
+            return;
+        }
+
+        for action in actions {
+            match action {
+                DistributedSessionAction::Send { connection, bytes } => {
+                    let writer = self
+                        .distributed_connections
+                        .get(&connection)
+                        .filter(|state| !state.closing)
+                        .map(|state| state.writer.clone());
+                    let Some(writer) = writer else {
+                        continue;
+                    };
+                    if writer.try_send(WebSocketFrame::Binary(bytes)).is_ok() {
+                        self.program
+                            .on_distributed_session_send_accepted(connection);
+                    } else {
+                        self.close_slow_distributed_session_connection(connection);
+                    }
+                }
+                DistributedSessionAction::Close { connection, close } => {
+                    self.close_distributed_session_connection(connection, close);
+                }
+            }
+        }
+    }
+
+    fn validate_distributed_session_actions(
+        &self,
+        actions: &[DistributedSessionAction],
+    ) -> Result<(), ()> {
+        if actions.len() > self.config.limits.max_actions_per_event {
+            return Err(());
+        }
+        let mut live = self
+            .distributed_connections
+            .iter()
+            .filter_map(|(connection, state)| (!state.closing).then_some(*connection))
+            .collect::<BTreeSet<_>>();
+        for action in actions {
+            match action {
+                DistributedSessionAction::Send { connection, bytes } => {
+                    if !live.contains(connection)
+                        || bytes.len() > self.config.limits.max_websocket_message_bytes
+                    {
+                        return Err(());
+                    }
+                }
+                DistributedSessionAction::Close { connection, close } => {
+                    if !live.remove(connection) || validate_close(close, &self.config).is_err() {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fail_invalid_distributed_session_lifecycle(
+        &mut self,
+        current: Option<DistributedSessionConnectionId>,
+    ) {
+        let close = WebSocketClose::new(1011, "invalid distributed Session lifecycle");
+        if let Some(current) = current
+            && self.distributed_connections.contains_key(&current)
+        {
+            self.close_distributed_session_connection(current, close);
+        } else {
+            self.close_all_distributed_session_connections(close);
+        }
+    }
+
+    fn close_slow_distributed_session_connection(
+        &mut self,
+        connection: DistributedSessionConnectionId,
+    ) {
+        let SlowClientPolicy::Close { code, reason } = &self.config.slow_client_policy;
+        self.close_distributed_session_connection(
+            connection,
+            WebSocketClose::new(*code, reason.clone()),
+        );
+    }
+
+    fn close_distributed_session_connection(
+        &mut self,
+        connection: DistributedSessionConnectionId,
+        close: WebSocketClose,
+    ) {
+        if let Some(state) = self.distributed_connections.get_mut(&connection) {
+            state.closing = true;
+            state.close.close(close);
+        }
+    }
+
+    fn close_all_distributed_session_connections(&mut self, close: WebSocketClose) {
+        for state in self.distributed_connections.values_mut() {
+            state.closing = true;
+            state.close.close(close.clone());
         }
     }
 
@@ -535,6 +1010,12 @@ enum WebSocketCallOutcome {
     Cancelled(CancellationReason),
 }
 
+enum DistributedSessionCallOutcome {
+    Actions(Vec<DistributedSessionAction>),
+    TimedOut,
+    Cancelled(CancellationReason),
+}
+
 enum OpenDecision {
     Accept,
     Reject(HttpResponse),
@@ -546,6 +1027,7 @@ pub async fn bind<P: ServerProgram>(
     program: P,
 ) -> Result<RunningServer, ServerError> {
     config.validate().map_err(ServerError::Config)?;
+    let has_distributed_session_transport = program.has_distributed_session_transport();
     let listener = TcpListener::bind(address)
         .await
         .map_err(ServerError::Bind)?;
@@ -559,6 +1041,9 @@ pub async fn bind<P: ServerProgram>(
         receiver: owner_receiver,
         connections: HashMap::new(),
         rooms: HashMap::new(),
+        distributed_connections: HashMap::new(),
+        has_distributed_session_transport,
+        blocked_distributed_timer_deadline: None,
         shutdown_reply: None,
     };
     let owner_task = tokio::spawn(owner.run());
@@ -567,6 +1052,7 @@ pub async fn bind<P: ServerProgram>(
         owner: owner_sender.clone(),
         accepting: Arc::clone(&accepting),
         next_connection: Arc::new(AtomicU64::new(1)),
+        has_distributed_session_transport,
         config: Arc::clone(&config),
     };
     let app = Router::new().fallback(dispatch).with_state(state);
@@ -602,6 +1088,22 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
         .get(UPGRADE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    if parts.uri.path() == DISTRIBUTED_SESSION_TRANSPORT_PATH {
+        if !state.has_distributed_session_transport {
+            return plain_response(StatusCode::NOT_FOUND, "not found");
+        }
+        if !websocket_attempt {
+            return plain_response(
+                StatusCode::UPGRADE_REQUIRED,
+                "distributed Session transport requires WebSocket upgrade",
+            );
+        }
+        let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            Ok(upgrade) => upgrade,
+            Err(rejection) => return rejection.into_response(),
+        };
+        return dispatch_distributed_session(state, parts, upgrade).await;
+    }
     if websocket_attempt {
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
             Ok(upgrade) => upgrade,
@@ -758,6 +1260,98 @@ async fn dispatch_websocket(
     }
 }
 
+async fn dispatch_distributed_session(
+    state: AppState,
+    parts: axum::http::request::Parts,
+    upgrade: WebSocketUpgrade,
+) -> Response<Body> {
+    let request_head = match parse_request_head(&parts, &state.config, true) {
+        Ok(head) => head,
+        Err(error) => return error.into_response(),
+    };
+    let deadline = Instant::now() + state.config.timeouts.program_call;
+    let event = DistributedSessionOpen {
+        headers: request_head.headers,
+        cookies: request_head.cookies,
+        peer: request_head.peer,
+        scheme: request_head.scheme,
+        deadline,
+    };
+    let connection = DistributedSessionConnectionId::from_raw(
+        state.next_connection.fetch_add(1, Ordering::Relaxed),
+    );
+    let (write_sender, write_receiver) =
+        mpsc::channel(state.config.limits.websocket_write_queue_messages);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let writer = BoundedWriter {
+        sender: write_sender,
+        queued_bytes: Arc::clone(&queued_bytes),
+        max_bytes: state.config.limits.websocket_write_queue_bytes,
+    };
+    let (close_sender, close_receiver) = watch::channel(None);
+    let close = CloseSender(close_sender);
+    let (cancellation_source, cancellation) = CallCancellation::channel();
+    let mut disconnect_guard = DisconnectGuard::new(cancellation_source.clone());
+    let (reply_sender, reply_receiver) = oneshot::channel();
+    let command = OwnerCommand::DistributedSessionOpen {
+        connection,
+        event,
+        writer,
+        close,
+        cancellation,
+        cancellation_source,
+        reply: reply_sender,
+    };
+    match state.owner.try_send(command) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            disconnect_guard.disarm();
+            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "server overloaded");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            disconnect_guard.disarm();
+            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "server unavailable");
+        }
+    }
+
+    match reply_receiver.await {
+        Ok(DistributedSessionOpenReply::Accepted) => {
+            disconnect_guard.disarm();
+            let owner = state.owner.clone();
+            let config = Arc::clone(&state.config);
+            upgrade
+                .max_message_size(state.config.limits.max_websocket_message_bytes)
+                .max_frame_size(state.config.limits.max_websocket_message_bytes)
+                .on_upgrade(move |socket| {
+                    run_distributed_session_websocket(
+                        socket,
+                        connection,
+                        owner,
+                        write_receiver,
+                        queued_bytes,
+                        close_receiver,
+                        config,
+                    )
+                })
+        }
+        Ok(DistributedSessionOpenReply::TimedOut) => {
+            disconnect_guard.disarm();
+            plain_response(StatusCode::GATEWAY_TIMEOUT, "program timeout")
+        }
+        Ok(DistributedSessionOpenReply::ConnectionGone) => {
+            disconnect_guard.disarm();
+            plain_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "distributed Session transport unavailable",
+            )
+        }
+        Err(_) => {
+            disconnect_guard.disarm();
+            plain_response(StatusCode::SERVICE_UNAVAILABLE, "server unavailable")
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_websocket(
     socket: WebSocket,
@@ -881,6 +1475,201 @@ async fn run_websocket(
     notify_websocket_close(&owner, connection, observed_close).await;
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_distributed_session_websocket(
+    socket: WebSocket,
+    connection: DistributedSessionConnectionId,
+    owner: mpsc::Sender<OwnerCommand>,
+    mut write_receiver: mpsc::Receiver<QueuedFrame>,
+    queued_bytes: Arc<AtomicUsize>,
+    mut close_receiver: watch::Receiver<Option<WebSocketClose>>,
+    config: Arc<ServerConfig>,
+) {
+    let (mut sink, mut stream) = socket.split();
+    let mut ping_interval = config.timeouts.websocket_ping_interval.map(|duration| {
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + duration, duration);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        interval
+    });
+    let mut pong_timeout = Box::pin(tokio::time::sleep(Duration::from_secs(365 * 24 * 60 * 60)));
+    let mut awaiting_pong = false;
+    let mut ping_sequence = 0_u64;
+    let mut observed_close = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            changed = close_receiver.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let requested_close = close_receiver.borrow().clone();
+                if let Some(close) = requested_close {
+                    let _ = sink.send(close_message(&close)).await;
+                    observed_close = Some(close);
+                    break;
+                }
+            }
+            _ = &mut pong_timeout, if awaiting_pong => {
+                let close = WebSocketClose::new(1002, "pong timeout");
+                let _ = sink.send(close_message(&close)).await;
+                observed_close = Some(close);
+                break;
+            }
+            queued = write_receiver.recv() => {
+                let Some(queued) = queued else {
+                    break;
+                };
+                queued_bytes.fetch_sub(queued.bytes, Ordering::AcqRel);
+                let WebSocketFrame::Binary(bytes) = queued.frame else {
+                    let close = WebSocketClose::new(
+                        1011,
+                        "invalid distributed Session writer frame",
+                    );
+                    let _ = sink.send(close_message(&close)).await;
+                    observed_close = Some(close);
+                    break;
+                };
+                if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                    break;
+                }
+            }
+            _ = next_ping(&mut ping_interval), if !awaiting_pong => {
+                ping_sequence = ping_sequence.wrapping_add(1);
+                if sink.send(Message::Ping(ping_sequence.to_be_bytes().to_vec().into())).await.is_err() {
+                    break;
+                }
+                awaiting_pong = true;
+                pong_timeout.as_mut().reset(
+                    tokio::time::Instant::now() + config.timeouts.websocket_pong_timeout
+                );
+            }
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if !process_distributed_session_event(
+                            &owner,
+                            connection,
+                            DistributedSessionEvent::Binary(bytes.to_vec()),
+                            &mut sink,
+                        ).await {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(_))) => {
+                        let close = WebSocketClose::new(1003, "binary frames required");
+                        let _ = sink.send(close_message(&close)).await;
+                        observed_close = Some(close);
+                        break;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sink.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => awaiting_pong = false,
+                    Some(Ok(Message::Close(frame))) => {
+                        observed_close = frame.as_ref().map(|frame| {
+                            WebSocketClose::new(frame.code, frame.reason.to_string())
+                        });
+                        let _ = sink.send(Message::Close(frame)).await;
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        let transport_error = classify_websocket_error(&error);
+                        let close = match transport_error {
+                            WebSocketTransportError::MessageTooLarge => {
+                                WebSocketClose::new(1009, "message too large")
+                            }
+                            _ => WebSocketClose::new(1002, "invalid WebSocket message"),
+                        };
+                        let _ = sink.send(close_message(&close)).await;
+                        observed_close = Some(close);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    notify_distributed_session_close(&owner, connection, observed_close).await;
+}
+
+async fn process_distributed_session_event<S>(
+    owner: &mpsc::Sender<OwnerCommand>,
+    connection: DistributedSessionConnectionId,
+    event: DistributedSessionEvent,
+    sink: &mut S,
+) -> bool
+where
+    S: futures::Sink<Message> + Unpin,
+{
+    let (cancellation_source, cancellation) = CallCancellation::channel();
+    let mut disconnect_guard = DisconnectGuard::new(cancellation_source.clone());
+    let (reply_sender, reply_receiver) = oneshot::channel();
+    let command = OwnerCommand::DistributedSessionEvent {
+        connection,
+        event,
+        cancellation,
+        cancellation_source,
+        reply: reply_sender,
+    };
+    match owner.try_send(command) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            disconnect_guard.disarm();
+            let _ = sink
+                .send(close_message(&WebSocketClose::new(
+                    1013,
+                    "server overloaded",
+                )))
+                .await;
+            return false;
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            disconnect_guard.disarm();
+            let _ = sink
+                .send(close_message(&WebSocketClose::new(1001, "server shutdown")))
+                .await;
+            return false;
+        }
+    }
+
+    let keep_open = match reply_receiver.await {
+        Ok(DistributedSessionEventReply::Processed) => true,
+        Ok(DistributedSessionEventReply::TimedOut) => {
+            let _ = sink
+                .send(close_message(&WebSocketClose::new(1011, "program timeout")))
+                .await;
+            false
+        }
+        Ok(DistributedSessionEventReply::ConnectionGone) | Err(_) => false,
+    };
+    disconnect_guard.disarm();
+    keep_open
+}
+
+async fn notify_distributed_session_close(
+    owner: &mpsc::Sender<OwnerCommand>,
+    connection: DistributedSessionConnectionId,
+    close: Option<WebSocketClose>,
+) {
+    let (cancellation_source, cancellation) = CallCancellation::channel();
+    let (reply_sender, reply_receiver) = oneshot::channel();
+    let command = OwnerCommand::DistributedSessionEvent {
+        connection,
+        event: DistributedSessionEvent::Close(close),
+        cancellation,
+        cancellation_source,
+        reply: reply_sender,
+    };
+    if owner.send(command).await.is_ok() {
+        let _ = reply_receiver.await;
+    }
+}
+
 async fn process_websocket_event<S>(
     owner: &mpsc::Sender<OwnerCommand>,
     connection: ConnectionId,
@@ -963,6 +1752,15 @@ async fn next_ping(interval: &mut Option<Interval>) {
     }
 }
 
+async fn wait_for_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        }
+        None => pending::<()>().await,
+    }
+}
+
 fn frame_message(frame: WebSocketFrame) -> Message {
     match frame {
         WebSocketFrame::Text(text) => Message::Text(text.into()),
@@ -979,7 +1777,10 @@ fn close_message(close: &WebSocketClose) -> Message {
 
 fn classify_websocket_error(error: &axum::Error) -> WebSocketTransportError {
     let message = error.to_string().to_ascii_lowercase();
-    if message.contains("capacity") || message.contains("too large") || message.contains("too big")
+    if message.contains("capacity")
+        || message.contains("too large")
+        || message.contains("too big")
+        || message.contains("too long")
     {
         WebSocketTransportError::MessageTooLarge
     } else if message.contains("protocol") || message.contains("utf-8") || message.contains("utf8")

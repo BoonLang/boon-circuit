@@ -1,5 +1,5 @@
 store: [
-    session_changed: SOURCE
+    session_changed: Client/store.increment
 
     session_count:
         0 |> HOLD session_count {

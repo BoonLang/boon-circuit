@@ -604,7 +604,6 @@ impl ProgramSession {
         let runtime = LiveRuntime::from_shared_machine_plan(
             Arc::clone(artifact.plan()),
             SessionOptions {
-                session_id: Some(id.0.clone()),
                 max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
                 ..SessionOptions::default()
             },
@@ -638,6 +637,77 @@ impl ProgramSession {
 
     pub fn runtime_mut(&mut self) -> &mut LiveRuntime {
         &mut self.runtime
+    }
+
+    fn fork_distributed_server_evaluation(
+        &self,
+        turn: Option<&crate::RuntimeTurn>,
+    ) -> Result<Self, crate::DistributedRuntimeError> {
+        let next_source_sequence = self.evaluation_next_source_sequence(turn)?;
+        let runtime = self
+            .runtime
+            .fork_distributed_server_evaluation(turn.is_some())
+            .map_err(distributed_machine_error)?;
+        Ok(Self {
+            id: self.id.clone(),
+            artifact: self.artifact.clone(),
+            runtime,
+            next_source_sequence,
+        })
+    }
+
+    fn evaluation_next_source_sequence(
+        &self,
+        turn: Option<&crate::RuntimeTurn>,
+    ) -> Result<u64, crate::DistributedRuntimeError> {
+        let Some(source_sequence) = turn.and_then(|turn| turn.source_sequence) else {
+            return Ok(self.next_source_sequence);
+        };
+        if source_sequence != self.next_source_sequence {
+            return Err(distributed_machine_error(
+                "prepared Server source sequence changed before evaluation",
+            ));
+        }
+        source_sequence
+            .checked_add(1)
+            .ok_or_else(|| distributed_machine_error("program source sequence overflow"))
+    }
+
+    fn validate_distributed_server_evaluation(
+        &self,
+        turn: Option<&crate::RuntimeTurn>,
+        evaluation: &Self,
+    ) -> Result<(), crate::DistributedRuntimeError> {
+        if self.runtime.has_unsettled_turn() != turn.is_some() {
+            return Err(distributed_machine_error(
+                "distributed Server authority preparation state changed before commit",
+            ));
+        }
+        if evaluation.runtime.has_unsettled_turn() {
+            return Err(distributed_machine_error(
+                "distributed Server evaluation remained unsettled",
+            ));
+        }
+        if self.id != evaluation.id
+            || self.artifact.id() != evaluation.artifact.id()
+            || self.artifact.plan_digest() != evaluation.artifact.plan_digest()
+        {
+            return Err(distributed_machine_error(
+                "distributed Server evaluation belongs to another program authority",
+            ));
+        }
+        let expected_sequence = self.evaluation_next_source_sequence(turn)?;
+        if evaluation.next_source_sequence != expected_sequence {
+            return Err(distributed_machine_error(
+                "distributed Server evaluation source sequence is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn install_distributed_server_evaluation(&mut self, evaluation: Self) {
+        self.runtime = evaluation.runtime;
+        self.next_source_sequence = evaluation.next_source_sequence;
     }
 
     pub fn frame(&self) -> Option<&DocumentFrame> {
@@ -676,6 +746,15 @@ impl ProgramSession {
 
     pub fn output_value_current(&mut self, name: &str) -> crate::RuntimeResult<crate::Value> {
         self.runtime.output_value_current(name)
+    }
+
+    pub fn update_session_context(
+        &mut self,
+        connection_status: crate::SessionConnectionStatus,
+        principal: crate::SessionPrincipal,
+    ) -> crate::RuntimeResult<Option<crate::RuntimeTurn>> {
+        self.runtime
+            .update_session_context(connection_status, principal)
     }
 
     pub fn complete_transient_effect(
@@ -753,6 +832,191 @@ impl ProgramSession {
     }
 }
 
+impl crate::DistributedServerMachine for ProgramSession {
+    type EvaluationMachine = ProgramSession;
+
+    fn artifact(&self) -> &ProgramArtifact {
+        &self.artifact
+    }
+
+    fn fork_prepared_evaluation(
+        &self,
+        turn: Option<&crate::RuntimeTurn>,
+    ) -> Result<Self::EvaluationMachine, crate::DistributedRuntimeError> {
+        self.fork_distributed_server_evaluation(turn)
+    }
+
+    fn install_evaluation(
+        &mut self,
+        evaluation: Self::EvaluationMachine,
+    ) -> Result<(), crate::DistributedRuntimeError> {
+        self.validate_distributed_server_evaluation(None, &evaluation)?;
+        self.install_distributed_server_evaluation(evaluation);
+        Ok(())
+    }
+
+    fn commit_prepared_evaluation(
+        &mut self,
+        turn: crate::RuntimeTurn,
+        evaluation: Self::EvaluationMachine,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.validate_distributed_server_evaluation(Some(&turn), &evaluation)?;
+        self.install_distributed_server_evaluation(evaluation);
+        Ok(turn)
+    }
+
+    fn event_for_path(
+        &self,
+        path: &str,
+        payload: SourcePayload,
+    ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
+        self.runtime
+            .source_event(self.next_source_sequence, path, None, payload)
+            .map_err(distributed_machine_error)
+    }
+
+    fn event_for_source(
+        &self,
+        source: boon_plan::SourceId,
+        payload: SourcePayload,
+    ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
+        self.runtime
+            .source_event_by_id(self.next_source_sequence, source, None, payload)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_dispatch(
+        &mut self,
+        event: crate::SourceEvent,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.next_source_sequence
+            .checked_add(1)
+            .ok_or_else(|| distributed_machine_error("program source sequence overflow"))?;
+        self.runtime
+            .dispatch_unsettled(event)
+            .map_err(distributed_machine_error)
+    }
+
+    fn export_current(
+        &mut self,
+        export_id: boon_plan::ExportId,
+    ) -> Result<crate::Value, crate::DistributedRuntimeError> {
+        self.runtime
+            .distributed_export_value_current(export_id)
+            .map_err(distributed_machine_error)
+    }
+
+    fn call_arguments(
+        &mut self,
+        call: &boon_plan::RemoteCallSitePlan,
+    ) -> Result<
+        BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+        crate::DistributedRuntimeError,
+    > {
+        self.runtime
+            .distributed_call_arguments_current(call.call_site_id)
+            .map_err(distributed_machine_error)
+    }
+
+    fn evaluate_function(
+        &mut self,
+        export_id: boon_plan::ExportId,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+    ) -> Result<crate::Value, crate::DistributedRuntimeError> {
+        self.runtime
+            .evaluate_distributed_function(export_id, arguments)
+            .map_err(distributed_machine_error)
+    }
+
+    fn replace_distributed_context(
+        &mut self,
+        session_context: crate::SessionContext,
+        imports: Vec<crate::DistributedImportUpdate>,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::DistributedRuntimeError> {
+        self.runtime
+            .replace_distributed_execution_context(session_context, imports)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_transient_effect_completion(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        outcome: crate::Value,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.runtime
+            .complete_transient_effect_unsettled(call_id, outcome)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_transient_effect_result(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        result_sequence: u64,
+        outcome: crate::Value,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.runtime
+            .deliver_transient_effect_result_unsettled(call_id, result_sequence, outcome)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_transient_effect_cancellation(
+        &mut self,
+        call_ids: &[crate::TransientEffectCallId],
+    ) -> Result<Option<crate::RuntimeTurn>, crate::DistributedRuntimeError> {
+        self.runtime
+            .cancel_transient_effects_unsettled(call_ids)
+            .map_err(distributed_machine_error)
+    }
+
+    fn commit_prepared_turn(
+        &mut self,
+        turn: crate::RuntimeTurn,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        if let Some(source_sequence) = turn.source_sequence {
+            if source_sequence != self.next_source_sequence {
+                return Err(distributed_machine_error(
+                    "prepared Server source sequence changed before commit",
+                ));
+            }
+            self.next_source_sequence = self
+                .next_source_sequence
+                .checked_add(1)
+                .ok_or_else(|| distributed_machine_error("program source sequence overflow"))?;
+        }
+        self.runtime.settle_turn();
+        Ok(turn)
+    }
+
+    fn rollback_prepared_turn(&mut self) -> Result<(), crate::DistributedRuntimeError> {
+        self.runtime
+            .rollback_unsettled_turn()
+            .map_err(distributed_machine_error)
+    }
+
+    fn has_pending_transient_effect(&self, call_id: crate::TransientEffectCallId) -> bool {
+        self.runtime
+            .pending_transient_effect_credits(call_id)
+            .is_some()
+    }
+
+    fn set_transient_effect_scope(&mut self, scope: u64) {
+        self.runtime.set_transient_effect_scope(scope);
+    }
+
+    fn root_value_current(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::Value, crate::DistributedRuntimeError> {
+        self.runtime
+            .root_value_current(name)
+            .map_err(distributed_machine_error)
+    }
+}
+
+fn distributed_machine_error(error: impl fmt::Display) -> crate::DistributedRuntimeError {
+    crate::DistributedRuntimeError::Runtime(error.to_string())
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ProgramSessionDispatch {
     pub source_sequence: u64,
@@ -789,7 +1053,6 @@ impl PersistentProgramSession {
         let (runtime, startup) = crate::PersistentRuntime::from_shared_machine_plan(
             Arc::clone(artifact.plan()),
             SessionOptions {
-                session_id: Some(id.0.clone()),
                 max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
                 ..SessionOptions::default()
             },
@@ -865,6 +1128,216 @@ impl PersistentProgramSession {
             },
             acknowledged.acknowledgement,
         ))
+    }
+
+    pub fn dispatch_prepared_durably(
+        &mut self,
+        event: crate::SourceEvent,
+    ) -> Result<crate::DurablyAcknowledgedTurn, crate::PersistentDispatchError> {
+        if event.sequence != self.next_source_sequence {
+            return Err(crate::PersistentDispatchError::Runtime(format!(
+                "prepared source sequence {} does not match next sequence {}",
+                event.sequence, self.next_source_sequence
+            )));
+        }
+        let next_source_sequence = self.next_source_sequence.checked_add(1).ok_or_else(|| {
+            crate::PersistentDispatchError::Runtime("program source sequence overflow".to_owned())
+        })?;
+        let acknowledged = self.runtime.dispatch_durably(event)?;
+        self.next_source_sequence = next_source_sequence;
+        Ok(acknowledged)
+    }
+
+    pub fn prepare_distributed_dispatch(
+        &mut self,
+        event: crate::SourceEvent,
+        immediate: bool,
+    ) -> Result<crate::RuntimeTurn, crate::PersistentDispatchError> {
+        if event.sequence != self.next_source_sequence {
+            return Err(crate::PersistentDispatchError::Runtime(format!(
+                "prepared source sequence {} does not match next sequence {}",
+                event.sequence, self.next_source_sequence
+            )));
+        }
+        self.next_source_sequence.checked_add(1).ok_or_else(|| {
+            crate::PersistentDispatchError::Runtime("program source sequence overflow".to_owned())
+        })?;
+        self.runtime.prepare_distributed_dispatch(event, immediate)
+    }
+
+    pub fn prepare_distributed_effect_completion(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        outcome: crate::Value,
+        immediate: bool,
+    ) -> Result<crate::RuntimeTurn, crate::PersistentDispatchError> {
+        self.runtime
+            .prepare_distributed_effect_completion(call_id, outcome, immediate)
+    }
+
+    pub fn prepare_distributed_effect_result(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        result_sequence: u64,
+        outcome: crate::Value,
+        immediate: bool,
+    ) -> Result<crate::RuntimeTurn, crate::PersistentDispatchError> {
+        self.runtime
+            .prepare_distributed_effect_result(call_id, result_sequence, outcome, immediate)
+    }
+
+    pub fn prepare_distributed_effect_cancellation(
+        &mut self,
+        call_ids: &[crate::TransientEffectCallId],
+        immediate: bool,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::PersistentDispatchError> {
+        self.runtime
+            .prepare_distributed_effect_cancellation(call_ids, immediate)
+    }
+
+    pub fn commit_prepared_distributed_turn(
+        &mut self,
+        turn: crate::RuntimeTurn,
+    ) -> Result<(crate::RuntimeTurn, Option<CommitAck>), crate::PersistentDispatchError> {
+        self.commit_prepared_distributed_turn_with_protocol_state(turn, Vec::new())
+    }
+
+    pub fn commit_prepared_distributed_turn_with_protocol_state(
+        &mut self,
+        turn: crate::RuntimeTurn,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
+    ) -> Result<(crate::RuntimeTurn, Option<CommitAck>), crate::PersistentDispatchError> {
+        let source_sequence = turn.source_sequence;
+        if let Some(source_sequence) = source_sequence {
+            if source_sequence != self.next_source_sequence {
+                return Err(crate::PersistentDispatchError::Runtime(
+                    "prepared Server source sequence changed before commit".to_owned(),
+                ));
+            }
+            self.next_source_sequence.checked_add(1).ok_or_else(|| {
+                crate::PersistentDispatchError::Runtime(
+                    "program source sequence overflow".to_owned(),
+                )
+            })?;
+        }
+        let committed = self
+            .runtime
+            .commit_prepared_distributed_turn(turn, protocol_state_changes)?;
+        if source_sequence.is_some() {
+            self.next_source_sequence += 1;
+        }
+        Ok(committed)
+    }
+
+    pub fn rollback_prepared_distributed_turn(
+        &mut self,
+    ) -> Result<(), crate::PersistentDispatchError> {
+        self.runtime.rollback_prepared_distributed_turn()
+    }
+
+    pub fn fork_prepared_distributed_server_evaluation(
+        &self,
+        turn: Option<&crate::RuntimeTurn>,
+    ) -> Result<ProgramSession, crate::DistributedRuntimeError> {
+        let next_source_sequence = self.evaluation_next_source_sequence(turn)?;
+        let runtime = self
+            .runtime
+            .runtime()
+            .fork_distributed_server_evaluation(turn.is_some())
+            .map_err(distributed_machine_error)?;
+        Ok(ProgramSession {
+            id: self.id.clone(),
+            artifact: self.artifact.clone(),
+            runtime,
+            next_source_sequence,
+        })
+    }
+
+    pub fn install_distributed_server_evaluation(
+        &mut self,
+        evaluation: ProgramSession,
+    ) -> Result<(), crate::PersistentDispatchError> {
+        self.validate_distributed_server_evaluation(None, &evaluation)
+            .map_err(|error| crate::PersistentDispatchError::Runtime(error.to_string()))?;
+        self.runtime
+            .validate_distributed_server_evaluation(&evaluation.runtime, false)?;
+        self.runtime
+            .install_distributed_server_evaluation(evaluation.runtime);
+        self.next_source_sequence = evaluation.next_source_sequence;
+        Ok(())
+    }
+
+    pub fn prepare_protocol_checkpoint(
+        &mut self,
+    ) -> Result<crate::RuntimeTurn, crate::PersistentDispatchError> {
+        self.runtime.prepare_distributed_protocol_checkpoint()
+    }
+
+    pub fn commit_prepared_distributed_server_evaluation(
+        &mut self,
+        turn: crate::RuntimeTurn,
+        evaluation: ProgramSession,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
+    ) -> Result<(crate::RuntimeTurn, Option<CommitAck>), crate::PersistentDispatchError> {
+        self.validate_distributed_server_evaluation(Some(&turn), &evaluation)
+            .map_err(|error| crate::PersistentDispatchError::Runtime(error.to_string()))?;
+        self.runtime
+            .validate_distributed_server_evaluation(&evaluation.runtime, true)?;
+        let committed = self
+            .runtime
+            .commit_prepared_distributed_turn(turn, protocol_state_changes)?;
+        self.runtime
+            .install_distributed_server_evaluation(evaluation.runtime);
+        self.next_source_sequence = evaluation.next_source_sequence;
+        Ok(committed)
+    }
+
+    fn evaluation_next_source_sequence(
+        &self,
+        turn: Option<&crate::RuntimeTurn>,
+    ) -> Result<u64, crate::DistributedRuntimeError> {
+        let Some(source_sequence) = turn.and_then(|turn| turn.source_sequence) else {
+            return Ok(self.next_source_sequence);
+        };
+        if source_sequence != self.next_source_sequence {
+            return Err(distributed_machine_error(
+                "prepared persistent Server source sequence changed before evaluation",
+            ));
+        }
+        source_sequence
+            .checked_add(1)
+            .ok_or_else(|| distributed_machine_error("program source sequence overflow"))
+    }
+
+    fn validate_distributed_server_evaluation(
+        &self,
+        turn: Option<&crate::RuntimeTurn>,
+        evaluation: &ProgramSession,
+    ) -> Result<(), crate::DistributedRuntimeError> {
+        if self.runtime.runtime().has_unsettled_turn() != turn.is_some() {
+            return Err(distributed_machine_error(
+                "persistent distributed Server authority preparation state changed before commit",
+            ));
+        }
+        if evaluation.runtime.has_unsettled_turn() {
+            return Err(distributed_machine_error(
+                "distributed Server evaluation remained unsettled",
+            ));
+        }
+        if self.id != evaluation.id
+            || self.artifact.id() != evaluation.artifact.id()
+            || self.artifact.plan_digest() != evaluation.artifact.plan_digest()
+        {
+            return Err(distributed_machine_error(
+                "distributed Server evaluation belongs to another persistent authority",
+            ));
+        }
+        if evaluation.next_source_sequence != self.evaluation_next_source_sequence(turn)? {
+            return Err(distributed_machine_error(
+                "persistent distributed Server evaluation source sequence is invalid",
+            ));
+        }
+        Ok(())
     }
 
     fn prepare_dispatch(
@@ -967,6 +1440,203 @@ impl PersistentProgramSession {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::DistributedServerMachine for PersistentProgramSession {
+    type EvaluationMachine = ProgramSession;
+
+    fn artifact(&self) -> &ProgramArtifact {
+        &self.artifact
+    }
+
+    fn fork_prepared_evaluation(
+        &self,
+        turn: Option<&crate::RuntimeTurn>,
+    ) -> Result<Self::EvaluationMachine, crate::DistributedRuntimeError> {
+        self.fork_prepared_distributed_server_evaluation(turn)
+    }
+
+    fn install_evaluation(
+        &mut self,
+        evaluation: Self::EvaluationMachine,
+    ) -> Result<(), crate::DistributedRuntimeError> {
+        self.install_distributed_server_evaluation(evaluation)
+            .map_err(distributed_machine_error)
+    }
+
+    fn commit_prepared_evaluation(
+        &mut self,
+        turn: crate::RuntimeTurn,
+        evaluation: Self::EvaluationMachine,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.commit_prepared_distributed_server_evaluation(turn, evaluation, Vec::new())
+            .map(|(turn, _)| turn)
+            .map_err(distributed_machine_error)
+    }
+
+    fn commit_prepared_evaluation_with_protocol_state(
+        &mut self,
+        turn: crate::RuntimeTurn,
+        evaluation: Self::EvaluationMachine,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.commit_prepared_distributed_server_evaluation(turn, evaluation, protocol_state_changes)
+            .map(|(turn, _)| turn)
+            .map_err(distributed_machine_error)
+    }
+
+    fn event_for_path(
+        &self,
+        path: &str,
+        payload: SourcePayload,
+    ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
+        self.runtime
+            .runtime()
+            .source_event(self.next_source_sequence, path, None, payload)
+            .map_err(distributed_machine_error)
+    }
+
+    fn event_for_source(
+        &self,
+        source: boon_plan::SourceId,
+        payload: SourcePayload,
+    ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
+        self.runtime
+            .runtime()
+            .source_event_by_id(self.next_source_sequence, source, None, payload)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_dispatch(
+        &mut self,
+        event: crate::SourceEvent,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.prepare_distributed_dispatch(event, false)
+            .map_err(distributed_machine_error)
+    }
+
+    fn export_current(
+        &mut self,
+        export_id: boon_plan::ExportId,
+    ) -> Result<crate::Value, crate::DistributedRuntimeError> {
+        self.runtime
+            .distributed_export_value_current(export_id)
+            .map_err(distributed_machine_error)
+    }
+
+    fn call_arguments(
+        &mut self,
+        call: &boon_plan::RemoteCallSitePlan,
+    ) -> Result<
+        BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+        crate::DistributedRuntimeError,
+    > {
+        self.runtime
+            .distributed_call_arguments_current(call.call_site_id)
+            .map_err(distributed_machine_error)
+    }
+
+    fn evaluate_function(
+        &mut self,
+        export_id: boon_plan::ExportId,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+    ) -> Result<crate::Value, crate::DistributedRuntimeError> {
+        self.runtime
+            .evaluate_distributed_function(export_id, arguments)
+            .map_err(distributed_machine_error)
+    }
+
+    fn replace_distributed_context(
+        &mut self,
+        session_context: crate::SessionContext,
+        imports: Vec<crate::DistributedImportUpdate>,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::DistributedRuntimeError> {
+        self.runtime
+            .replace_distributed_context(session_context, imports)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_transient_effect_completion(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        outcome: crate::Value,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.prepare_distributed_effect_completion(call_id, outcome, false)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_transient_effect_result(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        result_sequence: u64,
+        outcome: crate::Value,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.prepare_distributed_effect_result(call_id, result_sequence, outcome, false)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_transient_effect_cancellation(
+        &mut self,
+        call_ids: &[crate::TransientEffectCallId],
+    ) -> Result<Option<crate::RuntimeTurn>, crate::DistributedRuntimeError> {
+        self.prepare_distributed_effect_cancellation(call_ids, false)
+            .map_err(distributed_machine_error)
+    }
+
+    fn commit_prepared_turn(
+        &mut self,
+        turn: crate::RuntimeTurn,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.commit_prepared_distributed_turn(turn)
+            .map(|(turn, _)| turn)
+            .map_err(distributed_machine_error)
+    }
+
+    fn commit_prepared_turn_with_protocol_state(
+        &mut self,
+        turn: crate::RuntimeTurn,
+        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        self.commit_prepared_distributed_turn_with_protocol_state(turn, protocol_state_changes)
+            .map(|(turn, _)| turn)
+            .map_err(distributed_machine_error)
+    }
+
+    fn prepare_protocol_checkpoint(
+        &mut self,
+    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
+        PersistentProgramSession::prepare_protocol_checkpoint(self)
+            .map_err(distributed_machine_error)
+    }
+
+    fn supports_protocol_state(&self) -> bool {
+        true
+    }
+
+    fn rollback_prepared_turn(&mut self) -> Result<(), crate::DistributedRuntimeError> {
+        self.rollback_prepared_distributed_turn()
+            .map_err(distributed_machine_error)
+    }
+
+    fn has_pending_transient_effect(&self, call_id: crate::TransientEffectCallId) -> bool {
+        self.runtime
+            .pending_transient_effect_credits(call_id)
+            .is_some()
+    }
+
+    fn set_transient_effect_scope(&mut self, scope: u64) {
+        self.runtime.set_transient_effect_scope(scope);
+    }
+
+    fn root_value_current(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::Value, crate::DistributedRuntimeError> {
+        self.runtime
+            .root_value_current(name)
+            .map_err(distributed_machine_error)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DistributedProgramBundle {
     artifacts: Vec<ProgramArtifact>,
@@ -1064,10 +1734,6 @@ impl DistributedProgramBundle {
             .iter()
             .find(|artifact| artifact.role() == role)
     }
-
-    pub fn start_distributed(&self) -> crate::RuntimeResult<DistributedProgramLifecycle> {
-        DistributedProgramLifecycle::start(self)
-    }
 }
 
 fn program_role_rank(role: ProgramRole) -> u8 {
@@ -1092,273 +1758,6 @@ fn deterministic_program_session_id(artifact: &ProgramArtifact) -> ProgramSessio
         hasher.update(component.as_bytes());
     }
     ProgramSessionId(format!("program-session:{:x}", hasher.finalize()))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DistributedProgramTurn {
-    pub lifecycle_sequence: u64,
-    pub session: ProgramSessionId,
-    pub role: ProgramRole,
-    pub source_sequence: u64,
-    pub runtime_sequence: u64,
-    pub source_path: String,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct DistributedDispatchOutcome {
-    pub turn: DistributedProgramTurn,
-    pub runtime_turn: crate::RuntimeTurn,
-    pub propagated_turns: Vec<DistributedPropagationTurn>,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct DistributedPropagationTurn {
-    pub consumer_role: ProgramRole,
-    pub import_id: boon_plan::ImportId,
-    pub runtime_turn: crate::RuntimeTurn,
-}
-
-pub struct DistributedProgramLifecycle {
-    sessions: Vec<ProgramSession>,
-    graph: boon_plan::DistributedGraphPlan,
-    delivered_values: BTreeMap<boon_plan::ImportId, (u64, crate::Value)>,
-    next_lifecycle_sequence: u64,
-    turn_log: Vec<DistributedProgramTurn>,
-}
-
-impl DistributedProgramLifecycle {
-    fn start(bundle: &DistributedProgramBundle) -> crate::RuntimeResult<Self> {
-        if bundle.artifacts.len() != 3
-            || bundle.artifact(ProgramRole::Client).is_none()
-            || bundle.artifact(ProgramRole::Session).is_none()
-            || bundle.artifact(ProgramRole::Server).is_none()
-        {
-            return Err(
-                "distributed lifecycle requires client, session, and server artifacts".into(),
-            );
-        }
-        let sessions = bundle
-            .artifacts
-            .iter()
-            .cloned()
-            .map(ProgramSession::start)
-            .collect::<Result<Vec<_>, _>>()?;
-        let graph_identity = bundle.artifacts[0]
-            .plan()
-            .distributed_endpoint
-            .as_ref()
-            .expect("bundle validation requires endpoint contracts")
-            .graph
-            .clone();
-        let graph = boon_plan::DistributedGraphPlan::new(
-            bundle.artifacts[0].application(),
-            graph_identity,
-            bundle
-                .artifacts
-                .iter()
-                .map(|artifact| {
-                    artifact
-                        .plan()
-                        .distributed_endpoint
-                        .as_ref()
-                        .expect("bundle validation requires endpoint contracts")
-                        .endpoint
-                        .clone()
-                })
-                .collect(),
-        )?;
-        let mut lifecycle = Self {
-            sessions,
-            graph,
-            delivered_values: BTreeMap::new(),
-            next_lifecycle_sequence: 1,
-            turn_log: Vec::new(),
-        };
-        lifecycle.propagate_distributed_currentness()?;
-        Ok(lifecycle)
-    }
-
-    pub fn session_count(&self) -> usize {
-        self.sessions.len()
-    }
-
-    pub fn artifact(&self, role: ProgramRole) -> Option<&ProgramArtifact> {
-        self.session(role).map(ProgramSession::artifact)
-    }
-
-    pub fn session_id(&self, role: ProgramRole) -> Option<&ProgramSessionId> {
-        self.session(role).map(ProgramSession::id)
-    }
-
-    pub fn turn_log(&self) -> &[DistributedProgramTurn] {
-        &self.turn_log
-    }
-
-    pub fn frame(&self, role: ProgramRole) -> Option<&DocumentFrame> {
-        self.session(role).and_then(ProgramSession::frame)
-    }
-
-    pub fn dispatch(
-        &mut self,
-        role: ProgramRole,
-        source_path: &str,
-        target: Option<RowId>,
-        payload: SourcePayload,
-    ) -> crate::RuntimeResult<DistributedDispatchOutcome> {
-        let lifecycle_sequence = self.next_lifecycle_sequence;
-        let next_lifecycle_sequence = lifecycle_sequence
-            .checked_add(1)
-            .ok_or("distributed lifecycle sequence overflow")?;
-        let session = self.session_mut(role)?;
-        let session_id = session.id().clone();
-        let dispatched = session.dispatch(source_path, target, payload)?;
-        let turn = DistributedProgramTurn {
-            lifecycle_sequence,
-            session: session_id,
-            role,
-            source_sequence: dispatched.source_sequence,
-            runtime_sequence: dispatched.runtime_turn.sequence,
-            source_path: dispatched.source_path,
-        };
-        self.next_lifecycle_sequence = next_lifecycle_sequence;
-        self.turn_log.push(turn.clone());
-        let propagated_turns = self.propagate_distributed_currentness()?;
-        Ok(DistributedDispatchOutcome {
-            turn,
-            runtime_turn: dispatched.runtime_turn,
-            propagated_turns,
-        })
-    }
-
-    pub fn root_value_current(
-        &mut self,
-        role: ProgramRole,
-        name: &str,
-    ) -> crate::RuntimeResult<crate::Value> {
-        self.session_mut(role)?.root_value_current(name)
-    }
-
-    pub fn output_value_current(
-        &mut self,
-        role: ProgramRole,
-        name: &str,
-    ) -> crate::RuntimeResult<crate::Value> {
-        self.session_mut(role)?.output_value_current(name)
-    }
-
-    pub fn propagate_distributed_currentness(
-        &mut self,
-    ) -> crate::RuntimeResult<Vec<DistributedPropagationTurn>> {
-        let mut propagated = Vec::new();
-        for consumer_role in [ProgramRole::Session, ProgramRole::Client] {
-            let endpoint = self
-                .graph
-                .endpoints
-                .iter()
-                .find(|endpoint| endpoint.role == consumer_role)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "distributed graph has no {} endpoint",
-                        consumer_role.as_str()
-                    )
-                })?;
-            for import in &endpoint.value_imports {
-                let value = self
-                    .session_mut(import.producer_role)?
-                    .distributed_export_value_current(import.source_export_id)?;
-                self.deliver_distributed_value(
-                    consumer_role,
-                    import.import_id,
-                    value,
-                    &mut propagated,
-                )?;
-            }
-
-            // Call-result imports may depend on earlier calls in the same
-            // endpoint. Re-evaluate a bounded number of times; graph validation
-            // has already rejected cycles.
-            for _ in 0..=endpoint.remote_call_sites.len() {
-                let mut changed = false;
-                for call in &endpoint.remote_call_sites {
-                    let arguments = self
-                        .session_mut(consumer_role)?
-                        .distributed_call_arguments_current(call.call_site_id)?;
-                    let value = self
-                        .session_mut(call.callee_role)?
-                        .evaluate_distributed_function(call.function_export_id, arguments)?;
-                    changed |= self.deliver_distributed_value(
-                        consumer_role,
-                        call.result_import_id,
-                        value,
-                        &mut propagated,
-                    )?;
-                }
-                if !changed {
-                    break;
-                }
-            }
-        }
-        Ok(propagated)
-    }
-
-    fn deliver_distributed_value(
-        &mut self,
-        consumer_role: ProgramRole,
-        import_id: boon_plan::ImportId,
-        value: crate::Value,
-        propagated: &mut Vec<DistributedPropagationTurn>,
-    ) -> crate::RuntimeResult<bool> {
-        if self
-            .delivered_values
-            .get(&import_id)
-            .is_some_and(|(_, current)| current == &value)
-        {
-            return Ok(false);
-        }
-        let revision = self
-            .delivered_values
-            .get(&import_id)
-            .map(|(revision, _)| revision.saturating_add(1))
-            .unwrap_or(1);
-        if revision == u64::MAX
-            && self
-                .delivered_values
-                .get(&import_id)
-                .is_some_and(|(current, _)| *current == u64::MAX)
-        {
-            return Err(
-                format!("distributed import {import_id} content revision exhausted").into(),
-            );
-        }
-        let turn = self.session_mut(consumer_role)?.update_distributed_import(
-            import_id,
-            revision,
-            value.clone(),
-        )?;
-        self.delivered_values.insert(import_id, (revision, value));
-        if let Some(runtime_turn) = turn {
-            propagated.push(DistributedPropagationTurn {
-                consumer_role,
-                import_id,
-                runtime_turn,
-            });
-        }
-        Ok(true)
-    }
-
-    fn session(&self, role: ProgramRole) -> Option<&ProgramSession> {
-        self.sessions
-            .iter()
-            .find(|session| session.artifact().role() == role)
-    }
-
-    fn session_mut(&mut self, role: ProgramRole) -> crate::RuntimeResult<&mut ProgramSession> {
-        self.sessions
-            .iter_mut()
-            .find(|session| session.artifact().role() == role)
-            .ok_or_else(|| format!("distributed lifecycle has no {} role", role.as_str()).into())
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1649,14 +2048,16 @@ fn validate_plan(
                 .effects
                 .iter()
                 .filter(|effect| {
-                    !matches!(effect.replay, EffectReplay::ReadOnly)
-                        || effect.barrier != EffectBarrier::None
+                    !matches!(
+                        effect.replay,
+                        EffectReplay::ReadOnly | EffectReplay::ProcessScoped
+                    ) || effect.barrier != EffectBarrier::None
                         || effect.schema.is_none()
                 })
                 .count();
             if denied_effects > 0 {
                 failures.push(format!(
-                    "profile `{}` forbids {denied_effects} host effect contract(s) that are not typed read-only operations without persistence barriers",
+                    "profile `{}` forbids {denied_effects} host effect contract(s) that are not typed process-local operations without persistence barriers",
                     profile.name(),
                 ));
             }
@@ -1682,14 +2083,13 @@ fn validate_plan(
                     profile.name()
                 ));
             }
-            if plan.outputs.is_empty()
-                || plan
-                    .outputs
-                    .iter()
-                    .any(|output| !matches!(output.contract, OutputContractKind::HostValue { .. }))
+            if plan
+                .outputs
+                .iter()
+                .any(|output| !matches!(output.contract, OutputContractKind::HostValue { .. }))
             {
                 failures.push(format!(
-                    "{} program requires one or more typed host-value outputs",
+                    "{} program outputs must be typed host values",
                     profile.name()
                 ));
             }
@@ -3173,7 +3573,6 @@ store: [
                     body: store.request.body
                     connect_timeout_ms: store.request.connect_timeout_ms
                     overall_timeout_ms: store.request.overall_timeout_ms
-                    cancellation: store.request.cancellation
                 )
             }
         }
@@ -3462,7 +3861,7 @@ document: Document/new(
                         ("path_segments".to_owned(), crate::Value::List(Vec::new())),
                         ("query".to_owned(), crate::Value::List(Vec::new())),
                         ("headers".to_owned(), crate::Value::List(Vec::new())),
-                        ("body".to_owned(), crate::Value::Bytes(Vec::new())),
+                        ("body".to_owned(), crate::Value::Bytes(Vec::new().into())),
                         (
                             "connect_timeout_ms".to_owned(),
                             crate::Value::integer(500).unwrap(),
@@ -3507,7 +3906,7 @@ document: Document/new(
                 ("path_segments".to_owned(), crate::Value::List(Vec::new())),
                 ("query".to_owned(), crate::Value::List(Vec::new())),
                 ("headers".to_owned(), crate::Value::List(Vec::new())),
-                ("body".to_owned(), crate::Value::Bytes(Vec::new())),
+                ("body".to_owned(), crate::Value::Bytes(Vec::new().into())),
                 (
                     "connect_timeout_ms".to_owned(),
                     crate::Value::integer(500).unwrap(),
@@ -3547,7 +3946,7 @@ document: Document/new(
             ),
             ("status".to_owned(), crate::Value::integer(207).unwrap()),
             ("headers".to_owned(), crate::Value::List(Vec::new())),
-            ("body".to_owned(), crate::Value::Bytes(Vec::new())),
+            ("body".to_owned(), crate::Value::Bytes(Vec::new().into())),
             (
                 "redirects_followed".to_owned(),
                 crate::Value::integer(0).unwrap(),
@@ -3603,10 +4002,43 @@ document: Document/new(
     }
 
     #[test]
-    fn distributed_program_requires_distinct_namespaces_and_starts_deterministic_sessions() {
-        let client_request = request(1, &child_source("Distributed"));
-        let session_request = session_request(1, server_source());
-        let server_request = server_request(1, server_source());
+    fn distributed_program_requires_distinct_namespaces_and_orders_role_artifacts() {
+        let client_request = request(
+            1,
+            r#"
+store: [
+    increment: SOURCE
+]
+
+scene: Scene/Element/text(
+    element: []
+    style: [width: Fill]
+    text: TEXT { Distributed }
+)
+"#,
+        );
+        let session_request = session_request(
+            1,
+            r#"
+store: [
+    increment: Client/store.increment
+    count:
+        0 |> HOLD count {
+            LATEST {
+                increment |> THEN { count + 1 }
+            }
+        }
+]
+
+outputs: [
+    count: store.count
+]
+"#,
+        );
+        let server_request = server_request(
+            1,
+            "store: [\n    ready: True\n]\n\noutputs: [\n    ready: store.ready\n]\n",
+        );
         let bundle = compile_distributed_program_bundle(&[
             server_request.clone(),
             client_request.clone(),
@@ -3616,25 +4048,6 @@ document: Document/new(
         assert_eq!(bundle.artifacts()[0].role(), ProgramRole::Client);
         assert_eq!(bundle.artifacts()[1].role(), ProgramRole::Session);
         assert_eq!(bundle.artifacts()[2].role(), ProgramRole::Server);
-
-        let first = bundle.start_distributed().unwrap();
-        let second = bundle.start_distributed().unwrap();
-        assert_eq!(
-            first.session_id(ProgramRole::Client),
-            second.session_id(ProgramRole::Client)
-        );
-        assert_eq!(
-            first.session_id(ProgramRole::Session),
-            second.session_id(ProgramRole::Session)
-        );
-        assert_eq!(
-            first.session_id(ProgramRole::Server),
-            second.session_id(ProgramRole::Server)
-        );
-        assert_ne!(
-            first.session_id(ProgramRole::Client),
-            first.session_id(ProgramRole::Server)
-        );
 
         let mut duplicate_namespace_request = server_request;
         duplicate_namespace_request.revision = 2;
@@ -3650,15 +4063,19 @@ document: Document/new(
     }
 
     #[test]
-    fn distributed_value_updates_patch_the_client_document_directly() {
+    fn distributed_client_document_compiles_a_session_value_import() {
         let client = request(
             1,
             r#"
+store: [
+    increment: SOURCE
+]
+
 document: Document/new(
     root: Element/label(
         element: []
         style: []
-        label: Session.outputs.adjusted_count
+        label: Session/store.adjusted_count
     )
 )
 "#,
@@ -3667,7 +4084,14 @@ document: Document/new(
             1,
             r#"
 store: [
-    adjusted_count: Server.store.count + 1
+    increment: Client/store.increment
+    count:
+        40 |> HOLD count {
+            LATEST {
+                increment |> THEN { count + 1 }
+            }
+        }
+    adjusted_count: count + 1
 ]
 
 outputs: [
@@ -3677,49 +4101,24 @@ outputs: [
         );
         let server = server_request(
             1,
-            r#"
-store: [
-    increment: SOURCE
-    count:
-        40 |> HOLD count {
-            LATEST {
-                increment |> THEN { count + 1 }
-            }
-        }
-]
-
-outputs: [
-    count: store.count
-]
-"#,
+            "store: [\n    ready: True\n]\n\noutputs: [\n    ready: store.ready\n]\n",
         );
         let bundle = compile_distributed_program_bundle(&[client, session, server]).unwrap();
-        let mut lifecycle = bundle.start_distributed().unwrap();
-        assert!(frame_has_text(
-            lifecycle.frame(ProgramRole::Client).unwrap(),
-            "41"
-        ));
-
-        let outcome = lifecycle
-            .dispatch(
-                ProgramRole::Server,
-                "store.increment",
-                None,
-                SourcePayload::default(),
-            )
+        let client_endpoint = bundle
+            .artifact(ProgramRole::Client)
+            .unwrap()
+            .plan()
+            .distributed_endpoint
+            .as_ref()
             .unwrap();
-        assert!(outcome.propagated_turns.iter().any(|turn| {
-            turn.consumer_role == ProgramRole::Client
-                && turn
-                    .runtime_turn
-                    .document_patches
-                    .iter()
-                    .any(|patch| matches!(patch, DocumentPatch::SetText { .. }))
+        assert_eq!(client_endpoint.endpoint.value_imports.len(), 1);
+        assert_eq!(
+            client_endpoint.endpoint.value_imports[0].producer_role,
+            ProgramRole::Session
+        );
+        assert!(client_endpoint.wire_schema.value_edges.iter().any(|edge| {
+            edge.producer_role == ProgramRole::Session && edge.consumer_role == ProgramRole::Client
         }));
-        assert!(frame_has_text(
-            lifecycle.frame(ProgramRole::Client).unwrap(),
-            "42"
-        ));
     }
 
     #[test]

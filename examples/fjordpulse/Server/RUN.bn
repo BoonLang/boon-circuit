@@ -23,18 +23,16 @@ store: [
         }
 
     search_query:
-        LATEST {
-            http_request.method |> THEN {
-                http_request.query
-                    |> List/filter_field_equal(
-                        field: name
-                        value: TEXT { q }
-                    )
-                    |> List/join_field(
-                        field: value
-                        separator: Text/empty()
-                    )
-            }
+        http_request.method |> THEN {
+            http_request.query
+                |> List/filter_field_equal(
+                    field: name
+                    value: TEXT { q }
+                )
+                |> List/join_field(
+                    field: value
+                    separator: Text/empty()
+                )
         }
 
     stations: LIST {

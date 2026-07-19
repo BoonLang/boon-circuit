@@ -21,12 +21,10 @@ store: [
     theme:
         DRAIN { preferences.theme }
         |> HOLD theme {
-            LATEST {
-                sources.theme_button.events.press |> THEN {
-                    theme |> WHEN {
-                        Light => Dark
-                        Dark => Light
-                    }
+            sources.theme_button.events.press |> THEN {
+                theme |> WHEN {
+                    Light => Dark
+                    Dark => Light
                 }
             }
         }
@@ -34,21 +32,17 @@ store: [
     density:
         DRAIN { preferences.density }
         |> HOLD density {
-            LATEST {
-                sources.density_button.events.press |> THEN {
-                    density |> WHEN {
-                        Comfortable => Compact
-                        Compact => Comfortable
-                    }
+            sources.density_button.events.press |> THEN {
+                density |> WHEN {
+                    Comfortable => Compact
+                    Compact => Comfortable
                 }
             }
         }
 
     show_help:
         False |> HOLD show_help {
-            LATEST {
-                sources.help_button.events.press |> THEN { True }
-            }
+            sources.help_button.events.press |> THEN { True }
         }
 
     tasks:
@@ -69,28 +63,22 @@ FUNCTION new_task(task) {
 
         title:
             task.title |> HOLD title {
-                LATEST {
-                    sources.rename_button.events.press |> THEN {
-                        TEXT { Plan release (edited) }
-                    }
+                sources.rename_button.events.press |> THEN {
+                    TEXT { Plan release (edited) }
                 }
             }
 
         completed:
             task.completed |> HOLD completed {
-                LATEST {
-                    sources.toggle_button.events.press |> THEN { completed |> Bool/not() }
-                }
+                sources.toggle_button.events.press |> THEN { completed |> Bool/not() }
             }
 
         priority:
             task.priority |> HOLD priority {
-                LATEST {
-                    sources.priority_button.events.press |> THEN {
-                        priority |> WHEN {
-                            Normal => High
-                            High => Normal
-                        }
+                sources.priority_button.events.press |> THEN {
+                    priority |> WHEN {
+                        Normal => High
+                        High => Normal
                     }
                 }
             }

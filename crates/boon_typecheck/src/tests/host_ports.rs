@@ -79,6 +79,144 @@ store: [
 }
 
 #[test]
+fn typed_host_effect_allows_omitting_a_schema_defaulted_argument() {
+    let parsed = boon_parser::parse_source(
+        "defaulted-file-effect.bn",
+        r#"
+store: [
+    read: SOURCE
+    selected: PackageAsset[url: TEXT { asset://files/primary.bin }]
+    result:
+        NotStarted |> HOLD result {
+            read |> THEN {
+                File/read_stream(
+                    file: selected
+                    retain_content: False
+                )
+            }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+    assert!(
+        !report.has_errors(),
+        "schema default was not accepted: {:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn typed_host_effect_arguments_use_when_variant_narrowing() {
+    let parsed = boon_parser::parse_source(
+        "narrowed-effect-chain.bn",
+        r#"
+store: [
+    read: SOURCE
+    selected: PackageAsset[url: TEXT { asset://files/primary.vcd }]
+    file_result:
+        NotStarted |> HOLD file_result {
+            read |> THEN {
+                File/read_stream(
+                    file: selected
+                    retain_content: True
+                )
+            }
+        }
+    waveform_result:
+        NotStarted |> HOLD waveform_result {
+            file_result |> WHEN {
+                Finished => file_result.retained |> WHEN {
+                    Retained => Wellen/open(content: file_result.retained.content)
+                    __ => SKIP
+                }
+                __ => SKIP
+            }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+    assert!(
+        !report.has_errors(),
+        "host-effect validation ran before WHEN narrowing: {:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn typed_host_effect_checks_inline_and_multiline_arguments_against_one_schema() {
+    for (label, call) in [
+        (
+            "inline",
+            "File/read_stream(file: selected, chunk_bytes: False, retain_content: False)",
+        ),
+        (
+            "multiline",
+            r#"File/read_stream(
+                    file: selected
+                    chunk_bytes: False
+                    retain_content: False
+                )"#,
+        ),
+    ] {
+        let source = format!(
+            r#"
+store: [
+    read: SOURCE
+    selected: PackageAsset[url: TEXT {{ asset://files/primary.bin }}]
+    result:
+        NotStarted |> HOLD result {{
+            read |> THEN {{ {call} }}
+        }}
+]
+"#,
+        );
+        let parsed = boon_parser::parse_source(&format!("wrong-{label}.bn"), &source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("argument `chunk_bytes`")
+                    && diagnostic.message.contains("expected: NUMBER")
+            }),
+            "{label} call escaped schema typing: {:?}",
+            report.diagnostics
+        );
+    }
+
+    for missing in ["file", "retain_content"] {
+        let arguments = match missing {
+            "file" => "retain_content: False",
+            "retain_content" => "file: selected",
+            _ => unreachable!(),
+        };
+        let source = format!(
+            r#"
+store: [
+    read: SOURCE
+    selected: PackageAsset[url: TEXT {{ asset://files/primary.bin }}]
+    result:
+        NotStarted |> HOLD result {{
+            read |> THEN {{ File/read_stream({arguments}) }}
+        }}
+]
+"#,
+        );
+        let parsed = boon_parser::parse_source(&format!("missing-{missing}.bn"), &source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains(&format!("missing required argument `{missing}`"))),
+            "missing {missing} was accepted: {:?}",
+            report.diagnostics
+        );
+    }
+}
+
+#[test]
 fn http_host_port_accepts_only_the_closed_bytes_response_contract() {
     let valid_responses = [
         r#"[

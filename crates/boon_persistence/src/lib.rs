@@ -10,7 +10,7 @@ use std::fmt;
 mod codec;
 mod migration;
 
-pub use boon_data::Value as StoredValue;
+pub use boon_data::{Bytes, Value as StoredValue};
 
 #[cfg(any(target_arch = "wasm32", test))]
 mod web;
@@ -95,7 +95,7 @@ pub fn canonical_intent_key(intent: &StoredValue) -> StoredValue {
     let mut hasher = Sha256::new();
     hasher.update(b"boon.effect-intent-key.v1");
     hash_stored_value(&mut hasher, intent);
-    StoredValue::Bytes(hasher.finalize().to_vec())
+    StoredValue::Bytes(hasher.finalize().to_vec().into())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -293,8 +293,124 @@ pub struct CheckpointBatch {
     pub changes: Vec<DurableChange>,
     pub outbox_changes: Vec<DurableOutboxChange>,
     #[serde(default)]
+    pub protocol_state_changes: Vec<DurableProtocolStateChange>,
+    #[serde(default)]
     pub content_artifact_changes: Vec<DurableContentArtifactChange>,
     pub checksum: [u8; 32],
+}
+
+pub const MAX_PROTOCOL_STATE_RECORDS: usize = 4_096;
+pub const MAX_PROTOCOL_STATE_RECORD_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PROTOCOL_STATE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Host-private key for protocol recovery state committed with application authority.
+///
+/// Keys and payloads are deliberately absent from the public persistence inspector and
+/// application export. Hosts derive keys from their own private identity domains.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct ProtocolStateKey(pub [u8; 32]);
+
+impl ProtocolStateKey {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ProtocolStateKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProtocolStateKey(..)")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProtocolStateRecord {
+    pub revision: u64,
+    pub payload: Bytes,
+}
+
+impl fmt::Debug for ProtocolStateRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtocolStateRecord")
+            .field("revision", &self.revision)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DurableProtocolStateChange {
+    Put {
+        key: ProtocolStateKey,
+        expected_revision: Option<u64>,
+        next_revision: u64,
+        payload: Bytes,
+        turn_sequence: u64,
+    },
+    Delete {
+        key: ProtocolStateKey,
+        expected_revision: u64,
+        turn_sequence: u64,
+    },
+}
+
+impl DurableProtocolStateChange {
+    pub const fn turn_sequence(&self) -> u64 {
+        match self {
+            Self::Put { turn_sequence, .. } | Self::Delete { turn_sequence, .. } => *turn_sequence,
+        }
+    }
+}
+
+impl fmt::Debug for DurableProtocolStateChange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Put {
+                expected_revision,
+                next_revision,
+                payload,
+                turn_sequence,
+                ..
+            } => formatter
+                .debug_struct("PutProtocolState")
+                .field("expected_revision", expected_revision)
+                .field("next_revision", next_revision)
+                .field("payload_bytes", &payload.len())
+                .field("turn_sequence", turn_sequence)
+                .finish(),
+            Self::Delete {
+                expected_revision,
+                turn_sequence,
+                ..
+            } => formatter
+                .debug_struct("DeleteProtocolState")
+                .field("expected_revision", expected_revision)
+                .field("turn_sequence", turn_sequence)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProtocolStateSnapshot {
+    pub records: BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
+}
+
+impl fmt::Debug for ProtocolStateSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bytes = self
+            .records
+            .values()
+            .map(|record| record.payload.len())
+            .sum::<usize>();
+        formatter
+            .debug_struct("ProtocolStateSnapshot")
+            .field("record_count", &self.records.len())
+            .field("payload_bytes", &bytes)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -439,6 +555,11 @@ pub struct BarrierRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InspectRequest {
+    pub application: ApplicationIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LoadProtocolStateRequest {
     pub application: ApplicationIdentity,
 }
 
@@ -633,6 +754,7 @@ pub struct ShutdownRequest;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PersistenceCommand {
     Load(RestoreRequest),
+    LoadProtocolState(LoadProtocolStateRequest),
     Initialize(RestoreImage),
     Commit(CheckpointBatch),
     Activate(ActivationBatch),
@@ -746,6 +868,7 @@ pub struct ShutdownAck;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PersistenceResult {
     Loaded(Result<Option<RestoreImage>, StoreError>),
+    ProtocolStateLoaded(Result<ProtocolStateSnapshot, StoreError>),
     Initialized(Result<CommitAck, StoreError>),
     Committed(Result<CommitAck, StoreError>),
     Activated(Result<ActivationAck, StoreError>),
@@ -771,6 +894,7 @@ pub enum StoreError {
     InvalidChecksum,
     InvalidAuthority(String),
     InvalidOutboxTransition(String),
+    InvalidProtocolState(String),
     InvalidContentArtifact(String),
     Backend(String),
 }
@@ -789,6 +913,9 @@ impl fmt::Display for StoreError {
             Self::InvalidOutboxTransition(detail) => {
                 write!(formatter, "invalid outbox transition: {detail}")
             }
+            Self::InvalidProtocolState(detail) => {
+                write!(formatter, "invalid protocol state: {detail}")
+            }
             Self::InvalidContentArtifact(detail) => {
                 write!(formatter, "invalid content artifact: {detail}")
             }
@@ -806,6 +933,7 @@ pub trait PersistenceDriver {
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryDriver {
     applications: BTreeMap<ApplicationIdentity, RestoreImage>,
+    protocol_state: BTreeMap<ApplicationIdentity, ProtocolStateSnapshot>,
     artifacts: BTreeMap<(ApplicationIdentity, ContentArtifactId), ContentArtifact>,
     closed: bool,
     fail_next_activation: bool,
@@ -813,7 +941,9 @@ pub struct InMemoryDriver {
 
 impl InMemoryDriver {
     pub fn seed(&mut self, image: RestoreImage) {
-        self.applications.insert(image.application.clone(), image);
+        let application = image.application.clone();
+        self.applications.insert(application.clone(), image);
+        self.protocol_state.entry(application).or_default();
     }
 
     pub fn fail_next_activation(&mut self) {
@@ -822,6 +952,13 @@ impl InMemoryDriver {
 
     pub fn image(&self, application: &ApplicationIdentity) -> Option<&RestoreImage> {
         self.applications.get(application)
+    }
+
+    pub fn protocol_state(
+        &self,
+        application: &ApplicationIdentity,
+    ) -> Option<&ProtocolStateSnapshot> {
+        self.protocol_state.get(application)
     }
 
     fn application_artifacts(
@@ -879,7 +1016,9 @@ impl InMemoryDriver {
             epoch: image.epoch,
             through_turn_sequence: image.through_turn_sequence,
         };
-        self.applications.insert(image.application.clone(), image);
+        let application = image.application.clone();
+        self.applications.insert(application.clone(), image);
+        self.protocol_state.entry(application).or_default();
         Ok(ack)
     }
 
@@ -890,8 +1029,19 @@ impl InMemoryDriver {
             .cloned()
             .ok_or(StoreError::MissingApplication)?;
         let ack = apply_checkpoint_to_image(&mut candidate, &batch)?;
+        let mut protocol_state = self
+            .protocol_state
+            .get(&batch.application)
+            .cloned()
+            .unwrap_or_default();
+        apply_durable_protocol_state_changes(
+            &mut protocol_state.records,
+            &batch.protocol_state_changes,
+        )?;
         let artifacts = self.application_artifacts(&batch.application);
         validate_content_artifact_storage(&candidate.content_artifact_manifest, &artifacts)?;
+        self.protocol_state
+            .insert(batch.application.clone(), protocol_state);
         self.applications.insert(batch.application, candidate);
         Ok(ack)
     }
@@ -949,6 +1099,7 @@ impl InMemoryDriver {
         let (reset, ack) = apply_reset_to_image(current, &batch)?;
         self.artifacts
             .retain(|(application, _), _| application != &batch.application);
+        self.protocol_state.remove(&batch.application);
         self.applications.insert(batch.application, reset);
         Ok(ack)
     }
@@ -1031,6 +1182,19 @@ impl PersistenceDriver for InMemoryDriver {
         }
         match command {
             PersistenceCommand::Load(request) => PersistenceResult::Loaded(self.load(request)),
+            PersistenceCommand::LoadProtocolState(request) => {
+                let result = self
+                    .applications
+                    .contains_key(&request.application)
+                    .then(|| {
+                        self.protocol_state
+                            .get(&request.application)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .ok_or(StoreError::MissingApplication);
+                PersistenceResult::ProtocolStateLoaded(result)
+            }
             PersistenceCommand::Initialize(image) => {
                 PersistenceResult::Initialized(self.initialize(image))
             }
@@ -1341,6 +1505,114 @@ pub fn apply_durable_outbox_changes(
                 outbox.remove(item_id);
             }
         }
+    }
+    Ok(())
+}
+
+/// Applies opaque host-protocol recovery records with optimistic revisions.
+///
+/// The persistence layer validates boundedness and compare-and-swap ordering but
+/// never interprets payload bytes. Protocol owners are responsible for their own
+/// versioned payload schema.
+pub fn apply_durable_protocol_state_changes(
+    records: &mut BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
+    changes: &[DurableProtocolStateChange],
+) -> Result<(), StoreError> {
+    let mut candidate = records.clone();
+    for change in changes {
+        match change {
+            DurableProtocolStateChange::Put {
+                key,
+                expected_revision,
+                next_revision,
+                payload,
+                ..
+            } => {
+                if payload.len() > MAX_PROTOCOL_STATE_RECORD_BYTES {
+                    return Err(StoreError::InvalidProtocolState(format!(
+                        "protocol record has {} bytes, limit is {MAX_PROTOCOL_STATE_RECORD_BYTES}",
+                        payload.len()
+                    )));
+                }
+                let current = candidate.get(key);
+                match (expected_revision, current) {
+                    (None, None) if *next_revision == 1 => {}
+                    (Some(expected), Some(current))
+                        if current.revision == *expected
+                            && expected.checked_add(1) == Some(*next_revision) => {}
+                    (_, Some(current))
+                        if current.revision == *next_revision && current.payload == *payload =>
+                    {
+                        continue;
+                    }
+                    _ => {
+                        return Err(StoreError::InvalidProtocolState(
+                            "protocol record revision compare-and-swap failed".to_owned(),
+                        ));
+                    }
+                }
+                candidate.insert(
+                    *key,
+                    ProtocolStateRecord {
+                        revision: *next_revision,
+                        payload: payload.clone(),
+                    },
+                );
+            }
+            DurableProtocolStateChange::Delete {
+                key,
+                expected_revision,
+                ..
+            } => {
+                let Some(current) = candidate.get(key) else {
+                    return Err(StoreError::InvalidProtocolState(
+                        "cannot delete a missing protocol record".to_owned(),
+                    ));
+                };
+                if current.revision != *expected_revision {
+                    return Err(StoreError::InvalidProtocolState(
+                        "protocol record delete revision does not match".to_owned(),
+                    ));
+                }
+                candidate.remove(key);
+            }
+        }
+    }
+    validate_protocol_state(&candidate)?;
+    *records = candidate;
+    Ok(())
+}
+
+pub fn validate_protocol_state(
+    records: &BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
+) -> Result<(), StoreError> {
+    if records.len() > MAX_PROTOCOL_STATE_RECORDS {
+        return Err(StoreError::InvalidProtocolState(format!(
+            "protocol state has {} records, limit is {MAX_PROTOCOL_STATE_RECORDS}",
+            records.len()
+        )));
+    }
+    let mut bytes = 0usize;
+    for record in records.values() {
+        if record.revision == 0 {
+            return Err(StoreError::InvalidProtocolState(
+                "protocol record revision must be positive".to_owned(),
+            ));
+        }
+        if record.payload.len() > MAX_PROTOCOL_STATE_RECORD_BYTES {
+            return Err(StoreError::InvalidProtocolState(format!(
+                "protocol record has {} bytes, limit is {MAX_PROTOCOL_STATE_RECORD_BYTES}",
+                record.payload.len()
+            )));
+        }
+        bytes = bytes.checked_add(record.payload.len()).ok_or_else(|| {
+            StoreError::InvalidProtocolState("protocol state byte count overflow".to_owned())
+        })?;
+    }
+    if bytes > MAX_PROTOCOL_STATE_BYTES {
+        return Err(StoreError::InvalidProtocolState(format!(
+            "protocol state has {bytes} bytes, limit is {MAX_PROTOCOL_STATE_BYTES}"
+        )));
     }
     Ok(())
 }
@@ -1921,6 +2193,15 @@ fn validate_checkpoint(batch: &CheckpointBatch) -> Result<(), StoreError> {
             )));
         }
     }
+    for change in &batch.protocol_state_changes {
+        let turn = change.turn_sequence();
+        if turn < batch.first_turn_sequence || turn > batch.last_turn_sequence {
+            return Err(StoreError::InvalidProtocolState(format!(
+                "protocol-state transition turn {turn} is outside checkpoint range {}..={}",
+                batch.first_turn_sequence, batch.last_turn_sequence
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2095,6 +2376,7 @@ fn checkpoint_checksum(batch: &CheckpointBatch) -> [u8; 32] {
     hasher.update(batch.last_turn_sequence.to_be_bytes());
     hash_changes(&mut hasher, &batch.changes);
     hash_outbox_changes(&mut hasher, &batch.outbox_changes);
+    hash_protocol_state_changes(&mut hasher, &batch.protocol_state_changes);
     hash_content_artifact_changes(&mut hasher, &batch.content_artifact_changes);
     hasher.finalize().into()
 }
@@ -2332,6 +2614,45 @@ fn hash_outbox_changes(hasher: &mut Sha256, changes: &[DurableOutboxChange]) {
     }
 }
 
+fn hash_protocol_state_changes(hasher: &mut Sha256, changes: &[DurableProtocolStateChange]) {
+    hasher.update((changes.len() as u64).to_be_bytes());
+    for change in changes {
+        match change {
+            DurableProtocolStateChange::Put {
+                key,
+                expected_revision,
+                next_revision,
+                payload,
+                turn_sequence,
+            } => {
+                hasher.update([0]);
+                hasher.update(key.as_bytes());
+                match expected_revision {
+                    Some(revision) => {
+                        hasher.update([1]);
+                        hasher.update(revision.to_be_bytes());
+                    }
+                    None => hasher.update([0]),
+                }
+                hasher.update(next_revision.to_be_bytes());
+                hasher.update(turn_sequence.to_be_bytes());
+                hasher.update((payload.len() as u64).to_be_bytes());
+                hasher.update(payload);
+            }
+            DurableProtocolStateChange::Delete {
+                key,
+                expected_revision,
+                turn_sequence,
+            } => {
+                hasher.update([1]);
+                hasher.update(key.as_bytes());
+                hasher.update(expected_revision.to_be_bytes());
+                hasher.update(turn_sequence.to_be_bytes());
+            }
+        }
+    }
+}
+
 fn hash_outbox_transition_header(
     hasher: &mut Sha256,
     item_id: OutboxItemId,
@@ -2535,6 +2856,9 @@ pub(crate) fn inspector_snapshot_with_artifacts(
 fn error_result(command: PersistenceCommand, error: StoreError) -> PersistenceResult {
     match command {
         PersistenceCommand::Load(_) => PersistenceResult::Loaded(Err(error)),
+        PersistenceCommand::LoadProtocolState(_) => {
+            PersistenceResult::ProtocolStateLoaded(Err(error))
+        }
         PersistenceCommand::Initialize(_) => PersistenceResult::Initialized(Err(error)),
         PersistenceCommand::Commit(_) => PersistenceResult::Committed(Err(error)),
         PersistenceCommand::Activate(_) => PersistenceResult::Activated(Err(error)),
@@ -2713,6 +3037,7 @@ mod tests {
             last_turn_sequence: turn_sequence,
             changes: authority_changes,
             outbox_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: changes,
             checksum: [0; 32],
         }
@@ -3039,7 +3364,7 @@ mod tests {
     }
 
     fn invocation() -> EffectInvocationId {
-        EffectInvocationId::from_semantic_route(effect(), "test.send", "store.result").unwrap()
+        EffectInvocationId::from_result_owner(effect(), "store.result").unwrap()
     }
 
     fn pending_outbox(key: i64, turn_sequence: u64) -> DurableOutboxItem {
@@ -3095,6 +3420,7 @@ mod tests {
                 },
             }],
             outbox_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3138,6 +3464,7 @@ mod tests {
                 },
             ],
             outbox_changes: Vec::new(),
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3322,6 +3649,7 @@ mod tests {
             last_turn_sequence: 1,
             changes: Vec::new(),
             outbox_changes,
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3355,6 +3683,7 @@ mod tests {
             last_turn_sequence: 2,
             changes: Vec::new(),
             outbox_changes: vec![dispatch.clone(), dispatch],
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3390,6 +3719,7 @@ mod tests {
                 attempt: 1,
                 turn_sequence: 3,
             }],
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3436,6 +3766,7 @@ mod tests {
                 },
             }],
             outbox_changes: completions,
+            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3513,5 +3844,48 @@ mod tests {
             driver.execute(PersistenceCommand::ResetApplication(batch)),
             PersistenceResult::ApplicationReset(Err(StoreError::StaleEpoch))
         ));
+    }
+
+    #[test]
+    fn private_protocol_state_is_revisioned_bounded_and_not_in_the_restore_image() {
+        let key = ProtocolStateKey([7; 32]);
+        let mut records = BTreeMap::new();
+        apply_durable_protocol_state_changes(
+            &mut records,
+            &[DurableProtocolStateChange::Put {
+                key,
+                expected_revision: None,
+                next_revision: 1,
+                payload: Bytes::from_static(b"session-checkpoint-v1"),
+                turn_sequence: 1,
+            }],
+        )
+        .unwrap();
+        assert_eq!(records[&key].revision, 1);
+
+        let stale = DurableProtocolStateChange::Put {
+            key,
+            expected_revision: Some(0),
+            next_revision: 1,
+            payload: Bytes::from_static(b"stale"),
+            turn_sequence: 2,
+        };
+        assert!(matches!(
+            apply_durable_protocol_state_changes(&mut records, &[stale]),
+            Err(StoreError::InvalidProtocolState(_))
+        ));
+        assert_eq!(records[&key].payload.as_ref(), b"session-checkpoint-v1");
+
+        apply_durable_protocol_state_changes(
+            &mut records,
+            &[DurableProtocolStateChange::Delete {
+                key,
+                expected_revision: 1,
+                turn_sequence: 2,
+            }],
+        )
+        .unwrap();
+        assert!(records.is_empty());
+        assert!(!format!("{:?}", ProtocolStateSnapshot { records }).contains("session-checkpoint"));
     }
 }

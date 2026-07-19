@@ -33,7 +33,7 @@ FUNCTION hero() {
                 gap: 14
                 style: [width: Fill, padding: 12, paint: False]
                 items: LIST {
-                    KavikComponents/heading(PASS: [store: PASSED.store], text: TEXT { Martin Kavik }, size: 54)
+                    KavikComponents/heading(text: TEXT { Martin Kavik }, size: 54, PASS: [store: PASSED.store])
                     Scene/Element/text(
                         element: []
                         style: [
@@ -51,9 +51,9 @@ FUNCTION hero() {
                         gap: 8
                         style: [width: Fill, wrap: True, wrap_min_width: 130, paint: False]
                         items: LIST {
-                            KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Rust & Wasm }, accent: KavikTheme/accent(of: Orange))
-                            KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Product Design }, accent: KavikTheme/accent(of: Teal))
-                            KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Open Source }, accent: KavikTheme/accent(of: Pink))
+                            KavikComponents/pill(label: TEXT { Rust & Wasm }, accent: KavikTheme/accent(of: Orange), PASS: [store: PASSED.store])
+                            KavikComponents/pill(label: TEXT { Product Design }, accent: KavikTheme/accent(of: Teal), PASS: [store: PASSED.store])
+                            KavikComponents/pill(label: TEXT { Open Source }, accent: KavikTheme/accent(of: Pink), PASS: [store: PASSED.store])
                         }
                     )
                 }
@@ -109,8 +109,8 @@ FUNCTION skill(title, detail, accent) {
             padding: 16
         ]
         items: LIST {
-            KavikComponents/heading(PASS: [store: PASSED.store], text: title, size: 21)
-            KavikComponents/muted(PASS: [store: PASSED.store], text: detail)
+            KavikComponents/heading(text: title, size: 21, PASS: [store: PASSED.store])
+            KavikComponents/muted(text: detail, PASS: [store: PASSED.store])
         }
     )
 }
@@ -122,7 +122,7 @@ FUNCTION selected_work() {
         gap: 20
         style: [...KavikTheme/panel_alt(mode: PASSED.store.mode), width: Fill, padding: 20]
         items: LIST {
-            KavikComponents/section_header(PASS: [store: PASSED.store], title: TEXT { Selected Work }, subtitle: TEXT { I'm mostly a toolmaker. })
+            KavikComponents/section_header(title: TEXT { Selected Work }, subtitle: TEXT { I'm mostly a toolmaker. }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
@@ -135,9 +135,10 @@ FUNCTION selected_work() {
                     KavikWork/boon_computer_card(PASS: [store: PASSED.store])
                 }
             )
-            KavikComponents/action_button(PASS: [store: PASSED.store]
+            KavikComponents/action_button(
                 source: PASSED.store.elements.view_all_work
                 label: TEXT { View All Work }
+                PASS: [store: PASSED.store]
             )
         }
     )
@@ -150,27 +151,31 @@ FUNCTION news() {
         gap: 20
         style: [...KavikTheme/panel(mode: PASSED.store.mode), width: Fill, padding: 20]
         items: LIST {
-            KavikComponents/section_header(PASS: [store: PASSED.store], title: TEXT { News & Notes }, subtitle: TEXT { From the workshop. })
+            KavikComponents/section_header(title: TEXT { News & Notes }, subtitle: TEXT { From the workshop. }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
                 gap: 14
                 style: [width: Fill, wrap: True, wrap_min_width: 260, paint: False]
                 items: LIST {
-                    KavikBlog/boon_post_card(PASS: [store: PASSED.store]
+                    KavikBlog/boon_post_card(
                         source: PASSED.store.elements.post.boon
+                        PASS: [store: PASSED.store]
                     )
-                    KavikBlog/novywave_post_card(PASS: [store: PASSED.store]
+                    KavikBlog/novywave_post_card(
                         source: PASSED.store.elements.post.novywave
+                        PASS: [store: PASSED.store]
                     )
-                    KavikBlog/moonzoon_foundations_card(PASS: [store: PASSED.store]
+                    KavikBlog/moonzoon_foundations_card(
                         source: PASSED.store.elements.post.moonzoon_foundations
+                        PASS: [store: PASSED.store]
                     )
                 }
             )
-            KavikComponents/action_button(PASS: [store: PASSED.store]
+            KavikComponents/action_button(
                 source: PASSED.store.elements.view_all_posts
                 label: TEXT { View All Posts }
+                PASS: [store: PASSED.store]
             )
         }
     )

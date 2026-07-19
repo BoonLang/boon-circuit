@@ -5,8 +5,8 @@ FUNCTION page() {
         gap: 24
         style: [width: Fill, paint: False]
         items: LIST {
-            KavikComponents/page_hero(PASS: [store: PASSED.store], title: TEXT { Work }, tagline: TEXT { Things I design & build. })
-            KavikComponents/muted(PASS: [store: PASSED.store], text: TEXT { Boon / NovyWave / MoonZoon / BoonComputer / RayBox / Prompter / LocalSearch / UI Parser / Persons.pro })
+            KavikComponents/page_hero(title: TEXT { Work }, tagline: TEXT { Things I design & build. }, PASS: [store: PASSED.store])
+            KavikComponents/muted(text: TEXT { Boon / NovyWave / MoonZoon / BoonComputer / RayBox / Prompter / LocalSearch / UI Parser / Persons.pro }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
@@ -30,7 +30,7 @@ FUNCTION page() {
 }
 
 FUNCTION boon_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { Boon }
         description: TEXT { One language for web apps, CLIs and hardware }
         body: TEXT { A declarative, statically typed language where the runtime remembers values across reloads. Boon combines persistent state, dataflow, a visual debugger, and interchangeable execution engines. Related work includes MoonZoon, UI Parser, RayBox, and BoonComputer. }
@@ -39,11 +39,12 @@ FUNCTION boon_card() {
         image_alt: TEXT { Boon - Timeless and Playful Language }
         link_label: TEXT { boon.run }
         link_url: TEXT { https://boon.run }
+        PASS: [store: PASSED.store]
     )
 }
 
 FUNCTION novywave_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { NovyWave }
         description: TEXT { Modern GTKWave alternative }
         body: TEXT { A modern waveform viewer for FPGA and hardware debugging. It combines WebAssembly with a portable desktop shell, supports Linux, macOS, Windows, browser and remote-server workflows, and uses a plugin-based architecture. Funded by NLnet Foundation. }
@@ -52,11 +53,12 @@ FUNCTION novywave_card() {
         image_alt: TEXT { NovyWave waveform viewer on Linux }
         link_label: TEXT { GitHub }
         link_url: TEXT { https://github.com/NovyWave/NovyWave }
+        PASS: [store: PASSED.store]
     )
 }
 
 FUNCTION moonzoon_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { MoonZoon }
         description: TEXT { Rust fullstack framework }
         body: TEXT { Fullstack Rust without HTML, CSS, or JavaScript. A Wasm frontend with signals and no Virtual DOM, a native Rust backend, typed routes, real-time typed messages, and automatic reload through the mzoon CLI. It powers Boon Playground and NovyWave. }
@@ -65,11 +67,12 @@ FUNCTION moonzoon_card() {
         image_alt: TEXT { MoonZoon logo }
         link_label: TEXT { GitHub }
         link_url: TEXT { https://github.com/MoonZoon/MoonZoon }
+        PASS: [store: PASSED.store]
     )
 }
 
 FUNCTION boon_computer_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { BoonComputer }
         description: TEXT { RISC CPU on FPGA, designed in Boon, running Boon }
         body: TEXT { The roadmap starts with Boon-to-Verilog circuits, DigitalJS and Wasm Yosys simulation, and real FPGA peripherals. The long-term proof is a Boon program running on a CPU whose architecture is itself described in Boon. }
@@ -78,11 +81,12 @@ FUNCTION boon_computer_card() {
         image_alt: TEXT { BoonComputer RISC CPU on FPGA }
         link_label: TEXT { Project on kavik.cz }
         link_url: TEXT { https://kavik.cz/work/#boon-computer }
+        PASS: [store: PASSED.store]
     )
 }
 
 FUNCTION raybox_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { RayBox }
         description: TEXT { 3D web UI renderer with SDF and PBR }
         body: TEXT { RayBox renders interface elements as real 3D objects using signed distance functions and physically based rendering. Buttons have depth, dialogs float and cast shadows, and inset effects emerge from geometry. Slang targets web and native GPU backends. }
@@ -91,11 +95,12 @@ FUNCTION raybox_card() {
         image_alt: TEXT { RayBox physical 3D user interface }
         link_label: TEXT { Project on kavik.cz }
         link_url: TEXT { https://kavik.cz/work/#raybox }
+        PASS: [store: PASSED.store]
     )
 }
 
 FUNCTION prompter_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { Prompter }
         description: TEXT { Web UI for Claude Code sessions }
         body: TEXT { A Rust CLI that wraps coding agents in a pseudo-terminal and exposes a dashboard. It supports mobile access, supervises idle agents, protects deterministic test files with hashes, and preserves an audit trail of prompts and sessions. }
@@ -104,11 +109,12 @@ FUNCTION prompter_card() {
         image_alt: TEXT { Prompter web interface }
         link_label: TEXT { Project on kavik.cz }
         link_url: TEXT { https://kavik.cz/work/#prompter }
+        PASS: [store: PASSED.store]
     )
 }
 
 FUNCTION localsearch_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { LocalSearch }
         description: TEXT { Rust full-text search library for the browser }
         body: TEXT { Fast client-side indexing and autocomplete without server round trips. It indexes and searches 20,000 film titles in milliseconds, reducing backend load and keeping search useful when remote services are slow or unavailable. }
@@ -117,11 +123,12 @@ FUNCTION localsearch_card() {
         image_alt: TEXT { LocalSearch client-side full-text search }
         link_label: TEXT { GitHub }
         link_url: TEXT { https://github.com/Stremio/local-search }
+        PASS: [store: PASSED.store]
     )
 }
 
 FUNCTION ui_parser_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { UI Parser }
         description: TEXT { Extract UI metadata from web pages }
         body: TEXT { A browser tool for UI recreation and visual testing. It captures element bounds, computed styles, text and pseudo-element sizes, actually used fonts, and layout relationships through a DevTools-style extension surface. }
@@ -130,11 +137,12 @@ FUNCTION ui_parser_card() {
         image_alt: TEXT { UI Parser overlay visualization }
         link_label: TEXT { Project on kavik.cz }
         link_url: TEXT { https://kavik.cz/work/#ui-parser }
+        PASS: [store: PASSED.store]
     )
 }
 
 FUNCTION persons_card() {
-    KavikComponents/project_card(PASS: [store: PASSED.store]
+    KavikComponents/project_card(
         title: TEXT { Persons.pro }
         description: TEXT { The app for freelancers and digital product makers }
         body: TEXT { A local-first direction for hiring, sponsorship, and sales with fewer platform fees. The concept combines near-zero-fee payments, visible escrow, verified identities, Boon, LocalSearch, and decentralized transports. }
@@ -143,5 +151,6 @@ FUNCTION persons_card() {
         image_alt: TEXT { Persons.pro dashboard concept }
         link_label: TEXT { Single-page demo }
         link_url: TEXT { https://persons.pro/ }
+        PASS: [store: PASSED.store]
     )
 }

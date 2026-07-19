@@ -64,22 +64,89 @@ Implemented generically in the engine and native host:
 
 Still required before NovyWave is complete:
 
-- enforce one canonical, non-renamable parameter schema for every function and
-  operator. Standard-library signatures define built-in parameter names;
-  `FUNCTION` declarations define application-function parameter names; every
-  call site must use those exact names. A pipe supplies the first declared
-  receiver parameter; a non-piped call must name that receiver, and ordinary
-  unnamed positional call arguments are compiler errors. Contextual operators
-  are typed compiler primitives rather than ordinary function calls:
-  `List/map` accepts only `List/map(old, new: ...)`, where `old` is the fixed
-  per-row binding and `new` is its result expression. Migrate all examples,
-  fixtures, tests, and documentation atomically, with no alias fallback;
+- complete the canonical OUT/compiler/source migration from
+  `BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md`, summarized
+  below, across NovyWave source, fixtures, tests, and documentation with no
+  syntax or execution fallback;
 - app-owned native visual scenarios that prove real VCD, FST, and GHW data in
   the rendered waveform surface and link their proof to the interaction frame;
 - app-owned report integration for the already-tested bounded-backpressure,
   inactive-branch cancellation, and terminal-resource diagnostics;
 - the remaining navigation, comparison, analog-display, and physical
   visual acceptance scenarios listed below.
+
+## Canonical Language And Compiler Contract
+
+NovyWave uses the same call and contextual-function model as every Boon
+application. Every call has parentheses. Ordinary inputs use their exact
+declared names in declaration order; they are never positional or caller
+renamed. A pipe supplies only the first declared ordinary parameter.
+
+Per-row context is an `OUT` parameter and works through ordinary user-defined
+wrappers. A direct mapping creates the fresh canonical output with a bare call
+entry:
+
+```boon
+signals
+|> List/map(
+    item
+    new: [signal: item]
+)
+```
+
+A wrapper declares and forwards that output with the normal function syntax:
+
+```boon
+FUNCTION map_signal_rows(signals, entry: OUT, new) {
+    signals
+    |> List/map(
+        item: entry
+        new: new
+    )
+}
+
+signals
+|> Waveform/map_signal_rows(
+    entry
+    new: [signal: entry]
+)
+```
+
+Bare `entry` creates the wrapper's fresh output. `item: entry` forwards it to
+the callee; this does not rename `List/map`'s canonical `item` formal. `OUT` is
+compile-time wiring, not runtime state, a source, a value, or a host handle.
+NovyWave must not depend on a hardcoded contextual-operator parser/compiler
+branch, `ListMapBinding`, or backend rediscovery of row scope.
+
+`PASS:` is separate context wiring, may occur at most once, and must be the
+final clause of a call. It is not a function parameter, value, output, pipe
+receiver, persisted field, or wire value. Earlier argument expressions may
+read `PASSED` context without moving `PASS:` away from final position.
+
+Lexical declarations are visible throughout their scope independently of text
+order. This applies to functions, modules, `BLOCK` bindings, explicit record
+fields, and fresh `OUT` declarations. Calls still require exact declaration
+order. Same-name record fields need an explicit outer alias rather than relying
+on a before-declaration shadowing window, and instantaneous dependency cycles
+remain errors.
+
+NovyWave collection code uses only the canonical typed forms:
+
+- `List/find(item, if:) -> Found[value] | NotFound`, followed by ordinary
+  matching, instead of `List/find_value`, quoted reflective fields, or an
+  embedded fallback;
+- `List/chunk(size:)`, whose result exposes only canonical `.items` and
+  `.label`, instead of caller-named result fields;
+- typed `OUT` projections and predicates for `List/map` and `List/filter`,
+  including through user wrappers.
+
+`boon_typecheck` resolves this source once into the authoritative
+`CheckedProgram`. `boon_ir` elaborates contextual calls, validates output nets,
+expands transparent wrappers, erases `OUT` and `PASS`, and emits the
+authoritative `ErasedProgram`. Executor, native document/render, host-effect,
+and verifier paths consume only `ErasedProgram`; equivalent direct,
+one-wrapper, and multi-wrapper source must have equivalent executable work and
+ownership.
 
 ## Goal
 

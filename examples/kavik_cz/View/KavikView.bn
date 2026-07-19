@@ -272,9 +272,9 @@ FUNCTION footer() {
             }]
         ]
         items: LIST {
-            KavikComponents/muted(PASS: [store: PASSED.store], text: TEXT { Martin Kavik - Prague, Czechia })
-            KavikComponents/external_link(PASS: [store: PASSED.store], label: TEXT { GitHub }, to: TEXT { https://github.com/MartinKavik })
-            KavikComponents/external_link(PASS: [store: PASSED.store], label: TEXT { kavik.cz }, to: TEXT { https://kavik.cz })
+            KavikComponents/muted(text: TEXT { Martin Kavik - Prague, Czechia }, PASS: [store: PASSED.store])
+            KavikComponents/external_link(label: TEXT { GitHub }, to: TEXT { https://github.com/MartinKavik }, PASS: [store: PASSED.store])
+            KavikComponents/external_link(label: TEXT { kavik.cz }, to: TEXT { https://kavik.cz }, PASS: [store: PASSED.store])
         }
     )
 }

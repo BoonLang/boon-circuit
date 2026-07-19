@@ -30,7 +30,7 @@ FUNCTION section(title, subtitle, items) {
             padding: [left: 20, right: 20, top: 24, bottom: 24]
         ]
         items: LIST {
-            KavikComponents/section_header(PASS: [store: PASSED.store], title: title, subtitle: subtitle)
+            KavikComponents/section_header(title: title, subtitle: subtitle, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Column
@@ -61,16 +61,16 @@ FUNCTION about_hero() {
                 gap: 10
                 style: [width: Fill, padding: 14, paint: False]
                 items: LIST {
-                    KavikComponents/heading(PASS: [store: PASSED.store], text: TEXT { About Martin }, size: 50)
-                    KavikComponents/muted(PASS: [store: PASSED.store], text: TEXT { Toolmaker. Explorer. })
-                    KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { I build tools across product design, Rust, WebAssembly, native graphics, programming languages, and hardware experiments. })
+                    KavikComponents/heading(text: TEXT { About Martin }, size: 50, PASS: [store: PASSED.store])
+                    KavikComponents/muted(text: TEXT { Toolmaker. Explorer. }, PASS: [store: PASSED.store])
+                    KavikComponents/paragraph(text: TEXT { I build tools across product design, Rust, WebAssembly, native graphics, programming languages, and hardware experiments. }, PASS: [store: PASSED.store])
                 }
             )
             KavikComponents/image(
-                PASS: [store: PASSED.store]
                 url: TEXT { asset://kavik_cz/images/martin_trondheim.jpg }
                 alt: TEXT { Martin Kavik in a forest near Trondheim }
                 aspect: 1.5
+                PASS: [store: PASSED.store]
             )
         }
     )
@@ -81,8 +81,8 @@ FUNCTION beginning() {
         title: TEXT { The Beginning }
         subtitle: TEXT { Coming full circle. }
         items: LIST {
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { When I returned from kindergarten, I noticed a weird box in our living room. Dad whispered magic spells a wizard had taught him: restart in MS-DOS mode, then write cd games. The curse started with Supaplex. A couple of years later I killed the computer by trying to compress its hard disk. })
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { At thirteen I built an antenna holder to finally get internet, then learned C# from a Czech school website. I chose programming over 3D graphics because making something out of nothing felt like the ultimate creativity. Now RayBox brings me back to 3D, and AI in terminals brings me back to MS-DOS. })
+            KavikComponents/paragraph(text: TEXT { When I returned from kindergarten, I noticed a weird box in our living room. Dad whispered magic spells a wizard had taught him: restart in MS-DOS mode, then write cd games. The curse started with Supaplex. A couple of years later I killed the computer by trying to compress its hard disk. }, PASS: [store: PASSED.store])
+            KavikComponents/paragraph(text: TEXT { At thirteen I built an antenna holder to finally get internet, then learned C# from a Czech school website. I chose programming over 3D graphics because making something out of nothing felt like the ultimate creativity. Now RayBox brings me back to 3D, and AI in terminals brings me back to MS-DOS. }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
@@ -90,18 +90,18 @@ FUNCTION beginning() {
                 style: [width: Fill, wrap: True, wrap_min_width: 300, paint: False]
                 items: LIST {
                     KavikComponents/media(
-                        PASS: [store: PASSED.store]
                         title: TEXT { 3D Kitchen, 2008 }
                         video_id: TEXT { FAJVs5GcArQ }
                         poster_url: TEXT { asset://kavik_cz/images/videos/kitchen.jpg }
                         to: TEXT { https://www.youtube.com/watch?v=FAJVs5GcArQ }
+                        PASS: [store: PASSED.store]
                     )
                     KavikComponents/media(
-                        PASS: [store: PASSED.store]
                         title: TEXT { Case modding, 2009 }
                         video_id: TEXT { Ics_QWPZATk }
                         poster_url: TEXT { asset://kavik_cz/images/videos/case-modding.jpg }
                         to: TEXT { https://www.youtube.com/watch?v=Ics_QWPZATk }
+                        PASS: [store: PASSED.store]
                     )
                 }
             )
@@ -114,8 +114,8 @@ FUNCTION drawings() {
         title: TEXT { Drawings }
         subtitle: TEXT { Drawn from the rough. }
         items: LIST {
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { At fifteen I moved with my mum and sister from a small spa town to a grittier corner of Ostrava. The following years looped through school, gym, programming, games, and attempts at art. Drawing became a quiet escape and a brutal teacher: when you create, the gaps expose what you do not know. })
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { I slowly learned to struggle well and trust my decisions. Soon I could help mum pay our rent from my first programming jobs, and the collection of drawings grew with me. })
+            KavikComponents/paragraph(text: TEXT { At fifteen I moved with my mum and sister from a small spa town to a grittier corner of Ostrava. The following years looped through school, gym, programming, games, and attempts at art. Drawing became a quiet escape and a brutal teacher: when you create, the gaps expose what you do not know. }, PASS: [store: PASSED.store])
+            KavikComponents/paragraph(text: TEXT { I slowly learned to struggle well and trust my decisions. Soon I could help mum pay our rent from my first programming jobs, and the collection of drawings grew with me. }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
@@ -137,10 +137,10 @@ FUNCTION drawings() {
 
 FUNCTION gallery_image(file, alt) {
     KavikComponents/image(
-        PASS: [store: PASSED.store]
         url: TEXT { asset://kavik_cz/images/about/{file} }
         alt: alt
         aspect: 1.15
+        PASS: [store: PASSED.store]
     )
 }
 
@@ -155,14 +155,14 @@ FUNCTION poetry() {
                 gap: 16
                 style: [width: Fill, wrap: True, wrap_min_width: 300, paint: False]
                 items: LIST {
-                    KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/about/street.jpg }, alt: TEXT { Street drawing }, aspect: 0.78)
+                    KavikComponents/image(url: TEXT { asset://kavik_cz/images/about/street.jpg }, alt: TEXT { Street drawing }, aspect: 0.78, PASS: [store: PASSED.store])
                     Scene/Element/stripe(
                         element: []
                         direction: Column
                         gap: 12
                         style: [width: Fill, paint: False]
                         items: LIST {
-                            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { Silhouette in the window. Watching street lamp in the moonlight. Holding the cup of cocoa. The clock's bell strikes the midnight. })
+                            KavikComponents/paragraph(text: TEXT { Silhouette in the window. Watching street lamp in the moonlight. Holding the cup of cocoa. The clock's bell strikes the midnight. }, PASS: [store: PASSED.store])
                             Scene/Element/text(
                                 element: []
                                 style: [
@@ -192,15 +192,15 @@ FUNCTION emptiness() {
         subtitle: TEXT { A guitar composition. }
         items: LIST {
             KavikComponents/media(
-                PASS: [store: PASSED.store]
                 title: TEXT { The Emptiness - guitar composition }
                 video_id: TEXT { 3mNv0QXfPhE }
                 poster_url: TEXT { asset://kavik_cz/images/videos/emptiness.jpg }
                 to: TEXT { https://www.youtube.com/watch?v=3mNv0QXfPhE }
+                PASS: [store: PASSED.store]
             )
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { There are three kinds of emptiness: the sad one when you miss something, the better one when fear of frustration is gone, and the best one when time distorts and everything but one thing ceases to exist. You enter flow while balancing on the edge of your skill and doing something you believe in. })
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { I work in bursts and let the unconscious mind continue during pauses. Guitar became a quiet filler for those pauses. The urge to compose eventually won over the motivation to become technically good, so I wrote The Emptiness with pencil, tested it on a cheap guitar, and recreated the score years later. })
-            KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/about/burlaks_on_volga.jpg }, alt: TEXT { Burlaks on the Volga by Ilya Repin }, aspect: 1.58)
+            KavikComponents/paragraph(text: TEXT { There are three kinds of emptiness: the sad one when you miss something, the better one when fear of frustration is gone, and the best one when time distorts and everything but one thing ceases to exist. You enter flow while balancing on the edge of your skill and doing something you believe in. }, PASS: [store: PASSED.store])
+            KavikComponents/paragraph(text: TEXT { I work in bursts and let the unconscious mind continue during pauses. Guitar became a quiet filler for those pauses. The urge to compose eventually won over the motivation to become technically good, so I wrote The Emptiness with pencil, tested it on a cheap guitar, and recreated the score years later. }, PASS: [store: PASSED.store])
+            KavikComponents/image(url: TEXT { asset://kavik_cz/images/about/burlaks_on_volga.jpg }, alt: TEXT { Burlaks on the Volga by Ilya Repin }, aspect: 1.58, PASS: [store: PASSED.store])
         }
     )
 }
@@ -228,7 +228,7 @@ FUNCTION hardware_detours() {
                     )
                 }
             )
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { Both projects whispered the same lesson: hardware is subtle and quick to punish. Ten years later I am developing a language to write software and design hardware. I will create my own roulettes. })
+            KavikComponents/paragraph(text: TEXT { Both projects whispered the same lesson: hardware is subtle and quick to punish. Ten years later I am developing a language to write software and design hardware. I will create my own roulettes. }, PASS: [store: PASSED.store])
         }
     )
 }
@@ -240,9 +240,9 @@ FUNCTION hardware_card(title, image_url, text) {
         gap: 10
         style: [...KavikTheme/panel(mode: PASSED.store.mode), width: Fill, padding: 14]
         items: LIST {
-            KavikComponents/image(PASS: [store: PASSED.store], url: image_url, alt: title, aspect: 1.5)
-            KavikComponents/heading(PASS: [store: PASSED.store], text: title, size: 23)
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: text)
+            KavikComponents/image(url: image_url, alt: title, aspect: 1.5, PASS: [store: PASSED.store])
+            KavikComponents/heading(text: title, size: 23, PASS: [store: PASSED.store])
+            KavikComponents/paragraph(text: text, PASS: [store: PASSED.store])
         }
     )
 }
@@ -259,22 +259,22 @@ FUNCTION testing_gravity() {
                 style: [width: Fill, wrap: True, wrap_min_width: 300, paint: False]
                 items: LIST {
                     KavikComponents/media(
-                        PASS: [store: PASSED.store]
                         title: TEXT { Bungee jumping }
                         video_id: TEXT { muVBtlwP4BQ }
                         poster_url: TEXT { asset://kavik_cz/images/videos/bungee.jpg }
                         to: TEXT { https://www.youtube.com/watch?v=muVBtlwP4BQ }
+                        PASS: [store: PASSED.store]
                     )
                     KavikComponents/media(
-                        PASS: [store: PASSED.store]
                         title: TEXT { Skydiving }
                         video_id: TEXT { 0-UQKFUs02M }
                         poster_url: TEXT { asset://kavik_cz/images/videos/skydiving.jpg }
                         to: TEXT { https://www.youtube.com/watch?v=0-UQKFUs02M }
+                        PASS: [store: PASSED.store]
                     )
                 }
             )
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { If you do not experience real fear from time to time, the mind starts creating fears out of nothing. })
+            KavikComponents/paragraph(text: TEXT { If you do not experience real fear from time to time, the mind starts creating fears out of nothing. }, PASS: [store: PASSED.store])
         }
     )
 }
@@ -284,16 +284,16 @@ FUNCTION life() {
         title: TEXT { Life }
         subtitle: TEXT { Who I am now. }
         items: LIST {
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { I live in Prague with two hobbits and one queen. I am nocturnal, enjoy the brief Czech spring before the sun becomes a Death Star, and now lift mostly toys and small creatures instead of dumbbells. })
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { I like one-to-one conversations, spicy food and sushi, cozy cafes, and hikes. Skip the formalities. A slow reply probably means I am on the kindergarten walk, thinking about your problem. Our Tour de Norge 2024 confirmed the plan to learn Norwegian and move there. })
+            KavikComponents/paragraph(text: TEXT { I live in Prague with two hobbits and one queen. I am nocturnal, enjoy the brief Czech spring before the sun becomes a Death Star, and now lift mostly toys and small creatures instead of dumbbells. }, PASS: [store: PASSED.store])
+            KavikComponents/paragraph(text: TEXT { I like one-to-one conversations, spicy food and sushi, cozy cafes, and hikes. Skip the formalities. A slow reply probably means I am on the kindergarten walk, thinking about your problem. Our Tour de Norge 2024 confirmed the plan to learn Norwegian and move there. }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
                 gap: 14
                 style: [width: Fill, wrap: True, wrap_min_width: 300, paint: False]
                 items: LIST {
-                    KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/about/cat_alesund.jpg }, alt: TEXT { Cat in Alesund }, aspect: 1.3)
-                    KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/about/norway_trip.jpg }, alt: TEXT { Norway road trip map }, aspect: 1.3)
+                    KavikComponents/image(url: TEXT { asset://kavik_cz/images/about/cat_alesund.jpg }, alt: TEXT { Cat in Alesund }, aspect: 1.3, PASS: [store: PASSED.store])
+                    KavikComponents/image(url: TEXT { asset://kavik_cz/images/about/norway_trip.jpg }, alt: TEXT { Norway road trip map }, aspect: 1.3, PASS: [store: PASSED.store])
                 }
             )
         }
@@ -305,20 +305,20 @@ FUNCTION partner() {
         title: TEXT { As Your Partner }
         subtitle: TEXT { I'm not hired to write code. I'm hired to help with the product. }
         items: LIST {
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { How I naturally work has a name: Shape Up. Six years of four-to-six-week cycles ending with progress reports and demos taught me to ask business questions early and fill whatever gap blocks the product. })
+            KavikComponents/paragraph(text: TEXT { How I naturally work has a name: Shape Up. Six years of four-to-six-week cycles ending with progress reports and demos taught me to ask business questions early and fill whatever gap blocks the product. }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
                 gap: 8
                 style: [width: Fill, wrap: True, wrap_min_width: 130, paint: False]
                 items: LIST {
-                    KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Systematic }, accent: KavikTheme/accent(of: Blue))
-                    KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Empathetic }, accent: KavikTheme/accent(of: Pink))
-                    KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Proactive }, accent: KavikTheme/accent(of: Teal))
-                    KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { INTJ-A }, accent: KavikTheme/accent(of: Purple))
+                    KavikComponents/pill(label: TEXT { Systematic }, accent: KavikTheme/accent(of: Blue), PASS: [store: PASSED.store])
+                    KavikComponents/pill(label: TEXT { Empathetic }, accent: KavikTheme/accent(of: Pink), PASS: [store: PASSED.store])
+                    KavikComponents/pill(label: TEXT { Proactive }, accent: KavikTheme/accent(of: Teal), PASS: [store: PASSED.store])
+                    KavikComponents/pill(label: TEXT { INTJ-A }, accent: KavikTheme/accent(of: Purple), PASS: [store: PASSED.store])
                 }
             )
-            KavikComponents/paragraph(PASS: [store: PASSED.store], text: TEXT { I have also been paid to teach Rust, get apps through Facebook review, design in Figma and Penpot, audit smart contracts, write email templates and articles, accelerate integration tests, and edit visual assets. I work mostly part-time so open source, research, and two small creators in training receive attention too. })
+            KavikComponents/paragraph(text: TEXT { I have also been paid to teach Rust, get apps through Facebook review, design in Figma and Penpot, audit smart contracts, write email templates and articles, accelerate integration tests, and edit visual assets. I work mostly part-time so open source, research, and two small creators in training receive attention too. }, PASS: [store: PASSED.store])
         }
     )
 }

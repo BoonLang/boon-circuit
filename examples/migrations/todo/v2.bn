@@ -20,12 +20,12 @@ store: [
             [title: TEXT { Plan release }, completed: False]
             [title: TEXT { Test migration }, completed: True]
         }
-        |> List/map(todo, new: retiring_todo(todo: todo))
+        |> List/map(item, new: retiring_todo(todo: item))
         |> DRAINING
 
     tasks:
         DRAIN { todos }
-        |> List/map(task, new: new_task(task: task))
+        |> List/map(item, new: new_task(task: item))
 ]
 
 FUNCTION retiring_todo(todo) {
@@ -113,7 +113,7 @@ FUNCTION task_list() {
         direction: Column
         gap: 8
         style: [width: Fill, height: Fill]
-        items: store.tasks |> List/map(task, new: task_row(task: task))
+        items: store.tasks |> List/map(item, new: task_row(task: item))
     )
 }
 

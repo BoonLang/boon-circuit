@@ -4,20 +4,20 @@
 -- row circuit separate is the first step toward moving formula and view helper
 -- code into ordinary Boon modules instead of one large example file.
 
-FUNCTION new_cell(cell) {
-    sources: [
-        editor: [
-            select: SOURCE
-            change: SOURCE
-            commit: SOURCE
-            cancel: SOURCE
-            blur: SOURCE
-        ]
-    ]
-
+FUNCTION new_cell(cell_index) {
     [
+        sources: [
+            editor: [
+                select: SOURCE
+                change: SOURCE
+                commit: SOURCE
+                cancel: SOURCE
+                blur: SOURCE
+            ]
+        ]
+
         address:
-            cell_address(index: cell.index)
+            cell_address(index: cell_index)
 
         default_formula:
             default_formula_for_address(address: address)
@@ -60,6 +60,6 @@ FUNCTION new_cell(cell) {
             compute_value(address: address, formula_text: formula_text)
 
         error:
-            Error/text(compute_value(address: address, formula_text: formula_text))
+            Error/text(value: compute_value(address: address, formula_text: formula_text))
     ]
 }

@@ -3927,13 +3927,13 @@ mod tests {
                 .unwrap()
         };
         runtime
-            .dispatch(event(&runtime, 1, "cell.sources.editor.select", None))
+            .dispatch(event(&runtime, 1, "item.sources.editor.select", None))
             .unwrap();
         runtime
-            .dispatch(event(&runtime, 2, "cell.sources.editor.change", Some("20")))
+            .dispatch(event(&runtime, 2, "item.sources.editor.change", Some("20")))
             .unwrap();
         runtime
-            .dispatch(event(&runtime, 3, "cell.sources.editor.commit", Some("20")))
+            .dispatch(event(&runtime, 3, "item.sources.editor.commit", Some("20")))
             .unwrap();
         runtime.barrier().unwrap();
         let durable = runtime.load_durable_image().unwrap().unwrap();

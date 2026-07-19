@@ -5,82 +5,97 @@ FUNCTION page() {
         gap: 28
         style: [width: Fill, paint: False]
         items: LIST {
-            KavikComponents/page_hero(PASS: [store: PASSED.store], title: TEXT { Shelf }, tagline: TEXT { Books and games that shaped my thinking. })
-            KavikComponents/action_button(PASS: [store: PASSED.store]
+            KavikComponents/page_hero(title: TEXT { Shelf }, tagline: TEXT { Books and games that shaped my thinking. }, PASS: [store: PASSED.store])
+            KavikComponents/action_button(
                 source: PASSED.store.elements.post.boon
                 label: TEXT { Read The Boon of Dataflow }
+                PASS: [store: PASSED.store]
             )
-            KavikComponents/section_header(PASS: [store: PASSED.store], title: TEXT { Books }, subtitle: TEXT { Ideas, systems, stories, and ways of working. })
+            KavikComponents/section_header(title: TEXT { Books }, subtitle: TEXT { Ideas, systems, stories, and ways of working. }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
                 gap: 14
                 style: [width: Fill, wrap: True, wrap_min_width: 320, paint: False]
                 items: LIST {
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Tools for Building }
                         entries: TEXT { B01 Designing Data-Intensive Applications - the distributed systems bible. B02 Designing Data-Intensive Applications, 2nd Edition. B03 Domain Modeling Made Functional - changed how I think about types. B04 Flow-Based Programming. B05 Lucid, the Dataflow Programming Language - time as a first-class concept. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Design }
                         entries: TEXT { B06 elm-ui: The CSS Escape Plan - UI without CSS battles. B07 Refactoring UI - design taste for developers. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Expanding Horizons }
                         entries: TEXT { B08 All I Really Need to Know I Learned in Kindergarten. B09 The Empath's Survival Guide. B10 The Future of Fusion Energy. B11 Thinking, Fast and Slow. B12 Way of the Peaceful Warrior. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Stories That Stay }
                         entries: TEXT { B13 The 100-Year-Old Man Who Climbed Out the Window and Disappeared. B14 The Egyptian. B15 Inheritance Cycle. B16 Shadows of the Apt. B17 To Sleep in a Sea of Stars. B18 The Wandering Earth. B19 The Witcher. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Ways of Working }
                         entries: TEXT { B20 Rework - permission to stay small. B21 Shape Up - how to scope and ship. B22 Working in Public - making open source sustainable. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { For the Little Ones }
                         entries: TEXT { B23 Computer Engineering for Babies. B24 Computer Engineering for Big Babies. B25 Pepper & Carrot. }
+                        PASS: [store: PASSED.store]
                     )
                 }
             )
-            KavikComponents/section_header(PASS: [store: PASSED.store], title: TEXT { Games }, subtitle: TEXT { Interactive lessons in time, systems, atmosphere, and play. })
+            KavikComponents/section_header(title: TEXT { Games }, subtitle: TEXT { Interactive lessons in time, systems, atmosphere, and play. }, PASS: [store: PASSED.store])
             Scene/Element/stripe(
                 element: []
                 direction: Row
                 gap: 14
                 style: [width: Fill, wrap: True, wrap_min_width: 320, paint: False]
                 items: LIST {
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Narrative Adventures }
                         entries: TEXT { G01 A Plague Tale: Innocence + Requiem. G02 Beyond Two Souls. G03 BioShock: The Collection. G04 Detroit: Become Human. G05 Lost Words: Beyond the Page. G06 Mafia. G07 Red Dead Redemption 2. G08 The Witcher 3. G09 What Remains of Edith Finch. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Building & Strategy }
                         entries: TEXT { G10 Desynced - robots building robots. G11 Factorio - the factory must grow. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Action & Combat }
                         entries: TEXT { G12 Clair Obscur: Expedition 33. G13 Chorus. G14 DOOM: The Dark Ages. G15 EVERSPACE. G16 God of War + Ragnarok. G17 Hellblade: Senua's Sacrifice + Saga. G18 Katana ZERO. G19 Metro: Last Light Redux + Exodus. G20 TimeShift. G21 Transistor. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Puzzle & Mind-bending }
                         entries: TEXT { G22 Braid: Anniversary Edition. G23 COCOON. G24 Gorogoa. G25 Half-Life: Alyx. G26 Portal + Portal 2 + Revolution. G27 Quern: Undying Thoughts. G28 Supaplex. G29 Superliminal. G30 The Room Collection. G31 The Talos Principle 1 & 2. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Horror & Psychological }
                         entries: TEXT { G32 DISTRAINT 1 & 2. G33 Happy Game. G34 In Sound Mind. G35 Inscryption. G36 Layers of Fear. G37 Little Nightmares. G38 Martha Is Dead. G39 Pony Island. G40 SOMA. G41 The Hex. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Atmospheric & Artistic }
                         entries: TEXT { G42 GRIS. G43 Growbot. G44 Heal. G45 INSIDE. G46 LIMBO. G47 Ori and the Blind Forest + Will of the Wisps. G48 Planet of Lana. G49 The Last Campfire. G50 The Vanishing of Ethan Carter. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Co-op & Multiplayer }
                         entries: TEXT { G51 It Takes Two. G52 Shift Happens. G53 Split Fiction. }
+                        PASS: [store: PASSED.store]
                     )
-                    KavikComponents/shelf_group(PASS: [store: PASSED.store]
+                    KavikComponents/shelf_group(
                         title: TEXT { Whimsical & Charming }
                         entries: TEXT { G54 A Juggler's Tale. G55 Catie in MeowmeowLand. G56 High On Life. G57 Lost in Random. }
+                        PASS: [store: PASSED.store]
                     )
                 }
             )

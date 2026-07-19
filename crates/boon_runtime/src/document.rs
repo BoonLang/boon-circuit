@@ -1344,7 +1344,7 @@ impl<'a> Evaluator<'a> {
                 self.structural_lists.insert(list);
                 let rows = self
                     .session
-                    .list_row_snapshots(list)
+                    .list_row_snapshots_current(list)
                     .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
                 Ok(EvalValue::List(
                     rows.into_iter()
@@ -2981,19 +2981,6 @@ fn eval_builtin(
             EvalValue::List(values) => !values.is_empty(),
             _ => false,
         }),
-        DocumentBuiltin::ListJoinField => {
-            let separator = named_value(&arguments, "separator")
-                .map(EvalValue::text)
-                .unwrap_or_default();
-            EvalValue::Text(match first {
-                EvalValue::List(values) => values
-                    .into_iter()
-                    .map(|value| value.text())
-                    .collect::<Vec<_>>()
-                    .join(&separator),
-                value => value.text(),
-            })
-        }
         DocumentBuiltin::ListLatest => match first {
             EvalValue::List(mut values) => values.pop().unwrap_or(EvalValue::Null),
             value => value,
@@ -3009,12 +2996,9 @@ fn eval_builtin(
         }
         DocumentBuiltin::ListRemove
         | DocumentBuiltin::ListRetain
-        | DocumentBuiltin::ListFilterFieldEqual
-        | DocumentBuiltin::ListFilterFieldNotEqual
-        | DocumentBuiltin::ListFilterTextContains
         | DocumentBuiltin::ListSortBy
         | DocumentBuiltin::ListMap => first,
-        DocumentBuiltin::ListFind | DocumentBuiltin::ListFindValue => match first {
+        DocumentBuiltin::ListFind => match first {
             EvalValue::List(mut values) => values.drain(..).next().unwrap_or(EvalValue::Null),
             value => value,
         },
@@ -3102,6 +3086,23 @@ fn eval_builtin(
         ),
         DocumentBuiltin::TextEmpty => EvalValue::Text(String::new()),
         DocumentBuiltin::TextIsEmpty => EvalValue::Bool(first.text().is_empty()),
+        DocumentBuiltin::TextJoin => {
+            let separator = named_value(&arguments, "separator")
+                .map(EvalValue::text)
+                .unwrap_or_default();
+            let empty = named_value(&arguments, "empty")
+                .map(EvalValue::text)
+                .unwrap_or_default();
+            EvalValue::Text(match first {
+                EvalValue::List(values) if values.is_empty() => empty,
+                EvalValue::List(values) => values
+                    .into_iter()
+                    .map(|value| value.text())
+                    .collect::<Vec<_>>()
+                    .join(&separator),
+                value => value.text(),
+            })
+        }
         DocumentBuiltin::TextJoinLines => EvalValue::Text(match first {
             EvalValue::List(values) => values
                 .into_iter()
@@ -3114,6 +3115,7 @@ fn eval_builtin(
         DocumentBuiltin::TextSpace => EvalValue::Text(" ".to_owned()),
         DocumentBuiltin::TextTimeRangeLabel => EvalValue::Text(first.text()),
         DocumentBuiltin::TextToBytes => EvalValue::Bytes(first.text().into_bytes().into()),
+        DocumentBuiltin::TextToLowercase => EvalValue::Text(first.text().to_lowercase()),
         DocumentBuiltin::TextToNumber => {
             EvalValue::Number(first.text().parse().unwrap_or_default())
         }

@@ -6,21 +6,15 @@ store: [
     decode: SOURCE
     encoded:
         BYTES[2] {} |> HOLD encoded {
-            LATEST {
-                store.encode |> THEN { text_payload |> Text/to_bytes(encoding: Utf8) }
-            }
+            store.encode |> THEN { text_payload |> Text/to_bytes(encoding: Utf8) }
         }
     encoded_len:
         0 |> HOLD encoded_len {
-            LATEST {
-                store.decode |> THEN { store.encoded |> Bytes/length() }
-            }
+            store.decode |> THEN { store.encoded |> Bytes/length() }
         }
     decoded:
         TEXT { old } |> HOLD decoded {
-            LATEST {
-                store.decode |> THEN { store.encoded |> Bytes/to_text(encoding: Utf8) }
-            }
+            store.decode |> THEN { store.encoded |> Bytes/to_text(encoding: Utf8) }
         }
 ]
 

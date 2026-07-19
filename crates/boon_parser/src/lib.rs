@@ -271,7 +271,6 @@ pub struct ParserItem {
     pub field: Option<String>,
     pub example: Option<String>,
     pub function: Option<String>,
-    pub map_new_function: Option<String>,
     pub source_event: Option<String>,
     pub hold: Option<String>,
     pub list_capacity: Option<usize>,
@@ -315,7 +314,7 @@ pub struct AstStatement {
 pub enum AstStatementKind {
     Function {
         name: String,
-        args: Vec<String>,
+        parameters: Vec<AstParameter>,
     },
     Field {
         name: String,
@@ -343,6 +342,8 @@ pub struct AstExpr {
     pub line: usize,
     pub start: usize,
     pub end: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_input: Option<usize>,
     pub kind: AstExprKind,
 }
 
@@ -372,11 +373,15 @@ pub enum AstExprKind {
     Call {
         function: String,
         args: Vec<AstCallArg>,
+        pass: Option<AstPassContext>,
     },
     Pipe {
         input: usize,
         op: String,
         args: Vec<AstCallArg>,
+        pass: Option<AstPassContext>,
+        #[serde(default)]
+        arms: Vec<usize>,
     },
     Draining {
         input: usize,
@@ -388,6 +393,8 @@ pub enum AstExprKind {
     Latest,
     When {
         input: usize,
+        #[serde(default)]
+        arms: Vec<usize>,
     },
     Then {
         input: usize,
@@ -401,6 +408,11 @@ pub enum AstExprKind {
     MatchArm {
         pattern: Vec<String>,
         output: Option<usize>,
+    },
+    Block {
+        #[serde(default)]
+        bindings: Vec<AstBlockBinding>,
+        result: Option<usize>,
     },
     Object(Vec<AstRecordField>),
     Record(Vec<AstRecordField>),
@@ -439,9 +451,57 @@ pub enum BytesSizeSyntax {
     Fixed(usize),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AstParameterKind {
+    Value,
+    Out,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstParameter {
+    pub name: String,
+    pub kind: AstParameterKind,
+    pub ordinal: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AstCallArgKind {
+    BareBinding,
+    Named,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AstCallArg {
-    pub name: Option<String>,
+    pub kind: AstCallArgKind,
+    pub name: String,
+    pub value: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl AstCallArg {
+    pub fn named_name(&self) -> Option<&str> {
+        (self.kind == AstCallArgKind::Named).then_some(self.name.as_str())
+    }
+
+    pub fn is_bare_binding(&self) -> bool {
+        self.kind == AstCallArgKind::BareBinding
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstPassContext {
+    pub value: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AstBlockBinding {
+    pub name: String,
+    pub statement: usize,
     pub value: usize,
     pub start: usize,
     pub end: usize,
@@ -482,6 +542,9 @@ pub enum AstTokenKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParsedSourcePort {
     pub path: String,
+    pub binding_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expr_id: Option<usize>,
     pub line: usize,
     pub scoped: bool,
     pub interval_ms: Option<u64>,
@@ -491,6 +554,8 @@ pub struct ParsedSourcePort {
 pub struct ParsedStateCell {
     pub path: String,
     pub hold_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expr_id: Option<usize>,
     pub line: usize,
     pub indexed: bool,
 }
@@ -1093,9 +1158,8 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let item_lines = merge_multiline_call_expression_lines(&item_lines, &text_body_line_ranges);
     let items = parser_items(&item_lines, &text_body_line_ranges);
     let mut expressions = Vec::new();
-    let statements = ast_statement_tree(&items, &mut expressions, source);
-    link_multiline_block_outputs(&statements, &mut expressions);
-    link_multiline_list_map_new_args(&statements, &mut expressions);
+    let mut statements = ast_statement_tree(&items, &mut expressions, source);
+    link_multiline_expression_structure(&mut statements, &mut expressions);
     Ok(AstProgram {
         tokens,
         lines,
@@ -1105,88 +1169,218 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     })
 }
 
-fn link_multiline_list_map_new_args(statements: &[AstStatement], expressions: &mut [AstExpr]) {
-    for statement in statements {
-        link_multiline_list_map_new_args(&statement.children, expressions);
-        let Some(parent_expr) = statement.expr else {
-            continue;
-        };
-        let Some(value_expr) = last_statement_expression(&statement.children, expressions) else {
-            continue;
-        };
-        let marker = expressions
-            .get(parent_expr)
-            .and_then(|expression| match &expression.kind {
-                AstExprKind::Pipe { op, args, .. } if op == "List/map" => {
-                    args.iter().enumerate().find_map(|(index, arg)| {
-                        (arg.name.is_none()
-                            && expressions.get(arg.value).is_some_and(|expr| {
-                                matches!(&expr.kind, AstExprKind::Identifier(name) if name == "new")
-                            }))
-                        .then_some((index, arg.value))
-                    })
-                }
-                _ => None,
-            });
-        let Some((marker_index, marker_expr)) = marker else {
-            continue;
-        };
-        expressions[marker_expr].kind = AstExprKind::Delimiter;
-        let Some(AstExpr {
-            kind: AstExprKind::Pipe { args, .. },
+fn link_multiline_expression_structure(
+    statements: &mut [AstStatement],
+    expressions: &mut Vec<AstExpr>,
+) {
+    for statement in statements.iter_mut() {
+        link_multiline_expression_structure(&mut statement.children, expressions);
+        materialize_statement_structure(statement, expressions);
+    }
+    link_multiline_pipeline_inputs(statements, expressions);
+}
+
+fn materialize_statement_structure(statement: &mut AstStatement, expressions: &mut Vec<AstExpr>) {
+    let child_values = statement_sequence_values(&statement.children, expressions);
+    let child_result = child_values.last().copied();
+    let child_arms = statement
+        .children
+        .iter()
+        .filter_map(|child| child.expr)
+        .filter(|expr_id| {
+            expressions
+                .get(*expr_id)
+                .is_some_and(|expr| matches!(expr.kind, AstExprKind::MatchArm { .. }))
+        })
+        .collect::<Vec<_>>();
+
+    let Some(expr_id) = statement.expr else {
+        return;
+    };
+    let expr_id = statement_structure_owner(expr_id, expressions);
+    let block_bindings = statement
+        .children
+        .iter()
+        .filter_map(|child| {
+            let name = statement_binding_name(child)?.to_owned();
+            Some(AstBlockBinding {
+                name,
+                statement: child.id,
+                value: statement_value_expression(child, expressions)?,
+                start: child.start,
+                end: child.end,
+            })
+        })
+        .collect::<Vec<_>>();
+    let record_fields = statement
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, child)| {
+            let (name, spread) = match &child.kind {
+                AstStatementKind::Spread => (format!("__spread_{index}"), true),
+                _ => (statement_binding_name(child)?.to_owned(), false),
+            };
+            Some(AstRecordField {
+                name,
+                value: statement_value_expression(child, expressions)?,
+                start: child.start,
+                end: child.end,
+                spread,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let Some(expression) = expressions.get_mut(expr_id) else {
+        return;
+    };
+    match &mut expression.kind {
+        AstExprKind::When { arms, .. } => {
+            if arms.is_empty() {
+                *arms = child_arms;
+            }
+        }
+        AstExprKind::Pipe { op, arms, .. } if op == "WHILE" => {
+            if arms.is_empty() {
+                *arms = child_arms;
+            }
+        }
+        AstExprKind::Then { output, .. } | AstExprKind::MatchArm { output, .. } => {
+            if output.is_none() {
+                *output = child_result;
+            }
+        }
+        AstExprKind::Block { bindings, result } => {
+            if bindings.is_empty() {
+                *bindings = block_bindings;
+            }
+            if result.is_none() {
+                *result = child_result;
+            }
+        }
+        AstExprKind::Record(fields) => {
+            if fields.is_empty() {
+                *fields = record_fields;
+            }
+        }
+        AstExprKind::ListLiteral { items, .. } => {
+            if items.is_empty() {
+                *items = child_values;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn statement_structure_owner(expr_id: usize, expressions: &[AstExpr]) -> usize {
+    let Some(expression) = expressions.get(expr_id) else {
+        return expr_id;
+    };
+    match &expression.kind {
+        AstExprKind::MatchArm {
+            output: Some(output),
             ..
-        }) = expressions.get_mut(parent_expr)
-        else {
-            continue;
-        };
-        args[marker_index].name = Some("new".to_owned());
-        args[marker_index].value = value_expr;
+        } if expression_owns_statement_children(*output, expressions) => {
+            statement_structure_owner(*output, expressions)
+        }
+        _ => expr_id,
     }
 }
 
-fn link_multiline_block_outputs(statements: &[AstStatement], expressions: &mut [AstExpr]) {
-    for statement in statements {
-        link_multiline_block_outputs(&statement.children, expressions);
-        let Some(parent_expr) = statement.expr else {
-            continue;
-        };
-        let Some(output) = last_statement_expression(&statement.children, expressions) else {
-            continue;
-        };
-        let Some(expression) = expressions.get_mut(parent_expr) else {
-            continue;
-        };
-        match &mut expression.kind {
-            AstExprKind::Then {
-                output: current, ..
-            }
-            | AstExprKind::MatchArm {
-                output: current, ..
-            } if current.is_none() => {
-                *current = Some(output);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn last_statement_expression(
-    statements: &[AstStatement],
-    expressions: &[AstExpr],
-) -> Option<usize> {
-    statements.iter().rev().find_map(|statement| {
-        if !statement.children.is_empty()
-            && statement
-                .children
-                .iter()
-                .all(|child| statement_is_pipeline_continuation(child, expressions))
-        {
-            return last_statement_expression(&statement.children, expressions);
-        }
-        statement
-            .expr
-            .or_else(|| last_statement_expression(&statement.children, expressions))
+fn expression_owns_statement_children(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    expressions.get(expr_id).is_some_and(|expression| {
+        matches!(
+            &expression.kind,
+            AstExprKind::Block { .. }
+                | AstExprKind::Record(_)
+                | AstExprKind::ListLiteral { .. }
+                | AstExprKind::BytesLiteral { .. }
+                | AstExprKind::Hold { .. }
+                | AstExprKind::Latest
+                | AstExprKind::When { .. }
+                | AstExprKind::Then { .. }
+        ) || matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "WHILE")
     })
+}
+
+fn link_multiline_pipeline_inputs(statements: &[AstStatement], expressions: &mut [AstExpr]) {
+    let mut previous = None;
+    for statement in statements {
+        let value = statement_value_expression(statement, expressions);
+        if statement_is_pipeline_continuation(statement, expressions)
+            && let (Some(expr_id), Some(input)) = (statement.expr, previous)
+            && let Some(expression) = expressions.get_mut(expr_id)
+        {
+            expression.linked_input = Some(input);
+        }
+        if let Some(value) = value {
+            previous = Some(value);
+        }
+    }
+}
+
+fn statement_sequence_values(statements: &[AstStatement], expressions: &[AstExpr]) -> Vec<usize> {
+    let mut values = Vec::new();
+    for statement in statements {
+        let Some(value) = statement_value_expression(statement, expressions) else {
+            continue;
+        };
+        if statement_is_pipeline_continuation(statement, expressions) && !values.is_empty() {
+            *values.last_mut().expect("non-empty values") = value;
+        } else {
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn statement_value_expression(statement: &AstStatement, expressions: &[AstExpr]) -> Option<usize> {
+    if statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .is_some_and(|expr| {
+            matches!(
+                &expr.kind,
+                AstExprKind::Block { .. }
+                    | AstExprKind::Record(_)
+                    | AstExprKind::ListLiteral { .. }
+                    | AstExprKind::BytesLiteral { .. }
+                    | AstExprKind::Hold { .. }
+                    | AstExprKind::Latest
+                    | AstExprKind::When { .. }
+                    | AstExprKind::Then { .. }
+                    | AstExprKind::MatchArm { .. }
+            ) || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "WHILE")
+        })
+    {
+        return statement.expr;
+    }
+    statement_sequence_values(&statement.children, expressions)
+        .last()
+        .copied()
+        .or(statement.expr)
+}
+
+fn statement_binding_name(statement: &AstStatement) -> Option<&str> {
+    match &statement.kind {
+        AstStatementKind::Field { name }
+        | AstStatementKind::Source {
+            field: Some(name), ..
+        }
+        | AstStatementKind::Hold {
+            field: Some(name), ..
+        }
+        | AstStatementKind::List {
+            field: Some(name), ..
+        } => Some(name),
+        AstStatementKind::Function { .. }
+        | AstStatementKind::Source { field: None, .. }
+        | AstStatementKind::Hold { field: None, .. }
+        | AstStatementKind::List { field: None, .. }
+        | AstStatementKind::Block
+        | AstStatementKind::Spread
+        | AstStatementKind::Expression => None,
+    }
 }
 
 /// Tokenizes Boon source with the same lexer used by the parser.
@@ -1432,7 +1626,6 @@ fn merge_multiline_call_expression_lines(
             continue;
         }
 
-        let nested_call = unmatched_parenthesis_count(&line.symbols) > 1;
         let mut end_index = index;
         let mut candidate = line.symbols.clone();
         let mut outer_close = None;
@@ -1447,21 +1640,11 @@ fn merge_multiline_call_expression_lines(
             candidate.extend(next.symbols.iter().cloned());
             outer_close = matching_close(&candidate, open);
         }
-        let Some(outer_close) = outer_close else {
+        let Some(_) = outer_close else {
             merged.push(line.clone());
             index += 1;
             continue;
         };
-        let has_trailing_expression = candidate
-            .get(outer_close + 1..)
-            .is_some_and(|tokens| !tokens.is_empty());
-        let when_arm_call = line.symbols[..open].iter().any(|symbol| symbol == "=>");
-        if !nested_call && !has_trailing_expression && !when_arm_call {
-            merged.push(line.clone());
-            index += 1;
-            continue;
-        }
-
         let mut expression_line = line.clone();
         for next in &lines[index + 1..=end_index] {
             if multiline_expression_needs_separator(&expression_line.symbols, &next.symbols) {
@@ -1483,16 +1666,6 @@ fn merge_multiline_call_expression_lines(
         index = end_index + 1;
     }
     merged
-}
-
-fn unmatched_parenthesis_count(symbols: &[String]) -> usize {
-    symbols
-        .iter()
-        .fold(0usize, |depth, symbol| match symbol.as_str() {
-            "(" => depth + 1,
-            ")" => depth.saturating_sub(1),
-            _ => depth,
-        })
 }
 
 fn multiline_expression_needs_separator(current: &[String], next: &[String]) -> bool {
@@ -1605,7 +1778,6 @@ fn parser_item(line: &ParserLine) -> ParserItem {
         indent: line.indent,
         start: line.start,
         end: line.end,
-        map_new_function: ast_map_new_function(&symbols).map(ToOwned::to_owned),
         source_event,
         hold: ast_hold_name(&symbols).map(ToOwned::to_owned),
         list_capacity: ast_list_capacity(&symbols),
@@ -1677,7 +1849,7 @@ fn ast_statement(
     let kind = if let Some(function) = item.function.clone() {
         AstStatementKind::Function {
             name: function,
-            args: ast_function_args(&item.symbols),
+            parameters: ast_function_parameters(&item.symbols, item),
         }
     } else if item.has_lexeme("SOURCE") {
         AstStatementKind::Source {
@@ -1708,10 +1880,30 @@ fn ast_statement(
     } else {
         AstStatementKind::Expression
     };
-    let expr = if matches!(kind, AstStatementKind::Function { .. })
-        || (matches!(kind, AstStatementKind::Block) && !is_semantic_block)
-    {
+    let expr = if matches!(kind, AstStatementKind::Function { .. }) {
         None
+    } else if matches!(kind, AstStatementKind::Block) && !is_semantic_block {
+        (item.symbols.first().map(String::as_str) == Some("[")).then(|| {
+            push_ast_expr(
+                item,
+                expressions,
+                AstExprKind::Record(Vec::new()),
+                item.start,
+                item.end,
+            )
+        })
+    } else if item.field.is_some()
+        && item.symbols.get(1).map(String::as_str) == Some(":")
+        && item.symbols.get(2).map(String::as_str) == Some("[")
+        && item.symbols.len() == 3
+    {
+        Some(push_ast_expr(
+            item,
+            expressions,
+            AstExprKind::Record(Vec::new()),
+            item.start,
+            item.end,
+        ))
     } else {
         let expr_tokens = statement_expression_tokens(item);
         (!expr_tokens.is_empty()).then(|| parse_ast_expr(&expr_tokens, item, expressions, source))
@@ -1766,6 +1958,7 @@ fn push_ast_expr(
         line: item.line,
         start,
         end,
+        linked_input: None,
         kind,
     });
     id
@@ -1805,6 +1998,11 @@ fn ast_expr_kind(
     {
         return AstExprKind::Delimiter;
     }
+    if tokens.first().map(String::as_str) == Some("(")
+        && matching_close(tokens, 0) == Some(tokens.len() - 1)
+    {
+        return ast_expr_kind(&tokens[1..tokens.len() - 1], item, expressions, source);
+    }
     if tokens == ["SOURCE"] {
         return AstExprKind::Source;
     }
@@ -1843,7 +2041,10 @@ fn ast_expr_kind(
     if tokens.first().map(String::as_str) == Some("BLOCK")
         && tokens.last().map(String::as_str) == Some("{")
     {
-        return AstExprKind::Identifier("BLOCK".to_owned());
+        return AstExprKind::Block {
+            bindings: Vec::new(),
+            result: None,
+        };
     }
     if let Some(path) = ast_drain_path(tokens) {
         return AstExprKind::Drain { path };
@@ -1909,10 +2110,16 @@ fn ast_expr_kind(
             input,
             op: format!("Field/{field}"),
             args: Vec::new(),
+            pass: None,
+            arms: Vec::new(),
         };
     }
-    if let Some((function, args)) = ast_call(tokens, item, expressions, source) {
-        return AstExprKind::Call { function, args };
+    if let Some((function, args, pass)) = ast_call(tokens, item, expressions, source) {
+        return AstExprKind::Call {
+            function,
+            args,
+            pass,
+        };
     }
     if tokens.len() == 1 && split_role_value_head(&tokens[0]).is_some() {
         AstExprKind::Path(path_segments(tokens))
@@ -2105,8 +2312,8 @@ fn ast_pipe_expr_kind(
         };
     }
     if op == "WHEN" {
-        push_inline_when_match_arms(&tokens[pipe + 1..], item, expressions, source);
-        return AstExprKind::When { input };
+        let arms = parse_inline_match_arms(&tokens[pipe + 1..], item, expressions, source);
+        return AstExprKind::When { input, arms };
     }
     if op == "THEN" {
         return AstExprKind::Then {
@@ -2114,10 +2321,18 @@ fn ast_pipe_expr_kind(
             output: ast_operator_block_expr(&tokens[pipe + 1..], item, expressions, source),
         };
     }
+    let (args, pass) = ast_call_args_after_operator(&tokens[pipe + 1..], item, expressions, source);
+    let arms = if op == "WHILE" {
+        parse_inline_match_arms(&tokens[pipe + 1..], item, expressions, source)
+    } else {
+        Vec::new()
+    };
     AstExprKind::Pipe {
         input,
         op,
-        args: ast_call_args_after_operator(&tokens[pipe + 1..], item, expressions, source),
+        args,
+        pass,
+        arms,
     }
 }
 
@@ -2162,7 +2377,7 @@ fn ast_call(
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
     source: &str,
-) -> Option<(String, Vec<AstCallArg>)> {
+) -> Option<(String, Vec<AstCallArg>, Option<AstPassContext>)> {
     let open = tokens.iter().position(|token| token == "(")?;
     if open == 0 {
         return None;
@@ -2174,13 +2389,8 @@ fn ast_call(
     } else {
         &[]
     };
-    Some((
-        function,
-        split_top_level(arg_tokens, ",")
-            .into_iter()
-            .filter_map(|part| ast_call_arg(&part, item, expressions, source))
-            .collect(),
-    ))
+    let (args, pass) = ast_call_parts(arg_tokens, item, expressions, source);
+    Some((function, args, pass))
 }
 
 fn ast_call_args_after_operator(
@@ -2188,9 +2398,9 @@ fn ast_call_args_after_operator(
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
     source: &str,
-) -> Vec<AstCallArg> {
+) -> (Vec<AstCallArg>, Option<AstPassContext>) {
     let Some(open) = tokens.iter().position(|token| token == "(") else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let close = matching_close(tokens, open).unwrap_or(tokens.len() - 1);
     let arg_tokens = if close > open {
@@ -2198,10 +2408,39 @@ fn ast_call_args_after_operator(
     } else {
         &[]
     };
-    split_top_level(arg_tokens, ",")
-        .into_iter()
-        .filter_map(|part| ast_call_arg(&part, item, expressions, source))
-        .collect()
+    ast_call_parts(arg_tokens, item, expressions, source)
+}
+
+fn ast_call_parts(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> (Vec<AstCallArg>, Option<AstPassContext>) {
+    let mut args = Vec::new();
+    let mut pass = None;
+    for part in split_top_level(tokens, ",") {
+        if part.first().map(String::as_str) == Some("PASS")
+            && part.get(1).map(String::as_str) == Some(":")
+        {
+            let (start, end) = span_for_tokens(&part, item).unwrap_or((item.start, item.end));
+            let value = parse_ast_expr(&part[2..], item, expressions, source);
+            if pass.is_none() {
+                pass = Some(AstPassContext { value, start, end });
+            } else {
+                args.push(AstCallArg {
+                    kind: AstCallArgKind::Named,
+                    name: "PASS".to_owned(),
+                    value,
+                    start,
+                    end,
+                });
+            }
+        } else if let Some(arg) = ast_call_arg(&part, item, expressions, source) {
+            args.push(arg);
+        }
+    }
+    (args, pass)
 }
 
 fn ast_operator_block_expr(
@@ -2228,26 +2467,26 @@ fn push_inline_hold_latest_exprs(
     let _ = ast_operator_block_expr(&tokens[latest..], item, expressions, source);
 }
 
-fn push_inline_when_match_arms(
+fn parse_inline_match_arms(
     tokens: &[String],
     item: &ParserItem,
     expressions: &mut Vec<AstExpr>,
     source: &str,
-) {
+) -> Vec<usize> {
     let Some(open) = tokens.iter().position(|token| token == "{") else {
-        return;
+        return Vec::new();
     };
     let Some(close) = matching_close(tokens, open) else {
-        return;
+        return Vec::new();
     };
     if close <= open + 1 {
-        return;
+        return Vec::new();
     }
-    for part in split_top_level(&tokens[open + 1..close], ",") {
-        if part.iter().any(|token| token == "=>") {
-            parse_ast_expr(&part, item, expressions, source);
-        }
-    }
+    split_top_level(&tokens[open + 1..close], ",")
+        .into_iter()
+        .filter(|part| part.iter().any(|token| token == "=>"))
+        .map(|part| parse_ast_expr(&part, item, expressions, source))
+        .collect()
 }
 
 fn ast_call_arg(
@@ -2262,29 +2501,52 @@ fn ast_call_arg(
     if tokens.get(1).map(String::as_str) == Some(":") {
         let (start, end) = span_for_tokens(tokens, item).unwrap_or((item.start, item.end));
         return Some(AstCallArg {
-            name: Some(tokens[0].clone()),
+            kind: AstCallArgKind::Named,
+            name: tokens[0].clone(),
             value: parse_ast_expr(&tokens[2..], item, expressions, source),
             start,
             end,
         });
     }
     let (start, end) = span_for_tokens(tokens, item).unwrap_or((item.start, item.end));
+    let name = (tokens.len() == 1 && is_name(&tokens[0]))
+        .then(|| tokens[0].clone())
+        .unwrap_or_default();
     Some(AstCallArg {
-        name: None,
+        kind: AstCallArgKind::BareBinding,
+        name,
         value: parse_ast_expr(tokens, item, expressions, source),
         start,
         end,
     })
 }
 
-fn ast_function_args(tokens: &[String]) -> Vec<String> {
+fn ast_function_parameters(tokens: &[String], item: &ParserItem) -> Vec<AstParameter> {
     let Some(open) = tokens.iter().position(|token| token == "(") else {
         return Vec::new();
     };
     let close = matching_close(tokens, open).unwrap_or(tokens.len() - 1);
     split_top_level(&tokens[open + 1..close], ",")
         .into_iter()
-        .filter_map(|part| part.first().cloned())
+        .enumerate()
+        .filter_map(|(ordinal, part)| {
+            let name = part.first()?.clone();
+            let kind = if part.get(1).map(String::as_str) == Some(":")
+                && part.get(2).map(String::as_str) == Some("OUT")
+            {
+                AstParameterKind::Out
+            } else {
+                AstParameterKind::Value
+            };
+            let (start, end) = span_for_tokens(&part, item).unwrap_or((item.start, item.end));
+            Some(AstParameter {
+                name,
+                kind,
+                ordinal,
+                start,
+                end,
+            })
+        })
         .collect()
 }
 
@@ -2672,15 +2934,6 @@ fn ast_bytes_literal(
     Some((size, items))
 }
 
-fn ast_map_new_function(symbols: &[String]) -> Option<&str> {
-    let map = symbols.iter().position(|lexeme| lexeme == "List/map")?;
-    let new = symbols[map..].iter().position(|lexeme| lexeme == "new")? + map;
-    (symbols.get(new + 1).map(String::as_str) == Some(":"))
-        .then(|| symbols.get(new + 2))?
-        .map(String::as_str)
-        .filter(|name| is_name(name))
-}
-
 fn ast_opens_scope(symbols: &[String]) -> bool {
     matches!(
         symbols.last().map(String::as_str),
@@ -2696,10 +2949,11 @@ fn ast_expression_operators(symbols: &[String]) -> Vec<String> {
 }
 
 fn is_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn detect_program_kind() -> ProgramKind {
@@ -2799,6 +3053,8 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
     }
     validate_reserved_standard_namespaces(path, &ast.statements)?;
     validate_role_qualified_value_syntax(path, &ast.tokens)?;
+    validate_function_parameter_syntax(path, ast)?;
+    validate_call_entry_syntax(path, ast)?;
     if example_source && let Some(document) = document_statement(ast) {
         let document_is_canonical = document.expr.is_some_and(|expr_id| {
             ast.expressions.get(expr_id).is_some_and(|expr| {
@@ -2817,6 +3073,121 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
     validate_drain_syntax(path, ast, &text_literal_spans)?;
     validate_bytes_syntax(path, ast, &text_literal_spans)?;
     Ok(())
+}
+
+fn validate_function_parameter_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
+    for item in ast.items.iter().filter(|item| item.function.is_some()) {
+        let Some(open) = item.symbols.iter().position(|symbol| symbol == "(") else {
+            continue;
+        };
+        let close = matching_close(&item.symbols, open).unwrap_or(item.symbols.len());
+        let mut names = BTreeSet::new();
+        for part in split_top_level(&item.symbols[open + 1..close], ",") {
+            if part.is_empty() {
+                continue;
+            }
+            let valid = matches!(part.as_slice(), [name] if is_name(name))
+                || matches!(part.as_slice(), [name, colon, out] if is_name(name) && colon == ":" && out == "OUT");
+            let name = part.first().map(String::as_str).unwrap_or_default();
+            let column = item
+                .symbol_spans
+                .iter()
+                .zip(&item.symbols)
+                .find_map(|((start, _), symbol)| (symbol == name).then_some(*start))
+                .map_or(item.indent + 1, |start| {
+                    start.saturating_sub(item.start) + 1
+                });
+            if !valid {
+                return Err(error(
+                    path,
+                    item.line,
+                    column,
+                    "function parameters must be `name` or `name: OUT`",
+                ));
+            }
+            if matches!(name, "PASS" | "PASSED" | "OUT") {
+                return Err(error(
+                    path,
+                    item.line,
+                    column,
+                    "`PASS`, `PASSED`, and `OUT` are reserved and cannot be function parameter names",
+                ));
+            }
+            if !names.insert(name.to_owned()) {
+                return Err(error(
+                    path,
+                    item.line,
+                    column,
+                    &format!("duplicate function parameter `{name}`"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_call_entry_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
+    for expr in &ast.expressions {
+        let (function, args, pass) = match &expr.kind {
+            AstExprKind::Call {
+                function,
+                args,
+                pass,
+            } => (function.as_str(), args.as_slice(), pass.as_ref()),
+            AstExprKind::Pipe { op, args, pass, .. } => {
+                (op.as_str(), args.as_slice(), pass.as_ref())
+            }
+            _ => continue,
+        };
+        let mut names = BTreeSet::new();
+        for arg in args {
+            let column = parser_column_for_offset(ast, expr.line, arg.start);
+            if arg.is_bare_binding() && arg.name.is_empty() {
+                return Err(error(
+                    path,
+                    expr.line,
+                    column,
+                    &format!(
+                        "bare entry in `{function}` must be one identifier naming a declared OUT parameter; ordinary arguments use `name: expression`"
+                    ),
+                ));
+            }
+            if arg.name == "PASS" {
+                return Err(error(
+                    path,
+                    expr.line,
+                    column,
+                    "`PASS` may appear only once as the final call clause",
+                ));
+            }
+            if !names.insert(arg.name.as_str()) {
+                return Err(error(
+                    path,
+                    expr.line,
+                    column,
+                    &format!("duplicate call entry `{}` in `{function}`", arg.name),
+                ));
+            }
+        }
+        if let Some(pass) = pass
+            && args.iter().any(|arg| arg.start > pass.start)
+        {
+            return Err(error(
+                path,
+                expr.line,
+                parser_column_for_offset(ast, expr.line, pass.start),
+                "`PASS` must be the final call clause",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parser_column_for_offset(ast: &AstProgram, line: usize, offset: usize) -> usize {
+    ast.lines
+        .iter()
+        .find(|candidate| candidate.line == line)
+        .map_or(1, |candidate| offset.saturating_sub(candidate.start) + 1)
 }
 
 fn pipeline_operator_requires_call_parentheses(operator: &str) -> bool {
@@ -3472,13 +3843,9 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "List/range"
             | "List/get"
             | "List/find"
-            | "List/find_value"
-            | "List/filter_text_contains"
-            | "List/filter_field_equal"
-            | "List/filter_field_not_equal"
+            | "List/filter"
             | "List/move_field_first"
             | "List/move_field_last"
-            | "List/join_field"
             | "List/chunk"
             | "List/remove"
             | "List/retain"
@@ -3490,9 +3857,11 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "List/is_not_empty"
             | "List/latest"
             | "Text/empty"
+            | "Text/join"
             | "Text/concat"
             | "Text/time_range_label"
             | "Text/trim"
+            | "Text/to_lowercase"
             | "Text/to_uppercase"
             | "Text/substring"
             | "Text/length"
@@ -3919,6 +4288,7 @@ fn derive_structure_from_statements(
                                 indexed,
                                 hold_name: path.clone(),
                                 path,
+                                expr_id: statement_stateful_expression_id(statement, expressions),
                                 line: statement.line,
                             },
                         );
@@ -3960,15 +4330,20 @@ fn derive_structure_from_statements(
                     tables,
                 );
                 if !collected_from_expr && let Some(field) = field.as_deref() {
-                    let source_scope = source_scope_without_event_groups(scope);
+                    let binding_path = match event.as_deref() {
+                        Some(event) => join_path(scope, [field, event]),
+                        None => join_path(scope, [field]),
+                    };
                     let path = match event.as_deref() {
-                        Some(event) => join_path(&source_scope, [field, event]),
-                        None => join_path(&source_scope, [field]),
+                        Some(event) => join_path(scope, [field, event]),
+                        None => join_path(scope, [field]),
                     };
                     push_source_port(
                         tables,
                         ParsedSourcePort {
                             path,
+                            binding_path,
+                            expr_id: statement.expr,
                             line: statement.line,
                             scoped: source_scope_is_scoped(scope, row_scopes),
                             interval_ms: None,
@@ -3998,6 +4373,7 @@ fn derive_structure_from_statements(
                         indexed: scope_is_indexed(scope, row_scopes),
                         hold_name: name.clone().unwrap_or_else(|| path.clone()),
                         path,
+                        expr_id: statement.expr,
                         line: statement.line,
                     },
                 );
@@ -4153,22 +4529,45 @@ fn collect_expr_list_value_facts(
                 facts.saw_row_items = true;
             }
         }
-        AstExprKind::Call { function, args } => {
+        AstExprKind::Call {
+            function,
+            args,
+            pass,
+        } => {
             facts.saw_list_operator |= list_returning_operator(function);
             for arg in args {
                 collect_expr_list_value_facts(arg.value, expressions, facts);
             }
+            if let Some(pass) = pass {
+                collect_expr_list_value_facts(pass.value, expressions, facts);
+            }
         }
-        AstExprKind::Pipe { input, op, args } => {
+        AstExprKind::Pipe {
+            input,
+            op,
+            args,
+            pass,
+            arms,
+        } => {
             facts.saw_list_operator |= list_returning_operator(op);
             collect_expr_list_value_facts(*input, expressions, facts);
             for arg in args {
                 collect_expr_list_value_facts(arg.value, expressions, facts);
             }
+            if let Some(pass) = pass {
+                collect_expr_list_value_facts(pass.value, expressions, facts);
+            }
+            for arm in arms {
+                collect_expr_list_value_facts(*arm, expressions, facts);
+            }
         }
-        AstExprKind::Draining { input }
-        | AstExprKind::Hold { initial: input, .. }
-        | AstExprKind::When { input } => {
+        AstExprKind::When { input, arms } => {
+            collect_expr_list_value_facts(*input, expressions, facts);
+            for arm in arms {
+                collect_expr_list_value_facts(*arm, expressions, facts);
+            }
+        }
+        AstExprKind::Draining { input } | AstExprKind::Hold { initial: input, .. } => {
             collect_expr_list_value_facts(*input, expressions, facts);
         }
         AstExprKind::Then { input, output } => {
@@ -4184,6 +4583,14 @@ fn collect_expr_list_value_facts(
         AstExprKind::MatchArm { output, .. } => {
             if let Some(output) = output {
                 collect_expr_list_value_facts(*output, expressions, facts);
+            }
+        }
+        AstExprKind::Block { bindings, result } => {
+            for binding in bindings {
+                collect_expr_list_value_facts(binding.value, expressions, facts);
+            }
+            if let Some(result) = result {
+                collect_expr_list_value_facts(*result, expressions, facts);
             }
         }
         AstExprKind::Object(fields)
@@ -4541,23 +4948,48 @@ fn collect_called_functions(expr_id: usize, expressions: &[AstExpr], calls: &mut
         return;
     };
     match &expr.kind {
-        AstExprKind::Call { function, args } => {
+        AstExprKind::Call {
+            function,
+            args,
+            pass,
+        } => {
             calls.push(function.clone());
             for arg in args {
                 collect_called_functions(arg.value, expressions, calls);
             }
+            if let Some(pass) = pass {
+                collect_called_functions(pass.value, expressions, calls);
+            }
         }
-        AstExprKind::Pipe { input, op, args } => {
+        AstExprKind::Pipe {
+            input,
+            op,
+            args,
+            pass,
+            arms,
+        } => {
             collect_called_functions(*input, expressions, calls);
             calls.push(op.clone());
             for arg in args {
                 collect_called_functions(arg.value, expressions, calls);
             }
+            if let Some(pass) = pass {
+                collect_called_functions(pass.value, expressions, calls);
+            }
+            for arm in arms {
+                collect_called_functions(*arm, expressions, calls);
+            }
         }
         AstExprKind::Draining { input } => {
             collect_called_functions(*input, expressions, calls);
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::When { input, arms } => {
+            collect_called_functions(*input, expressions, calls);
+            for arm in arms {
+                collect_called_functions(*arm, expressions, calls);
+            }
+        }
+        AstExprKind::Hold { initial, .. } => {
             collect_called_functions(*initial, expressions, calls);
         }
         AstExprKind::Then { input, output } => {
@@ -4573,6 +5005,14 @@ fn collect_called_functions(expr_id: usize, expressions: &[AstExpr], calls: &mut
         AstExprKind::MatchArm { output, .. } => {
             if let Some(output) = output {
                 collect_called_functions(*output, expressions, calls);
+            }
+        }
+        AstExprKind::Block { bindings, result } => {
+            for binding in bindings {
+                collect_called_functions(binding.value, expressions, calls);
+            }
+            if let Some(result) = result {
+                collect_called_functions(*result, expressions, calls);
             }
         }
         AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
@@ -4633,14 +5073,29 @@ fn push_state_cell(tables: &mut StructureTables, cell: ParsedStateCell) {
 }
 
 fn statement_direct_stateful_operator(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement_stateful_expression_id(statement, expressions).is_some()
+}
+
+fn statement_stateful_expression_id(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<usize> {
     statement
         .expr
-        .and_then(|expr_id| expressions.get(expr_id))
-        .is_some_and(|expr| expr_is_stateful_statement_expr(expr, statement, expressions))
-        || statement
-            .children
-            .iter()
-            .any(|child| child_statement_is_stateful(child, expressions))
+        .filter(|expr_id| {
+            expressions
+                .get(*expr_id)
+                .is_some_and(|expr| expr_is_stateful_statement_expr(expr, statement, expressions))
+        })
+        .or_else(|| {
+            statement.children.iter().find_map(|child| {
+                child.expr.filter(|expr_id| {
+                    expressions.get(*expr_id).is_some_and(|expr| {
+                        expr_is_stateful_statement_expr(expr, child, expressions)
+                    })
+                })
+            })
+        })
 }
 
 fn statement_direct_root_memory_operator(
@@ -4671,13 +5126,6 @@ fn expr_is_root_memory_statement_expr(
     }
 }
 
-fn child_statement_is_stateful(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
-    statement
-        .expr
-        .and_then(|expr_id| expressions.get(expr_id))
-        .is_some_and(|expr| expr_is_stateful_statement_expr(expr, statement, expressions))
-}
-
 fn expr_is_stateful_statement_expr(
     expr: &AstExpr,
     statement: &AstStatement,
@@ -4685,7 +5133,7 @@ fn expr_is_stateful_statement_expr(
 ) -> bool {
     match &expr.kind {
         AstExprKind::Latest => latest_statement_has_initial(statement, expressions),
-        AstExprKind::Pipe { op, .. } => matches!(op.as_str(), "Bool/toggle" | "List/latest"),
+        AstExprKind::Pipe { op, .. } => op == "Bool/toggle",
         _ => false,
     }
 }
@@ -4744,18 +5192,34 @@ fn expr_contains_transient_latest_operator(expr_id: usize, expressions: &[AstExp
     };
     match &expr.kind {
         AstExprKind::Latest | AstExprKind::When { .. } | AstExprKind::Then { .. } => true,
-        AstExprKind::Pipe { input, op, args } => {
+        AstExprKind::Pipe {
+            input,
+            op,
+            args,
+            pass,
+            ..
+        } => {
             matches!(op.as_str(), "THEN" | "WHEN" | "List/latest")
                 || expr_contains_transient_latest_operator(*input, expressions)
                 || args
                     .iter()
                     .any(|arg| expr_contains_transient_latest_operator(arg.value, expressions))
+                || pass.as_ref().is_some_and(|pass| {
+                    expr_contains_transient_latest_operator(pass.value, expressions)
+                })
         }
-        AstExprKind::Call { function, args } => {
+        AstExprKind::Call {
+            function,
+            args,
+            pass,
+        } => {
             matches!(function.as_str(), "THEN" | "WHEN" | "List/latest")
                 || args
                     .iter()
                     .any(|arg| expr_contains_transient_latest_operator(arg.value, expressions))
+                || pass.as_ref().is_some_and(|pass| {
+                    expr_contains_transient_latest_operator(pass.value, expressions)
+                })
         }
         AstExprKind::Draining { input } | AstExprKind::Hold { initial: input, .. } => {
             expr_contains_transient_latest_operator(*input, expressions)
@@ -4766,6 +5230,14 @@ fn expr_contains_transient_latest_operator(expr_id: usize, expressions: &[AstExp
         }
         AstExprKind::MatchArm { output, .. } => output
             .is_some_and(|output| expr_contains_transient_latest_operator(output, expressions)),
+        AstExprKind::Block { bindings, result } => {
+            bindings
+                .iter()
+                .any(|binding| expr_contains_transient_latest_operator(binding.value, expressions))
+                || result.is_some_and(|result| {
+                    expr_contains_transient_latest_operator(result, expressions)
+                })
+        }
         AstExprKind::Object(fields)
         | AstExprKind::Record(fields)
         | AstExprKind::TaggedObject { fields, .. } => fields
@@ -4836,10 +5308,11 @@ fn collect_source_ports_from_expr(
     };
     match &expr.kind {
         AstExprKind::Source => {
-            let source_scope = source_scope_without_event_groups(scope);
-            if let Some(path) = scope_path(&source_scope) {
+            if let Some(path) = scope_path(scope) {
                 tables.source_ports.push(ParsedSourcePort {
                     path,
+                    binding_path: scope_path(scope).expect("SOURCE scope is nonempty"),
+                    expr_id: Some(expr.id),
                     line,
                     scoped,
                     interval_ms: None,
@@ -4854,7 +5327,9 @@ fn collect_source_ports_from_expr(
                 push_source_port(
                     tables,
                     ParsedSourcePort {
+                        binding_path: path.clone(),
                         path,
+                        expr_id: Some(expr.id),
                         line,
                         scoped,
                         interval_ms: Some(interval_ms),
@@ -5122,9 +5597,9 @@ fn statement_row_scope_function(
 ) -> Option<ParsedRowScopeFunction> {
     let expr = ast.expressions.get(statement.expr?)?;
     match &expr.kind {
-        AstExprKind::Pipe { input, op, args }
-            if op == "List/map" || (include_append_constructors && op == "List/append") =>
-        {
+        AstExprKind::Pipe {
+            input, op, args, ..
+        } if op == "List/map" || (include_append_constructors && op == "List/append") => {
             let output_list = statement_row_scope_output_list(statement, op);
             let input_list = collection_list_name(*input, ast);
             let parent_storage_scope = scope
@@ -5160,7 +5635,7 @@ fn statement_row_scope_function(
                 .or_else(|| scope.last().cloned())?;
             let function = if op == "List/map" {
                 args.iter()
-                    .find(|arg| arg.name.as_deref() == Some("new"))
+                    .find(|arg| arg.named_name() == Some("new"))
                     .and_then(|arg| function_name_from_expr(arg.value, ast))
                     .or_else(|| {
                         statement
@@ -5172,7 +5647,7 @@ fn statement_row_scope_function(
                     })
             } else {
                 args.iter()
-                    .find(|arg| arg.name.as_deref() == Some("item"))
+                    .find(|arg| arg.named_name() == Some("item"))
                     .and_then(|arg| function_name_from_expr(arg.value, ast))
             }?;
             let row_scope = if op == "List/map" {
@@ -5240,7 +5715,7 @@ fn statement_row_scope_output_list(statement: &AstStatement, op: &str) -> Option
 }
 
 fn list_map_binding_name(args: &[AstCallArg], ast: &AstProgram) -> Option<String> {
-    let arg = args.iter().find(|arg| arg.name.is_none())?;
+    let arg = args.iter().find(|arg| arg.is_bare_binding())?;
     let expr = ast.expressions.get(arg.value)?;
     match &expr.kind {
         AstExprKind::Identifier(name) => Some(name.clone()),
@@ -5342,12 +5817,10 @@ fn list_returning_operator(op: &str) -> bool {
         op,
         "List/range"
             | "List/map"
+            | "List/filter"
             | "List/append"
             | "List/retain"
             | "List/remove"
-            | "List/filter_text_contains"
-            | "List/filter_field_equal"
-            | "List/filter_field_not_equal"
             | "List/move_field_first"
             | "List/move_field_last"
             | "List/chunk"
@@ -5407,16 +5880,6 @@ fn scope_path(scope: &[String]) -> Option<String> {
     })
 }
 
-fn source_scope_without_event_groups(scope: &[String]) -> Vec<String> {
-    let source_leaf = scope.len().saturating_sub(1);
-    scope
-        .iter()
-        .enumerate()
-        .filter(|(index, segment)| segment.as_str() != "events" || *index == source_leaf)
-        .map(|(_, segment)| segment.clone())
-        .collect()
-}
-
 fn source_scope_is_scoped(scope: &[String], row_scopes: &[ParsedRowScopeFunction]) -> bool {
     scope_is_indexed(scope, row_scopes)
 }
@@ -5473,6 +5936,232 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multiline_selectors_retain_owned_match_arms() {
+        let parsed = parse_ast(
+            "structured-selectors.bn",
+            r#"
+when_value:
+    selector |> WHEN {
+        Ready =>
+            selector.value
+            |> Number/abs()
+        fallback => BLOCK {
+            copied: fallback
+            copied
+        }
+    }
+
+while_value:
+    selector |> WHILE {
+        Ready => selector.value
+        fallback => fallback
+    }
+"#,
+        )
+        .unwrap();
+
+        let when = parsed
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, AstExprKind::When { .. }))
+            .expect("WHEN expression");
+        let AstExprKind::When { arms, .. } = &when.kind else {
+            unreachable!();
+        };
+        assert_eq!(arms.len(), 2);
+        assert!(arms.iter().all(|arm| matches!(
+            parsed.expressions[*arm].kind,
+            AstExprKind::MatchArm {
+                output: Some(_),
+                ..
+            }
+        )));
+
+        let ready_output = arms
+            .iter()
+            .find_map(|arm| match &parsed.expressions[*arm].kind {
+                AstExprKind::MatchArm {
+                    pattern,
+                    output: Some(output),
+                } if pattern == &["Ready"] => Some(*output),
+                _ => None,
+            });
+        let ready_output = ready_output.expect("Ready output");
+        let ready = &parsed.expressions[ready_output];
+        assert!(matches!(&ready.kind, AstExprKind::Pipe { op, .. } if op == "Number/abs"));
+        let linked_input = ready.linked_input.expect("multiline pipeline input");
+        assert!(matches!(
+            &parsed.expressions[linked_input].kind,
+            AstExprKind::Path(parts) if parts == &["selector", "value"]
+        ));
+
+        let fallback_output = arms
+            .iter()
+            .find_map(|arm| match &parsed.expressions[*arm].kind {
+                AstExprKind::MatchArm {
+                    pattern,
+                    output: Some(output),
+                } if pattern == &["fallback"] => Some(*output),
+                _ => None,
+            })
+            .expect("fallback output");
+        let AstExprKind::Block { bindings, result } = &parsed.expressions[fallback_output].kind
+        else {
+            panic!("fallback output must remain a BLOCK");
+        };
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.name.as_str())
+                .collect::<Vec<_>>(),
+            ["copied"]
+        );
+        assert!(matches!(
+            parsed.expressions[result.expect("fallback BLOCK result")].kind,
+            AstExprKind::Identifier(ref name) if name == "copied"
+        ));
+
+        let while_arms = parsed
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                AstExprKind::Pipe { op, arms, .. } if op == "WHILE" => Some(arms),
+                _ => None,
+            });
+        assert_eq!(while_arms.expect("WHILE arms").len(), 2);
+    }
+
+    #[test]
+    fn expression_block_retains_bindings_result_and_multiline_children() {
+        let parsed = parse_ast(
+            "structured-block.bn",
+            r#"
+FUNCTION calculate(input) {
+    BLOCK {
+        answer: normalized
+        normalized:
+            input
+            |> Number/abs()
+        answer
+    }
+}
+
+FUNCTION row(input) {
+    [
+        value: input
+    ]
+}
+
+rows: LIST {
+    [value: 1]
+    [value: 2]
+}
+"#,
+        )
+        .unwrap();
+
+        let block = parsed
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, AstExprKind::Block { .. }))
+            .expect("BLOCK expression");
+        let AstExprKind::Block { bindings, result } = &block.kind else {
+            unreachable!();
+        };
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.name.as_str())
+                .collect::<Vec<_>>(),
+            ["answer", "normalized"]
+        );
+        assert!(bindings.iter().all(|binding| binding.statement > 0));
+        assert!(matches!(
+            parsed.expressions[result.expect("BLOCK result")].kind,
+            AstExprKind::Identifier(ref name) if name == "answer"
+        ));
+        let normalized = bindings
+            .iter()
+            .find(|binding| binding.name == "normalized")
+            .expect("normalized binding");
+        assert!(matches!(
+            parsed.expressions[normalized.value].kind,
+            AstExprKind::Pipe { ref op, .. } if op == "Number/abs"
+        ));
+        assert!(parsed.expressions[normalized.value].linked_input.is_some());
+
+        let record = parsed
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                AstExprKind::Record(fields) if fields.iter().any(|field| field.name == "value") => {
+                    Some(fields)
+                }
+                _ => None,
+            })
+            .expect("multiline record fields");
+        assert_eq!(record.len(), 1);
+        let list_items = parsed
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                AstExprKind::ListLiteral { items, .. } if items.len() == 2 => Some(items),
+                _ => None,
+            });
+        assert_eq!(list_items.expect("multiline list items").len(), 2);
+    }
+
+    #[test]
+    fn grouped_infix_expression_preserves_the_inner_operation() {
+        let parsed = parse_source(
+            "grouped-infix.bn",
+            r#"
+store: [
+    value: (input.value + 1) * 2
+]
+"#,
+        )
+        .unwrap();
+        let multiply = parsed
+            .expressions
+            .iter()
+            .find(|expr| matches!(&expr.kind, AstExprKind::Infix { op, .. } if op == "*"))
+            .expect("outer multiplication is parsed");
+        let AstExprKind::Infix { left, .. } = multiply.kind else {
+            unreachable!();
+        };
+        assert!(matches!(
+            parsed.expressions[left].kind,
+            AstExprKind::Infix { ref op, .. } if op == "+"
+        ));
+    }
+
+    #[test]
+    fn nested_grouped_expression_preserves_every_operation() {
+        let parsed = parse_source(
+            "nested-grouped-infix.bn",
+            r#"
+store: [
+    value: ((input.value + 1) * 2)
+]
+"#,
+        )
+        .unwrap();
+        let multiply = parsed
+            .expressions
+            .iter()
+            .find(|expr| matches!(&expr.kind, AstExprKind::Infix { op, .. } if op == "*"))
+            .expect("outer groups are unwrapped");
+        let AstExprKind::Infix { left, .. } = multiply.kind else {
+            unreachable!();
+        };
+        assert!(matches!(
+            parsed.expressions[left].kind,
+            AstExprKind::Infix { ref op, .. } if op == "+"
+        ));
+    }
+
+    #[test]
     fn multiline_list_map_new_call_creates_a_keyed_row_scope() {
         let parsed = parse_source(
             "multiline-dynamic-map.bn",
@@ -5513,7 +6202,7 @@ FUNCTION new_row(row) {
             .iter()
             .find_map(|expr| match &expr.kind {
                 AstExprKind::Pipe { op, args, .. } if op == "List/map" => {
-                    args.iter().find(|arg| arg.name.as_deref() == Some("new"))
+                    args.iter().find(|arg| arg.named_name() == Some("new"))
                 }
                 _ => None,
             })
@@ -5595,14 +6284,13 @@ store: [
     selected:
         result |> WHEN {
             Ready =>
-                List/find_value(
-                    rows
-                    field: "id"
-                    value: TEXT { one }
-                    target: "values"
-                    fallback: LIST {}
-                )
-                |> List/map(old, new: old)
+                rows
+                |> List/find(item, if: item.id == TEXT { one })
+                |> WHEN {
+                    Found[value] => value.values
+                    NotFound => LIST {}
+                }
+                |> List/map(item, new: item)
             __ => LIST {}
         }
 ]
@@ -5687,5 +6375,98 @@ store: [
                 .iter()
                 .any(|list| list.name == "bounded_rows")
         );
+    }
+
+    #[test]
+    fn function_parameters_and_call_entries_preserve_out_and_pass_structure() {
+        let parsed = parse_source(
+            "out-structure.bn",
+            r#"
+FUNCTION map(list, item: OUT, new) {
+    new
+}
+
+items: LIST { [value: 1] }
+mapped:
+    map(
+        list: items
+        item
+        new: item.value
+        PASS: [theme: theme]
+    )
+"#,
+        )
+        .unwrap();
+
+        let parameters = parsed
+            .ast
+            .statements
+            .iter()
+            .find_map(|statement| match &statement.kind {
+                AstStatementKind::Function { name, parameters } if name == "map" => {
+                    Some(parameters)
+                }
+                _ => None,
+            })
+            .expect("map parameters");
+        assert_eq!(
+            parameters
+                .iter()
+                .map(|parameter| (parameter.name.as_str(), parameter.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("list", AstParameterKind::Value),
+                ("item", AstParameterKind::Out),
+                ("new", AstParameterKind::Value),
+            ]
+        );
+
+        let (args, pass) = parsed
+            .expressions
+            .iter()
+            .find_map(|expr| match &expr.kind {
+                AstExprKind::Call {
+                    function,
+                    args,
+                    pass,
+                } if function == "map" => Some((args, pass.as_ref())),
+                _ => None,
+            })
+            .expect("map call");
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0].named_name(), Some("list"));
+        assert!(args[1].is_bare_binding());
+        assert_eq!(args[1].name, "item");
+        assert_eq!(args[2].named_name(), Some("new"));
+        assert!(pass.is_some());
+    }
+
+    #[test]
+    fn pass_must_be_unique_and_final() {
+        for source in [
+            "value: render(PASS: [theme: theme], value: 1)",
+            "value: render(value: 1, PASS: [theme: theme], PASS: [theme: other])",
+        ] {
+            let error = parse_source("invalid-pass.bn", source).unwrap_err();
+            assert!(error.message.contains("`PASS`"), "{error}");
+        }
+        parse_source(
+            "valid-pass.bn",
+            "value: render(value: 1, PASS: [theme: theme])",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ordinary_positional_call_entries_are_rejected() {
+        let error = parse_source("positional.bn", "value: render(1)").unwrap_err();
+        assert!(error.message.contains("ordinary arguments use"), "{error}");
+    }
+
+    #[test]
+    fn function_parameter_kinds_are_exact() {
+        let error =
+            parse_source("invalid-parameter.bn", "FUNCTION map(item: EACH) { item }").unwrap_err();
+        assert!(error.message.contains("`name` or `name: OUT`"), "{error}");
     }
 }

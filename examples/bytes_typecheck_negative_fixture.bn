@@ -1,7 +1,3 @@
-SOURCE
-HOLD
-LATEST
-LIST {}
 bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
 too_short: BYTES[2] { 16u01 }
 implicit_text: BYTES[__] { TEXT { hi } }

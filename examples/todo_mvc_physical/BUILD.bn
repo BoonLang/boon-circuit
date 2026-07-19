@@ -13,7 +13,7 @@ svg_files: icons_directory
 
 generation_result:
     svg_files
-    |> List/map(old, new: old
+    |> List/map(item, new: item
     |> icon_code()
     |> WHEN {
         Ok[text] => text

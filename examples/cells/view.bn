@@ -22,6 +22,13 @@ FUNCTION cells_app() {
 }
 
 FUNCTION formula_bar() {
+    store.selected_input |> WHEN {
+        Found[cell] => selected_formula_bar(cell: cell)
+        NotFound => empty_formula_bar()
+    }
+}
+
+FUNCTION selected_formula_bar(cell) {
     Element/stripe(
         element: []
         direction: Row
@@ -40,7 +47,7 @@ FUNCTION formula_bar() {
                     background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
                     font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
                 ]
-                label: store.selected_input.address
+                label: cell.address
             )
             Element/label(
                 element: []
@@ -54,11 +61,12 @@ FUNCTION formula_bar() {
             )
             Element/text_input(
                 element: [
+                    address: store.selected_address
                     event: [
-                        change: store.selected_input.sources.editor.events.change
-                        key_down: store.selected_input.sources.editor.commit
-                        escape: store.selected_input.sources.editor.cancel
-                        blur: store.selected_input.sources.editor.events.blur
+                        change: cell.sources.editor.events.change
+                        key_down: cell.sources.editor.commit
+                        escape: cell.sources.editor.cancel
+                        blur: cell.sources.editor.events.blur
                     ]
                 ]
                 style: [
@@ -70,9 +78,57 @@ FUNCTION formula_bar() {
                     input_live_change: False
                 ]
                 label: TEXT { fx input }
-                text: store.selected_input.editing_text
+                text: cell.editing_text
                 placeholder: [text: Text/empty()]
-                address: store.selected_address
+            )
+        }
+    )
+}
+
+FUNCTION empty_formula_bar() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 4
+        style: [
+            width: Fill
+            height: 34
+            background: [color: Oklch[lightness:0.98]]
+        ]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [
+                    width: 40
+                    height: 30
+                    background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
+                    font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
+                ]
+                label: store.selected_address
+            )
+            Element/label(
+                element: []
+                style: [
+                    width: 24
+                    height: 30
+                    background: [color: Oklch[lightness:0.93,chroma:0.02,hue:250]]
+                    font: [size: 10, color: Oklch[lightness:0.38,chroma:0.04,hue:250]]
+                ]
+                label: TEXT { fx }
+            )
+            Element/text_input(
+                element: [address: store.selected_address]
+                style: [
+                    width: Fill
+                    height: 30
+                    background: [color: Oklch[lightness:1]]
+                    border: [color: Oklch[lightness:0.86,chroma:0.02,hue:250]]
+                    font: [size: 12, color: Oklch[lightness:0.12]]
+                    input_live_change: False
+                ]
+                label: TEXT { fx input }
+                text: Text/empty()
+                placeholder: [text: Text/empty()]
             )
         }
     )
@@ -115,7 +171,7 @@ FUNCTION column_header_cells() {
         ]
         items:
             sheet_columns
-            |> List/map(column, new: column_header_cell(column: column))
+            |> List/map(item, new: column_header_cell(column: item))
     )
 }
 
@@ -146,7 +202,7 @@ FUNCTION sheet_row_views() {
         ]
         items:
             store.sheet_rows
-            |> List/map(sheet_row, new: sheet_row_view(sheet_row: sheet_row))
+            |> List/map(item, new: sheet_row_view(sheet_row: item))
     )
 }
 
@@ -169,7 +225,7 @@ FUNCTION sheet_row_view(sheet_row) {
                     background: [color: Oklch[lightness:0.96,chroma:0.01,hue:250]]
                     font: [size: 10, color: Oklch[lightness:0.46,chroma:0.04,hue:250]]
                 ]
-                label: sheet_row.row_number
+                label: sheet_row.label
             )
             sheet_row_cells(sheet_row: sheet_row)
         }
@@ -186,17 +242,20 @@ FUNCTION sheet_row_cells(sheet_row) {
             height: 24
         ]
         items:
-            sheet_row.cells
-            |> List/map(cell, new: cell_view(cell: cell))
+            sheet_row.items
+            |> List/map(item, new: cell_view(cell: item))
     )
 }
 
 FUNCTION cell_view(cell) {
     Element/button(
         element: [
+            address: cell.address
             event: [
                 press: cell.sources.editor.select
             ]
+            key: cell.address
+            text: cell.display_text
         ]
         style: [
             width: 80
@@ -210,9 +269,6 @@ FUNCTION cell_view(cell) {
             font: [size: 10, color: Oklch[lightness:0.12]]
         ]
         label: cell.display_text
-        text: cell.display_text
         target: cell.editing_text
-        key: cell.address
-        address: cell.address
     )
 }

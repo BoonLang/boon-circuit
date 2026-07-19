@@ -5,20 +5,13 @@ fn bytes_set_lowers_a_fixed_single_byte_value() {
     let parsed = boon_parser::parse_source(
         "bytes-set-fixed-single-byte.bn",
         r#"
-SOURCE
-HOLD
-LATEST
-LIST {}
-
 store: [
     payload: BYTES[2] { 16u01, 16u02 }
     patch: SOURCE
     patched:
         BYTES[2] {} |> HOLD patched {
-            LATEST {
-                store.patch |> THEN {
-                    store.payload |> Bytes/set(index: 1, value: BYTES[1] { 16u5A })
-                }
+            store.patch |> THEN {
+                store.payload |> Bytes/set(index: 1, value: BYTES[1] { 16u5A })
             }
         }
 ]
@@ -173,18 +166,12 @@ fn bytes_text_conversion_update_expressions_require_explicit_encoding() {
     let missing = boon_parser::parse_source(
         "missing-bytes-encoding-ir.bn",
         r#"
-SOURCE
-HOLD
-LATEST
-LIST {}
 store: [
 encode: SOURCE
 text: TEXT { hi }
 encoded:
     BYTES {} |> HOLD encoded {
-        LATEST {
-            store.encode |> THEN { store.text |> Text/to_bytes() }
-        }
+        store.encode |> THEN { store.text |> Text/to_bytes() }
     }
 ]
 document: Document/new(root: Element/label(element: [], label: TEXT { Missing encoding }))
@@ -304,28 +291,28 @@ fn row_local_bare_source_identifier_lowers_indexed_bytes_reads() {
 
     assert!(ir.update_branches.iter().any(|branch| {
         branch.indexed
-            && branch.target == "row.payload_len"
-            && branch.source == "row.inspect"
+            && branch.target == "store.rows.payload_len"
+            && branch.source == "store.rows.inspect"
             && branch.expression
                 == UpdateExpression::BytesLength {
-                    path: "row.payload".to_owned(),
+                    path: "store.rows.payload".to_owned(),
                 }
     }));
     assert!(ir.update_branches.iter().any(|branch| {
         branch.indexed
-            && branch.target == "row.payload_second"
-            && branch.source == "row.inspect"
+            && branch.target == "store.rows.payload_second"
+            && branch.source == "store.rows.inspect"
             && branch.expression
                 == UpdateExpression::BytesGet {
-                    path: "row.payload".to_owned(),
+                    path: "store.rows.payload".to_owned(),
                     index: 1,
                 }
     }));
     assert!(!ir.update_branches.iter().any(|branch| {
-        branch.source == "row.receive"
+        branch.source == "store.rows.receive"
             && matches!(
                 branch.target.as_str(),
-                "row.payload_len" | "row.payload_second"
+                "store.rows.payload_len" | "store.rows.payload_second"
             )
     }));
 }

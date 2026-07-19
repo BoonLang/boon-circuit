@@ -24,14 +24,14 @@ FUNCTION header() {
         gap: 10
         style: [width: Fill, height: 42, paint: False]
         items: LIST {
-            Components/text(PASS: [store: PASSED.store], value: TEXT { Profile source }, of: Heading)
+            Components/text(value: TEXT { Profile source }, of: Heading, PASS: [store: PASSED.store])
             Components/status(
-                PASS: [store: PASSED.store]
                 label: Workspace/compile_label(
                     state: PASSED.store.draft_compile_state
                     revision: PASSED.store.draft_revision
                 )
                 tone: Workspace/compile_tone(state: PASSED.store.draft_compile_state)
+                PASS: [store: PASSED.store]
             )
         }
     )

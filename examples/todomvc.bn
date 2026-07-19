@@ -59,42 +59,42 @@ store: [
         |> List/append(item: title_to_add |> THEN {
             [title: title_to_add, completed: False]
         })
-        |> List/remove(todo, when:
+        |> List/remove(item, when:
             LATEST {
-                todo.sources.remove_todo_button.events.press |> THEN { True }
-                sources.clear_completed_button.events.press |> THEN { todo.completed }
+                item.sources.remove_todo_button.events.press |> THEN { True }
+                sources.clear_completed_button.events.press |> THEN { item.completed }
             }
         )
-        |> List/map(todo, new: new_todo(todo: todo, store: store))
+        |> List/map(item, new: new_todo(todo: item, store: store))
 
     visible_todos:
         todos
-        |> List/retain(todo, if:
+        |> List/retain(item, if:
             selected_filter |> WHEN {
                 All => True
-                Active => todo.completed |> Bool/not()
-                Completed => todo.completed
+                Active => item.completed |> Bool/not()
+                Completed => item.completed
             }
         )
 
     active_count:
         todos
-        |> List/retain(todo, if: todo.completed |> Bool/not())
+        |> List/retain(item, if: item.completed |> Bool/not())
         |> List/count()
 
     completed_count:
         todos
-        |> List/retain(todo, if: todo.completed)
+        |> List/retain(item, if: item.completed)
         |> List/count()
 
     has_todos:
-        active_count == 0 |> Bool/and(completed_count == 0) |> Bool/not()
+        active_count == 0 |> Bool/and(with: completed_count == 0) |> Bool/not()
 
     has_completed:
         completed_count > 0
 
     all_completed:
-        active_count == 0 |> Bool/and(completed_count > 0)
+        active_count == 0 |> Bool/and(with: completed_count > 0)
 
     new_todo_focused:
         True |> HOLD state {
@@ -390,7 +390,7 @@ FUNCTION todo_list() {
         visible: PASSED.store.has_todos
         items:
             PASSED.store.visible_todos
-            |> List/map(todo, new: todo_row(todo: todo))
+            |> List/map(item, new: todo_row(todo: item))
     )
 }
 

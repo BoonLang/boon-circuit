@@ -20,7 +20,7 @@ store: [
             [title: TEXT { Plan release }, completed: False]
             [title: TEXT { Test migration }, completed: True]
         }
-        |> List/map(todo, new: new_todo(todo: todo))
+        |> List/map(item, new: new_todo(todo: item))
 ]
 
 FUNCTION new_todo(todo) {
@@ -101,7 +101,7 @@ FUNCTION task_list() {
         direction: Column
         gap: 8
         style: [width: Fill, height: Fill]
-        items: store.todos |> List/map(todo, new: task_row(todo: todo))
+        items: store.todos |> List/map(item, new: task_row(todo: item))
     )
 }
 

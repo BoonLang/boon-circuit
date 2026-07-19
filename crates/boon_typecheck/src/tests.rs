@@ -4,3 +4,4 @@ use super::*;
 include!("tests/host_ports.rs");
 include!("tests/distributed.rs");
 include!("tests/reactive_collections.rs");
+include!("tests/calls.rs");

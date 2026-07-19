@@ -17,57 +17,39 @@ store: [
     inspect: SOURCE
     joined:
         BYTES[4] {} |> HOLD joined {
-            LATEST {
-                store.build |> THEN { left_payload |> Bytes/concat(with: right_payload) }
-            }
+            store.build |> THEN { left_payload |> Bytes/concat(with: right_payload) }
         }
     hex:
         TEXT { old } |> HOLD hex {
-            LATEST {
-                store.encode |> THEN { store.joined |> Bytes/to_hex() }
-            }
+            store.encode |> THEN { store.joined |> Bytes/to_hex() }
         }
     base64:
         TEXT { old } |> HOLD base64 {
-            LATEST {
-                store.encode |> THEN { Bytes/to_base64(input: store.joined) }
-            }
+            store.encode |> THEN { Bytes/to_base64(input: store.joined) }
         }
     zeros:
         BYTES[4] { 16uFF, 16uFF, 16uFF, 16uFF } |> HOLD zeros {
-            LATEST {
-                store.decode |> THEN { Bytes/zeros(byte_count: 4) }
-            }
+            store.decode |> THEN { Bytes/zeros(byte_count: 4) }
         }
     decoded_hex:
         BYTES[4] {} |> HOLD decoded_hex {
-            LATEST {
-                store.decode |> THEN { hex_input |> Bytes/from_hex() }
-            }
+            store.decode |> THEN { hex_input |> Bytes/from_hex() }
         }
     decoded_base64:
         BYTES[4] {} |> HOLD decoded_base64 {
-            LATEST {
-                store.decode |> THEN { Bytes/from_base64(input: base64_input) }
-            }
+            store.decode |> THEN { Bytes/from_base64(input: base64_input) }
         }
     zeros_len:
         0 |> HOLD zeros_len {
-            LATEST {
-                store.inspect |> THEN { store.zeros |> Bytes/length() }
-            }
+            store.inspect |> THEN { store.zeros |> Bytes/length() }
         }
     decoded_hex_byte:
         BYTES[1] { 16u00 } |> HOLD decoded_hex_byte {
-            LATEST {
-                store.inspect |> THEN { store.decoded_hex |> Bytes/get(index: 2) }
-            }
+            store.inspect |> THEN { store.decoded_hex |> Bytes/get(index: 2) }
         }
     decoded_base64_hex:
         TEXT { old } |> HOLD decoded_base64_hex {
-            LATEST {
-                store.inspect |> THEN { store.decoded_base64 |> Bytes/to_hex() }
-            }
+            store.inspect |> THEN { store.decoded_base64 |> Bytes/to_hex() }
         }
 ]
 

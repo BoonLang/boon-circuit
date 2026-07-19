@@ -29,7 +29,7 @@ sheet_columns:
         [index: TEXT { 24 }, label: TEXT { Y }]
         [index: TEXT { 25 }, label: TEXT { Z }]
     }
-    |> List/map(column, new: new_sheet_column(column: column))
+    |> List/map(item, new: new_sheet_column(column: item))
 
 FUNCTION new_sheet_column(column) {
     [

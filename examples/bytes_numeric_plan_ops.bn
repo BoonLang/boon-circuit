@@ -7,63 +7,43 @@ store: [
     inspect: SOURCE
     read_u16_le:
         0 |> HOLD read_u16_le {
-            LATEST {
-                store.measure |> THEN { payload |> Bytes/read_unsigned(offset: 0, byte_count: 2, endian: Little) }
-            }
+            store.measure |> THEN { payload |> Bytes/read_unsigned(offset: 0, byte_count: 2, endian: Little) }
         }
     read_u16_be:
         0 |> HOLD read_u16_be {
-            LATEST {
-                store.measure |> THEN { Bytes/read_unsigned(input: payload, offset: 0, byte_count: 2, endian: Big) }
-            }
+            store.measure |> THEN { Bytes/read_unsigned(input: payload, offset: 0, byte_count: 2, endian: Big) }
         }
     read_i16_be:
         0 |> HOLD read_i16_be {
-            LATEST {
-                store.measure |> THEN { payload |> Bytes/read_signed(offset: 2, byte_count: 2, endian: Big) }
-            }
+            store.measure |> THEN { payload |> Bytes/read_signed(offset: 2, byte_count: 2, endian: Big) }
         }
     read_i8:
         0 |> HOLD read_i8 {
-            LATEST {
-                store.measure |> THEN { Bytes/read_signed(input: payload, offset: 5, byte_count: 1, endian: Little) }
-            }
+            store.measure |> THEN { Bytes/read_signed(input: payload, offset: 5, byte_count: 1, endian: Little) }
         }
     written_unsigned:
         BYTES[8] {} |> HOLD written_unsigned {
-            LATEST {
-                store.write |> THEN { payload |> Bytes/write_unsigned(offset: 6, byte_count: 2, endian: Big, value: 4660) }
-            }
+            store.write |> THEN { payload |> Bytes/write_unsigned(offset: 6, byte_count: 2, endian: Big, value: 4660) }
         }
     written_signed:
         BYTES[8] {} |> HOLD written_signed {
-            LATEST {
-                store.write |> THEN { Bytes/write_signed(input: payload, offset: 4, byte_count: 2, endian: Little, value: -129) }
-            }
+            store.write |> THEN { Bytes/write_signed(input: payload, offset: 4, byte_count: 2, endian: Little, value: -129) }
         }
     written_unsigned_hex:
         TEXT { old } |> HOLD written_unsigned_hex {
-            LATEST {
-                store.inspect |> THEN { store.written_unsigned |> Bytes/to_hex() }
-            }
+            store.inspect |> THEN { store.written_unsigned |> Bytes/to_hex() }
         }
     written_signed_hex:
         TEXT { old } |> HOLD written_signed_hex {
-            LATEST {
-                store.inspect |> THEN { store.written_signed |> Bytes/to_hex() }
-            }
+            store.inspect |> THEN { store.written_signed |> Bytes/to_hex() }
         }
     written_unsigned_read:
         0 |> HOLD written_unsigned_read {
-            LATEST {
-                store.inspect |> THEN { store.written_unsigned |> Bytes/read_unsigned(offset: 6, byte_count: 2, endian: Big) }
-            }
+            store.inspect |> THEN { store.written_unsigned |> Bytes/read_unsigned(offset: 6, byte_count: 2, endian: Big) }
         }
     written_signed_read:
         0 |> HOLD written_signed_read {
-            LATEST {
-                store.inspect |> THEN { store.written_signed |> Bytes/read_signed(offset: 4, byte_count: 2, endian: Little) }
-            }
+            store.inspect |> THEN { store.written_signed |> Bytes/read_signed(offset: 4, byte_count: 2, endian: Little) }
         }
 ]
 

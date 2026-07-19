@@ -4,17 +4,18 @@ store: [
     selected_address:
         TEXT { A0 } |> HOLD selected_address {
             LATEST {
-                cell.sources.editor.select.address
-                cell.sources.editor.change.address
-                cell.sources.editor.commit.address
-                cell.sources.editor.cancel.address
-                cell.sources.editor.blur.address
+                item.sources.editor.select.address
+                item.sources.editor.change.address
+                item.sources.editor.commit.address
+                item.sources.editor.cancel.address
+                item.sources.editor.blur.address
             }
         }
 
     selected_input:
-        List/find(cells, field: address, value: selected_address)
+        cells
+        |> List/find(item, if: item.address == selected_address)
 
     sheet_rows:
-        List/chunk(cells, size: 26, items: cells, label: row_number)
+        List/chunk(list: cells, size: 26)
 ]

@@ -3,7 +3,7 @@ store: [
         LIST {
             [name: TEXT { beta }, payload: BYTES[3] {}]
         }
-        |> List/map(row, new: row_widget(row: row))
+        |> List/map(item, new: row_widget(row: item))
 ]
 
 FUNCTION row_widget(row) {

@@ -34,18 +34,18 @@ FUNCTION browser_bar() {
         ]
         items: LIST {
             Components/button(
-                PASS: [store: PASSED.store]
                 source: PASSED.store.elements.show_draft_page
                 label: TEXT { Draft }
                 tone: Neutral
                 selected: PASSED.store.preview_surface == DraftPage
+                PASS: [store: PASSED.store]
             )
             Components/button(
-                PASS: [store: PASSED.store]
                 source: PASSED.store.elements.show_published_page
                 label: TEXT { Published }
                 tone: Neutral
                 selected: PASSED.store.preview_surface == PublishedPage
+                PASS: [store: PASSED.store]
             )
             Scene/Element/text(
                 element: []
@@ -142,14 +142,14 @@ FUNCTION publication_placeholder() {
         ]
         items: LIST {
             Components/text(
-                PASS: [store: PASSED.store]
                 value: TEXT { Nothing published yet }
                 of: Heading
+                PASS: [store: PASSED.store]
             )
             Components/text(
-                PASS: [store: PASSED.store]
                 value: TEXT { Publish a valid draft to create the first immutable public revision. }
                 of: Muted
+                PASS: [store: PASSED.store]
             )
         }
     )

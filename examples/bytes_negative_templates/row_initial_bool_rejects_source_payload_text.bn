@@ -5,7 +5,7 @@ store: [
             [flag: False]
             [flag: True]
         }
-        |> List/map(row, new: row_widget(row: row))
+        |> List/map(item, new: row_widget(row: item))
 ]
 
 FUNCTION row_widget(row) {

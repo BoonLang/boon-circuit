@@ -273,7 +273,7 @@ store: [
     credential_descriptors:
         LIST {}
         |> List/append(item: registered_credential)
-        |> List/map(credential, new: Account/credential(credential: credential))
+        |> List/map(item, new: Account/credential(credential: item))
 
     credential_count:
         credential_descriptors |> List/length()
@@ -444,7 +444,7 @@ store: [
                 capability_profile: elements.publish_candidate_program.compiled.capability_profile
             ]
         })
-        |> List/map(revision, new: Workspace/published_revision(revision: revision))
+        |> List/map(item, new: Workspace/published_revision(revision: item))
 
     published_revision_count:
         published_revisions |> List/length()

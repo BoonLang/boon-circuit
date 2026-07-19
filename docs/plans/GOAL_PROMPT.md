@@ -120,6 +120,9 @@ Phase 1: implement the OUT compiler and runtime cutover completely
   with typed `List/find(item, if:) -> Found[value] | NotFound`. Derive field
   index use from typed equality and preserve zero scans for Cells address
   lookup without an example branch.
+- Replace List/filter_field_equal and List/filter_field_not_equal with typed
+  `List/filter(item, if:)` predicates. Infer any field index from typed IR;
+  never expose quoted field metadata as a user-facing query API.
 - Replace caller-named List/chunk fields with `List/chunk(size:)` and canonical
   `.items`/`.label`. Make map/filter/chunk/find lazy keyed views with logical
   length, demanded ranges, precise current reads, and incremental dirty work.
@@ -253,7 +256,8 @@ Final verification and absolute stop condition:
 - Final scans must find no Python, semantic BYTE, SOURCE { ... }, invented
   effects blocks, internal JSON role transport, ProgramRole::Document or paired
   fallback, positional/renamed calls, non-final PASS, ListMapBinding,
-  List/find_value, reflective find, caller-renamed chunk fields, runtime OUT,
+  List/find_value, reflective find, List/filter_field_equal,
+  List/filter_field_not_equal, caller-renamed chunk fields, runtime OUT,
   parser/backend contextual rediscovery, exposed hidden session identity,
   positional owner/event fallback, example-specific shortcut, compatibility
   runtime, temporary codemod, or stale report.

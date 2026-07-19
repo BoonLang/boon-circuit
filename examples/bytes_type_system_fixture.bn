@@ -1,7 +1,3 @@
-SOURCE
-HOLD
-LATEST
-LIST {}
 hex_input: TEXT { 01020304 } |> HOLD hex_input { LATEST {} }
 base64_input: TEXT { AQIDBA== } |> HOLD base64_input { LATEST {} }
 bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }

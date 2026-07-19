@@ -2,7 +2,7 @@ use super::{
     CompileProfile, CompiledMachinePlanFromSource, CompilerResult, CompilerSourceUnit,
     compiler_statement_ast_exprs, elapsed_ms, machine_plan_backend, parse_source_units,
 };
-use boon_ir::{DistributedPureCall, TypedProgram, verify_hidden_identity, verify_static_schedule};
+use boon_ir::{DistributedPureCall, ErasedProgram, verify_hidden_identity, verify_static_schedule};
 use boon_plan::{
     ApplicationIdentity, DataTypeFieldPlan, DataTypePlan, DataVariantPlan, DistributedArgumentId,
     DistributedDeclarationId, DistributedEndpointContractPlan, DistributedEndpointId,
@@ -55,7 +55,7 @@ impl CompiledDistributedMachinePlans {
 struct LoweredRole {
     request: DistributedCompilerProgram,
     parsed: boon_parser::ParsedProgram,
-    ir: TypedProgram,
+    ir: ErasedProgram,
     parse_ms: f64,
     lower_ms: f64,
     verify_ms: f64,
@@ -315,9 +315,17 @@ fn collect_bundle_references(
                         });
                     }
                 }
-                boon_parser::AstExprKind::Call { function, args }
+                boon_parser::AstExprKind::Call {
+                    function,
+                    args,
+                    pass: _,
+                }
                 | boon_parser::AstExprKind::Pipe {
-                    op: function, args, ..
+                    input: _,
+                    op: function,
+                    args,
+                    pass: _,
+                    ..
                 } => {
                     let Some((namespace, local_function)) = function.split_once('/') else {
                         continue;
@@ -333,12 +341,17 @@ fn collect_bundle_references(
                     }
                     let mut arguments = Vec::with_capacity(args.len());
                     for argument in args {
-                        let Some(name) = argument.name.clone() else {
+                        if argument.is_bare_binding() {
                             return Err(PlanError::new(format!(
                                 "distributed function `{function}` requires named arguments"
                             )));
-                        };
-                        arguments.push((name, argument.value));
+                        }
+                        let name = argument.named_name().ok_or_else(|| {
+                            PlanError::new(format!(
+                                "distributed function `{function}` has an invalid call entry"
+                            ))
+                        })?;
+                        arguments.push((name.to_owned(), argument.value));
                     }
                     references.calls.push(BundleCallReference {
                         consumer_role: *consumer_role,
@@ -680,13 +693,18 @@ fn declared_function_arguments(
         matches: &mut Vec<Vec<String>>,
     ) {
         for statement in statements {
-            if let boon_parser::AstStatementKind::Function { name, args } = &statement.kind
+            if let boon_parser::AstStatementKind::Function { name, parameters } = &statement.kind
                 && (name == local_function
                     || local_function
                         .rsplit_once('/')
                         .is_some_and(|(_, suffix)| suffix == name))
             {
-                matches.push(args.clone());
+                matches.push(
+                    parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect(),
+                );
             }
             collect(&statement.children, local_function, matches);
         }
@@ -1164,9 +1182,12 @@ fn link_lowered_roles(
                     None => ValueRef::Source(link.event_source_id.expect("event link source")),
                 },
             };
-            context
-                .expression_refs
-                .insert(reference.expr_id.as_usize(), imported_value_ref.clone());
+            bind_executable_expression_ref(
+                &mut context.expression_refs,
+                &consumer.ir,
+                reference.expr_id.as_usize(),
+                imported_value_ref.clone(),
+            )?;
             context
                 .path_refs
                 .insert(reference.canonical_path.clone(), imported_value_ref.clone());
@@ -1274,14 +1295,15 @@ fn link_lowered_roles(
                 stable_identity,
             )?;
             let result_import_id = ImportId::from_remote_call_result(call_site_id)?;
-            contexts
-                .get_mut(consumer_role)
-                .expect("consumer context")
-                .expression_refs
-                .insert(
-                    call.expr_id.as_usize(),
-                    ValueRef::DistributedImport(result_import_id),
-                );
+            bind_executable_expression_ref(
+                &mut contexts
+                    .get_mut(consumer_role)
+                    .expect("consumer context")
+                    .expression_refs,
+                &consumer.ir,
+                call.expr_id.as_usize(),
+                ValueRef::DistributedImport(result_import_id),
+            )?;
             call_links.push(CallLink {
                 consumer_role: *consumer_role,
                 owner_path,
@@ -1711,6 +1733,39 @@ fn link_lowered_roles(
     })
 }
 
+fn bind_executable_expression_ref(
+    refs: &mut BTreeMap<boon_ir::ExecutableExprId, ValueRef>,
+    program: &ErasedProgram,
+    checked_expr_id: usize,
+    value: ValueRef,
+) -> Result<(), PlanError> {
+    let checked_expr_id = boon_typecheck::CheckedExprId(checked_expr_id as u32);
+    let matches = program
+        .executable
+        .expressions
+        .iter()
+        .filter(|expression| expression.checked_expr_id == checked_expr_id)
+        .map(|expression| expression.id)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Err(PlanError::new(format!(
+            "distributed checked expression {} has no executable identity",
+            checked_expr_id.0
+        )));
+    }
+    for expression in matches {
+        if let Some(previous) = refs.insert(expression, value.clone())
+            && previous != value
+        {
+            return Err(PlanError::new(format!(
+                "distributed executable expression {} resolves to conflicting values",
+                expression.0
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn origin_scoped_server_values<'a>(
     server: &CompiledMachinePlanFromSource,
     value_links: impl Iterator<Item = &'a ValueLink>,
@@ -1835,7 +1890,7 @@ fn validate_distributed_immediate_cycles(
     Ok(())
 }
 
-fn distributed_expression_is_retained_output(program: &TypedProgram, expr_id: usize) -> bool {
+fn distributed_expression_is_retained_output(program: &ErasedProgram, expr_id: usize) -> bool {
     program.output_values.iter().any(|output| {
         matches!(
             output.contract,
@@ -1878,7 +1933,7 @@ fn distributed_cycle_from(
     None
 }
 
-fn distributed_root_owner(program: &TypedProgram, expr_id: usize) -> Result<String, PlanError> {
+fn distributed_root_owner(program: &ErasedProgram, expr_id: usize) -> Result<String, PlanError> {
     let mut candidates = program
         .derived_values
         .iter()
@@ -1921,12 +1976,11 @@ fn distributed_root_owner(program: &TypedProgram, expr_id: usize) -> Result<Stri
 }
 
 fn find_function_signature<'a>(
-    program: &'a TypedProgram,
+    program: &'a ErasedProgram,
     local_function: &str,
 ) -> Result<&'a FunctionTypeEntry, PlanError> {
     let matches = program
-        .typecheck_report
-        .function_type_table
+        .function_types
         .entries
         .iter()
         .filter(|entry| {

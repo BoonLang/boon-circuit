@@ -4,19 +4,29 @@ FUNCTION cell_address(index) {
     BLOCK {
         column_index: index % 26
         row_index: index / 26 |> Number/floor()
-        column: List/get(sheet_columns, index: column_index)
+        column: List/get(list: sheet_columns, index: column_index)
         column.label + row_index
     }
 }
 
 FUNCTION default_formula_for_address(address) {
-    List/find_value(cells_default_values, field: address, value: address, target: value, fallback: Text/empty())
+    cells_default_values
+    |> List/find(item, if: item.address == address)
+    |> WHEN {
+        Found[value] => value.value
+        NotFound => Text/empty()
+    }
 }
 
 FUNCTION cell_value(target_address) {
     BLOCK {
-        found: List/find(cells, field: address, value: target_address)
-        raw: found.value
+        raw:
+            cells
+            |> List/find(item, if: item.address == target_address)
+            |> WHEN {
+                Found[value] => value.value
+                NotFound => Text/empty()
+            }
         raw |> Text/to_number() |> WHILE {
             NaN => raw
             number => number
@@ -44,7 +54,7 @@ FUNCTION sum_range(start_address, end_address) {
             |> Text/substring(start: 1, length: end_row_length)
             |> Text/to_number()
         List/range(from: start_row, to: end_row)
-        |> List/map(row, new: range_cell_value(column: start_column, row: row))
+        |> List/map(item, new: range_cell_value(column: start_column, row: item))
         |> List/sum()
     }
 }
@@ -52,7 +62,7 @@ FUNCTION sum_range(start_address, end_address) {
 FUNCTION formula_ascii_bytes(text) {
     BLOCK {
         encoded: text |> Text/to_bytes(encoding: Ascii)
-        error_text: Error/text(encoded)
+        error_text: Error/text(value: encoded)
         error_text |> Text/is_empty() |> WHILE {
             True => encoded
             False => Error/new(code: TEXT { parse_error })
@@ -130,7 +140,7 @@ FUNCTION expression_value(text) {
     BLOCK {
         trimmed: text |> Text/trim()
         bytes: formula_ascii_bytes(text: trimmed)
-        bytes_error: Error/text(bytes)
+        bytes_error: Error/text(value: bytes)
         bytes_error |> Text/is_empty() |> WHILE {
             False => Error/new(code: TEXT { parse_error })
             True => BLOCK {

@@ -1,9 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use boon_ir::{
-    self as ir, BytesScalarArg, DerivedValueKind, InitialValue, ListAppendFieldValue,
-    ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind, ListTextNormalization,
-    TypedProgram, UpdateExpression, UpdateGuard, UpdateValueExpression,
+    self as ir, BytesScalarArg, DerivedValueKind, ErasedProgram, InitialValue,
+    ListAppendFieldValue, ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind,
+    ListTextNormalization, UpdateExpression, UpdateGuard, UpdateValueExpression,
 };
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstStatement, AstStatementKind, BytesSizeSyntax,
@@ -32,7 +32,7 @@ fn plan_scope_id(value: Option<ir::ScopeId>) -> Option<ScopeId> {
     value.map(|value| ScopeId(value.0))
 }
 
-fn demand_plan(program: &TypedProgram) -> DemandPlan {
+fn demand_plan(program: &ErasedProgram) -> DemandPlan {
     let observed_paths = program
         .view_bindings
         .iter()
@@ -56,7 +56,7 @@ fn demand_plan(program: &TypedProgram) -> DemandPlan {
     }
 }
 
-fn effect_contracts(program: &TypedProgram) -> Result<Vec<EffectContract>, PlanError> {
+fn effect_contracts(program: &ErasedProgram) -> Result<Vec<EffectContract>, PlanError> {
     let mut effects = BTreeMap::new();
     for expression in &program.expressions {
         let host_operation = match &expression.kind {
@@ -197,7 +197,7 @@ fn effect_invocation_for_branch(
 }
 
 fn normalize_semantic_list_memory_value_ref(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     value_ref: ValueRef,
     expected_type: &DataTypePlan,
 ) -> ValueRef {
@@ -215,7 +215,7 @@ fn normalize_semantic_list_memory_value_ref(
 }
 
 fn host_effect_intent_value_ref(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
     constants: &mut Vec<PlanConstant>,
     trigger_source: &str,
@@ -224,20 +224,8 @@ fn host_effect_intent_value_ref(
     expr_id: usize,
 ) -> Option<ValueRef> {
     if let Some(path) = expression_path_string(program, expr_id) {
-        return resolve_update_value_ref(index, trigger_source, target, indexed, &path)
-            .or_else(|| {
-                indexed.then(|| {
-                    host_effect_row_template_argument_ref(
-                        program,
-                        index,
-                        constants,
-                        trigger_source,
-                        target,
-                        &path,
-                    )
-                })?
-            })
-            .or_else(|| {
+        return resolve_update_value_ref(index, trigger_source, target, indexed, &path).or_else(
+            || {
                 (!path.contains('.'))
                     .then(|| {
                         target
@@ -246,113 +234,15 @@ fn host_effect_intent_value_ref(
                     })
                     .flatten()
                     .and_then(|canonical| index.resolve(&canonical))
-            });
+            },
+        );
     }
     constant_initial_expression_value(program, expr_id)
         .map(|value| ValueRef::Constant(push_plan_constant(constants, value)))
 }
 
-fn host_effect_row_template_argument_ref(
-    program: &TypedProgram,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    trigger_source: &str,
-    target: &str,
-    path: &str,
-) -> Option<ValueRef> {
-    let state = program
-        .state_cells
-        .iter()
-        .find(|state| state.path == target)?;
-    let scope = program
-        .row_scopes
-        .iter()
-        .find(|scope| Some(scope.id) == state.scope_id)?;
-    let function = program.functions.iter().find(|function| {
-        function.name == scope.function
-            || function.name.ends_with(&format!("/{}", scope.function))
-            || scope.function.ends_with(&format!("/{}", function.name))
-    })?;
-    let binding = program
-        .typecheck_report
-        .list_map_bindings
-        .iter()
-        .find(|binding| {
-            binding.result_kind == boon_typecheck::ListMapResultKind::RuntimeValue
-                && binding
-                    .template_function
-                    .as_deref()
-                    .is_some_and(|candidate| {
-                        candidate == scope.function
-                            || candidate.ends_with(&format!("/{}", scope.function))
-                            || scope.function.ends_with(&format!("/{candidate}"))
-                    })
-        })?;
-    let (parameter, suffix) = path
-        .split_once('.')
-        .map_or((path, None), |(parameter, suffix)| {
-            (parameter, Some(suffix))
-        });
-    let parameter_index = function
-        .args
-        .iter()
-        .position(|candidate| candidate == parameter)?;
-    let positional = binding
-        .template_args
-        .iter()
-        .filter(|argument| argument.name.is_none())
-        .collect::<Vec<_>>();
-    let argument = binding
-        .template_args
-        .iter()
-        .find(|argument| argument.name.as_deref() == Some(parameter))
-        .or_else(|| positional.get(parameter_index).copied())?;
-
-    if let Some(argument_path) = expression_path_string(program, argument.value) {
-        let substituted = suffix.map_or_else(
-            || argument_path.clone(),
-            |suffix| format!("{argument_path}.{suffix}"),
-        );
-        if let Some(value_ref) =
-            resolve_update_value_ref(index, trigger_source, target, true, &substituted)
-        {
-            return Some(value_ref);
-        }
-        if let Some(value_ref) = index.resolve_unique_suffix(&substituted) {
-            return Some(value_ref);
-        }
-        if let Some(parent) = row_scope_parent_path(target, &scope.row_scope) {
-            let canonical = format!("{parent}.{substituted}");
-            if let Some(value_ref) =
-                resolve_update_value_ref(index, trigger_source, target, true, &canonical)
-            {
-                return Some(value_ref);
-            }
-        }
-        return None;
-    }
-
-    suffix.is_none().then(|| {
-        constant_initial_expression_value(program, argument.value)
-            .map(|value| ValueRef::Constant(push_plan_constant(constants, value)))
-    })?
-}
-
-fn row_scope_parent_path<'a>(target: &'a str, row_scope: &str) -> Option<&'a str> {
-    let marker = format!(".{row_scope}.");
-    target
-        .find(&marker)
-        .map(|offset| &target[..offset])
-        .or_else(|| {
-            target
-                .strip_prefix(row_scope)
-                .and_then(|suffix| suffix.strip_prefix('.').map(|_| ""))
-        })
-        .filter(|parent| !parent.is_empty())
-}
-
 fn output_root_plans(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     document: Option<&DocumentPlan>,
     index: &ValueIndex,
 ) -> Result<Vec<OutputRootPlan>, PlanError> {
@@ -434,7 +324,7 @@ fn output_root_plans(
 }
 
 fn host_port_plans(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     outputs: &[OutputRootPlan],
 ) -> Result<Vec<HostPortPlan>, PlanError> {
     let source_id = |path: &str, line: usize| {
@@ -496,7 +386,7 @@ fn host_port_plans(
         .collect()
 }
 
-fn statement_is_source_group(program: &TypedProgram, statement: &AstStatement) -> bool {
+fn statement_is_source_group(program: &ErasedProgram, statement: &AstStatement) -> bool {
     !statement.children.is_empty()
         && statement.children.iter().all(|child| match child.kind {
             AstStatementKind::Source { .. } => true,
@@ -532,12 +422,8 @@ fn root_path_is_observed(observed_paths: &BTreeSet<String>, path: &str) -> bool 
         })
 }
 
-fn ir_scope_id(value: Option<ScopeId>) -> Option<ir::ScopeId> {
-    value.map(|value| ir::ScopeId(value.0))
-}
-
 fn source_payload_schema_from_ir(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     source: &ir::SourcePort,
 ) -> Result<SourcePayloadSchema, PlanError> {
     let value = &source.payload_schema;
@@ -657,7 +543,7 @@ fn plan_value_type_from_initial_with_root_and_row_fields(
 }
 
 fn state_initial_value_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     state: &boon_ir::StateCell,
     root_field_types: &RootInitialFieldTypeMap,
     row_field_types: &RowInitialFieldTypeMap,
@@ -804,16 +690,17 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
             })
         }
         DataTypePlan::Null
-        | DataTypePlan::Bytes { fixed_len: Some(_) }
         | DataTypePlan::Record { .. }
         | DataTypePlan::List { .. }
-        | DataTypePlan::Error { .. }
-        | DataTypePlan::Unknown => None,
+        | DataTypePlan::Error { .. } => Some(PlanConstantValue::Data {
+            value: boon_data::Value::Null,
+        }),
+        DataTypePlan::Bytes { fixed_len: Some(_) } | DataTypePlan::Unknown => None,
     }
 }
 
 fn semantic_memory_for_state<'a>(
-    program: &'a TypedProgram,
+    program: &'a ErasedProgram,
     state: &ir::StateCell,
 ) -> Option<&'a ir::SemanticMemory> {
     program.semantic_memory.iter().find(|memory| {
@@ -827,11 +714,11 @@ fn semantic_memory_for_state<'a>(
     })
 }
 
-fn state_has_active_semantic_memory(program: &TypedProgram, state: &ir::StateCell) -> bool {
+fn state_has_active_semantic_memory(program: &ErasedProgram, state: &ir::StateCell) -> bool {
     semantic_memory_for_state(program, state).is_some()
 }
 
-fn list_has_active_semantic_memory(program: &TypedProgram, list: &ir::ListMemory) -> bool {
+fn list_has_active_semantic_memory(program: &ErasedProgram, list: &ir::ListMemory) -> bool {
     program.semantic_memory.iter().any(|memory| {
         semantic_memory_is_active(memory)
             && matches!(
@@ -848,7 +735,7 @@ struct MigrationListStorageDefault {
 }
 
 fn migration_list_storage_default(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     list: &ir::ListMemory,
     synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
 ) -> Result<Option<MigrationListStorageDefault>, PlanError> {
@@ -919,7 +806,7 @@ fn migration_list_storage_default(
 }
 
 fn compiled_list_storage_slot(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     list: &ir::ListMemory,
     id: PlanStorageId,
     synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
@@ -957,7 +844,7 @@ fn compiled_list_storage_slot(
 }
 
 fn migration_identity_source_constant(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     edge: &ir::MigrationEdge,
 ) -> Option<PlanConstantValue> {
     if edge.transform != ir::MigrationTransform::Identity || edge.source_leaves.len() != 1 {
@@ -979,7 +866,7 @@ fn migration_identity_source_constant(
 }
 
 fn migration_storage_default(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     state: &ir::StateCell,
 ) -> Option<MigrationStorageDefault> {
     let memory = semantic_memory_for_state(program, state)?;
@@ -1091,7 +978,7 @@ fn semantic_memory_is_active(memory: &ir::SemanticMemory) -> bool {
     matches!(memory.status, ir::SemanticMemoryStatus::Active)
 }
 
-fn semantic_memory_is_runtime_active(program: &TypedProgram, memory: &ir::SemanticMemory) -> bool {
+fn semantic_memory_is_runtime_active(program: &ErasedProgram, memory: &ir::SemanticMemory) -> bool {
     if !semantic_memory_is_active(memory) {
         return false;
     }
@@ -1132,7 +1019,7 @@ fn semantic_memory_is_transient_effect_result(
 }
 
 fn state_for_semantic_memory<'a>(
-    program: &'a TypedProgram,
+    program: &'a ErasedProgram,
     memory: &ir::SemanticMemory,
 ) -> Result<&'a ir::StateCell, PlanError> {
     let state_id = match memory.runtime_backing {
@@ -1183,7 +1070,7 @@ fn scalar_slot_for_semantic_memory<'a>(
 }
 
 fn semantic_scalar_memory_plan(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     memory: &ir::SemanticMemory,
     scalar_slots: &[ScalarStorageSlot],
 ) -> Result<MemoryPlan, PlanError> {
@@ -1243,7 +1130,7 @@ fn semantic_scalar_memory_plan(
 }
 
 fn semantic_list_memory_plan(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     memory: &ir::SemanticMemory,
     list_slots: &[ListStorageSlot],
     synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
@@ -1311,7 +1198,7 @@ fn semantic_list_memory_plan(
             memory.identity.semantic_path
         )));
     };
-    let append_field_types = list_append_authoritative_field_types(program, index, &list.name)?;
+    let append_field_types = list_append_authoritative_field_types(program, index, list)?;
     let mut row_fields = Vec::new();
     if !has_indexed_memory {
         for field in &semantic_row_fields {
@@ -1507,15 +1394,16 @@ fn list_initializer_field_type(
 }
 
 fn list_append_authoritative_field_types(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
-    list_name: &str,
+    list: &boon_ir::ListMemory,
 ) -> Result<BTreeMap<String, DataTypePlan>, PlanError> {
+    let list_name = &list.name;
     let mut field_types = BTreeMap::new();
     for operation in program
         .list_operations
         .iter()
-        .filter(|operation| operation.list == list_name)
+        .filter(|operation| operation.list_id == list.id)
     {
         let ListOperationKind::Append { trigger, fields } = &operation.kind else {
             continue;
@@ -1571,7 +1459,7 @@ fn list_append_authoritative_field_types(
 }
 
 fn data_type_plan_for_value_ref(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
     value_ref: &ValueRef,
 ) -> Option<DataTypePlan> {
@@ -1599,7 +1487,7 @@ fn data_type_plan_for_value_ref(
 }
 
 fn plan_value_type_for_value_ref(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
     value_ref: &ValueRef,
 ) -> Option<PlanValueType> {
@@ -1656,7 +1544,7 @@ fn plan_value_type_for_value_ref(
 }
 
 fn migration_leaf_ref(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     source: &ir::MigrationSourceLeaf,
     indexed_list_owner: Option<&MigrationListOwnerPlan>,
     data_type: DataTypePlan,
@@ -1673,7 +1561,7 @@ fn migration_leaf_ref(
 }
 
 fn migration_indexed_list_owner(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     memory: &ir::SemanticMemory,
 ) -> Result<MigrationListOwnerPlan, PlanError> {
     let list_id = match memory.runtime_backing {
@@ -1713,7 +1601,7 @@ fn migration_indexed_list_owner(
 }
 
 fn migration_input_data_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     sources: &[&ir::MigrationSourceLeaf],
     leaves: &[MigrationLeafRefPlan],
 ) -> Result<DataTypePlan, PlanError> {
@@ -1739,7 +1627,7 @@ fn migration_input_data_type(
 }
 
 fn durable_migration_source_list_plan(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     source: &ir::MigrationSourceLeaf,
     synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
 ) -> Result<ListMemoryPlan, PlanError> {
@@ -1784,7 +1672,7 @@ fn durable_migration_source_list_plan(
 }
 
 fn durable_migration_source_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     source: &ir::MigrationSourceLeaf,
     synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
 ) -> Result<DataTypePlan, PlanError> {
@@ -1861,7 +1749,7 @@ fn migration_row_fields_by_key(
 }
 
 fn migration_list_row_fields(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     edge: &ir::MigrationEdge,
     destination_memory_id: MemoryId,
     target_lists: &[ListMemoryPlan],
@@ -1943,7 +1831,7 @@ fn migration_list_row_fields(
 type MigrationEnvironment = BTreeMap<String, MigrationExpressionPlan>;
 
 struct MigrationExpressionLowerer<'a> {
-    program: &'a TypedProgram,
+    program: &'a ErasedProgram,
     drain_inputs: BTreeMap<usize, MigrationInputId>,
     active_functions: Vec<String>,
 }
@@ -2059,20 +1947,51 @@ impl MigrationExpressionLowerer<'_> {
                 left: Box::new(self.lower_expr(*left, None, environment)?),
                 right: Box::new(self.lower_expr(*right, None, environment)?),
             }),
-            AstExprKind::Call { function, args } => {
+            AstExprKind::Call { function, args, .. } => {
                 self.lower_call(function, None, args, environment)
             }
-            AstExprKind::Pipe { input, op, args } => {
+            AstExprKind::Pipe { input, op, args, .. } => {
                 let input = self.lower_expr(*input, pipeline_input, environment)?;
                 self.lower_call(op, Some(input), args, environment)
             }
-            AstExprKind::When { input } => {
+            AstExprKind::When { input, .. } => {
                 let input = self.lower_expr(*input, pipeline_input, environment)?;
                 let arms = self.lower_match_arms(expr_id, environment)?;
                 Ok(MigrationExpressionPlan::Match {
                     input: Box::new(input),
                     arms,
                 })
+            }
+            AstExprKind::Block { bindings, result } => {
+                let mut environment = environment.clone();
+                let mut pending = bindings.iter().collect::<Vec<_>>();
+                let mut last_error = None;
+                while !pending.is_empty() {
+                    let mut next = Vec::new();
+                    let mut progress = false;
+                    for binding in pending {
+                        match self.lower_expr(binding.value, None, &environment) {
+                            Ok(value) => {
+                                environment.insert(binding.name.clone(), value);
+                                progress = true;
+                            }
+                            Err(error) => {
+                                last_error = Some(error);
+                                next.push(binding);
+                            }
+                        }
+                    }
+                    if !progress {
+                        return Err(last_error.unwrap_or_else(|| {
+                            PlanError::new("migration BLOCK bindings cannot be resolved")
+                        }));
+                    }
+                    pending = next;
+                }
+                let result = result.ok_or_else(|| {
+                    PlanError::new("migration BLOCK expression has no result")
+                })?;
+                self.lower_expr(result, pipeline_input, &environment)
             }
             AstExprKind::Source
             | AstExprKind::Draining { .. }
@@ -2131,7 +2050,7 @@ impl MigrationExpressionLowerer<'_> {
         let binding = matches!(function, "List/map" | "List/retain")
             .then(|| args.first())
             .flatten()
-            .filter(|argument| argument.name.is_none())
+            .filter(|argument| argument.is_bare_binding())
             .and_then(|argument| self.program.expressions.get(argument.value))
             .and_then(|expr| match &expr.kind {
                 AstExprKind::Identifier(name) => Some(name.clone()),
@@ -2139,7 +2058,7 @@ impl MigrationExpressionLowerer<'_> {
             });
         let mut arguments = Vec::new();
         for (index, argument) in args.iter().enumerate() {
-            if index == 0 && binding.is_some() && argument.name.is_none() {
+            if index == 0 && binding.is_some() && argument.is_bare_binding() {
                 continue;
             }
             let value = if let Some(binding) = &binding {
@@ -2161,7 +2080,7 @@ impl MigrationExpressionLowerer<'_> {
                 }
             };
             arguments.push(MigrationCallArgumentPlan {
-                name: argument.name.clone(),
+                name: argument.named_name().map(str::to_owned),
                 value,
             });
         }
@@ -2190,7 +2109,7 @@ impl MigrationExpressionLowerer<'_> {
             )));
         }
         let mut values = BTreeMap::<String, MigrationExpressionPlan>::new();
-        let mut positional = args.iter().filter(|argument| argument.name.is_none());
+        let mut positional = args.iter().filter(|argument| argument.is_bare_binding());
         if let Some(input) = input {
             let first = definition.args.first().ok_or_else(|| {
                 PlanError::new(format!(
@@ -2203,7 +2122,7 @@ impl MigrationExpressionLowerer<'_> {
         for parameter in definition.args.iter().skip(values.len()) {
             let argument = args
                 .iter()
-                .find(|argument| argument.name.as_deref() == Some(parameter.as_str()))
+                .find(|argument| argument.named_name() == Some(parameter.as_str()))
                 .or_else(|| positional.next())
                 .ok_or_else(|| {
                     PlanError::new(format!(
@@ -2340,7 +2259,7 @@ fn function_result_expr(statement: &AstStatement) -> Option<usize> {
     })
 }
 
-fn statement_for_expression(program: &TypedProgram, expr_id: usize) -> Option<&AstStatement> {
+fn statement_for_expression(program: &ErasedProgram, expr_id: usize) -> Option<&AstStatement> {
     program
         .functions
         .iter()
@@ -2377,7 +2296,7 @@ fn match_arm_ids_from_statement(statement: &AstStatement) -> Vec<usize> {
         .collect()
 }
 
-fn fallback_match_arm_ids(program: &TypedProgram, when_expr_id: usize) -> Vec<usize> {
+fn fallback_match_arm_ids(program: &ErasedProgram, when_expr_id: usize) -> Vec<usize> {
     let mut arms = Vec::new();
     for expression in program.expressions.iter().skip(when_expr_id + 1) {
         match expression.kind {
@@ -2394,7 +2313,7 @@ fn fallback_match_arm_ids(program: &TypedProgram, when_expr_id: usize) -> Vec<us
 }
 
 fn migration_recipe(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     target_memory: &[MemoryPlan],
     target_lists: &[ListMemoryPlan],
     synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
@@ -2905,7 +2824,7 @@ fn merge_migration_catalog(
 }
 
 fn persistence_plan(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     application: &ApplicationPlan,
     schema_version: u64,
     scalar_slots: &[ScalarStorageSlot],
@@ -2976,7 +2895,7 @@ fn persistence_plan(
 }
 
 pub fn compile_typed_program(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     target_profile: TargetProfile,
     program_role: ProgramRole,
     application_identity: &ApplicationIdentity,
@@ -2996,14 +2915,14 @@ pub fn compile_typed_program(
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DistributedMachineContext {
-    pub expression_refs: BTreeMap<usize, ValueRef>,
+    pub expression_refs: BTreeMap<ir::ExecutableExprId, ValueRef>,
     pub path_refs: BTreeMap<String, ValueRef>,
     pub synthetic_source_routes: Vec<SourceRoute>,
     pub endpoint: Option<DistributedEndpointPlan>,
 }
 
 pub(crate) fn compile_typed_program_with_distributed_context(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     target_profile: TargetProfile,
     program_role: ProgramRole,
     application_identity: &ApplicationIdentity,
@@ -3128,27 +3047,29 @@ pub(crate) fn compile_typed_program_with_distributed_context(
     {
         let state_index = state.id.as_usize();
         let slot_id = scalar_slots.len();
-        let initial_expression = if let Some(edge) = migration_storage_defaults[state_index]
-            .as_ref()
-            .and_then(|default| default.indexed_edge.as_ref())
-        {
-            Some(migration_indexed_default_expression(
+        let migration_default = migration_storage_defaults[state_index].as_ref();
+        let initial_expression = match migration_default {
+            Some(default) if default.indexed_edge.is_some() => {
+                Some(migration_indexed_default_expression(
+                    program,
+                    state,
+                    default
+                        .indexed_edge
+                        .as_ref()
+                        .expect("matched indexed migration edge"),
+                    &index,
+                    &synthetic_initial_field_ids,
+                    &mut constants,
+                )?)
+            }
+            Some(_) => None,
+            None => initial_state_expression(
                 program,
                 state,
-                edge,
                 &index,
                 &synthetic_initial_field_ids,
                 &mut constants,
-            )?)
-        } else {
-            initial_state_expression(
-                program,
-                state,
-                &index,
-                &synthetic_initial_field_ids,
-                &expression_value_types,
-                &mut constants,
-            )
+            )?,
         };
         scalar_slots.push(ScalarStorageSlot {
             id: PlanStorageId(slot_id),
@@ -3251,9 +3172,48 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         })
         .collect::<Vec<_>>();
 
+    let materialized_runtime_fields = materialized_runtime_fields(program)?;
+    let materialized_runtime_field_ids = materialized_runtime_fields
+        .values()
+        .flat_map(|fields| fields.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let projection_owned_lists = program
+        .list_projections
+        .iter()
+        .filter_map(|projection| match index.resolve(&projection.target) {
+            Some(ValueRef::List(list)) => Some(list),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let mut derived_ops = Vec::new();
     let mut materialized_row_fields = BTreeMap::<ListId, BTreeSet<FieldId>>::new();
     for derived in &program.derived_values {
+        if matches!(derived_output_ref(program, derived), ValueRef::List(list)
+            if projection_owned_lists.contains(&list))
+        {
+            continue;
+        }
+        if let Some(list_id) = derived.materialized_list_id
+            && program
+                .lists
+                .get(list_id.as_usize())
+                .is_some_and(|list| !list_has_active_semantic_memory(program, list))
+        {
+            continue;
+        }
+        if derived.indexed
+            && derived.kind == DerivedValueKind::Pure
+            && matches!(derived_output_ref(program, derived), ValueRef::Field(field)
+                if materialized_runtime_field_ids.contains(&field))
+        {
+            continue;
+        }
+        if derived.kind == DerivedValueKind::ListView && derived.materialized_list_id.is_none() {
+            return Err(PlanError::new(format!(
+                "derived list view `{}` has no typed materialized ListId",
+                derived.path
+            )));
+        }
         let mut inputs = Vec::new();
         let mut unresolved =
             resolve_paths(&index, &derived.sources, &mut inputs, &mut unresolved_refs);
@@ -3264,7 +3224,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
             &mut constants,
             &mut inputs,
             &mut unresolved_refs,
-        );
+        )?;
         if let Some(target_list) = derived_materialized_list_id(program, derived)
             && let Some(inner) = expression.take()
         {
@@ -3289,9 +3249,16 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 .entry(target_list)
                 .or_default()
                 .extend(fields.values().copied());
+            let row_field_copies =
+                materialized_list_row_field_copies(program, target_list, &inner)?;
+            materialized_row_fields
+                .entry(target_list)
+                .or_default()
+                .extend(row_field_copies.iter().map(|copy| copy.target_field));
             expression = Some(PlanDerivedExpression::MaterializeList {
                 target_list,
                 fields,
+                row_field_copies,
                 expression: Box::new(inner),
             });
         }
@@ -3415,11 +3382,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         .map(|list_operation| {
             let mut inputs = Vec::new();
             let mut unresolved = 0usize;
-            let output = index.resolve(&list_operation.list);
-            if output.is_none() {
-                unresolved += 1;
-                unresolved_refs.insert(list_operation.list.clone());
-            }
+            let output = Some(ValueRef::List(plan_list_id(list_operation.list_id)));
             let mut append_plan = None;
             let mut remove_plan = None;
             let mut retain_plan = None;
@@ -3580,24 +3543,6 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 unresolved_refs.insert(projection.target.clone());
             }
             let projection_plan = match (&projection.kind, source_ref.clone(), source_list) {
-                (ListProjectionKind::Find { field, value }, _, Some(source_list)) => {
-                    let value_ref = match index.resolve(value) {
-                        Some(value_ref) => {
-                            inputs.push(value_ref.clone());
-                            Some(value_ref)
-                        }
-                        None => {
-                            unresolved += 1;
-                            unresolved_refs.insert(value.clone());
-                            None
-                        }
-                    };
-                    value_ref.map(|value| PlanListProjection::Find {
-                        source_list,
-                        field: field.clone(),
-                        value,
-                    })
-                }
                 (
                     ListProjectionKind::IndexedQuery {
                         fields,
@@ -4077,6 +4022,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         program,
         &executable_fields,
         &distributed.expression_refs,
+        &distributed.path_refs,
     )?;
     let outputs = output_root_plans(program, document.as_ref(), &index)?;
     let host_ports = host_port_plans(program, &outputs)?;
@@ -4323,7 +4269,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
 }
 
 pub(crate) fn distributed_exportable_values(
-    program: &TypedProgram,
+    program: &ErasedProgram,
 ) -> BTreeMap<String, (boon_typecheck::FlowType, ValueRef)> {
     let root_field_types = root_initial_field_value_types(program);
     let row_field_types = row_initial_field_value_types(program);
@@ -4335,8 +4281,7 @@ pub(crate) fn distributed_exportable_values(
         &BTreeMap::new(),
     );
     program
-        .typecheck_report
-        .named_value_type_table
+        .named_value_types
         .entries
         .iter()
         .filter_map(|entry| {
@@ -4356,7 +4301,7 @@ pub(crate) fn distributed_exportable_values(
 }
 
 pub(crate) fn lower_distributed_root_expression(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     owner_path: &str,
     expr_id: usize,
     constants: &mut Vec<PlanConstant>,
@@ -4371,67 +4316,58 @@ pub(crate) fn lower_distributed_root_expression(
         &distributed.expression_refs,
         &distributed.path_refs,
     );
-    let derived = ir::DerivedValue {
-        id: ir::FieldId(usize::MAX),
-        path: owner_path.to_owned(),
-        kind: DerivedValueKind::Pure,
-        sources: Vec::new(),
-        indexed: false,
-        scope_id: None,
-        startup_recompute: false,
-        statement: AstStatement {
-            id: usize::MAX,
-            line: 0,
-            indent: 0,
-            start: 0,
-            end: 0,
-            kind: AstStatementKind::Expression,
-            expr: Some(expr_id),
-            children: Vec::new(),
-        },
-    };
+    let checked_expr_id = boon_typecheck::CheckedExprId(expr_id as u32);
+    let root = program
+        .executable
+        .roots
+        .iter()
+        .find(|root| root.checked_expr_id == checked_expr_id)
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "distributed call argument expression {expr_id} in `{owner_path}` has no exact executable root"
+            ))
+        })?;
     let mut inputs = Vec::new();
-    let mut env = BTreeMap::new();
-    let expression_types = expression_value_type_lookup(program);
-    lower_row_expr(
-        program,
-        &derived,
-        &index,
-        constants,
-        &mut inputs,
-        &mut env,
-        &expression_types,
-        expr_id,
-    )
-    .and_then(lowered_scalar)
-    .ok_or_else(|| {
-        PlanError::new(format!(
-            "distributed call argument expression {expr_id} in `{owner_path}` is not a closed root value expression"
-        ))
-    })
+    ExecutableRowLowerer::new(program, &index, constants, &mut inputs)
+        .lower(root.expression)
+        .map_err(|error| {
+            PlanError::new(format!(
+                "distributed call argument expression {expr_id} in `{owner_path}` failed executable lowering: {error}"
+            ))
+        })
 }
 
 pub(crate) fn lower_distributed_pure_function_body(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     function_name: &str,
     export_id: ExportId,
     parameters: &[(String, DistributedArgumentId)],
     constants: &mut Vec<PlanConstant>,
 ) -> Result<PlanRowExpression, PlanError> {
-    let function = program
+    let matches = program
+        .executable
         .functions
         .iter()
-        .find(|candidate| {
+        .filter(|candidate| {
             candidate.name == function_name
                 || function_name
                     .rsplit_once('/')
                     .is_some_and(|(_, suffix)| suffix == candidate.name)
         })
-        .ok_or_else(|| {
-            PlanError::new(format!(
-                "distributed function `{function_name}` has no local definition"
-            ))
-        })?;
+        .collect::<Vec<_>>();
+    let function = match matches.as_slice() {
+        [function] => *function,
+        [] => {
+            return Err(PlanError::new(format!(
+                "distributed function `{function_name}` has no standalone executable definition"
+            )));
+        }
+        _ => {
+            return Err(PlanError::new(format!(
+                "distributed function `{function_name}` has ambiguous standalone executable definitions"
+            )));
+        }
+    };
     let root_field_types = root_initial_field_value_types(program);
     let row_field_types = row_initial_field_value_types(program);
     let index = ValueIndex::new(
@@ -4441,51 +4377,45 @@ pub(crate) fn lower_distributed_pure_function_body(
         &BTreeMap::new(),
         &BTreeMap::new(),
     );
-    let derived = ir::DerivedValue {
-        id: ir::FieldId(usize::MAX),
-        path: format!("distributed.{function_name}"),
-        kind: DerivedValueKind::Pure,
-        sources: Vec::new(),
-        indexed: false,
-        scope_id: None,
-        startup_recompute: false,
-        statement: function.statement.clone(),
-    };
-    let mut env = parameters
+    let argument_ids = parameters.iter().cloned().collect::<BTreeMap<_, _>>();
+    if argument_ids.len() != function.parameters.len() {
+        return Err(PlanError::new(format!(
+            "distributed function `{function_name}` executable parameter count does not match its boundary contract"
+        )));
+    }
+    let parameter_bindings = function
+        .parameters
         .iter()
-        .map(|(name, argument_id)| {
-            (
-                name.clone(),
-                LoweredRowValue::Scalar(PlanRowExpression::Field {
+        .map(|parameter| {
+            let argument_id = argument_ids.get(&parameter.name).copied().ok_or_else(|| {
+                PlanError::new(format!(
+                    "distributed function `{function_name}` has no boundary argument for executable parameter `{}`",
+                    parameter.name
+                ))
+            })?;
+            Ok((
+                parameter.id,
+                PlanRowExpression::Field {
                     input: ValueRef::DistributedFunctionArgument {
                         export_id,
-                        argument_id: *argument_id,
+                        argument_id,
                     },
-                }),
-            )
+                },
+            ))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Result<BTreeMap<_, _>, PlanError>>()?;
     let mut inputs = Vec::new();
-    let expression_types = expression_value_type_lookup(program);
-    lower_row_function_body(
-        program,
-        &derived,
-        &index,
-        constants,
-        &mut inputs,
-        &function.statement,
-        &mut env,
-        &expression_types,
-    )
-    .and_then(lowered_scalar)
-    .ok_or_else(|| {
-        PlanError::new(format!(
-            "distributed function `{function_name}` does not lower to one pure closed value"
-        ))
-    })
+    ExecutableRowLowerer::new(program, &index, constants, &mut inputs)
+        .with_parameter_bindings(parameter_bindings)
+        .lower(function.root)
+        .map_err(|error| {
+            PlanError::new(format!(
+                "distributed function `{function_name}` failed standalone executable lowering: {error}"
+            ))
+        })
 }
 
-fn validate_number_literals(program: &TypedProgram) -> Result<(), PlanError> {
+fn validate_number_literals(program: &ErasedProgram) -> Result<(), PlanError> {
     for expression in &program.expressions {
         let AstExprKind::Number(literal) = &expression.kind else {
             continue;
@@ -4601,14 +4531,14 @@ fn initial_value_kind_from_constant(value: &PlanConstantValue) -> InitialValueKi
 }
 
 fn constant_initial_expression_value(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     expr_id: usize,
 ) -> Option<PlanConstantValue> {
     constant_initial_expression_value_inner(program, expr_id, &mut BTreeSet::new())
 }
 
 fn constant_initial_expression_value_inner(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     expr_id: usize,
     visiting_functions: &mut BTreeSet<String>,
 ) -> Option<PlanConstantValue> {
@@ -4637,7 +4567,7 @@ fn constant_initial_expression_value_inner(
                 inline_bytes: (bytes.len() <= INLINE_BYTE_CONSTANT_LIMIT).then_some(bytes),
             })
         }
-        AstExprKind::Call { function, args } if args.is_empty() => match function.as_str() {
+        AstExprKind::Call { function, args, .. } if args.is_empty() => match function.as_str() {
             "Text/empty" => Some(PlanConstantValue::Text {
                 value: String::new(),
             }),
@@ -4678,37 +4608,10 @@ fn initial_row_field_path(value: &InitialValue) -> Option<String> {
     }
 }
 
-fn migration_drain_environment_key(expr_id: usize) -> String {
-    format!("$boon$migration_drain:{expr_id}")
-}
-
-fn row_lowering_context(state: &ir::StateCell) -> ir::DerivedValue {
-    ir::DerivedValue {
-        id: ir::FieldId(state.id.0),
-        path: state.path.clone(),
-        kind: DerivedValueKind::Pure,
-        sources: Vec::new(),
-        indexed: state.indexed,
-        scope_id: state.scope_id,
-        startup_recompute: false,
-        statement: AstStatement {
-            id: usize::MAX.saturating_sub(state.id.as_usize()),
-            line: state.source_line,
-            indent: 0,
-            start: 0,
-            end: 0,
-            kind: AstStatementKind::Expression,
-            expr: state.initial_expr_id.map(|expr| expr.as_usize()),
-            children: Vec::new(),
-        },
-    }
-}
-
 fn migration_source_row_default_expression(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     source: &ir::MigrationSourceLeaf,
     target_list: &ir::ListMemory,
-    index: &ValueIndex,
     synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
     constants: &mut Vec<PlanConstant>,
 ) -> Result<PlanRowExpression, PlanError> {
@@ -4739,18 +4642,16 @@ fn migration_source_row_default_expression(
             input: ValueRef::Field(field),
         });
     }
-    initial_row_expression(program, source_state, index, synthetic_field_ids, constants).ok_or_else(
-        || {
-            PlanError::new(format!(
-                "indexed migration default `{}` is not reconstructable",
-                source.semantic_path
-            ))
-        },
-    )
+    initial_row_expression(program, source_state, synthetic_field_ids).ok_or_else(|| {
+        PlanError::new(format!(
+            "indexed migration default `{}` is not reconstructable",
+            source.semantic_path
+        ))
+    })
 }
 
 fn migration_indexed_default_expression(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     state: &ir::StateCell,
     edge: &ir::MigrationEdge,
     index: &ValueIndex,
@@ -4787,7 +4688,6 @@ fn migration_indexed_default_expression(
                     program,
                     source,
                     target_list,
-                    index,
                     synthetic_field_ids,
                     constants,
                 )?,
@@ -4799,11 +4699,15 @@ fn migration_indexed_default_expression(
             PlanRowExpression::Object {
                 fields: fields
                     .into_iter()
-                    .map(|(name, value)| PlanRowObjectField { name, value })
+                    .map(|(name, value)| PlanRowObjectField {
+                        name,
+                        value,
+                        spread: false,
+                    })
                     .collect(),
             }
         };
-        drain_values.insert(drain_expr_id, LoweredRowValue::Scalar(value));
+        drain_values.insert(drain_expr_id, value);
     }
     if edge.transform == ir::MigrationTransform::Identity {
         if drain_values.len() != 1 {
@@ -4814,78 +4718,81 @@ fn migration_indexed_default_expression(
         return drain_values
             .into_values()
             .next()
-            .and_then(lowered_scalar)
             .ok_or_else(|| PlanError::new("identity indexed migration default is not scalar"));
     }
-    let ir::MigrationTransform::PureExpression { pipeline, .. } = &edge.transform else {
+    let ir::MigrationTransform::PureExpression {
+        expression_root, ..
+    } = &edge.transform
+    else {
         return Err(PlanError::new(
             "indexed migration default has an unsupported transform",
         ));
     };
-    let context = row_lowering_context(state);
-    let mut env = drain_values
-        .into_iter()
-        .map(|(expr_id, value)| (migration_drain_environment_key(expr_id), value))
-        .collect::<BTreeMap<_, _>>();
-    let mut inputs = Vec::new();
-    let expression_types = expression_value_type_lookup(program);
-    let mut current = None;
-    for expr_id in pipeline {
-        if let Some(previous) = current.clone() {
-            env.insert(ROW_PREVIOUS_BINDING.to_owned(), previous);
+    let root = unique_executable_expression_for_checked(
+        program,
+        expression_root.as_usize(),
+        &format!("indexed migration default `{}`", state.path),
+    )?;
+    let mut bindings = BTreeMap::new();
+    let mut bound_drain_origins = BTreeSet::new();
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
         }
-        current = if let Some(statement) = statement_for_expression(program, expr_id.as_usize()) {
-            lower_row_statement_value(
-                program,
-                &context,
-                index,
-                constants,
-                &mut inputs,
-                &mut env,
-                &expression_types,
-                statement,
-            )
-        } else {
-            lower_row_expr(
-                program,
-                &context,
-                index,
-                constants,
-                &mut inputs,
-                &mut env,
-                &expression_types,
-                expr_id.as_usize(),
-            )
-        };
-        if current.is_none() {
-            return Err(PlanError::new(format!(
-                "indexed migration default `{}` could not lower expression {}",
-                state.path,
-                expr_id.as_usize()
-            )));
+        let expression = program
+            .executable
+            .expressions
+            .get(expression_id.as_usize())
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "indexed migration default `{}` references missing executable expression {}",
+                    state.path, expression_id.0
+                ))
+            })?;
+        let origin = expression.checked_expr_id.0 as usize;
+        if matches!(expression.kind, ir::ExecutableExpressionKind::Drain { .. })
+            && let Some(value) = drain_values.get(&origin)
+        {
+            bindings.insert(expression_id, value.clone());
+            bound_drain_origins.insert(origin);
         }
+        pending.extend(ir::executable_expression_children(&expression.kind));
     }
-    current
-        .and_then(lowered_scalar)
-        .ok_or_else(|| PlanError::new("indexed migration default did not produce a scalar"))
+    let missing = drain_values
+        .keys()
+        .filter(|origin| !bound_drain_origins.contains(origin))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(PlanError::new(format!(
+            "indexed migration default `{}` cannot bind executable DRAIN expression(s) {:?}",
+            state.path, missing
+        )));
+    }
+    let mut inputs = Vec::new();
+    ExecutableRowLowerer::new(program, index, constants, &mut inputs)
+        .with_bindings(bindings)
+        .lower(root)
+        .map_err(|error| {
+            PlanError::new(format!(
+                "indexed migration default `{}` failed executable lowering: {error}",
+                state.path
+            ))
+        })
 }
 
 fn initial_row_expression(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     state: &boon_ir::StateCell,
-    index: &ValueIndex,
     synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
-    constants: &mut Vec<PlanConstant>,
 ) -> Option<PlanRowExpression> {
     let InitialValue::RowInitialField { path } = &state.initial_value else {
         return None;
     };
     let initial_expr = state.initial_expr_id?.0;
     let scope_id = state.scope_id?;
-    let scope = program
-        .row_scopes
-        .iter()
-        .find(|scope| scope.id == scope_id)?;
     let list = program
         .lists
         .iter()
@@ -4900,135 +4807,113 @@ fn initial_row_expression(
             input: ValueRef::Field(field),
         });
     }
-    let binding = program
-        .typecheck_report
-        .list_map_bindings
-        .iter()
-        .find(|binding| {
-            binding.result_kind == boon_typecheck::ListMapResultKind::RuntimeValue
-                && binding
-                    .template_function
-                    .as_deref()
-                    .is_some_and(|function| {
-                        function == scope.function
-                            || function.ends_with(&format!("/{}", scope.function))
-                            || scope.function.ends_with(&format!("/{function}"))
-                    })
-        })?;
-    let function = program.functions.iter().find(|function| {
-        function.name == scope.function
-            || function.name.ends_with(&format!("/{}", scope.function))
-            || scope.function.ends_with(&format!("/{}", function.name))
-    })?;
-
-    let context = row_lowering_context(state);
-
-    let mut input_names = match &list.initializer {
-        ListInitializer::RecordLiteral { rows } => rows
-            .iter()
-            .flat_map(|row| row.fields.iter().map(|field| field.name.clone()))
-            .collect::<BTreeSet<_>>(),
-        ListInitializer::Range { .. } => BTreeSet::from(["index".to_owned(), "value".to_owned()]),
-        ListInitializer::Empty | ListInitializer::Unknown { .. } => BTreeSet::new(),
-    };
-    input_names.extend(
-        synthetic_field_ids
-            .keys()
-            .filter(|(list_name, _)| list_name == &list.name)
-            .map(|(_, field_name)| field_name.clone()),
-    );
-    let object = input_names
-        .into_iter()
-        .filter_map(|name| {
-            storage_input_field_id(program, &list.name, &name, synthetic_field_ids).map(|field| {
-                PlanRowObjectField {
-                    name,
-                    value: PlanRowExpression::Field {
-                        input: ValueRef::Field(field),
-                    },
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut caller_env = BTreeMap::from([(
-        binding.item_binding_name.clone(),
-        LoweredRowValue::Scalar(PlanRowExpression::Object { fields: object }),
-    )]);
-    let mut local_constants = constants.clone();
-    let mut inputs = Vec::new();
-    let expression_types = expression_value_type_lookup(program);
-    let positional = binding
-        .template_args
-        .iter()
-        .filter(|argument| argument.name.is_none())
-        .collect::<Vec<_>>();
-    let mut env = BTreeMap::new();
-    for (index_in_function, parameter) in function.args.iter().enumerate() {
-        let Some(argument) = binding
-            .template_args
-            .iter()
-            .find(|argument| argument.name.as_deref() == Some(parameter.as_str()))
-            .or_else(|| positional.get(index_in_function).copied())
-        else {
-            continue;
-        };
-        let Some(value) = lower_row_expr(
-            program,
-            &context,
-            index,
-            &mut local_constants,
-            &mut inputs,
-            &mut caller_env,
-            &expression_types,
-            argument.value,
-        ) else {
-            continue;
-        };
-        env.insert(parameter.clone(), value);
-    }
-    let expression = lower_row_expr(
-        program,
-        &context,
-        index,
-        &mut local_constants,
-        &mut inputs,
-        &mut env,
-        &expression_types,
-        initial_expr,
-    )
-    .and_then(lowered_scalar)?;
-    *constants = local_constants;
-    Some(expression)
+    let _ = initial_expr;
+    None
 }
 
 fn initial_state_expression(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     state: &boon_ir::StateCell,
     index: &ValueIndex,
     synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
-    expression_types: &BTreeMap<usize, PlanValueType>,
     constants: &mut Vec<PlanConstant>,
-) -> Option<PlanRowExpression> {
-    if let Some(expression) =
-        initial_row_expression(program, state, index, synthetic_field_ids, constants)
-    {
-        return Some(expression);
+) -> Result<Option<PlanRowExpression>, PlanError> {
+    if let Some(expression) = initial_row_expression(program, state, synthetic_field_ids) {
+        return Ok(Some(expression));
     }
-    let initial_expr = state.initial_expr_id?.as_usize();
-    let context = row_lowering_context(state);
+    let Some(executable_state_id) = state.executable_state_id else {
+        if state.initial_expr_id.is_none() {
+            return Ok(None);
+        }
+        return Err(PlanError::new(format!(
+            "state `{}` has an initial value but no executable state identity",
+            state.path
+        )));
+    };
+    let executable_state = program
+        .executable
+        .states
+        .get(executable_state_id.as_usize())
+        .filter(|candidate| candidate.id == executable_state_id)
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "state `{}` references missing executable state {}",
+                state.path, executable_state_id.0
+            ))
+        })?;
+    let state_expression = program
+        .executable
+        .expressions
+        .get(executable_state.expression.as_usize())
+        .filter(|candidate| candidate.id == executable_state.expression)
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "state `{}` executable state {} references missing expression {}",
+                state.path, executable_state_id.0, executable_state.expression.0
+            ))
+        })?;
+    let initial = match &state_expression.kind {
+        ir::ExecutableExpressionKind::Hold { initial, .. } => *initial,
+        ir::ExecutableExpressionKind::Latest { branches } => {
+            branches.first().copied().ok_or_else(|| {
+                PlanError::new(format!(
+                    "state `{}` executable LATEST state {} has no initial branch",
+                    state.path, executable_state_id.0
+                ))
+            })?
+        }
+        _ if state.initial_expr_id.is_none() => return Ok(None),
+        _ => {
+            return Err(PlanError::new(format!(
+                "state `{}` executable state {} is not owned by HOLD or LATEST",
+                state.path, executable_state_id.0
+            )));
+        }
+    };
+    if state.initial_expr_id.is_none() {
+        return Ok(None);
+    }
     let mut inputs = Vec::new();
-    let mut env = BTreeMap::new();
-    lower_row_expr(
-        program,
-        &context,
-        index,
-        constants,
-        &mut inputs,
-        &mut env,
-        expression_types,
-        initial_expr,
-    )
-    .and_then(lowered_scalar)
+    ExecutableRowLowerer::new(program, index, constants, &mut inputs)
+        .lower(initial)
+        .map(Some)
+        .map_err(|error| {
+            PlanError::new(format!(
+                "state `{}` failed executable initial lowering: {error}",
+                state.path
+            ))
+        })
+}
+
+fn unique_executable_expression_for_checked(
+    program: &ErasedProgram,
+    checked_expr_id: usize,
+    context: &str,
+) -> Result<ir::ExecutableExprId, PlanError> {
+    let checked_expr_id = boon_typecheck::CheckedExprId(checked_expr_id as u32);
+    let mut matches = program
+        .executable
+        .expressions
+        .iter()
+        .filter(|expression| expression.checked_expr_id == checked_expr_id)
+        .map(|expression| expression.id)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [expression] => Ok(*expression),
+        [] => Err(PlanError::new(format!(
+            "{context} checked expression {} has no executable counterpart",
+            checked_expr_id.0
+        ))),
+        many => Err(PlanError::new(format!(
+            "{context} checked expression {} has ambiguous executable counterparts {:?}; static owner identity must select one",
+            checked_expr_id.0,
+            many.iter()
+                .map(|expression| expression.0)
+                .collect::<Vec<_>>()
+        ))),
+    }
 }
 
 fn initial_root_field_path(value: &InitialValue) -> Option<String> {
@@ -5072,7 +4957,7 @@ fn row_initial_field_value_type(
         .or_else(|| row_field_types.get(&(None, path.to_owned())).copied())
 }
 
-fn row_initial_field_value_types(program: &TypedProgram) -> RowInitialFieldTypeMap {
+fn row_initial_field_value_types(program: &ErasedProgram) -> RowInitialFieldTypeMap {
     let mut row_field_types = RowInitialFieldTypeMap::new();
 
     for list in &program.lists {
@@ -5129,7 +5014,7 @@ fn row_initial_field_value_types(program: &TypedProgram) -> RowInitialFieldTypeM
         .collect()
 }
 
-fn root_initial_field_value_types(program: &TypedProgram) -> RootInitialFieldTypeMap {
+fn root_initial_field_value_types(program: &ErasedProgram) -> RootInitialFieldTypeMap {
     let mut root_field_types = RootInitialFieldTypeMap::new();
     let source_payload_types = source_payload_value_type_lookup(program);
     let expr_value_types = expression_value_type_lookup(program);
@@ -5174,7 +5059,7 @@ fn root_initial_field_value_types(program: &TypedProgram) -> RootInitialFieldTyp
 }
 
 fn source_payload_value_type_lookup(
-    program: &TypedProgram,
+    program: &ErasedProgram,
 ) -> BTreeMap<(String, SourcePayloadField), PlanValueType> {
     let mut payload_types = BTreeMap::new();
     for source in &program.sources {
@@ -5246,7 +5131,6 @@ fn update_expression_output_type_for_root_initial(
         | UpdateExpression::MatchValueConst { .. }
         | UpdateExpression::MatchTextIsEmptyConst { .. }
         | UpdateExpression::MatchInfixConst { .. }
-        | UpdateExpression::ListFindValue { .. }
         | UpdateExpression::HostEffect { .. }
         | UpdateExpression::Unknown { .. } => None,
     }
@@ -5361,10 +5245,9 @@ fn data_type_plan_from_data(value: &boon_data::Value) -> DataTypePlan {
     }
 }
 
-fn expression_value_type_lookup(program: &TypedProgram) -> BTreeMap<usize, PlanValueType> {
+fn expression_value_type_lookup(program: &ErasedProgram) -> BTreeMap<usize, PlanValueType> {
     program
-        .typecheck_report
-        .expr_type_table
+        .expression_types
         .entries
         .iter()
         .filter_map(|entry| {
@@ -5375,56 +5258,18 @@ fn expression_value_type_lookup(program: &TypedProgram) -> BTreeMap<usize, PlanV
 }
 
 fn derived_value_output_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
+    _expr_value_types: &BTreeMap<usize, PlanValueType>,
 ) -> Option<PlanValueType> {
-    direct_statement_value_expr_id(&derived.statement)
-        .and_then(|expr_id| inferred_expression_value_type(program, expr_id, expr_value_types))
+    executable_value_for_statement(program, derived.executable_statement_id.as_usize())
+        .and_then(|root| program.executable.expressions.get(root.as_usize()))
+        .and_then(|expression| plan_value_type_from_typecheck_type(&expression.flow_type.ty))
         .filter(|value_type| plan_value_type_is_concrete(*value_type))
-        .or_else(|| {
-            (derived.kind == DerivedValueKind::SourceEventTransform)
-                .then(|| {
-                    let exprs = super::compiler_statement_ast_exprs(
-                        &derived.statement,
-                        &program.expressions,
-                    );
-                    let mut output_type = None;
-                    for source in &derived.sources {
-                        let arm = source_event_transform_arm_statement(
-                            program,
-                            derived,
-                            &exprs,
-                            source,
-                            &derived.statement,
-                        )?;
-                        let arm_expr = expr_by_id(program, arm.expr?)?;
-                        let output_expr = match arm_expr.kind {
-                            AstExprKind::Then {
-                                output: Some(output),
-                                ..
-                            } => output,
-                            _ => arm_expr.id,
-                        };
-                        let value_type =
-                            inferred_expression_value_type(program, output_expr, expr_value_types)?;
-                        if !plan_value_type_is_concrete(value_type) {
-                            return None;
-                        }
-                        match output_type {
-                            Some(existing) if existing != value_type => return None,
-                            Some(_) => {}
-                            None => output_type = Some(value_type),
-                        }
-                    }
-                    output_type
-                })
-                .flatten()
-        })
 }
 
 fn inferred_expression_value_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     expr_id: usize,
     expr_value_types: &BTreeMap<usize, PlanValueType>,
 ) -> Option<PlanValueType> {
@@ -5432,7 +5277,7 @@ fn inferred_expression_value_type(
 }
 
 fn inferred_expression_value_type_inner(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     expr_id: usize,
     expr_value_types: &BTreeMap<usize, PlanValueType>,
     visiting_functions: &mut BTreeSet<String>,
@@ -5452,29 +5297,11 @@ fn inferred_expression_value_type_inner(
         AstExprKind::BytesLiteral { size, items } => {
             inferred_bytes_literal_value_type(program, size, items, expr_value_types)
         }
-        AstExprKind::Call { function, args } => inferred_call_value_type(
-            program,
-            function,
-            args,
-            expr_value_types,
-            visiting_functions,
-        ),
-        AstExprKind::Pipe { input, op, args } => {
-            let mut call_args = Vec::with_capacity(args.len() + 1);
-            call_args.push(AstCallArg {
-                name: Some("input".to_owned()),
-                value: *input,
-                start: expr.start,
-                end: expr.end,
-            });
-            call_args.extend(args.iter().cloned());
-            inferred_call_value_type(
-                program,
-                op,
-                &call_args,
-                expr_value_types,
-                visiting_functions,
-            )
+        AstExprKind::Call { function, .. } => {
+            inferred_call_value_type(program, function, expr_value_types, visiting_functions)
+        }
+        AstExprKind::Pipe { op, .. } => {
+            inferred_call_value_type(program, op, expr_value_types, visiting_functions)
         }
         AstExprKind::Infix { left, op, right } if op == "+" => {
             let left_type = inferred_expression_value_type_inner(
@@ -5520,7 +5347,7 @@ fn inferred_expression_value_type_inner(
 }
 
 fn inferred_bytes_literal_value_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     size: &BytesSizeSyntax,
     items: &[usize],
     expr_value_types: &BTreeMap<usize, PlanValueType>,
@@ -5551,19 +5378,12 @@ fn inferred_bytes_literal_value_type(
 }
 
 fn inferred_call_value_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     function: &str,
-    args: &[AstCallArg],
     expr_value_types: &BTreeMap<usize, PlanValueType>,
     visiting_functions: &mut BTreeSet<String>,
 ) -> Option<PlanValueType> {
-    if let Some(value_type) = inferred_builtin_call_value_type(
-        program,
-        function,
-        args,
-        expr_value_types,
-        visiting_functions,
-    ) {
+    if let Some(value_type) = inferred_builtin_call_value_type(function) {
         return Some(value_type);
     }
     if !visiting_functions.insert(function.to_owned()) {
@@ -5586,17 +5406,13 @@ fn inferred_call_value_type(
     result
 }
 
-fn inferred_builtin_call_value_type(
-    program: &TypedProgram,
-    function: &str,
-    args: &[AstCallArg],
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    visiting_functions: &mut BTreeSet<String>,
-) -> Option<PlanValueType> {
+fn inferred_builtin_call_value_type(function: &str) -> Option<PlanValueType> {
     match function {
         "Text/empty"
         | "Text/space"
         | "Text/trim"
+        | "Text/to_lowercase"
+        | "Text/to_uppercase"
         | "Text/concat"
         | "Text/substring"
         | "Text/time_range_label"
@@ -5650,20 +5466,8 @@ fn inferred_builtin_call_value_type(
         | "Bytes/write_unsigned"
         | "Bytes/write_signed"
         | "File/read_bytes" => Some(PlanValueType::Bytes { fixed_len: None }),
-        "List/find_value" => named_arg(args, "fallback").and_then(|fallback| {
-            inferred_expression_value_type_inner(
-                program,
-                fallback.value,
-                expr_value_types,
-                visiting_functions,
-            )
-        }),
         _ => None,
     }
-}
-
-fn named_arg<'a>(args: &'a [AstCallArg], name: &str) -> Option<&'a AstCallArg> {
-    args.iter().find(|arg| arg.name.as_deref() == Some(name))
 }
 
 fn plan_value_type_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<PlanValueType> {
@@ -5720,7 +5524,7 @@ fn direct_statement_value_expr_id(statement: &AstStatement) -> Option<usize> {
 }
 
 fn plan_initial_list_rows(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     list: &boon_ir::ListMemory,
     initializer: &ListInitializer,
     synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
@@ -5751,7 +5555,7 @@ fn plan_initial_list_rows(
 }
 
 fn row_field_id_for_list_field(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     list_name: &str,
     field_name: &str,
     synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
@@ -5778,7 +5582,7 @@ fn row_field_id_for_list_field(
 }
 
 fn storage_input_field_id(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     list_name: &str,
     field_name: &str,
     synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
@@ -5791,21 +5595,8 @@ fn storage_input_field_id(
         })
 }
 
-fn row_field_id_for_list_id(
-    program: &TypedProgram,
-    list_id: ListId,
-    field_name: &str,
-) -> Option<FieldId> {
-    let list = program
-        .lists
-        .iter()
-        .find(|list| plan_list_id(list.id) == list_id)?;
-    let synthetic_field_ids = synthetic_initial_list_field_ids(program);
-    row_field_id_for_list_field(program, &list.name, field_name, &synthetic_field_ids)
-}
-
 fn row_input_field_id_for_list_id(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     list_id: ListId,
     field_name: &str,
 ) -> Option<FieldId> {
@@ -5818,7 +5609,7 @@ fn row_input_field_id_for_list_id(
 }
 
 fn query_row_data_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
     list_id: ListId,
 ) -> Option<DataTypePlan> {
@@ -5913,7 +5704,7 @@ fn query_row_data_type(
             open: false,
         }),
         ListInitializer::Empty | ListInitializer::Unknown { .. } => {
-            let fields = list_append_authoritative_field_types(program, index, &list.name).ok()?;
+            let fields = list_append_authoritative_field_types(program, index, list).ok()?;
             (!fields.is_empty()).then(|| DataTypePlan::Record {
                 fields: fields
                     .into_iter()
@@ -6131,7 +5922,7 @@ fn plan_query_residual(
 }
 
 fn list_row_field_ids(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     list: &boon_ir::ListMemory,
     synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
 ) -> Vec<FieldId> {
@@ -6155,7 +5946,9 @@ fn list_row_field_ids(
     fields.into_iter().collect()
 }
 
-fn synthetic_initial_list_field_ids(program: &TypedProgram) -> BTreeMap<(String, String), FieldId> {
+fn synthetic_initial_list_field_ids(
+    program: &ErasedProgram,
+) -> BTreeMap<(String, String), FieldId> {
     let mut next_id = program
         .semantic_index
         .fields
@@ -6200,7 +5993,7 @@ fn synthetic_initial_list_field_ids(program: &TypedProgram) -> BTreeMap<(String,
                 for field in program
                     .list_operations
                     .iter()
-                    .filter(|operation| operation.list == list.name)
+                    .filter(|operation| operation.list_id == list.id)
                     .filter_map(|operation| match &operation.kind {
                         ListOperationKind::Append { fields, .. } => Some(fields),
                         _ => None,
@@ -6220,30 +6013,34 @@ fn synthetic_initial_list_field_ids(program: &TypedProgram) -> BTreeMap<(String,
     ids
 }
 
-fn list_has_runtime_constructor_map(program: &TypedProgram, list: &boon_ir::ListMemory) -> bool {
-    let Some(scope) = list.row_scope_id.and_then(|scope| {
-        program
-            .row_scopes
-            .iter()
-            .find(|candidate| candidate.id == scope)
-    }) else {
-        return false;
+fn list_has_runtime_constructor_map(program: &ErasedProgram, list: &boon_ir::ListMemory) -> bool {
+    runtime_materialization_for_path(program, &list.name).is_some()
+}
+
+fn runtime_materialization_for_path<'a>(
+    program: &'a ErasedProgram,
+    path: &str,
+) -> Option<&'a ir::ContextualMaterialization> {
+    let value = program.executable.statements.iter().find_map(|statement| {
+        matches!(
+            &statement.kind,
+            ir::ExecutableStatementKind::Field {
+                path: statement_path,
+                ..
+            } if statement_path == path
+        )
+        .then_some(statement.value)
+        .flatten()
+    })?;
+    let ir::ExecutableExpressionKind::Materialize { materialization } =
+        &program.executable.expressions.get(value.as_usize())?.kind
+    else {
+        return None;
     };
     program
-        .typecheck_report
-        .list_map_bindings
-        .iter()
-        .any(|binding| {
-            binding.result_kind == boon_typecheck::ListMapResultKind::RuntimeValue
-                && binding
-                    .template_function
-                    .as_deref()
-                    .is_some_and(|function| {
-                        function == scope.function
-                            || function.ends_with(&format!("/{}", scope.function))
-                            || scope.function.ends_with(&format!("/{function}"))
-                    })
-        })
+        .materializations
+        .get(*materialization)
+        .filter(|value| value.result_kind == ir::MaterializationResultKind::RuntimeValue)
 }
 
 fn append_constant_id(constants: &mut Vec<PlanConstant>, value: &str) -> PlanConstantId {
@@ -6251,7 +6048,7 @@ fn append_constant_id(constants: &mut Vec<PlanConstant>, value: &str) -> PlanCon
 }
 
 fn list_append_value_ref(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
     trigger: &str,
     path: &str,
@@ -6336,51 +6133,71 @@ fn push_integer_plan_constant(
 }
 
 fn derived_expression_for_value(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
     index: &ValueIndex,
     constants: &mut Vec<PlanConstant>,
     inputs: &mut Vec<ValueRef>,
     _unresolved_refs: &mut BTreeSet<String>,
-) -> Option<PlanDerivedExpression> {
-    source_group_derived_expression(program, derived, index, inputs)
-        .or_else(|| source_key_text_trim_non_empty_expression(program, derived, index, inputs))
-        .or_else(|| source_event_transform_expression(program, derived, index, constants, inputs))
-        .or_else(|| bool_not_derived_expression(program, derived, index, inputs))
-        .or_else(|| number_compare_const_derived_expression(program, derived, index, inputs))
-        .or_else(|| root_bool_derived_expression(program, derived, index, inputs))
-        .or_else(|| row_expression_for_value(program, derived, index, constants, inputs))
+) -> Result<Option<PlanDerivedExpression>, PlanError> {
+    if derived.kind == DerivedValueKind::SourceEventTransform {
+        return source_event_transform_expression(program, derived, index, constants, inputs)
+            .map(Some);
+    }
+    row_expression_for_value(program, derived, index, constants, inputs)
 }
 
 fn derived_materialized_list_id(
-    program: &TypedProgram,
+    _program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
 ) -> Option<ListId> {
-    if derived.kind != DerivedValueKind::ListView {
-        return None;
-    }
-    let local = derived
-        .path
-        .rsplit_once('.')
-        .map(|(_, local)| local)
-        .unwrap_or(&derived.path);
-    program
-        .lists
+    (derived.kind == DerivedValueKind::ListView)
+        .then_some(derived.materialized_list_id)
+        .flatten()
+        .map(plan_list_id)
+}
+
+fn materialized_runtime_fields(
+    program: &ErasedProgram,
+) -> Result<BTreeMap<ListId, BTreeSet<FieldId>>, PlanError> {
+    let mut result = BTreeMap::<ListId, BTreeSet<FieldId>>::new();
+    for derived in program
+        .derived_values
         .iter()
-        .find(|list| {
-            list.row_scope_id.is_some()
-                && matches!(
-                    list.initializer,
-                    ListInitializer::Empty | ListInitializer::Unknown { .. }
-                )
-                && (list.name == derived.path
-                    || list.name == local
-                    || list
-                        .name
-                        .rsplit_once('.')
-                        .is_some_and(|(_, list_local)| list_local == local))
-        })
-        .map(|list| plan_list_id(list.id))
+        .filter(|derived| derived.kind == DerivedValueKind::ListView)
+    {
+        let list_id = derived.materialized_list_id.ok_or_else(|| {
+            PlanError::new(format!(
+                "derived list view `{}` has no typed materialized ListId",
+                derived.path
+            ))
+        })?;
+        let list = program
+            .lists
+            .iter()
+            .find(|list| list.id == list_id)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "derived list view `{}` targets missing list {}",
+                    derived.path, list_id.0
+                ))
+            })?;
+        let scope_id = list.row_scope_id.ok_or_else(|| {
+            PlanError::new(format!(
+                "derived list view `{}` targets list `{}` without a row ScopeId",
+                derived.path, list.name
+            ))
+        })?;
+        result.entry(plan_list_id(list_id)).or_default().extend(
+            program
+                .semantic_index
+                .fields
+                .iter()
+                .filter(|field| field.scope_id == Some(scope_id))
+                .map(|field| plan_field_id(field.id)),
+        );
+    }
+    Ok(result)
 }
 
 fn collect_materialized_list_field_names(
@@ -6414,13 +6231,157 @@ fn collect_materialized_list_field_names(
     }
 }
 
+fn materialized_list_row_field_copies(
+    program: &ErasedProgram,
+    target_list: ListId,
+    expression: &PlanDerivedExpression,
+) -> Result<Vec<PlanMaterializedRowFieldCopy>, PlanError> {
+    let mut source_lists = BTreeSet::new();
+    collect_materialized_row_sources(expression, &mut source_lists);
+    if source_lists.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target_fields = list_row_fields_by_name(program, target_list);
+    let mut copies = Vec::new();
+    for source_list in source_lists {
+        let source_fields = list_row_fields_by_name(program, source_list);
+        let before = copies.len();
+        for (name, target_field) in &target_fields {
+            if let Some(source_field) = source_fields.get(name) {
+                copies.push(PlanMaterializedRowFieldCopy {
+                    source_list,
+                    source_field: *source_field,
+                    target_field: *target_field,
+                });
+            }
+        }
+        if copies.len() == before && !target_fields.is_empty() {
+            return Err(PlanError::new(format!(
+                "materialized list {} cannot copy typed rows from list {}",
+                target_list.0, source_list.0
+            )));
+        }
+    }
+    Ok(copies)
+}
+
+fn list_row_fields_by_name(program: &ErasedProgram, list_id: ListId) -> BTreeMap<String, FieldId> {
+    let Some(list) = program
+        .lists
+        .iter()
+        .find(|list| plan_list_id(list.id) == list_id)
+    else {
+        return BTreeMap::new();
+    };
+    let mut fields = BTreeMap::new();
+    if let Some(scope) = list.row_scope_id {
+        fields.extend(
+            program
+                .semantic_index
+                .fields
+                .iter()
+                .filter(|field| field.scope_id == Some(scope))
+                .map(|field| (field.local_name.clone(), plan_field_id(field.id))),
+        );
+    }
+    let synthetic = synthetic_initial_list_field_ids(program);
+    fields.extend(
+        synthetic
+            .into_iter()
+            .filter(|((list_name, _), _)| list_name == &list.name)
+            .map(|((_, field_name), field)| (field_name, field)),
+    );
+    fields
+}
+
+fn collect_materialized_row_sources(
+    expression: &PlanDerivedExpression,
+    sources: &mut BTreeSet<ListId>,
+) {
+    match expression {
+        PlanDerivedExpression::MaterializeList { expression, .. } => {
+            collect_materialized_row_sources(expression, sources);
+        }
+        PlanDerivedExpression::RowExpression { expression } => {
+            collect_row_result_sources(expression, sources);
+        }
+        PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+            collect_row_result_sources(default, sources);
+            for arm in arms {
+                collect_row_result_sources(&arm.value, sources);
+            }
+        }
+        PlanDerivedExpression::BoolAnd { left, right } => {
+            collect_materialized_row_sources(left, sources);
+            collect_materialized_row_sources(right, sources);
+        }
+        PlanDerivedExpression::BoolNotExpression { input } => {
+            collect_materialized_row_sources(input, sources);
+        }
+        PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
+        | PlanDerivedExpression::BoolNot { .. }
+        | PlanDerivedExpression::NumberCompareConst { .. }
+        | PlanDerivedExpression::ValueCompare { .. } => {}
+    }
+}
+
+fn collect_row_result_sources(expression: &PlanRowExpression, sources: &mut BTreeSet<ListId>) {
+    match expression {
+        PlanRowExpression::ListRef { list_id } => {
+            sources.insert(*list_id);
+        }
+        PlanRowExpression::ContextualCollection {
+            operation: PlanContextualOperationKind::Filter | PlanContextualOperationKind::Retain,
+            source,
+            ..
+        } => collect_row_result_sources(source, sources),
+        PlanRowExpression::ContextualCollection {
+            owner,
+            operation: PlanContextualOperationKind::Map,
+            source,
+            row_local,
+            body,
+            ..
+        } => collect_mapped_row_result_sources(*owner, *row_local, source, body, sources),
+        PlanRowExpression::Select { arms, .. } => {
+            for arm in arms {
+                collect_row_result_sources(&arm.value, sources);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_mapped_row_result_sources(
+    owner: PlanStaticOwnerId,
+    row_local: PlanLocalId,
+    source: &PlanRowExpression,
+    body: &PlanRowExpression,
+    sources: &mut BTreeSet<ListId>,
+) {
+    match body {
+        PlanRowExpression::LocalRow {
+            owner: body_owner,
+            local,
+        } if *body_owner == owner && *local == row_local => {
+            collect_row_result_sources(source, sources);
+        }
+        PlanRowExpression::Select { arms, .. } => {
+            for arm in arms {
+                collect_mapped_row_result_sources(owner, row_local, source, &arm.value, sources);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_materialized_list_row_names(
     expression: &PlanRowExpression,
     names: &mut BTreeSet<String>,
 ) {
     match expression {
-        PlanRowExpression::ListMap { value, .. } => {
-            collect_materialized_record_field_names(value, names);
+        PlanRowExpression::ContextualCollection { body, .. } => {
+            collect_materialized_record_field_names(body, names);
         }
         PlanRowExpression::Select { arms, .. } => {
             for arm in arms {
@@ -6453,135 +6414,117 @@ fn collect_materialized_record_field_names(
     }
 }
 
-fn source_group_derived_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-) -> Option<PlanDerivedExpression> {
-    if !statement_is_source_group(program, &derived.statement) {
-        return None;
-    }
-    let expression =
-        source_group_row_expression(program, &derived.statement, &derived.path, index, inputs)?;
-    Some(PlanDerivedExpression::RowExpression { expression })
-}
-
-fn source_group_row_expression(
-    program: &TypedProgram,
-    statement: &AstStatement,
-    path: &str,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-) -> Option<PlanRowExpression> {
-    let mut fields = Vec::with_capacity(statement.children.len());
-    for child in &statement.children {
-        let (name, value) = match &child.kind {
-            AstStatementKind::Source { field, .. } => {
-                let field = field.as_ref()?;
-                let source_path = format!("{path}.{field}");
-                let source = index.resolve(&source_path)?;
-                if !matches!(source, ValueRef::Source(_)) {
-                    return None;
-                }
-                if !inputs.contains(&source) {
-                    inputs.push(source.clone());
-                }
-                (field.clone(), PlanRowExpression::Field { input: source })
-            }
-            AstStatementKind::Field { name } if statement_is_source_group(program, child) => {
-                let child_path = format!("{path}.{name}");
-                (
-                    name.clone(),
-                    source_group_row_expression(program, child, &child_path, index, inputs)?,
-                )
-            }
-            _ if row_statement_is_empty_delimiter(child, program) => continue,
-            _ => return None,
-        };
-        fields.push(PlanRowObjectField { name, value });
-    }
-    Some(PlanRowExpression::Object { fields })
-}
-
 fn source_event_transform_expression(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
     index: &ValueIndex,
     constants: &mut Vec<PlanConstant>,
     inputs: &mut Vec<ValueRef>,
-) -> Option<PlanDerivedExpression> {
+) -> Result<PlanDerivedExpression, PlanError> {
     if derived.kind != DerivedValueKind::SourceEventTransform {
-        return None;
+        return Err(PlanError::new(format!(
+            "derived value `{}` is not a source-event transform",
+            derived.path
+        )));
     }
 
+    let root = executable_value_for_statement(program, derived.executable_statement_id.as_usize())
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "source-event derived value `{}` has no executable statement root",
+                derived.path
+            ))
+        })?;
     let mut local_constants = constants.clone();
     let mut local_inputs = inputs.clone();
-    let expr_value_types = expression_value_type_lookup(program);
-    let mut env = BTreeMap::new();
-
-    let exprs = super::compiler_statement_ast_exprs(&derived.statement, &program.expressions);
     let mut arm_values = Vec::new();
-    for source in &derived.sources {
-        let trigger = index.resolve(source)?;
-        if !matches!(&trigger, ValueRef::Source(_) | ValueRef::State(_)) {
-            continue;
-        }
-        let value = source_event_transform_arm_expression(
+    for arm in &derived.trigger_arms {
+        let gate = program
+            .executable
+            .expressions
+            .get(arm.gate_expression_id.as_usize())
+            .filter(|expression| {
+                expression.id == arm.gate_expression_id
+                    && expression.checked_expr_id == arm.gate_checked_expr_id
+                    && expression.owner == arm.owner
+            })
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "source-event derived value `{}` has a stale trigger-owned gate {}",
+                    derived.path, arm.gate_expression_id
+                ))
+            })?;
+        let output = program
+            .executable
+            .expressions
+            .get(arm.output_expression_id.as_usize())
+            .filter(|expression| expression.id == arm.output_expression_id)
+            .map(|_| arm.output_expression_id)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "source-event derived value `{}` trigger gate {} has missing output {}",
+                    derived.path, gate.id, arm.output_expression_id
+                ))
+            })?;
+        let cause = arm.cause;
+        let (trigger, cause_path) = event_cause_value_ref(program, cause)?;
+        let indexed_context = derived.indexed || event_cause_is_indexed(program, cause);
+        let value = ExecutableRowLowerer::new(
             program,
-            derived,
             index,
             &mut local_constants,
             &mut local_inputs,
-            &expr_value_types,
-            &exprs,
-            source,
         )
-        .or_else(|| {
-            super::compiler_source_then_field_value(&exprs, source).map(|value| {
-                row_expression_from_compiler_field_value(
-                    &mut local_constants,
-                    &mut local_inputs,
-                    value,
-                )
-            })
-        })
-        .or_else(|| {
-            source_event_transform_text_arm_expression(
-                program,
-                derived,
-                index,
-                &mut local_inputs,
-                source,
-            )
-        });
-        let Some(value) = value else {
-            continue;
-        };
+        .with_source_context(&cause_path, &derived.path, indexed_context)
+        .lower(output)
+        .map_err(|error| {
+            PlanError::new(format!(
+                "source-event derived value `{}` trigger `{cause_path}` failed executable lowering: {error}",
+                derived.path
+            ))
+        })?;
         if !local_inputs.contains(&trigger) {
             local_inputs.push(trigger.clone());
         }
         arm_values.push((trigger, value));
     }
     if arm_values.is_empty() {
-        return None;
+        return Err(PlanError::new(format!(
+            "source-event derived value `{}` has no trigger-owned executable arm",
+            derived.path
+        )));
     }
     let output_type =
         source_event_transform_output_type(program, index, &local_constants, &arm_values);
-    let default = source_event_transform_default_expression(
-        program,
-        derived,
-        index,
-        &mut local_constants,
-        &mut local_inputs,
-        &mut env,
-        &expr_value_types,
-        output_type,
-    )
-    .unwrap_or_else(|| {
-        let value = source_event_transform_fresh_value(output_type, &local_constants, &arm_values);
-        row_constant_expression(&mut local_constants, &mut local_inputs, value)
-    });
+    let default = derived
+        .default_roots
+        .iter()
+        .copied()
+        .find_map(|candidate| {
+            let mut candidate_constants = local_constants.clone();
+            let mut candidate_inputs = local_inputs.clone();
+            let value = ExecutableRowLowerer::new(
+                program,
+                index,
+                &mut candidate_constants,
+                &mut candidate_inputs,
+            )
+            .lower(candidate)
+            .ok()?;
+            let candidate_type =
+                row_expression_value_type(program, index, &candidate_constants, &value);
+            if output_type.is_some_and(|expected| candidate_type != Some(expected)) {
+                return None;
+            }
+            local_constants = candidate_constants;
+            local_inputs = candidate_inputs;
+            Some(value)
+        })
+        .unwrap_or_else(|| {
+            let value =
+                source_event_transform_fresh_value(output_type, &local_constants, &arm_values);
+            row_constant_expression(&mut local_constants, &mut local_inputs, value)
+        });
     let arms = arm_values
         .into_iter()
         .map(|(trigger, value)| PlanSourceEventTransformArm { trigger, value })
@@ -6589,15 +6532,96 @@ fn source_event_transform_expression(
 
     *constants = local_constants;
     *inputs = local_inputs;
-    Some(PlanDerivedExpression::SourceEventTransform {
+    Ok(PlanDerivedExpression::SourceEventTransform {
         default: Box::new(default),
         arms,
-        router_route: super::compiler_statement_calls_router_go_to(&exprs),
+        router_route: executable_expression_calls(program, root, "Router/go_to"),
     })
 }
 
+fn event_cause_path(program: &ErasedProgram, cause: ir::EventCause) -> Option<&str> {
+    match cause {
+        ir::EventCause::Source(source_id) => program
+            .sources
+            .get(source_id.as_usize())
+            .filter(|source| source.id == source_id)
+            .map(|source| source.path.as_str()),
+        ir::EventCause::State(state_id) => program
+            .state_cells
+            .get(state_id.as_usize())
+            .filter(|state| state.id == state_id)
+            .map(|state| state.path.as_str()),
+    }
+}
+
+fn event_cause_value_ref(
+    program: &ErasedProgram,
+    cause: ir::EventCause,
+) -> Result<(ValueRef, String), PlanError> {
+    let path = event_cause_path(program, cause)
+        .ok_or_else(|| PlanError::new(format!("event cause {cause:?} has no runtime resource")))?
+        .to_owned();
+    let value = match cause {
+        ir::EventCause::Source(source_id) => ValueRef::Source(plan_source_id(source_id)),
+        ir::EventCause::State(state_id) => ValueRef::State(plan_state_id(state_id)),
+    };
+    Ok((value, path))
+}
+
+fn event_cause_is_indexed(program: &ErasedProgram, cause: ir::EventCause) -> bool {
+    match cause {
+        ir::EventCause::Source(source_id) => program
+            .sources
+            .get(source_id.as_usize())
+            .is_some_and(|source| source.id == source_id && source.scoped),
+        ir::EventCause::State(state_id) => program
+            .state_cells
+            .get(state_id.as_usize())
+            .is_some_and(|state| state.id == state_id && state.indexed),
+    }
+}
+
+fn executable_expression_calls(
+    program: &ErasedProgram,
+    root: ir::ExecutableExprId,
+    function: &str,
+) -> bool {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        let Some(expression) = program.executable.expressions.get(current.as_usize()) else {
+            continue;
+        };
+        if matches!(
+            &expression.kind,
+            ir::ExecutableExpressionKind::Call { name, .. } if name == function
+        ) {
+            return true;
+        }
+        pending.extend(executable_children(program, &expression.kind));
+    }
+    false
+}
+
+fn executable_children(
+    program: &ErasedProgram,
+    kind: &ir::ExecutableExpressionKind,
+) -> Vec<ir::ExecutableExprId> {
+    if let ir::ExecutableExpressionKind::Materialize { materialization } = kind {
+        return program
+            .materializations
+            .get(*materialization)
+            .map(|materialization| vec![materialization.source, materialization.body])
+            .unwrap_or_default();
+    }
+    ir::executable_expression_children(kind)
+}
+
 fn source_event_transform_output_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
     constants: &[PlanConstant],
     arms: &[(ValueRef, PlanRowExpression)],
@@ -6680,358 +6704,6 @@ fn source_event_transform_fresh_value(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn source_event_transform_arm_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    exprs: &[AstExpr],
-    source: &str,
-) -> Option<PlanRowExpression> {
-    if matches!(index.resolve(source), Some(ValueRef::State(_))) {
-        return state_event_transform_arm_expression(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            expr_value_types,
-            exprs,
-            source,
-        );
-    }
-    let arm =
-        source_event_transform_arm_statement(program, derived, exprs, source, &derived.statement)?;
-    let arm_expr = expr_by_id(program, arm.expr?)?;
-    let ValueRef::Source(source_id) = index.resolve(source)? else {
-        return None;
-    };
-    if let Some(field) = index.source_field_payload_alias(source, &derived.path) {
-        let input = ValueRef::SourcePayload { source_id, field };
-        if !inputs.contains(&input) {
-            inputs.push(input.clone());
-        }
-        return Some(PlanRowExpression::Field { input });
-    }
-    let source_port = program
-        .sources
-        .iter()
-        .find(|candidate| candidate.path == source)?;
-    let payload_fields = source_port
-        .payload_schema
-        .fields
-        .iter()
-        .chain(
-            source_port
-                .payload_schema
-                .typed_fields
-                .iter()
-                .map(|descriptor| &descriptor.field),
-        )
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut env = BTreeMap::new();
-    if let Some(scope_id) = source_port.scope_id
-        && let Some(list) = program
-            .lists
-            .iter()
-            .find(|list| list.row_scope_id == Some(scope_id))
-    {
-        let current_row = LoweredRowValue::CurrentRow {
-            list_id: plan_list_id(list.id),
-        };
-        if let Some(scope) = program.row_scopes.iter().find(|scope| scope.id == scope_id) {
-            env.insert(scope.row_scope.clone(), current_row.clone());
-        }
-        let expression_ids = exprs.iter().map(|expr| expr.id).collect::<BTreeSet<_>>();
-        for binding in &program.typecheck_report.list_map_bindings {
-            if expression_ids.contains(&binding.map_expr_id) {
-                env.insert(binding.item_binding_name.clone(), current_row.clone());
-            }
-        }
-    }
-    for payload_field in payload_fields {
-        let field_name = match &payload_field {
-            ir::SourcePayloadField::Address => "address",
-            ir::SourcePayloadField::Bytes => "bytes",
-            ir::SourcePayloadField::Key => "key",
-            ir::SourcePayloadField::Named(name) => name,
-            ir::SourcePayloadField::Text => "text",
-        };
-        let input = ValueRef::SourcePayload {
-            source_id,
-            field: source_payload_field_from_ir(&payload_field),
-        };
-        if !inputs.contains(&input) {
-            inputs.push(input.clone());
-        }
-        let value = LoweredRowValue::Scalar(PlanRowExpression::Field { input });
-        env.insert(format!("{source}.{field_name}"), value.clone());
-        env.insert(format!("{source}.event.{field_name}"), value.clone());
-        if let Some(relative) = source.strip_prefix("store.") {
-            env.insert(format!("{relative}.{field_name}"), value.clone());
-            env.insert(format!("{relative}.event.{field_name}"), value);
-        }
-    }
-    let lowered = match &arm_expr.kind {
-        AstExprKind::Then {
-            output: Some(output),
-            ..
-        } => statement_with_expression(arm, *output)
-            .filter(|statement| !statement.children.is_empty())
-            .and_then(|statement| {
-                lower_row_statement_value(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    &mut env,
-                    expr_value_types,
-                    statement,
-                )
-            })
-            .or_else(|| {
-                (!arm.children.is_empty())
-                    .then(|| {
-                        lower_row_function_body(
-                            program,
-                            derived,
-                            index,
-                            constants,
-                            inputs,
-                            arm,
-                            &mut env,
-                            expr_value_types,
-                        )
-                    })
-                    .flatten()
-            })
-            .or_else(|| {
-                lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    &mut env,
-                    expr_value_types,
-                    *output,
-                )
-            }),
-        AstExprKind::Then { output: None, .. } => lower_row_function_body(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            arm,
-            &mut env,
-            expr_value_types,
-        ),
-        _ => lower_row_statement_value(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            &mut env,
-            expr_value_types,
-            arm,
-        ),
-    };
-    lowered.and_then(lowered_scalar)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn state_event_transform_arm_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    exprs: &[AstExpr],
-    source: &str,
-) -> Option<PlanRowExpression> {
-    let arm =
-        source_event_transform_arm_statement(program, derived, exprs, source, &derived.statement)?;
-    let arm_expr = expr_by_id(program, arm.expr?)?;
-    let mut env = BTreeMap::new();
-    let lowered = match &arm_expr.kind {
-        AstExprKind::Then {
-            output: Some(output),
-            ..
-        } => (!arm.children.is_empty())
-            .then(|| {
-                lower_row_function_body(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    arm,
-                    &mut env,
-                    expr_value_types,
-                )
-            })
-            .flatten()
-            .or_else(|| {
-                statement_with_expression(arm, *output)
-                    .filter(|statement| !statement.children.is_empty())
-                    .and_then(|statement| {
-                        lower_row_statement_value(
-                            program,
-                            derived,
-                            index,
-                            constants,
-                            inputs,
-                            &mut env,
-                            expr_value_types,
-                            statement,
-                        )
-                    })
-            })
-            .or_else(|| {
-                lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    &mut env,
-                    expr_value_types,
-                    *output,
-                )
-            }),
-        AstExprKind::Then { output: None, .. } => lower_row_function_body(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            arm,
-            &mut env,
-            expr_value_types,
-        ),
-        _ => lower_row_statement_value(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            &mut env,
-            expr_value_types,
-            arm,
-        ),
-    };
-    lowered.and_then(lowered_scalar)
-}
-
-fn source_event_transform_arm_statement<'a>(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    exprs: &[AstExpr],
-    source: &str,
-    statement: &'a AstStatement,
-) -> Option<&'a AstStatement> {
-    if let Some(arm) =
-        source_event_transform_direct_arm_statement(program, exprs, source, statement)
-    {
-        return Some(arm);
-    }
-    if let Some(arm) = statement.children.iter().find_map(|child| {
-        source_event_transform_arm_statement(program, derived, exprs, source, child)
-    }) {
-        return Some(arm);
-    }
-    if let Some(expr_id) = statement.expr
-        && expression_tree_reaches_source(program, derived, exprs, expr_id, source)
-    {
-        return source_event_then_continuation(program, statement).or(Some(statement));
-    }
-    None
-}
-
-fn source_event_transform_direct_arm_statement<'a>(
-    program: &TypedProgram,
-    exprs: &[AstExpr],
-    source: &str,
-    statement: &'a AstStatement,
-) -> Option<&'a AstStatement> {
-    if statement
-        .expr
-        .and_then(|expr_id| expr_by_id(program, expr_id))
-        .is_some_and(|expr| {
-            matches!(
-                &expr.kind,
-                AstExprKind::Then { input, .. }
-                    if super::expr_tree_mentions_source(exprs, *input, source)
-            )
-        })
-    {
-        return Some(statement);
-    }
-    if let Some(arm) = statement.children.iter().find_map(|child| {
-        source_event_transform_direct_arm_statement(program, exprs, source, child)
-    }) {
-        return Some(arm);
-    }
-    let expr_id = statement.expr?;
-    super::expr_tree_mentions_source(exprs, expr_id, source)
-        .then(|| source_event_then_continuation(program, statement).unwrap_or(statement))
-}
-
-fn expression_tree_reaches_source(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    exprs: &[AstExpr],
-    expr_id: usize,
-    source: &str,
-) -> bool {
-    if super::expr_tree_mentions_source(exprs, expr_id, source) {
-        return true;
-    }
-    let mut ids = BTreeSet::new();
-    super::collect_expr_ids(expr_id, exprs, &mut ids);
-    exprs.iter().any(|expr| {
-        if !ids.contains(&expr.id) {
-            return false;
-        }
-        let Some(path) = expression_path_string(program, expr.id) else {
-            return false;
-        };
-        let path = canonical_sibling_path(&derived.path, &path);
-        if path == derived.path {
-            return false;
-        }
-        program.derived_values.iter().any(|candidate| {
-            candidate.path == path && candidate.sources.iter().any(|cause| cause == source)
-        }) || program.possible_causes.iter().any(|candidate| {
-            candidate.target == path && candidate.sources.iter().any(|cause| cause == source)
-        })
-    })
-}
-
-fn source_event_then_continuation<'a>(
-    program: &TypedProgram,
-    statement: &'a AstStatement,
-) -> Option<&'a AstStatement> {
-    if statement
-        .expr
-        .and_then(|expr| expr_by_id(program, expr))
-        .is_some_and(|expr| matches!(expr.kind, AstExprKind::Then { .. }))
-    {
-        return Some(statement);
-    }
-    statement
-        .children
-        .iter()
-        .find_map(|child| source_event_then_continuation(program, child))
-}
-
 fn plan_row_expression_is_bool_constant(
     constants: &[PlanConstant],
     expression: &PlanRowExpression,
@@ -7045,1485 +6717,902 @@ fn plan_row_expression_is_bool_constant(
         .is_some_and(|constant| matches!(constant.value, PlanConstantValue::Bool { .. }))
 }
 
-fn source_event_transform_text_arm_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-    source: &str,
-) -> Option<PlanRowExpression> {
-    let expression = super::compiler_source_event_transform_text_expression(
-        derived,
-        source,
-        &program.expressions,
-        &program.functions,
-    );
-    if std::env::var_os("BOON_COMPILER_SOURCE_EVENT_TRACE").is_some() {
-        eprintln!(
-            "source_event_transform_text_arm path={} source={} expression={expression:?}",
-            derived.path, source
-        );
-    }
-    match expression {
-        super::CompilerDerivedTextExpression::SourceRootText { path }
-        | super::CompilerDerivedTextExpression::EnterKeyRootTextTrimNonEmpty { path } => {
-            source_event_transform_text_path_expression(
-                program, derived, index, inputs, source, &path,
-            )
-        }
-        _ => {
-            let path =
-                source_event_transform_final_then_source_text_path(program, derived, source)?;
-            if std::env::var_os("BOON_COMPILER_SOURCE_EVENT_TRACE").is_some() {
-                eprintln!(
-                    "source_event_transform_text_arm final_then path={} source={} text_path={path}",
-                    derived.path, source
-                );
-            }
-            source_event_transform_text_path_expression(
-                program, derived, index, inputs, source, &path,
-            )
-        }
-    }
+struct ExecutableRowLowerer<'a> {
+    program: &'a ErasedProgram,
+    index: &'a ValueIndex,
+    constants: &'a mut Vec<PlanConstant>,
+    inputs: &'a mut Vec<ValueRef>,
+    source_context: Option<ExecutableSourceReadContext>,
+    bindings: BTreeMap<ir::ExecutableExprId, PlanRowExpression>,
+    parameter_bindings: BTreeMap<ir::ExecutableParameterId, PlanRowExpression>,
+    memo: BTreeMap<(ir::ExecutableExprId, Option<PlanStaticOwnerId>), PlanRowExpression>,
 }
 
-fn source_event_transform_text_path_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-    source: &str,
-    path: &str,
-) -> Option<PlanRowExpression> {
-    let mut input = resolve_update_value_ref(index, source, &derived.path, derived.indexed, path)?;
-    if let ValueRef::SourcePayload {
-        source_id: payload_source_id,
-        field,
-    } = &input
-        && let Some(backing_state) = source_payload_backing_row_state(
-            program,
-            index,
-            source,
-            *payload_source_id,
-            field,
-            derived.indexed,
-        )
-    {
-        input = backing_state;
-    }
-    if !inputs.contains(&input) {
-        inputs.push(input.clone());
-    }
-    Some(PlanRowExpression::Field { input })
-}
-
-fn source_event_transform_final_then_source_text_path(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    source: &str,
-) -> Option<String> {
-    let exprs = super::compiler_statement_ast_exprs(&derived.statement, &program.expressions);
-    exprs.iter().rev().find_map(|expr| {
-        let AstExprKind::Then {
-            output: Some(output),
-            ..
-        } = expr.kind
-        else {
-            return None;
-        };
-        let path = expression_path_string(program, output)?;
-        matches!(
-            source_payload_field_from_path(source, &path, true),
-            Some(SourcePayloadField::Text)
-        )
-        .then_some(path)
-    })
-}
-
-fn source_payload_backing_row_state(
-    program: &TypedProgram,
-    index: &ValueIndex,
-    source: &str,
-    source_id: SourceId,
-    field: &SourcePayloadField,
+#[derive(Clone, Debug)]
+struct ExecutableSourceReadContext {
+    source: String,
+    target: String,
     indexed: bool,
-) -> Option<ValueRef> {
-    program.update_branches.iter().find_map(|branch| {
-        if branch.source != source || branch.indexed != indexed {
-            return None;
-        }
-        if source_payload_field_for_expression(index, source, &branch.expression).as_ref()
-            != Some(field)
-        {
-            return None;
-        }
-        let Some(ValueRef::Source(branch_source_id)) = index.resolve(&branch.source) else {
-            return None;
-        };
-        if branch_source_id != source_id {
-            return None;
-        }
-        match index.resolve(&branch.target)? {
-            ValueRef::State(state_id) => Some(ValueRef::State(state_id)),
-            _ => None,
-        }
-    })
 }
-
-fn source_event_transform_default_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    output_type: Option<PlanValueType>,
-) -> Option<PlanRowExpression> {
-    source_event_transform_default_expression_in_statement(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        output_type,
-        &derived.statement,
-    )
-}
-
-fn source_event_transform_default_expression_in_statement(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    output_type: Option<PlanValueType>,
-    statement: &AstStatement,
-) -> Option<PlanRowExpression> {
-    for child in &statement.children {
-        if source_event_transform_statement_mentions_source(
+impl<'a> ExecutableRowLowerer<'a> {
+    fn new(
+        program: &'a ErasedProgram,
+        index: &'a ValueIndex,
+        constants: &'a mut Vec<PlanConstant>,
+        inputs: &'a mut Vec<ValueRef>,
+    ) -> Self {
+        Self {
             program,
-            derived,
-            child,
-            &derived.sources,
-        ) {
-            continue;
-        }
-
-        let mut candidate_constants = constants.clone();
-        let mut candidate_inputs = inputs.clone();
-        let mut candidate_env = env.clone();
-        if let Some(value) = lower_row_statement_value(
-            program,
-            derived,
-            index,
-            &mut candidate_constants,
-            &mut candidate_inputs,
-            &mut candidate_env,
-            expr_value_types,
-            child,
-        )
-        .and_then(lowered_scalar)
-        .filter(|value| {
-            let candidate_type =
-                row_expression_value_type(program, index, &candidate_constants, value);
-            match output_type {
-                Some(expected) => candidate_type == Some(expected),
-                None => candidate_type.is_some(),
-            }
-        }) {
-            *constants = candidate_constants;
-            *inputs = candidate_inputs;
-            *env = candidate_env;
-            return Some(value);
-        }
-        if let Some(value) = source_event_transform_default_expression_in_statement(
-            program,
-            derived,
             index,
             constants,
             inputs,
-            env,
-            expr_value_types,
-            output_type,
-            child,
-        ) {
-            return Some(value);
+            source_context: None,
+            bindings: BTreeMap::new(),
+            parameter_bindings: BTreeMap::new(),
+            memo: BTreeMap::new(),
         }
     }
-    None
-}
 
-fn source_event_transform_statement_mentions_source(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    statement: &AstStatement,
-    sources: &[String],
-) -> bool {
-    let exprs = super::compiler_statement_ast_exprs(statement, &program.expressions);
-    statement.expr.is_some_and(|expr_id| {
-        sources
-            .iter()
-            .any(|source| expression_tree_reaches_source(program, derived, &exprs, expr_id, source))
-    })
-}
+    fn with_bindings(
+        mut self,
+        bindings: BTreeMap<ir::ExecutableExprId, PlanRowExpression>,
+    ) -> Self {
+        self.bindings = bindings;
+        self
+    }
 
-fn row_expression_from_compiler_field_value(
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    value: super::CompilerFieldValue,
-) -> PlanRowExpression {
-    let value = match value {
-        super::CompilerFieldValue::Text(value) => PlanConstantValue::Text { value },
-        super::CompilerFieldValue::Bool(value) => PlanConstantValue::Bool { value },
-    };
-    row_constant_expression(constants, inputs, value)
-}
+    fn with_parameter_bindings(
+        mut self,
+        bindings: BTreeMap<ir::ExecutableParameterId, PlanRowExpression>,
+    ) -> Self {
+        self.parameter_bindings = bindings;
+        self
+    }
 
-fn source_key_text_trim_non_empty_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-) -> Option<PlanDerivedExpression> {
-    if derived.kind != DerivedValueKind::SourceEventTransform || derived.sources.len() != 1 {
-        return None;
+    fn with_source_context(mut self, source: &str, target: &str, indexed: bool) -> Self {
+        self.source_context = Some(ExecutableSourceReadContext {
+            source: source.to_owned(),
+            target: target.to_owned(),
+            indexed,
+        });
+        self
     }
-    let source = derived.sources.first()?;
-    let source_id = match index.resolve(source)? {
-        ValueRef::Source(source_id) => source_id,
-        _ => return None,
-    };
-    if let Some(expression) = source_key_text_trim_non_empty_runtime_expression(
-        program, derived, index, inputs, source, source_id,
-    ) {
-        return Some(expression);
-    }
-    let source_event_statement = derived.statement.children.first()?;
-    let AstExprKind::When { input } = &expr_by_id(program, source_event_statement.expr?)?.kind
-    else {
-        return None;
-    };
-    let payload_path = expression_path_string(program, *input)?;
-    let key_field = source_payload_field_from_path(source, &payload_path, true)?;
-    if key_field != SourcePayloadField::Key || !index.source_has_payload_field(source, &key_field) {
-        return None;
-    }
-    let enter_arm = match_arm_child(source_event_statement, "Enter", program)?;
-    let inner_expr_id = match_arm_output_id(program, enter_arm)?;
-    let inner_statement = enter_arm
-        .children
-        .iter()
-        .find(|statement| statement.expr == Some(inner_expr_id))?;
-    let AstExprKind::When { input: trim_input } = &expr_by_id(program, inner_expr_id)?.kind else {
-        return None;
-    };
-    let state_path = text_trim_input_path(program, *trim_input, &derived.path)?;
-    let state =
-        match resolve_update_value_ref(index, source, &derived.path, derived.indexed, &state_path)?
-        {
-            ValueRef::State(state_id) => ValueRef::State(state_id),
-            ValueRef::SourcePayload {
-                source_id,
-                field: SourcePayloadField::Text,
-            } => ValueRef::SourcePayload {
-                source_id,
-                field: SourcePayloadField::Text,
-            },
-            _ => return None,
-        };
-    if !when_has_empty_skip_and_passthrough(inner_statement, program) {
-        return None;
-    }
-    let payload_ref = ValueRef::SourcePayload {
-        source_id,
-        field: key_field.clone(),
-    };
-    let source_ref = ValueRef::Source(source_id);
-    if !inputs.contains(&source_ref) {
-        inputs.push(source_ref);
-    }
-    if !inputs.contains(&payload_ref) {
-        inputs.push(payload_ref);
-    }
-    if !inputs.contains(&state) {
-        inputs.push(state.clone());
-    }
-    Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
-        source_id,
-        key_field,
-        required_key: "Enter".to_owned(),
-        state,
-        skip_empty: true,
-    })
-}
 
-fn source_key_text_trim_non_empty_runtime_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-    source: &str,
-    source_id: SourceId,
-) -> Option<PlanDerivedExpression> {
-    if !index.source_has_payload_field(source, &SourcePayloadField::Key) {
-        return None;
+    fn lower(&mut self, root: ir::ExecutableExprId) -> Result<PlanRowExpression, PlanError> {
+        self.lower_scoped(root, None)
     }
-    let state = match super::compiler_source_event_transform_text_expression(
-        derived,
-        source,
-        &program.expressions,
-        &program.functions,
-    ) {
-        super::CompilerDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty => {
-            if !index.source_has_payload_field(source, &SourcePayloadField::Text) {
-                return None;
-            }
-            ValueRef::SourcePayload {
-                source_id,
-                field: SourcePayloadField::Text,
-            }
+
+    fn lower_scoped(
+        &mut self,
+        root: ir::ExecutableExprId,
+        inherited_owner: Option<PlanStaticOwnerId>,
+    ) -> Result<PlanRowExpression, PlanError> {
+        if let Some(value) = self.bindings.get(&root) {
+            return Ok(value.clone());
         }
-        super::CompilerDerivedTextExpression::EnterKeyRootTextTrimNonEmpty { path } => {
-            match resolve_update_value_ref(index, source, &derived.path, derived.indexed, &path)? {
-                ValueRef::State(state_id) => ValueRef::State(state_id),
-                ValueRef::SourcePayload {
-                    source_id,
-                    field: SourcePayloadField::Text,
-                } => ValueRef::SourcePayload {
-                    source_id,
-                    field: SourcePayloadField::Text,
-                },
-                _ => return None,
-            }
+        let key = (root, inherited_owner);
+        if let Some(value) = self.memo.get(&key) {
+            return Ok(value.clone());
         }
-        _ => return None,
-    };
-    let key_field = SourcePayloadField::Key;
-    let payload_ref = ValueRef::SourcePayload {
-        source_id,
-        field: key_field.clone(),
-    };
-    let source_ref = ValueRef::Source(source_id);
-    if !inputs.contains(&source_ref) {
-        inputs.push(source_ref);
-    }
-    if !inputs.contains(&payload_ref) {
-        inputs.push(payload_ref);
-    }
-    if !inputs.contains(&state) {
-        inputs.push(state.clone());
-    }
-    Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
-        source_id,
-        key_field,
-        required_key: "Enter".to_owned(),
-        state,
-        skip_empty: true,
-    })
-}
-
-fn bool_not_derived_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-) -> Option<PlanDerivedExpression> {
-    if derived.kind != DerivedValueKind::Pure {
-        return None;
-    }
-    let statement = derived.statement.children.first()?;
-    let expr = expr_by_id(program, statement.expr?)?;
-    let input_path = match &expr.kind {
-        AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
-            expression_path_string(program, *input)?
-        }
-        AstExprKind::Call { function, args } if function == "Bool/not" => {
-            expression_path_string(program, args.first()?.value)?
-        }
-        _ => return None,
-    };
-    let canonical_path = canonical_sibling_path(&derived.path, &input_path);
-    let input = index.resolve(&canonical_path)?;
-    inputs.push(input.clone());
-    Some(PlanDerivedExpression::BoolNot { input })
-}
-
-fn number_compare_const_derived_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-) -> Option<PlanDerivedExpression> {
-    if derived.kind != DerivedValueKind::Pure {
-        return None;
-    }
-    let statement = derived.statement.children.first()?;
-    let expr = expr_by_id(program, statement.expr?)?;
-    let AstExprKind::Infix { left, op, right } = &expr.kind else {
-        return None;
-    };
-    if !matches!(op.as_str(), ">" | ">=" | "<" | "<=" | "==" | "!=") {
-        return None;
-    }
-    let left_path = expression_path_string(program, *left)?;
-    let right_expr = expr_by_id(program, *right)?;
-    let AstExprKind::Number(right_value) = &right_expr.kind else {
-        return None;
-    };
-    let right = right_value.parse::<FiniteReal>().ok()?;
-    let canonical_path = canonical_sibling_path(&derived.path, &left_path);
-    let left = index.resolve(&canonical_path)?;
-    inputs.push(left.clone());
-    Some(PlanDerivedExpression::NumberCompareConst {
-        left,
-        op: op.clone(),
-        right,
-    })
-}
-
-fn root_bool_derived_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-) -> Option<PlanDerivedExpression> {
-    if derived.kind != DerivedValueKind::Pure || derived.indexed {
-        return None;
-    }
-    let statement = derived.statement.children.first()?;
-    lower_root_bool_expr(program, &derived.path, index, inputs, statement.expr?)
-}
-
-fn lower_root_bool_expr(
-    program: &TypedProgram,
-    derived_path: &str,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-    expr_id: usize,
-) -> Option<PlanDerivedExpression> {
-    let expr = expr_by_id(program, expr_id)?;
-    match &expr.kind {
-        AstExprKind::Pipe { input, op, args } if op == "Bool/and" => {
-            let right = args.first()?.value;
-            Some(PlanDerivedExpression::BoolAnd {
-                left: Box::new(lower_root_bool_expr(
-                    program,
-                    derived_path,
-                    index,
-                    inputs,
-                    *input,
-                )?),
-                right: Box::new(lower_root_bool_expr(
-                    program,
-                    derived_path,
-                    index,
-                    inputs,
-                    right,
-                )?),
-            })
-        }
-        AstExprKind::Call { function, args } if function == "Bool/and" => {
-            let left = args.first()?.value;
-            let right = args.get(1)?.value;
-            Some(PlanDerivedExpression::BoolAnd {
-                left: Box::new(lower_root_bool_expr(
-                    program,
-                    derived_path,
-                    index,
-                    inputs,
-                    left,
-                )?),
-                right: Box::new(lower_root_bool_expr(
-                    program,
-                    derived_path,
-                    index,
-                    inputs,
-                    right,
-                )?),
-            })
-        }
-        AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
-            Some(PlanDerivedExpression::BoolNotExpression {
-                input: Box::new(lower_root_bool_expr(
-                    program,
-                    derived_path,
-                    index,
-                    inputs,
-                    *input,
-                )?),
-            })
-        }
-        AstExprKind::Call { function, args } if function == "Bool/not" => {
-            Some(PlanDerivedExpression::BoolNotExpression {
-                input: Box::new(lower_root_bool_expr(
-                    program,
-                    derived_path,
-                    index,
-                    inputs,
-                    args.first()?.value,
-                )?),
-            })
-        }
-        AstExprKind::Infix { left, op, right }
-            if matches!(op.as_str(), ">" | ">=" | "<" | "<=" | "==" | "!=") =>
-        {
-            let left_path = expression_path_string(program, *left)?;
-            if let Some(right_path) = expression_path_string(program, *right) {
-                let left = index.resolve(&canonical_sibling_path(derived_path, &left_path))?;
-                let right = index.resolve(&canonical_sibling_path(derived_path, &right_path))?;
-                if !inputs.contains(&left) {
-                    inputs.push(left.clone());
-                }
-                if !inputs.contains(&right) {
-                    inputs.push(right.clone());
-                }
-                return Some(PlanDerivedExpression::ValueCompare {
-                    left,
-                    op: op.clone(),
-                    right,
-                });
-            }
-            let right_expr = expr_by_id(program, *right)?;
-            let AstExprKind::Number(right_value) = &right_expr.kind else {
-                return None;
-            };
-            let right = right_value.parse::<FiniteReal>().ok()?;
-            let canonical_path = canonical_sibling_path(derived_path, &left_path);
-            let left = index.resolve(&canonical_path)?;
-            if !inputs.contains(&left) {
-                inputs.push(left.clone());
-            }
-            Some(PlanDerivedExpression::NumberCompareConst {
-                left,
-                op: op.clone(),
-                right,
-            })
-        }
-        _ => None,
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LoweredRowValue {
-    Scalar(PlanRowExpression),
-    ListMapItem {
-        binding: String,
-        list_id: Option<ListId>,
-    },
-    CurrentRow {
-        list_id: ListId,
-    },
-    ListRow {
-        list_id: ListId,
-        index: PlanRowExpression,
-    },
-    ListFindRow {
-        list_id: ListId,
-        field: FieldId,
-        value: PlanRowExpression,
-    },
-}
-
-const ROW_PREVIOUS_BINDING: &str = "$boon$row_previous";
-
-fn row_expression_for_value(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-) -> Option<PlanDerivedExpression> {
-    if !matches!(
-        derived.kind,
-        DerivedValueKind::Pure | DerivedValueKind::ListView
-    ) {
-        return None;
-    }
-    let mut local_constants = constants.clone();
-    let mut local_inputs = inputs.clone();
-    let mut env = BTreeMap::new();
-    if let Some(scope) = derived
-        .scope_id
-        .and_then(|scope_id| program.row_scopes.iter().find(|scope| scope.id == scope_id))
-        && let Some(list) = program
-            .lists
-            .iter()
-            .find(|list| list.row_scope_id == Some(scope.id))
-    {
-        env.insert(
-            scope.row_scope.clone(),
-            LoweredRowValue::CurrentRow {
-                list_id: plan_list_id(list.id),
-            },
-        );
-    }
-    let expr_value_types = expression_value_type_lookup(program);
-    let value = lower_row_statement_value(
-        program,
-        derived,
-        index,
-        &mut local_constants,
-        &mut local_inputs,
-        &mut env,
-        &expr_value_types,
-        &derived.statement,
-    )?;
-    let LoweredRowValue::Scalar(expression) = value else {
-        return None;
-    };
-    *constants = local_constants;
-    *inputs = local_inputs;
-    Some(PlanDerivedExpression::RowExpression { expression })
-}
-
-fn lower_row_expr(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    expr_id: usize,
-) -> Option<LoweredRowValue> {
-    let expr = expr_by_id(program, expr_id)?;
-    if let Some(value_ref) = index.resolve_distributed_expression(expr_id) {
-        if !inputs.contains(&value_ref) {
-            inputs.push(value_ref.clone());
-        }
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::Field {
-            input: value_ref,
-        }));
-    }
-    if let AstExprKind::Call { function, .. } = &expr.kind
-        && matches!(function.as_str(), "List/find" | "List/find_value")
-        && let Some(statement) = statement_for_expression(program, expr_id)
-        && statement
-            .children
-            .iter()
-            .any(|child| row_statement_named_field(child).is_some())
-        && let Some(value) = lower_row_list_find_statement(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            function,
-            statement,
-        )
-    {
-        return Some(value);
-    }
-    if matches!(&expr.kind, AstExprKind::Call { args, .. } if args.is_empty())
-        && let Some(statement) = statement_for_expression(program, expr_id)
-        && statement
-            .children
-            .iter()
-            .any(|child| row_statement_named_field(child).is_some())
-        && let Some(value) = lower_row_call_statement_with_field_args(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            statement,
-            expr_id,
-        )
-    {
-        return Some(value);
-    }
-    if let AstExprKind::Call { function, args } = &expr.kind
-        && args.is_empty()
-        && let Some(intrinsic) = session_info_intrinsic(function)
-    {
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::Intrinsic {
-            intrinsic,
-        }));
-    }
-    match &expr.kind {
-        AstExprKind::Delimiter => env.get(ROW_PREVIOUS_BINDING).cloned(),
-        AstExprKind::Drain { .. } => env.get(&migration_drain_environment_key(expr_id)).cloned(),
-        AstExprKind::Identifier(name) => env
-            .get(name)
+        let expression = self
+            .program
+            .executable
+            .expressions
+            .get(root.as_usize())
             .cloned()
-            .or_else(|| {
-                row_field_expression(program, derived, index, inputs, name)
-                    .map(LoweredRowValue::Scalar)
-            })
-            .or_else(|| unbound_identifier_literal(constants, inputs, name)),
-        AstExprKind::Path(parts) if parts.len() == 1 => {
-            let name = parts.first()?;
-            env.get(name)
-                .cloned()
-                .or_else(|| {
-                    row_field_expression(program, derived, index, inputs, name)
-                        .map(LoweredRowValue::Scalar)
-                })
-                .or_else(|| unbound_identifier_literal(constants, inputs, name))
+            .ok_or_else(|| {
+                PlanError::new(format!("executable expression {} is missing", root.0))
+            })?;
+        if let Some(value) = self.index.resolve_distributed_expression(root) {
+            return Ok(self.value_ref(value));
         }
-        AstExprKind::Path(parts) if parts.len() == 2 => {
-            let path = boon_parser::canonical_value_path(parts);
-            if let Some(value) = env.get(&path).cloned() {
-                return Some(value);
+        let owner = expression
+            .owner
+            .map(|owner| PlanStaticOwnerId(owner.as_usize()))
+            .or(inherited_owner);
+        let value = match expression.kind {
+            ir::ExecutableExpressionKind::CanonicalRead {
+                target,
+                storage_binding,
+                path,
+                projection,
+            } => self.lower_read(storage_binding, Some(target), &path, &projection)?,
+            ir::ExecutableExpressionKind::ExternalRead { canonical_path } => {
+                self.lower_read(None, None, &canonical_path, &[])?
             }
-            if let Some(value) = env.get(&parts[0]).cloned() {
-                return match value {
-                    LoweredRowValue::CurrentRow { list_id } => {
-                        let field = row_input_field_id_for_list_id(program, list_id, &parts[1])?;
-                        let input = ValueRef::Field(field);
-                        if !inputs.contains(&input) {
-                            inputs.push(input.clone());
-                        }
-                        Some(LoweredRowValue::Scalar(PlanRowExpression::Field { input }))
-                    }
-                    LoweredRowValue::ListRow { list_id, index } => {
-                        let field = row_field_id_for_list_id(program, list_id, &parts[1])?;
-                        Some(LoweredRowValue::Scalar(PlanRowExpression::ListGetField {
-                            list_id,
-                            index: Box::new(index),
-                            field,
-                        }))
-                    }
-                    LoweredRowValue::ListFindRow {
+            ir::ExecutableExpressionKind::Drain {
+                target,
+                storage_binding,
+                path,
+                projection,
+            } => self.lower_read(storage_binding, Some(target), &path, &projection)?,
+            ir::ExecutableExpressionKind::Text(value) => {
+                self.constant(PlanConstantValue::Text { value })
+            }
+            ir::ExecutableExpressionKind::Number(value) => {
+                self.constant(PlanConstantValue::Number {
+                    value: value.parse().map_err(|error| {
+                        PlanError::new(format!(
+                            "executable Number `{value}` is not finite: {error}"
+                        ))
+                    })?,
+                })
+            }
+            ir::ExecutableExpressionKind::BytesByte(value) => self.bytes_constant(vec![value]),
+            ir::ExecutableExpressionKind::Bool(value) => {
+                self.constant(PlanConstantValue::Bool { value })
+            }
+            ir::ExecutableExpressionKind::Tag(value) => {
+                self.constant(PlanConstantValue::Enum { value })
+            }
+            ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
+                PlanRowExpression::TaggedObject {
+                    tag,
+                    fields: self.lower_fields(fields, owner)?,
+                }
+            }
+            ir::ExecutableExpressionKind::Source { .. } => {
+                let source = self
+                    .program
+                    .executable
+                    .sources
+                    .iter()
+                    .find(|source| source.expression == root)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "SOURCE executable expression {} has no ExecutableSourceId",
+                            root.0
+                        ))
+                    })?;
+                let value = self
+                    .index
+                    .resolve_executable_source(source.id)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "executable source {} (`{}`) has no unique typed SourceId",
+                            source.id, source.binding_path
+                        ))
+                    })?;
+                self.value_ref(value)
+            }
+            ir::ExecutableExpressionKind::Call {
+                callable_kind: _,
+                name,
+                arguments,
+            } => self.lower_call(&name, arguments, owner)?,
+            ir::ExecutableExpressionKind::Materialize { materialization } => {
+                let materialization = self
+                    .program
+                    .materializations
+                    .get(materialization)
+                    .cloned()
+                    .ok_or_else(|| PlanError::new("executable materialization is missing"))?;
+                let source = self
+                    .lower_scoped(materialization.source, owner)
+                    .map_err(|error| {
+                        PlanError::new(format!(
+                            "contextual {:?} owner {} source failed: {error}",
+                            materialization.operation,
+                            materialization.owner.as_usize()
+                        ))
+                    })?;
+                let body = self
+                    .lower_scoped(
+                        materialization.body,
+                        Some(PlanStaticOwnerId(materialization.owner.as_usize())),
+                    )
+                    .map_err(|error| {
+                        PlanError::new(format!(
+                            "contextual {:?} owner {} body failed: {error}",
+                            materialization.operation,
+                            materialization.owner.as_usize()
+                        ))
+                    })?;
+                let index_lookup = self.contextual_index_lookup(&materialization, &source, &body);
+                PlanRowExpression::ContextualCollection {
+                    owner: PlanStaticOwnerId(materialization.owner.as_usize()),
+                    operation: plan_contextual_operation(materialization.operation),
+                    source: Box::new(source),
+                    row_local: PlanLocalId(materialization.row_local.0 as usize),
+                    body: Box::new(body),
+                    index_lookup,
+                }
+            }
+            ir::ExecutableExpressionKind::Draining { input } => self.lower_scoped(input, owner)?,
+            ir::ExecutableExpressionKind::Hold { .. } => {
+                let state = self
+                    .program
+                    .executable
+                    .states
+                    .iter()
+                    .find(|state| state.expression == root)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "HOLD executable expression {} has no ExecutableStateId",
+                            root.0
+                        ))
+                    })?;
+                let value = self
+                    .index
+                    .resolve_executable_state(state.id)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "executable state {} (`{}`) has no unique typed StateId",
+                            state.id, state.binding_path
+                        ))
+                    })?;
+                self.value_ref(value)
+            }
+            ir::ExecutableExpressionKind::Latest { branches } => {
+                let [branch] = branches.as_slice() else {
+                    return Err(PlanError::new(
+                        "temporal LATEST reached pure executable value lowering",
+                    ));
+                };
+                self.lower_scoped(*branch, owner)?
+            }
+            ir::ExecutableExpressionKind::When { input, arms } => PlanRowExpression::Select {
+                input: Box::new(self.lower_scoped(input, owner)?),
+                arms: arms
+                    .into_iter()
+                    .map(|arm| {
+                        Ok(PlanRowSelectArm {
+                            pattern: executable_select_pattern(&arm.pattern)?,
+                            value: self.lower_scoped(arm.output, owner)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?,
+            },
+            ir::ExecutableExpressionKind::Then { input, output } => {
+                self.lower_scoped(output.unwrap_or(input), owner)?
+            }
+            ir::ExecutableExpressionKind::Infix { left, op, right } => {
+                PlanRowExpression::NumberInfix {
+                    op,
+                    left: Box::new(self.lower_scoped(left, owner)?),
+                    right: Box::new(self.lower_scoped(right, owner)?),
+                }
+            }
+            ir::ExecutableExpressionKind::MatchArm { output, .. } => self.lower_scoped(
+                output.ok_or_else(|| PlanError::new("match arm has no output"))?,
+                owner,
+            )?,
+            ir::ExecutableExpressionKind::Object(fields)
+            | ir::ExecutableExpressionKind::Record(fields) => PlanRowExpression::Object {
+                fields: self.lower_fields(fields, owner)?,
+            },
+            ir::ExecutableExpressionKind::List { items, .. } => PlanRowExpression::ListLiteral {
+                items: items
+                    .into_iter()
+                    .map(|item| self.lower_scoped(item, owner))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            ir::ExecutableExpressionKind::Bytes { .. } => {
+                self.bytes_constant(executable_static_bytes(self.program, root).ok_or_else(
+                    || PlanError::new("dynamic BYTES literal is not a closed scalar"),
+                )?)
+            }
+            ir::ExecutableExpressionKind::Delimiter => {
+                let parents = self
+                    .program
+                    .executable
+                    .expressions
+                    .iter()
+                    .filter(|expression| {
+                        ir::executable_expression_children(&expression.kind).contains(&root)
+                    })
+                    .map(|expression| {
+                        (
+                            expression.id.0,
+                            expression.checked_expr_id.0,
+                            expression.kind.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                return Err(PlanError::new(format!(
+                    "pipeline delimiter executable expression {} (checked {}) survived expansion under parent(s) {:?}",
+                    root.0, expression.checked_expr_id.0, parents
+                )));
+            }
+            ir::ExecutableExpressionKind::Project { input, fields } => {
+                let mut value = self.lower_scoped(input, owner)?;
+                for field in fields {
+                    value = PlanRowExpression::ObjectField {
+                        object: Box::new(value),
+                        field,
+                    };
+                }
+                value
+            }
+            ir::ExecutableExpressionKind::MaterializationLocal {
+                owner: local_owner,
+                local,
+                projection,
+            } => {
+                let local_row = PlanRowExpression::LocalRow {
+                    owner: PlanStaticOwnerId(local_owner.as_usize()),
+                    local: PlanLocalId(local.0 as usize),
+                };
+                let source_list = self
+                    .program
+                    .materializations
+                    .iter()
+                    .find(|materialization| {
+                        materialization.owner == local_owner && materialization.row_local == local
+                    })
+                    .and_then(|materialization| materialization.source_list_id)
+                    .map(plan_list_id);
+                if projection.is_empty() && source_list.is_some() {
+                    local_row
+                } else if let (Some(list_id), Some(ValueRef::Field(field))) = (
+                    source_list,
+                    self.materialization_local_value_ref(local_owner, local, &projection),
+                ) {
+                    PlanRowExpression::ListRowField {
+                        row: Box::new(local_row),
                         list_id,
                         field,
-                        value,
-                    } => {
-                        let target = row_field_id_for_list_id(program, list_id, &parts[1])?;
-                        Some(LoweredRowValue::Scalar(PlanRowExpression::ListFindValue {
-                            list_id,
-                            field,
-                            value: Box::new(value),
-                            target,
-                            fallback: None,
-                        }))
                     }
-                    LoweredRowValue::ListMapItem { binding, list_id } => {
-                        let row = PlanRowExpression::ListMapItem { binding };
-                        if let Some(list_id) = list_id {
-                            let field = row_field_id_for_list_id(program, list_id, &parts[1])
-                                .or_else(|| {
-                                    row_input_field_id_for_list_id(program, list_id, &parts[1])
-                                })?;
-                            Some(LoweredRowValue::Scalar(PlanRowExpression::ListRowField {
-                                row: Box::new(row),
-                                list_id,
-                                field,
-                            }))
-                        } else {
-                            Some(LoweredRowValue::Scalar(PlanRowExpression::ObjectField {
-                                object: Box::new(row),
-                                field: parts[1].clone(),
-                            }))
-                        }
+                } else {
+                    PlanRowExpression::Local {
+                        owner: PlanStaticOwnerId(local_owner.as_usize()),
+                        local: PlanLocalId(local.0 as usize),
+                        projection,
                     }
-                    LoweredRowValue::Scalar(object) => {
-                        Some(LoweredRowValue::Scalar(PlanRowExpression::ObjectField {
-                            object: Box::new(object),
-                            field: parts[1].clone(),
-                        }))
-                    }
+                }
+            }
+            ir::ExecutableExpressionKind::FunctionParameter {
+                parameter,
+                projection,
+            } => {
+                let mut value = self
+                    .parameter_bindings
+                    .get(&parameter)
+                    .cloned()
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "executable function parameter {}:{} has no lowering binding",
+                            parameter.function.0, parameter.ordinal
+                        ))
+                    })?;
+                for field in projection {
+                    value = PlanRowExpression::ObjectField {
+                        object: Box::new(value),
+                        field,
+                    };
+                }
+                value
+            }
+        };
+        self.memo.insert(key, value.clone());
+        Ok(value)
+    }
+
+    fn lower_read(
+        &mut self,
+        storage_binding: Option<ir::StorageBindingId>,
+        declaration: Option<boon_typecheck::DeclId>,
+        path: &str,
+        projection: &[String],
+    ) -> Result<PlanRowExpression, PlanError> {
+        let projected =
+            (!projection.is_empty()).then(|| format!("{path}.{}", projection.join(".")));
+        if let Some(value) = self.source_context.as_ref().and_then(|context| {
+            resolve_update_value_ref(
+                self.index,
+                &context.source,
+                &context.target,
+                context.indexed,
+                projected.as_deref().unwrap_or(path),
+            )
+        }) {
+            return Ok(self.value_ref(value));
+        }
+        if let Some(storage_binding) = storage_binding {
+            let value = self
+                .index
+                .resolve_storage(storage_binding)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "storage binding {storage_binding} for checked declaration {:?} (`{path}`) has no machine value",
+                        declaration.map(|declaration| declaration.0)
+                    ))
+                })?;
+            let mut value = self.value_ref(value);
+            for field in projection {
+                value = PlanRowExpression::ObjectField {
+                    object: Box::new(value),
+                    field: field.clone(),
                 };
             }
-            let object = (|| {
-                let (parent, _) = derived.path.rsplit_once('.')?;
-                let (grandparent, _) = parent.rsplit_once('.')?;
-                let candidate = format!("{grandparent}.{}", parts[0]);
-                row_field_expression(program, derived, index, inputs, &candidate)
-            })()
-            .or_else(|| row_field_expression(program, derived, index, inputs, &parts[0]));
-            if let Some(object) = object {
-                return Some(LoweredRowValue::Scalar(PlanRowExpression::ObjectField {
-                    object: Box::new(object),
-                    field: parts[1].clone(),
-                }));
-            }
-            row_field_expression(program, derived, index, inputs, &path)
-                .map(LoweredRowValue::Scalar)
+            return Ok(value);
         }
-        AstExprKind::Path(parts) if parts.len() > 2 => {
-            let path = boon_parser::canonical_value_path(parts);
-            if let Some(value) = env.get(&path).cloned() {
-                return Some(value);
-            }
-            if let Some(value) = row_field_expression(program, derived, index, inputs, &path) {
-                return Some(LoweredRowValue::Scalar(value));
-            }
-            let mut value = env.get(parts.first()?)?.clone();
-            for field in &parts[1..] {
-                value = lower_row_value_field(program, inputs, value, field)?;
-            }
-            Some(value)
+        if let Some(declaration) = declaration {
+            return Err(PlanError::new(format!(
+                "checked declaration {} (`{path}`) reached machine lowering without an exact storage binding",
+                declaration.0
+            )));
         }
-        AstExprKind::Path(parts) => {
-            let path = boon_parser::canonical_value_path(parts);
-            env.get(&path).cloned().or_else(|| {
-                row_field_expression(program, derived, index, inputs, &path)
-                    .map(LoweredRowValue::Scalar)
-            })
-        }
-        AstExprKind::When { input } => lower_inline_row_select(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            expr,
-            *input,
-        ),
-        AstExprKind::Number(value) => {
-            let value = plan_number_constant(value)?;
-            Some(LoweredRowValue::Scalar(row_constant_expression(
-                constants, inputs, value,
-            )))
-        }
-        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
-            Some(LoweredRowValue::Scalar(row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Text {
-                    value: value.clone(),
-                },
-            )))
-        }
-        AstExprKind::Bool(value) => Some(LoweredRowValue::Scalar(row_constant_expression(
-            constants,
-            inputs,
-            PlanConstantValue::Bool { value: *value },
-        ))),
-        AstExprKind::ByteLiteral { value, .. } => Some(LoweredRowValue::Scalar(
-            row_bytes_constant_expression(constants, inputs, vec![*value]),
-        )),
-        AstExprKind::BytesLiteral { size: _, items } => {
-            let bytes = row_static_bytes_literal(program, items)?;
-            Some(LoweredRowValue::Scalar(row_bytes_constant_expression(
-                constants, inputs, bytes,
-            )))
-        }
-        AstExprKind::Enum(value) | AstExprKind::Tag(value) => {
-            Some(LoweredRowValue::Scalar(row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Enum {
-                    value: value.clone(),
-                },
-            )))
-        }
-        AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
-            let mut object_fields = Vec::with_capacity(fields.len());
-            for field in fields {
-                if field.spread {
-                    return None;
-                }
-                let value = lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    field.value,
-                )
-                .and_then(lowered_scalar)?;
-                object_fields.push(PlanRowObjectField {
-                    name: field.name.clone(),
-                    value,
-                });
-            }
-            Some(LoweredRowValue::Scalar(PlanRowExpression::Object {
-                fields: object_fields,
-            }))
-        }
-        AstExprKind::TaggedObject { tag, fields } => {
-            let mut object_fields = Vec::with_capacity(fields.len());
-            for field in fields {
-                if field.spread {
-                    return None;
-                }
-                let value = lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    field.value,
-                )
-                .and_then(lowered_scalar)?;
-                object_fields.push(PlanRowObjectField {
-                    name: field.name.clone(),
-                    value,
-                });
-            }
-            Some(LoweredRowValue::Scalar(PlanRowExpression::TaggedObject {
-                tag: tag.clone(),
-                fields: object_fields,
-            }))
-        }
-        AstExprKind::ListLiteral { items, .. } => {
-            let mut lowered_items = Vec::with_capacity(items.len());
-            for item in items {
-                lowered_items.push(
-                    lower_row_expr(
-                        program,
-                        derived,
-                        index,
-                        constants,
-                        inputs,
-                        env,
-                        expr_value_types,
-                        *item,
-                    )
-                    .and_then(lowered_scalar)?,
-                );
-            }
-            Some(LoweredRowValue::Scalar(PlanRowExpression::ListLiteral {
-                items: lowered_items,
-            }))
-        }
-        AstExprKind::Infix { left, op, right } if op == "+" => {
-            let left_expr_id = *left;
-            let right_expr_id = *right;
-            let expression_value_type =
-                inferred_expression_value_type(program, expr_id, expr_value_types);
-            let left = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                *left,
-            )?;
-            let right = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                *right,
-            )?;
-            let left_value_type =
-                lowered_row_value_type(program, index, constants, &left).or_else(|| {
-                    inferred_expression_value_type(program, left_expr_id, expr_value_types)
-                });
-            let right_value_type = lowered_row_value_type(program, index, constants, &right)
-                .or_else(|| {
-                    inferred_expression_value_type(program, right_expr_id, expr_value_types)
-                });
-            match (expression_value_type, left_value_type, right_value_type) {
-                (_, Some(PlanValueType::Number), Some(PlanValueType::Number)) => {
-                    Some(LoweredRowValue::Scalar(PlanRowExpression::NumberInfix {
-                        op: op.clone(),
-                        left: Box::new(lowered_scalar(left)?),
-                        right: Box::new(lowered_scalar(right)?),
-                    }))
-                }
-                (Some(PlanValueType::Text), _, _)
-                | (_, Some(PlanValueType::Text), _)
-                | (_, _, Some(PlanValueType::Text)) => {
-                    Some(LoweredRowValue::Scalar(PlanRowExpression::TextConcat {
-                        parts: vec![lowered_scalar(left)?, lowered_scalar(right)?],
-                    }))
-                }
-                (Some(PlanValueType::Number), _, _) => {
-                    Some(LoweredRowValue::Scalar(PlanRowExpression::NumberInfix {
-                        op: op.clone(),
-                        left: Box::new(lowered_scalar(left)?),
-                        right: Box::new(lowered_scalar(right)?),
-                    }))
-                }
-                _ => Some(LoweredRowValue::Scalar(PlanRowExpression::NumberInfix {
-                    op: op.clone(),
-                    left: Box::new(lowered_scalar(left)?),
-                    right: Box::new(lowered_scalar(right)?),
-                })),
-            }
-        }
-        AstExprKind::Infix { left, op, right }
-            if matches!(
-                op.as_str(),
-                "%" | "/" | "-" | "*" | ">" | ">=" | "<" | "<=" | "==" | "!="
-            ) =>
+        if let Some(value) = projected
+            .as_deref()
+            .and_then(|projected| self.index.resolve(projected))
         {
-            let left = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                *left,
-            )?;
-            let right = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                *right,
-            )?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::NumberInfix {
-                op: op.clone(),
-                left: Box::new(lowered_scalar(left)?),
-                right: Box::new(lowered_scalar(right)?),
-            }))
+            return Ok(self.value_ref(value));
         }
-        AstExprKind::Call { function, args } if function == "List/get" => lower_row_list_get(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            args,
-        ),
-        AstExprKind::Call { function, args } if row_list_builtin(function) => {
-            lower_row_list_builtin(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                function,
-                None,
-                args,
-            )
+        let value = self
+            .source_context
+            .as_ref()
+            .and_then(|context| {
+                resolve_update_value_ref(
+                    self.index,
+                    &context.source,
+                    &context.target,
+                    context.indexed,
+                    path,
+                )
+            })
+            .or_else(|| self.index.resolve(path))
+            .ok_or_else(|| {
+                PlanError::new(format!("executable read `{path}` has no typed ValueRef"))
+            })?;
+        let mut value = self.value_ref(value);
+        for field in projection {
+            value = PlanRowExpression::ObjectField {
+                object: Box::new(value),
+                field: field.clone(),
+            };
         }
-        AstExprKind::Call { function, args } if row_text_builtin(function) => {
-            lower_row_text_builtin(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                function,
-                None,
-                args,
-            )
-        }
-        AstExprKind::Call { function, args } if row_generic_builtin(function) => {
-            lower_row_builtin_call(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                function,
-                None,
-                args,
-            )
-        }
-        AstExprKind::Call { function, args } => lower_row_function_call(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            function,
-            args,
-        ),
-        AstExprKind::Pipe { input, op, args } if op == "List/get" => {
-            let mut call_args = Vec::with_capacity(args.len() + 1);
-            call_args.push(AstCallArg {
-                name: None,
-                value: *input,
-                start: expr.start,
-                end: expr.end,
-            });
-            call_args.extend(args.iter().cloned());
-            lower_row_list_get(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                &call_args,
-            )
-        }
-        AstExprKind::Pipe { input, op, args } if row_list_builtin(op) => lower_row_list_builtin(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            op,
-            Some(*input),
-            args,
-        ),
-        AstExprKind::Pipe { input, op, args } if row_text_builtin(op) => lower_row_text_builtin(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            op,
-            Some(*input),
-            args,
-        ),
-        AstExprKind::Pipe { input, op, args } if row_generic_builtin(op) => lower_row_builtin_call(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            op,
-            Some(*input),
-            args,
-        ),
-        AstExprKind::Pipe { input, op, args } => {
-            let mut call_args = Vec::with_capacity(args.len() + 1);
-            call_args.push(AstCallArg {
-                name: None,
-                value: *input,
-                start: expr.start,
-                end: expr.end,
-            });
-            call_args.extend(args.iter().cloned());
-            lower_row_function_call(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                op,
-                &call_args,
-            )
-        }
-        _ => None,
+        Ok(value)
     }
-}
 
-fn lower_row_value_field(
-    program: &TypedProgram,
-    inputs: &mut Vec<ValueRef>,
-    value: LoweredRowValue,
-    field_name: &str,
-) -> Option<LoweredRowValue> {
-    match value {
-        LoweredRowValue::CurrentRow { list_id } => {
-            let field = row_input_field_id_for_list_id(program, list_id, field_name)?;
-            let input = ValueRef::Field(field);
-            if !inputs.contains(&input) {
-                inputs.push(input.clone());
+    fn materialization_local_value_ref(
+        &self,
+        owner: ir::StaticOwnerId,
+        local: ir::MaterializationLocalId,
+        projection: &[String],
+    ) -> Option<ValueRef> {
+        if projection.is_empty() {
+            return None;
+        }
+        let materialization = self
+            .program
+            .materializations
+            .iter()
+            .find(|materialization| {
+                materialization.owner == owner && materialization.row_local == local
+            })?;
+        let list_id = materialization.source_list_id?;
+        let list = self
+            .program
+            .lists
+            .get(list_id.as_usize())
+            .filter(|list| list.id == list_id)?;
+        self.index
+            .resolve(&format!("{}.{}", list.name, projection.join(".")))
+    }
+
+    fn contextual_index_lookup(
+        &self,
+        materialization: &ir::ContextualMaterialization,
+        source: &PlanRowExpression,
+        body: &PlanRowExpression,
+    ) -> Option<PlanContextualIndexLookup> {
+        if !matches!(
+            materialization.operation,
+            ir::ContextualOperationKind::Filter
+                | ir::ContextualOperationKind::Retain
+                | ir::ContextualOperationKind::Any
+                | ir::ContextualOperationKind::Find
+        ) {
+            return None;
+        }
+        let list_id = plan_list_id(materialization.source_list_id?);
+        if !matches!(source, PlanRowExpression::ListRef { list_id: source } if *source == list_id) {
+            return None;
+        }
+        let PlanRowExpression::NumberInfix { op, left, right } = body else {
+            return None;
+        };
+        if op != "==" {
+            return None;
+        }
+        let owner = PlanStaticOwnerId(materialization.owner.as_usize());
+        let local = PlanLocalId(materialization.row_local.0 as usize);
+        let indexed_operand = |candidate: &PlanRowExpression,
+                               value: &PlanRowExpression|
+         -> Option<PlanContextualIndexLookup> {
+            let PlanRowExpression::ListRowField {
+                row,
+                list_id: candidate_list,
+                field,
+            } = candidate
+            else {
+                return None;
+            };
+            if *candidate_list != list_id
+                || !matches!(
+                    row.as_ref(),
+                    PlanRowExpression::LocalRow {
+                        owner: candidate_owner,
+                        local: candidate_local,
+                    } if *candidate_owner == owner && *candidate_local == local
+                )
+                || value.references_contextual_local(owner, local)
+            {
+                return None;
             }
-            Some(LoweredRowValue::Scalar(PlanRowExpression::Field { input }))
-        }
-        LoweredRowValue::ListRow { list_id, index } => {
-            let field = row_field_id_for_list_id(program, list_id, field_name)?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::ListGetField {
+            Some(PlanContextualIndexLookup {
                 list_id,
-                index: Box::new(index),
-                field,
-            }))
+                field: *field,
+                value: Box::new(value.clone()),
+            })
+        };
+        indexed_operand(left, right).or_else(|| indexed_operand(right, left))
+    }
+
+    fn value_ref(&mut self, value: ValueRef) -> PlanRowExpression {
+        let value = match value {
+            ValueRef::Field(field_id) if !field_has_derived_computation(self.program, field_id) => {
+                list_id_for_semantic_list_memory_field(self.program, field_id)
+                    .map(ValueRef::List)
+                    .unwrap_or(ValueRef::Field(field_id))
+            }
+            value => value,
+        };
+        if !self.inputs.contains(&value) {
+            self.inputs.push(value.clone());
         }
-        LoweredRowValue::ListFindRow {
-            list_id,
-            field,
-            value,
-        } => {
-            let target = row_field_id_for_list_id(program, list_id, field_name)?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::ListFindValue {
-                list_id,
-                field,
-                value: Box::new(value),
-                target,
-                fallback: None,
-            }))
+        match value {
+            ValueRef::List(list_id) => PlanRowExpression::ListRef { list_id },
+            input => PlanRowExpression::Field { input },
         }
-        LoweredRowValue::ListMapItem { binding, list_id } => {
-            let row = PlanRowExpression::ListMapItem { binding };
-            let expression = if let Some(list_id) = list_id {
-                let field = row_field_id_for_list_id(program, list_id, field_name)
-                    .or_else(|| row_input_field_id_for_list_id(program, list_id, field_name))?;
-                PlanRowExpression::ListRowField {
-                    row: Box::new(row),
-                    list_id,
-                    field,
+    }
+
+    fn constant(&mut self, value: PlanConstantValue) -> PlanRowExpression {
+        row_constant_expression(self.constants, self.inputs, value)
+    }
+
+    fn bytes_constant(&mut self, bytes: Vec<u8>) -> PlanRowExpression {
+        row_bytes_constant_expression(self.constants, self.inputs, bytes)
+    }
+
+    fn lower_fields(
+        &mut self,
+        fields: Vec<ir::ExecutableRecordField>,
+        owner: Option<PlanStaticOwnerId>,
+    ) -> Result<Vec<PlanRowObjectField>, PlanError> {
+        fields
+            .into_iter()
+            .map(|field| {
+                Ok(PlanRowObjectField {
+                    name: field.name,
+                    value: self.lower_scoped(field.value, owner)?,
+                    spread: field.spread,
+                })
+            })
+            .collect()
+    }
+
+    fn lower_call(
+        &mut self,
+        function: &str,
+        arguments: Vec<ir::ExecutableCallArgument>,
+        owner: Option<PlanStaticOwnerId>,
+    ) -> Result<PlanRowExpression, PlanError> {
+        if let Some(intrinsic) = session_info_intrinsic(function) {
+            return Ok(PlanRowExpression::Intrinsic { intrinsic });
+        }
+        let mut input = None;
+        let mut args = Vec::new();
+        for argument in arguments {
+            let value = if row_builtin_arg_expects_symbol(function, Some(&argument.name)) {
+                match &self.program.executable.expressions[argument.value.as_usize()].kind {
+                    ir::ExecutableExpressionKind::Tag(value)
+                    | ir::ExecutableExpressionKind::Text(value) => {
+                        self.constant(PlanConstantValue::Text {
+                            value: value.clone(),
+                        })
+                    }
+                    _ => self.lower_scoped(argument.value, owner).map_err(|error| {
+                        PlanError::new(format!(
+                            "call `{function}` argument `{}` failed: {error}",
+                            argument.name
+                        ))
+                    })?,
                 }
             } else {
-                PlanRowExpression::ObjectField {
-                    object: Box::new(row),
-                    field: field_name.to_owned(),
-                }
+                self.lower_scoped(argument.value, owner).map_err(|error| {
+                    PlanError::new(format!(
+                        "call `{function}` argument `{}` failed: {error}",
+                        argument.name
+                    ))
+                })?
             };
-            Some(LoweredRowValue::Scalar(expression))
-        }
-        LoweredRowValue::Scalar(object) => {
-            Some(LoweredRowValue::Scalar(PlanRowExpression::ObjectField {
-                object: Box::new(object),
-                field: field_name.to_owned(),
-            }))
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lower_inline_row_select(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    select: &AstExpr,
-    input: usize,
-) -> Option<LoweredRowValue> {
-    let input = lower_row_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        input,
-    )
-    .and_then(lowered_scalar)?;
-    let candidates = program
-        .expressions
-        .iter()
-        .filter(|candidate| {
-            candidate.start >= select.start
-                && candidate.end <= select.end
-                && matches!(candidate.kind, AstExprKind::MatchArm { .. })
-        })
-        .collect::<Vec<_>>();
-    let mut direct = candidates
-        .iter()
-        .copied()
-        .filter(|candidate| {
-            !candidates.iter().any(|parent| {
-                parent.id != candidate.id
-                    && parent.start <= candidate.start
-                    && candidate.end <= parent.end
-            })
-        })
-        .collect::<Vec<_>>();
-    direct.sort_by_key(|arm| arm.start);
-    let mut arms = Vec::new();
-    for arm in direct {
-        let AstExprKind::MatchArm { pattern, output } = &arm.kind else {
-            continue;
-        };
-        let output = (*output)?;
-        let (pattern, binding) = row_select_pattern_and_binding(pattern)?;
-        let mut arm_env = env.clone();
-        if let Some(binding) = binding {
-            arm_env.insert(binding, LoweredRowValue::Scalar(input.clone()));
-        }
-        let value = lower_row_expr(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            &mut arm_env,
-            expr_value_types,
-            output,
-        )
-        .and_then(lowered_scalar)?;
-        arms.push(PlanRowSelectArm { pattern, value });
-    }
-    (!arms.is_empty()).then_some(LoweredRowValue::Scalar(PlanRowExpression::Select {
-        input: Box::new(input),
-        arms,
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lower_row_when_statement(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    statement: &AstStatement,
-    expr_id: usize,
-) -> Option<LoweredRowValue> {
-    let expr = expr_by_id(program, expr_id)?;
-    let AstExprKind::When { input } = expr.kind else {
-        return None;
-    };
-    if statement.children.is_empty() {
-        return None;
-    }
-    let input = lower_row_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        input,
-    )
-    .and_then(lowered_scalar)?;
-    let mut arms = Vec::new();
-    for child in &statement.children {
-        let Some(child_expr) = child.expr else {
-            continue;
-        };
-        let arm = expr_by_id(program, child_expr)?;
-        let AstExprKind::MatchArm { pattern, output } = &arm.kind else {
-            continue;
-        };
-        let (pattern, binding) = row_select_pattern_and_binding(pattern)?;
-        let mut arm_env = env.clone();
-        if let Some(binding) = binding {
-            arm_env.insert(binding, LoweredRowValue::Scalar(input.clone()));
-        }
-        let (mut output, continuation_start) = if let Some(output) = *output {
-            (
-                lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    &mut arm_env,
-                    expr_value_types,
-                    output,
-                )?,
-                0,
-            )
-        } else {
-            let first = child.children.first()?;
-            (
-                lower_row_statement_value(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    &mut arm_env,
-                    expr_value_types,
-                    first,
-                )?,
-                1,
-            )
-        };
-        for continuation in child.children.iter().skip(continuation_start) {
-            if row_statement_is_pipeline_continuation(program, continuation) {
-                output = lower_row_pipeline_child_statement(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    &mut arm_env,
-                    expr_value_types,
-                    output,
-                    continuation,
-                )?;
+            if argument.from_pipe {
+                if input.replace(value).is_some() {
+                    return Err(PlanError::new(format!(
+                        "executable call `{function}` has multiple pipe inputs"
+                    )));
+                }
+            } else {
+                args.push(PlanRowCallArg {
+                    name: Some(argument.name),
+                    value,
+                });
             }
         }
-        let output = lowered_scalar(output)?;
-        arms.push(PlanRowSelectArm {
-            pattern,
-            value: output,
-        });
+        Ok(plan_builtin_expression(function, input, args))
     }
-    (!arms.is_empty()).then_some(LoweredRowValue::Scalar(PlanRowExpression::Select {
-        input: Box::new(input),
-        arms,
-    }))
 }
 
-fn lowered_scalar(value: LoweredRowValue) -> Option<PlanRowExpression> {
+fn plan_contextual_operation(value: ir::ContextualOperationKind) -> PlanContextualOperationKind {
     match value {
-        LoweredRowValue::Scalar(expression) => Some(expression),
-        LoweredRowValue::ListMapItem { binding, .. } => {
-            Some(PlanRowExpression::ListMapItem { binding })
-        }
-        LoweredRowValue::CurrentRow { .. }
-        | LoweredRowValue::ListRow { .. }
-        | LoweredRowValue::ListFindRow { .. } => None,
+        ir::ContextualOperationKind::Map => PlanContextualOperationKind::Map,
+        ir::ContextualOperationKind::Filter => PlanContextualOperationKind::Filter,
+        ir::ContextualOperationKind::Retain => PlanContextualOperationKind::Retain,
+        ir::ContextualOperationKind::Every => PlanContextualOperationKind::Every,
+        ir::ContextualOperationKind::Any => PlanContextualOperationKind::Any,
+        ir::ContextualOperationKind::Find => PlanContextualOperationKind::Find,
     }
 }
 
-fn row_expression_direct_list_id(expression: &PlanRowExpression) -> Option<ListId> {
-    match expression {
-        PlanRowExpression::ListRef { list_id } => Some(*list_id),
-        PlanRowExpression::ListFilterField { list_id, .. } => Some(*list_id),
-        PlanRowExpression::BuiltinCall {
-            function,
-            input: Some(input),
-            ..
-        } if matches!(
-            function.as_str(),
-            "List/retain"
-                | "List/filter_field_equal"
-                | "List/filter_field_not_equal"
-                | "List/filter_text_contains"
-        ) =>
-        {
-            row_expression_direct_list_id(input)
+fn executable_select_pattern(pattern: &[String]) -> Result<PlanRowSelectPattern, PlanError> {
+    let value = pattern
+        .iter()
+        .position(|token| token == "[")
+        .map_or_else(|| pattern.join(" "), |open| pattern[..open].join(" "));
+    Ok(match value.as_str() {
+        "__" => PlanRowSelectPattern::Wildcard,
+        "True" => PlanRowSelectPattern::Bool { value: true },
+        "False" => PlanRowSelectPattern::Bool { value: false },
+        "NaN" => PlanRowSelectPattern::NaN,
+        _ => match value.parse::<FiniteReal>() {
+            Ok(value) => PlanRowSelectPattern::Number { value },
+            Err(_) => PlanRowSelectPattern::Text { value },
+        },
+    })
+}
+
+fn executable_static_bytes(program: &ErasedProgram, root: ir::ExecutableExprId) -> Option<Vec<u8>> {
+    match &program.executable.expressions.get(root.as_usize())?.kind {
+        ir::ExecutableExpressionKind::BytesByte(value) => Some(vec![*value]),
+        ir::ExecutableExpressionKind::Bytes { items, .. } => {
+            let mut bytes = Vec::new();
+            for item in items {
+                bytes.extend(executable_static_bytes(program, *item)?);
+            }
+            Some(bytes)
         }
         _ => None,
     }
 }
 
-fn lowered_row_value_type(
-    program: &TypedProgram,
-    index: &ValueIndex,
-    constants: &[PlanConstant],
-    value: &LoweredRowValue,
-) -> Option<PlanValueType> {
-    match value {
-        LoweredRowValue::Scalar(expression) => {
-            row_expression_value_type(program, index, constants, expression)
+fn executable_value_for_statement(
+    program: &ErasedProgram,
+    statement_id: usize,
+) -> Option<ir::ExecutableExprId> {
+    program
+        .executable
+        .statements
+        .iter()
+        .find(|statement| statement.id == ir::ExecutableStatementId(statement_id))
+        .and_then(|statement| statement.value)
+}
+
+fn plan_builtin_expression(
+    function: &str,
+    input: Option<PlanRowExpression>,
+    args: Vec<PlanRowCallArg>,
+) -> PlanRowExpression {
+    let fallback_input = input.clone();
+    let named = |names: &[&str]| row_call_arg_value(&args, names);
+    match function {
+        "Text/trim" => {
+            input
+                .or_else(|| named(&["input", "text"]))
+                .map(|input| PlanRowExpression::TextTrim {
+                    input: Box::new(input),
+                })
         }
-        LoweredRowValue::ListMapItem { .. } => None,
-        LoweredRowValue::CurrentRow { .. }
-        | LoweredRowValue::ListRow { .. }
-        | LoweredRowValue::ListFindRow { .. } => None,
+        "Text/is_empty" => input.or_else(|| named(&["input", "text"])).map(|input| {
+            PlanRowExpression::TextIsEmpty {
+                input: Box::new(input),
+            }
+        }),
+        "Text/starts_with" => input
+            .or_else(|| named(&["input", "text"]))
+            .zip(named(&["prefix"]))
+            .map(|(input, prefix)| PlanRowExpression::TextStartsWith {
+                input: Box::new(input),
+                prefix: Box::new(prefix),
+            }),
+        "Text/length" => {
+            input
+                .or_else(|| named(&["input", "text"]))
+                .map(|input| PlanRowExpression::TextLength {
+                    input: Box::new(input),
+                })
+        }
+        "Text/to_number" => input.or_else(|| named(&["input", "text"])).map(|input| {
+            PlanRowExpression::TextToNumber {
+                input: Box::new(input),
+            }
+        }),
+        "Text/concat" => input
+            .or_else(|| named(&["input", "text", "left"]))
+            .zip(named(&["with", "right"]))
+            .map(|(left, right)| {
+                let mut parts = vec![left];
+                if let Some(separator) = named(&["separator"]) {
+                    parts.push(separator);
+                }
+                parts.push(right);
+                PlanRowExpression::TextConcat { parts }
+            }),
+        "Text/substring" => input
+            .or_else(|| named(&["input", "text"]))
+            .zip(named(&["start"]))
+            .zip(named(&["length"]))
+            .map(
+                |((input, start), length)| PlanRowExpression::TextSubstring {
+                    input: Box::new(input),
+                    start: Box::new(start),
+                    length: Box::new(length),
+                },
+            ),
+        "Text/to_bytes" => input.or_else(|| named(&["input", "text"])).map(|input| {
+            PlanRowExpression::TextToBytes {
+                input: Box::new(input),
+                encoding: named(&["encoding"]).map(Box::new),
+            }
+        }),
+        "Bytes/to_text" => input.or_else(|| named(&["input", "bytes"])).map(|input| {
+            PlanRowExpression::BytesToText {
+                input: Box::new(input),
+                encoding: named(&["encoding"]).map(Box::new),
+            }
+        }),
+        "Bytes/to_hex" => input.or_else(|| named(&["input", "bytes"])).map(|input| {
+            PlanRowExpression::BytesToHex {
+                input: Box::new(input),
+            }
+        }),
+        "Bytes/to_base64" => input.or_else(|| named(&["input", "bytes"])).map(|input| {
+            PlanRowExpression::BytesToBase64 {
+                input: Box::new(input),
+            }
+        }),
+        "Bytes/from_hex" => input.or_else(|| named(&["input", "text"])).map(|input| {
+            PlanRowExpression::BytesFromHex {
+                input: Box::new(input),
+            }
+        }),
+        "Bytes/from_base64" => input.or_else(|| named(&["input", "text"])).map(|input| {
+            PlanRowExpression::BytesFromBase64 {
+                input: Box::new(input),
+            }
+        }),
+        "Bytes/is_empty" => {
+            input
+                .or_else(|| named(&["input"]))
+                .map(|input| PlanRowExpression::BytesIsEmpty {
+                    input: Box::new(input),
+                })
+        }
+        "Bytes/length" => {
+            input
+                .or_else(|| named(&["input"]))
+                .map(|input| PlanRowExpression::BytesLength {
+                    input: Box::new(input),
+                })
+        }
+        "Bytes/get" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["index"]))
+            .map(|(input, index)| PlanRowExpression::BytesGet {
+                input: Box::new(input),
+                index: Box::new(index),
+            }),
+        "Bytes/slice" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["offset", "start"]))
+            .zip(named(&["byte_count", "length", "count"]))
+            .map(
+                |((input, offset), byte_count)| PlanRowExpression::BytesSlice {
+                    input: Box::new(input),
+                    offset: Box::new(offset),
+                    byte_count: Box::new(byte_count),
+                },
+            ),
+        "Bytes/take" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["byte_count", "length", "count"]))
+            .map(|(input, byte_count)| PlanRowExpression::BytesTake {
+                input: Box::new(input),
+                byte_count: Box::new(byte_count),
+            }),
+        "Bytes/drop" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["byte_count", "length", "count"]))
+            .map(|(input, byte_count)| PlanRowExpression::BytesDrop {
+                input: Box::new(input),
+                byte_count: Box::new(byte_count),
+            }),
+        "Bytes/zeros" => named(&["byte_count", "length", "count"]).map(|byte_count| {
+            PlanRowExpression::BytesZeros {
+                byte_count: Box::new(byte_count),
+            }
+        }),
+        "Bytes/set" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["index"]))
+            .zip(named(&["value"]))
+            .map(|((input, index), value)| PlanRowExpression::BytesSet {
+                input: Box::new(input),
+                index: Box::new(index),
+                value: Box::new(value),
+            }),
+        "Bytes/find" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["needle"]))
+            .map(|(input, needle)| PlanRowExpression::BytesFind {
+                input: Box::new(input),
+                needle: Box::new(needle),
+            }),
+        "Bytes/starts_with" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["prefix"]))
+            .map(|(input, prefix)| PlanRowExpression::BytesStartsWith {
+                input: Box::new(input),
+                prefix: Box::new(prefix),
+            }),
+        "Bytes/ends_with" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["suffix"]))
+            .map(|(input, suffix)| PlanRowExpression::BytesEndsWith {
+                input: Box::new(input),
+                suffix: Box::new(suffix),
+            }),
+        "Bytes/concat" => input
+            .or_else(|| named(&["left", "input"]))
+            .zip(named(&["right", "with"]))
+            .map(|(left, right)| PlanRowExpression::BytesConcat {
+                left: Box::new(left),
+                right: Box::new(right),
+            }),
+        "Bytes/equal" => input
+            .or_else(|| named(&["left", "input"]))
+            .zip(named(&["right", "with"]))
+            .map(|(left, right)| PlanRowExpression::BytesEqual {
+                left: Box::new(left),
+                right: Box::new(right),
+            }),
+        "List/range" => {
+            named(&["from"])
+                .zip(named(&["to"]))
+                .map(|(from, to)| PlanRowExpression::ListRange {
+                    from: Box::new(from),
+                    to: Box::new(to),
+                })
+        }
+        "List/sum" => {
+            input
+                .or_else(|| named(&["input", "list"]))
+                .map(|input| PlanRowExpression::ListSum {
+                    input: Box::new(input),
+                })
+        }
+        _ => None,
     }
+    .unwrap_or_else(|| PlanRowExpression::BuiltinCall {
+        function: function.to_owned(),
+        input: fallback_input.map(Box::new),
+        args,
+    })
 }
 
 fn row_expression_value_type(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
     constants: &[PlanConstant],
     expression: &PlanRowExpression,
@@ -8566,24 +7655,25 @@ fn row_expression_value_type(
         PlanRowExpression::BytesLength { .. }
         | PlanRowExpression::BytesFind { .. }
         | PlanRowExpression::BytesReadUnsigned { .. }
-        | PlanRowExpression::BytesReadSigned { .. } => Some(PlanValueType::Number),
+        | PlanRowExpression::BytesReadSigned { .. }
+        | PlanRowExpression::TextLength { .. }
+        | PlanRowExpression::TextToNumber { .. }
+        | PlanRowExpression::NumberInfix { .. }
+        | PlanRowExpression::ListSum { .. } => Some(PlanValueType::Number),
         PlanRowExpression::BytesGet { .. } => Some(PlanValueType::Bytes { fixed_len: Some(1) }),
         PlanRowExpression::BytesIsEmpty { .. }
         | PlanRowExpression::BytesStartsWith { .. }
         | PlanRowExpression::BytesEndsWith { .. }
-        | PlanRowExpression::BytesEqual { .. } => Some(PlanValueType::Bool),
-        PlanRowExpression::TextIsEmpty { .. } | PlanRowExpression::TextStartsWith { .. } => {
-            Some(PlanValueType::Bool)
-        }
-        PlanRowExpression::TextLength { .. }
-        | PlanRowExpression::TextToNumber { .. }
-        | PlanRowExpression::NumberInfix { .. }
-        | PlanRowExpression::ListSum { .. } => Some(PlanValueType::Number),
+        | PlanRowExpression::BytesEqual { .. }
+        | PlanRowExpression::TextIsEmpty { .. }
+        | PlanRowExpression::TextStartsWith { .. } => Some(PlanValueType::Bool),
         PlanRowExpression::BuiltinCall { function, .. } => match function.as_str() {
-            "Text/empty" | "Error/text" | "Router/route" => Some(PlanValueType::Text),
+            "Text/empty" | "Text/join" | "Text/to_lowercase" | "Text/to_uppercase"
+            | "Error/text" | "Router/route" => Some(PlanValueType::Text),
             "List/count" | "List/length" => Some(PlanValueType::Number),
-            "Text/all_chars_in" | "List/is_not_empty" => Some(PlanValueType::Bool),
-            "List/join_field" => Some(PlanValueType::Text),
+            "Text/all_chars_in" | "Text/contains" | "List/is_not_empty" => {
+                Some(PlanValueType::Bool)
+            }
             _ => None,
         },
         PlanRowExpression::Select { arms, .. } => {
@@ -8594,14 +7684,13 @@ fn row_expression_value_type(
             arm_types.all(|arm_type| arm_type == first).then_some(first)
         }
         PlanRowExpression::ListGetField { field, .. }
-        | PlanRowExpression::ListFindValue { target: field, .. }
         | PlanRowExpression::ListRowField { field, .. } => index.field_value_type(*field).copied(),
         PlanRowExpression::ListRef { .. }
         | PlanRowExpression::ListRange { .. }
         | PlanRowExpression::ListLiteral { .. }
-        | PlanRowExpression::ListMap { .. }
-        | PlanRowExpression::ListFilterField { .. }
-        | PlanRowExpression::ListMapItem { .. }
+        | PlanRowExpression::ContextualCollection { .. }
+        | PlanRowExpression::Local { .. }
+        | PlanRowExpression::LocalRow { .. }
         | PlanRowExpression::Object { .. }
         | PlanRowExpression::TaggedObject { .. }
         | PlanRowExpression::ObjectField { .. } => None,
@@ -8616,68 +7705,8 @@ fn session_info_intrinsic(function: &str) -> Option<PlanIntrinsic> {
     }
 }
 
-fn lower_row_number_expr(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    expr_id: usize,
-) -> Option<PlanRowExpression> {
-    let expr = expr_by_id(program, expr_id)?;
-    if let AstExprKind::ByteLiteral { value, .. } = &expr.kind {
-        return Some(row_constant_expression(
-            constants,
-            inputs,
-            PlanConstantValue::Number {
-                value: FiniteReal::new(f64::from(*value)).ok()?,
-            },
-        ));
-    }
-    if let AstExprKind::Infix { left, op, right } = &expr.kind
-        && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%")
-    {
-        return Some(PlanRowExpression::NumberInfix {
-            op: op.clone(),
-            left: Box::new(lower_row_number_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                *left,
-            )?),
-            right: Box::new(lower_row_number_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                *right,
-            )?),
-        });
-    }
-    lower_row_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        expr_id,
-    )
-    .and_then(lowered_scalar)
-}
-
 fn list_id_for_semantic_list_memory_field(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     field_id: FieldId,
 ) -> Option<ListId> {
     let field = program
@@ -8702,1868 +7731,11 @@ fn list_id_for_semantic_list_memory_field(
         .map(|list| plan_list_id(list.id))
 }
 
-fn lower_row_statement_value(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    statement: &AstStatement,
-) -> Option<LoweredRowValue> {
-    if let Some(expr_id) = statement.expr {
-        if !statement.children.is_empty()
-            && let AstExprKind::Pipe { input, op, args } = &expr_by_id(program, expr_id)?.kind
-            && row_list_builtin(op)
-        {
-            let multiline_args = row_list_multiline_args(program, op, args, statement);
-            return lower_row_list_builtin(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                op,
-                Some(*input),
-                multiline_args.as_deref().unwrap_or(args),
-            );
-        }
-        if !statement.children.is_empty()
-            && let Some(value) = lower_row_call_statement_with_field_args(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                statement,
-                expr_id,
-            )
-        {
-            return Some(value);
-        }
-        if let Some(value) = lower_row_while_statement(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            statement,
-            expr_id,
-        ) {
-            return Some(value);
-        }
-        if let Some(value) = lower_row_when_statement(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            statement,
-            expr_id,
-        ) {
-            return Some(value);
-        }
-        if matches!(
-            expr_by_id(program, expr_id)?.kind,
-            AstExprKind::ListLiteral { .. }
-        ) && !statement.children.is_empty()
-        {
-            let mut items = Vec::with_capacity(statement.children.len());
-            for child in &statement.children {
-                items.push(
-                    lower_row_statement_value(
-                        program,
-                        derived,
-                        index,
-                        constants,
-                        inputs,
-                        env,
-                        expr_value_types,
-                        child,
-                    )
-                    .and_then(lowered_scalar)?,
-                );
-            }
-            return Some(LoweredRowValue::Scalar(PlanRowExpression::ListLiteral {
-                items,
-            }));
-        }
-        if !statement.children.is_empty() {
-            let mut output = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                expr_id,
-            )?;
-            for child in &statement.children {
-                output = lower_row_pipeline_child_statement(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    output,
-                    child,
-                )?;
-            }
-            return Some(output);
-        }
-        return lower_row_expr(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            expr_id,
-        );
-    }
-    if !statement.children.is_empty() {
-        return lower_row_function_body(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            statement,
-            env,
-            expr_value_types,
-        );
-    }
-    let expr_id = direct_statement_value_expr_id(statement)?;
-    lower_row_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        expr_id,
-    )
-}
-
-fn lower_row_pipeline_child_statement(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    previous: LoweredRowValue,
-    statement: &AstStatement,
-) -> Option<LoweredRowValue> {
-    let expr_id = statement.expr?;
-    let saved_previous = env.insert(ROW_PREVIOUS_BINDING.to_owned(), previous);
-    let expr = expr_by_id(program, expr_id)?;
-    let result = match &expr.kind {
-        AstExprKind::Pipe { input, op, args } if row_list_builtin(op) => {
-            let multiline_args = row_list_multiline_args(program, op, args, statement);
-            lower_row_list_builtin(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                op,
-                Some(*input),
-                multiline_args.as_deref().unwrap_or(args),
-            )
-        }
-        AstExprKind::Pipe { input, op, args } if row_text_builtin(op) => lower_row_text_builtin(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            op,
-            Some(*input),
-            args,
-        ),
-        AstExprKind::Pipe { input, op, args } if row_generic_builtin(op) => lower_row_builtin_call(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            op,
-            Some(*input),
-            args,
-        ),
-        _ => lower_row_statement_value(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            statement,
-        ),
-    };
-    match saved_previous {
-        Some(previous) => {
-            env.insert(ROW_PREVIOUS_BINDING.to_owned(), previous);
-        }
-        None => {
-            env.remove(ROW_PREVIOUS_BINDING);
-        }
-    }
-    result
-}
-
-fn row_statement_is_pipeline_continuation(
-    program: &TypedProgram,
-    statement: &AstStatement,
-) -> bool {
-    statement
-        .expr
-        .is_some_and(|expr_id| row_expr_chain_starts_with_pipeline_placeholder(program, expr_id))
-}
-
-fn row_expr_chain_starts_with_pipeline_placeholder(program: &TypedProgram, expr_id: usize) -> bool {
-    let Some(expr) = expr_by_id(program, expr_id) else {
-        return false;
-    };
-    match &expr.kind {
-        AstExprKind::Delimiter => true,
-        AstExprKind::Pipe { input, .. }
-        | AstExprKind::Then { input, .. }
-        | AstExprKind::When { input }
-        | AstExprKind::Draining { input }
-        | AstExprKind::Hold { initial: input, .. } => {
-            row_expr_chain_starts_with_pipeline_placeholder(program, *input)
-        }
-        _ => false,
-    }
-}
-
-fn row_list_multiline_args(
-    program: &TypedProgram,
-    function: &str,
-    args: &[AstCallArg],
-    statement: &AstStatement,
-) -> Option<Vec<AstCallArg>> {
-    let mut resolved = args.to_vec();
-    let mut changed = false;
-    let multiline_value_arg = match function {
-        "List/any" | "List/retain" => Some("if"),
-        "List/map" => Some("new"),
-        _ => None,
-    };
-    if let Some(arg_name) = multiline_value_arg {
-        let named_marker = args.iter().position(|arg| {
-            arg.name.as_deref() == Some(arg_name)
-                && expr_by_id(program, arg.value).is_some_and(|expr| {
-                    matches!(expr.kind, AstExprKind::Delimiter)
-                        || row_raw_symbol(program, arg.value).as_deref() == Some(arg_name)
-                })
-        });
-        let positional_marker = args
-            .iter()
-            .position(|arg| row_raw_symbol(program, arg.value).as_deref() == Some(arg_name));
-        if named_arg(args, arg_name).is_none() || named_marker.is_some() {
-            let predicate = statement
-                .children
-                .iter()
-                .find(|child| matches!(child.kind, AstStatementKind::Expression))?;
-            let value = predicate.expr?;
-            if let Some(marker) = named_marker.or(positional_marker) {
-                resolved[marker] = AstCallArg {
-                    name: Some(arg_name.to_owned()),
-                    value,
-                    start: predicate.start,
-                    end: predicate.end,
-                };
-            } else {
-                resolved.push(AstCallArg {
-                    name: Some(arg_name.to_owned()),
-                    value,
-                    start: predicate.start,
-                    end: predicate.end,
-                });
-            }
-            changed = true;
-        }
-    }
-    for child in &statement.children {
-        let Some(name) = row_statement_named_field(child) else {
-            continue;
-        };
-        if resolved.iter().any(|arg| arg.name.as_deref() == Some(name)) {
-            continue;
-        }
-        resolved.push(AstCallArg {
-            name: Some(name.to_owned()),
-            value: child.expr?,
-            start: child.start,
-            end: child.end,
-        });
-        changed = true;
-    }
-    changed.then_some(resolved)
-}
-
-fn row_statement_named_field(statement: &AstStatement) -> Option<&str> {
-    match &statement.kind {
-        AstStatementKind::Field { name }
-        | AstStatementKind::List {
-            field: Some(name), ..
-        } => Some(name),
-        _ => None,
-    }
-}
-
-fn lower_row_call_statement_with_field_args(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    statement: &AstStatement,
-    expr_id: usize,
-) -> Option<LoweredRowValue> {
-    let expr = expr_by_id(program, expr_id)?;
-    let AstExprKind::Call { function, args } = &expr.kind else {
-        return None;
-    };
-    if let Some(value) = lower_row_list_find_statement(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        function,
-        statement,
-    ) {
-        return Some(value);
-    }
-    if !args.is_empty() {
-        return None;
-    }
-    let mut call_args = Vec::new();
-    for child in &statement.children {
-        let name = match row_statement_named_field(child) {
-            Some(name) => Some(name.to_owned()),
-            None if matches!(child.kind, AstStatementKind::Expression) => None,
-            None => return None,
-        };
-        let value = child.expr?;
-        call_args.push(AstCallArg {
-            name,
-            value,
-            start: child.start,
-            end: child.end,
-        });
-    }
-    if row_list_builtin(function) {
-        return lower_row_list_builtin(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            function,
-            None,
-            &call_args,
-        );
-    }
-    if row_text_builtin(function) {
-        return lower_row_text_builtin(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            function,
-            None,
-            &call_args,
-        );
-    }
-    if row_generic_builtin(function) {
-        return lower_row_builtin_call(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            function,
-            None,
-            &call_args,
-        );
-    }
-    lower_row_function_call(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        function,
-        &call_args,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lower_row_list_find_statement(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    function: &str,
-    statement: &AstStatement,
-) -> Option<LoweredRowValue> {
-    if function != "List/find" && function != "List/find_value" {
-        return None;
-    }
-    let list_expr = statement
-        .children
-        .iter()
-        .find(|child| matches!(child.kind, AstStatementKind::Expression))?
-        .expr?;
-    let child_field = |name: &str| {
-        statement
-            .children
-            .iter()
-            .find(|child| row_statement_named_field(child) == Some(name))
-    };
-    let field_name = row_raw_symbol(program, child_field("field")?.expr?)?;
-    let value = lower_row_statement_value(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        child_field("value")?,
-    )
-    .and_then(lowered_scalar)?;
-    let target_name = (function == "List/find_value")
-        .then(|| row_raw_symbol(program, child_field("target")?.expr?))
-        .flatten();
-    let fallback = if let Some(fallback) = child_field("fallback") {
-        Some(
-            lower_row_statement_value(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                fallback,
-            )
-            .and_then(lowered_scalar)?,
-        )
-    } else {
-        None
-    };
-    if let Some(list_id) = lower_row_list_ref(program, derived, index, inputs, list_expr) {
-        let field = row_field_id_for_list_id(program, list_id, &field_name)?;
-        if function == "List/find" {
-            return Some(LoweredRowValue::ListFindRow {
-                list_id,
-                field,
-                value,
-            });
-        }
-        let target = row_field_id_for_list_id(program, list_id, target_name.as_deref()?)?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::ListFindValue {
-            list_id,
-            field,
-            value: Box::new(value),
-            target,
-            fallback: fallback.map(Box::new),
-        }));
-    }
-
-    let input = lower_row_list_expression(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        list_expr,
-    )?;
-    Some(LoweredRowValue::Scalar(scalar_list_find_expression(
-        constants,
-        inputs,
-        function,
-        input,
-        field_name,
-        value,
-        target_name,
-        fallback,
-    )?))
-}
-
-fn lower_row_while_statement(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    statement: &AstStatement,
-    expr_id: usize,
-) -> Option<LoweredRowValue> {
-    let expr = expr_by_id(program, expr_id)?;
-    let input_id = match &expr.kind {
-        AstExprKind::Pipe { input, op, args: _ } if op == "WHILE" || op == "WHEN" => *input,
-        AstExprKind::When { input } => *input,
-        _ => return None,
-    };
-    if let Some(value) = lower_row_equality_while_statement(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        statement,
-        input_id,
-    ) {
-        return Some(value);
-    }
-    let input = lower_row_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        input_id,
-    )?;
-    let input_expression = lowered_scalar(input)?;
-    let mut arms = Vec::new();
-    for child in &statement.children {
-        let arm_expr = expr_by_id(program, child.expr?)?;
-        let AstExprKind::MatchArm { pattern, output } = &arm_expr.kind else {
-            continue;
-        };
-        let mut arm_env = env.clone();
-        let (select_pattern, binding) = row_select_pattern_and_binding(pattern)?;
-        if let Some(binding) = binding {
-            arm_env.insert(binding, LoweredRowValue::Scalar(input_expression.clone()));
-        }
-        let arm_value = lower_row_match_arm_output(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            child,
-            &mut arm_env,
-            expr_value_types,
-            *output,
-        )?;
-        arms.push(PlanRowSelectArm {
-            pattern: select_pattern,
-            value: lowered_scalar(arm_value)?,
-        });
-    }
-    (!arms.is_empty()).then_some(LoweredRowValue::Scalar(PlanRowExpression::Select {
-        input: Box::new(input_expression),
-        arms,
-    }))
-}
-
-fn lower_row_equality_while_statement(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    statement: &AstStatement,
-    input_id: usize,
-) -> Option<LoweredRowValue> {
-    let input_expr = expr_by_id(program, input_id)?;
-    let AstExprKind::Infix { left, op, right } = &input_expr.kind else {
-        return None;
-    };
-    if !matches!(op.as_str(), "==" | "!=") {
-        return None;
-    }
-    if row_equality_rhs_is_dynamic_reference(program, derived, index, env, *right) {
-        return None;
-    }
-    let input = lower_row_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        *left,
-    )?;
-    let input_expression = lowered_scalar(input)?;
-    let match_pattern = row_select_pattern_for_expr(program, *right)?;
-    let mut true_value = None;
-    let mut false_value = None;
-    for child in &statement.children {
-        let arm_expr = expr_by_id(program, child.expr?)?;
-        let AstExprKind::MatchArm { pattern, output } = &arm_expr.kind else {
-            continue;
-        };
-        let label = pattern.join("");
-        if label != "True" && label != "False" {
-            return None;
-        }
-        let mut arm_env = env.clone();
-        let arm_value = lower_row_match_arm_output(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            child,
-            &mut arm_env,
-            expr_value_types,
-            *output,
-        )?;
-        let arm_value = lowered_scalar(arm_value)?;
-        if label == "True" {
-            true_value = Some(arm_value);
-        } else {
-            false_value = Some(arm_value);
-        }
-    }
-    let true_value = true_value?;
-    let false_value = false_value?;
-    let (match_value, wildcard_value) = if op == "==" {
-        (true_value, false_value)
-    } else {
-        (false_value, true_value)
-    };
-    Some(LoweredRowValue::Scalar(PlanRowExpression::Select {
-        input: Box::new(input_expression),
-        arms: vec![
-            PlanRowSelectArm {
-                pattern: match_pattern,
-                value: match_value,
-            },
-            PlanRowSelectArm {
-                pattern: PlanRowSelectPattern::Wildcard,
-                value: wildcard_value,
-            },
-        ],
-    }))
-}
-
-fn row_equality_rhs_is_dynamic_reference(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    env: &BTreeMap<String, LoweredRowValue>,
-    expr_id: usize,
-) -> bool {
-    let Some(path) = expression_path_string(program, expr_id) else {
-        return false;
-    };
-    if env.contains_key(&path) {
-        return true;
-    }
-    let mut candidates = scoped_resolution_candidates(&derived.path, &path);
-    if let Some((parent, _)) = derived.path.rsplit_once('.') {
-        candidates.push(format!("{parent}.{path}"));
-        if let Some((grandparent, _)) = parent.rsplit_once('.') {
-            candidates.push(format!("{grandparent}.{path}"));
-        }
-    }
-    candidates
-        .iter()
-        .any(|candidate| index.resolve(candidate).is_some())
-}
-
-fn lower_row_match_arm_output(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    arm_statement: &AstStatement,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    output: Option<usize>,
-) -> Option<LoweredRowValue> {
-    if arm_statement
-        .children
-        .iter()
-        .any(|child| row_statement_is_pipeline_continuation(program, child))
-    {
-        return lower_row_function_body(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            arm_statement,
-            env,
-            expr_value_types,
-        );
-    }
-    let Some(output) = output else {
-        return lower_row_function_body(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            arm_statement,
-            env,
-            expr_value_types,
-        );
-    };
-    if row_expr_is_block_marker(program, output) && !arm_statement.children.is_empty() {
-        return lower_row_function_body(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            arm_statement,
-            env,
-            expr_value_types,
-        );
-    }
-    if !arm_statement.children.is_empty()
-        && let Some(value) = lower_row_while_statement(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            arm_statement,
-            output,
-        )
-    {
-        return Some(value);
-    }
-    if !arm_statement.children.is_empty()
-        && let Some(value) = lower_row_when_statement(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            arm_statement,
-            output,
-        )
-    {
-        return Some(value);
-    }
-    lower_row_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        output,
-    )
-}
-
-fn row_select_pattern_for_expr(
-    program: &TypedProgram,
-    expr_id: usize,
-) -> Option<PlanRowSelectPattern> {
-    match &expr_by_id(program, expr_id)?.kind {
-        AstExprKind::Number(value) => value
-            .parse::<FiniteReal>()
-            .ok()
-            .map(|value| PlanRowSelectPattern::Number { value }),
-        AstExprKind::Bool(value) => Some(PlanRowSelectPattern::Bool { value: *value }),
-        AstExprKind::StringLiteral(value)
-        | AstExprKind::TextLiteral(value)
-        | AstExprKind::Enum(value)
-        | AstExprKind::Tag(value)
-        | AstExprKind::Identifier(value) => Some(PlanRowSelectPattern::Text {
-            value: value.clone(),
-        }),
-        AstExprKind::Path(parts) => Some(PlanRowSelectPattern::Text {
-            value: parts.join("."),
-        }),
-        _ => None,
-    }
-}
-
-fn row_expr_is_block_marker(program: &TypedProgram, expr_id: usize) -> bool {
-    let kind = expr_by_id(program, expr_id).map(|expr| &expr.kind);
-    matches!(kind, Some(AstExprKind::Delimiter))
-        || matches!(kind, Some(AstExprKind::Identifier(name)) if name == "BLOCK")
-}
-
-fn row_select_pattern_and_binding(
-    pattern: &[String],
-) -> Option<(PlanRowSelectPattern, Option<String>)> {
-    let label = pattern.join("");
-    match label.as_str() {
-        "True" => Some((PlanRowSelectPattern::Bool { value: true }, None)),
-        "False" => Some((PlanRowSelectPattern::Bool { value: false }, None)),
-        "NaN" => Some((PlanRowSelectPattern::NaN, None)),
-        "__" => Some((PlanRowSelectPattern::Wildcard, None)),
-        _ => label
-            .parse::<FiniteReal>()
-            .map(|value| (PlanRowSelectPattern::Number { value }, None))
-            .ok()
-            .or_else(|| {
-                row_text_pattern_literal(&label)
-                    .map(|value| (PlanRowSelectPattern::Text { value }, None))
-            })
-            .or_else(|| {
-                row_binding_pattern_name(&label)
-                    .map(|binding| (PlanRowSelectPattern::Wildcard, Some(binding)))
-            })
-            .or(Some((PlanRowSelectPattern::Text { value: label }, None))),
-    }
-}
-
-fn row_text_pattern_literal(label: &str) -> Option<String> {
-    let text = label.trim();
-    let inner = text
-        .strip_prefix("TEXT")?
-        .trim_start()
-        .strip_prefix('{')?
-        .strip_suffix('}')?;
-    Some(inner.trim().to_owned())
-}
-
-fn row_binding_pattern_name(label: &str) -> Option<String> {
-    let mut chars = label.chars();
-    let first = chars.next()?;
-    if !(first == '_' || first.is_ascii_lowercase()) {
-        return None;
-    }
-    chars
-        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        .then(|| label.to_owned())
-}
-
-fn row_text_builtin(function: &str) -> bool {
-    matches!(
-        function,
-        "Text/trim"
-            | "Text/is_empty"
-            | "Text/all_chars_in"
-            | "Text/starts_with"
-            | "Text/length"
-            | "Text/to_number"
-            | "Text/concat"
-            | "Text/substring"
-            | "Text/time_range_label"
-    )
-}
-
-fn row_list_builtin(function: &str) -> bool {
-    matches!(
-        function,
-        "List/find"
-            | "List/find_value"
-            | "List/range"
-            | "List/map"
-            | "List/any"
-            | "List/sum"
-            | "List/count"
-            | "List/length"
-            | "List/is_not_empty"
-            | "List/retain"
-            | "List/filter_field_equal"
-            | "List/filter_field_not_equal"
-            | "List/filter_text_contains"
-            | "List/join_field"
-    )
-}
-
-fn row_generic_builtin(function: &str) -> bool {
-    matches!(
-        function,
-        "Text/empty"
-            | "Router/route"
-            | "Number/to_text"
-            | "Text/to_bytes"
-            | "Bytes/to_text"
-            | "Bytes/to_hex"
-            | "Bytes/to_base64"
-            | "Bytes/from_hex"
-            | "Bytes/from_base64"
-            | "Bytes/is_empty"
-            | "Bytes/length"
-            | "Bytes/get"
-            | "Bytes/slice"
-            | "Bytes/take"
-            | "Bytes/drop"
-            | "Bytes/zeros"
-            | "Bytes/read_unsigned"
-            | "Bytes/read_signed"
-            | "Bytes/set"
-            | "Bytes/write_unsigned"
-            | "Bytes/write_signed"
-            | "Bytes/find"
-            | "Bytes/starts_with"
-            | "Bytes/ends_with"
-            | "Bytes/concat"
-            | "Bytes/equal"
-            | "Error/new"
-            | "Error/text"
-            | "Number/min"
-            | "Number/max"
-            | "Number/ceil"
-            | "Number/floor"
-            | "Number/round"
-            | "Number/truncate"
-            | "Number/interpolate"
-            | "Number/project_offset"
-            | "Number/project_time"
-            | "Number/project_width"
-    )
-}
-
-fn lower_row_list_builtin(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    function: &str,
-    piped_input: Option<usize>,
-    args: &[AstCallArg],
-) -> Option<LoweredRowValue> {
-    match function {
-        "List/range" => {
-            let from = named_arg(args, "from")?.value;
-            let to = named_arg(args, "to")?.value;
-            let from = lower_row_number_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                from,
-            )?;
-            let to = lower_row_number_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                to,
-            )?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::ListRange {
-                from: Box::new(from),
-                to: Box::new(to),
-            }))
-        }
-        "List/find" | "List/find_value" => {
-            let list_expr =
-                piped_input.or_else(|| first_positional_arg(args).map(|arg| arg.value))?;
-            let field_name =
-                named_arg(args, "field").and_then(|arg| row_raw_symbol(program, arg.value))?;
-            let value_expr = named_arg(args, "value")?.value;
-            let value = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                value_expr,
-            )
-            .and_then(lowered_scalar)?;
-            let target_name = (function == "List/find_value")
-                .then(|| {
-                    named_arg(args, "target").and_then(|arg| row_raw_symbol(program, arg.value))
-                })
-                .flatten();
-            let fallback = if let Some(arg) = named_arg(args, "fallback") {
-                Some(
-                    lower_row_expr(
-                        program,
-                        derived,
-                        index,
-                        constants,
-                        inputs,
-                        env,
-                        expr_value_types,
-                        arg.value,
-                    )
-                    .and_then(lowered_scalar)?,
-                )
-            } else {
-                None
-            };
-            if let Some(list_id) = lower_row_list_ref(program, derived, index, inputs, list_expr) {
-                let field = row_field_id_for_list_id(program, list_id, &field_name)
-                    .or_else(|| row_input_field_id_for_list_id(program, list_id, &field_name))?;
-                if function == "List/find" {
-                    return Some(LoweredRowValue::ListFindRow {
-                        list_id,
-                        field,
-                        value,
-                    });
-                }
-                let target = row_field_id_for_list_id(program, list_id, target_name.as_deref()?)?;
-                return Some(LoweredRowValue::Scalar(PlanRowExpression::ListFindValue {
-                    list_id,
-                    field,
-                    value: Box::new(value),
-                    target,
-                    fallback: fallback.map(Box::new),
-                }));
-            }
-
-            let input = lower_row_list_expression(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                list_expr,
-            )?;
-            Some(LoweredRowValue::Scalar(scalar_list_find_expression(
-                constants,
-                inputs,
-                function,
-                input,
-                field_name,
-                value,
-                target_name,
-                fallback,
-            )?))
-        }
-        "List/map" => {
-            let input_expr = piped_input.or_else(|| positional_arg(args, 0).map(|arg| arg.value));
-            let (input, implicit_input) = lower_row_list_input_expression(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                input_expr,
-                piped_input.is_some(),
-            )?;
-            let binding_arg_index = if implicit_input { 0 } else { 1 };
-            let binding = positional_arg(args, binding_arg_index)
-                .and_then(|arg| row_raw_symbol(program, arg.value))?;
-            let new_expr = named_arg(args, "new")?.value;
-            let mut map_env = env.clone();
-            map_env.insert(
-                binding.clone(),
-                LoweredRowValue::ListMapItem {
-                    binding: binding.clone(),
-                    list_id: row_expression_direct_list_id(&input),
-                },
-            );
-            let value = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                &mut map_env,
-                expr_value_types,
-                new_expr,
-            )
-            .and_then(lowered_scalar)?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::ListMap {
-                input: Box::new(input),
-                binding,
-                value: Box::new(value),
-            }))
-        }
-        "List/count" | "List/length" | "List/is_not_empty" => {
-            let input_expr =
-                piped_input.or_else(|| first_positional_arg(args).map(|arg| arg.value));
-            let (input, _) = lower_row_list_input_expression(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                input_expr,
-                piped_input.is_some(),
-            )?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::BuiltinCall {
-                function: function.to_owned(),
-                input: Some(Box::new(input)),
-                args: Vec::new(),
-            }))
-        }
-        "List/retain" | "List/any" => {
-            let input_expr = piped_input.or_else(|| positional_arg(args, 0).map(|arg| arg.value));
-            let (input, implicit_input) = lower_row_list_input_expression(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                input_expr,
-                piped_input.is_some(),
-            )?;
-            let binding_arg_index = if implicit_input { 0 } else { 1 };
-            let binding = positional_arg(args, binding_arg_index)
-                .and_then(|arg| row_raw_symbol(program, arg.value))?;
-            let predicate_expr = named_arg(args, "if")?.value;
-            let mut retain_env = env.clone();
-            retain_env.insert(
-                binding.clone(),
-                LoweredRowValue::ListMapItem {
-                    binding: binding.clone(),
-                    list_id: row_expression_direct_list_id(&input),
-                },
-            );
-            let predicate = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                &mut retain_env,
-                expr_value_types,
-                predicate_expr,
-            )
-            .and_then(lowered_scalar)?;
-            let binding_value = row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Text { value: binding },
-            );
-            Some(LoweredRowValue::Scalar(PlanRowExpression::BuiltinCall {
-                function: function.to_owned(),
-                input: Some(Box::new(input)),
-                args: vec![
-                    PlanRowCallArg {
-                        name: Some("binding".to_owned()),
-                        value: binding_value,
-                    },
-                    PlanRowCallArg {
-                        name: Some("if".to_owned()),
-                        value: predicate,
-                    },
-                ],
-            }))
-        }
-        "List/filter_field_equal" | "List/filter_field_not_equal" => {
-            let input_expr =
-                piped_input.or_else(|| first_positional_arg(args).map(|arg| arg.value));
-            let (input, _) = lower_row_list_input_expression(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                input_expr,
-                piped_input.is_some(),
-            )?;
-            if let Some(list_id) = row_expression_direct_list_id(&input)
-                && let Some(field_name) =
-                    named_arg(args, "field").and_then(|arg| row_raw_symbol(program, arg.value))
-                && let Some(field) = row_field_id_for_list_id(program, list_id, &field_name)
-                    .or_else(|| row_input_field_id_for_list_id(program, list_id, &field_name))
-            {
-                let expected = lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    named_arg(args, "value")?.value,
-                )
-                .and_then(lowered_scalar)?;
-                return Some(LoweredRowValue::Scalar(
-                    PlanRowExpression::ListFilterField {
-                        input: Box::new(input),
-                        list_id,
-                        field,
-                        expected: Box::new(expected),
-                        retain_equal: function == "List/filter_field_equal",
-                    },
-                ));
-            }
-            let lowered_args = args
-                .iter()
-                .map(|arg| {
-                    let value = if row_builtin_arg_expects_symbol(function, arg.name.as_deref()) {
-                        lower_row_symbol_or_expr(
-                            program,
-                            derived,
-                            index,
-                            constants,
-                            inputs,
-                            env,
-                            expr_value_types,
-                            arg.value,
-                        )?
-                    } else {
-                        lower_row_expr(
-                            program,
-                            derived,
-                            index,
-                            constants,
-                            inputs,
-                            env,
-                            expr_value_types,
-                            arg.value,
-                        )
-                        .and_then(lowered_scalar)?
-                    };
-                    Some(PlanRowCallArg {
-                        name: arg.name.clone(),
-                        value,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::BuiltinCall {
-                function: function.to_owned(),
-                input: Some(Box::new(input)),
-                args: lowered_args,
-            }))
-        }
-        "List/filter_text_contains" | "List/join_field" => {
-            let input_expr =
-                piped_input.or_else(|| first_positional_arg(args).map(|arg| arg.value));
-            let (input, _) = lower_row_list_input_expression(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                input_expr,
-                piped_input.is_some(),
-            )?;
-            let lowered_args = args
-                .iter()
-                .map(|arg| {
-                    let value = if row_builtin_arg_expects_symbol(function, arg.name.as_deref()) {
-                        lower_row_symbol_or_expr(
-                            program,
-                            derived,
-                            index,
-                            constants,
-                            inputs,
-                            env,
-                            expr_value_types,
-                            arg.value,
-                        )?
-                    } else {
-                        lower_row_expr(
-                            program,
-                            derived,
-                            index,
-                            constants,
-                            inputs,
-                            env,
-                            expr_value_types,
-                            arg.value,
-                        )
-                        .and_then(lowered_scalar)?
-                    };
-                    Some(PlanRowCallArg {
-                        name: arg.name.clone(),
-                        value,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::BuiltinCall {
-                function: function.to_owned(),
-                input: Some(Box::new(input)),
-                args: lowered_args,
-            }))
-        }
-        "List/sum" => {
-            let input_expr =
-                piped_input.or_else(|| first_positional_arg(args).map(|arg| arg.value));
-            let (input, _) = lower_row_list_input_expression(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                input_expr,
-                piped_input.is_some(),
-            )?;
-            Some(LoweredRowValue::Scalar(PlanRowExpression::ListSum {
-                input: Box::new(input),
-            }))
-        }
-        _ => None,
-    }
-}
-
-fn lower_row_list_input_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    expr_id: Option<usize>,
-    expr_is_implicit_input: bool,
-) -> Option<(PlanRowExpression, bool)> {
-    if let Some(expr_id) = expr_id {
-        return Some((
-            lower_row_list_expression(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                expr_id,
-            )?,
-            expr_is_implicit_input,
-        ));
-    }
-    Some((
-        env.get(ROW_PREVIOUS_BINDING)
-            .cloned()
-            .and_then(lowered_scalar)?,
-        true,
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scalar_list_find_expression(
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    function: &str,
-    input: PlanRowExpression,
-    field: String,
-    value: PlanRowExpression,
-    target: Option<String>,
-    fallback: Option<PlanRowExpression>,
-) -> Option<PlanRowExpression> {
-    let mut args = vec![
-        PlanRowCallArg {
-            name: Some("field".to_owned()),
-            value: row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Text { value: field },
-            ),
-        },
-        PlanRowCallArg {
-            name: Some("value".to_owned()),
-            value,
-        },
-    ];
-    if function == "List/find_value" {
-        args.push(PlanRowCallArg {
-            name: Some("target".to_owned()),
-            value: row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Text { value: target? },
-            ),
-        });
-        if let Some(fallback) = fallback {
-            args.push(PlanRowCallArg {
-                name: Some("fallback".to_owned()),
-                value: fallback,
-            });
-        }
-    }
-    Some(PlanRowExpression::BuiltinCall {
-        function: function.to_owned(),
-        input: Some(Box::new(input)),
-        args,
-    })
-}
-
-fn lower_row_list_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    expr_id: usize,
-) -> Option<PlanRowExpression> {
-    if let Some(list_id) = lower_row_list_ref(program, derived, index, inputs, expr_id) {
-        return Some(PlanRowExpression::ListRef { list_id });
-    }
-    let expression = lower_row_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        expr_id,
-    )
-    .and_then(lowered_scalar)?;
-    if let PlanRowExpression::Field {
-        input: ValueRef::Field(field_id),
-    } = &expression
-        && !field_has_derived_computation(program, *field_id)
-        && let Some(list_id) = list_id_for_semantic_list_memory_field(program, *field_id)
-    {
-        let list_ref = ValueRef::List(list_id);
-        if !inputs.contains(&list_ref) {
-            inputs.push(list_ref);
-        }
-        return Some(PlanRowExpression::ListRef { list_id });
-    }
-    Some(expression)
-}
-
-fn field_has_derived_computation(program: &TypedProgram, field: FieldId) -> bool {
+fn field_has_derived_computation(program: &ErasedProgram, field: FieldId) -> bool {
     program
         .derived_values
         .iter()
         .any(|derived| derived_output_ref(program, derived) == ValueRef::Field(field))
-}
-
-fn lower_row_list_ref(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-    expr_id: usize,
-) -> Option<ListId> {
-    let list_path = expression_path_string(program, expr_id)?;
-    let canonical = canonical_sibling_path(&derived.path, &list_path);
-    let local = list_path.rsplit_once('.').map(|(_, local)| local);
-    let candidates = [Some(canonical.as_str()), Some(list_path.as_str()), local];
-    for candidate in candidates.into_iter().flatten() {
-        match index.resolve(candidate) {
-            Some(ValueRef::List(list_id)) => {
-                let list_ref = ValueRef::List(list_id);
-                if !inputs.contains(&list_ref) {
-                    inputs.push(list_ref);
-                }
-                return Some(list_id);
-            }
-            Some(ValueRef::Field(field_id))
-                if !field_has_derived_computation(program, field_id) =>
-            {
-                let list_id = list_id_for_semantic_list_memory_field(program, field_id)?;
-                let list_ref = ValueRef::List(list_id);
-                if !inputs.contains(&list_ref) {
-                    inputs.push(list_ref);
-                }
-                return Some(list_id);
-            }
-            Some(_) => return None,
-            None => {}
-        }
-    }
-    None
-}
-
-fn first_positional_arg(args: &[AstCallArg]) -> Option<&AstCallArg> {
-    positional_arg(args, 0)
-}
-
-fn positional_arg(args: &[AstCallArg], index: usize) -> Option<&AstCallArg> {
-    args.iter().filter(|arg| arg.name.is_none()).nth(index)
-}
-
-fn row_raw_symbol(program: &TypedProgram, expr_id: usize) -> Option<String> {
-    match &expr_by_id(program, expr_id)?.kind {
-        AstExprKind::Identifier(value)
-        | AstExprKind::Enum(value)
-        | AstExprKind::Tag(value)
-        | AstExprKind::StringLiteral(value)
-        | AstExprKind::TextLiteral(value) => Some(value.clone()),
-        AstExprKind::Path(parts) => Some(boon_parser::canonical_value_path(parts)),
-        _ => None,
-    }
-}
-
-fn lower_row_builtin_call(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    function: &str,
-    piped_input: Option<usize>,
-    args: &[AstCallArg],
-) -> Option<LoweredRowValue> {
-    let input = match piped_input {
-        Some(expr_id) => Some(
-            lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                expr_id,
-            )
-            .and_then(lowered_scalar)?,
-        ),
-        None => None,
-    };
-    let args = args
-        .iter()
-        .map(|arg| {
-            let value = if row_builtin_arg_expects_symbol(function, arg.name.as_deref()) {
-                lower_row_symbol_or_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    arg.value,
-                )?
-            } else if row_builtin_arg_expects_number(function, arg.name.as_deref()) {
-                lower_row_number_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    arg.value,
-                )?
-            } else {
-                let value = lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    arg.value,
-                )?;
-                lowered_scalar(value)?
-            };
-            Some(PlanRowCallArg {
-                name: arg.name.clone(),
-                value,
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    if function == "Text/to_bytes" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input", "text"]))?;
-        let encoding = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("encoding"))
-            .map(|arg| Box::new(arg.value.clone()));
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::TextToBytes {
-            input: Box::new(input),
-            encoding,
-        }));
-    }
-    if function == "Bytes/to_text" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input", "bytes"]))?;
-        let encoding = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("encoding"))
-            .map(|arg| Box::new(arg.value.clone()));
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesToText {
-            input: Box::new(input),
-            encoding,
-        }));
-    }
-    if function == "Bytes/to_hex" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input", "bytes"]))?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesToHex {
-            input: Box::new(input),
-        }));
-    }
-    if function == "Bytes/to_base64" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input", "bytes"]))?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesToBase64 {
-            input: Box::new(input),
-        }));
-    }
-    if function == "Bytes/from_hex" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input", "text"]))?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesFromHex {
-            input: Box::new(input),
-        }));
-    }
-    if function == "Bytes/from_base64" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input", "text"]))?;
-        return Some(LoweredRowValue::Scalar(
-            PlanRowExpression::BytesFromBase64 {
-                input: Box::new(input),
-            },
-        ));
-    }
-    if function == "Bytes/is_empty" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesIsEmpty {
-            input: Box::new(input),
-        }));
-    }
-    if function == "Bytes/length" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesLength {
-            input: Box::new(input),
-        }));
-    }
-    if function == "Bytes/get" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let index = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("index"))
-            .map(|arg| arg.value.clone())?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesGet {
-            input: Box::new(input),
-            index: Box::new(index),
-        }));
-    }
-    if function == "Bytes/slice" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let offset = args
-            .iter()
-            .find(|arg| {
-                arg.name
-                    .as_deref()
-                    .is_some_and(|name| name == "offset" || name == "start")
-            })
-            .map(|arg| arg.value.clone())?;
-        let byte_count = args
-            .iter()
-            .find(|arg| {
-                arg.name
-                    .as_deref()
-                    .is_some_and(|name| name == "byte_count" || name == "length" || name == "count")
-            })
-            .map(|arg| arg.value.clone())?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesSlice {
-            input: Box::new(input),
-            offset: Box::new(offset),
-            byte_count: Box::new(byte_count),
-        }));
-    }
-    if function == "Bytes/take" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesTake {
-            input: Box::new(input),
-            byte_count: Box::new(byte_count),
-        }));
-    }
-    if function == "Bytes/drop" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesDrop {
-            input: Box::new(input),
-            byte_count: Box::new(byte_count),
-        }));
-    }
-    if function == "Bytes/zeros" && input.is_none() {
-        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesZeros {
-            byte_count: Box::new(byte_count),
-        }));
-    }
-    if function == "Bytes/read_unsigned" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let offset = row_call_arg_value(&args, &["offset", "start"])?;
-        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
-        let endian = row_call_arg_value(&args, &["endian"])?;
-        return Some(LoweredRowValue::Scalar(
-            PlanRowExpression::BytesReadUnsigned {
-                input: Box::new(input),
-                offset: Box::new(offset),
-                byte_count: Box::new(byte_count),
-                endian: Box::new(endian),
-            },
-        ));
-    }
-    if function == "Bytes/read_signed" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let offset = row_call_arg_value(&args, &["offset", "start"])?;
-        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
-        let endian = row_call_arg_value(&args, &["endian"])?;
-        return Some(LoweredRowValue::Scalar(
-            PlanRowExpression::BytesReadSigned {
-                input: Box::new(input),
-                offset: Box::new(offset),
-                byte_count: Box::new(byte_count),
-                endian: Box::new(endian),
-            },
-        ));
-    }
-    if function == "Bytes/set" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let index = row_call_arg_value(&args, &["index"])?;
-        let value = row_call_arg_value(&args, &["value"])?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesSet {
-            input: Box::new(input),
-            index: Box::new(index),
-            value: Box::new(value),
-        }));
-    }
-    if function == "Bytes/write_unsigned" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let offset = row_call_arg_value(&args, &["offset", "start"])?;
-        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
-        let endian = row_call_arg_value(&args, &["endian"])?;
-        let value = row_call_arg_value(&args, &["value"])?;
-        return Some(LoweredRowValue::Scalar(
-            PlanRowExpression::BytesWriteUnsigned {
-                input: Box::new(input),
-                offset: Box::new(offset),
-                byte_count: Box::new(byte_count),
-                endian: Box::new(endian),
-                value: Box::new(value),
-            },
-        ));
-    }
-    if function == "Bytes/write_signed" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let offset = row_call_arg_value(&args, &["offset", "start"])?;
-        let byte_count = row_call_arg_value(&args, &["byte_count", "length", "count"])?;
-        let endian = row_call_arg_value(&args, &["endian"])?;
-        let value = row_call_arg_value(&args, &["value"])?;
-        return Some(LoweredRowValue::Scalar(
-            PlanRowExpression::BytesWriteSigned {
-                input: Box::new(input),
-                offset: Box::new(offset),
-                byte_count: Box::new(byte_count),
-                endian: Box::new(endian),
-                value: Box::new(value),
-            },
-        ));
-    }
-    if function == "Bytes/find" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let needle = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("needle"))
-            .map(|arg| arg.value.clone())?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesFind {
-            input: Box::new(input),
-            needle: Box::new(needle),
-        }));
-    }
-    if function == "Bytes/starts_with" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let prefix = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("prefix"))
-            .map(|arg| arg.value.clone())?;
-        return Some(LoweredRowValue::Scalar(
-            PlanRowExpression::BytesStartsWith {
-                input: Box::new(input),
-                prefix: Box::new(prefix),
-            },
-        ));
-    }
-    if function == "Bytes/ends_with" {
-        let input = input.or_else(|| row_call_arg_value(&args, &["input"]))?;
-        let suffix = args
-            .iter()
-            .find(|arg| arg.name.as_deref() == Some("suffix"))
-            .map(|arg| arg.value.clone())?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesEndsWith {
-            input: Box::new(input),
-            suffix: Box::new(suffix),
-        }));
-    }
-    if function == "Bytes/concat" {
-        let left = input.or_else(|| row_call_arg_value(&args, &["left", "input"]))?;
-        let right = row_call_arg_value(&args, &["right", "with"])?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesConcat {
-            left: Box::new(left),
-            right: Box::new(right),
-        }));
-    }
-    if function == "Bytes/equal" {
-        let left = input.or_else(|| row_call_arg_value(&args, &["left", "input"]))?;
-        let right = row_call_arg_value(&args, &["right", "with"])?;
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::BytesEqual {
-            left: Box::new(left),
-            right: Box::new(right),
-        }));
-    }
-
-    Some(LoweredRowValue::Scalar(PlanRowExpression::BuiltinCall {
-        function: function.to_owned(),
-        input: input.map(Box::new),
-        args,
-    }))
 }
 
 fn row_call_arg_value(args: &[PlanRowCallArg], names: &[&str]) -> Option<PlanRowExpression> {
@@ -10576,74 +7748,10 @@ fn row_call_arg_value(args: &[PlanRowCallArg], names: &[&str]) -> Option<PlanRow
         .map(|arg| arg.value.clone())
 }
 
-fn row_builtin_arg_expects_number(function: &str, arg_name: Option<&str>) -> bool {
-    matches!(
-        (function, arg_name),
-        (
-            "Number/to_text",
-            Some("radix" | "min_width" | "signed_width" | "group_size")
-        ) | ("Bytes/get", Some("index"))
-            | ("Bytes/slice", Some("offset"))
-            | ("Bytes/slice", Some("byte_count"))
-            | ("Bytes/take", Some("byte_count" | "length" | "count"))
-            | ("Bytes/drop", Some("byte_count" | "length" | "count"))
-            | ("Bytes/zeros", Some("byte_count" | "length" | "count"))
-            | (
-                "Bytes/read_unsigned",
-                Some("offset" | "start" | "byte_count" | "length" | "count")
-            )
-            | (
-                "Bytes/read_signed",
-                Some("offset" | "start" | "byte_count" | "length" | "count")
-            )
-            | ("Bytes/set", Some("index" | "value"))
-            | (
-                "Bytes/write_unsigned",
-                Some("offset" | "start" | "byte_count" | "length" | "count" | "value")
-            )
-            | (
-                "Bytes/write_signed",
-                Some("offset" | "start" | "byte_count" | "length" | "count" | "value")
-            )
-            | (
-                "Number/interpolate",
-                Some("start" | "end" | "numerator" | "denominator" | "fallback")
-            )
-            | (
-                "Number/project_offset",
-                Some("time" | "viewport_start" | "viewport_end" | "canvas_width" | "fallback")
-            )
-            | (
-                "Number/project_time",
-                Some(
-                    "pointer_x" | "pointer_width" | "viewport_start" | "viewport_end" | "fallback"
-                )
-            )
-            | (
-                "Number/project_width",
-                Some(
-                    "start_time"
-                        | "end_time"
-                        | "viewport_start"
-                        | "viewport_end"
-                        | "canvas_width"
-                        | "fallback"
-                )
-            )
-    )
-}
-
 fn row_builtin_arg_expects_symbol(function: &str, arg_name: Option<&str>) -> bool {
     matches!(
         (function, arg_name),
         (_, Some("encoding"))
-            | (
-                "List/filter_field_equal"
-                    | "List/filter_field_not_equal"
-                    | "List/filter_text_contains"
-                    | "List/join_field",
-                Some("field" | "prefer_field" | "empty_field")
-            )
             | (
                 "Bytes/read_unsigned"
                     | "Bytes/read_signed"
@@ -10654,292 +7762,16 @@ fn row_builtin_arg_expects_symbol(function: &str, arg_name: Option<&str>) -> boo
     )
 }
 
-fn lower_row_symbol_or_expr(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    expr_id: usize,
-) -> Option<PlanRowExpression> {
-    match &expr_by_id(program, expr_id)?.kind {
-        AstExprKind::Identifier(value) | AstExprKind::Enum(value) | AstExprKind::Tag(value) => {
-            Some(row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Text {
-                    value: value.clone(),
-                },
-            ))
-        }
-        _ => lower_row_expr(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            expr_id,
-        )
-        .and_then(lowered_scalar),
-    }
-}
-
-fn lower_row_text_builtin(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    function: &str,
-    piped_input: Option<usize>,
-    args: &[AstCallArg],
-) -> Option<LoweredRowValue> {
-    let input_expr = piped_input.or_else(|| {
-        args.iter()
-            .find(|arg| {
-                arg.name.is_none()
-                    || arg.name.as_deref() == Some("input")
-                    || arg.name.as_deref() == Some("text")
-            })
-            .map(|arg| arg.value)
-    });
-    let input = if let Some(input_expr) = input_expr {
-        lower_row_expr(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            input_expr,
-        )?
-    } else {
-        env.get(ROW_PREVIOUS_BINDING).cloned()?
-    };
-    let input = lowered_scalar(input)?;
-    let expression = match function {
-        "Text/trim" => PlanRowExpression::TextTrim {
-            input: Box::new(input),
-        },
-        "Text/is_empty" => PlanRowExpression::TextIsEmpty {
-            input: Box::new(input),
-        },
-        "Text/all_chars_in" => {
-            let chars_expr = args
-                .iter()
-                .find(|arg| arg.name.as_deref() == Some("chars"))
-                .map(|arg| arg.value)?;
-            let chars = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                chars_expr,
-            )?;
-            PlanRowExpression::BuiltinCall {
-                function: function.to_owned(),
-                input: Some(Box::new(input)),
-                args: vec![PlanRowCallArg {
-                    name: Some("chars".to_owned()),
-                    value: lowered_scalar(chars)?,
-                }],
-            }
-        }
-        "Text/starts_with" => {
-            let prefix_expr = args
-                .iter()
-                .find(|arg| arg.name.as_deref() == Some("prefix"))
-                .map(|arg| arg.value)?;
-            let prefix = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                prefix_expr,
-            )?;
-            PlanRowExpression::TextStartsWith {
-                input: Box::new(input),
-                prefix: Box::new(lowered_scalar(prefix)?),
-            }
-        }
-        "Text/length" => PlanRowExpression::TextLength {
-            input: Box::new(input),
-        },
-        "Text/to_number" => PlanRowExpression::TextToNumber {
-            input: Box::new(input),
-        },
-        "Text/concat" => {
-            let with_expr = args
-                .iter()
-                .find(|arg| arg.name.as_deref() == Some("with"))
-                .or_else(|| args.iter().filter(|arg| arg.name.is_none()).nth(1))
-                .map(|arg| arg.value)?;
-            let with = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                with_expr,
-            )?;
-            let mut parts = vec![input];
-            if let Some(separator_expr) = args
-                .iter()
-                .find(|arg| arg.name.as_deref() == Some("separator"))
-                .map(|arg| arg.value)
-            {
-                let separator = lower_row_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    separator_expr,
-                )?;
-                parts.push(lowered_scalar(separator)?);
-            }
-            parts.push(lowered_scalar(with)?);
-            PlanRowExpression::TextConcat { parts }
-        }
-        "Text/substring" => {
-            let start_expr = args
-                .iter()
-                .find(|arg| arg.name.as_deref() == Some("start"))
-                .map(|arg| arg.value)?;
-            let length_expr = args
-                .iter()
-                .find(|arg| arg.name.as_deref() == Some("length"))
-                .map(|arg| arg.value)?;
-            let start = lower_row_number_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                start_expr,
-            )?;
-            let length = lower_row_number_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                length_expr,
-            )?;
-            PlanRowExpression::TextSubstring {
-                input: Box::new(input),
-                start: Box::new(start),
-                length: Box::new(length),
-            }
-        }
-        "Text/time_range_label" => {
-            let end_expr = args
-                .iter()
-                .find(|arg| arg.name.as_deref() == Some("end"))
-                .map(|arg| arg.value)?;
-            let unit_expr = args
-                .iter()
-                .find(|arg| arg.name.as_deref() == Some("unit"))
-                .map(|arg| arg.value)?;
-            let end = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                end_expr,
-            )?;
-            let unit = lower_row_expr(
-                program,
-                derived,
-                index,
-                constants,
-                inputs,
-                env,
-                expr_value_types,
-                unit_expr,
-            )?;
-            let space = row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Text {
-                    value: " ".to_owned(),
-                },
-            );
-            let separator = row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Text {
-                    value: " - ".to_owned(),
-                },
-            );
-            PlanRowExpression::TextConcat {
-                parts: vec![
-                    input,
-                    space.clone(),
-                    lowered_scalar(unit.clone())?,
-                    separator,
-                    lowered_scalar(end)?,
-                    space,
-                    lowered_scalar(unit)?,
-                ],
-            }
-        }
-        _ => return None,
-    };
-    Some(LoweredRowValue::Scalar(expression))
-}
-
 fn row_constant_expression(
     constants: &mut Vec<PlanConstant>,
     inputs: &mut Vec<ValueRef>,
     value: PlanConstantValue,
 ) -> PlanRowExpression {
     let constant_id = push_plan_constant(constants, value);
-    inputs.push(ValueRef::Constant(constant_id));
+    if !inputs.contains(&ValueRef::Constant(constant_id)) {
+        inputs.push(ValueRef::Constant(constant_id));
+    }
     PlanRowExpression::Constant { constant_id }
-}
-
-fn unbound_identifier_literal(
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    name: &str,
-) -> Option<LoweredRowValue> {
-    name.chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase())
-        .then(|| {
-            LoweredRowValue::Scalar(row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Enum {
-                    value: name.to_owned(),
-                },
-            ))
-        })
 }
 
 fn row_bytes_constant_expression(
@@ -10960,7 +7792,7 @@ fn row_bytes_constant_expression(
     )
 }
 
-fn row_static_bytes_literal(program: &TypedProgram, items: &[usize]) -> Option<Vec<u8>> {
+fn row_static_bytes_literal(program: &ErasedProgram, items: &[usize]) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     for item in items {
         match &expr_by_id(program, *item)?.kind {
@@ -10974,355 +7806,43 @@ fn row_static_bytes_literal(program: &TypedProgram, items: &[usize]) -> Option<V
     Some(bytes)
 }
 
-fn lower_row_list_get(
-    program: &TypedProgram,
+fn row_expression_for_value(
+    program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
     index: &ValueIndex,
     constants: &mut Vec<PlanConstant>,
     inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    args: &[AstCallArg],
-) -> Option<LoweredRowValue> {
-    let list_expr = args.iter().find(|arg| arg.name.is_none())?.value;
-    let index_expr = args
-        .iter()
-        .find(|arg| arg.name.as_deref() == Some("index"))?
-        .value;
-    let index_expression = lower_row_number_expr(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        index_expr,
-    )?;
-    if let Some(list_id) = lower_row_list_ref(program, derived, index, inputs, list_expr) {
-        return Some(LoweredRowValue::ListRow {
-            list_id,
-            index: index_expression,
-        });
+) -> Result<Option<PlanDerivedExpression>, PlanError> {
+    if !matches!(
+        derived.kind,
+        DerivedValueKind::Pure | DerivedValueKind::ListView
+    ) {
+        return Ok(None);
     }
-    let input = lower_row_list_expression(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        env,
-        expr_value_types,
-        list_expr,
-    )?;
-    Some(LoweredRowValue::Scalar(PlanRowExpression::BuiltinCall {
-        function: "List/get".to_owned(),
-        input: Some(Box::new(input)),
-        args: vec![PlanRowCallArg {
-            name: Some("index".to_owned()),
-            value: index_expression,
-        }],
-    }))
+    let root = executable_value_for_statement(program, derived.executable_statement_id.as_usize())
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "derived value `{}` has no executable root",
+                derived.path
+            ))
+        })?;
+    let expression = ExecutableRowLowerer::new(program, index, constants, inputs)
+        .lower(root)
+        .map_err(|error| {
+            PlanError::new(format!(
+                "derived value `{}` failed executable lowering: {error}",
+                derived.path
+            ))
+        })?;
+    Ok(Some(PlanDerivedExpression::RowExpression { expression }))
 }
 
-fn lower_row_function_call(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-    function: &str,
-    args: &[AstCallArg],
-) -> Option<LoweredRowValue> {
-    let function = program.functions.iter().find(|candidate| {
-        candidate.name == function
-            || function
-                .rsplit_once('/')
-                .is_some_and(|(_, suffix)| suffix == candidate.name)
-    })?;
-    let mut function_env = BTreeMap::new();
-    let mut positional_index = 0usize;
-    for arg in args {
-        let arg_name = if let Some(name) = arg.name.as_ref() {
-            name.clone()
-        } else {
-            let name = function.args.get(positional_index)?.clone();
-            positional_index += 1;
-            name
-        };
-        let value = lower_row_expr(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            env,
-            expr_value_types,
-            arg.value,
-        )?;
-        function_env.insert(arg_name, value);
-    }
-    lower_row_function_body(
-        program,
-        derived,
-        index,
-        constants,
-        inputs,
-        &function.statement,
-        &mut function_env,
-        expr_value_types,
-    )
-}
-
-fn lower_row_function_body(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    inputs: &mut Vec<ValueRef>,
-    statement: &AstStatement,
-    env: &mut BTreeMap<String, LoweredRowValue>,
-    expr_value_types: &BTreeMap<usize, PlanValueType>,
-) -> Option<LoweredRowValue> {
-    let body = statement
-        .children
-        .iter()
-        .find(|child| matches!(child.kind, AstStatementKind::Block))
-        .unwrap_or(statement);
-    let mut output = None;
-    let mut object_fields = Vec::new();
-    let mut pending_field: Option<(String, LoweredRowValue, Option<usize>)> = None;
-    for child in &body.children {
-        if row_statement_is_empty_delimiter(child, program) {
-            continue;
-        }
-        if let Some(previous) = output.clone() {
-            env.insert(ROW_PREVIOUS_BINDING.to_owned(), previous);
-        } else {
-            env.remove(ROW_PREVIOUS_BINDING);
-        }
-        match &child.kind {
-            AstStatementKind::Field { name }
-            | AstStatementKind::List {
-                field: Some(name), ..
-            } => {
-                let saved_constants = constants.clone();
-                let saved_inputs = inputs.clone();
-                let saved_env = env.clone();
-                let value = lower_row_statement_value(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    child,
-                );
-                let Some(value) = value else {
-                    if row_materialization_field_is_runtime_owned(program, derived, name) {
-                        *constants = saved_constants;
-                        *inputs = saved_inputs;
-                        *env = saved_env;
-                        continue;
-                    }
-                    return None;
-                };
-                let object_index = lowered_scalar(value.clone()).map(|scalar| {
-                    let index = object_fields.len();
-                    object_fields.push(PlanRowObjectField {
-                        name: name.clone(),
-                        value: scalar,
-                    });
-                    index
-                });
-                env.insert(name.clone(), value.clone());
-                pending_field = Some((name.clone(), value, object_index));
-            }
-            AstStatementKind::Expression => {
-                if row_statement_is_pipeline_continuation(program, child)
-                    && let Some((name, previous, object_index)) = pending_field.take()
-                {
-                    let value = lower_row_pipeline_child_statement(
-                        program,
-                        derived,
-                        index,
-                        constants,
-                        inputs,
-                        env,
-                        expr_value_types,
-                        previous,
-                        child,
-                    )?;
-                    if let Some(object_index) = object_index {
-                        object_fields[object_index].value = lowered_scalar(value.clone())?;
-                    }
-                    env.insert(name.clone(), value.clone());
-                    pending_field = Some((name, value, object_index));
-                    continue;
-                }
-                pending_field = None;
-                output = Some(lower_row_statement_value(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    child,
-                )?);
-            }
-            AstStatementKind::List { field: None, .. } => {
-                pending_field = None;
-                output = Some(lower_row_statement_value(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    child,
-                )?);
-            }
-            AstStatementKind::Block => {
-                pending_field = None;
-                output = Some(lower_row_function_body(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    child,
-                    env,
-                    expr_value_types,
-                )?);
-            }
-            _ => {
-                pending_field = None;
-            }
-        }
-    }
-    env.remove(ROW_PREVIOUS_BINDING);
-    if output.is_none() && !object_fields.is_empty() {
-        return Some(LoweredRowValue::Scalar(PlanRowExpression::Object {
-            fields: object_fields,
-        }));
-    }
-    output
-}
-
-fn row_materialization_field_is_runtime_owned(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    field_name: &str,
-) -> bool {
-    let Some(list_id) = derived_materialized_list_id(program, derived) else {
-        return false;
-    };
-    let Some(scope_id) = program
-        .lists
-        .iter()
-        .find(|list| plan_list_id(list.id) == list_id)
-        .and_then(|list| list.row_scope_id)
-    else {
-        return false;
-    };
-    let Some(scope) = program.row_scopes.iter().find(|scope| scope.id == scope_id) else {
-        return false;
-    };
-    let path = format!("{}.{}", scope.row_scope, field_name);
-    let owns_path = |candidate: &str| {
-        candidate == path
-            || candidate
-                .strip_prefix(&path)
-                .is_some_and(|suffix| suffix.starts_with('.'))
-    };
-    program.sources.iter().any(|source| owns_path(&source.path))
-        || program
-            .state_cells
-            .iter()
-            .any(|state| owns_path(&state.path))
-        || program
-            .derived_values
-            .iter()
-            .any(|value| value.indexed && owns_path(&value.path))
-}
-
-fn row_statement_is_empty_delimiter(statement: &AstStatement, program: &TypedProgram) -> bool {
+fn row_statement_is_empty_delimiter(statement: &AstStatement, program: &ErasedProgram) -> bool {
     statement.children.is_empty()
         && statement
             .expr
             .and_then(|id| program.expressions.get(id))
             .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter))
-}
-
-fn row_field_expression(
-    program: &TypedProgram,
-    derived: &boon_ir::DerivedValue,
-    index: &ValueIndex,
-    inputs: &mut Vec<ValueRef>,
-    path: &str,
-) -> Option<PlanRowExpression> {
-    if let Some(value_ref) = explicit_input_row_field_ref(program, derived.scope_id, path) {
-        inputs.push(value_ref.clone());
-        return Some(PlanRowExpression::Field { input: value_ref });
-    }
-    let candidates = scoped_resolution_candidates(&derived.path, path);
-    let value_ref = candidates
-        .iter()
-        .find_map(|candidate| index.resolve(candidate))
-        .or_else(|| {
-            synthetic_range_row_field_ref(program, plan_scope_id(derived.scope_id), path)
-        })?;
-    inputs.push(value_ref.clone());
-    Some(PlanRowExpression::Field { input: value_ref })
-}
-
-fn explicit_input_row_field_ref(
-    program: &TypedProgram,
-    scope_id: Option<ir::ScopeId>,
-    path: &str,
-) -> Option<ValueRef> {
-    let scope_id = scope_id?;
-    let scope = program
-        .row_scopes
-        .iter()
-        .find(|scope| scope.id == scope_id)?;
-    let field = path.strip_prefix(&format!("{}.", scope.row_scope))?;
-    if field.contains('.') {
-        return None;
-    }
-    let list = program
-        .lists
-        .iter()
-        .find(|list| list.row_scope_id == Some(scope_id))?;
-    synthetic_initial_list_field_ids(program)
-        .get(&(list.name.clone(), field.to_owned()))
-        .copied()
-        .map(ValueRef::Field)
-}
-
-fn synthetic_range_row_field_ref(
-    program: &TypedProgram,
-    scope_id: Option<ScopeId>,
-    path: &str,
-) -> Option<ValueRef> {
-    let local = path.rsplit('.').next().unwrap_or(path);
-    if !matches!(local, "index" | "value") {
-        return None;
-    }
-    let list = program.lists.iter().find(|list| {
-        list.row_scope_id == ir_scope_id(scope_id)
-            && matches!(list.initializer, ListInitializer::Range { .. })
-    })?;
-    let ids = synthetic_initial_list_field_ids(program);
-    ids.get(&(list.name.clone(), local.to_owned()))
-        .copied()
-        .map(ValueRef::Field)
 }
 
 fn plan_list_remove_predicate(
@@ -11374,60 +7894,16 @@ fn plan_list_remove_predicate(
     }
 }
 
-fn expr_by_id(program: &TypedProgram, id: usize) -> Option<&AstExpr> {
+fn expr_by_id(program: &ErasedProgram, id: usize) -> Option<&AstExpr> {
     program.expressions.iter().find(|expr| expr.id == id)
 }
 
-fn match_arm_child<'a>(
-    statement: &'a AstStatement,
-    required_pattern: &str,
-    program: &TypedProgram,
-) -> Option<&'a AstStatement> {
-    statement.children.iter().find(|child| {
-        child
-            .expr
-            .and_then(|expr_id| match &expr_by_id(program, expr_id)?.kind {
-                AstExprKind::MatchArm { pattern, .. } => {
-                    Some(pattern.iter().any(|item| item == required_pattern))
-                }
-                _ => None,
-            })
-            .unwrap_or(false)
-    })
-}
-
-fn match_arm_output_id(program: &TypedProgram, statement: &AstStatement) -> Option<usize> {
-    let expr = expr_by_id(program, statement.expr?)?;
-    let AstExprKind::MatchArm { output, .. } = &expr.kind else {
-        return None;
-    };
-    (*output).or_else(|| statement.children.first().and_then(|child| child.expr))
-}
-
-fn expression_path_string(program: &TypedProgram, expr_id: usize) -> Option<String> {
+fn expression_path_string(program: &ErasedProgram, expr_id: usize) -> Option<String> {
     match &expr_by_id(program, expr_id)?.kind {
         AstExprKind::Identifier(value) => Some(value.clone()),
         AstExprKind::Path(parts) => Some(boon_parser::canonical_value_path(parts)),
         _ => None,
     }
-}
-
-fn text_trim_input_path(
-    program: &TypedProgram,
-    expr_id: usize,
-    derived_path: &str,
-) -> Option<String> {
-    let expr = expr_by_id(program, expr_id)?;
-    let path = match &expr.kind {
-        AstExprKind::Pipe { input, op, .. } if op == "Text/trim" => {
-            expression_path_string(program, *input)?
-        }
-        AstExprKind::Call { function, args } if function == "Text/trim" => {
-            expression_path_string(program, args.first()?.value)?
-        }
-        _ => return None,
-    };
-    Some(canonical_sibling_path(derived_path, &path))
 }
 
 fn canonical_sibling_path(parent_path: &str, path: &str) -> String {
@@ -11438,88 +7914,6 @@ fn canonical_sibling_path(parent_path: &str, path: &str) -> String {
         .rsplit_once('.')
         .map(|(parent, _)| format!("{parent}.{path}"))
         .unwrap_or_else(|| path.to_owned())
-}
-
-fn scoped_resolution_candidates(parent_path: &str, path: &str) -> Vec<String> {
-    let parent_root = parent_path.split('.').next();
-    let path_root = path.split('.').next();
-    let explicitly_qualified = path.contains('.')
-        && (path_root == parent_root
-            || path_root.is_some_and(|root| matches!(root, "Client" | "Session" | "Server")));
-    let mut candidates = Vec::new();
-    if explicitly_qualified {
-        candidates.push(path.to_owned());
-    }
-    let mut scope = parent_path.rsplit_once('.').map(|(parent, _)| parent);
-    while let Some(parent) = scope {
-        candidates.push(format!("{parent}.{path}"));
-        scope = parent.rsplit_once('.').map(|(grandparent, _)| grandparent);
-    }
-    if !explicitly_qualified {
-        candidates.push(path.to_owned());
-    }
-    if let Some((_, local_name)) = path.rsplit_once('.') {
-        candidates.push(local_name.to_owned());
-    }
-    candidates.dedup();
-    candidates
-}
-
-fn when_has_empty_skip_and_passthrough(statement: &AstStatement, program: &TypedProgram) -> bool {
-    let mut has_empty_skip = false;
-    let mut has_passthrough = false;
-    for child in &statement.children {
-        let Some(expr_id) = child.expr else {
-            continue;
-        };
-        let Some(expr) = expr_by_id(program, expr_id) else {
-            continue;
-        };
-        let AstExprKind::MatchArm { pattern, output } = &expr.kind else {
-            continue;
-        };
-        if pattern.iter().any(|item| item == "TEXT" || item == "{}")
-            && match_arm_outputs_skip(program, *output, child)
-        {
-            has_empty_skip = true;
-        }
-        if pattern.len() == 1 && match_arm_outputs_identifier(program, *output, child, &pattern[0])
-        {
-            has_passthrough = true;
-        }
-    }
-    has_empty_skip && has_passthrough
-}
-
-fn match_arm_outputs_skip(
-    program: &TypedProgram,
-    output: Option<usize>,
-    statement: &AstStatement,
-) -> bool {
-    match_arm_output_expr(program, output, statement).is_some_and(|expr| {
-        matches!(&expr.kind, AstExprKind::Identifier(value) | AstExprKind::Tag(value) if value == "SKIP")
-    })
-}
-
-fn match_arm_outputs_identifier(
-    program: &TypedProgram,
-    output: Option<usize>,
-    statement: &AstStatement,
-    expected: &str,
-) -> bool {
-    match_arm_output_expr(program, output, statement).is_some_and(
-        |expr| matches!(&expr.kind, AstExprKind::Identifier(value) if value == expected),
-    )
-}
-
-fn match_arm_output_expr<'a>(
-    program: &'a TypedProgram,
-    output: Option<usize>,
-    statement: &AstStatement,
-) -> Option<&'a AstExpr> {
-    output
-        .or_else(|| statement.children.first().and_then(|child| child.expr))
-        .and_then(|expr_id| expr_by_id(program, expr_id))
 }
 
 fn update_constant_id_for_expression(
@@ -11576,8 +7970,7 @@ fn update_constant_value(value: &str, target_type: &PlanValueType) -> Option<Pla
         PlanValueType::Enum => Some(PlanConstantValue::Enum {
             value: value.to_owned(),
         }),
-        PlanValueType::Bytes { .. } => None,
-        PlanValueType::Data => None,
+        PlanValueType::Bytes { .. } | PlanValueType::Data => None,
         PlanValueType::RootInitialField
         | PlanValueType::RowInitialField
         | PlanValueType::Unknown => match value {
@@ -11591,7 +7984,6 @@ fn update_constant_value(value: &str, target_type: &PlanValueType) -> Option<Pla
         },
     }
 }
-
 fn match_const_output_constant_value(
     value: &str,
     target_type: &PlanValueType,
@@ -11854,50 +8246,6 @@ fn collect_update_expression_refs(
             }
             count
         }
-        UpdateExpression::ListFindValue {
-            list,
-            field,
-            expected,
-            target: value_target,
-            fallback,
-        } => {
-            let list_paths = scoped_resolution_candidates(target, list);
-            let Some(resolved_list_path) =
-                list_paths
-                    .iter()
-                    .find(|list_path| match index.resolve(list_path) {
-                        Some(ValueRef::List(list_id)) => {
-                            refs.push(ValueRef::List(list_id));
-                            true
-                        }
-                        _ => false,
-                    })
-            else {
-                unresolved.insert(list.clone());
-                return 1;
-            };
-            let mut count = 0;
-            for field_path in [
-                format!("{resolved_list_path}.{field}"),
-                format!("{resolved_list_path}.{value_target}"),
-            ] {
-                if let Some(ValueRef::Field(field_id)) = index.resolve(&field_path) {
-                    refs.push(ValueRef::Field(field_id));
-                } else {
-                    unresolved.insert(field_path);
-                    count += 1;
-                }
-            }
-            count += collect_update_value_expression_refs(
-                index, source, target, indexed, expected, refs, unresolved,
-            );
-            if let Some(fallback) = fallback {
-                count += collect_update_value_expression_refs(
-                    index, source, target, indexed, fallback, refs, unresolved,
-                );
-            }
-            count
-        }
     }
 }
 
@@ -11934,7 +8282,7 @@ fn collect_bytes_scalar_arg_ref(
 }
 
 fn ordered_update_expression_inputs(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     index: &ValueIndex,
     constants: &mut Vec<PlanConstant>,
     source: &str,
@@ -12448,50 +8796,6 @@ fn ordered_update_expression_inputs(
                 };
                 refs.push(ValueRef::Constant(pattern_constant_id));
                 refs.append(&mut output_refs);
-            }
-            refs
-        }
-        UpdateExpression::ListFindValue {
-            list,
-            field,
-            expected,
-            target: value_target,
-            fallback,
-        } => {
-            let list_paths = scoped_resolution_candidates(target, list);
-            let Some((resolved_list_path, list_ref @ ValueRef::List(_))) =
-                list_paths.iter().find_map(|list_path| {
-                    index.resolve(list_path).and_then(|value_ref| {
-                        matches!(value_ref, ValueRef::List(_))
-                            .then_some((list_path.as_str(), value_ref))
-                    })
-                })
-            else {
-                return Vec::new();
-            };
-            let Some(field_ref @ ValueRef::Field(_)) =
-                index.resolve(&format!("{resolved_list_path}.{field}"))
-            else {
-                return Vec::new();
-            };
-            let Some(expected_ref) = update_value_expression_value_ref(
-                index, constants, source, target, indexed, expected,
-            ) else {
-                return Vec::new();
-            };
-            let Some(target_ref @ ValueRef::Field(_)) =
-                index.resolve(&format!("{resolved_list_path}.{value_target}"))
-            else {
-                return Vec::new();
-            };
-            let mut refs = vec![list_ref, field_ref, expected_ref, target_ref];
-            if let Some(fallback) = fallback {
-                let Some(fallback_ref) = update_value_expression_value_ref(
-                    index, constants, source, target, indexed, fallback,
-                ) else {
-                    return Vec::new();
-                };
-                refs.push(fallback_ref);
             }
             refs
         }
@@ -13038,7 +9342,7 @@ fn source_row_lookup_payload_field_from_path(
 }
 
 fn source_field_payload_aliases_from_program(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     source_payload_fields: &BTreeMap<String, BTreeSet<SourcePayloadField>>,
     source_row_lookup_fields: &BTreeMap<String, String>,
 ) -> BTreeMap<(String, String), SourcePayloadField> {
@@ -13094,7 +9398,7 @@ fn source_field_payload_aliases_from_program(
 }
 
 fn source_event_transform_row_lookup_payload_alias(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
     source: &str,
     source_payload_fields: &BTreeMap<String, BTreeSet<SourcePayloadField>>,
@@ -13137,7 +9441,7 @@ fn source_row_lookup_payload_field_from_path_maps(
 }
 
 fn pure_latest_reference_paths(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
 ) -> Vec<String> {
     let exprs = super::compiler_statement_ast_exprs(&derived.statement, &program.expressions);
@@ -13407,7 +9711,6 @@ fn update_expression_kind(expression: &UpdateExpression) -> PlanExpressionKind {
         UpdateExpression::MatchValueConst { .. } => PlanExpressionKind::MatchValueConst,
         UpdateExpression::MatchTextIsEmptyConst { .. } => PlanExpressionKind::MatchTextIsEmptyConst,
         UpdateExpression::MatchInfixConst { .. } => PlanExpressionKind::MatchInfixConst,
-        UpdateExpression::ListFindValue { .. } => PlanExpressionKind::ListFindValue,
         UpdateExpression::Unknown { .. } => PlanExpressionKind::Unknown,
     }
 }
@@ -13420,30 +9723,31 @@ fn unique_value_refs(value_refs: Vec<ValueRef>) -> Vec<ValueRef> {
         .collect()
 }
 
-fn delta_routes(program: &TypedProgram) -> Vec<DeltaRoute> {
-    let mut routes = Vec::new();
+fn delta_routes(program: &ErasedProgram) -> Vec<DeltaRoute> {
+    let mut outputs = BTreeSet::new();
     for state in &program.state_cells {
-        routes.push(DeltaRoute {
-            id: PlanDeltaId(routes.len()),
-            output: ValueRef::State(plan_state_id(state.id)),
-        });
+        outputs.insert(ValueRef::State(plan_state_id(state.id)));
     }
     for list in &program.lists {
-        routes.push(DeltaRoute {
-            id: PlanDeltaId(routes.len()),
-            output: ValueRef::List(plan_list_id(list.id)),
-        });
+        outputs.insert(ValueRef::List(plan_list_id(list.id)));
     }
     for derived in &program.derived_values {
-        routes.push(DeltaRoute {
-            id: PlanDeltaId(routes.len()),
-            output: derived_output_ref(program, derived),
-        });
+        outputs.insert(derived_output_ref(program, derived));
     }
-    routes
+    outputs
+        .into_iter()
+        .enumerate()
+        .map(|(id, output)| DeltaRoute {
+            id: PlanDeltaId(id),
+            output,
+        })
+        .collect()
 }
 
-fn derived_output_ref(program: &TypedProgram, derived: &boon_ir::DerivedValue) -> ValueRef {
+fn derived_output_ref(program: &ErasedProgram, derived: &boon_ir::DerivedValue) -> ValueRef {
+    if let Some(list) = derived.materialized_list_id {
+        return ValueRef::List(plan_list_id(list));
+    }
     if let Some(field) = program
         .semantic_index
         .fields
@@ -13457,7 +9761,10 @@ fn derived_output_ref(program: &TypedProgram, derived: &boon_ir::DerivedValue) -
 
 struct ValueIndex {
     by_path: BTreeMap<String, ValueRef>,
-    distributed_by_expr: BTreeMap<usize, ValueRef>,
+    by_storage: BTreeMap<ir::StorageBindingId, ValueRef>,
+    distributed_by_expression: BTreeMap<ir::ExecutableExprId, ValueRef>,
+    source_by_executable: BTreeMap<ir::ExecutableSourceId, ValueRef>,
+    state_by_executable: BTreeMap<ir::ExecutableStateId, ValueRef>,
     source_payload_fields: BTreeMap<String, BTreeSet<SourcePayloadField>>,
     source_row_lookup_fields: BTreeMap<String, String>,
     source_field_payload_aliases: BTreeMap<(String, String), SourcePayloadField>,
@@ -13468,13 +9775,14 @@ struct ValueIndex {
 
 impl ValueIndex {
     fn new(
-        program: &TypedProgram,
+        program: &ErasedProgram,
         root_field_types: &RootInitialFieldTypeMap,
         row_field_types: &RowInitialFieldTypeMap,
-        distributed_by_expr: &BTreeMap<usize, ValueRef>,
+        distributed_by_expression: &BTreeMap<ir::ExecutableExprId, ValueRef>,
         distributed_by_path: &BTreeMap<String, ValueRef>,
     ) -> Self {
         let mut by_path = BTreeMap::new();
+        let mut by_storage = BTreeMap::new();
         let mut source_payload_fields = BTreeMap::new();
         let mut source_row_lookup_fields = BTreeMap::new();
         let mut state_value_types = BTreeMap::new();
@@ -13485,6 +9793,10 @@ impl ValueIndex {
         for source in &program.sources {
             by_path.insert(
                 source.path.clone(),
+                ValueRef::Source(plan_source_id(source.id)),
+            );
+            by_path.insert(
+                source.binding_path.clone(),
                 ValueRef::Source(plan_source_id(source.id)),
             );
             source_payload_fields.insert(
@@ -13500,6 +9812,15 @@ impl ValueIndex {
                 source_row_lookup_fields.insert(source.path.clone(), row_lookup_field.to_owned());
             }
         }
+        let source_by_executable = program
+            .sources
+            .iter()
+            .filter_map(|source| {
+                source
+                    .executable_source_id
+                    .map(|executable| (executable, ValueRef::Source(plan_source_id(source.id))))
+            })
+            .collect();
         for state in &program.state_cells {
             by_path.insert(state.path.clone(), ValueRef::State(plan_state_id(state.id)));
             state_value_types.insert(
@@ -13518,6 +9839,15 @@ impl ValueIndex {
                 ),
             );
         }
+        let state_by_executable = program
+            .state_cells
+            .iter()
+            .filter_map(|state| {
+                state
+                    .executable_state_id
+                    .map(|executable| (executable, ValueRef::State(plan_state_id(state.id))))
+            })
+            .collect();
         for branch in &program.update_branches {
             let UpdateExpression::HostEffect { operation, .. } = &branch.expression else {
                 continue;
@@ -13582,6 +9912,26 @@ impl ValueIndex {
             }
             by_path.insert(derived.path.clone(), output_ref);
         }
+        for binding in &program.storage.bindings {
+            let value = match binding.kind {
+                ir::StorageBindingKind::Value {
+                    list: Some(list), ..
+                } => Some(ValueRef::List(plan_list_id(list))),
+                ir::StorageBindingKind::Value {
+                    field: Some(field), ..
+                } => Some(ValueRef::Field(plan_field_id(field))),
+                ir::StorageBindingKind::Value { .. } => None,
+                ir::StorageBindingKind::Source { runtime, .. } => {
+                    Some(ValueRef::Source(plan_source_id(runtime)))
+                }
+                ir::StorageBindingKind::State { runtime, .. } => {
+                    Some(ValueRef::State(plan_state_id(runtime)))
+                }
+            };
+            if let Some(value) = value {
+                by_storage.insert(binding.id, value);
+            }
+        }
         for field in &program.semantic_index.fields {
             by_path
                 .entry(field.path.clone())
@@ -13597,7 +9947,10 @@ impl ValueIndex {
         );
         Self {
             by_path,
-            distributed_by_expr: distributed_by_expr.clone(),
+            by_storage,
+            distributed_by_expression: distributed_by_expression.clone(),
+            source_by_executable,
+            state_by_executable,
             source_payload_fields,
             source_row_lookup_fields,
             source_field_payload_aliases,
@@ -13614,19 +9967,20 @@ impl ValueIndex {
             .or_else(|| self.resolve_state_projection(path))
     }
 
-    fn resolve_unique_suffix(&self, path: &str) -> Option<ValueRef> {
-        let suffix = format!(".{path}");
-        let mut matches = self
-            .by_path
-            .iter()
-            .filter(|(candidate, _)| candidate.as_str() == path || candidate.ends_with(&suffix))
-            .map(|(_, value_ref)| value_ref.clone());
-        let first = matches.next()?;
-        matches.all(|candidate| candidate == first).then_some(first)
+    fn resolve_storage(&self, binding: ir::StorageBindingId) -> Option<ValueRef> {
+        self.by_storage.get(&binding).cloned()
     }
 
-    fn resolve_distributed_expression(&self, expr_id: usize) -> Option<ValueRef> {
-        self.distributed_by_expr.get(&expr_id).cloned()
+    fn resolve_distributed_expression(&self, expression: ir::ExecutableExprId) -> Option<ValueRef> {
+        self.distributed_by_expression.get(&expression).cloned()
+    }
+
+    fn resolve_executable_source(&self, source: ir::ExecutableSourceId) -> Option<ValueRef> {
+        self.source_by_executable.get(&source).cloned()
+    }
+
+    fn resolve_executable_state(&self, state: ir::ExecutableStateId) -> Option<ValueRef> {
+        self.state_by_executable.get(&state).cloned()
     }
 
     fn resolve_state_projection(&self, path: &str) -> Option<ValueRef> {

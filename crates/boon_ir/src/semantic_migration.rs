@@ -1,6 +1,7 @@
 use super::{
-    ExprId, FieldDef, FieldId, ListId, ListMemory, RowScope, ScopeId, SemanticMemoryId, StateCell,
-    StateId, is_output_registry_value_path, statement_expr_ids_recursive,
+    DerivedListStorageIds, ExecutableStatementId, ExprId, FieldDef, FieldId, ListId, ListMemory,
+    RowScope, ScopeId, SemanticMemoryId, StateCell, StateId, is_output_registry_value_path,
+    scope_id_for_path, statement_expr_ids_recursive,
 };
 use boon_parser::{
     AstDrainPath, AstExpr, AstExprKind, AstStatement, AstStatementKind, ParsedProgram,
@@ -152,18 +153,20 @@ pub(super) fn lower_semantic_memory_and_migrations(
     row_scopes: &[RowScope],
     state_cells: &[StateCell],
     lists: &[ListMemory],
+    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
     typecheck_report: &TypeCheckReport,
 ) -> Result<(Vec<SemanticMemory>, Vec<MigrationEdge>), String> {
-    let migration_fields = migration_field_defs(program, fields);
-    let fields = migration_fields.as_slice();
     let mut memory = build_semantic_memory(
         program,
         fields,
         row_scopes,
         state_cells,
         lists,
+        derived_list_storage,
         typecheck_report,
-    );
+    )?;
+    let migration_fields = migration_field_defs(program, fields);
+    let fields = migration_fields.as_slice();
     let has_markers = program.expressions.iter().any(|expr| {
         matches!(
             expr.kind,
@@ -175,9 +178,9 @@ pub(super) fn lower_semantic_memory_and_migrations(
     }
 
     let parents = expression_parents(&program.expressions);
-    associate_draining_markers(program, fields, &parents, &mut memory)?;
+    associate_draining_markers(program, fields, state_cells, &parents, &mut memory)?;
     let mut drains = {
-        let authority = AuthorityIndex::new(&memory);
+        let authority = AuthorityIndex::new(&memory, state_cells);
         collect_drains(
             program,
             fields,
@@ -190,7 +193,7 @@ pub(super) fn lower_semantic_memory_and_migrations(
     };
     refine_identity_destination_types(&mut memory, &mut drains);
     validate_pairs_and_coverage(&memory, &drains)?;
-    let authority = AuthorityIndex::new(&memory);
+    let authority = AuthorityIndex::new(&memory, state_cells);
     validate_no_ordinary_draining_reads(program, fields, &memory, &authority)?;
     let edges = lower_edges(program, typecheck_report, &memory, &drains)?;
     validate_migration_cycles(&memory, &edges)?;
@@ -204,8 +207,9 @@ fn build_semantic_memory(
     row_scopes: &[RowScope],
     state_cells: &[StateCell],
     lists: &[ListMemory],
+    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
     report: &TypeCheckReport,
-) -> Vec<SemanticMemory> {
+) -> Result<Vec<SemanticMemory>, String> {
     let list_paths = lists
         .iter()
         .map(|list| (list.id, semantic_list_path(list, fields)))
@@ -213,22 +217,43 @@ fn build_semantic_memory(
     let list_types = lists
         .iter()
         .map(|list| {
+            let typed = derived_list_storage
+                .values()
+                .find(|storage| storage.list_id == list.id)
+                .map(|storage| SemanticDataType::List {
+                    item: Box::new(semantic_data_type(&storage.item_type)),
+                });
             (
                 list.id,
-                semantic_type_for_list(program, list, fields, report),
+                typed.unwrap_or_else(|| semantic_type_for_list(program, list, fields, report)),
             )
         })
         .collect::<BTreeMap<_, _>>();
     let mut memory = Vec::with_capacity(state_cells.len() + lists.len());
 
     for state in state_cells {
-        let field = fields.iter().find(|field| field.path == state.path);
-        let field_id = field.and_then(|field| {
-            fields
-                .iter()
-                .position(|candidate| candidate.path == field.path)
-                .map(FieldId)
-        });
+        let field_candidates = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.statement.id == state.statement_id)
+            .filter(|(_, field)| scope_id_for_path(row_scopes, &field.path) == state.scope_id)
+            .collect::<Vec<_>>();
+        let (field_id, field) = match field_candidates.as_slice() {
+            [] => (None, None),
+            [(id, field)] => (Some(FieldId(*id)), Some(*field)),
+            _ => {
+                return Err(format!(
+                    "state `{}` statement {} scope {:?} resolves to multiple semantic fields {:?}",
+                    state.path,
+                    state.statement_id,
+                    state.scope_id,
+                    field_candidates
+                        .iter()
+                        .map(|(_, field)| field.path.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        };
         let mut data_type = semantic_type_for_state(state, field, report);
         let (kind, owner_path, runtime_backing) = if let Some(scope_id) = state.scope_id {
             let row_scope = row_scopes.iter().find(|scope| scope.id == scope_id);
@@ -274,10 +299,14 @@ fn build_semantic_memory(
                 },
             )
         };
+        let semantic_path = state
+            .semantic_path
+            .clone()
+            .unwrap_or_else(|| state.path.clone());
         let identity = SemanticMemoryIdentity {
             canonical_module: canonical_module_for_line(program, state.source_line),
             owner_path,
-            semantic_path: state.path.clone(),
+            semantic_path,
             kind,
         };
         memory.push(SemanticMemory {
@@ -337,7 +366,7 @@ fn build_semantic_memory(
             },
         });
     }
-    memory
+    Ok(memory)
 }
 
 fn indexed_state_type<'a>(
@@ -406,36 +435,12 @@ fn semantic_type_for_list(
     }
     candidates.sort_unstable();
     candidates.dedup();
-    let template_functions = program
-        .row_scope_functions
-        .iter()
-        .filter(|scope| scope.list == list.name)
-        .map(|scope| scope.function.as_str())
-        .collect::<BTreeSet<_>>();
     let mut data_types = candidates
         .iter()
         .filter_map(|expr_id| checked_type_for_expr(report, *expr_id))
         .map(semantic_data_type)
         .filter(|data_type| matches!(data_type, SemanticDataType::List { .. }))
         .collect::<Vec<_>>();
-    data_types.extend(
-        report
-            .list_map_bindings
-            .iter()
-            .filter(|binding| {
-                (candidates.contains(&binding.map_expr_id)
-                    || binding
-                        .template_function
-                        .as_deref()
-                        .is_some_and(|function| template_functions.contains(function)))
-                    && matches!(
-                        binding.result_kind,
-                        boon_typecheck::ListMapResultKind::RuntimeValue
-                    )
-            })
-            .map(|binding| semantic_data_type(&binding.result_type))
-            .filter(|data_type| matches!(data_type, SemanticDataType::List { .. })),
-    );
     data_types.extend(candidates.iter().filter_map(|expr_id| {
         let AstExprKind::ListLiteral { items, .. } = &program.expressions.get(*expr_id)?.kind
         else {
@@ -728,11 +733,22 @@ struct ResolvedRegion {
 
 struct AuthorityIndex<'a> {
     memory: &'a [SemanticMemory],
+    runtime_aliases: BTreeMap<String, String>,
 }
 
 impl<'a> AuthorityIndex<'a> {
-    fn new(memory: &'a [SemanticMemory]) -> Self {
-        Self { memory }
+    fn new(memory: &'a [SemanticMemory], states: &[StateCell]) -> Self {
+        let runtime_aliases = states
+            .iter()
+            .filter_map(|state| {
+                let semantic = state.semantic_path.as_ref()?;
+                (semantic != &state.path).then(|| (state.path.clone(), semantic.clone()))
+            })
+            .collect();
+        Self {
+            memory,
+            runtime_aliases,
+        }
     }
 
     fn resolve_drain_path(
@@ -808,9 +824,22 @@ impl<'a> AuthorityIndex<'a> {
     }
 
     fn resolve_canonical_path(&self, path: &str) -> Vec<ResolvedRegion> {
+        let canonical = self
+            .runtime_aliases
+            .iter()
+            .filter_map(|(runtime, semantic)| {
+                if path == runtime {
+                    return Some((runtime.len(), semantic.clone()));
+                }
+                let suffix = path.strip_prefix(runtime)?.strip_prefix('.')?;
+                Some((runtime.len(), format!("{semantic}.{suffix}")))
+            })
+            .max_by_key(|(matched, _)| *matched)
+            .map(|(_, canonical)| canonical);
+        let canonical = canonical.as_deref().unwrap_or(path);
         self.memory
             .iter()
-            .filter_map(|memory| region_for_memory_path(memory, path))
+            .filter_map(|memory| region_for_memory_path(memory, canonical))
             .collect()
     }
 }
@@ -935,11 +964,12 @@ fn field_contexts_for_expr(expr_id: usize, fields: &[FieldDef]) -> Vec<&FieldDef
 fn associate_draining_markers(
     program: &ParsedProgram,
     fields: &[FieldDef],
+    states: &[StateCell],
     parents: &BTreeMap<usize, Vec<ParentLink>>,
     memory: &mut [SemanticMemory],
 ) -> Result<(), String> {
     let marker_owners = {
-        let authority = AuthorityIndex::new(memory);
+        let authority = AuthorityIndex::new(memory, states);
         let mut marker_owners = Vec::new();
         for marker in program
             .expressions
@@ -1107,20 +1137,28 @@ fn expression_parents(expressions: &[AstExpr]) -> BTreeMap<usize, Vec<ParentLink
             });
         };
         match &expr.kind {
-            AstExprKind::Call { args, .. } => {
+            AstExprKind::Call { args, pass, .. } => {
                 for arg in args {
                     add(arg.value, ParentRole::Plain);
                 }
+                if let Some(pass) = pass {
+                    add(pass.value, ParentRole::Plain);
+                }
             }
-            AstExprKind::Pipe { input, args, .. } => {
+            AstExprKind::Pipe {
+                input, args, pass, ..
+            } => {
                 add(*input, ParentRole::Plain);
                 for arg in args {
                     add(arg.value, ParentRole::Plain);
                 }
+                if let Some(pass) = pass {
+                    add(pass.value, ParentRole::Plain);
+                }
             }
             AstExprKind::Draining { input } => add(*input, ParentRole::DrainingWrapper),
             AstExprKind::Hold { initial, .. } => add(*initial, ParentRole::AuthorityWrapper),
-            AstExprKind::When { input } => add(*input, ParentRole::AuthorityWrapper),
+            AstExprKind::When { input, .. } => add(*input, ParentRole::AuthorityWrapper),
             AstExprKind::Then { input, output } => {
                 add(*input, ParentRole::AuthorityWrapper);
                 if let Some(output) = output {
@@ -1134,6 +1172,14 @@ fn expression_parents(expressions: &[AstExpr]) -> BTreeMap<usize, Vec<ParentLink
             AstExprKind::MatchArm { output, .. } => {
                 if let Some(output) = output {
                     add(*output, ParentRole::AuthorityWrapper);
+                }
+            }
+            AstExprKind::Block { bindings, result } => {
+                for binding in bindings {
+                    add(binding.value, ParentRole::Plain);
+                }
+                if let Some(result) = result {
+                    add(*result, ParentRole::AuthorityWrapper);
                 }
             }
             AstExprKind::Object(fields)
@@ -1531,7 +1577,7 @@ fn expr_is_pipeline_continuation(expr_id: usize, expressions: &[AstExpr]) -> boo
     let input = match expressions.get(expr_id).map(|expr| &expr.kind) {
         Some(AstExprKind::Pipe { input, .. })
         | Some(AstExprKind::Then { input, .. })
-        | Some(AstExprKind::When { input })
+        | Some(AstExprKind::When { input, .. })
         | Some(AstExprKind::Draining { input })
         | Some(AstExprKind::Hold { initial: input, .. }) => *input,
         _ => return false,
@@ -1545,7 +1591,7 @@ fn expr_chain_starts_with_placeholder(expr_id: usize, expressions: &[AstExpr]) -
         Some(AstExprKind::Unknown(tokens)) => !tokens.is_empty(),
         Some(AstExprKind::Pipe { input, .. })
         | Some(AstExprKind::Then { input, .. })
-        | Some(AstExprKind::When { input })
+        | Some(AstExprKind::When { input, .. })
         | Some(AstExprKind::Draining { input })
         | Some(AstExprKind::Hold { initial: input, .. }) => {
             expr_chain_starts_with_placeholder(*input, expressions)
@@ -1580,18 +1626,30 @@ fn expr_tree_contains_seen(
 
 fn expr_children(expr: &AstExpr) -> Vec<usize> {
     match &expr.kind {
-        AstExprKind::Call { args, .. } => args.iter().map(|arg| arg.value).collect(),
-        AstExprKind::Pipe { input, args, .. } => std::iter::once(*input)
+        AstExprKind::Call { args, pass, .. } => args
+            .iter()
+            .map(|arg| arg.value)
+            .chain(pass.iter().map(|pass| pass.value))
+            .collect(),
+        AstExprKind::Pipe {
+            input, args, pass, ..
+        } => std::iter::once(*input)
             .chain(args.iter().map(|arg| arg.value))
+            .chain(pass.iter().map(|pass| pass.value))
             .collect(),
         AstExprKind::Draining { input }
-        | AstExprKind::When { input }
+        | AstExprKind::When { input, .. }
         | AstExprKind::Hold { initial: input, .. } => vec![*input],
         AstExprKind::Then { input, output } => std::iter::once(*input)
             .chain(output.iter().copied())
             .collect(),
         AstExprKind::Infix { left, right, .. } => vec![*left, *right],
         AstExprKind::MatchArm { output, .. } => output.iter().copied().collect(),
+        AstExprKind::Block { bindings, result } => bindings
+            .iter()
+            .map(|binding| binding.value)
+            .chain(result.iter().copied())
+            .collect(),
         AstExprKind::Object(fields)
         | AstExprKind::Record(fields)
         | AstExprKind::TaggedObject { fields, .. } => {
@@ -2079,35 +2137,48 @@ impl PurityChecker<'_> {
                 "migration transform at line {} reads SOURCE data",
                 expr.line
             )),
-            AstExprKind::Call { function, args } => {
+            AstExprKind::Call {
+                function,
+                args,
+                pass,
+            } => {
+                let mut local_params = params.clone();
+                local_params.extend(
+                    args.iter()
+                        .filter(|arg| arg.is_bare_binding())
+                        .map(|arg| arg.name.clone()),
+                );
                 for arg in args {
-                    self.check_expr(arg.value, params, false)?;
+                    if arg.named_name().is_some() {
+                        self.check_expr(arg.value, &local_params, false)?;
+                    }
+                }
+                if let Some(pass) = pass {
+                    self.check_expr(pass.value, params, false)?;
                 }
                 self.check_call(function, expr.line)
             }
-            AstExprKind::Pipe { input, op, args } => {
+            AstExprKind::Pipe {
+                input,
+                op,
+                args,
+                pass,
+                ..
+            } => {
                 self.check_expr(*input, params, true)?;
                 let mut local_params = params.clone();
-                let binding_arg = matches!(op.as_str(), "List/map" | "List/retain")
-                    .then(|| args.first())
-                    .flatten()
-                    .filter(|arg| arg.name.is_none())
-                    .and_then(|arg| self.program.expressions.get(arg.value))
-                    .and_then(|expr| match &expr.kind {
-                        AstExprKind::Identifier(name) => Some((expr.id, name.clone())),
-                        _ => None,
-                    });
-                if let Some((_, binding)) = &binding_arg {
-                    local_params.insert(binding.clone());
-                }
+                local_params.extend(
+                    args.iter()
+                        .filter(|arg| arg.is_bare_binding())
+                        .map(|arg| arg.name.clone()),
+                );
                 for arg in args {
-                    if binding_arg
-                        .as_ref()
-                        .is_some_and(|(expr_id, _)| *expr_id == arg.value)
-                    {
-                        continue;
+                    if arg.named_name().is_some() {
+                        self.check_expr(arg.value, &local_params, false)?;
                     }
-                    self.check_expr(arg.value, &local_params, false)?;
+                }
+                if let Some(pass) = pass {
+                    self.check_expr(pass.value, params, false)?;
                 }
                 self.check_call(op, expr.line)
             }
@@ -2130,11 +2201,22 @@ impl PurityChecker<'_> {
                 Ok(())
             }
             AstExprKind::Delimiter if allow_placeholder => Ok(()),
-            AstExprKind::When { input } => self.check_expr(*input, params, true),
+            AstExprKind::When { input, .. } => self.check_expr(*input, params, true),
             AstExprKind::MatchArm { output, .. } => match output {
                 Some(output) => self.check_expr(*output, params, false),
                 None => Ok(()),
             },
+            AstExprKind::Block { bindings, result } => {
+                let mut local_params = params.clone();
+                local_params.extend(bindings.iter().map(|binding| binding.name.clone()));
+                for binding in bindings {
+                    self.check_expr(binding.value, &local_params, false)?;
+                }
+                if let Some(result) = result {
+                    self.check_expr(*result, &local_params, false)?;
+                }
+                Ok(())
+            }
             AstExprKind::StringLiteral(_)
             | AstExprKind::TextLiteral(_)
             | AstExprKind::Number(_)
@@ -2179,10 +2261,13 @@ impl PurityChecker<'_> {
                 "migration transform purity cannot prove recursive function `{function}` deterministic"
             ));
         }
-        let AstStatementKind::Function { args, .. } = &statement.kind else {
+        let AstStatementKind::Function { parameters, .. } = &statement.kind else {
             unreachable!();
         };
-        let params = args.iter().cloned().collect::<BTreeSet<_>>();
+        let params = parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<BTreeSet<_>>();
         self.active_functions.push(function.to_owned());
         let result = self.check_function_body(statement, &params);
         self.active_functions.pop();
@@ -2295,16 +2380,13 @@ fn pure_builtin(function: &str) -> bool {
             | "Bytes/write_unsigned"
             | "Bytes/write_signed"
             | "List/map"
+            | "List/filter"
             | "List/retain"
             | "List/range"
             | "List/chunk"
-            | "List/filter_text_contains"
-            | "List/filter_field_equal"
-            | "List/filter_field_not_equal"
             | "List/move_field_first"
             | "List/move_field_last"
             | "List/find"
-            | "List/find_value"
             | "List/get"
             | "List/count"
             | "List/length"
@@ -2312,7 +2394,7 @@ fn pure_builtin(function: &str) -> bool {
             | "List/every"
             | "List/any"
             | "List/is_not_empty"
-            | "List/join_field"
+            | "Text/join"
             | "Error/new"
             | "Error/text"
     ) || function.starts_with("Field/")

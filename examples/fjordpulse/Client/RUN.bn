@@ -553,7 +553,7 @@ store: [
 
     map_locating:
         False |> HOLD map_locating {
-            elements.map.locate.events.press |> THEN { Bool/not(map_locating) }
+            elements.map.locate.events.press |> THEN { map_locating |> Bool/not() }
         }
 
     map_state:

@@ -403,6 +403,13 @@ projections, for example `List/filter(item, if: ...)` and
 compile-time metadata. User data access must not be encoded as quoted field
 names merely to help a backend recognize an operation.
 
+`List/filter_field_equal` and `List/filter_field_not_equal` are removed rather
+than retained as convenience aliases. Their canonical replacements are typed
+predicates such as `List/filter(item, if: item.family == family)` and
+`List/filter(item, if: item.family != family)`. The typed IR may infer an
+indexed equality lookup from those predicates, but that optimization is never
+expressed through a quoted field name in Boon source.
+
 ## Order-Independent Lexical Binding
 
 Declarations are collected before references are resolved within a lexical
@@ -952,6 +959,8 @@ The migration should also enforce already-agreed call consistency:
   argument;
 - `List/find_value` and reflective `List/find(field:, value:)` are replaced by
   typed `List/find(item, if:) -> Found | NotFound`;
+- `List/filter_field_equal` and `List/filter_field_not_equal` are replaced by
+  typed `List/filter(item, if:)` predicates;
 - `List/chunk` exposes canonical `.items` and `.label` fields rather than
   accepting caller-selected field names;
 - one-input `LATEST` is rejected because it performs no merge or selection;
@@ -1131,7 +1140,8 @@ dual execution path, or permanent syntax adapter may ship.
   branches on example or component identity.
 - Scan for the removed positional/renaming call fallbacks and hardcoded
   contextual `List/map` handling.
-- Scan for `ListMapBinding`, `List/find_value`, reflective `List/find`, renamed
+- Scan for `ListMapBinding`, `List/find_value`, reflective `List/find`,
+  `List/filter_field_equal`, `List/filter_field_not_equal`, renamed
   `List/chunk` result fields, parser row-scope heuristics, AST-consuming
   executable backends, runtime output handles, positional owner recovery, and
   default generation/event-route fallbacks.

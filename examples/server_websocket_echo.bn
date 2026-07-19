@@ -197,7 +197,7 @@ store: [
 ]
 
 outputs: [
-    websocket_actions: store.action_seed |> List/map(seed, new: websocket_action(kind: store.action_kind, status: store.action_status, body_kind: store.action_body_kind, body_text: store.action_body_text, frame_kind: store.action_frame_kind, text: store.action_text, bytes: store.action_bytes, room: store.action_room, code: store.action_code, reason: store.action_reason))
+    websocket_actions: store.action_seed |> List/map(item, new: websocket_action(kind: store.action_kind, status: store.action_status, body_kind: store.action_body_kind, body_text: store.action_body_text, frame_kind: store.action_frame_kind, text: store.action_text, bytes: store.action_bytes, room: store.action_room, code: store.action_code, reason: store.action_reason))
 ]
 
 host_ports: [

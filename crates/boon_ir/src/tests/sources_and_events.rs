@@ -89,24 +89,22 @@ store: [
     clear: SOURCE
     active_file:
         TEXT { first } |> HOLD active_file {
-            LATEST {
-                clear |> THEN { TEXT { none } }
-            }
+            clear |> THEN { TEXT { none } }
         }
     rows:
         LIST {
             [file: TEXT { first }]
             [file: TEXT { second }]
         }
-        |> List/map(row, new: selectable_row(row: row))
+        |> List/map(item, new: selectable_row(row: item))
     visible_rows:
         rows
-        |> List/filter_field_equal(field: "file", value: active_file)
+        |> List/filter(item, if: item.file == active_file)
     selected:
         visible_rows
-        |> List/map(visible_row, new:
-            visible_row.controls.select.event.press
-                |> THEN { visible_row.file }
+        |> List/map(item, new:
+            item.controls.select.event.press
+                |> THEN { item.file }
         )
         |> List/latest()
 ]
@@ -199,13 +197,13 @@ fn view_row_source_alias_resolves_to_unique_canonical_source_path() {
 #[test]
 fn selected_row_source_projection_resolves_by_unique_source_suffix() {
     let sources = [
-        ("cell.sources.editor.change", SourceId(0)),
-        ("cell.sources.editor.commit", SourceId(1)),
+        ("item.sources.editor.change", SourceId(0)),
+        ("item.sources.editor.commit", SourceId(1)),
     ];
     assert_eq!(
         canonical_view_source_path(&sources, "store.selected_input.sources.editor.change")
             .map(|(path, source_id)| (path, source_id.as_usize())),
-        Some(("cell.sources.editor.change", 0))
+        Some(("item.sources.editor.change", 0))
     );
 
     let ambiguous = [
@@ -249,11 +247,9 @@ elements: [
 ]
 zoom_step:
     0 |> HOLD zoom_step {
-        LATEST {
-            elements.keyboard_capture.key |> WHEN {
-                W => zoom_step * 2
-                __ => SKIP
-            }
+        elements.keyboard_capture.key |> WHEN {
+            W => zoom_step * 2
+            __ => SKIP
         }
     }
 ]
@@ -271,37 +267,34 @@ zoom_step:
 #[test]
 fn projected_helper_field_access_does_not_create_persistent_helper_fields() {
     let source = r#"
-SOURCE
-HOLD
-LATEST
 store: [
-flavors:
-    LIST {
-        [id: TEXT { left }, suffix: TEXT { left }]
-        [id: TEXT { right }, suffix: TEXT { right }]
-    }
-rows:
-    LIST {
-        [id: TEXT { a }, name: TEXT { A }]
-    }
-projected:
-    flavors |> List/map(flavor, new: projected_flavor(flavor: flavor))
+    flavors:
+        LIST {
+            [id: TEXT { left }, suffix: TEXT { left }]
+            [id: TEXT { right }, suffix: TEXT { right }]
+        }
+    rows:
+        LIST {
+            [id: TEXT { a }, name: TEXT { A }]
+        }
+    projected:
+        flavors |> List/map(item, new: projected_flavor(flavor: item))
 ]
 
 FUNCTION projected_flavor(flavor) {
-[
-    flavor_id: flavor.id
-    detail_label:
-        rows
-        |> List/map(row, new: detail_row(row: row, suffix: flavor.suffix).label)
-        |> List/latest()
-]
+    [
+        flavor_id: flavor.id
+        detail_label:
+            rows
+            |> List/map(item, new: detail_row(row: item, suffix: flavor.suffix).label)
+            |> List/latest()
+    ]
 }
 
 FUNCTION detail_row(row, suffix) {
-[
-    label: row.name |> Text/concat(with: suffix, separator: ":")
-]
+    [
+        label: row.name |> Text/concat(with: suffix, separator: ":")
+    ]
 }
 
 document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
@@ -460,10 +453,10 @@ store: [
             [title: TEXT { First }, visible: True]
             [title: TEXT { Hidden }, visible: False]
         }
-        |> List/map(row, new: new_row(title: row.title, visible: row.visible))
+        |> List/map(item, new: new_row(title: item.title, visible: item.visible))
     visible_rows:
         rows
-        |> List/retain(candidate, if: candidate.visible)
+        |> List/retain(item, if: item.visible)
 ]
 
 FUNCTION new_row(title, visible) {
@@ -482,35 +475,47 @@ FUNCTION render_row(item) {
     )
 }
 
+FUNCTION render_rows(list, old: OUT, new) {
+    list |> List/map(item: old, new: new)
+}
+
 document: Document/new(
     root: Element/stripe(
         element: []
         direction: Column
         style: []
         items: store.visible_rows
-            |> List/map(old, new: render_row(item: old))
+            |> render_rows(old, new: render_row(item: old))
     )
 )
 "#;
     let parsed = boon_parser::parse_source("render-row-alias-retain.bn", source).unwrap();
     let ir = lower(&parsed).expect("render aliases must preserve the storage row scope");
 
-    let row_scope = ir
-        .row_scopes
+    let rows = ir
+        .lists
         .iter()
-        .find(|scope| scope.list == "rows" && scope.row_scope == "row")
-        .expect("rows storage scope");
+        .find(|list| list.name == "store.rows")
+        .expect("rows storage");
+    let row_scope = &ir.row_scopes[rows.row_scope_id.expect("rows scope").as_usize()];
+    let visible_rows = ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.visible_rows")
+        .expect("visible rows storage");
+    let visible_scope =
+        &ir.row_scopes[visible_rows.row_scope_id.expect("visible rows scope").as_usize()];
     let source = ir
         .sources
         .iter()
-        .find(|source| source.path == "row.controls.press")
+        .find(|source| source.path == "store.rows.controls.press")
         .expect("row press source");
 
     assert_eq!(source.scope_id, Some(row_scope.id));
     assert!(ir.view_bindings.iter().any(|binding| {
         binding.node_kind == "Button"
             && binding.attr == "press"
-            && binding.path == "row.controls.press"
+            && binding.path == "store.rows.controls.press"
             && binding.kind == ViewBindingKind::Source
             && binding.scope_id == Some(row_scope.id)
             && binding.source_id == Some(source.id)
@@ -518,9 +523,9 @@ document: Document/new(
     assert!(ir.view_bindings.iter().any(|binding| {
         binding.node_kind == "Button"
             && binding.attr == "label"
-            && binding.path == "row.title"
+            && binding.path == "store.visible_rows.title"
             && binding.kind == ViewBindingKind::Data
-            && binding.scope_id == Some(row_scope.id)
+            && binding.scope_id == Some(visible_scope.id)
             && binding.source_id.is_none()
     }));
     assert!(
@@ -668,7 +673,7 @@ store: [
     reset: SOURCE
     seed_rows: LIST { [key: TEXT { row }] }
     rows:
-        seed_rows |> List/map(seed_row, new: selectable_row(seed_row: seed_row))
+        seed_rows |> List/map(item, new: selectable_row(seed_row: item))
     clock_result:
         ClockNotRequested |> HOLD clock_result {
             start |> THEN { Clock/wall() }
@@ -687,9 +692,9 @@ store: [
                 }
                 reset |> THEN { TEXT { fallback } }
                 rows
-                    |> List/map(row, new: LATEST {
-                        row.select |> THEN { row.key }
-                    })
+                    |> List/map(item, new:
+                        item.select |> THEN { item.key }
+                    )
                     |> List/latest()
             }
         }
@@ -734,7 +739,7 @@ store: [
 
     assert!(
         ir.update_branches.iter().any(|branch| {
-            branch.source == "store.elements.search.key_down"
+            branch.source == "store.elements.search.events.key_down"
                 && branch.target == "store.highlighted"
                 && matches!(branch.expression, UpdateExpression::MatchValueConst { .. })
         }),
@@ -853,9 +858,7 @@ fn multiline_list_append_record_preserves_owned_fields() {
 store: [
     elements: [create: SOURCE]
     group_to_create:
-        LATEST {
-            elements.create.event.press |> THEN { TEXT { core } }
-        }
+        elements.create.event.press |> THEN { TEXT { core } }
     groups:
         LIST {}
         |> List/append(item: group_to_create |> THEN {
@@ -864,7 +867,7 @@ store: [
                 members: TEXT { A, B }
             ]
         })
-        |> List/map(group, new: [name: group.name, members: group.members])
+        |> List/map(item, new: [name: item.name, members: item.members])
 ]
 "#;
     let parsed = boon_parser::parse_source("multiline-list-append.bn", source).unwrap();
@@ -873,7 +876,9 @@ store: [
         .list_operations
         .iter()
         .find(|operation| {
-            operation.list == "groups" && matches!(operation.kind, ListOperationKind::Append { .. })
+            operation.list == "store.groups"
+                && ir.lists[operation.list_id.as_usize()].name == operation.list
+                && matches!(operation.kind, ListOperationKind::Append { .. })
         })
         .expect("groups append operation");
     let ListOperationKind::Append { trigger, fields } = &append.kind else {
@@ -923,7 +928,7 @@ store: [
     let items = ir
         .lists
         .iter()
-        .find(|list| list.name == "items")
+        .find(|list| list.name == "store.items")
         .expect("items list memory");
     let ListInitializer::RecordLiteral { rows } = &items.initializer else {
         panic!("expected typed record rows, got {:?}", items.initializer);
@@ -972,7 +977,11 @@ FUNCTION place(id, name, x, y) {
     )
     .unwrap();
     let ir = lower(&parsed).unwrap();
-    let places = ir.lists.iter().find(|list| list.name == "places").unwrap();
+    let places = ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.places")
+        .unwrap();
     let ListInitializer::RecordLiteral { rows } = &places.initializer else {
         panic!("function-built records must be authoritative rows");
     };
@@ -1012,9 +1021,7 @@ store: [
             pulse |> THEN { count + 1 }
         }
     transient:
-        LATEST {
-            pulse |> THEN { count + 10 }
-        }
+        pulse |> THEN { count + 10 }
     derived: count + 20
 ]
 "#;
@@ -1035,9 +1042,26 @@ store: [
             .collect::<Vec<_>>(),
         [("store.count", SemanticMemoryKind::RootScalar)]
     );
-    assert!(ir.derived_values.iter().any(|value| {
-        value.path == "store.transient" && value.kind == DerivedValueKind::SourceEventTransform
-    }));
+    let transient = ir
+        .derived_values
+        .iter()
+        .find(|value| value.path == "store.transient")
+        .expect("transient event transform");
+    assert_eq!(transient.kind, DerivedValueKind::SourceEventTransform);
+    assert_eq!(transient.trigger_arms.len(), 1);
+    let arm = &transient.trigger_arms[0];
+    assert!(matches!(arm.cause, EventCause::Source(_)));
+    let gate = &ir.executable.expressions[arm.gate_expression_id.as_usize()];
+    assert_eq!(gate.id, arm.gate_expression_id);
+    assert_eq!(gate.checked_expr_id, arm.gate_checked_expr_id);
+    assert_eq!(gate.owner, arm.owner);
+    assert!(
+        ir.executable
+            .expressions
+            .get(arm.output_expression_id.as_usize())
+            .is_some_and(|output| output.id == arm.output_expression_id)
+    );
+    assert!(transient.default_roots.is_empty());
     assert!(
         ir.derived_values
             .iter()
@@ -1053,8 +1077,8 @@ store: [
     candidate:
         add |> THEN {
             entries
-            |> List/any(entry, if:
-                entry.id == add.text
+            |> List/any(item, if:
+                item.id == add.text
             )
             |> WHEN {
                 True => SKIP
@@ -1066,24 +1090,25 @@ store: [
     entries:
         LIST {}
         |> List/append(item: candidate)
-        |> List/map(entry, new: entry_view(entry: entry))
+        |> List/map(item, new: entry_view(entry: item))
 ]
 
 FUNCTION entry_view(entry) {
-[
-    id: entry.id
-]
+    [
+        id: entry.id
+    ]
 }
 "#;
     let parsed = boon_parser::parse_source("unique-append.bn", source).unwrap();
     let ir = lower(&parsed).expect("authoritative list ownership must break the feedback cycle");
 
-    assert!(ir.lists.iter().any(|list| list.name == "entries"));
+    assert!(ir.lists.iter().any(|list| list.name == "store.entries"));
     let append = ir
         .list_operations
         .iter()
         .find(|operation| {
-            operation.list == "entries"
+            operation.list == "store.entries"
+                && ir.lists[operation.list_id.as_usize()].name == operation.list
                 && matches!(operation.kind, ListOperationKind::Append { .. })
         })
         .expect("entries append operation");
@@ -1120,8 +1145,8 @@ store: [
         |> List/append(item: controls.append |> THEN {
             [completed: False]
         })
-        |> List/map(row, new: new_row(initial_completed: row.completed))
-    all_completed: rows |> List/every(row, if: row.completed)
+        |> List/map(item, new: new_row(initial_completed: item.completed))
+    all_completed: rows |> List/every(item, if: item.completed)
 ]
 
 FUNCTION new_row(initial_completed) {
@@ -1143,16 +1168,75 @@ FUNCTION new_row(initial_completed) {
 "#;
     let parsed = boon_parser::parse_source("mapped-row-source-ownership.bn", source).unwrap();
     let ir = lower(&parsed).expect("mapped row source ownership must lower");
+    let completed_state = ir
+        .state_cells
+        .iter()
+        .find(|state| state.semantic_path.as_deref() == Some("store.rows.completed"))
+        .unwrap_or_else(|| {
+            panic!(
+                "canonical mapped-row completed state; available={:?}",
+                ir.state_cells
+                    .iter()
+                    .map(|state| (&state.path, &state.semantic_path, state.scope_id))
+                    .collect::<Vec<_>>()
+            )
+        });
     let sources = ir
         .update_branches
         .iter()
-        .filter(|branch| branch.target == "row.completed")
+        .filter(|branch| branch.target == completed_state.path)
         .map(|branch| branch.source.as_str())
         .collect::<Vec<_>>();
 
     assert_eq!(
         sources,
-        ["store.controls.toggle_all", "row.controls.toggle"],
+        [
+            "store.controls.toggle_all",
+            "store.rows.controls.toggle",
+        ],
         "row state must not inherit append or sibling-field event sources"
     );
+}
+
+#[test]
+fn runtime_lowering_binds_named_root_hold_to_exact_executable_state() {
+    let parsed = boon_parser::parse_source(
+        "runtime-root-hold-identity.bn",
+        "value: TEXT { one } |> HOLD value { LATEST {} }\n",
+    )
+    .unwrap();
+    let ir = lower_runtime(&parsed).expect("runtime root HOLD must lower");
+    let state = ir
+        .state_cells
+        .iter()
+        .find(|state| state.path == "value")
+        .expect("root state cell");
+    let executable = state
+        .executable_state_id
+        .unwrap_or_else(|| {
+            panic!(
+                "root state has no exact executable identity; executable states={:#?}; roots={:#?}; expressions={:#?}; statements={:#?}; state={state:#?}",
+                ir.executable.states,
+                ir.executable.roots,
+                ir.executable.expressions,
+                ir.executable.statements,
+            )
+        });
+    let binding = ir
+        .storage
+        .bindings
+        .iter()
+        .find(|binding| {
+            matches!(
+                binding.kind,
+                StorageBindingKind::State {
+                    executable: candidate,
+                    ..
+                } if candidate == executable
+            )
+        })
+        .expect("state storage binding");
+    assert!(ir.executable.states.iter().any(|state| {
+        state.id == executable && state.declaration == binding.declaration
+    }));
 }

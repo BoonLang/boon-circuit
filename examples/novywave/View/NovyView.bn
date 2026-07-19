@@ -1430,7 +1430,7 @@ FUNCTION file_tree_workspace_rows(list_height) {
         style: [width: Fill, height: list_height, paint: False, scroll_y: True, scrollbars: True]
         items:
             PASSED.store.file_tree_rows
-            |> List/map(row, new: file_tree_row(row: row))
+            |> List/map(item, new: file_tree_row(row: item))
     )
 }
 
@@ -1449,7 +1449,7 @@ FUNCTION external_catalog_file_tree_row_list() {
         style: [width: Fill, height: 224, paint: False, scroll_y: True, scrollbars: True]
         items:
             PASSED.store.external_catalog_file_tree_rows
-            |> List/map(external_file_tree_row, new: file_tree_row(row: external_file_tree_row))
+            |> List/map(item, new: file_tree_row(row: item))
     )
 }
 
@@ -1461,7 +1461,7 @@ FUNCTION external_fallback_file_tree_row_list() {
         style: [width: Fill, height: 224, paint: False, scroll_y: True, scrollbars: True]
         items:
             PASSED.store.external_fallback_file_tree_rows
-            |> List/map(external_file_tree_row, new: file_tree_row(row: external_file_tree_row))
+            |> List/map(item, new: file_tree_row(row: item))
     )
 }
 
@@ -2059,7 +2059,7 @@ FUNCTION selected_name_column_body() {
         ]
         items: LIST {
             PASSED.store.selected_signal_lane_rows
-            |> List/map(row, new: selected_name_column_row(row: row))
+            |> List/map(item, new: selected_name_column_row(row: item))
             PASSED.store.comparison_visible |> WHEN {
                 True => comparison_name_column_row()
                 False => NoElement
@@ -2080,7 +2080,7 @@ FUNCTION selected_value_column_body() {
         ]
         items: LIST {
             PASSED.store.selected_signal_lane_rows
-            |> List/map(row, new: selected_value_column_row(row: row))
+            |> List/map(item, new: selected_value_column_row(row: item))
             PASSED.store.comparison_visible |> WHEN {
                 True => comparison_value_column_row()
                 False => NoElement
@@ -2141,7 +2141,7 @@ FUNCTION selected_wave_rows_column() {
         ]
         items: LIST {
             PASSED.store.selected_signal_lane_rows
-            |> List/map(row, new: selected_wave_column_row(row: row))
+            |> List/map(item, new: selected_wave_column_row(row: item))
             PASSED.store.comparison_visible |> WHEN {
                 True => comparison_wave_column_row()
                 False => NoElement
@@ -2856,7 +2856,7 @@ FUNCTION marker_rows_panel() {
             gap: 4
             style: [width: 180, height: 28, paint: False, scroll_x: True, scrollbars: True]
             items:
-                PASSED.store.markers |> List/map(marker, new: marker_row(marker: marker))
+                PASSED.store.markers |> List/map(item, new: marker_row(marker: item))
         )
         False => Scene/Element/label(
             element: []
@@ -4040,7 +4040,7 @@ FUNCTION waveform_segment_lane(signal) {
         style: [width: Fill, height: Fill, paint: False]
         items:
             signal.segments
-            |> List/map(segment, new: waveform_segment(segment: waveform_segment_for_signal(segment: segment, signal: signal)))
+            |> List/map(item, new: waveform_segment(segment: waveform_segment_for_signal(segment: item, signal: signal)))
     )
 }
 
@@ -4364,7 +4364,7 @@ FUNCTION variables_virtual_list() {
         gap: 4
         style: [width: Fill, height: 140, paint: False, scroll_y: True, scrollbars: True]
         items:
-            PASSED.store.variable_rows |> List/map(row, new: variables_virtual_row(row: row))
+            PASSED.store.variable_rows |> List/map(item, new: variables_virtual_row(row: item))
     )
 }
 
@@ -4375,7 +4375,7 @@ FUNCTION variables_virtual_row(row) {
         gap: 0
         style: [width: Fill, height: 24, paint: False]
         items:
-            row.signals |> List/map(signal, new: variable_result_row(signal: signal))
+            row.items |> List/map(item, new: variable_result_row(signal: item))
     )
 }
 

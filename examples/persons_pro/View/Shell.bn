@@ -123,25 +123,25 @@ FUNCTION preview_width_controls() {
         style: [width: Auto, height: 40, paint: False]
         items: LIST {
             Components/button(
-                PASS: [store: PASSED.store]
                 source: PASSED.store.elements.preview_phone
                 label: TEXT { Phone }
                 tone: Neutral
                 selected: PASSED.store.preview_width_mode == Phone
+                PASS: [store: PASSED.store]
             )
             Components/button(
-                PASS: [store: PASSED.store]
                 source: PASSED.store.elements.preview_tablet
                 label: TEXT { Tablet }
                 tone: Neutral
                 selected: PASSED.store.preview_width_mode == Tablet
+                PASS: [store: PASSED.store]
             )
             Components/button(
-                PASS: [store: PASSED.store]
                 source: PASSED.store.elements.preview_desktop
                 label: TEXT { Auto }
                 tone: Neutral
                 selected: PASSED.store.preview_width_mode == Desktop
+                PASS: [store: PASSED.store]
             )
         }
     )
@@ -149,7 +149,6 @@ FUNCTION preview_width_controls() {
 
 FUNCTION theme_button(source) {
     Components/button(
-        PASS: [store: PASSED.store]
         source: source
         label: PASSED.store.mode |> WHEN {
             Dark => TEXT { Light }
@@ -157,6 +156,7 @@ FUNCTION theme_button(source) {
         }
         tone: Neutral
         selected: False
+        PASS: [store: PASSED.store]
     )
 }
 
@@ -174,8 +174,8 @@ FUNCTION desktop_workspace() {
         ]
         items: LIST {
             Editor/root(
-                PASS: [store: PASSED.store]
                 input_id: TEXT { desktop profile source }
+                PASS: [store: PASSED.store]
             )
             preview_frame()
         }
@@ -199,14 +199,14 @@ FUNCTION mobile_workspace() {
             mobile_tabs()
             PASSED.store.active_view |> WHEN {
                 Code => Editor/root(
-                    PASS: [store: PASSED.store]
                     input_id: TEXT { mobile profile source }
+                    PASS: [store: PASSED.store]
                 )
                 Preview => preview_frame()
                 Publish => Publish/root(PASS: [store: PASSED.store])
                 __ => Editor/root(
-                    PASS: [store: PASSED.store]
                     input_id: TEXT { mobile profile source }
+                    PASS: [store: PASSED.store]
                 )
             }
         }
@@ -256,25 +256,25 @@ FUNCTION mobile_tabs() {
         style: [width: Fill, height: 40, paint: False]
         items: LIST {
             Components/button(
-                PASS: [store: PASSED.store]
                 source: PASSED.store.elements.show_code
                 label: TEXT { Code }
                 tone: Neutral
                 selected: PASSED.store.active_view == Code
+                PASS: [store: PASSED.store]
             )
             Components/button(
-                PASS: [store: PASSED.store]
                 source: PASSED.store.elements.show_preview
                 label: TEXT { Preview }
                 tone: Neutral
                 selected: PASSED.store.active_view == Preview
+                PASS: [store: PASSED.store]
             )
             Components/button(
-                PASS: [store: PASSED.store]
                 source: PASSED.store.elements.show_publish
                 label: TEXT { Publish }
                 tone: Neutral
                 selected: PASSED.store.active_view == Publish
+                PASS: [store: PASSED.store]
             )
         }
     )

@@ -3,12 +3,14 @@ use boon_plan::{
     DataTypePlan, DistributedArgumentId, EffectInvocationId, EffectInvocationPlan,
     EffectResultRoute, ExportId, FieldId, FiniteReal, ImportId, InitialValueKind, ListId,
     ListInitializerKind, ListStorageSlot, MachinePlan, PlanConstantId, PlanConstantValue,
-    PlanDerivedExpression, PlanDerivedKind, PlanExpressionKind, PlanIntrinsic,
-    PlanListOperationKind, PlanListProjection, PlanListRemovePredicate, PlanOp, PlanOpId,
-    PlanOpKind, PlanQueryResidual, PlanQuerySelection, PlanRowCallArg, PlanRowExpression,
-    PlanRowSelectPattern, PlanSourceGuard, QueryCollectionId, QueryCollectionPlan, QueryIndexId,
-    QueryIndexPlan, QueryKeyType, RemoteCallSiteId, RootOutputDemand, ScalarStorageSlot, ScopeId,
-    SourceId, SourcePayloadField, SourceRoute, StateId, ValueRef,
+    PlanContextualOperationKind, PlanDerivedExpression, PlanDerivedKind, PlanExpressionKind,
+    PlanIntrinsic, PlanListOperationKind, PlanListProjection, PlanListRemovePredicate, PlanLocalId,
+    PlanMaterializedRowFieldCopy, PlanOp, PlanOpId, PlanOpKind, PlanQueryResidual,
+    PlanQuerySelection, PlanRowCallArg, PlanRowExpression, PlanRowObjectField,
+    PlanRowSelectPattern, PlanSourceGuard, PlanStaticOwnerId, QueryCollectionId,
+    QueryCollectionPlan, QueryIndexId, QueryIndexPlan, QueryKeyType, RemoteCallSiteId,
+    RootOutputDemand, ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute,
+    StateId, ValueRef,
 };
 use boon_query::{
     Collection as QueryCollection, CursorToken as QueryCursorToken, IndexId as EngineIndexId,
@@ -292,6 +294,7 @@ pub struct TurnMetrics {
     pub dirty_state_count: usize,
     pub dirty_field_count: usize,
     pub recomputed_field_count: usize,
+    pub recomputed_list_count: usize,
     pub changed_row_count: usize,
     pub dependency_fanout_count: usize,
     pub index_lookup_count: usize,
@@ -603,6 +606,7 @@ pub enum Error {
     InvalidEvent(String),
     Unsupported { op: PlanOpId, detail: String },
     Cycle { field: FieldId, row: Option<RowId> },
+    ListCycle { list: ListId },
     WorkBudgetExceeded { limit: u64, attempted: u64 },
     Evaluation(String),
     NotDemanded(FieldId),
@@ -625,6 +629,7 @@ impl fmt::Display for Error {
                 ),
                 None => write!(formatter, "derived cycle at root field {}", field.0),
             },
+            Self::ListCycle { list } => write!(formatter, "derived cycle at list {}", list.0),
             Self::WorkBudgetExceeded { limit, attempted } => write!(
                 formatter,
                 "executor work budget exceeded: attempted {attempted} units with a {limit}-unit transaction limit"
@@ -656,6 +661,21 @@ struct DerivedCell {
     value: Option<Value>,
 }
 
+#[derive(Clone, Debug)]
+struct DerivedListCell {
+    currentness: Currentness,
+    items: Option<Vec<EvalValue>>,
+}
+
+impl Default for DerivedListCell {
+    fn default() -> Self {
+        Self {
+            currentness: Currentness::Dirty,
+            items: None,
+        }
+    }
+}
+
 impl Default for DerivedCell {
     fn default() -> Self {
         Self {
@@ -676,7 +696,48 @@ struct Row {
 struct ListState {
     rows: BTreeMap<RowId, Row>,
     order: Vec<RowId>,
+    order_positions: BTreeMap<RowId, usize>,
     next_key: u64,
+}
+
+impl ListState {
+    fn from_rows(rows: BTreeMap<RowId, Row>, order: Vec<RowId>, next_key: u64) -> Self {
+        let order_positions = order
+            .iter()
+            .enumerate()
+            .map(|(position, row)| (*row, position))
+            .collect();
+        Self {
+            rows,
+            order,
+            order_positions,
+            next_key,
+        }
+    }
+
+    fn push_ordered(&mut self, row: RowId) {
+        self.order_positions.insert(row, self.order.len());
+        self.order.push(row);
+    }
+
+    fn insert_ordered(&mut self, index: usize, row: RowId) {
+        self.order.insert(index, row);
+        self.rebuild_order_positions(index);
+    }
+
+    fn remove_ordered(&mut self, row: RowId) {
+        let Some(position) = self.order_positions.remove(&row) else {
+            return;
+        };
+        self.order.remove(position);
+        self.rebuild_order_positions(position);
+    }
+
+    fn rebuild_order_positions(&mut self, from: usize) {
+        for (position, row) in self.order.iter().enumerate().skip(from) {
+            self.order_positions.insert(*row, position);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -722,6 +783,7 @@ struct IndexKey {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Consumer {
     Root(FieldId),
+    List(ListId),
     Row(RowId, FieldId),
 }
 
@@ -823,6 +885,9 @@ struct Dependencies {
     root_by_state: BTreeMap<StateId, BTreeSet<FieldId>>,
     root_by_field: BTreeMap<FieldId, BTreeSet<FieldId>>,
     root_by_list: BTreeMap<ListId, BTreeSet<FieldId>>,
+    list_by_state: BTreeMap<StateId, BTreeSet<ListId>>,
+    list_by_field: BTreeMap<FieldId, BTreeSet<ListId>>,
+    list_by_list: BTreeMap<ListId, BTreeSet<ListId>>,
     row_by_field: BTreeMap<(ListId, FieldId), BTreeSet<FieldId>>,
     row_by_root_state: BTreeMap<StateId, BTreeSet<(ListId, FieldId)>>,
     row_by_root_field: BTreeMap<FieldId, BTreeSet<(ListId, FieldId)>>,
@@ -834,6 +899,7 @@ struct Metadata {
     constants: BTreeMap<PlanConstantId, Value>,
     distributed_import_types: BTreeMap<ImportId, DataTypePlan>,
     root_computations: BTreeMap<FieldId, Arc<PlanOp>>,
+    list_computations: BTreeMap<ListId, Arc<PlanOp>>,
     row_computations: BTreeMap<FieldId, Arc<PlanOp>>,
     row_field_owner: BTreeMap<FieldId, ListId>,
     indexed_state_field: BTreeMap<StateId, FieldId>,
@@ -856,6 +922,8 @@ struct Metadata {
     mutations_by_state: BTreeMap<StateId, Vec<Arc<PlanOp>>>,
     source_derived_by_source: BTreeMap<SourceId, BTreeSet<FieldId>>,
     state_derived_by_state: BTreeMap<StateId, BTreeSet<FieldId>>,
+    source_derived_lists_by_source: BTreeMap<SourceId, BTreeSet<ListId>>,
+    state_derived_lists_by_state: BTreeMap<StateId, BTreeSet<ListId>>,
     transient_effect_result_states: BTreeSet<StateId>,
     transient_effect_result_fields: BTreeSet<FieldId>,
     session_info_root_fields: BTreeSet<FieldId>,
@@ -1095,9 +1163,12 @@ impl Metadata {
         }
 
         let mut root_computations = BTreeMap::new();
+        let mut list_computations = BTreeMap::new();
         let mut row_computations = BTreeMap::new();
         let mut source_derived_by_source = BTreeMap::<SourceId, BTreeSet<FieldId>>::new();
         let mut state_derived_by_state = BTreeMap::<StateId, BTreeSet<FieldId>>::new();
+        let mut source_derived_lists_by_source = BTreeMap::<SourceId, BTreeSet<ListId>>::new();
+        let mut state_derived_lists_by_state = BTreeMap::<StateId, BTreeSet<ListId>>::new();
         let mut updates_by_source = BTreeMap::<SourceId, Vec<Arc<PlanOp>>>::new();
         let mut updates_by_state = BTreeMap::<StateId, Vec<Arc<PlanOp>>>::new();
         let transient_effects = plan
@@ -1117,14 +1188,8 @@ impl Metadata {
                     derived_kind,
                     expression,
                     ..
-                } => {
-                    let Some(ValueRef::Field(field)) = op.output else {
-                        return Err(Error::InvalidPlan(format!(
-                            "derived op {} has no field output",
-                            op.id.0
-                        )));
-                    };
-                    if op.indexed {
+                } => match op.output {
+                    Some(ValueRef::Field(field)) if op.indexed => {
                         row_computations.insert(field, Arc::new(op.clone()));
                         if expression
                             .as_ref()
@@ -1132,7 +1197,8 @@ impl Metadata {
                         {
                             session_info_row_fields.insert(field);
                         }
-                    } else {
+                    }
+                    Some(ValueRef::Field(field)) => {
                         root_computations.insert(field, Arc::new(op.clone()));
                         if expression
                             .as_ref()
@@ -1169,16 +1235,58 @@ impl Metadata {
                             }
                         }
                     }
-                }
-                PlanOpKind::ListProjection { .. } => {
-                    let Some(ValueRef::Field(field)) = op.output else {
+                    Some(ValueRef::List(list)) if !op.indexed => {
+                        list_computations.insert(list, Arc::new(op.clone()));
+                        if *derived_kind == PlanDerivedKind::SourceEventTransform
+                            && let Some(PlanDerivedExpression::SourceEventTransform {
+                                arms, ..
+                            }) = expression
+                        {
+                            for arm in arms {
+                                match &arm.trigger {
+                                    ValueRef::Source(source) => {
+                                        source_derived_lists_by_source
+                                            .entry(*source)
+                                            .or_default()
+                                            .insert(list);
+                                    }
+                                    ValueRef::State(state) => {
+                                        state_derived_lists_by_state
+                                            .entry(*state)
+                                            .or_default()
+                                            .insert(list);
+                                    }
+                                    _ => {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "source-event transform list {} has a non-event arm trigger",
+                                            list.0
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
                         return Err(Error::InvalidPlan(format!(
-                            "list projection op {} has no field output",
+                            "derived op {} has no valid field or list output",
                             op.id.0
                         )));
-                    };
-                    root_computations.insert(field, Arc::new(op.clone()));
-                }
+                    }
+                },
+                PlanOpKind::ListProjection { .. } => match op.output {
+                    Some(ValueRef::Field(field)) => {
+                        root_computations.insert(field, Arc::new(op.clone()));
+                    }
+                    Some(ValueRef::List(list)) => {
+                        list_computations.insert(list, Arc::new(op.clone()));
+                    }
+                    _ => {
+                        return Err(Error::InvalidPlan(format!(
+                            "list projection op {} has no field or list output",
+                            op.id.0
+                        )));
+                    }
+                },
                 PlanOpKind::UpdateBranch {
                     trigger, effect, ..
                 } => {
@@ -1327,6 +1435,7 @@ impl Metadata {
             constants,
             distributed_import_types,
             root_computations,
+            list_computations,
             row_computations,
             row_field_owner,
             indexed_state_field,
@@ -1349,6 +1458,8 @@ impl Metadata {
             mutations_by_state,
             source_derived_by_source,
             state_derived_by_state,
+            source_derived_lists_by_source,
+            state_derived_lists_by_state,
             transient_effect_result_states,
             transient_effect_result_fields,
             session_info_root_fields,
@@ -1405,6 +1516,34 @@ impl Metadata {
                     .entry(list)
                     .or_default()
                     .insert(*output);
+            }
+        }
+        for (output, op) in &self.list_computations {
+            for input in &op.inputs {
+                match input {
+                    ValueRef::State(state) if !self.indexed_state_owner.contains_key(state) => {
+                        dependencies
+                            .list_by_state
+                            .entry(*state)
+                            .or_default()
+                            .insert(*output);
+                    }
+                    ValueRef::Field(field) if !self.row_field_owner.contains_key(field) => {
+                        dependencies
+                            .list_by_field
+                            .entry(*field)
+                            .or_default()
+                            .insert(*output);
+                    }
+                    ValueRef::List(list) if list != output => {
+                        dependencies
+                            .list_by_list
+                            .entry(*list)
+                            .or_default()
+                            .insert(*output);
+                    }
+                    _ => {}
+                }
             }
         }
         for (output, op) in &self.row_computations {
@@ -2427,7 +2566,7 @@ struct PendingTransientEffect {
     available_credits: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum EvalValue {
     Value(Value),
     Row(RowId),
@@ -2439,6 +2578,8 @@ enum EvalValue {
     },
 }
 
+type PlanLocalBindings = BTreeMap<(PlanStaticOwnerId, PlanLocalId), EvalValue>;
+
 #[derive(Clone)]
 pub struct MachineInstance {
     plan: Arc<MachinePlan>,
@@ -2449,6 +2590,7 @@ pub struct MachineInstance {
     active_distributed_arguments: BTreeMap<(ExportId, DistributedArgumentId), Value>,
     root_states: BTreeMap<StateId, Value>,
     root_fields: BTreeMap<FieldId, DerivedCell>,
+    derived_lists: BTreeMap<ListId, DerivedListCell>,
     lists: BTreeMap<ListId, ListState>,
     indexes: BTreeMap<IndexKey, BTreeSet<RowId>>,
     query_collections: BTreeMap<ListId, QueryCollectionState>,
@@ -2547,6 +2689,7 @@ impl MachineInstanceBuilder {
                 active_distributed_arguments: BTreeMap::new(),
                 root_states: BTreeMap::new(),
                 root_fields: BTreeMap::new(),
+                derived_lists: BTreeMap::new(),
                 lists: BTreeMap::new(),
                 indexes: BTreeMap::new(),
                 query_collections,
@@ -3135,7 +3278,32 @@ impl MachineInstance {
     }
 
     pub fn list_rows(&self, list: ListId) -> Vec<RowId> {
+        if let Some(items) = self
+            .derived_lists
+            .get(&list)
+            .filter(|cell| cell.currentness == Currentness::Current)
+            .and_then(|cell| cell.items.as_ref())
+        {
+            return items.iter().filter_map(eval_row_id).collect();
+        }
         self.list_row_ids(list)
+    }
+
+    pub fn list_value_current(&mut self, list: ListId) -> Result<Value, Error> {
+        self.list_value_current_with_metrics(list)
+            .map(|(value, _)| value)
+    }
+
+    pub fn list_value_current_with_metrics(
+        &mut self,
+        list: ListId,
+    ) -> Result<(Value, TurnMetrics), Error> {
+        let mut work = self.fresh_work();
+        let value =
+            self.eval_value_ref(&ValueRef::List(list), None, None, None, None, &mut work)?;
+        let value = self.materialize_eval(value)?.into_visible_facade();
+        work.finish_metrics();
+        Ok((value, work.metrics))
     }
 
     pub fn logical_row_count(&self) -> usize {
@@ -3143,6 +3311,14 @@ impl MachineInstance {
     }
 
     pub fn list_row_at(&self, list: ListId, index: usize) -> Option<RowId> {
+        if let Some(items) = self
+            .derived_lists
+            .get(&list)
+            .filter(|cell| cell.currentness == Currentness::Current)
+            .and_then(|cell| cell.items.as_ref())
+        {
+            return items.get(index).and_then(eval_row_id);
+        }
         self.lists
             .get(&list)
             .and_then(|state| state.order.get(index))
@@ -3157,6 +3333,26 @@ impl MachineInstance {
             .order
             .iter()
             .map(|row| self.row_snapshot(*row))
+            .collect()
+    }
+
+    pub fn list_row_snapshots_current(&mut self, list: ListId) -> Result<Vec<RowSnapshot>, Error> {
+        if !self.metadata.list_computations.contains_key(&list) {
+            return self.list_row_snapshots(list);
+        }
+        let mut work = self.fresh_work();
+        let items = self.ensure_list_current(list, None, &mut work)?;
+        items
+            .into_iter()
+            .map(|item| match item {
+                EvalValue::Row(row) | EvalValue::MappedRow { id: row, .. } => {
+                    self.row_snapshot(row)
+                }
+                _ => Err(Error::Evaluation(format!(
+                    "derived list {} contains an item without stable row identity",
+                    list.0
+                ))),
+            })
             .collect()
     }
 
@@ -3994,6 +4190,34 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         work: &mut Work,
     ) -> Result<Value, Error> {
+        if self.metadata.list_computations.contains_key(&list) {
+            let items = self.ensure_list_current(list, event, work)?;
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(self.materialize_typed_list_item(item, item_type, event, work)?);
+            }
+            return Ok(Value::List(values));
+        }
+        if !matches!(
+            item_type,
+            boon_plan::DataTypePlan::Record { open: false, .. }
+        ) {
+            let value_field = self.metadata.list_storage_field(list, "value")?;
+            let rows = self.list_row_ids(list);
+            work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
+            let values = rows
+                .into_iter()
+                .map(|row| {
+                    let value = if self.metadata.row_computations.contains_key(&value_field) {
+                        self.ensure_row_field(row, value_field, event, work)?
+                    } else {
+                        self.row_value(row, value_field)?
+                    };
+                    normalize_scalar_list_item(value, item_type)
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            return Ok(Value::List(values));
+        }
         let boon_plan::DataTypePlan::Record {
             fields,
             open: false,
@@ -4024,6 +4248,89 @@ impl MachineInstance {
             values.push(Value::Record(record));
         }
         Ok(Value::List(values))
+    }
+
+    fn materialize_typed_list_item(
+        &mut self,
+        item: EvalValue,
+        item_type: &boon_plan::DataTypePlan,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<Value, Error> {
+        let boon_plan::DataTypePlan::Record {
+            fields,
+            open: false,
+        } = item_type
+        else {
+            return normalize_host_output_value(self.materialize_eval(item)?);
+        };
+        match item {
+            EvalValue::Row(row) => {
+                let mut record = BTreeMap::new();
+                for output_field in fields {
+                    let field = self
+                        .metadata
+                        .list_storage_field(row.list, &output_field.name)?;
+                    let value = if self.metadata.row_computations.contains_key(&field) {
+                        self.ensure_row_field(row, field, event, work)?
+                    } else {
+                        self.row_value(row, field)?
+                    };
+                    record.insert(
+                        output_field.name.clone(),
+                        normalize_host_output_value(value)?,
+                    );
+                }
+                Ok(Value::Record(record))
+            }
+            EvalValue::MappedRow {
+                id: row,
+                fields: mut mapped,
+            } => {
+                let mut record = BTreeMap::new();
+                for output_field in fields {
+                    let value = if let Some(value) = mapped.remove(&output_field.name) {
+                        self.materialize_eval(value)?
+                    } else {
+                        let field = self
+                            .metadata
+                            .list_storage_field(row.list, &output_field.name)?;
+                        if self.metadata.row_computations.contains_key(&field) {
+                            self.ensure_row_field(row, field, event, work)?
+                        } else {
+                            self.row_value(row, field)?
+                        }
+                    };
+                    record.insert(
+                        output_field.name.clone(),
+                        normalize_host_output_value(value)?,
+                    );
+                }
+                Ok(Value::Record(record))
+            }
+            EvalValue::Record(mut mapped) => {
+                let mut record = BTreeMap::new();
+                for output_field in fields {
+                    let value = mapped.remove(&output_field.name).ok_or_else(|| {
+                        Error::Evaluation(format!(
+                            "derived list record is missing field `{}`",
+                            output_field.name
+                        ))
+                    })?;
+                    record.insert(
+                        output_field.name.clone(),
+                        normalize_host_output_value(self.materialize_eval(value)?)?,
+                    );
+                }
+                Ok(Value::Record(record))
+            }
+            EvalValue::Value(Value::Record(record)) => {
+                normalize_host_output_value(Value::Record(record))
+            }
+            value => Err(Error::Evaluation(format!(
+                "derived list record output received {value:?}"
+            ))),
+        }
     }
 
     pub fn inspect_value_current(&mut self, name: &str, max_rows: usize) -> Result<Value, Error> {
@@ -4143,6 +4450,9 @@ impl MachineInstance {
     fn initialize_storage_defaults(&mut self, work: &mut Work) -> Result<(), Error> {
         for field in self.metadata.root_computations.keys() {
             self.root_fields.insert(*field, DerivedCell::default());
+        }
+        for list in self.metadata.list_computations.keys() {
+            self.derived_lists.insert(*list, DerivedListCell::default());
         }
         for slot in &self.plan.storage_layout.scalar_slots {
             if slot.indexed || slot.initial_value_kind == InitialValueKind::RootInitialField {
@@ -4349,11 +4659,7 @@ impl MachineInstance {
             }
             self.lists.insert(
                 list_id,
-                ListState {
-                    rows,
-                    order,
-                    next_key: restored.next_key,
-                },
+                ListState::from_rows(rows, order, restored.next_key),
             );
             self.touched_lists.insert(list_id);
 
@@ -4436,6 +4742,10 @@ impl MachineInstance {
             cell.currentness = Currentness::Dirty;
             cell.value = None;
         }
+        for cell in self.derived_lists.values_mut() {
+            cell.currentness = Currentness::Dirty;
+            cell.items = None;
+        }
         Ok(())
     }
 
@@ -4504,7 +4814,7 @@ impl MachineInstance {
             Error::Evaluation(format!("list {} was not initialized", slot.list_id.0))
         })?;
         list.next_key = list.next_key.max(key.saturating_add(1));
-        list.order.push(row_id);
+        list.push_ordered(row_id);
         list.rows.insert(row_id, row);
         self.index_row(row_id)?;
         self.bind_row_sources(row_id, slot.scope_id)?;
@@ -5420,11 +5730,23 @@ impl MachineInstance {
                 .get(&state)
                 .cloned()
                 .unwrap_or_default();
+            let derived_lists = self
+                .metadata
+                .state_derived_lists_by_state
+                .get(&state)
+                .cloned()
+                .unwrap_or_default();
             for field in &derived {
                 self.mark_root_dirty(*field, work);
             }
+            for list in &derived_lists {
+                self.mark_list_dirty(*list, work);
+            }
             for field in &derived {
                 self.ensure_root_field(*field, Some(&event), work)?;
+            }
+            for list in &derived_lists {
+                self.ensure_list_current(*list, Some(&event), work)?;
             }
 
             let updates = self
@@ -5439,8 +5761,14 @@ impl MachineInstance {
             for field in &derived {
                 self.mark_root_dirty(*field, work);
             }
+            for list in &derived_lists {
+                self.mark_list_dirty(*list, work);
+            }
             for field in &derived {
                 self.ensure_root_field(*field, Some(&event), work)?;
+            }
+            for list in &derived_lists {
+                self.ensure_list_current(*list, Some(&event), work)?;
             }
             let mutations = self
                 .metadata
@@ -5608,7 +5936,7 @@ impl MachineInstance {
                     let list = self.lists.get_mut(&row.list).ok_or_else(|| {
                         Error::Evaluation(format!("rollback list {} is missing", row.list.0))
                     })?;
-                    list.order.retain(|candidate| *candidate != row);
+                    list.remove_ordered(row);
                     list.rows.remove(&row);
                     list.next_key = previous_next_key;
                     self.touched_row_fields
@@ -5631,7 +5959,7 @@ impl MachineInstance {
                         Error::Evaluation(format!("rollback list {} is missing", row.list.0))
                     })?;
                     let index = order_index.min(list.order.len());
-                    list.order.insert(index, row);
+                    list.insert_ordered(index, row);
                     list.rows.insert(row, value);
                     list.next_key = previous_next_key;
                     self.touched_row_fields
@@ -5813,6 +6141,14 @@ impl MachineInstance {
             }
             for field in source_fields {
                 self.ensure_root_field(*field, Some(event), work)?;
+            }
+        }
+        if let Some(source_lists) = metadata.source_derived_lists_by_source.get(&event.source) {
+            for list in source_lists {
+                self.mark_list_dirty(*list, work);
+            }
+            for list in source_lists {
+                self.ensure_list_current(*list, Some(event), work)?;
             }
         }
 
@@ -6492,6 +6828,75 @@ impl MachineInstance {
         Ok(value)
     }
 
+    fn ensure_list_current(
+        &mut self,
+        list: ListId,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<Vec<EvalValue>, Error> {
+        let currentness = self
+            .derived_lists
+            .get(&list)
+            .map(|cell| cell.currentness)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!("list {} has no derived computation", list.0))
+            })?;
+        match currentness {
+            Currentness::Current => {
+                return self
+                    .derived_lists
+                    .get(&list)
+                    .and_then(|cell| cell.items.clone())
+                    .ok_or_else(|| {
+                        Error::Evaluation(format!("current derived list {} has no items", list.0))
+                    });
+            }
+            Currentness::Evaluating => return Err(Error::ListCycle { list }),
+            Currentness::Dirty => {}
+        }
+        work.consume(1)?;
+        self.derived_lists
+            .get_mut(&list)
+            .expect("derived list checked above")
+            .currentness = Currentness::Evaluating;
+        let consumer = Consumer::List(list);
+        self.dynamic_dependencies.clear(consumer);
+        let op = self
+            .metadata
+            .list_computations
+            .get(&list)
+            .cloned()
+            .ok_or_else(|| Error::InvalidPlan(format!("derived list {} has no plan op", list.0)))?;
+        let evaluated = self.evaluate_list_computation(list, &op, event, work);
+        let items = match evaluated {
+            Ok(items) => items,
+            Err(error) => {
+                self.derived_lists
+                    .get_mut(&list)
+                    .expect("derived list checked above")
+                    .currentness = Currentness::Dirty;
+                return Err(error);
+            }
+        };
+        let old = self
+            .derived_lists
+            .get(&list)
+            .and_then(|cell| cell.items.clone());
+        {
+            let cell = self
+                .derived_lists
+                .get_mut(&list)
+                .expect("derived list checked above");
+            cell.items = Some(items.clone());
+            cell.currentness = Currentness::Current;
+        }
+        work.metrics.recomputed_list_count += 1;
+        if old.as_ref() != Some(&items) {
+            self.invalidate_list_structure(list, work);
+        }
+        Ok(items)
+    }
+
     fn ensure_published_current(
         &mut self,
         event: Option<&SourceEvent>,
@@ -6648,7 +7053,14 @@ impl MachineInstance {
                 self.materialize_eval(value)?
             }
             PlanOpKind::ListProjection { projection } => {
-                self.evaluate_projection(field, op.id, projection, event, work)?
+                let value = self.evaluate_projection(
+                    ValueRef::Field(field),
+                    op.id,
+                    projection,
+                    event,
+                    work,
+                )?;
+                self.materialize_eval(value)?
             }
             PlanOpKind::ListOperation {
                 operation_kind: PlanListOperationKind::Retain,
@@ -6668,6 +7080,34 @@ impl MachineInstance {
             }
         };
         Ok(value)
+    }
+
+    fn evaluate_list_computation(
+        &mut self,
+        list: ListId,
+        op: &PlanOp,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<Vec<EvalValue>, Error> {
+        let evaluated = match &op.kind {
+            PlanOpKind::DerivedValue { .. } => self.evaluate_derived_op(op, None, event, work)?,
+            PlanOpKind::ListProjection { projection } => {
+                self.evaluate_projection(ValueRef::List(list), op.id, projection, event, work)?
+            }
+            _ => {
+                return Err(Error::Unsupported {
+                    op: op.id,
+                    detail: "operation cannot produce a derived list".to_owned(),
+                });
+            }
+        };
+        match evaluated {
+            EvalValue::List(items) => Ok(items),
+            _ => Err(Error::InvalidPlan(format!(
+                "list computation {} did not produce a list",
+                op.id.0
+            ))),
+        }
     }
 
     fn evaluate_derived_op(
@@ -6861,6 +7301,16 @@ impl MachineInstance {
             .unwrap_or_default();
         for field in dependents {
             self.mark_root_dirty(field, work);
+        }
+        let list_dependents = self
+            .metadata
+            .dependencies
+            .list_by_state
+            .get(&state)
+            .cloned()
+            .unwrap_or_default();
+        for list in list_dependents {
+            self.mark_list_dirty(list, work);
         }
         let row_dependents = self
             .metadata
@@ -7429,6 +7879,16 @@ impl MachineInstance {
                 self.mark_root_dirty(dependent, work);
             }
         }
+        let list_dependents = self
+            .metadata
+            .dependencies
+            .list_by_field
+            .get(&field)
+            .cloned()
+            .unwrap_or_default();
+        for list in list_dependents {
+            self.mark_list_dirty(list, work);
+        }
         let row_dependents = self
             .metadata
             .dependencies
@@ -7496,10 +7956,35 @@ impl MachineInstance {
         }
     }
 
+    fn mark_list_dirty(&mut self, list: ListId, work: &mut Work) {
+        if self
+            .derived_lists
+            .get(&list)
+            .is_some_and(|cell| cell.currentness == Currentness::Evaluating)
+        {
+            return;
+        }
+        let became_dirty = self.derived_lists.get_mut(&list).map(|cell| {
+            let became_dirty = cell.currentness == Currentness::Current;
+            if became_dirty {
+                cell.currentness = Currentness::Dirty;
+            }
+            became_dirty
+        });
+        let consumer = Consumer::List(list);
+        let first_in_turn = work.dirty_consumers.insert(consumer);
+        if became_dirty.is_none() || (!became_dirty.unwrap_or_default() && !first_in_turn) {
+            return;
+        }
+        self.dynamic_dependencies.clear(consumer);
+        self.invalidate_list_structure(list, work);
+    }
+
     fn mark_consumer_dirty(&mut self, consumer: Consumer, work: &mut Work) {
         work.metrics.dependency_fanout_count += 1;
         match consumer {
             Consumer::Root(field) => self.mark_root_dirty(field, work),
+            Consumer::List(list) => self.mark_list_dirty(list, work),
             Consumer::Row(row, field) => self.mark_row_dirty(row, field, work),
         }
     }
@@ -7594,6 +8079,16 @@ impl MachineInstance {
         {
             consumers.insert(Consumer::Root(field));
         }
+        for dependent in self
+            .metadata
+            .dependencies
+            .list_by_list
+            .get(&list)
+            .cloned()
+            .unwrap_or_default()
+        {
+            consumers.insert(Consumer::List(dependent));
+        }
         for (owner, field) in self
             .metadata
             .dependencies
@@ -7661,6 +8156,11 @@ impl MachineInstance {
                         DynamicDependency::RowField(row, field) => {
                             Some(Consumer::Row(*row, *field))
                         }
+                        DynamicDependency::List(list)
+                            if self.metadata.list_computations.contains_key(list) =>
+                        {
+                            Some(Consumer::List(*list))
+                        }
                         DynamicDependency::Query(_)
                         | DynamicDependency::IndexedQuery(_)
                         | DynamicDependency::List(_)
@@ -7720,7 +8220,7 @@ impl MachineInstance {
         row: Option<RowId>,
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
         work.consume(1)?;
@@ -7732,11 +8232,32 @@ impl MachineInstance {
             PlanDerivedExpression::MaterializeList {
                 target_list,
                 fields,
+                row_field_copies,
                 expression,
             } => {
                 let value =
                     self.eval_derived_expression(expression, row, event, output, bindings, work)?;
-                self.reconcile_materialized_list(*target_list, fields, value, work)
+                if matches!(&value, EvalValue::Value(Value::Text(value)) if value == "SKIP") {
+                    let items = self
+                        .derived_lists
+                        .get(target_list)
+                        .and_then(|cell| cell.items.clone())
+                        .unwrap_or_else(|| {
+                            self.list_row_ids(*target_list)
+                                .into_iter()
+                                .map(EvalValue::Row)
+                                .collect()
+                        });
+                    return Ok(EvalValue::List(items));
+                }
+                self.reconcile_materialized_list(
+                    *target_list,
+                    fields,
+                    row_field_copies,
+                    value,
+                    event,
+                    work,
+                )
             }
             PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
                 source_id,
@@ -7858,7 +8379,9 @@ impl MachineInstance {
         &mut self,
         list_id: ListId,
         field_ids: &BTreeMap<String, FieldId>,
+        row_field_copies: &[PlanMaterializedRowFieldCopy],
         value: EvalValue,
+        event: Option<&SourceEvent>,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
         let items = eval_to_list(value)?;
@@ -7882,7 +8405,16 @@ impl MachineInstance {
         work.consume(desired_len.try_into().unwrap_or(u64::MAX))?;
         let desired = items
             .into_iter()
-            .map(|item| self.materialized_row_fields(list_id, field_ids, item))
+            .map(|item| {
+                self.materialized_row_fields(
+                    list_id,
+                    field_ids,
+                    row_field_copies,
+                    item,
+                    event,
+                    work,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let state_fields = self
             .metadata
@@ -7921,7 +8453,10 @@ impl MachineInstance {
         &mut self,
         list_id: ListId,
         field_ids: &BTreeMap<String, FieldId>,
+        row_field_copies: &[PlanMaterializedRowFieldCopy],
         item: EvalValue,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
     ) -> Result<BTreeMap<FieldId, Value>, Error> {
         let fields = match item {
             EvalValue::Record(fields) | EvalValue::MappedRow { fields, .. } => fields,
@@ -7930,6 +8465,27 @@ impl MachineInstance {
                 .into_iter()
                 .map(|(name, value)| (name, EvalValue::Value(value)))
                 .collect(),
+            EvalValue::Row(row) | EvalValue::Value(Value::Row { id: row, .. }) => {
+                let copies = row_field_copies
+                    .iter()
+                    .filter(|copy| copy.source_list == row.list)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if copies.is_empty() {
+                    return Err(Error::Evaluation(format!(
+                        "materialized list {} has no typed field copies for source list {}",
+                        list_id.0, row.list.0
+                    )));
+                }
+                let consumer = Some(Consumer::List(list_id));
+                let mut fields = BTreeMap::new();
+                for copy in copies {
+                    self.register_row_dependency(consumer, row, copy.source_field);
+                    let value = self.ensure_row_field(row, copy.source_field, event, work)?;
+                    fields.insert(copy.target_field, value);
+                }
+                return Ok(fields);
+            }
             other => {
                 return Err(Error::Evaluation(format!(
                     "materialized list {} produced non-record row {other:?}",
@@ -8008,6 +8564,11 @@ impl MachineInstance {
                 }),
             ValueRef::List(list) => {
                 self.register_list_dependency(consumer, *list);
+                if self.metadata.list_computations.contains_key(list) {
+                    return self
+                        .ensure_list_current(*list, event, work)
+                        .map(EvalValue::List);
+                }
                 let rows = self.list_row_ids(*list);
                 work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 Ok(EvalValue::List(
@@ -8135,7 +8696,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
         consumer: Option<Consumer>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
         work.consume(1)?;
@@ -8537,38 +9098,14 @@ impl MachineInstance {
             }
             PlanRowExpression::ListRef { list_id } => {
                 self.register_list_dependency(consumer, *list_id);
+                if self.derived_lists.contains_key(list_id) {
+                    self.ensure_list_current(*list_id, event, work)?;
+                }
                 let rows = self.list_row_ids(*list_id);
                 work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 Ok(EvalValue::List(
                     rows.into_iter().map(EvalValue::Row).collect(),
                 ))
-            }
-            PlanRowExpression::ListFindValue {
-                list_id,
-                field,
-                value,
-                target,
-                fallback,
-            } => {
-                let key =
-                    self.eval_row_expression(value, row, event, output, consumer, bindings, work)?;
-                let key = self.materialize_eval(key)?;
-                let candidates = self.lookup_index(*list_id, *field, &key, consumer, work)?;
-                if let Some(found) = candidates.first().copied() {
-                    if self.register_row_dependency(consumer, found, *target) {
-                        return Ok(EvalValue::Value(Value::Error {
-                            code: "cycle_error".to_owned(),
-                        }));
-                    }
-                    return self
-                        .ensure_row_field(found, *target, event, work)
-                        .map(EvalValue::Value);
-                }
-                if let Some(fallback) = fallback {
-                    self.eval_row_expression(fallback, row, event, output, consumer, bindings, work)
-                } else {
-                    Ok(EvalValue::Value(Value::Text("NaN".to_owned())))
-                }
             }
             PlanRowExpression::ListRange { from, to } => {
                 let from = self
@@ -8601,73 +9138,205 @@ impl MachineInstance {
                 }
                 Ok(EvalValue::List(values))
             }
-            PlanRowExpression::ListMap {
-                input,
-                binding,
-                value,
+            PlanRowExpression::ContextualCollection {
+                owner,
+                operation,
+                source,
+                row_local,
+                body,
+                index_lookup,
             } => {
-                let input =
-                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let items = eval_to_list(input)?;
-                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                let previous = bindings.get(binding).cloned();
-                let mut values = Vec::with_capacity(items.len());
-                for item in items {
-                    let origin = eval_row_id(&item);
-                    bindings.insert(binding.clone(), item);
-                    let value = self
-                        .eval_row_expression(value, row, event, output, consumer, bindings, work)?;
-                    values.push(match (origin, value) {
-                        (Some(id), EvalValue::Record(fields)) => {
-                            EvalValue::MappedRow { id, fields }
-                        }
-                        (_, value) => value,
-                    });
-                }
-                match previous {
-                    Some(previous) => {
-                        bindings.insert(binding.clone(), previous);
-                    }
-                    None => {
-                        bindings.remove(binding);
-                    }
-                }
-                Ok(EvalValue::List(values))
-            }
-            PlanRowExpression::ListFilterField {
-                input,
-                list_id,
-                field,
-                expected,
-                retain_equal,
-            } => {
-                let input =
-                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let expected = self
-                    .eval_row_expression(expected, row, event, output, consumer, bindings, work)?;
-                let expected = self.materialize_eval(expected)?;
-                let items = eval_to_list(input)?;
-                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                let mut filtered = Vec::new();
-                for item in items {
-                    let actual = self.eval_list_row_field(
-                        item.clone(),
-                        *list_id,
-                        *field,
+                if let Some(index_lookup) = index_lookup {
+                    let expected = self.eval_row_expression(
+                        &index_lookup.value,
+                        row,
                         event,
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    )?;
+                    let expected = self.materialize_eval(expected)?;
+                    let mut candidates = self.lookup_index(
+                        index_lookup.list_id,
+                        index_lookup.field,
+                        &expected,
                         consumer,
                         work,
                     )?;
-                    let actual = self.materialize_eval(actual)?;
-                    if (actual == expected) == *retain_equal {
-                        filtered.push(item);
+                    let positions = &self
+                        .lists
+                        .get(&index_lookup.list_id)
+                        .ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "typed contextual index references missing list {}",
+                                index_lookup.list_id.0
+                            ))
+                        })?
+                        .order_positions;
+                    candidates.sort_by_key(|candidate| {
+                        positions.get(candidate).copied().unwrap_or(usize::MAX)
+                    });
+                    work.consume(candidates.len().try_into().unwrap_or(u64::MAX))?;
+                    return match operation {
+                        PlanContextualOperationKind::Filter
+                        | PlanContextualOperationKind::Retain => Ok(EvalValue::List(
+                            candidates.into_iter().map(EvalValue::Row).collect(),
+                        )),
+                        PlanContextualOperationKind::Any => {
+                            Ok(EvalValue::Value(Value::Bool(!candidates.is_empty())))
+                        }
+                        PlanContextualOperationKind::Find => {
+                            Ok(candidates.first().copied().map_or_else(
+                                || {
+                                    EvalValue::Record(BTreeMap::from([(
+                                        "$tag".to_owned(),
+                                        EvalValue::Value(Value::Text("NotFound".to_owned())),
+                                    )]))
+                                },
+                                |found| {
+                                    EvalValue::Record(BTreeMap::from([
+                                        (
+                                            "$tag".to_owned(),
+                                            EvalValue::Value(Value::Text("Found".to_owned())),
+                                        ),
+                                        ("value".to_owned(), EvalValue::Row(found)),
+                                    ]))
+                                },
+                            ))
+                        }
+                        _ => Err(Error::InvalidPlan(format!(
+                            "typed contextual index is not valid for {operation:?}"
+                        ))),
+                    };
+                }
+                let input =
+                    self.eval_row_expression(source, row, event, output, consumer, bindings, work)?;
+                let items = eval_to_list(input)?;
+                let local = (*owner, *row_local);
+                if bindings.contains_key(&local) {
+                    return Err(Error::InvalidPlan(format!(
+                        "contextual owner {} local {} is already active",
+                        owner.0, row_local.0
+                    )));
+                }
+                match operation {
+                    PlanContextualOperationKind::Map => {
+                        work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                        let mut values = Vec::with_capacity(items.len());
+                        for item in items {
+                            let origin = eval_row_id(&item);
+                            let value = self.eval_contextual_body(
+                                local, item, body, row, event, output, consumer, bindings, work,
+                            )?;
+                            values.push(match (origin, value) {
+                                (Some(id), EvalValue::Record(fields)) => {
+                                    EvalValue::MappedRow { id, fields }
+                                }
+                                (_, value) => value,
+                            });
+                        }
+                        Ok(EvalValue::List(values))
+                    }
+                    PlanContextualOperationKind::Filter | PlanContextualOperationKind::Retain => {
+                        work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                        let mut retained = Vec::new();
+                        for item in items {
+                            let include = self.eval_contextual_body(
+                                local,
+                                item.clone(),
+                                body,
+                                row,
+                                event,
+                                output,
+                                consumer,
+                                bindings,
+                                work,
+                            )?;
+                            if eval_to_bool(&include)? {
+                                retained.push(item);
+                            }
+                        }
+                        Ok(EvalValue::List(retained))
+                    }
+                    PlanContextualOperationKind::Every => {
+                        for item in items {
+                            work.consume(1)?;
+                            let matches = self.eval_contextual_body(
+                                local, item, body, row, event, output, consumer, bindings, work,
+                            )?;
+                            if !eval_to_bool(&matches)? {
+                                return Ok(EvalValue::Value(Value::Bool(false)));
+                            }
+                        }
+                        Ok(EvalValue::Value(Value::Bool(true)))
+                    }
+                    PlanContextualOperationKind::Any => {
+                        for item in items {
+                            work.consume(1)?;
+                            let matches = self.eval_contextual_body(
+                                local, item, body, row, event, output, consumer, bindings, work,
+                            )?;
+                            if eval_to_bool(&matches)? {
+                                return Ok(EvalValue::Value(Value::Bool(true)));
+                            }
+                        }
+                        Ok(EvalValue::Value(Value::Bool(false)))
+                    }
+                    PlanContextualOperationKind::Find => {
+                        for item in items {
+                            work.consume(1)?;
+                            work.metrics.list_find_scan_count += 1;
+                            let matches = self.eval_contextual_body(
+                                local,
+                                item.clone(),
+                                body,
+                                row,
+                                event,
+                                output,
+                                consumer,
+                                bindings,
+                                work,
+                            )?;
+                            if eval_to_bool(&matches)? {
+                                return Ok(EvalValue::Record(BTreeMap::from([
+                                    (
+                                        "$tag".to_owned(),
+                                        EvalValue::Value(Value::Text("Found".to_owned())),
+                                    ),
+                                    ("value".to_owned(), item),
+                                ])));
+                            }
+                        }
+                        Ok(EvalValue::Record(BTreeMap::from([(
+                            "$tag".to_owned(),
+                            EvalValue::Value(Value::Text("NotFound".to_owned())),
+                        )])))
                     }
                 }
-                Ok(EvalValue::List(filtered))
             }
-            PlanRowExpression::ListMapItem { binding } => {
-                bindings.get(binding).cloned().ok_or_else(|| {
-                    Error::Evaluation(format!("List/map binding `{binding}` is missing"))
+            PlanRowExpression::Local {
+                owner,
+                local,
+                projection,
+            } => {
+                let mut value = bindings.get(&(*owner, *local)).cloned().ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "contextual owner {} local {} is not active",
+                        owner.0, local.0
+                    ))
+                })?;
+                for field in projection {
+                    value = self.eval_object_field(value, field, event, consumer, work)?;
+                }
+                Ok(value)
+            }
+            PlanRowExpression::LocalRow { owner, local } => {
+                bindings.get(&(*owner, *local)).cloned().ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "contextual row owner {} local {} is not active",
+                        owner.0, local.0
+                    ))
                 })
             }
             PlanRowExpression::ListSum { input } => {
@@ -8686,44 +9355,24 @@ impl MachineInstance {
                         .map_err(|_| Error::Evaluation("List/sum overflow".to_owned()))?,
                 )))
             }
-            PlanRowExpression::Object { fields } => {
-                let mut record = BTreeMap::new();
-                for field in fields {
-                    record.insert(
-                        field.name.clone(),
-                        self.eval_row_expression(
-                            &field.value,
-                            row,
-                            event,
-                            output,
-                            consumer,
-                            bindings,
-                            work,
-                        )?,
-                    );
-                }
-                Ok(EvalValue::Record(record))
-            }
+            PlanRowExpression::Object { fields } => self.eval_record_fields(
+                fields,
+                BTreeMap::new(),
+                row,
+                event,
+                output,
+                consumer,
+                bindings,
+                work,
+            ),
             PlanRowExpression::TaggedObject { tag, fields } => {
-                let mut record = BTreeMap::from([(
+                let record = BTreeMap::from([(
                     "$tag".to_owned(),
                     EvalValue::Value(Value::Text(tag.clone())),
                 )]);
-                for field in fields {
-                    record.insert(
-                        field.name.clone(),
-                        self.eval_row_expression(
-                            &field.value,
-                            row,
-                            event,
-                            output,
-                            consumer,
-                            bindings,
-                            work,
-                        )?,
-                    );
-                }
-                Ok(EvalValue::Record(record))
+                self.eval_record_fields(
+                    fields, record, row, event, output, consumer, bindings, work,
+                )
             }
             PlanRowExpression::ObjectField { object, field } => {
                 let object =
@@ -8779,6 +9428,32 @@ impl MachineInstance {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn eval_contextual_body(
+        &mut self,
+        local: (PlanStaticOwnerId, PlanLocalId),
+        value: EvalValue,
+        body: &PlanRowExpression,
+        row: Option<RowId>,
+        event: Option<&SourceEvent>,
+        output: Option<FieldId>,
+        consumer: Option<Consumer>,
+        bindings: &mut PlanLocalBindings,
+        work: &mut Work,
+    ) -> Result<EvalValue, Error> {
+        let previous = bindings.insert(local, value);
+        let result = self.eval_row_expression(body, row, event, output, consumer, bindings, work);
+        match previous {
+            Some(previous) => {
+                bindings.insert(local, previous);
+            }
+            None => {
+                bindings.remove(&local);
+            }
+        }
+        result
+    }
+
     fn eval_intrinsic(&self, intrinsic: PlanIntrinsic) -> Value {
         let SessionContext::Available { status, principal } = &self.options.session_context else {
             return Value::Error {
@@ -8819,7 +9494,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
         consumer: Option<Consumer>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<i64, Error> {
         let value =
@@ -8835,7 +9510,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
         consumer: Option<Consumer>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<Bytes, Error> {
         let value =
@@ -8851,7 +9526,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
         consumer: Option<Consumer>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<Option<String>, Error> {
         expression
@@ -8918,6 +9593,80 @@ impl MachineInstance {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn eval_record_fields(
+        &mut self,
+        fields: &[PlanRowObjectField],
+        mut record: BTreeMap<String, EvalValue>,
+        row: Option<RowId>,
+        event: Option<&SourceEvent>,
+        output: Option<FieldId>,
+        consumer: Option<Consumer>,
+        bindings: &mut PlanLocalBindings,
+        work: &mut Work,
+    ) -> Result<EvalValue, Error> {
+        for field in fields {
+            let value = self.eval_row_expression(
+                &field.value,
+                row,
+                event,
+                output,
+                consumer,
+                bindings,
+                work,
+            )?;
+            if field.spread {
+                self.extend_record_from_spread(&mut record, value, event, consumer, work)?;
+            } else {
+                record.insert(field.name.clone(), value);
+            }
+        }
+        Ok(EvalValue::Record(record))
+    }
+
+    fn extend_record_from_spread(
+        &mut self,
+        record: &mut BTreeMap<String, EvalValue>,
+        value: EvalValue,
+        event: Option<&SourceEvent>,
+        consumer: Option<Consumer>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        match value {
+            EvalValue::Record(fields) | EvalValue::MappedRow { fields, .. } => {
+                record.extend(fields);
+            }
+            EvalValue::Value(Value::Record(fields))
+            | EvalValue::Value(Value::MappedRow { fields, .. }) => {
+                record.extend(
+                    fields
+                        .into_iter()
+                        .map(|(name, value)| (name, EvalValue::Value(value))),
+                );
+            }
+            EvalValue::Row(row) | EvalValue::Value(Value::Row { id: row, .. }) => {
+                let fields = self
+                    .metadata
+                    .row_field_names
+                    .iter()
+                    .filter(|((list, _), _)| *list == row.list)
+                    .map(|((_, field), name)| (*field, name.clone()))
+                    .collect::<Vec<_>>();
+                for (field, name) in fields {
+                    self.register_row_dependency(consumer, row, field);
+                    let value = self.ensure_row_field(row, field, event, work)?;
+                    record.insert(name, EvalValue::Value(value));
+                }
+            }
+            other => {
+                return Err(Error::Evaluation(format!(
+                    "record spread requires a record or typed row, found {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn eval_list_row_field(
         &mut self,
         value: EvalValue,
@@ -8962,11 +9711,106 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
         consumer: Option<Consumer>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
         match function {
+            "Bool/not" => {
+                let value = if let Some(input) = input {
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
+                } else {
+                    self.eval_named_arg(
+                        args, "value", row, event, output, consumer, bindings, work,
+                    )?
+                    .ok_or_else(|| Error::Evaluation("Bool/not requires `value`".to_owned()))?
+                };
+                Ok(EvalValue::Value(Value::Bool(!eval_to_bool(&value)?)))
+            }
+            "Bool/and" => {
+                let left = if let Some(input) = input {
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
+                } else {
+                    self.eval_named_arg(args, "left", row, event, output, consumer, bindings, work)?
+                        .ok_or_else(|| Error::Evaluation("Bool/and requires `left`".to_owned()))?
+                };
+                if !eval_to_bool(&left)? {
+                    return Ok(EvalValue::Value(Value::Bool(false)));
+                }
+                let right = self
+                    .eval_named_arg(args, "right", row, event, output, consumer, bindings, work)?
+                    .ok_or_else(|| Error::Evaluation("Bool/and requires `right`".to_owned()))?;
+                Ok(EvalValue::Value(Value::Bool(eval_to_bool(&right)?)))
+            }
+            "Bool/toggle" => {
+                let value = if let Some(input) = input {
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
+                } else {
+                    self.eval_named_arg(
+                        args, "value", row, event, output, consumer, bindings, work,
+                    )?
+                    .ok_or_else(|| Error::Evaluation("Bool/toggle requires `value`".to_owned()))?
+                };
+                let value = eval_to_bool(&value)?;
+                let when = self
+                    .eval_named_arg(args, "when", row, event, output, consumer, bindings, work)?
+                    .map(|when| eval_to_bool(&when))
+                    .transpose()?
+                    .unwrap_or(true);
+                Ok(EvalValue::Value(Value::Bool(if when {
+                    !value
+                } else {
+                    value
+                })))
+            }
             "Text/empty" => Ok(EvalValue::Value(Value::Text(String::new()))),
+            "Text/to_lowercase" => {
+                let value = if let Some(input) = input {
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
+                } else {
+                    self.eval_named_arg(
+                        args, "input", row, event, output, consumer, bindings, work,
+                    )?
+                    .ok_or_else(|| {
+                        Error::Evaluation("Text/to_lowercase requires `input`".to_owned())
+                    })?
+                };
+                Ok(EvalValue::Value(Value::Text(
+                    eval_to_text(&value)?.to_lowercase(),
+                )))
+            }
+            "Text/contains" => {
+                let value = if let Some(input) = input {
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
+                } else {
+                    self.eval_named_arg(
+                        args, "input", row, event, output, consumer, bindings, work,
+                    )?
+                    .ok_or_else(|| Error::Evaluation("Text/contains requires `input`".to_owned()))?
+                };
+                let needle = self
+                    .eval_named_arg(args, "needle", row, event, output, consumer, bindings, work)?
+                    .ok_or_else(|| {
+                        Error::Evaluation("Text/contains requires `needle`".to_owned())
+                    })?;
+                Ok(EvalValue::Value(Value::Bool(
+                    eval_to_text(&value)?.contains(&eval_to_text(&needle)?),
+                )))
+            }
+            "Text/is_not_empty" => {
+                let value = if let Some(input) = input {
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
+                } else {
+                    self.eval_named_arg(
+                        args, "input", row, event, output, consumer, bindings, work,
+                    )?
+                    .ok_or_else(|| {
+                        Error::Evaluation("Text/is_not_empty requires `input`".to_owned())
+                    })?
+                };
+                Ok(EvalValue::Value(Value::Bool(
+                    !eval_to_text(&value)?.is_empty(),
+                )))
+            }
             "Text/all_chars_in" => {
                 let input = input.ok_or_else(|| {
                     Error::Evaluation("Text/all_chars_in requires an input".to_owned())
@@ -9380,61 +10224,6 @@ impl MachineInstance {
                     Error::Evaluation(format!("List/get index {index} is out of bounds"))
                 })
             }
-            "List/find" | "List/find_value" => {
-                let input = input.ok_or_else(|| {
-                    Error::Evaluation(format!("{function} requires an input list"))
-                })?;
-                let input =
-                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let field = self
-                    .named_text_arg(args, "field", row, event, output, consumer, bindings, work)?
-                    .ok_or_else(|| Error::Evaluation(format!("{function} requires `field`")))?;
-                let expected = self
-                    .eval_named_arg(args, "value", row, event, output, consumer, bindings, work)?
-                    .ok_or_else(|| Error::Evaluation(format!("{function} requires `value`")))?;
-                let expected = self.materialize_eval(expected)?;
-                let mut found = None;
-                for item in eval_to_list(input)? {
-                    work.consume(1)?;
-                    let actual =
-                        self.eval_object_field(item.clone(), &field, event, consumer, work)?;
-                    if self.materialize_eval(actual)? == expected {
-                        found = Some(item);
-                        break;
-                    }
-                }
-                if function == "List/find" {
-                    return Ok(
-                        found.unwrap_or_else(|| EvalValue::Value(Value::Text("NaN".to_owned())))
-                    );
-                }
-                if let Some(found) = found {
-                    let target = self
-                        .named_text_arg(
-                            args, "target", row, event, output, consumer, bindings, work,
-                        )?
-                        .ok_or_else(|| {
-                            Error::Evaluation("List/find_value requires `target`".to_owned())
-                        })?;
-                    return self.eval_object_field(found, &target, event, consumer, work);
-                }
-                if let Some(fallback) = args
-                    .iter()
-                    .find(|arg| arg.name.as_deref() == Some("fallback"))
-                {
-                    self.eval_row_expression(
-                        &fallback.value,
-                        row,
-                        event,
-                        output,
-                        consumer,
-                        bindings,
-                        work,
-                    )
-                } else {
-                    Ok(EvalValue::Value(Value::Text("NaN".to_owned())))
-                }
-            }
             "List/count" | "List/length" => {
                 let input = input.ok_or_else(|| {
                     Error::Evaluation(format!("{function} requires an input list"))
@@ -9455,223 +10244,11 @@ impl MachineInstance {
                     !eval_to_list(value)?.is_empty(),
                 )))
             }
-            "List/any" => {
-                let input = input.ok_or_else(|| {
-                    Error::Evaluation("List/any requires an input list".to_owned())
-                })?;
+            "Text/join" => {
+                let input = input
+                    .ok_or_else(|| Error::Evaluation("Text/join requires texts".to_owned()))?;
                 let input =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let binding = self
-                    .eval_named_arg(
-                        args, "binding", row, event, output, consumer, bindings, work,
-                    )?
-                    .map(|value| eval_to_text(&value))
-                    .transpose()?
-                    .ok_or_else(|| Error::Evaluation("List/any requires `binding`".to_owned()))?;
-                let predicate = args
-                    .iter()
-                    .find(|arg| arg.name.as_deref() == Some("if"))
-                    .ok_or_else(|| Error::Evaluation("List/any requires `if`".to_owned()))?;
-                let previous = bindings.get(&binding).cloned();
-                let mut matched = false;
-                let items = eval_to_list(input)?;
-                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                for item in items {
-                    bindings.insert(binding.clone(), item);
-                    let include = self.eval_row_expression(
-                        &predicate.value,
-                        row,
-                        event,
-                        output,
-                        consumer,
-                        bindings,
-                        work,
-                    )?;
-                    if eval_to_bool(&include)? {
-                        matched = true;
-                        break;
-                    }
-                }
-                match previous {
-                    Some(previous) => {
-                        bindings.insert(binding, previous);
-                    }
-                    None => {
-                        bindings.remove(&binding);
-                    }
-                }
-                Ok(EvalValue::Value(Value::Bool(matched)))
-            }
-            "List/retain" => {
-                let input = input.ok_or_else(|| {
-                    Error::Evaluation("List/retain requires an input list".to_owned())
-                })?;
-                let input =
-                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let binding = self
-                    .eval_named_arg(
-                        args, "binding", row, event, output, consumer, bindings, work,
-                    )?
-                    .map(|value| eval_to_text(&value))
-                    .transpose()?
-                    .ok_or_else(|| {
-                        Error::Evaluation("List/retain requires `binding`".to_owned())
-                    })?;
-                let predicate = args
-                    .iter()
-                    .find(|arg| arg.name.as_deref() == Some("if"))
-                    .ok_or_else(|| Error::Evaluation("List/retain requires `if`".to_owned()))?;
-                let previous = bindings.get(&binding).cloned();
-                let mut retained = Vec::new();
-                let items = eval_to_list(input)?;
-                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                for item in items {
-                    bindings.insert(binding.clone(), item.clone());
-                    let include = self.eval_row_expression(
-                        &predicate.value,
-                        row,
-                        event,
-                        output,
-                        consumer,
-                        bindings,
-                        work,
-                    )?;
-                    if eval_to_bool(&include)? {
-                        retained.push(item);
-                    }
-                }
-                match previous {
-                    Some(previous) => {
-                        bindings.insert(binding, previous);
-                    }
-                    None => {
-                        bindings.remove(&binding);
-                    }
-                }
-                Ok(EvalValue::List(retained))
-            }
-            "List/filter_field_equal" | "List/filter_field_not_equal" => {
-                let input = input.ok_or_else(|| {
-                    Error::Evaluation(format!("{function} requires an input list"))
-                })?;
-                let input =
-                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let field = self
-                    .eval_named_arg(args, "field", row, event, output, consumer, bindings, work)?
-                    .map(|value| eval_to_text(&value))
-                    .transpose()?
-                    .ok_or_else(|| Error::Evaluation(format!("{function} requires `field`")))?;
-                let expected = self
-                    .eval_named_arg(args, "value", row, event, output, consumer, bindings, work)?
-                    .ok_or_else(|| Error::Evaluation(format!("{function} requires `value`")))?;
-                let expected = self.materialize_eval(expected)?;
-                let retain_equal = function == "List/filter_field_equal";
-                let mut filtered = Vec::new();
-                let items = eval_to_list(input)?;
-                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                for item in items {
-                    let actual =
-                        self.eval_object_field(item.clone(), &field, event, consumer, work)?;
-                    let actual = self.materialize_eval(actual)?;
-                    if (actual == expected) == retain_equal {
-                        filtered.push(item);
-                    }
-                }
-                Ok(EvalValue::List(filtered))
-            }
-            "List/filter_text_contains" => {
-                let input = input.ok_or_else(|| {
-                    Error::Evaluation("List/filter_text_contains requires a list".to_owned())
-                })?;
-                let input =
-                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let field = self
-                    .named_text_arg(args, "field", row, event, output, consumer, bindings, work)?
-                    .ok_or_else(|| {
-                        Error::Evaluation("List/filter_text_contains requires `field`".to_owned())
-                    })?;
-                let needle = self
-                    .named_text_arg(args, "needle", row, event, output, consumer, bindings, work)?
-                    .unwrap_or_default()
-                    .to_lowercase();
-                let prefer = self.named_text_arg(
-                    args,
-                    "prefer_field",
-                    row,
-                    event,
-                    output,
-                    consumer,
-                    bindings,
-                    work,
-                )?;
-                let empty_field = self.named_text_arg(
-                    args,
-                    "empty_field",
-                    row,
-                    event,
-                    output,
-                    consumer,
-                    bindings,
-                    work,
-                )?;
-                let empty_value = self.named_text_arg(
-                    args,
-                    "empty_value",
-                    row,
-                    event,
-                    output,
-                    consumer,
-                    bindings,
-                    work,
-                )?;
-                let mut filtered = Vec::new();
-                let items = eval_to_list(input)?;
-                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                for item in items {
-                    if needle.is_empty()
-                        && let (Some(empty_field), Some(empty_value)) =
-                            (empty_field.as_deref(), empty_value.as_deref())
-                    {
-                        let actual = self.eval_object_field(
-                            item.clone(),
-                            empty_field,
-                            event,
-                            consumer,
-                            work,
-                        )?;
-                        if eval_to_text(&actual)? == empty_value {
-                            filtered.push(item);
-                        }
-                        continue;
-                    }
-                    let actual =
-                        self.eval_object_field(item.clone(), &field, event, consumer, work)?;
-                    let primary_matches = eval_to_text(&actual)?.to_lowercase().contains(&needle);
-                    let preferred_matches = match prefer.as_deref() {
-                        Some(prefer) => self
-                            .eval_object_field(item.clone(), prefer, event, consumer, work)
-                            .ok()
-                            .and_then(|value| eval_to_text(&value).ok())
-                            .is_some_and(|value| value.to_lowercase().contains(&needle)),
-                        None => false,
-                    };
-                    if primary_matches || preferred_matches {
-                        filtered.push(item);
-                    }
-                }
-                Ok(EvalValue::List(filtered))
-            }
-            "List/join_field" => {
-                let input = input.ok_or_else(|| {
-                    Error::Evaluation("List/join_field requires a list".to_owned())
-                })?;
-                let input =
-                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let field = self
-                    .named_text_arg(args, "field", row, event, output, consumer, bindings, work)?
-                    .ok_or_else(|| {
-                        Error::Evaluation("List/join_field requires `field`".to_owned())
-                    })?;
                 let separator = self
                     .named_text_arg(
                         args,
@@ -9692,11 +10269,10 @@ impl MachineInstance {
                 if items.is_empty() {
                     return Ok(EvalValue::Value(Value::Text(empty)));
                 }
-                let mut values = Vec::new();
-                for item in items {
-                    let value = self.eval_object_field(item, &field, event, consumer, work)?;
-                    values.push(eval_to_text(&value)?);
-                }
+                let values = items
+                    .into_iter()
+                    .map(|item| eval_to_text(&item))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(EvalValue::Value(Value::Text(values.join(&separator))))
             }
             _ => Err(Error::Evaluation(format!(
@@ -9714,7 +10290,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
         consumer: Option<Consumer>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<Option<EvalValue>, Error> {
         args.iter()
@@ -9734,7 +10310,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
         consumer: Option<Consumer>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<Option<String>, Error> {
         self.eval_named_arg(args, name, row, event, output, consumer, bindings, work)?
@@ -9751,7 +10327,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         output: Option<FieldId>,
         consumer: Option<Consumer>,
-        bindings: &mut BTreeMap<String, EvalValue>,
+        bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<FiniteReal, Error> {
         self.eval_named_arg(args, name, row, event, output, consumer, bindings, work)?
@@ -10193,9 +10769,6 @@ impl MachineInstance {
             PlanExpressionKind::MatchInfixConst => {
                 self.evaluate_infix_match_update(op, ordered_inputs, row, event, work)?
             }
-            PlanExpressionKind::ListFindValue => {
-                self.evaluate_list_find_update(op, ordered_inputs, row, event, work)?
-            }
             PlanExpressionKind::HostEffect => {
                 return Err(Error::Unsupported {
                     op: op.id,
@@ -10555,39 +11128,6 @@ impl MachineInstance {
         }
         Ok(())
     }
-
-    fn evaluate_list_find_update(
-        &mut self,
-        op: &PlanOp,
-        inputs: &[ValueRef],
-        row: Option<RowId>,
-        event: &SourceEvent,
-        work: &mut Work,
-    ) -> Result<Value, Error> {
-        let [
-            ValueRef::List(list),
-            ValueRef::Field(field),
-            expected,
-            ValueRef::Field(target),
-            rest @ ..,
-        ] = inputs
-        else {
-            return Err(Error::InvalidPlan(format!(
-                "ListFindValue update {} has malformed inputs",
-                op.id.0
-            )));
-        };
-        let expected = self.eval_update_ref(expected, row, event, work)?;
-        let candidates = self.lookup_index(*list, *field, &expected, None, work)?;
-        if let Some(found) = candidates.first().copied() {
-            return self.ensure_row_field(found, *target, Some(event), work);
-        }
-        if let Some(fallback) = rest.first() {
-            self.eval_update_ref(fallback, row, event, work)
-        } else {
-            Ok(Value::Null)
-        }
-    }
 }
 
 impl MachineInstance {
@@ -10791,7 +11331,7 @@ impl MachineInstance {
             .get_mut(&list_id)
             .ok_or_else(|| Error::Evaluation(format!("list {} is missing", list_id.0)))?;
         list.next_key = key.saturating_add(1);
-        list.order.push(row_id);
+        list.push_ordered(row_id);
         list.rows.insert(row_id, row);
         self.touched_lists.insert(list_id);
         self.index_row(row_id)?;
@@ -10931,7 +11471,7 @@ impl MachineInstance {
             .lists
             .get_mut(&row.list)
             .and_then(|list| {
-                list.order.retain(|candidate| *candidate != row);
+                list.remove_ordered(row);
                 list.rows.remove(&row)
             })
             .ok_or_else(|| {
@@ -11083,41 +11623,23 @@ impl MachineInstance {
 
     fn evaluate_projection(
         &mut self,
-        output: FieldId,
+        output: ValueRef,
         op: PlanOpId,
         projection: &PlanListProjection,
         event: Option<&SourceEvent>,
         work: &mut Work,
-    ) -> Result<Value, Error> {
-        let consumer = Some(Consumer::Root(output));
-        match projection {
-            PlanListProjection::Find {
-                source_list,
-                field,
-                value,
-            } => {
-                let field = self
-                    .metadata
-                    .list_field(*source_list, field)
-                    .map_err(|error| {
-                        Error::InvalidPlan(format!(
-                            "list find projection {} field `{field}` could not resolve: {error}",
-                            op.0
-                        ))
-                    })?;
-                let selector =
-                    self.eval_value_ref(value, None, event, Some(output), consumer, work)?;
-                let selector = self.materialize_eval(selector)?;
-                let candidates =
-                    self.lookup_index(*source_list, field, &selector, consumer, work)?;
-                match candidates.first().copied() {
-                    Some(row) => {
-                        self.register_row_dependency(consumer, row, field);
-                        Ok(row_identity_value(row))
-                    }
-                    None => Ok(Value::Null),
-                }
+    ) -> Result<EvalValue, Error> {
+        let (consumer, output_field) = match output {
+            ValueRef::Field(field) => (Some(Consumer::Root(field)), Some(field)),
+            ValueRef::List(list) => (Some(Consumer::List(list)), None),
+            _ => {
+                return Err(Error::InvalidPlan(format!(
+                    "list projection {} has a non-field/list output",
+                    op.0
+                )));
             }
+        };
+        match projection {
             PlanListProjection::TextPrefix {
                 index,
                 source_list,
@@ -11135,12 +11657,12 @@ impl MachineInstance {
                     )));
                 }
                 let prefix =
-                    self.eval_value_ref(prefix, None, event, Some(output), consumer, work)?;
+                    self.eval_value_ref(prefix, None, event, output_field, consumer, work)?;
                 let prefix = self.materialize_eval(prefix)?;
                 let rows =
                     self.lookup_text_prefix_index(*index, &prefix, *limit, consumer, work)?;
-                Ok(Value::List(
-                    rows.into_iter().map(row_identity_value).collect(),
+                Ok(EvalValue::List(
+                    rows.into_iter().map(EvalValue::Row).collect(),
                 ))
             }
             PlanListProjection::IndexedQuery {
@@ -11151,6 +11673,12 @@ impl MachineInstance {
                 limit,
                 cursor,
             } => {
+                let output = output_field.ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "indexed query projection {} must produce a field",
+                        op.0
+                    ))
+                })?;
                 let declared = self
                     .metadata
                     .query_indexes
@@ -11178,7 +11706,7 @@ impl MachineInstance {
                 let (rows, next_cursor) = self.run_indexed_query(
                     *index, selection, residual, *limit, cursor, consumer, work,
                 )?;
-                Ok(Value::Record(BTreeMap::from([
+                Ok(EvalValue::Value(Value::Record(BTreeMap::from([
                     (
                         "rows".to_owned(),
                         Value::List(rows.into_iter().map(row_identity_value).collect()),
@@ -11187,7 +11715,7 @@ impl MachineInstance {
                         "cursor".to_owned(),
                         Value::Bytes(next_cursor.unwrap_or_default().into()),
                     ),
-                ])))
+                ]))))
             }
             PlanListProjection::Chunk {
                 source_list,
@@ -11201,21 +11729,27 @@ impl MachineInstance {
                         op.0
                     )));
                 }
-                self.register_list_dependency(consumer, *source_list);
-                let rows = self.list_row_ids(*source_list);
+                let rows = self.eval_value_ref(
+                    &ValueRef::List(*source_list),
+                    None,
+                    event,
+                    output_field,
+                    consumer,
+                    work,
+                )?;
+                let rows = eval_to_list(rows)?;
                 work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 let mut chunks = Vec::new();
                 for (index, chunk) in rows.chunks(*size).enumerate() {
-                    let items = chunk
-                        .iter()
-                        .map(|row| row_identity_value(*row))
-                        .collect::<Vec<_>>();
-                    chunks.push(Value::Record(BTreeMap::from([
-                        (label_field.clone(), Value::Text(index.to_string())),
-                        (item_field.clone(), Value::List(items)),
+                    chunks.push(EvalValue::Record(BTreeMap::from([
+                        (
+                            label_field.clone(),
+                            EvalValue::Value(Value::Text(index.to_string())),
+                        ),
+                        (item_field.clone(), EvalValue::List(chunk.to_vec())),
                     ])));
                 }
-                Ok(Value::List(chunks))
+                Ok(EvalValue::List(chunks))
             }
             PlanListProjection::ChunkValue {
                 source,
@@ -11230,32 +11764,42 @@ impl MachineInstance {
                     )));
                 }
                 let source =
-                    self.eval_value_ref(source, None, event, Some(output), consumer, work)?;
-                let source = self.materialize_eval(source)?;
-                let Value::List(rows) = source else {
-                    return Err(Error::Evaluation(format!(
-                        "chunk-value projection {} source is not a list",
-                        op.0
-                    )));
-                };
+                    self.eval_value_ref(source, None, event, output_field, consumer, work)?;
+                let rows = eval_to_list(source)?;
                 work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 let chunks = rows
                     .chunks(*size)
                     .enumerate()
                     .map(|(index, chunk)| {
-                        Value::Record(BTreeMap::from([
-                            (label_field.clone(), Value::Text(index.to_string())),
-                            (item_field.clone(), Value::List(chunk.to_vec())),
+                        EvalValue::Record(BTreeMap::from([
+                            (
+                                label_field.clone(),
+                                EvalValue::Value(Value::Text(index.to_string())),
+                            ),
+                            (item_field.clone(), EvalValue::List(chunk.to_vec())),
                         ]))
                     })
                     .collect();
-                Ok(Value::List(chunks))
+                Ok(EvalValue::List(chunks))
             }
             PlanListProjection::Unknown { summary } => Err(Error::Unsupported {
                 op,
                 detail: format!("unknown list projection: {summary}"),
             }),
         }
+    }
+}
+
+fn normalize_scalar_list_item(
+    value: Value,
+    item_type: &boon_plan::DataTypePlan,
+) -> Result<Value, Error> {
+    match (value, item_type) {
+        (Value::Text(value), boon_plan::DataTypePlan::Number) => value
+            .parse::<i64>()
+            .map_err(|_| Error::Evaluation(format!("`{value}` is not an exact list NUMBER")))
+            .and_then(Value::integer),
+        (value, _) => normalize_host_output_value(value),
     }
 }
 

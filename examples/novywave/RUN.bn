@@ -84,13 +84,13 @@ store: [
 
     real_first_signal_id:
         real_hierarchy_page_result |> WHEN {
-            HierarchyPage => List/find_value(
+            HierarchyPage =>
                 real_hierarchy_page_result.rows
-                field: "kind"
-                value: TEXT { Signal }
-                target: "signal_id"
-                fallback: TEXT { none }
-            )
+                |> List/find(item, if: item.kind == TEXT { Signal })
+                |> WHEN {
+                    Found[value] => value.signal_id
+                    NotFound => TEXT { none }
+                }
             __ => TEXT { none }
         }
 
@@ -282,13 +282,13 @@ store: [
 
     comparison_first_signal_id:
         comparison_hierarchy_page_result |> WHEN {
-            HierarchyPage => List/find_value(
+            HierarchyPage =>
                 comparison_hierarchy_page_result.rows
-                field: "kind"
-                value: TEXT { Signal }
-                target: "signal_id"
-                fallback: TEXT { none }
-            )
+                |> List/find(item, if: item.kind == TEXT { Signal })
+                |> WHEN {
+                    Found[value] => value.signal_id
+                    NotFound => TEXT { none }
+                }
             __ => TEXT { none }
         }
 
@@ -390,50 +390,51 @@ store: [
 
     comparison_transition_count:
         comparison_signal_page_result |> WHEN {
-            SignalPage => List/find_value(
+            SignalPage =>
                 comparison_signal_page_result.signals
-                field: "signal_id"
-                value: comparison_first_signal_id
-                target: "transitions"
-                fallback: LIST {}
-            ) |> List/length()
+                |> List/find(item, if: item.signal_id == comparison_first_signal_id)
+                |> WHEN {
+                    Found[value] => value.transitions
+                    NotFound => LIST {}
+                }
+                |> List/length()
             __ => 0
         }
 
     comparison_signal_name:
         comparison_hierarchy_page_result |> WHEN {
-            HierarchyPage => List/find_value(
+            HierarchyPage =>
                 comparison_hierarchy_page_result.rows
-                field: "signal_id"
-                value: comparison_first_signal_id
-                target: "full_name"
-                fallback: TEXT { comparison signal }
-            )
+                |> List/find(item, if: item.signal_id == comparison_first_signal_id)
+                |> WHEN {
+                    Found[value] => value.full_name
+                    NotFound => TEXT { comparison signal }
+                }
             __ => TEXT { comparison signal }
         }
 
     comparison_signal_width:
         comparison_hierarchy_page_result |> WHEN {
-            HierarchyPage => List/find_value(
+            HierarchyPage =>
                 comparison_hierarchy_page_result.rows
-                field: "signal_id"
-                value: comparison_first_signal_id
-                target: "width"
-                fallback: 1
-            )
+                |> List/find(item, if: item.signal_id == comparison_first_signal_id)
+                |> WHEN {
+                    Found[value] => value.width
+                    NotFound => 1
+                }
             __ => 1
         }
 
     comparison_current_value:
         comparison_cursor_values_result |> WHEN {
             CursorValues => real_waveform_value_text(
-                value: List/find_value(
+                value:
                     comparison_cursor_values_result.rows
-                    field: "signal_id"
-                    value: comparison_first_signal_id
-                    target: "value"
-                    fallback: StringValue[text: Text/empty()]
-                )
+                    |> List/find(item, if: item.signal_id == comparison_first_signal_id)
+                    |> WHEN {
+                        Found[value] => value.value
+                        NotFound => StringValue[text: Text/empty()]
+                    }
             )
             __ => Text/empty()
         }
@@ -449,7 +450,7 @@ store: [
             grouped: False
             segments:
                 comparison_signal_segments()
-                |> List/map(segment, new: new_waveform_segment(segment: segment))
+                |> List/map(item, new: new_waveform_segment(segment: item))
         ]
 
     real_bridge_format:
@@ -933,24 +934,32 @@ store: [
     startup_selected_file:
         TEXT { simple.vcd }
 
+    startup_selected_file_record:
+        startup_workspace_opened_files
+        |> List/find(item, if: item.file == startup_selected_file)
+
     startup_selected_file_path:
-        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "canonical_path", fallback: TEXT { ~/repos/NovyWave/test_files/simple.vcd })
+        startup_selected_file_record |> WHEN {
+            Found[value] => value.canonical_path
+            NotFound => TEXT { ~/repos/NovyWave/test_files/simple.vcd }
+        }
+
+    load_fixture_path_record:
+        startup_workspace_opened_files
+        |> List/find(item, if: item.canonical_path == load_files_path)
+
+    load_fixture_name_record:
+        startup_workspace_opened_files
+        |> List/find(item, if: item.file == load_files_path)
 
     load_fixture_path_match:
-        List/find_value(
-            startup_workspace_opened_files
-            field: "canonical_path"
-            value: load_files_path
-            target: "file"
-            fallback:
-                List/find_value(
-                    startup_workspace_opened_files
-                    field: "file"
-                    value: load_files_path
-                    target: "file"
-                    fallback: TEXT { none }
-                )
-        )
+        load_fixture_path_record |> WHEN {
+            Found[value] => value.file
+            NotFound => load_fixture_name_record |> WHEN {
+                Found[value] => value.file
+                NotFound => TEXT { none }
+            }
+        }
 
     load_requested_fixture_file:
         elements.load_external_file.event.press |> THEN { load_fixture_path_match }
@@ -962,16 +971,28 @@ store: [
         TEXT { Unsupported fixture path. Choose simple.vcd, wave_27.fst, or simple_test.ghw. }
 
     startup_selected_family:
-        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "family", fallback: TEXT { simple_vcd })
+        startup_selected_file_record |> WHEN {
+            Found[value] => value.family
+            NotFound => TEXT { simple_vcd }
+        }
 
     startup_selected_scope_key:
-        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "selected_scope_key", fallback: TEXT { simple_tb_s })
+        startup_selected_file_record |> WHEN {
+            Found[value] => value.selected_scope_key
+            NotFound => TEXT { simple_tb_s }
+        }
 
     startup_selected_scope_label:
-        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "selected_scope_label", fallback: TEXT { simple_tb.s })
+        startup_selected_file_record |> WHEN {
+            Found[value] => value.selected_scope_label
+            NotFound => TEXT { simple_tb.s }
+        }
 
     startup_primary_signal:
-        List/find_value(startup_workspace_opened_files, field: "file", value: startup_selected_file, target: "primary_signal", fallback: TEXT { clk })
+        startup_selected_file_record |> WHEN {
+            Found[value] => value.primary_signal
+            NotFound => TEXT { clk }
+        }
 
     startup_expanded_scopes:
         LIST {
@@ -989,7 +1010,7 @@ store: [
             [kind: FileTreeFile, file: TEXT { simple_test.ghw }, scope_key: TEXT { none }, label: TEXT { - simple_test.ghw }, expanded_label: TEXT { - simple_test.ghw }, collapsed_label: TEXT { - simple_test.ghw }, indent_width: 0, selected_file: TEXT { simple_test.ghw }, source_key: SelectFile]
             [kind: FileTreeScope, file: TEXT { simple_test.ghw }, scope_key: TEXT { ghw_simple }, label: TEXT { - ghw.simple }, expanded_label: TEXT { - ghw.simple }, collapsed_label: TEXT { - ghw.simple }, indent_width: 18, selected_file: TEXT { simple_test.ghw }, source_key: SelectGhwScope]
         }
-        |> List/map(file_tree_row, new: new_file_tree_row(file_tree_row: file_tree_row))
+        |> List/map(item, new: new_file_tree_row(file_tree_row: item))
 
     external_file_tree_file:
         TEXT { none } |> HOLD external_file_tree_file {
@@ -1001,14 +1022,14 @@ store: [
 
     external_catalog_file_tree_rows:
         file_tree_rows
-        |> List/filter_field_equal(field: "file", value: external_file_tree_file)
-        |> List/map(external_file_tree_row, new: new_file_tree_row(file_tree_row: external_file_tree_row))
+        |> List/filter(item, if: item.file == external_file_tree_file)
+        |> List/map(item, new: new_file_tree_row(file_tree_row: item))
 
     external_fallback_file_tree_rows:
         LIST {
             [kind: FileTreeFile, file: external_file_tree_file, scope_key: TEXT { none }, label: external_file_tree_label, expanded_label: external_file_tree_label, collapsed_label: external_file_tree_label, indent_width: 0, selected_file: external_file_tree_file, source_key: SelectLoadedFile]
         }
-        |> List/map(external_file_tree_row, new: new_file_tree_row(file_tree_row: external_file_tree_row))
+        |> List/map(item, new: new_file_tree_row(file_tree_row: item))
 
     external_file_tree_rows:
         external_catalog_file_tree_rows
@@ -1020,24 +1041,24 @@ store: [
 
     default_file_tree_selected_file:
         file_tree_rows
-        |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-        |> List/map(file_tree_row, new:
-            file_tree_row.file_row_elements.select_file.event.press |> THEN { file_tree_row.file }
+        |> List/filter(item, if: item.kind == FileTreeFile)
+        |> List/map(item, new:
+            item.file_row_elements.select_file.event.press |> THEN { item.file }
         )
         |> List/latest()
 
     external_file_tree_selected_file:
         LATEST {
             external_catalog_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.file_row_elements.select_file.event.press |> THEN { external_file_tree_row.file }
+                |> List/filter(item, if: item.kind == FileTreeFile)
+                |> List/map(item, new:
+                    item.file_row_elements.select_file.event.press |> THEN { item.file }
                 )
                 |> List/latest()
             external_fallback_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.file_row_elements.select_file.event.press |> THEN { external_file_tree_row.file }
+                |> List/filter(item, if: item.kind == FileTreeFile)
+                |> List/map(item, new:
+                    item.file_row_elements.select_file.event.press |> THEN { item.file }
                 )
                 |> List/latest()
         }
@@ -1045,49 +1066,52 @@ store: [
     external_file_tree_file_selected_scope:
         LATEST {
             external_catalog_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.file_row_elements.select_file.event.press |> THEN { TEXT { none } }
+                |> List/filter(item, if: item.kind == FileTreeFile)
+                |> List/map(item, new:
+                    item.file_row_elements.select_file.event.press |> THEN { TEXT { none } }
                 )
                 |> List/latest()
             external_fallback_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.file_row_elements.select_file.event.press |> THEN { TEXT { none } }
+                |> List/filter(item, if: item.kind == FileTreeFile)
+                |> List/map(item, new:
+                    item.file_row_elements.select_file.event.press |> THEN { TEXT { none } }
                 )
                 |> List/latest()
         }
 
     external_file_tree_scope_selected_scope:
         external_catalog_file_tree_rows
-        |> List/filter_field_equal(field: "kind", value: FileTreeScope)
-        |> List/map(external_file_tree_row, new:
-            external_file_tree_row.scope_row_elements.select_scope.event.press |> THEN { external_file_tree_row.scope_key }
+        |> List/filter(item, if: item.kind == FileTreeScope)
+        |> List/map(item, new:
+            item.scope_row_elements.select_scope.event.press |> THEN { item.scope_key }
         )
         |> List/latest()
 
     external_file_tree_file_selected_signal:
         LATEST {
             external_catalog_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.file_row_elements.select_file.event.press |> THEN { TEXT { none } }
+                |> List/filter(item, if: item.kind == FileTreeFile)
+                |> List/map(item, new:
+                    item.file_row_elements.select_file.event.press |> THEN { TEXT { none } }
                 )
                 |> List/latest()
             external_fallback_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.file_row_elements.select_file.event.press |> THEN { TEXT { none } }
+                |> List/filter(item, if: item.kind == FileTreeFile)
+                |> List/map(item, new:
+                    item.file_row_elements.select_file.event.press |> THEN { TEXT { none } }
                 )
                 |> List/latest()
         }
 
     external_file_tree_scope_selected_signal:
         external_catalog_file_tree_rows
-        |> List/filter_field_equal(field: "kind", value: FileTreeScope)
-        |> List/map(external_file_tree_row, new:
-            external_file_tree_row.scope_row_elements.select_scope.event.press |> THEN {
-                List/find_value(startup_workspace_opened_files, field: "file", value: external_file_tree_row.file, target: "primary_signal", fallback: store.startup_primary_signal)
+        |> List/filter(item, if: item.kind == FileTreeScope)
+        |> List/map(item, new:
+            item.scope_row_elements.select_scope.event.press |> THEN {
+                startup_file_record(file: item.file) |> WHEN {
+                    Found[value] => value.primary_signal
+                    NotFound => store.startup_primary_signal
+                }
             }
         )
         |> List/latest()
@@ -1095,26 +1119,35 @@ store: [
     external_file_tree_selected_family:
         LATEST {
             external_catalog_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.file_row_elements.select_file.event.press |> THEN {
-                        List/find_value(startup_workspace_opened_files, field: "file", value: external_file_tree_row.file, target: "family", fallback: store.startup_selected_family)
+                |> List/filter(item, if: item.kind == FileTreeFile)
+                |> List/map(item, new:
+                    item.file_row_elements.select_file.event.press |> THEN {
+                        startup_file_record(file: item.file) |> WHEN {
+                            Found[value] => value.family
+                            NotFound => store.startup_selected_family
+                        }
                     }
                 )
                 |> List/latest()
             external_fallback_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.file_row_elements.select_file.event.press |> THEN {
-                        List/find_value(startup_workspace_opened_files, field: "file", value: external_file_tree_row.file, target: "family", fallback: store.startup_selected_family)
+                |> List/filter(item, if: item.kind == FileTreeFile)
+                |> List/map(item, new:
+                    item.file_row_elements.select_file.event.press |> THEN {
+                        startup_file_record(file: item.file) |> WHEN {
+                            Found[value] => value.family
+                            NotFound => store.startup_selected_family
+                        }
                     }
                 )
                 |> List/latest()
             external_catalog_file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeScope)
-                |> List/map(external_file_tree_row, new:
-                    external_file_tree_row.scope_row_elements.select_scope.event.press |> THEN {
-                        List/find_value(startup_workspace_opened_files, field: "file", value: external_file_tree_row.file, target: "family", fallback: store.startup_selected_family)
+                |> List/filter(item, if: item.kind == FileTreeScope)
+                |> List/map(item, new:
+                    item.scope_row_elements.select_scope.event.press |> THEN {
+                        startup_file_record(file: item.file) |> WHEN {
+                            Found[value] => value.family
+                            NotFound => store.startup_selected_family
+                        }
                     }
                 )
                 |> List/latest()
@@ -1297,16 +1330,16 @@ store: [
                 elements.scope_uart.event.press |> THEN { TEXT { wave_27.fst } }
                 elements.scope_analog.event.press |> THEN { TEXT { wave_27.fst } }
                 file_tree_rows
-                    |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                    |> List/map(file_tree_row, new:
-                        file_tree_row.file_row_elements.select_file.event.press |> THEN { file_tree_row.file }
+                    |> List/filter(item, if: item.kind == FileTreeFile)
+                    |> List/map(item, new:
+                        item.file_row_elements.select_file.event.press |> THEN { item.file }
                     )
                     |> List/latest()
                 external_file_tree_selected_file
                 file_tree_rows
-                    |> List/filter_field_equal(field: "kind", value: FileTreeScope)
-                    |> List/map(file_tree_row, new:
-                        file_tree_row.scope_row_elements.select_scope.event.press |> THEN { file_tree_row.file }
+                    |> List/filter(item, if: item.kind == FileTreeScope)
+                    |> List/map(item, new:
+                        item.scope_row_elements.select_scope.event.press |> THEN { item.file }
                     )
                     |> List/latest()
                 elements.begin_default_file_load.event.press |> THEN { store.startup_selected_file }
@@ -1333,67 +1366,122 @@ store: [
     active_metadata_file:
         active_file
 
+    active_metadata_record:
+        waveform_metadata_record(file: active_metadata_file)
+
     active_metadata_format:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "format", fallback: TEXT { none })
+        active_metadata_record |> WHEN {
+            Found[value] => value.format
+            NotFound => TEXT { none }
+        }
 
     active_metadata_digest:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "digest", fallback: TEXT { sha256:none })
+        active_metadata_record |> WHEN {
+            Found[value] => value.digest
+            NotFound => TEXT { sha256:none }
+        }
 
     active_metadata_waveform_ref:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "waveform_ref", fallback: TEXT { wave:none })
+        active_metadata_record |> WHEN {
+            Found[value] => value.waveform_ref
+            NotFound => TEXT { wave:none }
+        }
 
     active_metadata_full_range:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "full_range", fallback: TEXT { no waveform range })
+        active_metadata_record |> WHEN {
+            Found[value] => value.full_range
+            NotFound => TEXT { no waveform range }
+        }
 
     active_metadata_initial_window:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "initial_window", fallback: TEXT { no request window })
+        active_metadata_record |> WHEN {
+            Found[value] => value.initial_window
+            NotFound => TEXT { no request window }
+        }
 
     active_metadata_range_start:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "range_start", fallback: 0)
-        |> Text/to_number()
+        active_metadata_record |> WHEN {
+            Found[value] => value.range_start
+            NotFound => 0
+        }
 
     active_metadata_range_end:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "range_end", fallback: 0)
-        |> Text/to_number()
+        active_metadata_record |> WHEN {
+            Found[value] => value.range_end
+            NotFound => 0
+        }
 
     active_metadata_initial_start:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "initial_start", fallback: 0)
-        |> Text/to_number()
+        active_metadata_record |> WHEN {
+            Found[value] => value.initial_start
+            NotFound => 0
+        }
 
     active_metadata_initial_end:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "initial_end", fallback: 0)
-        |> Text/to_number()
+        active_metadata_record |> WHEN {
+            Found[value] => value.initial_end
+            NotFound => 0
+        }
 
     active_metadata_canvas_width:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "canvas_width", fallback: 360)
-        |> Text/to_number()
+        active_metadata_record |> WHEN {
+            Found[value] => value.canvas_width
+            NotFound => 360
+        }
 
     active_metadata_stats:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "stats", fallback: TEXT { no waveform stats })
+        active_metadata_record |> WHEN {
+            Found[value] => value.stats
+            NotFound => TEXT { no waveform stats }
+        }
 
     active_metadata_large_file_contract:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "large_file_contract", fallback: TEXT { no large file materialized })
+        active_metadata_record |> WHEN {
+            Found[value] => value.large_file_contract
+            NotFound => TEXT { no large file materialized }
+        }
 
     active_metadata_hierarchy_page:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "hierarchy_page", fallback: TEXT { HIER:none })
+        active_metadata_record |> WHEN {
+            Found[value] => value.hierarchy_page
+            NotFound => TEXT { HIER:none }
+        }
 
     active_metadata_hierarchy_cursor:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "hierarchy_cursor", fallback: TEXT { hierarchy cursor none })
+        active_metadata_record |> WHEN {
+            Found[value] => value.hierarchy_cursor
+            NotFound => TEXT { hierarchy cursor none }
+        }
 
     active_metadata_materialization_bound:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "materialization_bound", fallback: TEXT { visible rows 0/0, waveform segments 0/256 max })
+        active_metadata_record |> WHEN {
+            Found[value] => value.materialization_bound
+            NotFound => TEXT { visible rows 0/0, waveform segments 0/256 max }
+        }
 
     active_metadata_time_unit:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "time_unit", fallback: TEXT { none })
+        active_metadata_record |> WHEN {
+            Found[value] => value.time_unit
+            NotFound => TEXT { none }
+        }
 
     active_metadata_timescale:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "timescale", fallback: TEXT { no timescale })
+        active_metadata_record |> WHEN {
+            Found[value] => value.timescale
+            NotFound => TEXT { no timescale }
+        }
 
     active_metadata_range_source:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "range_source", fallback: NoFile)
+        active_metadata_record |> WHEN {
+            Found[value] => value.range_source
+            NotFound => NoFile
+        }
 
     active_metadata_source:
-        List/find_value(waveform_file_metadata, field: "file", value: active_metadata_file, target: "metadata_source", fallback: NoFile)
+        active_metadata_record |> WHEN {
+            Found[value] => value.metadata_source
+            NotFound => NoFile
+        }
 
     external_loaded_metadata_format:
         elements.external_file_loaded_format.text
@@ -1736,9 +1824,9 @@ store: [
 
     row_selected_scope_key:
         file_tree_rows
-        |> List/filter_field_equal(field: "kind", value: FileTreeScope)
-        |> List/map(file_tree_row, new:
-            file_tree_row.scope_row_elements.select_scope.event.press |> THEN { file_tree_row.scope_key }
+        |> List/filter(item, if: item.kind == FileTreeScope)
+        |> List/map(item, new:
+            item.scope_row_elements.select_scope.event.press |> THEN { item.scope_key }
         )
         |> List/latest()
 
@@ -1758,10 +1846,13 @@ store: [
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { top_uart } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { ghw_simple } }
                 file_tree_rows
-                    |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                    |> List/map(file_tree_row, new:
-                        file_tree_row.file_row_elements.select_file.event.press |> THEN {
-                            List/find_value(startup_workspace_opened_files, field: "file", value: file_tree_row.file, target: "selected_scope_key", fallback: store.startup_selected_scope_key)
+                    |> List/filter(item, if: item.kind == FileTreeFile)
+                    |> List/map(item, new:
+                        item.file_row_elements.select_file.event.press |> THEN {
+                            startup_file_record(file: item.file) |> WHEN {
+                                Found[value] => value.selected_scope_key
+                                NotFound => store.startup_selected_scope_key
+                            }
                         }
                     )
                     |> List/latest()
@@ -1801,18 +1892,24 @@ store: [
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { tx_data } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { ghw_counter } }
                 file_tree_rows
-                    |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                    |> List/map(file_tree_row, new:
-                        file_tree_row.file_row_elements.select_file.event.press |> THEN {
-                            List/find_value(startup_workspace_opened_files, field: "file", value: file_tree_row.file, target: "primary_signal", fallback: store.startup_primary_signal)
+                    |> List/filter(item, if: item.kind == FileTreeFile)
+                    |> List/map(item, new:
+                        item.file_row_elements.select_file.event.press |> THEN {
+                            startup_file_record(file: item.file) |> WHEN {
+                                Found[value] => value.primary_signal
+                                NotFound => store.startup_primary_signal
+                            }
                         }
                     )
                     |> List/latest()
                 file_tree_rows
-                    |> List/filter_field_equal(field: "kind", value: FileTreeScope)
-                    |> List/map(file_tree_row, new:
-                        file_tree_row.scope_row_elements.select_scope.event.press |> THEN {
-                            List/find_value(startup_workspace_opened_files, field: "file", value: file_tree_row.file, target: "primary_signal", fallback: store.startup_primary_signal)
+                    |> List/filter(item, if: item.kind == FileTreeScope)
+                    |> List/map(item, new:
+                        item.scope_row_elements.select_scope.event.press |> THEN {
+                            startup_file_record(file: item.file) |> WHEN {
+                                Found[value] => value.primary_signal
+                                NotFound => store.startup_primary_signal
+                            }
                         }
                     )
                     |> List/latest()
@@ -1834,26 +1931,26 @@ store: [
         real_hierarchy_page_result |> WHEN {
             HierarchyPage =>
                 real_hierarchy_page_result.rows
-                |> List/filter_field_equal(field: "kind", value: TEXT { Signal })
+                |> List/filter(item, if: item.kind == TEXT { Signal })
             __ => LIST {}
         }
 
     real_first_signal_parent_id:
         real_hierarchy_page_result |> WHEN {
-            HierarchyPage => List/find_value(
+            HierarchyPage =>
                 real_hierarchy_page_result.rows
-                field: "kind"
-                value: TEXT { Signal }
-                target: "parent_id"
-                fallback: TEXT { none }
-            )
+                |> List/find(item, if: item.kind == TEXT { Signal })
+                |> WHEN {
+                    Found[value] => value.parent_id
+                    NotFound => TEXT { none }
+                }
             __ => TEXT { none }
         }
 
     signal_catalog:
         real_hierarchy_signal_rows
-        |> List/map(signal_row, new:
-            new_signal(signal: real_signal_catalog_row(signal_row: signal_row))
+        |> List/map(item, new:
+            new_signal(signal: real_signal_catalog_row(signal_row: item))
         )
 
     selected_signal_count:
@@ -1861,26 +1958,35 @@ store: [
 
     row_selected_signal_key:
         signal_catalog
-        |> List/map(signal_catalog_item, new:
-            signal_catalog_item.signal_elements.select_signal.event.press
-                |> THEN { signal_catalog_item.key }
+        |> List/map(item, new:
+            item.signal_elements.select_signal.event.press
+                |> THEN { item.key }
         )
         |> List/latest()
 
+    row_selected_signal_record:
+        signal_catalog_record(key: row_selected_signal_key)
+
     row_selected_signal_bridge_key:
-        List/find_value(signal_catalog, field: "key", value: row_selected_signal_key, target: "bridge_key", fallback: "NONE")
+        row_selected_signal_record |> WHEN {
+            Found[value] => value.bridge_key
+            NotFound => TEXT { NONE }
+        }
 
     row_selected_signal_fit_page:
-        List/find_value(signal_catalog, field: "key", value: row_selected_signal_key, target: "fit_page", fallback: "NONE")
+        row_selected_signal_record |> WHEN {
+            Found[value] => value.fit_page
+            NotFound => TEXT { NONE }
+        }
 
     selected_signal_family:
         active_file
 
     selected_signal_defaults:
         real_hierarchy_signal_rows
-        |> List/map(signal_row, new:
+        |> List/map(item, new:
             new_selected_visible_item(
-                row: real_selected_signal_row(signal_row: signal_row)
+                row: real_selected_signal_row(signal_row: item)
             )
         )
 
@@ -1924,8 +2030,8 @@ store: [
         LATEST {
             DefaultOrder
             selected_signal_defaults
-                |> List/map(selected_signal, new:
-                    selected_signal.row_elements.remove_signal.event.press
+                |> List/map(item, new:
+                    item.row_elements.remove_signal.event.press
                         |> THEN { WithoutSelection }
                 )
                 |> List/latest()
@@ -1960,9 +2066,9 @@ store: [
         LATEST {
             TEXT { none }
             selected_signal_defaults
-                |> List/map(selected_signal, new:
-                    selected_signal.row_elements.remove_signal.event.press
-                        |> THEN { selected_signal.id }
+                |> List/map(item, new:
+                    item.row_elements.remove_signal.event.press
+                        |> THEN { item.id }
                 )
                 |> List/latest()
             elements.selected_remove_data.event.press |> THEN { TEXT { data_bus } }
@@ -2021,11 +2127,11 @@ store: [
 
     selected_visible_items:
         selected_signal_defaults
-        |> List/filter_field_equal(field: "family", value: selected_signal_family)
-        |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
-        |> List/filter_field_equal(field: "selected", value: True)
-        |> List/filter_field_not_equal(field: "hidden_when_group", value: selected_group)
-        |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
+        |> List/filter(item, if: item.family == selected_signal_family)
+        |> List/filter(item, if: item.enabled == selected_rows_enabled_value)
+        |> List/filter(item, if: item.selected == True)
+        |> List/filter(item, if: item.hidden_when_group != selected_group)
+        |> List/filter(item, if: item.id != selected_rows_removed_signal_id)
 
     selected_lane_visible_row_count:
         selected_visible_items |> List/length()
@@ -2035,7 +2141,7 @@ store: [
 
     selected_signal_lane_rows:
         selected_visible_items
-        |> List/map(row, new: new_signal_lane_row(row: row))
+        |> List/map(item, new: new_signal_lane_row(row: item))
 
     selected_lane_materialized_row_count:
         selected_signal_lane_rows |> List/length()
@@ -2059,24 +2165,24 @@ store: [
 
     selected_signal_rows:
         selected_visible_items
-        |> List/filter_field_equal(field: "item_kind", value: VariableRow)
+        |> List/filter(item, if: item.item_kind == VariableRow)
 
     selected_signals:
         selected_signal_rows
 
     selected_signal_format_rows:
         selected_signal_rows
-        |> List/map(signal, new: [id: signal.id, formatter: signal.formatter, bit_width: signal.bit_width])
+        |> List/map(item, new: [id: item.id, formatter: item.formatter, bit_width: item.bit_width])
 
     selected_cursor_pair_source_rows:
         active_file == TEXT { simple_test.ghw } |> WHEN {
-            True => selected_signal_rows |> List/filter_field_equal(field: "id", value: active_signal)
+            True => selected_signal_rows |> List/filter(item, if: item.id == active_signal)
             False => selected_signal_rows
         }
 
     selected_cursor_pair_rows:
         selected_cursor_pair_source_rows
-        |> List/map(signal, new: selected_cursor_pair_row(signal: signal))
+        |> List/map(item, new: selected_cursor_pair_row(signal: item))
 
     selected_variable_file:
         active_file
@@ -2113,9 +2219,14 @@ store: [
     selected_timeline_window_end:
         selected_timeline_range_end
 
+    selected_timeline_metadata_record:
+        waveform_metadata_record(file: selected_timeline_metadata_file)
+
     selected_waveform_metadata_canvas_width:
-        List/find_value(waveform_file_metadata, field: "file", value: selected_timeline_metadata_file, target: "canvas_width", fallback: active_metadata_canvas_width)
-        |> Text/to_number()
+        selected_timeline_metadata_record |> WHEN {
+            Found[value] => value.canvas_width
+            NotFound => active_metadata_canvas_width
+        }
 
     selected_waveform_canvas_width:
         selected_waveform_metadata_canvas_width |> HOLD selected_waveform_canvas_width {
@@ -2303,22 +2414,16 @@ store: [
 
     selected_waveform_segments:
         selected_signal_rows
-        |> List/filter_field_equal(field: "id", value: active_signal)
-        |> List/is_not_empty()
+        |> List/find(item, if: item.id == active_signal)
         |> WHEN {
-            True => List/find_value(
-                selected_signal_rows
-                field: "id"
-                value: active_signal
-                target: "segments"
-                fallback: LIST {}
-            )
-            False => LIST {}
+            Found[value] => value.segments
+            NotFound => LIST {}
         }
 
     active_waveform_segment_labels:
         selected_waveform_segments
-        |> List/join_field(field: "label", separator: ",", empty: "none")
+        |> List/map(item, new: item.label)
+        |> Text/join(separator: ",", empty: "none")
 
     active_waveform_segment_count:
         selected_waveform_segments |> List/length()
@@ -2339,28 +2444,53 @@ store: [
         selected_timeline_tick_4 |> Text/concat(with: selected_timeline_time_unit, separator: " ")
 
     data_bus_alias:
-        List/find_value(signal_catalog, field: key, value: TEXT { data_bus }, target: alias, fallback: Text/empty())
+        signal_catalog_record(key: TEXT { data_bus }) |> WHEN {
+            Found[value] => value.alias
+            NotFound => Text/empty()
+        }
 
     signal_search_text:
         Text/empty() |> HOLD signal_search_text {
             elements.signal_search_input.text |> Text/trim()
         }
 
+    signal_search_needle:
+        signal_search_text |> Text/to_lowercase()
+
     search_results:
         signal_catalog
-        |> List/filter_text_contains(field: "name", needle: signal_search_text, prefer_field: "family", empty_field: "scope", empty_value: active_scope)
+        |> List/filter(item, if:
+            signal_search_text |> Text/is_empty() |> WHEN {
+                True => item.scope == active_scope
+                False =>
+                    item.name
+                    |> Text/to_lowercase()
+                    |> Text/contains(needle: signal_search_needle)
+                    |> WHEN {
+                        True => True
+                        False =>
+                            item.family
+                            |> Text/to_lowercase()
+                            |> Text/contains(needle: signal_search_needle)
+                    }
+            }
+        )
 
     variable_rows:
-        List/chunk(search_results, size: 1, items: signals, label: row_number)
+        List/chunk(list: search_results, size: 1)
 
     search_results_count:
         search_results |> List/length()
 
     search_results_key_summary:
-        search_results |> List/join_field(field: "key", separator: ",", empty: "none")
+        search_results
+        |> List/map(item, new: item.key)
+        |> Text/join(separator: ",", empty: "none")
 
     search_results_name_summary:
-        search_results |> List/join_field(field: "name", separator: ", ", empty: "none")
+        search_results
+        |> List/map(item, new: item.name)
+        |> Text/join(separator: ", ", empty: "none")
 
     focused_control_label:
         TEXT { none } |> HOLD focused_control_label {
@@ -2591,8 +2721,8 @@ store: [
                 members_label: TEXT { A[3:0], B[3:0] }
             ]
         })
-        |> List/map(group, new: new_signal_group(group: group, store: store))
-        |> List/remove(group, when:
+        |> List/map(item, new: new_signal_group(group: item, store: store))
+        |> List/remove(item, when:
             LATEST {
                 elements.group_remove.event.press |> THEN { True }
                 elements.load_default_file.event.press |> THEN { True }
@@ -2604,7 +2734,9 @@ store: [
         selected_signal_rows |> List/length()
 
     selected_rows_order_label:
-        selected_signal_rows |> List/join_field(field: "name", separator: ", ", empty: "none")
+        selected_signal_rows
+        |> List/map(item, new: item.name)
+        |> Text/join(separator: ", ", empty: "none")
 
     selected_signal_count_label:
         selected_rows_count |> Text/concat(with: TEXT { selected }, separator: " ")
@@ -2775,10 +2907,10 @@ store: [
         |> List/append(item: marker_add_from_load |> THEN {
             [label: TEXT { 50 s }]
         })
-        |> List/map(marker, new: new_marker(marker: marker, store: store))
-        |> List/remove(marker, when:
+        |> List/map(item, new: new_marker(marker: item, store: store))
+        |> List/remove(item, when:
             LATEST {
-                marker.marker_elements.remove_marker.event.press |> THEN { True }
+                item.marker_elements.remove_marker.event.press |> THEN { True }
                 elements.marker_remove.event.press |> THEN { True }
                 elements.show_empty.event.press |> THEN { True }
             }
@@ -2786,7 +2918,7 @@ store: [
 
     active_marker_count:
         markers
-        |> List/retain(marker, if: marker.has_label)
+        |> List/retain(item, if: item.has_label)
         |> List/count()
 
     marker_count_label:
@@ -2831,11 +2963,20 @@ store: [
             elements.load_default_file.event.press |> THEN { Hexadecimal }
         }
 
+    active_signal_default_record:
+        selected_signal_default_record(id: active_signal)
+
     active_signal_format:
-        List/find_value(selected_signal_defaults, field: "id", value: active_signal, target: "formatter", fallback: value_format)
+        active_signal_default_record |> WHEN {
+            Found[value] => value.formatter
+            NotFound => value_format
+        }
 
     active_signal_bit_width:
-        List/find_value(selected_signal_defaults, field: "id", value: active_signal, target: "bit_width", fallback: TEXT { 1-bit })
+        active_signal_default_record |> WHEN {
+            Found[value] => value.bit_width
+            NotFound => TEXT { 1-bit }
+        }
 
     data_bus_row_format:
         active_signal_format
@@ -2985,27 +3126,33 @@ store: [
     waveform_zoom_center_offset:
         Number/project_offset(time: waveform_hover_zoom_center_value, viewport_start: viewport_label_start, viewport_end: viewport_label_end, canvas_width: selected_waveform_canvas_width, fallback: 0, zoom: waveform_projection_zoom_level)
 
+    active_signal_catalog_record:
+        signal_catalog_record(key: active_signal)
+
     active_signal_label:
-        List/find_value(signal_catalog, field: "key", value: active_signal, target: "label", fallback: "none")
+        active_signal_catalog_record |> WHEN {
+            Found[value] => value.label
+            NotFound => TEXT { none }
+        }
 
     active_scope_key:
         active_scope
 
     active_scope_label:
         real_hierarchy_page_result |> WHEN {
-            HierarchyPage => List/find_value(
+            HierarchyPage =>
                 real_hierarchy_page_result.rows
-                field: "id"
-                value: active_scope
-                target: "full_name"
-                fallback: TEXT { none }
-            )
+                |> List/find(item, if: item.id == active_scope)
+                |> WHEN {
+                    Found[value] => value.full_name
+                    NotFound => TEXT { none }
+                }
             __ => TEXT { none }
         }
 
     active_scope_signal_count:
         real_hierarchy_signal_rows
-        |> List/filter_field_equal(field: "parent_id", value: active_scope)
+        |> List/filter(item, if: item.parent_id == active_scope)
         |> List/length()
         |> Number/to_text(radix: 10)
         |> Text/concat(with: TEXT { signals }, separator: " ")
@@ -3067,7 +3214,10 @@ store: [
         }
 
     active_signal_key:
-        List/find_value(signal_catalog, field: "key", value: active_signal, target: "bridge_key", fallback: "NONE")
+        active_signal_catalog_record |> WHEN {
+            Found[value] => value.bridge_key
+            NotFound => TEXT { NONE }
+        }
 
     format_label:
         NovyModel/format_label(format: active_signal_format)
@@ -3332,7 +3482,10 @@ store: [
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { sha256:aa4a6993101ff31601e12d613b746d8753f20448d78e8b720f708403047dc172 } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { sha256:3485b4b9a423ce61e54a9bd4a2c525cf7576f0e36d39ad73b208c2e38e980491 } }
                 file_tree_selected_file |> THEN {
-                    List/find_value(waveform_file_metadata, field: "file", value: file_tree_selected_file, target: "digest", fallback: TEXT { sha256:none })
+                    waveform_metadata_record(file: file_tree_selected_file) |> WHEN {
+                        Found[value] => value.digest
+                        NotFound => TEXT { sha256:none }
+                    }
                 }
                 elements.cursor_left.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { sha256:726d6fa4d5baa8881462f131997d16ff21494bb88708eb6b23420215e3f5a5de } }
@@ -3349,7 +3502,10 @@ store: [
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { wave:fst:wave-27:0-240ns } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { wave:ghw:simple-test:0-100ns } }
                 file_tree_selected_file |> THEN {
-                    List/find_value(waveform_file_metadata, field: "file", value: file_tree_selected_file, target: "waveform_ref", fallback: TEXT { wave:none })
+                    waveform_metadata_record(file: file_tree_selected_file) |> WHEN {
+                        Found[value] => value.waveform_ref
+                        NotFound => TEXT { wave:none }
+                    }
                 }
                 elements.cursor_left.event.press |> THEN { TEXT { wave:vcd:simple:0-250s } }
                 elements.stale_response_probe.event.press |> THEN { TEXT { wave:vcd:simple:0-250s } }
@@ -3528,7 +3684,8 @@ store: [
 
     bridge_cursor_values_label:
         selected_cursor_pair_rows
-        |> List/join_field(field: "label", separator: " ", empty: "unavailable")
+        |> List/map(item, new: item.label)
+        |> Text/join(separator: " ", empty: "unavailable")
         |> Text/concat(with: keyboard_cursor_label, separator: " at ")
 
     bridge_open_descriptor:
@@ -3934,6 +4091,26 @@ store: [
     bridge_data_policy: TEXT { comparable descriptors only; no Rust handles }
 ]
 
+FUNCTION startup_file_record(file) {
+    store.startup_workspace_opened_files
+    |> List/find(item, if: item.file == file)
+}
+
+FUNCTION waveform_metadata_record(file) {
+    store.waveform_file_metadata
+    |> List/find(item, if: item.file == file)
+}
+
+FUNCTION signal_catalog_record(key) {
+    store.signal_catalog
+    |> List/find(item, if: item.key == key)
+}
+
+FUNCTION selected_signal_default_record(id) {
+    store.selected_signal_defaults
+    |> List/find(item, if: item.id == id)
+}
+
 FUNCTION bridge_page_match_status(request, response) {
     request == TEXT { no-request } |> WHEN {
         True => TEXT { NOT_REQUESTED }
@@ -4089,16 +4266,15 @@ FUNCTION real_signal_bit_width(signal_row) {
 FUNCTION real_signal_segments(signal_id) {
     store.real_signal_page_result |> WHEN {
         SignalPage =>
-            List/find_value(
-                store.real_signal_page_result.signals
-                field: "signal_id"
-                value: signal_id
-                target: "transitions"
-                fallback: LIST {}
-            )
-            |> List/map(transition, new:
+            store.real_signal_page_result.signals
+            |> List/find(item, if: item.signal_id == signal_id)
+            |> WHEN {
+                Found[value] => value.transitions
+                NotFound => LIST {}
+            }
+            |> List/map(item, new:
                 real_waveform_segment(
-                    transition: transition
+                    transition: item
                     signal_id: signal_id
                 )
             )
@@ -4109,15 +4285,14 @@ FUNCTION real_signal_segments(signal_id) {
 FUNCTION comparison_signal_segments() {
     store.comparison_signal_page_result |> WHEN {
         SignalPage =>
-            List/find_value(
-                store.comparison_signal_page_result.signals
-                field: "signal_id"
-                value: store.comparison_first_signal_id
-                target: "transitions"
-                fallback: LIST {}
-            )
-            |> List/map(transition, new:
-                comparison_waveform_segment(transition: transition)
+            store.comparison_signal_page_result.signals
+            |> List/find(item, if: item.signal_id == store.comparison_first_signal_id)
+            |> WHEN {
+                Found[value] => value.transitions
+                NotFound => LIST {}
+            }
+            |> List/map(item, new:
+                comparison_waveform_segment(transition: item)
             )
         __ => LIST {}
     }
@@ -4148,13 +4323,13 @@ FUNCTION comparison_waveform_time_unit() {
 FUNCTION real_cursor_value_text(signal_id) {
     store.real_cursor_values_result |> WHEN {
         CursorValues => real_waveform_value_text(
-            value: List/find_value(
+            value:
                 store.real_cursor_values_result.rows
-                field: "signal_id"
-                value: signal_id
-                target: "value"
-                fallback: StringValue[text: Text/empty()]
-            )
+                |> List/find(item, if: item.signal_id == signal_id)
+                |> WHEN {
+                    Found[value] => value.value
+                    NotFound => StringValue[text: Text/empty()]
+                }
         )
         __ => Text/empty()
     }
@@ -4259,12 +4434,12 @@ FUNCTION new_signal(signal) {
                     elements.selected_remove_ghw_enable.event.press |> THEN { signal.key == TEXT { ghw_enable } |> WHEN { True => False False => selected_once } }
                     elements.selected_remove_ghw_state.event.press |> THEN { signal.key == TEXT { ghw_state } |> WHEN { True => False False => selected_once } }
                     selected_signal_defaults
-                        |> List/filter_field_equal(field: "item_kind", value: VariableRow)
-                        |> List/map(selected_signal, new:
-                            selected_signal.row_elements.remove_signal.event.press
+                        |> List/filter(item, if: item.item_kind == VariableRow)
+                        |> List/map(item, new:
+                            item.row_elements.remove_signal.event.press
                                 |> THEN {
-                                    selected_signal.id == signal.key |> WHEN {
-                                        True => selected_signal.family == signal.family |> WHEN {
+                                    item.id == signal.key |> WHEN {
+                                        True => item.family == signal.family |> WHEN {
                                             True => False
                                             False => selected_once
                                         }
@@ -4319,10 +4494,10 @@ FUNCTION signal_lane_focus_state(row) {
 
 FUNCTION signal_lane_segment_rows(row) {
     row.segments
-        |> List/retain(segment, if: waveform_segment_is_visible(segment: segment))
-        |> List/map(segment, new:
+        |> List/retain(item, if: waveform_segment_is_visible(segment: item))
+        |> List/map(item, new:
             new_signal_lane_segment(
-                segment: new_waveform_segment(segment: segment)
+                segment: new_waveform_segment(segment: item)
                 row: row
             )
         )
@@ -4478,12 +4653,12 @@ FUNCTION selected_row_is_visible(row) {
     row.item_kind |> WHEN {
         GroupHeader =>
             store.signal_catalog
-            |> List/filter_field_equal(field: "family", value: row.family)
-            |> List/any(signal, if: signal.selected_once)
+            |> List/filter(item, if: item.family == row.family)
+            |> List/any(item, if: item.selected_once)
         VariableRow =>
             store.signal_catalog
-            |> List/filter_field_equal(field: "key", value: row.id)
-            |> List/any(signal, if: signal.selected_once)
+            |> List/filter(item, if: item.key == row.id)
+            |> List/any(item, if: item.selected_once)
         __ => True
     }
 }

@@ -2,4 +2,4 @@
 
 cells:
     List/range(from: 0, to: 2599)
-    |> List/map(cell, new: new_cell(cell: cell))
+    |> List/map(item, new: new_cell(cell_index: item))

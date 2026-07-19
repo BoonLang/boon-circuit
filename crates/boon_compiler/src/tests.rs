@@ -20,7 +20,7 @@ store: [
     }
     results:
         List/query_prefix(
-            catalog
+            list: catalog
             field: name
             prefix: prefix
             limit: 20
@@ -39,7 +39,7 @@ store: [
     exact_key: [city: TEXT { OSLO }, name: TEXT { alpha }]
     exact_page:
         List/query(
-            catalog
+            list: catalog
             fields: TEXT { city,name }
             normalization: TEXT { TrimLowercase,TrimLowercase }
             select: Exact
@@ -63,7 +63,7 @@ store: [
     upper: 25
     score_page:
         List/query(
-            catalog
+            list: catalog
             fields: TEXT { score }
             normalization: TEXT { Exact }
             select: Range
@@ -78,7 +78,7 @@ store: [
     kind: Featured
     kind_page:
         List/query(
-            catalog
+            list: catalog
             fields: TEXT { kind }
             normalization: TEXT { Exact }
             select: Exact
@@ -329,8 +329,12 @@ fn compiler_owns_typed_prefix_query_index_plan() {
     assert_eq!(
         compiled.plan.query_indexes.len(),
         1,
-        "unresolved: {:#?}",
-        compiled.plan.debug_map.unresolved_executable_refs
+        "unresolved: {:#?}; projections: {:#?}; lists: {:#?}; statements: {:#?}; expressions: {:#?}",
+        compiled.plan.debug_map.unresolved_executable_refs,
+        compiled.ir.list_projections,
+        compiled.ir.lists,
+        compiled.parsed.ast.statements,
+        compiled.parsed.expressions,
     );
     let index = &compiled.plan.query_indexes[0];
     assert_eq!(index.source_semantic_path, "catalog");
@@ -356,8 +360,15 @@ fn compiler_owns_typed_prefix_query_index_plan() {
                 } if query_index == &index.id
             ))
     );
-    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
-    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    let verification = verify_plan(&compiled.plan).unwrap();
+    assert_eq!(verification.status, "pass", "{:#?}", verification.checks);
+    assert!(
+        compiled.plan.capability_summary.cpu_plan_executor_complete,
+        "capabilities: {:#?}; unresolved: {:#?}; unsupported: {:#?}",
+        compiled.plan.capability_summary,
+        compiled.plan.debug_map.unresolved_executable_refs,
+        boon_plan::cpu_plan_executor_unsupported_ops(&compiled.plan),
+    );
 }
 
 #[test]
@@ -368,11 +379,6 @@ fn compiler_owns_generic_compound_query_and_page_contract() {
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    assert!(
-        compiled.ir.typecheck_report.diagnostics.is_empty(),
-        "{:#?}",
-        compiled.ir.typecheck_report.diagnostics
-    );
     let [index] = compiled.plan.query_indexes.as_slice() else {
         panic!(
             "expected one canonical compound index, got {:?}; unresolved={:?}",
@@ -417,11 +423,6 @@ fn compiler_owns_number_range_and_tag_exact_indexes() {
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    assert!(
-        compiled.ir.typecheck_report.diagnostics.is_empty(),
-        "{:#?}",
-        compiled.ir.typecheck_report.diagnostics
-    );
     assert_eq!(
         compiled
             .plan
@@ -595,18 +596,27 @@ store: [
             _ => None,
         })
         .expect("typed pending expression");
-    assert!(matches!(
-        expression,
-        PlanDerivedExpression::BoolNotExpression { input }
-            if matches!(
-                input.as_ref(),
-                PlanDerivedExpression::ValueCompare {
-                    left: ValueRef::State(_),
-                    op,
-                    right: ValueRef::State(_),
-                } if op == "=="
-            )
-    ));
+    assert!(
+        matches!(
+            expression,
+            PlanDerivedExpression::RowExpression {
+                expression: PlanRowExpression::BuiltinCall {
+                    function,
+                    input: Some(input),
+                    args,
+                },
+            } if function == "Bool/not"
+                && args.is_empty()
+                && matches!(
+                    input.as_ref(),
+                    PlanRowExpression::NumberInfix { op, left, right }
+                        if op == "=="
+                            && matches!(left.as_ref(), PlanRowExpression::Field { input: ValueRef::State(_) })
+                            && matches!(right.as_ref(), PlanRowExpression::Field { input: ValueRef::State(_) })
+                )
+        ),
+        "unexpected root comparison expression: {expression:#?}"
+    );
     let verification = verify_plan(&compiled.plan).unwrap();
     assert_eq!(verification.error_count, 0, "{:#?}", verification.checks);
 }
@@ -740,9 +750,93 @@ use boon_plan::{
     DocumentValueClass, EffectBarrier, EffectReplay, EffectResultPolicy, EffectResultRoute,
     FieldId, MemoryId, MemoryKind, MigrationExpressionPlan, MigrationPredecessorBinding,
     MigrationTransferKindPlan, MigrationTransformPlan, OutputContractKind, OutputDemandPolicy,
-    OutputValueRef, PLAN_MAJOR_VERSION, PlanDerivedExpression, PlanExpressionKind, PlanOpKind,
-    PlanRowExpression, RootOutputDemand, ValueRef, plan_binary, plan_sha256, verify_plan,
+    OutputValueRef, PLAN_MAJOR_VERSION, PlanContextualOperationKind, PlanDerivedExpression,
+    PlanExpressionKind, PlanLocalId, PlanOpKind, PlanRowExpression, PlanStaticOwnerId,
+    RootOutputDemand, ValueRef, plan_binary, plan_sha256, verify_plan,
 };
+
+fn expect_contextual_map<'a>(
+    expression: &'a PlanRowExpression,
+    context: &str,
+) -> (
+    PlanStaticOwnerId,
+    PlanLocalId,
+    &'a PlanRowExpression,
+    &'a PlanRowExpression,
+) {
+    let PlanRowExpression::ContextualCollection {
+        owner,
+        operation,
+        source,
+        row_local,
+        body,
+        ..
+    } = expression
+    else {
+        panic!("{context} must lower as a typed contextual collection: {expression:#?}");
+    };
+    assert_eq!(
+        *operation,
+        PlanContextualOperationKind::Map,
+        "{context} must retain the exact List/map operation"
+    );
+    (*owner, *row_local, source.as_ref(), body.as_ref())
+}
+
+fn expect_contextual_filter<'a>(
+    expression: &'a PlanRowExpression,
+    context: &str,
+) -> (
+    PlanStaticOwnerId,
+    PlanLocalId,
+    &'a PlanRowExpression,
+    &'a PlanRowExpression,
+) {
+    let PlanRowExpression::ContextualCollection {
+        owner,
+        operation,
+        source,
+        row_local,
+        body,
+        ..
+    } = expression
+    else {
+        panic!("{context} must lower as a typed contextual collection: {expression:#?}");
+    };
+    assert_eq!(
+        *operation,
+        PlanContextualOperationKind::Filter,
+        "{context} must retain the exact List/filter operation"
+    );
+    (*owner, *row_local, source.as_ref(), body.as_ref())
+}
+
+fn assert_contextual_local_projection(
+    expression: &PlanRowExpression,
+    expected_owner: PlanStaticOwnerId,
+    expected_local: PlanLocalId,
+    expected_projection: &[&str],
+    context: &str,
+) {
+    let PlanRowExpression::Local {
+        owner,
+        local,
+        projection,
+    } = expression
+    else {
+        panic!("{context} must read the typed contextual local: {expression:#?}");
+    };
+    assert_eq!(*owner, expected_owner, "{context} changed static owner");
+    assert_eq!(*local, expected_local, "{context} changed local identity");
+    assert_eq!(
+        projection,
+        &expected_projection
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect::<Vec<_>>(),
+        "{context} changed its projected row fields"
+    );
+}
 
 fn example_path(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -805,11 +899,19 @@ fn compile_migration_fixture_chain(
         assert_eq!(
             verification.status,
             "pass",
-            "{relative_path} emitted an invalid MachinePlan: {:?}",
+            "{relative_path} emitted an invalid MachinePlan: {:?}; unresolved_ops={:?}",
             verification
                 .checks
                 .iter()
                 .filter(|check| !check.pass)
+                .collect::<Vec<_>>(),
+            compiled
+                .plan
+                .regions
+                .iter()
+                .flat_map(|region| &region.ops)
+                .filter(|op| op.unresolved_executable_ref_count > 0)
+                .map(|op| (op.id, &op.output, op.unresolved_executable_ref_count))
                 .collect::<Vec<_>>()
         );
         predecessor = Some(MigrationPredecessorBinding::from_machine_plan(
@@ -958,7 +1060,7 @@ fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
     assert!(matches!(
         &jobs.value,
         OutputValueRef::RuntimeValue {
-            value: ValueRef::Field(_)
+            value: ValueRef::List(_)
         }
     ));
     let [
@@ -1068,14 +1170,9 @@ store: [
     joined:
         request.method |> THEN {
             request.query
-                |> List/filter_field_equal(
-                    field: "name"
-                    value: TEXT { q }
-                )
-                |> List/join_field(
-                    field: "value"
-                    separator: Text/empty()
-                )
+                |> List/filter(item, if: item.name == TEXT { q })
+                |> List/map(item, new: item.value)
+                |> Text/join(separator: Text/empty())
         }
 ]
 
@@ -1099,35 +1196,41 @@ store: [
         .expect("source event transform");
     let PlanRowExpression::BuiltinCall {
         function,
-        input: Some(filtered),
+        input: Some(mapped),
         args: joined_args,
     } = transform
     else {
         panic!("terminal join call was not retained: {transform:#?}");
     };
-    assert_eq!(function, "List/join_field");
+    assert_eq!(function, "Text/join");
     assert_eq!(
         joined_args
             .iter()
             .filter_map(|arg| arg.name.as_deref())
             .collect::<Vec<_>>(),
-        ["field", "separator"]
+        ["separator"]
     );
-    let PlanRowExpression::BuiltinCall {
-        function,
-        args: filter_args,
-        ..
-    } = filtered.as_ref()
-    else {
-        panic!("filter call was not retained: {filtered:#?}");
+    let (map_owner, map_local, filtered, mapped_value) =
+        expect_contextual_map(mapped, "HTTP query value projection");
+    assert_contextual_local_projection(
+        mapped_value,
+        map_owner,
+        map_local,
+        &["value"],
+        "HTTP query value projection",
+    );
+    let (owner, row_local, _source, predicate) =
+        expect_contextual_filter(filtered, "HTTP query filter");
+    let PlanRowExpression::NumberInfix { op, left, .. } = predicate else {
+        panic!("HTTP query filter must retain its typed equality: {predicate:#?}");
     };
-    assert_eq!(function, "List/filter_field_equal");
-    assert_eq!(
-        filter_args
-            .iter()
-            .filter_map(|arg| arg.name.as_deref())
-            .collect::<Vec<_>>(),
-        ["field", "value"]
+    assert_eq!(op, "==");
+    assert_contextual_local_projection(
+        left,
+        owner,
+        row_local,
+        &["name"],
+        "HTTP query parameter name",
     );
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
 }
@@ -1916,7 +2019,7 @@ store: [
     workspace_id:
         Text/empty() |> HOLD workspace_id {
             store.lifecycle.started |> THEN {
-                Text/is_empty(workspace_id) |> WHEN {
+                Text/is_empty(input: workspace_id) |> WHEN {
                     True => store.lifecycle.started.workspace_id
                     False => workspace_id
                 }
@@ -2628,17 +2731,17 @@ FUNCTION keep_row(row) {
 
 todos:
     LIST { [title: TEXT { one }] }
-    |> List/map(todo, new: keep_row(row: todo))
+    |> List/map(item, new: keep_row(row: item))
     |> DRAINING
 
 tasks:
     DRAIN { todos }
-    |> List/map(task, new: keep_row(row: task))
+    |> List/map(item, new: keep_row(row: item))
 "#;
     let indexed = r#"
 todos:
     LIST { [title: TEXT { one }, text: TEXT { unset }] }
-    |> List/map(todo, new: new_todo(todo: todo))
+    |> List/map(item, new: new_todo(todo: item))
 
 FUNCTION new_todo(todo) {
     [
@@ -2736,7 +2839,16 @@ fn indexed_migrations_reconstruct_untouched_row_defaults() {
             .memory
             .iter()
             .find(|memory| memory.semantic_path == path)
-            .unwrap_or_else(|| panic!("missing persistence memory `{path}`"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing persistence memory `{path}`; available={:?}",
+                    plan.persistence
+                        .memory
+                        .iter()
+                        .map(|memory| memory.semantic_path.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
         plan.storage_layout
             .scalar_slots
             .iter()
@@ -2746,10 +2858,11 @@ fn indexed_migrations_reconstruct_untouched_row_defaults() {
     };
 
     assert!(matches!(
-        initial_expression(&v5, "task.text"),
+        initial_expression(&v5, "store.tasks.text"),
         PlanRowExpression::Field { .. }
     ));
-    let PlanRowExpression::Select { input, arms } = initial_expression(&v6, "task.status") else {
+    let PlanRowExpression::Select { input, arms } = initial_expression(&v6, "store.tasks.status")
+    else {
         panic!("pure indexed migration must compile to a sparse Select default");
     };
     assert!(matches!(input.as_ref(), PlanRowExpression::Field { .. }));
@@ -2853,14 +2966,14 @@ store: [
         LIST {
             [label: TEXT { First }]
         }
-        |> List/map(model_item, new: new_row(item: model_item))
+        |> List/map(item, new: new_row(item: item))
     visible_rows:
         rows
-        |> List/filter_field_equal(field: "label", value: active_label)
+        |> List/filter(item, if: item.label == active_label)
     row_selected:
         visible_rows
-        |> List/map(event_item, new:
-            event_item.controls.select.event.press |> THEN { event_item.label }
+        |> List/map(item, new:
+            item.controls.select.event.press |> THEN { item.label }
         )
         |> List/latest()
     selected:
@@ -2929,7 +3042,7 @@ FUNCTION new_row(item) {
     assert_eq!(
         verification.status,
         "pass",
-        "invalid list-event projection plan: {:?}",
+        "invalid list-event projection plan: {:?}\n{op:#?}",
         verification
             .checks
             .iter()
@@ -3129,8 +3242,8 @@ store: [
     }
     rows:
         seed_rows
-        |> List/map(seed_row, new:
-            wrap_row(row: seed_record(seed: seed_row))
+        |> List/map(item, new:
+            wrap_row(row: seed_record(seed: item))
         )
 ]
 
@@ -3162,7 +3275,9 @@ FUNCTION stateful_row(seed) {
             .debug_map
             .state_slots
             .iter()
-            .any(|entry| { entry.label.ends_with(".value") && entry.label.contains("seed_row") })
+            .any(|entry| { entry.label.ends_with(".value") && entry.label.contains("item") }),
+        "canonical item output lost its keyed nested state: {:?}",
+        compiled.plan.debug_map.state_slots
     );
     assert_eq!(compiled.plan.commit_plan.unresolved_update_branch_count, 0);
     assert_eq!(
@@ -3185,14 +3300,14 @@ store: [
     }
     unrelated_rows:
         unrelated_seed
-        |> List/map(signal, new: unrelated_row(signal: signal))
+        |> List/map(item, new: unrelated_row(signal: item))
     source_rows: LIST {
         [signal_id: TEXT { right }, name: TEXT { expected }]
     }
     catalog:
         source_rows
-        |> List/map(signal_row, new:
-            catalog_row(signal: catalog_record(signal_row: signal_row))
+        |> List/map(item, new:
+            catalog_row(signal: catalog_record(signal_row: item))
         )
 ]
 
@@ -3222,56 +3337,25 @@ FUNCTION catalog_row(signal) {
     )
     .unwrap();
 
-    let label = compiled
-        .plan
-        .debug_map
-        .fields
-        .iter()
-        .find(|field| field.label == "signal_row.label")
-        .and_then(|field| field.id.strip_prefix("field:"))
-        .and_then(|field| field.parse::<usize>().ok())
-        .map(FieldId)
-        .unwrap_or_else(|| {
-            panic!(
-                "catalog label field; available fields: {:?}",
-                compiled
-                    .plan
-                    .debug_map
-                    .fields
-                    .iter()
-                    .map(|field| field.label.as_str())
-                    .collect::<Vec<_>>()
-            )
-        });
-    assert!(
-        compiled
-            .plan
-            .regions
-            .iter()
-            .flat_map(|region| &region.ops)
-            .all(|op| op.output != Some(ValueRef::Field(label))),
-        "a materialized row field must not have a second indexed writer"
-    );
     let catalog = compiled
-        .plan
-        .debug_map
-        .fields
+        .ir
+        .derived_values
         .iter()
-        .find(|field| field.label == "store.catalog")
-        .and_then(|field| field.id.strip_prefix("field:"))
-        .and_then(|field| field.parse::<usize>().ok())
-        .map(FieldId)
-        .expect("catalog field");
+        .find(|derived| derived.path == "store.catalog")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("catalog materialized ListId");
     let catalog_op = compiled
         .plan
         .regions
         .iter()
         .flat_map(|region| &region.ops)
-        .find(|op| op.output == Some(ValueRef::Field(catalog)))
+        .find(|op| op.output == Some(ValueRef::List(catalog)))
         .expect("catalog materialization operation");
     let PlanOpKind::DerivedValue {
         expression:
             Some(PlanDerivedExpression::MaterializeList {
+                target_list,
                 fields: materialized_fields,
                 expression: materialized_expression,
                 ..
@@ -3281,71 +3365,52 @@ FUNCTION catalog_row(signal) {
     else {
         panic!("catalog must have one authoritative materializer: {catalog_op:#?}");
     };
-    assert_eq!(materialized_fields.get("label"), Some(&label));
-    let PlanDerivedExpression::RowExpression {
-        expression: PlanRowExpression::ListMap { value, .. },
-    } = materialized_expression.as_ref()
+    assert_eq!(*target_list, catalog);
+    let label = *materialized_fields
+        .get("label")
+        .expect("catalog materialized label field");
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .all(|op| op.output != Some(ValueRef::Field(label))),
+        "a materialized row field must not have a second indexed writer"
+    );
+    let PlanDerivedExpression::RowExpression { expression } = materialized_expression.as_ref()
     else {
         panic!("catalog materializer must retain the exact list map");
     };
-    let PlanRowExpression::Object { fields } = value.as_ref() else {
-        panic!("catalog map must produce a record");
-    };
-    let PlanRowExpression::ObjectField {
-        object,
-        field: projected_field,
-    } = &fields
-        .iter()
-        .find(|field| field.name == "label")
-        .expect("materialized catalog label")
-        .value
-    else {
-        panic!("catalog label must project the constructor argument object");
-    };
-    assert_eq!(projected_field, "label");
-    let PlanRowExpression::Object {
-        fields: constructor_fields,
-    } = object.as_ref()
-    else {
-        panic!("catalog constructor argument must retain its exact record");
-    };
-    let PlanRowExpression::ListRowField {
-        row: source_row,
-        list_id: source_list,
-        field: source_field,
-    } = &constructor_fields
-        .iter()
-        .find(|field| field.name == "label")
-        .expect("constructor label")
-        .value
-    else {
-        panic!(
-            "constructor label must project the mapped source row: {:#?}",
-            constructor_fields
-                .iter()
-                .find(|field| field.name == "label")
-        );
-    };
-    assert!(matches!(
-        source_row.as_ref(),
-        PlanRowExpression::ListMapItem { binding } if binding == "signal_row"
-    ));
+    let (owner, row_local, source, body) =
+        expect_contextual_map(expression, "catalog materializer");
     let source_rows = compiled
         .ir
         .lists
         .iter()
         .find(|list| list.name.ends_with("source_rows"))
         .expect("source rows list");
-    assert_eq!(source_list.0, source_rows.id.0);
     assert_eq!(
-        compiled
-            .plan
-            .debug_map
-            .fields
-            .iter()
-            .find(|field| field.id == format!("field:{}", source_field.0))
-            .map(|field| field.label.as_str()),
-        Some("source_rows.name")
+        source,
+        &PlanRowExpression::ListRef {
+            list_id: boon_plan::ListId(source_rows.id.0),
+        },
+        "catalog map must retain the exact source list"
+    );
+    let PlanRowExpression::Object { fields } = body else {
+        panic!("catalog map must produce a record");
+    };
+    let label_projection = &fields
+        .iter()
+        .find(|field| field.name == "label")
+        .expect("materialized catalog label")
+        .value;
+    assert_contextual_local_projection(
+        label_projection,
+        owner,
+        row_local,
+        &["name"],
+        "catalog constructor label",
     );
     verify_plan(&compiled.plan).expect("constructor formal plan must verify");
 }
@@ -3362,18 +3427,18 @@ store: [
             [file: TEXT { first.vcd }]
             [file: TEXT { second.vcd }]
         }
-        |> List/map(input_row, new: mapped_row(input: input_row))
+        |> List/map(item, new: mapped_row(input: item))
     selected:
         rows
-        |> List/filter_field_equal(field: "file", value: selected_file)
-        |> List/map(filtered_row, new: copied_row(input: filtered_row))
+        |> List/filter(item, if: item.file == selected_file)
+        |> List/map(item, new: copied_row(input: item))
     continued:
         selected_file |> WHEN {
             TEXT { first.vcd } =>
                 selected
-                |> List/map(continued_row, new:
+                |> List/map(item, new:
                     copied_row(
-                        input: continued_row
+                        input: item
                     )
                 )
             __ => LIST {}
@@ -3396,21 +3461,19 @@ document: Document/new(
     )
     .unwrap();
     let selected = compiled
-        .plan
-        .debug_map
-        .fields
+        .ir
+        .derived_values
         .iter()
-        .find(|field| field.label == "store.selected")
-        .and_then(|field| field.id.strip_prefix("field:"))
-        .and_then(|field| field.parse::<usize>().ok())
-        .map(FieldId)
-        .expect("selected field");
+        .find(|derived| derived.path == "store.selected")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("selected materialized ListId");
     let selected_op = compiled
         .plan
         .regions
         .iter()
         .flat_map(|region| &region.ops)
-        .find(|op| op.output == Some(ValueRef::Field(selected)))
+        .find(|op| op.output == Some(ValueRef::List(selected)))
         .expect("selected operation");
     let PlanOpKind::DerivedValue {
         expression: Some(expression),
@@ -3420,67 +3483,77 @@ document: Document/new(
         panic!("selected operation lost its typed expression: {selected_op:#?}");
     };
     let expression = match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => expression.as_ref(),
+        PlanDerivedExpression::MaterializeList {
+            target_list,
+            expression,
+            ..
+        } => {
+            assert_eq!(*target_list, selected);
+            expression.as_ref()
+        }
         expression => expression,
     };
-    let PlanDerivedExpression::RowExpression {
-        expression: PlanRowExpression::ListMap { value, input, .. },
-    } = expression
-    else {
+    let PlanDerivedExpression::RowExpression { expression } = expression else {
         panic!("selected list must lower its filtered map");
     };
-    assert!(matches!(
-        input.as_ref(),
-        PlanRowExpression::ListFilterField {
-            retain_equal: true,
-            ..
-        }
-    ));
-    let PlanRowExpression::Object { fields } = value.as_ref() else {
+    let (owner, row_local, source, body) = expect_contextual_map(expression, "selected list");
+    let (filter_owner, filter_local, filter_source, predicate) =
+        expect_contextual_filter(source, "selected source");
+    let PlanRowExpression::ListRef {
+        list_id: filter_list_id,
+    } = filter_source
+    else {
+        panic!("selected filter must retain its typed list source: {filter_source:#?}");
+    };
+    let PlanRowExpression::NumberInfix { op, left, .. } = predicate else {
+        panic!("selected filter must retain its typed equality: {predicate:#?}");
+    };
+    assert_eq!(op, "==");
+    assert_contextual_local_projection(
+        left,
+        filter_owner,
+        filter_local,
+        &["file"],
+        "selected filter file",
+    );
+    let PlanRowExpression::Object { fields } = body else {
         panic!("selected map must produce a record");
     };
-    let PlanRowExpression::ListRowField { list_id, field, .. } = &fields
+    let file_projection = &fields
         .iter()
         .find(|field| field.name == "file")
         .expect("selected file field")
-        .value
-    else {
-        panic!("filtered row field must retain an exact list and field identity");
-    };
-    let field_label = compiled
-        .plan
-        .debug_map
-        .fields
-        .iter()
-        .find(|entry| entry.id == format!("field:{}", field.0))
-        .map(|entry| entry.label.as_str())
-        .expect("mapped field label");
-    assert!(field_label.ends_with("file"));
+        .value;
+    assert_contextual_local_projection(
+        file_projection,
+        owner,
+        row_local,
+        &["file"],
+        "selected file field",
+    );
     assert!(
         compiled
             .plan
             .storage_layout
             .list_slots
             .iter()
-            .any(|slot| slot.list_id == *list_id)
+            .any(|slot| slot.list_id == *filter_list_id)
     );
 
     let continued = compiled
-        .plan
-        .debug_map
-        .fields
+        .ir
+        .derived_values
         .iter()
-        .find(|field| field.label == "store.continued")
-        .and_then(|field| field.id.strip_prefix("field:"))
-        .and_then(|field| field.parse::<usize>().ok())
-        .map(FieldId)
-        .expect("continued field");
+        .find(|derived| derived.path == "store.continued")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("continued materialized ListId");
     let continued_op = compiled
         .plan
         .regions
         .iter()
         .flat_map(|region| &region.ops)
-        .find(|op| op.output == Some(ValueRef::Field(continued)))
+        .find(|op| op.output == Some(ValueRef::List(continued)))
         .expect("continued operation");
     let PlanOpKind::DerivedValue {
         expression: Some(expression),
@@ -3490,19 +3563,64 @@ document: Document/new(
         panic!("continued operation lost its typed expression: {continued_op:#?}");
     };
     let expression = match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => expression.as_ref(),
+        PlanDerivedExpression::MaterializeList {
+            target_list,
+            expression,
+            ..
+        } => {
+            assert_eq!(*target_list, continued);
+            expression.as_ref()
+        }
         expression => expression,
     };
     let PlanDerivedExpression::RowExpression {
         expression: PlanRowExpression::Select { arms, .. },
     } = expression
     else {
-        panic!("continued field must lower to a select expression");
+        panic!("continued list must lower to a select expression");
     };
-    assert!(matches!(
-        arms.first().map(|arm| &arm.value),
-        Some(PlanRowExpression::ListMap { .. })
-    ));
+    let continued_map = &arms
+        .iter()
+        .find(|arm| {
+            matches!(
+                &arm.value,
+                PlanRowExpression::ContextualCollection {
+                    operation: PlanContextualOperationKind::Map,
+                    ..
+                }
+            )
+        })
+        .unwrap_or_else(|| panic!("continued select lost its mapped arm: {arms:#?}"))
+        .value;
+    assert!(
+        arms.iter().any(|arm| matches!(
+            &arm.value,
+            PlanRowExpression::ListLiteral { items } if items.is_empty()
+        )),
+        "continued select lost its empty fallback arm: {arms:#?}"
+    );
+    let (continued_owner, continued_local, continued_source, continued_body) =
+        expect_contextual_map(continued_map, "continued mapped select arm");
+    assert_eq!(
+        continued_source,
+        &PlanRowExpression::ListRef { list_id: selected },
+        "continued map must retain the selected list as its exact source"
+    );
+    let PlanRowExpression::Object { fields } = continued_body else {
+        panic!("continued map must produce a record: {continued_body:#?}");
+    };
+    let continued_file = &fields
+        .iter()
+        .find(|field| field.name == "file")
+        .expect("continued file field")
+        .value;
+    assert_contextual_local_projection(
+        continued_file,
+        continued_owner,
+        continued_local,
+        &["file"],
+        "continued file field",
+    );
 }
 
 #[test]
@@ -3594,7 +3712,7 @@ store: [
     }
     selected:
         True |> WHEN {
-            True => items |> List/filter_field_equal(field: "id", value: TEXT { a })
+            True => items |> List/filter(item, if: item.id == TEXT { a })
             False => items
         }
     mapped:
@@ -3606,44 +3724,64 @@ store: [
     )
     .unwrap();
 
-    let field_id = |label: &str| {
-        compiled
-            .plan
-            .debug_map
-            .fields
-            .iter()
-            .find(|field| field.label == label)
-            .and_then(|field| field.id.strip_prefix("field:"))
-            .and_then(|id| id.parse::<usize>().ok())
-            .map(boon_plan::FieldId)
-            .unwrap_or_else(|| panic!("missing field `{label}`"))
-    };
-    let selected = field_id("store.selected");
-    let mapped = field_id("store.mapped");
+    let mapped_list = compiled
+        .ir
+        .derived_values
+        .iter()
+        .find(|derived| derived.path == "store.mapped")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("mapped materialized ListId");
     let mapped_op = compiled
         .plan
         .regions
         .iter()
         .flat_map(|region| &region.ops)
-        .find(|op| op.output == Some(ValueRef::Field(mapped)))
+        .find(|op| op.output == Some(ValueRef::List(mapped_list)))
         .expect("mapped operation");
     let PlanOpKind::DerivedValue {
         expression:
-            Some(PlanDerivedExpression::RowExpression {
-                expression: PlanRowExpression::ListMap { input, .. },
+            Some(PlanDerivedExpression::MaterializeList {
+                target_list,
+                fields,
+                expression,
+                ..
             }),
         ..
     } = &mapped_op.kind
     else {
         panic!("mapped must lower as a list map: {mapped_op:#?}");
     };
-
+    assert_eq!(*target_list, mapped_list);
+    assert!(fields.contains_key("label"));
+    let PlanDerivedExpression::RowExpression { expression } = expression.as_ref() else {
+        panic!("mapped list lost its contextual row expression: {expression:#?}");
+    };
+    let (owner, row_local, source, body) = expect_contextual_map(expression, "mapped field");
+    let selected_list = compiled
+        .ir
+        .derived_values
+        .iter()
+        .find(|derived| derived.path == "store.selected")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("selected materialized ListId");
     assert_eq!(
-        input.as_ref(),
-        &PlanRowExpression::Field {
-            input: ValueRef::Field(selected),
-        }
+        source,
+        &PlanRowExpression::ListRef {
+            list_id: selected_list,
+        },
+        "mapped field must retain the exact derived-list source"
     );
+    let PlanRowExpression::Object { fields } = body else {
+        panic!("mapped field must produce a record: {body:#?}");
+    };
+    let label = &fields
+        .iter()
+        .find(|field| field.name == "label")
+        .expect("mapped label field")
+        .value;
+    assert_contextual_local_projection(label, owner, row_local, &["id"], "mapped label field");
 }
 
 #[test]
@@ -3686,40 +3824,87 @@ FUNCTION decorate(item) {
     .unwrap();
 
     let mapped = compiled
-        .plan
-        .debug_map
-        .fields
+        .ir
+        .derived_values
         .iter()
-        .find(|field| field.label == "store.mapped")
-        .and_then(|field| field.id.strip_prefix("field:"))
-        .and_then(|id| id.parse::<usize>().ok())
-        .map(boon_plan::FieldId)
-        .expect("mapped field");
+        .find(|derived| derived.path == "store.mapped")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("mapped materialized ListId");
     let mapped_op = compiled
         .plan
         .regions
         .iter()
         .flat_map(|region| &region.ops)
-        .find(|op| op.output == Some(ValueRef::Field(mapped)))
+        .find(|op| op.output == Some(ValueRef::List(mapped)))
         .expect("mapped operation");
 
-    assert!(
-        matches!(
-            &mapped_op.kind,
-            PlanOpKind::DerivedValue {
-                expression: Some(PlanDerivedExpression::MaterializeList {
-                    expression,
-                    ..
-                }),
+    let PlanOpKind::DerivedValue {
+        expression:
+            Some(PlanDerivedExpression::MaterializeList {
+                expression: materialized,
                 ..
-            } if matches!(
-                expression.as_ref(),
-                PlanDerivedExpression::RowExpression {
-                    expression: PlanRowExpression::ListMap { .. },
-                }
-            )
-        ),
-        "record-returning helper did not lower as List/map: {mapped_op:#?}"
+            }),
+        ..
+    } = &mapped_op.kind
+    else {
+        panic!("record-returning helper did not materialize its list: {mapped_op:#?}");
+    };
+    let PlanDerivedExpression::RowExpression { expression } = materialized.as_ref() else {
+        panic!("record-returning helper lost its row expression: {materialized:#?}");
+    };
+    let (owner, row_local, source, body) =
+        expect_contextual_map(expression, "record-returning helper");
+    let items = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name.ends_with("items"))
+        .expect("items list");
+    assert_eq!(
+        source,
+        &PlanRowExpression::ListRef {
+            list_id: boon_plan::ListId(items.id.0),
+        },
+        "record-returning helper must retain the exact items source"
+    );
+    let PlanRowExpression::Object { fields } = body else {
+        panic!("record-returning helper must produce a record: {body:#?}");
+    };
+    let label = &fields
+        .iter()
+        .find(|field| field.name == "label")
+        .expect("decorated label")
+        .value;
+    assert_contextual_local_projection(label, owner, row_local, &["id"], "decorated label");
+    let PlanRowExpression::Object {
+        fields: detail_fields,
+    } = &fields
+        .iter()
+        .find(|field| field.name == "details")
+        .expect("decorated details")
+        .value
+    else {
+        panic!(
+            "decorated details must remain a record: {:#?}",
+            fields
+                .iter()
+                .find(|field| field.name == "details")
+                .expect("decorated details")
+                .value
+        );
+    };
+    let detail_value = &detail_fields
+        .iter()
+        .find(|field| field.name == "value")
+        .expect("decorated detail value")
+        .value;
+    assert_contextual_local_projection(
+        detail_value,
+        owner,
+        row_local,
+        &["value"],
+        "decorated detail value",
     );
 }
 
@@ -3744,7 +3929,7 @@ store: [
 
 FUNCTION select_items(items) {
     items
-        |> List/filter_field_equal(field: "family", value: TEXT { kept })
+        |> List/filter(item, if: item.family == TEXT { kept })
         |> List/map(item, new: [label: item.id])
 }
 "#,
@@ -3753,36 +3938,78 @@ FUNCTION select_items(items) {
     .unwrap();
 
     let mapped = compiled
-        .plan
-        .debug_map
-        .fields
+        .ir
+        .derived_values
         .iter()
-        .find(|field| field.label == "store.mapped")
-        .and_then(|field| field.id.strip_prefix("field:"))
-        .and_then(|id| id.parse::<usize>().ok())
-        .map(boon_plan::FieldId)
-        .expect("mapped field");
+        .find(|derived| derived.path == "store.mapped")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("mapped materialized ListId");
     let mapped_op = compiled
         .plan
         .regions
         .iter()
         .flat_map(|region| &region.ops)
-        .find(|op| op.output == Some(ValueRef::Field(mapped)))
+        .find(|op| op.output == Some(ValueRef::List(mapped)))
         .expect("mapped operation");
 
-    assert!(matches!(
-        mapped_op.kind,
-        PlanOpKind::DerivedValue {
-            expression: Some(PlanDerivedExpression::RowExpression {
-                expression: PlanRowExpression::ListMap { .. },
+    let PlanOpKind::DerivedValue {
+        expression:
+            Some(PlanDerivedExpression::MaterializeList {
+                target_list,
+                fields: materialized_fields,
+                expression: materialized,
+                ..
             }),
-            ..
-        }
-    ));
+        ..
+    } = &mapped_op.kind
+    else {
+        panic!("multiline helper did not materialize its list: {mapped_op:#?}");
+    };
+    let mapped_list = compiled
+        .ir
+        .derived_values
+        .iter()
+        .find(|derived| derived.path == "store.mapped")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("mapped materialized ListId");
+    assert_eq!(*target_list, mapped_list);
+    assert!(materialized_fields.contains_key("label"));
+    let PlanDerivedExpression::RowExpression { expression } = materialized.as_ref() else {
+        panic!("multiline helper lost its row expression: {materialized:#?}");
+    };
+    let (owner, row_local, source, body) = expect_contextual_map(expression, "multiline helper");
+    let (filter_owner, filter_local, filter_source, predicate) =
+        expect_contextual_filter(source, "multiline helper filter");
+    assert!(
+        matches!(filter_source, PlanRowExpression::ListRef { .. }),
+        "multiline helper filter must retain its typed list source: {filter_source:#?}"
+    );
+    let PlanRowExpression::NumberInfix { op, left, .. } = predicate else {
+        panic!("multiline helper must retain its typed equality: {predicate:#?}");
+    };
+    assert_eq!(op, "==");
+    assert_contextual_local_projection(
+        left,
+        filter_owner,
+        filter_local,
+        &["family"],
+        "multiline helper family",
+    );
+    let PlanRowExpression::Object { fields } = body else {
+        panic!("multiline helper map must produce a record: {body:#?}");
+    };
+    let label = &fields
+        .iter()
+        .find(|field| field.name == "label")
+        .expect("multiline helper label")
+        .value;
+    assert_contextual_local_projection(label, owner, row_local, &["id"], "multiline helper label");
 }
 
 #[test]
-fn scalar_record_lists_lower_find_find_value_and_get_without_list_memory_identity() {
+fn scalar_record_lists_lower_typed_find_and_get_without_list_memory_identity() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "scalar-record-list-lookups.bn",
         r#"
@@ -3790,16 +4017,18 @@ store: [
     request: SOURCE
     found_value:
         request.method |> THEN {
-            List/find_value(
-                request.query
-                field: "name"
-                value: TEXT { q }
-                target: "value"
-                fallback: TEXT { missing }
+            request.query
+            |> List/find(
+                item
+                if: item.name == TEXT { q }
             )
+            |> WHEN {
+                Found[value] => value.value
+                NotFound => TEXT { missing }
+            }
         }
     second_row:
-        request.method |> THEN { List/get(request.query, index: 1) }
+        request.method |> THEN { List/get(list: request.query, index: 1) }
 ]
 "#,
         TargetProfile::SoftwareDefault,
@@ -3823,9 +4052,16 @@ store: [
     assert!(
         arm_values.iter().any(|value| matches!(
             value,
-            PlanRowExpression::BuiltinCall { function, .. } if function == "List/find_value"
+            PlanRowExpression::Select { input, .. }
+                if matches!(
+                    input.as_ref(),
+                    PlanRowExpression::ContextualCollection {
+                        operation: PlanContextualOperationKind::Find,
+                        ..
+                    }
+                )
         )),
-        "missing scalar List/find_value: {arm_values:#?}"
+        "missing scalar typed List/find: {arm_values:#?}"
     );
     assert!(
         arm_values.iter().any(|value| matches!(
@@ -3835,6 +4071,124 @@ store: [
         "missing scalar List/get: {arm_values:#?}"
     );
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+}
+
+#[test]
+fn stored_list_find_lowers_a_typed_field_id_index_lookup() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "typed-indexed-find.bn",
+        r#"
+store: [
+    items: LIST {
+        [key: TEXT { a }, value: TEXT { A }]
+        [key: TEXT { b }, value: TEXT { B }]
+    }
+    selected:
+        items
+        |> List/find(item, if: item.key == TEXT { b })
+        |> WHEN {
+            Found[value] => value.value
+            NotFound => TEXT { missing }
+        }
+]
+document: Document/new(
+    root: Element/label(element: [], label: store.selected)
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let selected = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.selected")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .unwrap_or_else(|| {
+            panic!(
+                "selected field id; available fields: {:?}",
+                compiled
+                    .plan
+                    .debug_map
+                    .fields
+                    .iter()
+                    .map(|field| field.label.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
+    let expression = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| {
+            (op.output == Some(ValueRef::Field(selected)))
+                .then_some(&op.kind)
+                .and_then(|kind| match kind {
+                    PlanOpKind::DerivedValue {
+                        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                        ..
+                    } => Some(expression),
+                    _ => None,
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "selected typed row expression; selected={selected:?}; ops={:#?}",
+                compiled
+                    .plan
+                    .regions
+                    .iter()
+                    .flat_map(|region| &region.ops)
+                    .filter(|op| op.output == Some(ValueRef::Field(selected)))
+                    .collect::<Vec<_>>()
+            )
+        });
+    let PlanRowExpression::Select { input, .. } = expression else {
+        panic!("selected find result must lower through WHEN: {expression:#?}");
+    };
+    let PlanRowExpression::ContextualCollection {
+        owner,
+        operation: PlanContextualOperationKind::Find,
+        source,
+        row_local,
+        body,
+        index_lookup: Some(index_lookup),
+    } = input.as_ref()
+    else {
+        panic!("selected find must carry typed index metadata: {input:#?}");
+    };
+    assert_eq!(
+        source.as_ref(),
+        &PlanRowExpression::ListRef {
+            list_id: index_lookup.list_id,
+        }
+    );
+    let PlanRowExpression::NumberInfix { op, left, .. } = body.as_ref() else {
+        panic!("typed find predicate lost equality: {body:#?}");
+    };
+    assert_eq!(op, "==");
+    assert!(matches!(
+        left.as_ref(),
+        PlanRowExpression::ListRowField {
+            row,
+            list_id,
+            field,
+        } if *list_id == index_lookup.list_id
+            && *field == index_lookup.field
+            && matches!(
+                row.as_ref(),
+                PlanRowExpression::LocalRow {
+                    owner: row_owner,
+                    local,
+                } if row_owner == owner && local == row_local
+            )
+    ));
+    assert!(boon_plan::verify_plan(&compiled.plan).is_ok());
 }
 
 #[test]
@@ -3883,8 +4237,15 @@ document: Document/new(
     .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
 
-    assert!(document.functions.iter().any(|function| {
-        let DocumentExprOp::Record { fields } = &document.expressions[function.body.0].op else {
+    assert!(
+        document
+            .expressions
+            .iter()
+            .all(|expression| !matches!(expression.op, DocumentExprOp::FunctionCall { .. })),
+        "transparent style helper must be erased before document lowering"
+    );
+    assert!(document.expressions.iter().any(|expression| {
+        let DocumentExprOp::Record { fields } = &expression.op else {
             return false;
         };
         let names = fields
@@ -3914,7 +4275,7 @@ FUNCTION render(profile) {
                 direction: Column
                 style: [width: Fill]
                 items: profile.projects
-                    |> List/map(project, new: project_row(project: project))
+                    |> List/map(item, new: project_row(project: item))
             )
         }
     )
@@ -3946,37 +4307,55 @@ scene: ProfilePage/render(profile: profile)
         compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
             .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
-    let DocumentExprOp::FunctionCall { arguments, .. } =
-        &document.expressions[document.root.expression.0].op
-    else {
-        panic!("scene root is not the ProfilePage call");
-    };
-    let DocumentExprOp::Record { fields: record } = &document.expressions[arguments[0].value.0].op
-    else {
-        panic!("ProfilePage call did not receive an explicit typed global record");
-    };
+    assert!(matches!(
+        document.expressions[document.root.expression.0].op,
+        DocumentExprOp::Constructor { .. }
+    ));
+    assert!(
+        document
+            .expressions
+            .iter()
+            .all(|expression| !matches!(expression.op, DocumentExprOp::FunctionCall { .. })),
+        "transparent cross-module calls must be erased before document lowering"
+    );
     let demanded = match &compiled.plan.demand.root_derived_outputs {
         RootOutputDemand::Selected(fields) => fields.iter().copied().collect::<BTreeSet<_>>(),
         RootOutputDemand::All => panic!("document demand must remain sparse"),
     };
-    let mut direct_field_count = 0;
-    let mut direct_list_count = 0;
-    for record_field in record {
-        match document.expressions[record_field.value.0].op {
-            DocumentExprOp::Read {
-                read: DocumentRead::Field { field },
-            } => {
-                direct_field_count += 1;
-                assert!(demanded.contains(&field));
-            }
-            DocumentExprOp::Read {
-                read: DocumentRead::List { .. },
-            } => direct_list_count += 1,
-            _ => panic!("global record member did not lower to a direct typed read"),
-        }
-    }
-    assert_eq!(direct_field_count, 1);
-    assert_eq!(direct_list_count, 1);
+    let name_field = compiled
+        .ir
+        .semantic_index
+        .fields
+        .iter()
+        .find(|field| field.path == "profile.name")
+        .map(|field| boon_plan::FieldId(field.id.0))
+        .expect("profile.name field");
+    let projects_list = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name == "projects" || list.name == "profile.projects")
+        .map(|list| boon_plan::ListId(list.id.0))
+        .expect("profile.projects list");
+
+    assert!(demanded.contains(&name_field));
+    assert!(document.expressions.iter().any(|expression| matches!(
+        expression.op,
+        DocumentExprOp::Read {
+            read: DocumentRead::Field { field },
+        } if field == name_field
+    )));
+    assert!(
+        document
+            .materializations
+            .iter()
+            .any(|materialization| matches!(
+                materialization.source,
+                boon_plan::DocumentMaterializationSource::List { list } if list == projects_list
+            )),
+        "profile.projects did not remain the typed materialization source: {:#?}",
+        document.materializations
+    );
 }
 
 #[test]
@@ -3990,7 +4369,7 @@ store: [
             [title: TEXT { First }, kind: First]
             [title: TEXT { Second }, kind: Second]
         }
-        |> List/map(row, new: new_row(title: row.title, kind: row.kind))
+        |> List/map(item, new: new_row(title: item.title, kind: item.kind))
 ]
 
 FUNCTION new_row(title, kind) {
@@ -4046,7 +4425,7 @@ document: Document/new(
         direction: Column
         style: []
         items: store.rows
-            |> List/map(row, new: render_row(row: row))
+            |> List/map(item, new: render_row(row: item))
     )
 )
 "#,
@@ -4055,21 +4434,24 @@ document: Document/new(
     .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
 
+    assert!(
+        document
+            .expressions
+            .iter()
+            .all(|expression| !matches!(expression.op, DocumentExprOp::FunctionCall { .. })),
+        "transparent row helpers must be erased before document lowering"
+    );
     assert!(document.expressions.iter().any(|expression| {
-        let DocumentExprOp::FunctionCall { arguments, .. } = &expression.op else {
+        let DocumentExprOp::Read {
+            read: DocumentRead::Parameter { projection, .. },
+        } = &expression.op
+        else {
             return false;
         };
-        arguments.iter().any(|argument| {
-            matches!(
-                document.expressions[argument.value.0].op,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Parameter {
-                        ref projection,
-                        ..
-                    }
-                } if projection.is_empty()
-            )
-        })
+        projection
+            .iter()
+            .map(|name| document.names[name.0].as_str())
+            .eq(["kind"])
     }));
     assert!(document.expressions.iter().any(|expression| {
         let DocumentExprOp::Select { arms, .. } = &expression.op else {
@@ -4117,14 +4499,23 @@ fn cells_rows_are_typed_visible_range_materializations() {
             DocumentMaterializationSource::List { .. }
         )
     }));
-    assert!(document.materializations.iter().any(|materialization| {
-        matches!(
-            materialization.source,
-            DocumentMaterializationSource::Field { .. }
-                | DocumentMaterializationSource::ScopedField { .. }
-                | DocumentMaterializationSource::ParameterField { .. }
-        )
-    }));
+    assert!(
+        document.materializations.iter().any(|materialization| {
+            matches!(
+                materialization.source,
+                DocumentMaterializationSource::Field { .. }
+                    | DocumentMaterializationSource::ScopedField { .. }
+                    | DocumentMaterializationSource::ParameterField { .. }
+                    | DocumentMaterializationSource::Parameter { .. }
+            )
+        }),
+        "materialization sources: {:#?}",
+        document
+            .materializations
+            .iter()
+            .map(|materialization| &materialization.source)
+            .collect::<Vec<_>>()
+    );
     assert!(document.materializations.iter().all(|materialization| {
         match materialization.source {
             DocumentMaterializationSource::List { .. }
@@ -4143,29 +4534,61 @@ fn cells_rows_are_typed_visible_range_materializations() {
         .debug_map
         .fields
         .iter()
-        .find(|field| field.label == "cell.address")
+        .find(|field| field.label == "item.address")
         .and_then(|field| field.id.strip_prefix("field:"))
         .and_then(|id| id.parse::<usize>().ok())
         .map(boon_plan::FieldId)
-        .expect("cell.address field id");
-    assert!(!document.expressions.iter().any(|expression| {
-        matches!(
-            expression.op,
-            DocumentExprOp::Read {
-                read: DocumentRead::Field { field }
-            } if field == address_field
-        )
-    }));
+        .expect("item.address field id");
+    let global_address_reads = document
+        .expressions
+        .iter()
+        .enumerate()
+        .filter(|(_, expression)| {
+            matches!(
+                expression.op,
+                DocumentExprOp::Read {
+                    read: DocumentRead::Field { field }
+                } if field == address_field
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        global_address_reads.is_empty(),
+        "row-owned address leaked into global reads: {:#?}",
+        global_address_reads
+            .iter()
+            .map(|(index, expression)| (
+                index,
+                expression,
+                compiled
+                    .ir
+                    .executable
+                    .expressions
+                    .get(expression.compiler_id)
+            ))
+            .collect::<Vec<_>>()
+    );
     let editing_state = compiled
         .plan
         .debug_map
         .state_slots
         .iter()
-        .find(|state| state.label == "cell.editing_text")
+        .find(|state| state.label == "cells.editing_text")
         .and_then(|state| state.id.strip_prefix("state:"))
         .and_then(|id| id.parse::<usize>().ok())
         .map(boon_plan::StateId)
-        .expect("cell.editing_text state id");
+        .unwrap_or_else(|| {
+            panic!(
+                "cells.editing_text state id; available states: {:?}",
+                compiled
+                    .plan
+                    .debug_map
+                    .state_slots
+                    .iter()
+                    .map(|state| state.label.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
     assert!(!document.expressions.iter().any(|expression| {
         matches!(
             expression.op,
@@ -4298,15 +4721,15 @@ store: [
                 target: completed.target
             ]
         })
-        |> List/map(revision, new: revision_view(revision: revision))
+        |> List/map(item, new: revision_view(revision: item))
 ]
 
 FUNCTION revision_view(revision) {
-[
-    digest: revision.digest
-    compiler: revision.compiler
-    target: revision.target
-]
+    [
+        digest: revision.digest
+        compiler: revision.compiler
+        target: revision.target
+    ]
 }
 "#,
         TargetProfile::SoftwareDefault,

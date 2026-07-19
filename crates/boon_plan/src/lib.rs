@@ -99,6 +99,8 @@ plan_usize_ids!(
     ListId,
     FieldId,
     ScopeId,
+    PlanStaticOwnerId,
+    PlanLocalId,
 );
 
 macro_rules! plan_digest_ids {
@@ -1389,12 +1391,11 @@ fn validate_distributed_pure_expression(
         PlanRowExpression::Intrinsic { .. }
         | PlanRowExpression::ListGetField { .. }
         | PlanRowExpression::ListRef { .. }
-        | PlanRowExpression::ListFindValue { .. }
         | PlanRowExpression::ListRange { .. }
         | PlanRowExpression::ListLiteral { .. }
-        | PlanRowExpression::ListMap { .. }
-        | PlanRowExpression::ListFilterField { .. }
-        | PlanRowExpression::ListMapItem { .. }
+        | PlanRowExpression::ContextualCollection { .. }
+        | PlanRowExpression::Local { .. }
+        | PlanRowExpression::LocalRow { .. }
         | PlanRowExpression::ListSum { .. }
         | PlanRowExpression::ListRowField { .. }
         | PlanRowExpression::BuiltinCall { .. } => false,
@@ -1527,12 +1528,11 @@ fn distributed_call_argument_expression_is_safe(
         PlanRowExpression::Intrinsic { .. }
         | PlanRowExpression::ListGetField { .. }
         | PlanRowExpression::ListRef { .. }
-        | PlanRowExpression::ListFindValue { .. }
         | PlanRowExpression::ListRange { .. }
         | PlanRowExpression::ListLiteral { .. }
-        | PlanRowExpression::ListMap { .. }
-        | PlanRowExpression::ListFilterField { .. }
-        | PlanRowExpression::ListMapItem { .. }
+        | PlanRowExpression::ContextualCollection { .. }
+        | PlanRowExpression::Local { .. }
+        | PlanRowExpression::LocalRow { .. }
         | PlanRowExpression::ListSum { .. }
         | PlanRowExpression::ListRowField { .. }
         | PlanRowExpression::BuiltinCall { .. } => false,
@@ -4008,16 +4008,12 @@ pub fn migration_call_is_supported(function: &str) -> bool {
             | "Bytes/read_signed"
             | "Bytes/write_unsigned"
             | "Bytes/write_signed"
-            | "List/map"
-            | "List/retain"
             | "List/range"
             | "List/chunk"
             | "List/get"
             | "List/count"
             | "List/length"
             | "List/sum"
-            | "List/every"
-            | "List/any"
             | "List/is_not_empty"
     )
 }
@@ -5201,11 +5197,6 @@ fn default_derived_startup_recompute() -> bool {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanListProjection {
-    Find {
-        source_list: ListId,
-        field: String,
-        value: ValueRef,
-    },
     TextPrefix {
         index: QueryIndexId,
         source_list: ListId,
@@ -5340,6 +5331,8 @@ pub enum PlanDerivedExpression {
     MaterializeList {
         target_list: ListId,
         fields: BTreeMap<String, FieldId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        row_field_copies: Vec<PlanMaterializedRowFieldCopy>,
         expression: Box<PlanDerivedExpression>,
     },
     SourceKeyTextTrimNonEmpty {
@@ -5380,6 +5373,13 @@ pub enum PlanDerivedExpression {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanMaterializedRowFieldCopy {
+    pub source_list: ListId,
+    pub source_field: FieldId,
+    pub target_field: FieldId,
+}
+
 impl PlanDerivedExpression {
     pub fn visit_intrinsics(&self, visitor: &mut impl FnMut(PlanIntrinsic)) {
         match self {
@@ -5415,6 +5415,24 @@ pub struct PlanSourceEventTransformArm {
 pub enum PlanIntrinsic {
     SessionInfoStatus,
     SessionInfoPrincipal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanContextualOperationKind {
+    Map,
+    Filter,
+    Retain,
+    Every,
+    Any,
+    Find,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanContextualIndexLookup {
+    pub list_id: ListId,
+    pub field: FieldId,
+    pub value: Box<PlanRowExpression>,
 }
 
 impl PlanIntrinsic {
@@ -5576,14 +5594,6 @@ pub enum PlanRowExpression {
     ListRef {
         list_id: ListId,
     },
-    ListFindValue {
-        list_id: ListId,
-        field: FieldId,
-        value: Box<PlanRowExpression>,
-        target: FieldId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        fallback: Option<Box<PlanRowExpression>>,
-    },
     ListRange {
         from: Box<PlanRowExpression>,
         to: Box<PlanRowExpression>,
@@ -5591,20 +5601,24 @@ pub enum PlanRowExpression {
     ListLiteral {
         items: Vec<PlanRowExpression>,
     },
-    ListMap {
-        input: Box<PlanRowExpression>,
-        binding: String,
-        value: Box<PlanRowExpression>,
+    ContextualCollection {
+        owner: PlanStaticOwnerId,
+        operation: PlanContextualOperationKind,
+        source: Box<PlanRowExpression>,
+        row_local: PlanLocalId,
+        body: Box<PlanRowExpression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index_lookup: Option<PlanContextualIndexLookup>,
     },
-    ListFilterField {
-        input: Box<PlanRowExpression>,
-        list_id: ListId,
-        field: FieldId,
-        expected: Box<PlanRowExpression>,
-        retain_equal: bool,
+    Local {
+        owner: PlanStaticOwnerId,
+        local: PlanLocalId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
     },
-    ListMapItem {
-        binding: String,
+    LocalRow {
+        owner: PlanStaticOwnerId,
+        local: PlanLocalId,
     },
     ListSum {
         input: Box<PlanRowExpression>,
@@ -5657,12 +5671,25 @@ impl PlanRowExpression {
         value_visitor: &mut impl FnMut(&ValueRef),
         intrinsic_visitor: &mut impl FnMut(PlanIntrinsic),
     ) {
-        let mut visit =
-            |expression: &PlanRowExpression| expression.visit(value_visitor, intrinsic_visitor);
+        if let Self::Field { input } = self {
+            value_visitor(input);
+        }
+        if let Self::Intrinsic { intrinsic } = self {
+            intrinsic_visitor(*intrinsic);
+        }
+        self.visit_children(&mut |expression| {
+            expression.visit(value_visitor, intrinsic_visitor);
+        });
+    }
+
+    fn visit_children(&self, visitor: &mut impl FnMut(&PlanRowExpression)) {
         match self {
-            Self::Field { input } => value_visitor(input),
-            Self::Intrinsic { intrinsic } => intrinsic_visitor(*intrinsic),
-            Self::Constant { .. } | Self::ListRef { .. } | Self::ListMapItem { .. } => {}
+            Self::Intrinsic { .. }
+            | Self::Field { .. }
+            | Self::Constant { .. }
+            | Self::ListRef { .. }
+            | Self::Local { .. }
+            | Self::LocalRow { .. } => {}
             Self::TextTrim { input }
             | Self::TextIsEmpty { input }
             | Self::TextLength { input }
@@ -5675,7 +5702,7 @@ impl PlanRowExpression {
             | Self::BytesLength { input }
             | Self::ListSum { input }
             | Self::ObjectField { object: input, .. }
-            | Self::ListRowField { row: input, .. } => visit(input),
+            | Self::ListRowField { row: input, .. } => visitor(input),
             Self::TextStartsWith { input, prefix }
             | Self::BytesStartsWith { input, prefix }
             | Self::BytesConcat {
@@ -5691,8 +5718,8 @@ impl PlanRowExpression {
                 right: prefix,
                 ..
             } => {
-                visit(input);
-                visit(prefix);
+                visitor(input);
+                visitor(prefix);
             }
             Self::BytesEndsWith { input, suffix }
             | Self::BytesFind {
@@ -5711,8 +5738,8 @@ impl PlanRowExpression {
                 input,
                 byte_count: suffix,
             } => {
-                visit(input);
-                visit(suffix);
+                visitor(input);
+                visitor(suffix);
             }
             Self::TextSubstring {
                 input,
@@ -5729,17 +5756,17 @@ impl PlanRowExpression {
                 index: start,
                 value: length,
             } => {
-                visit(input);
-                visit(start);
-                visit(length);
+                visitor(input);
+                visitor(start);
+                visitor(length);
             }
             Self::TextToBytes { input, encoding } | Self::BytesToText { input, encoding } => {
-                visit(input);
+                visitor(input);
                 if let Some(encoding) = encoding {
-                    visit(encoding);
+                    visitor(encoding);
                 }
             }
-            Self::BytesZeros { byte_count } => visit(byte_count),
+            Self::BytesZeros { byte_count } => visitor(byte_count),
             Self::BytesReadUnsigned {
                 input,
                 offset,
@@ -5752,10 +5779,10 @@ impl PlanRowExpression {
                 byte_count,
                 endian,
             } => {
-                visit(input);
-                visit(offset);
-                visit(byte_count);
-                visit(endian);
+                visitor(input);
+                visitor(offset);
+                visitor(byte_count);
+                visitor(endian);
             }
             Self::BytesWriteUnsigned {
                 input,
@@ -5771,58 +5798,129 @@ impl PlanRowExpression {
                 endian,
                 value,
             } => {
-                visit(input);
-                visit(offset);
-                visit(byte_count);
-                visit(endian);
-                visit(value);
+                visitor(input);
+                visitor(offset);
+                visitor(byte_count);
+                visitor(endian);
+                visitor(value);
             }
             Self::TextConcat { parts } | Self::ListLiteral { items: parts } => {
                 for part in parts {
-                    visit(part);
+                    visitor(part);
                 }
             }
-            Self::ListGetField { index, .. } => visit(index),
-            Self::ListFindValue {
-                value, fallback, ..
-            } => {
-                visit(value);
-                if let Some(fallback) = fallback {
-                    visit(fallback);
-                }
-            }
+            Self::ListGetField { index, .. } => visitor(index),
             Self::ListRange { from, to } => {
-                visit(from);
-                visit(to);
+                visitor(from);
+                visitor(to);
             }
-            Self::ListMap { input, value, .. } => {
-                visit(input);
-                visit(value);
-            }
-            Self::ListFilterField {
-                input, expected, ..
+            Self::ContextualCollection {
+                source,
+                body,
+                index_lookup,
+                ..
             } => {
-                visit(input);
-                visit(expected);
+                visitor(source);
+                if let Some(index_lookup) = index_lookup {
+                    visitor(&index_lookup.value);
+                }
+                visitor(body);
             }
             Self::Object { fields } | Self::TaggedObject { fields, .. } => {
                 for field in fields {
-                    visit(&field.value);
+                    visitor(&field.value);
                 }
             }
             Self::BuiltinCall { input, args, .. } => {
                 if let Some(input) = input {
-                    visit(input);
+                    visitor(input);
                 }
                 for argument in args {
-                    visit(&argument.value);
+                    visitor(&argument.value);
                 }
             }
             Self::Select { input, arms } => {
-                visit(input);
+                visitor(input);
                 for arm in arms {
-                    visit(&arm.value);
+                    visitor(&arm.value);
                 }
+            }
+        }
+    }
+
+    fn contextual_locals_resolve(&self) -> bool {
+        self.contextual_locals_resolve_inner(&mut BTreeMap::new())
+    }
+
+    pub fn references_contextual_local(
+        &self,
+        owner: PlanStaticOwnerId,
+        local: PlanLocalId,
+    ) -> bool {
+        if matches!(
+            self,
+            Self::Local {
+                owner: candidate_owner,
+                local: candidate_local,
+                ..
+            } | Self::LocalRow {
+                owner: candidate_owner,
+                local: candidate_local,
+            } if *candidate_owner == owner && *candidate_local == local
+        ) {
+            return true;
+        }
+        let mut found = false;
+        self.visit_children(&mut |child| {
+            if !found && child.references_contextual_local(owner, local) {
+                found = true;
+            }
+        });
+        found
+    }
+
+    fn contextual_locals_resolve_inner(
+        &self,
+        active: &mut BTreeMap<PlanStaticOwnerId, PlanLocalId>,
+    ) -> bool {
+        match self {
+            Self::Local {
+                owner,
+                local,
+                projection,
+            } => {
+                active.get(owner) == Some(local) && projection.iter().all(|field| !field.is_empty())
+            }
+            Self::LocalRow { owner, local } => active.get(owner) == Some(local),
+            Self::ContextualCollection {
+                owner,
+                source,
+                row_local,
+                body,
+                index_lookup,
+                ..
+            } => {
+                if active.contains_key(owner)
+                    || !source.contextual_locals_resolve_inner(active)
+                    || index_lookup.as_ref().is_some_and(|index_lookup| {
+                        !index_lookup.value.contextual_locals_resolve_inner(active)
+                    })
+                {
+                    return false;
+                }
+                active.insert(*owner, *row_local);
+                let valid = body.contextual_locals_resolve_inner(active);
+                active.remove(owner);
+                valid
+            }
+            _ => {
+                let mut valid = true;
+                self.visit_children(&mut |child| {
+                    if valid {
+                        valid = child.contextual_locals_resolve_inner(active);
+                    }
+                });
+                valid
             }
         }
     }
@@ -5832,6 +5930,8 @@ impl PlanRowExpression {
 pub struct PlanRowObjectField {
     pub name: String,
     pub value: PlanRowExpression,
+    #[serde(default)]
+    pub spread: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -5924,7 +6024,6 @@ pub enum PlanExpressionKind {
     MatchValueConst,
     MatchTextIsEmptyConst,
     MatchInfixConst,
-    ListFindValue,
     Unknown,
 }
 
@@ -6803,6 +6902,11 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
         id: "derived-expression-refs-resolve".to_owned(),
         pass: derived_expression_refs_resolve(plan),
         detail: "derived expression operands are present as typed refs".to_owned(),
+    });
+    checks.push(PlanCheck {
+        id: "row-expression-contextual-locals-resolve".to_owned(),
+        pass: row_expression_contextual_locals_resolve(plan),
+        detail: "contextual collection bodies read only owner-qualified typed locals".to_owned(),
     });
     checks.push(PlanCheck {
         id: "row-expression-list-fields-resolve".to_owned(),
@@ -8371,7 +8475,6 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                 }
                 PlanExpressionKind::ProjectTime
                 | PlanExpressionKind::MatchInfixConst
-                | PlanExpressionKind::ListFindValue
                 | PlanExpressionKind::HostEffect
                 | PlanExpressionKind::Unknown => false,
             }
@@ -8487,17 +8590,10 @@ fn cpu_plan_executor_supports_list_projection_op(
     if op.unresolved_executable_ref_count != 0 || !op.indexed {
         return false;
     }
-    let Some(ValueRef::Field(_)) = op.output else {
+    if !list_projection_output_matches(projection, op.output.as_ref()) {
         return false;
-    };
+    }
     match projection {
-        PlanListProjection::Find {
-            source_list, value, ..
-        } => {
-            op.inputs.contains(&ValueRef::List(*source_list))
-                && op.inputs.contains(value)
-                && matches!(value, ValueRef::State(_))
-        }
         PlanListProjection::TextPrefix {
             source_list,
             prefix,
@@ -8532,6 +8628,23 @@ fn cpu_plan_executor_supports_list_projection_op(
         } => *size > 0 && op.inputs.contains(&ValueRef::List(*source_list)),
         PlanListProjection::ChunkValue { source, size, .. } => {
             *size > 0 && op.inputs.contains(source)
+        }
+        PlanListProjection::Unknown { .. } => false,
+    }
+}
+
+fn list_projection_output_matches(
+    projection: &PlanListProjection,
+    output: Option<&ValueRef>,
+) -> bool {
+    match projection {
+        PlanListProjection::IndexedQuery { .. } => {
+            matches!(output, Some(ValueRef::Field(_)))
+        }
+        PlanListProjection::TextPrefix { .. }
+        | PlanListProjection::Chunk { .. }
+        | PlanListProjection::ChunkValue { .. } => {
+            matches!(output, Some(ValueRef::List(_)))
         }
         PlanListProjection::Unknown { .. } => false,
     }
@@ -8950,7 +9063,6 @@ fn cpu_plan_executor_supports_indexed_update_op(
         | PlanExpressionKind::MatchConst
         | PlanExpressionKind::MatchValueConst
         | PlanExpressionKind::MatchInfixConst
-        | PlanExpressionKind::ListFindValue
         | PlanExpressionKind::HostEffect
         | PlanExpressionKind::Unknown => false,
     }
@@ -11888,19 +12000,10 @@ fn list_projection_refs_resolve(plan: &MachinePlan) -> bool {
             let PlanOpKind::ListProjection { projection } = &op.kind else {
                 return true;
             };
-            if !matches!(op.output, Some(ValueRef::Field(_))) {
+            if !list_projection_output_matches(projection, op.output.as_ref()) {
                 return false;
             }
             match projection {
-                PlanListProjection::Find {
-                    source_list,
-                    field,
-                    value,
-                } => {
-                    !field.trim().is_empty()
-                        && op.inputs.contains(&ValueRef::List(*source_list))
-                        && op.inputs.contains(value)
-                }
                 PlanListProjection::TextPrefix {
                     index,
                     source_list,
@@ -12151,6 +12254,7 @@ fn derived_expression_refs_resolve(plan: &MachinePlan) -> bool {
                 PlanDerivedExpression::MaterializeList {
                     target_list,
                     fields,
+                    row_field_copies,
                     expression,
                 } => {
                     plan.storage_layout
@@ -12160,6 +12264,10 @@ fn derived_expression_refs_resolve(plan: &MachinePlan) -> bool {
                         && fields
                             .values()
                             .all(|field| list_has_row_field(plan, *target_list, *field))
+                        && row_field_copies.iter().all(|copy| {
+                            list_has_row_field(plan, copy.source_list, copy.source_field)
+                                && list_has_row_field(plan, *target_list, copy.target_field)
+                        })
                         && derived_expression_refs_resolve_for_op(op, expression)
                 }
                 PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
@@ -12373,38 +12481,25 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
             op.inputs.contains(&ValueRef::List(*list_id)) && row_expression_refs_resolve(op, index)
         }
         PlanRowExpression::ListRef { list_id } => op.inputs.contains(&ValueRef::List(*list_id)),
-        PlanRowExpression::ListFindValue {
-            list_id,
-            value,
-            fallback,
-            ..
-        } => {
-            op.inputs.contains(&ValueRef::List(*list_id))
-                && row_expression_refs_resolve(op, value)
-                && fallback
-                    .as_deref()
-                    .is_none_or(|fallback| row_expression_refs_resolve(op, fallback))
-        }
         PlanRowExpression::ListRange { from, to } => {
             row_expression_refs_resolve(op, from) && row_expression_refs_resolve(op, to)
         }
         PlanRowExpression::ListLiteral { items } => items
             .iter()
             .all(|item| row_expression_refs_resolve(op, item)),
-        PlanRowExpression::ListMap { input, value, .. } => {
-            row_expression_refs_resolve(op, input) && row_expression_refs_resolve(op, value)
-        }
-        PlanRowExpression::ListFilterField {
-            input,
-            list_id,
-            expected,
+        PlanRowExpression::ContextualCollection {
+            source,
+            body,
+            index_lookup,
             ..
         } => {
-            op.inputs.contains(&ValueRef::List(*list_id))
-                && row_expression_refs_resolve(op, input)
-                && row_expression_refs_resolve(op, expected)
+            row_expression_refs_resolve(op, source)
+                && row_expression_refs_resolve(op, body)
+                && index_lookup
+                    .as_ref()
+                    .is_none_or(|index_lookup| row_expression_refs_resolve(op, &index_lookup.value))
         }
-        PlanRowExpression::ListMapItem { .. } => true,
+        PlanRowExpression::Local { .. } | PlanRowExpression::LocalRow { .. } => true,
         PlanRowExpression::ListSum { input } => row_expression_refs_resolve(op, input),
         PlanRowExpression::Object { fields } | PlanRowExpression::TaggedObject { fields, .. } => {
             fields
@@ -12432,6 +12527,67 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
     }
 }
 
+fn row_expression_contextual_locals_resolve(plan: &MachinePlan) -> bool {
+    let initial_values_resolve = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .filter_map(|slot| slot.initial_expression.as_ref())
+        .all(PlanRowExpression::contextual_locals_resolve);
+    let derived_values_resolve = plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression: Some(expression),
+                ..
+            } => Some(expression),
+            _ => None,
+        })
+        .all(derived_expression_contextual_locals_resolve);
+    let distributed_values_resolve = plan.distributed_endpoint.as_ref().is_none_or(|endpoint| {
+        endpoint
+            .endpoint
+            .pure_function_exports
+            .iter()
+            .all(|function| function.body.contextual_locals_resolve())
+            && endpoint
+                .endpoint
+                .remote_call_sites
+                .iter()
+                .flat_map(|call| &call.arguments)
+                .all(|argument| argument.value.contextual_locals_resolve())
+    });
+    initial_values_resolve && derived_values_resolve && distributed_values_resolve
+}
+
+fn derived_expression_contextual_locals_resolve(expression: &PlanDerivedExpression) -> bool {
+    match expression {
+        PlanDerivedExpression::MaterializeList { expression, .. } => {
+            derived_expression_contextual_locals_resolve(expression)
+        }
+        PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+            default.contextual_locals_resolve()
+                && arms.iter().all(|arm| arm.value.contextual_locals_resolve())
+        }
+        PlanDerivedExpression::BoolAnd { left, right } => {
+            derived_expression_contextual_locals_resolve(left)
+                && derived_expression_contextual_locals_resolve(right)
+        }
+        PlanDerivedExpression::BoolNotExpression { input } => {
+            derived_expression_contextual_locals_resolve(input)
+        }
+        PlanDerivedExpression::RowExpression { expression } => {
+            expression.contextual_locals_resolve()
+        }
+        PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
+        | PlanDerivedExpression::BoolNot { .. }
+        | PlanDerivedExpression::NumberCompareConst { .. }
+        | PlanDerivedExpression::ValueCompare { .. } => true,
+    }
+}
+
 fn row_expression_list_fields_resolve(plan: &MachinePlan) -> bool {
     plan.regions
         .iter()
@@ -12454,7 +12610,8 @@ fn row_expression_list_fields_resolve_inner(
         | PlanRowExpression::Field { .. }
         | PlanRowExpression::Constant { .. }
         | PlanRowExpression::ListRef { .. }
-        | PlanRowExpression::ListMapItem { .. } => true,
+        | PlanRowExpression::Local { .. }
+        | PlanRowExpression::LocalRow { .. } => true,
         PlanRowExpression::Object { fields } | PlanRowExpression::TaggedObject { fields, .. } => {
             fields
                 .iter()
@@ -12615,20 +12772,6 @@ fn row_expression_list_fields_resolve_inner(
             list_has_row_field(plan, *list_id, *field)
                 && row_expression_list_fields_resolve_inner(plan, index)
         }
-        PlanRowExpression::ListFindValue {
-            list_id,
-            field,
-            value,
-            target,
-            fallback,
-        } => {
-            list_has_row_field(plan, *list_id, *field)
-                && list_has_row_field(plan, *list_id, *target)
-                && row_expression_list_fields_resolve_inner(plan, value)
-                && fallback
-                    .as_deref()
-                    .is_none_or(|fallback| row_expression_list_fields_resolve_inner(plan, fallback))
-        }
         PlanRowExpression::ListRange { from, to } => {
             row_expression_list_fields_resolve_inner(plan, from)
                 && row_expression_list_fields_resolve_inner(plan, to)
@@ -12636,20 +12779,27 @@ fn row_expression_list_fields_resolve_inner(
         PlanRowExpression::ListLiteral { items } => items
             .iter()
             .all(|item| row_expression_list_fields_resolve_inner(plan, item)),
-        PlanRowExpression::ListMap { input, value, .. } => {
-            row_expression_list_fields_resolve_inner(plan, input)
-                && row_expression_list_fields_resolve_inner(plan, value)
-        }
-        PlanRowExpression::ListFilterField {
-            input,
-            list_id,
-            field,
-            expected,
-            ..
+        PlanRowExpression::ContextualCollection {
+            owner,
+            operation,
+            source,
+            row_local,
+            body,
+            index_lookup,
         } => {
-            list_has_row_field(plan, *list_id, *field)
-                && row_expression_list_fields_resolve_inner(plan, input)
-                && row_expression_list_fields_resolve_inner(plan, expected)
+            row_expression_list_fields_resolve_inner(plan, source)
+                && row_expression_list_fields_resolve_inner(plan, body)
+                && index_lookup.as_ref().is_none_or(|index_lookup| {
+                    contextual_index_lookup_matches(
+                        plan,
+                        *owner,
+                        *operation,
+                        source,
+                        *row_local,
+                        body,
+                        index_lookup,
+                    )
+                })
         }
         PlanRowExpression::BuiltinCall { input, args, .. } => {
             input
@@ -12676,20 +12826,66 @@ fn list_has_row_field(plan: &MachinePlan, list_id: ListId, field_id: FieldId) ->
         .is_some_and(|slot| slot.row_field_ids.contains(&field_id))
 }
 
+fn contextual_index_lookup_matches(
+    plan: &MachinePlan,
+    owner: PlanStaticOwnerId,
+    operation: PlanContextualOperationKind,
+    source: &PlanRowExpression,
+    row_local: PlanLocalId,
+    body: &PlanRowExpression,
+    lookup: &PlanContextualIndexLookup,
+) -> bool {
+    if !matches!(
+        operation,
+        PlanContextualOperationKind::Filter
+            | PlanContextualOperationKind::Retain
+            | PlanContextualOperationKind::Any
+            | PlanContextualOperationKind::Find
+    ) || !matches!(
+        source,
+        PlanRowExpression::ListRef { list_id } if *list_id == lookup.list_id
+    ) || !list_has_row_field(plan, lookup.list_id, lookup.field)
+        || !row_expression_list_fields_resolve_inner(plan, &lookup.value)
+    {
+        return false;
+    }
+    let PlanRowExpression::NumberInfix { op, left, right } = body else {
+        return false;
+    };
+    if op != "==" {
+        return false;
+    }
+    let is_indexed_operand = |expression: &PlanRowExpression| {
+        matches!(
+            expression,
+            PlanRowExpression::ListRowField {
+                row,
+                list_id,
+                field,
+            } if *list_id == lookup.list_id
+                && *field == lookup.field
+                && matches!(
+                    row.as_ref(),
+                    PlanRowExpression::LocalRow {
+                        owner: candidate_owner,
+                        local: candidate_local,
+                    } if *candidate_owner == owner && *candidate_local == row_local
+                )
+        )
+    };
+    (is_indexed_operand(left) && right.as_ref() == lookup.value.as_ref())
+        || (is_indexed_operand(right) && left.as_ref() == lookup.value.as_ref())
+}
+
 fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
     match expression {
-        PlanRowExpression::ListFindValue {
-            value, fallback, ..
-        } => {
-            row_expression_cpu_evaluable(value)
-                && fallback.as_deref().is_none_or(row_expression_cpu_evaluable)
-        }
         PlanRowExpression::Intrinsic { .. }
         | PlanRowExpression::Field { .. }
         | PlanRowExpression::Constant { .. }
         | PlanRowExpression::ListRef { .. }
         | PlanRowExpression::ListRange { .. }
-        | PlanRowExpression::ListMapItem { .. } => true,
+        | PlanRowExpression::Local { .. }
+        | PlanRowExpression::LocalRow { .. } => true,
         PlanRowExpression::ListLiteral { items } => items.iter().all(row_expression_cpu_evaluable),
         PlanRowExpression::Object { fields } | PlanRowExpression::TaggedObject { fields, .. } => {
             fields
@@ -12816,12 +13012,18 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
         }
         PlanRowExpression::TextConcat { parts } => parts.iter().all(row_expression_cpu_evaluable),
         PlanRowExpression::ListGetField { index, .. } => row_expression_cpu_evaluable(index),
-        PlanRowExpression::ListMap { input, value, .. } => {
-            row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(value)
+        PlanRowExpression::ContextualCollection {
+            source,
+            body,
+            index_lookup,
+            ..
+        } => {
+            row_expression_cpu_evaluable(source)
+                && row_expression_cpu_evaluable(body)
+                && index_lookup
+                    .as_ref()
+                    .is_none_or(|index_lookup| row_expression_cpu_evaluable(&index_lookup.value))
         }
-        PlanRowExpression::ListFilterField {
-            input, expected, ..
-        } => row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(expected),
         PlanRowExpression::BuiltinCall {
             function,
             input,
@@ -12830,22 +13032,18 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
             matches!(
                 function.as_str(),
                 "Text/empty"
+                    | "Text/join"
+                    | "Text/contains"
+                    | "Text/to_lowercase"
                     | "Text/all_chars_in"
                     | "Error/new"
                     | "Error/text"
                     | "Router/route"
                     | "Number/to_text"
                     | "List/get"
-                    | "List/find"
-                    | "List/find_value"
                     | "List/count"
                     | "List/length"
                     | "List/is_not_empty"
-                    | "List/retain"
-                    | "List/filter_field_equal"
-                    | "List/filter_field_not_equal"
-                    | "List/filter_text_contains"
-                    | "List/join_field"
             ) && input.as_deref().is_none_or(row_expression_cpu_evaluable)
                 && args
                     .iter()
@@ -12866,7 +13064,8 @@ fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
         | PlanRowExpression::Field { .. }
         | PlanRowExpression::Constant { .. }
         | PlanRowExpression::ListRef { .. }
-        | PlanRowExpression::ListMapItem { .. } => true,
+        | PlanRowExpression::Local { .. }
+        | PlanRowExpression::LocalRow { .. } => true,
         PlanRowExpression::Object { fields } | PlanRowExpression::TaggedObject { fields, .. } => {
             fields
                 .iter()
@@ -12895,21 +13094,8 @@ fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
         PlanRowExpression::NumberInfix { left, right, .. } => {
             root_row_expression_cpu_evaluable(left) && root_row_expression_cpu_evaluable(right)
         }
-        PlanRowExpression::ListFindValue {
-            value, fallback, ..
-        } => {
-            root_row_expression_cpu_evaluable(value)
-                && fallback
-                    .as_deref()
-                    .is_none_or(root_row_expression_cpu_evaluable)
-        }
-        PlanRowExpression::ListMap { input, value, .. } => {
-            root_row_expression_cpu_evaluable(input) && root_row_expression_cpu_evaluable(value)
-        }
-        PlanRowExpression::ListFilterField {
-            input, expected, ..
-        } => {
-            root_row_expression_cpu_evaluable(input) && root_row_expression_cpu_evaluable(expected)
+        PlanRowExpression::ContextualCollection { source, body, .. } => {
+            root_row_expression_cpu_evaluable(source) && root_row_expression_cpu_evaluable(body)
         }
         PlanRowExpression::BuiltinCall {
             function,
@@ -12919,22 +13105,18 @@ fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
             matches!(
                 function.as_str(),
                 "Text/empty"
+                    | "Text/join"
+                    | "Text/contains"
+                    | "Text/to_lowercase"
                     | "Text/all_chars_in"
                     | "Error/new"
                     | "Error/text"
                     | "Router/route"
                     | "Number/to_text"
                     | "List/get"
-                    | "List/find"
-                    | "List/find_value"
                     | "List/count"
                     | "List/length"
                     | "List/is_not_empty"
-                    | "List/retain"
-                    | "List/filter_field_equal"
-                    | "List/filter_field_not_equal"
-                    | "List/filter_text_contains"
-                    | "List/join_field"
             ) && input
                 .as_deref()
                 .is_none_or(root_row_expression_cpu_evaluable)
@@ -13083,6 +13265,101 @@ pub fn non_executable_constant_payload_count(constants: &[PlanConstant]) -> usiz
             )
         })
         .count()
+}
+
+#[cfg(test)]
+mod contextual_collection_tests {
+    use super::*;
+
+    fn local(owner: usize, local: usize, projection: &[&str]) -> PlanRowExpression {
+        PlanRowExpression::Local {
+            owner: PlanStaticOwnerId(owner),
+            local: PlanLocalId(local),
+            projection: projection.iter().map(|field| (*field).to_owned()).collect(),
+        }
+    }
+
+    fn expression(
+        owner: usize,
+        operation: PlanContextualOperationKind,
+        row_local: usize,
+        projection: &[&str],
+    ) -> PlanRowExpression {
+        PlanRowExpression::ContextualCollection {
+            owner: PlanStaticOwnerId(owner),
+            operation,
+            source: Box::new(PlanRowExpression::Field {
+                input: ValueRef::List(ListId(2)),
+            }),
+            row_local: PlanLocalId(row_local),
+            body: Box::new(PlanRowExpression::Object {
+                fields: vec![
+                    PlanRowObjectField {
+                        name: "value".to_owned(),
+                        value: local(owner, row_local, projection),
+                        spread: false,
+                    },
+                    PlanRowObjectField {
+                        name: "status".to_owned(),
+                        value: PlanRowExpression::Intrinsic {
+                            intrinsic: PlanIntrinsic::SessionInfoStatus,
+                        },
+                        spread: false,
+                    },
+                ],
+            }),
+            index_lookup: None,
+        }
+    }
+
+    #[test]
+    fn typed_contextual_locals_validate_visit_and_hash_structurally() {
+        let base = expression(7, PlanContextualOperationKind::Map, 3, &["name"]);
+        assert!(base.contextual_locals_resolve());
+
+        let mut refs = Vec::new();
+        base.visit_value_refs(&mut |value| refs.push(value.clone()));
+        assert_eq!(refs, vec![ValueRef::List(ListId(2))]);
+        let mut intrinsics = Vec::new();
+        base.visit_intrinsics(&mut |intrinsic| intrinsics.push(intrinsic));
+        assert_eq!(intrinsics, vec![PlanIntrinsic::SessionInfoStatus]);
+
+        let hash = canonical_sha256(&base).unwrap();
+        assert_eq!(hash, canonical_sha256(&base).unwrap());
+        for changed in [
+            expression(8, PlanContextualOperationKind::Map, 3, &["name"]),
+            expression(7, PlanContextualOperationKind::Filter, 3, &["name"]),
+            expression(7, PlanContextualOperationKind::Map, 4, &["name"]),
+            expression(7, PlanContextualOperationKind::Map, 3, &["title"]),
+        ] {
+            assert_ne!(hash, canonical_sha256(&changed).unwrap());
+        }
+    }
+
+    #[test]
+    fn contextual_local_validation_rejects_unbound_or_empty_projection_fields() {
+        assert!(!local(0, 0, &[]).contextual_locals_resolve());
+
+        let wrong_owner = PlanRowExpression::ContextualCollection {
+            owner: PlanStaticOwnerId(0),
+            operation: PlanContextualOperationKind::Map,
+            source: Box::new(PlanRowExpression::ListLiteral { items: Vec::new() }),
+            row_local: PlanLocalId(0),
+            body: Box::new(local(1, 0, &[])),
+            index_lookup: None,
+        };
+        assert!(!wrong_owner.contextual_locals_resolve());
+
+        let empty_projection = PlanRowExpression::ContextualCollection {
+            owner: PlanStaticOwnerId(0),
+            operation: PlanContextualOperationKind::Map,
+            source: Box::new(PlanRowExpression::ListLiteral { items: Vec::new() }),
+            row_local: PlanLocalId(0),
+            body: Box::new(local(0, 0, &[""])),
+            index_lookup: None,
+        };
+        assert!(!empty_projection.contextual_locals_resolve());
+    }
 }
 
 #[cfg(test)]

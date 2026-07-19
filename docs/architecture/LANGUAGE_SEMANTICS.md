@@ -65,6 +65,144 @@ not fit. Prefixes are available only for radix 2, 8, and 16. Invalid options,
 non-whole inputs, and output requests beyond these bounds are typed errors, not
 implicit conversions or unbounded allocations.
 
+## Functions, Calls, And OUT
+
+All functions, including standard-library functions and user-defined wrappers,
+use one call model. Every call has parentheses. Ordinary inputs are named with
+their exact declared parameter names and appear in declaration order. There are
+no ordinary positional arguments and callers cannot rename parameters. A pipe
+supplies only the first declared ordinary parameter; it does not create a
+second receiver convention.
+
+An output parameter is declared with `OUT` in a function signature:
+
+```boon
+FUNCTION map(list, item: OUT, new) {
+    ...
+}
+```
+
+A bare call entry creates the fresh output with that exact canonical name:
+
+```boon
+items
+|> List/map(
+    item
+    new: item.value * 2
+)
+```
+
+Bare entries are reserved for fresh `OUT` bindings; they are never ordinary
+values. The equivalent non-piped form is:
+
+```boon
+List/map(
+    list: items
+    item
+    new: item.value * 2
+)
+```
+
+A wrapper forwards an existing output with a named connection. The formal name
+remains the callee's canonical parameter name, while the expression on the
+right resolves to the wrapper's output:
+
+```boon
+FUNCTION map_values(dictionary, entry: OUT, new) {
+    Dictionary[
+        ...dictionary
+        entries:
+            dictionary.entries
+            |> List/map(
+                item: entry
+                new: [
+                    key: entry.key
+                    value: new
+                ]
+            )
+    ]
+}
+
+dictionary
+|> Dictionary/map_values(
+    entry
+    new: entry.value * 2
+)
+```
+
+`item: item` forwards an output with the same local name and `item: entry`
+forwards a compatible output with a different local name. Neither form renames
+the formal parameter. `item: OUT` is declaration syntax and is invalid at a
+call site. Unknown, missing, duplicated, renamed, or out-of-order entries are
+compile errors, as is forwarding an ordinary value to an `OUT` formal.
+
+`OUT` is static contextual wiring supplied by the called function. It is not
+mutable storage, a `SOURCE`, a stream, a nominal value, a runtime handle, or a
+serializable field. User-defined direct, one-wrapper, and multi-wrapper forms
+must elaborate to equivalent executable operations and ownership. The compiler
+rejects zero-driver, multiple-driver, incompatible, and cyclic output nets.
+
+## PASS Context
+
+`PASS` is the sole reserved call-context clause:
+
+```boon
+Components/button(
+    source: store.submit
+    label: TEXT { Submit }
+    PASS: [store: PASSED.store]
+)
+```
+
+`PASS:` may occur at most once and must be the final call clause, including
+when preceding argument expressions read `PASSED` values. It is represented
+separately from the declared value and `OUT` parameter list and therefore does
+not affect function arity or parameter order. `PASS` cannot be a function
+parameter, pipe receiver, output, persisted field, serialized value, or runtime
+value. `PASS` and `PASSED` are reserved language context names.
+
+## Order-Independent Lexical Bindings
+
+Declarations are collected before references are resolved within a lexical
+scope. Functions, modules, `BLOCK` variables, explicit record fields, and fresh
+call outputs are visible throughout their scope independently of textual order:
+
+```boon
+BLOCK {
+    result: doubled + 1
+    doubled: input * 2
+}
+```
+
+The compiler resolves this dependency graph and schedules `doubled` before
+`result`. This does not relax call syntax: call entries still use exact names
+and declaration order because position is part of the API and diagnostic
+contract, not an evaluation-order mechanism.
+
+A local declaration shadows an outer declaration throughout its entire scope.
+Explicit record fields are sibling lexical declarations, so `[item: item]` is
+self-referential; copying an outer same-name value requires an explicit outer
+alias. Spread fields do not introduce lexical bindings. Instantaneous type,
+output-alias, value, temporal, or distributed cycles are rejected. A temporal
+cycle is valid only when a real boundary such as `SOURCE`, `HOLD`, publication,
+or asynchronous effect completion breaks it.
+
+## Checked And Erased Programs
+
+`boon_typecheck` produces the authoritative `CheckedProgram`: stable lexical
+declaration identities, resolved callable identities, exact typed call entries,
+contextual signatures, semantic occurrences, scope effects, correlations, and
+typed collection predicates and projections.
+
+`boon_ir` elaborates contextual calls, validates and unifies the static output
+net, expands transparent user wrappers in their declaring runtime island, and
+produces the authoritative `ErasedProgram`. The erased program has canonical
+executable operations and structural ownership anchors, with no runtime `OUT`,
+`PASS`, transparent wrapper call, positional binder, or parser-level call
+ambiguity. Machine, document, distributed, persistence, native host, and
+verifier backends consume only `ErasedProgram`; they do not rediscover call or
+context semantics from parser AST or function-name strings.
+
 ## Standard Runtime Namespaces
 
 The parser owns one canonical registry of standard-library, runtime, and
@@ -74,7 +212,8 @@ cannot shadow a registered root such as `List`, `File`, `Element`,
 
 `Client`, `Session`, and `Server` are program-role roots. A qualified value uses
 the role root followed by `/` and an ordinary dotted value path. A qualified
-function uses the same `/` function namespace syntax as every other Boon call:
+function uses the same `/` function namespace syntax as every other Boon call.
+For example, Session may reference its two adjacent islands:
 
 ```boon
 query: Client/store.query
@@ -111,7 +250,9 @@ A distributed application consists of one Client graph in each browser tab,
 one resumable Session island owned by that tab, and one shared Server graph.
 Only adjacent role edges are legal: Client and Session may depend on each other,
 and Session and Server may depend on each other. Direct Client/Server edges are
-rejected.
+rejected. Session is compiled once as an indexed template and instantiated with
+isolated state, hidden ownership, generation, and bounded scheduling for each
+tab.
 
 A consumer reads a qualified value or calls a qualified pure function with
 ordinary Boon syntax. Exports, imports, call sites, replies, and shared demand
@@ -287,7 +428,13 @@ LIST[10000] {
 The syntax should stay close to original Boon. Capacity is a target/profile
 constraint, not a reason to force a new app-level collection syntax.
 
-## List/map
+## Canonical List Operations
+
+Per-row collection operations use the same typed `OUT` calls as user-defined
+functions. `List/map(item, new: ...)` and `List/filter(item, if: ...)` do not
+have a hardcoded template syntax, compiler-only item binder, or caller-selected
+output name. A user wrapper forwards the output with ordinary named `OUT`
+connection syntax.
 
 Mapping over a dynamic list does not clone semantic graph nodes per row.
 
@@ -303,6 +450,36 @@ Renderer objects may be created/deleted/windowed in the host, but the Boon
 equation graph does not change and semantic recomputation is driven by dirty
 keys, not by visible rows.
 
+`List/find` performs a typed lookup:
+
+```boon
+result:
+    cells
+    |> List/find(
+        cell
+        if: cell.address == target_address
+    )
+```
+
+Its result is `Found[value: CELL] | NotFound` and is handled with ordinary
+`WHEN` matching. `List/find_value`, reflective quoted
+`field:`/`target:` arguments, and an embedded `fallback:` are not language
+forms. Typed predicate equality may select a compatible compiler-owned index;
+otherwise bounded scan work remains explicit and measurable.
+
+`List/chunk` has one canonical result shape:
+
+```boon
+rows:
+    cells
+    |> List/chunk(size: 26)
+```
+
+Each chunk exposes `.items` and `.label`. These fields are supplied by the
+operator and cannot be renamed by caller arguments. `.items` is a lazy keyed
+slice preserving source item identity; `.label` is the canonical chunk label
+or index.
+
 ## Compiler-Owned Indexed Queries
 
 `List/query` declares a bounded query over one keyed `LIST`. The declaration is
@@ -312,8 +489,8 @@ application cannot inject an index name or an unplanned query shape.
 
 ```boon
 page:
-    List/query(
-        catalog
+    catalog
+    |> List/query(
         fields: TEXT { city,name }
         normalization: TEXT { TrimLowercase,TrimLowercase }
         select: Prefix

@@ -4,7 +4,7 @@ store: [
             [name: TEXT { alpha }, payload: BYTES[3] {}, same_expected: BYTES[3] { 16u01, 16uFE, 16u04 }, different_expected: BYTES[3] { 16u01, 16u02, 16u04 }]
             [name: TEXT { beta }, payload: BYTES[3] {}, same_expected: BYTES[3] { 16u01, 16uFE, 16u04 }, different_expected: BYTES[3] { 16u01, 16u02, 16u04 }]
         }
-        |> List/map(row, new: row_widget(row: row))
+        |> List/map(item, new: row_widget(row: item))
 ]
 
 FUNCTION row_widget(row) {

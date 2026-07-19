@@ -108,6 +108,60 @@ fn distributed_external_values_and_calls_have_exact_static_types() {
 }
 
 #[test]
+fn runtime_checked_program_types_external_calls_inside_user_functions() {
+    let parsed = boon_parser::parse_source(
+        "distributed-function-body.bn",
+        r#"
+store: [
+    items: LIST { [value: 1] }
+    rows:
+        items
+        |> List/map(item, new: decorate(item: item))
+]
+
+FUNCTION decorate(item) {
+    [value: Session/add(value: item.value)]
+}
+"#,
+    )
+    .unwrap();
+    let external_call = parsed
+        .expressions
+        .iter()
+        .find(|expression| {
+            matches!(&expression.kind, AstExprKind::Call { function, .. }
+                if function == "Session/add")
+        })
+        .expect("qualified call in function body");
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Client);
+    environment.functions.insert(
+        "Session/add".to_owned(),
+        distributed_function(&[("value", Type::Number)], Type::Number),
+    );
+    let (output, _) = check_runtime_program_profiled_with_external_types(&parsed, &environment);
+    assert!(!output.report.has_errors(), "{:#?}", output.report.diagnostics);
+    assert_eq!(
+        output
+            .report
+            .expr_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.expr_id == external_call.id)
+            .map(|entry| &entry.flow_type),
+        Some(&distributed_continuous(Type::Number))
+    );
+    let checked = output.program.expect("checked runtime program");
+    assert_eq!(
+        checked
+            .expressions
+            .iter()
+            .find(|expression| expression.id == CheckedExprId(external_call.id as u32))
+            .map(|expression| &expression.flow_type),
+        Some(&distributed_continuous(Type::Number))
+    );
+}
+
+#[test]
 fn distributed_role_direction_and_same_role_qualification_fail_closed() {
     for (current_role, producer, source, expected) in [
         (
@@ -238,16 +292,8 @@ fn distributed_unknown_symbols_and_wrong_arguments_are_errors() {
             "external function `Server/add` has no argument `other`",
         ),
         (
-            "value: Server/add(1)\n",
-            "external function `Server/add` requires named arguments",
-        ),
-        (
             "value: Server/add(value: TEXT { no })\n",
             "external function `Server/add` argument `value` has incompatible type",
-        ),
-        (
-            "value: Server/add(value: 1, value: 2)\n",
-            "external function `Server/add` repeats argument `value`",
         ),
     ] {
         let parsed = boon_parser::parse_source("invalid-external.bn", source).unwrap();
@@ -261,6 +307,28 @@ fn distributed_unknown_symbols_and_wrong_arguments_are_errors() {
             report.diagnostics
         );
     }
+
+    let positional = boon_parser::parse_source(
+        "invalid-external-positional.bn",
+        "value: Server/add(1)\n",
+    )
+    .unwrap_err();
+    assert!(
+        positional
+            .message
+            .contains("ordinary arguments use `name: expression`"),
+        "unexpected parser diagnostic: {positional:#?}"
+    );
+
+    let duplicate = boon_parser::parse_source(
+        "invalid-external-duplicate.bn",
+        "value: Server/add(value: 1, value: 2)\n",
+    )
+    .unwrap_err();
+    assert!(
+        duplicate.message.contains("duplicate call entry `value`"),
+        "unexpected parser diagnostic: {duplicate:#?}"
+    );
 }
 
 #[test]

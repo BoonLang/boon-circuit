@@ -4,7 +4,7 @@ store: [
             [name: TEXT { alpha }, payload: BYTES[5] {}, text_payload: BYTES[3] { 16u41, 16u42, 16u43 }, text_source: TEXT { ABC }, hex_source: TEXT { 414243 }, base64_source: TEXT { QUJD }, needle: BYTES[2] { 16uFE, 16u04 }, missing: BYTES[2] { 16uAA, 16uBB }, prefix: BYTES[2] { 16u01, 16uFE }, suffix: BYTES[2] { 16u05, 16uFF }, wrong_suffix: BYTES[2] { 16uFE, 16u04 }]
             [name: TEXT { beta }, payload: BYTES[5] {}, text_payload: BYTES[3] { 16u41, 16u42, 16u43 }, text_source: TEXT { ABC }, hex_source: TEXT { 414243 }, base64_source: TEXT { QUJD }, needle: BYTES[2] { 16uFE, 16u04 }, missing: BYTES[2] { 16uAA, 16uBB }, prefix: BYTES[2] { 16u01, 16uFE }, suffix: BYTES[2] { 16u05, 16uFF }, wrong_suffix: BYTES[2] { 16uFE, 16u04 }]
         }
-        |> List/map(row, new: row_widget(row: row))
+        |> List/map(item, new: row_widget(row: item))
 ]
 
 FUNCTION row_widget(row) {

@@ -25,14 +25,9 @@ store: [
     search_query:
         http_request.method |> THEN {
             http_request.query
-                |> List/filter_field_equal(
-                    field: name
-                    value: TEXT { q }
-                )
-                |> List/join_field(
-                    field: value
-                    separator: Text/empty()
-                )
+                |> List/filter(item, if: item.name == TEXT { q })
+                |> List/map(item, new: item.value)
+                |> Text/join(separator: Text/empty())
         }
 
     stations: LIST {
@@ -45,7 +40,7 @@ store: [
 
     station_matches:
         List/query_prefix(
-            stations
+            list: stations
             field: name
             prefix: search_query
             limit: 20

@@ -4,7 +4,7 @@ store: [
             [name: TEXT { alpha }, payload: BYTES[3] {}]
             [name: TEXT { beta }, payload: BYTES[3] {}]
         }
-        |> List/map(row, new: row_widget(row: row))
+        |> List/map(item, new: row_widget(row: item))
 ]
 
 FUNCTION row_widget(row) {
@@ -14,21 +14,15 @@ FUNCTION row_widget(row) {
         name: row.name
         payload:
             row.payload |> HOLD payload {
-                LATEST {
-                    receive.bytes |> THEN { receive.bytes }
-                }
+                receive.bytes |> THEN { receive.bytes }
             }
         payload_len:
             0 |> HOLD payload_len {
-                LATEST {
-                    inspect |> THEN { payload |> Bytes/length() }
-                }
+                inspect |> THEN { payload |> Bytes/length() }
             }
         payload_second:
             BYTES[1] { 16u00 } |> HOLD payload_second {
-                LATEST {
-                    inspect |> THEN { payload |> Bytes/get(index: 1) }
-                }
+                inspect |> THEN { payload |> Bytes/get(index: 1) }
             }
     ]
 }

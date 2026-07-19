@@ -40,7 +40,7 @@ store: [
     }
     results:
         List/query_prefix(
-            catalog
+            list: catalog
             field: name
             prefix: prefix
             limit: 20
@@ -59,7 +59,7 @@ store: [
     exact_key: [city: TEXT { OSLO }, name: TEXT { alpha }]
     exact_page:
         List/query(
-            catalog
+            list: catalog
             fields: TEXT { city,name }
             normalization: TEXT { TrimLowercase,TrimLowercase }
             select: Exact
@@ -71,7 +71,7 @@ store: [
     mode_keys: [first: TEXT { rail }, second: TEXT { bus }]
     union_page:
         List/query(
-            catalog
+            list: catalog
             fields: TEXT { modes }
             normalization: TEXT { Tokens }
             select: Union
@@ -82,7 +82,7 @@ store: [
         )
     intersection_page:
         List/query(
-            catalog
+            list: catalog
             fields: TEXT { modes }
             normalization: TEXT { Tokens }
             select: Intersection
@@ -107,7 +107,7 @@ store: [
     prefix: TEXT { al }
     page:
         List/query(
-            catalog
+            list: catalog
             fields: TEXT { name }
             normalization: TEXT { TrimLowercase }
             select: Prefix
@@ -386,6 +386,30 @@ fn derived(
     }
 }
 
+fn contextual_collection(
+    owner: usize,
+    operation: PlanContextualOperationKind,
+    source: PlanRowExpression,
+    body: PlanRowExpression,
+) -> PlanRowExpression {
+    PlanRowExpression::ContextualCollection {
+        owner: PlanStaticOwnerId(owner),
+        operation,
+        source: Box::new(source),
+        row_local: PlanLocalId(0),
+        body: Box::new(body),
+        index_lookup: None,
+    }
+}
+
+fn contextual_local(owner: usize, projection: &[&str]) -> PlanRowExpression {
+    PlanRowExpression::Local {
+        owner: PlanStaticOwnerId(owner),
+        local: PlanLocalId(0),
+        projection: projection.iter().map(|field| (*field).to_owned()).collect(),
+    }
+}
+
 fn const_update(id: usize, source: usize, state: usize, constant: usize) -> PlanOp {
     PlanOp {
         id: PlanOpId(id),
@@ -623,186 +647,7 @@ fn unsettled_turn_can_rollback_authority_sequence_and_durable_delta() {
 }
 
 #[test]
-fn field_ids_keep_same_named_list_fields_distinct() {
-    let list = |id, field, value: &str| ListStorageSlot {
-        id: PlanStorageId(id),
-        list_id: ListId(id),
-        scope_id: None,
-        row_field_ids: vec![FieldId(field)],
-        capacity: None,
-        hidden_key_type: "Key".to_owned(),
-        has_generation: true,
-        initializer_kind: ListInitializerKind::RecordLiteral,
-        range: None,
-        initial_rows: vec![PlanInitialListRow {
-            fields: vec![PlanInitialListField {
-                name: "value".to_owned(),
-                field_id: Some(FieldId(field)),
-                value: PlanConstantValue::Text {
-                    value: value.to_owned(),
-                },
-            }],
-        }],
-    };
-    let expression = PlanRowExpression::TextConcat {
-        parts: vec![
-            PlanRowExpression::ListFindValue {
-                list_id: ListId(0),
-                field: FieldId(10),
-                value: Box::new(PlanRowExpression::Constant {
-                    constant_id: PlanConstantId(0),
-                }),
-                target: FieldId(10),
-                fallback: None,
-            },
-            PlanRowExpression::ListFindValue {
-                list_id: ListId(1),
-                field: FieldId(20),
-                value: Box::new(PlanRowExpression::Constant {
-                    constant_id: PlanConstantId(1),
-                }),
-                target: FieldId(20),
-                fallback: None,
-            },
-        ],
-    };
-    let session = MachineInstance::new(
-        plan(
-            RootOutputDemand::All,
-            vec![
-                constant(0, PlanConstantValue::Text { value: "A".into() }),
-                constant(1, PlanConstantValue::Text { value: "B".into() }),
-            ],
-            Vec::new(),
-            Vec::new(),
-            vec![list(0, 10, "A"), list(1, 20, "B")],
-            vec![derived(
-                0,
-                30,
-                vec![ValueRef::List(ListId(0)), ValueRef::List(ListId(1))],
-                Some(expression),
-            )],
-            Vec::new(),
-            vec![(ListId(0), "left"), (ListId(1), "right")],
-            vec![
-                (FieldId(10), "left.value"),
-                (FieldId(20), "right.value"),
-                (FieldId(30), "joined"),
-            ],
-        ),
-        SessionOptions::default(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        session.snapshot().unwrap().fields[&FieldId(30)],
-        Value::Text("AB".into())
-    );
-}
-
-#[test]
-fn text_filter_uses_empty_scope_only_for_empty_queries() {
-    let row = |name: &str, family: &str, scope: &str| PlanInitialListRow {
-        fields: vec![
-            PlanInitialListField {
-                name: "name".into(),
-                field_id: Some(FieldId(10)),
-                value: PlanConstantValue::Text { value: name.into() },
-            },
-            PlanInitialListField {
-                name: "family".into(),
-                field_id: Some(FieldId(11)),
-                value: PlanConstantValue::Text {
-                    value: family.into(),
-                },
-            },
-            PlanInitialListField {
-                name: "scope".into(),
-                field_id: Some(FieldId(12)),
-                value: PlanConstantValue::Text {
-                    value: scope.into(),
-                },
-            },
-        ],
-    };
-    let list = ListStorageSlot {
-        id: PlanStorageId(0),
-        list_id: ListId(0),
-        scope_id: None,
-        row_field_ids: vec![FieldId(10), FieldId(11), FieldId(12)],
-        capacity: None,
-        hidden_key_type: "Key".into(),
-        has_generation: true,
-        initializer_kind: ListInitializerKind::RecordLiteral,
-        range: None,
-        initial_rows: vec![
-            row("tx_data", "uart", "top.uart"),
-            row("rx_data", "uart", "top.uart"),
-            row("counter", "ghw", "ghw.simple"),
-        ],
-    };
-    let filter = |needle: usize| PlanRowExpression::BuiltinCall {
-        function: "List/filter_text_contains".into(),
-        input: Some(Box::new(PlanRowExpression::ListRef { list_id: ListId(0) })),
-        args: [
-            ("field", 0),
-            ("needle", needle),
-            ("prefer_field", 1),
-            ("empty_field", 2),
-            ("empty_value", 4),
-        ]
-        .into_iter()
-        .map(|(name, constant_id)| PlanRowCallArg {
-            name: Some(name.into()),
-            value: PlanRowExpression::Constant {
-                constant_id: PlanConstantId(constant_id),
-            },
-        })
-        .collect(),
-    };
-    let session = MachineInstance::new(
-        plan(
-            RootOutputDemand::All,
-            ["name", "family", "scope", "tx", "top.uart", ""]
-                .into_iter()
-                .enumerate()
-                .map(|(id, value)| {
-                    constant(
-                        id,
-                        PlanConstantValue::Text {
-                            value: value.into(),
-                        },
-                    )
-                })
-                .collect(),
-            Vec::new(),
-            Vec::new(),
-            vec![list],
-            vec![
-                derived(0, 20, vec![ValueRef::List(ListId(0))], Some(filter(3))),
-                derived(1, 21, vec![ValueRef::List(ListId(0))], Some(filter(5))),
-            ],
-            Vec::new(),
-            vec![(ListId(0), "signals")],
-            vec![
-                (FieldId(10), "signals.name"),
-                (FieldId(11), "signals.family"),
-                (FieldId(12), "signals.scope"),
-                (FieldId(20), "matching"),
-                (FieldId(21), "in_scope"),
-            ],
-        ),
-        SessionOptions::default(),
-    )
-    .unwrap();
-    let snapshot = session.snapshot().unwrap();
-
-    assert!(matches!(snapshot.fields[&FieldId(20)], Value::List(ref rows) if rows.len() == 1));
-    assert!(matches!(snapshot.fields[&FieldId(21)], Value::List(ref rows) if rows.len() == 2));
-}
-
-#[test]
-fn list_any_evaluates_bound_row_predicates() {
+fn contextual_any_evaluates_typed_local_projections() {
     let row = |selected: bool| PlanInitialListRow {
         fields: vec![PlanInitialListField {
             name: "selected".into(),
@@ -822,36 +667,16 @@ fn list_any_evaluates_bound_row_predicates() {
         range: None,
         initial_rows: vec![row(false), row(true)],
     };
-    let expression = PlanRowExpression::BuiltinCall {
-        function: "List/any".into(),
-        input: Some(Box::new(PlanRowExpression::ListRef { list_id: ListId(0) })),
-        args: vec![
-            PlanRowCallArg {
-                name: Some("binding".into()),
-                value: PlanRowExpression::Constant {
-                    constant_id: PlanConstantId(0),
-                },
-            },
-            PlanRowCallArg {
-                name: Some("if".into()),
-                value: PlanRowExpression::ObjectField {
-                    object: Box::new(PlanRowExpression::ListMapItem {
-                        binding: "item".into(),
-                    }),
-                    field: "selected".into(),
-                },
-            },
-        ],
-    };
+    let expression = contextual_collection(
+        0,
+        PlanContextualOperationKind::Any,
+        PlanRowExpression::ListRef { list_id: ListId(0) },
+        contextual_local(0, &["selected"]),
+    );
     let session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
-            vec![constant(
-                0,
-                PlanConstantValue::Text {
-                    value: "item".into(),
-                },
-            )],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             vec![list],
@@ -873,6 +698,334 @@ fn list_any_evaluates_bound_row_predicates() {
         session.snapshot().unwrap().fields[&FieldId(20)],
         Value::Bool(true)
     );
+}
+
+#[test]
+fn contextual_collection_operations_cover_map_filter_retain_every_any_and_find() {
+    let row = |value: i64, keep: bool| PlanInitialListRow {
+        fields: vec![
+            PlanInitialListField {
+                name: "value".into(),
+                field_id: Some(FieldId(10)),
+                value: number_constant(value),
+            },
+            PlanInitialListField {
+                name: "keep".into(),
+                field_id: Some(FieldId(11)),
+                value: PlanConstantValue::Bool { value: keep },
+            },
+        ],
+    };
+    let list = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: None,
+        row_field_ids: vec![FieldId(10), FieldId(11)],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![row(1, false), row(2, true), row(3, true)],
+    };
+    let operation = |id: usize, operation: PlanContextualOperationKind, body: PlanRowExpression| {
+        derived(
+            id,
+            20 + id,
+            vec![ValueRef::List(ListId(0))],
+            Some(contextual_collection(
+                id,
+                operation,
+                PlanRowExpression::ListRef { list_id: ListId(0) },
+                body,
+            )),
+        )
+    };
+    let session = MachineInstance::new(
+        plan(
+            RootOutputDemand::All,
+            vec![constant(0, PlanConstantValue::Bool { value: false })],
+            Vec::new(),
+            Vec::new(),
+            vec![list],
+            vec![
+                operation(
+                    0,
+                    PlanContextualOperationKind::Map,
+                    contextual_local(0, &["value"]),
+                ),
+                operation(
+                    1,
+                    PlanContextualOperationKind::Filter,
+                    contextual_local(1, &["keep"]),
+                ),
+                operation(
+                    2,
+                    PlanContextualOperationKind::Retain,
+                    contextual_local(2, &["keep"]),
+                ),
+                operation(
+                    3,
+                    PlanContextualOperationKind::Every,
+                    contextual_local(3, &["keep"]),
+                ),
+                operation(
+                    4,
+                    PlanContextualOperationKind::Any,
+                    contextual_local(4, &["keep"]),
+                ),
+                operation(
+                    5,
+                    PlanContextualOperationKind::Find,
+                    contextual_local(5, &["keep"]),
+                ),
+                operation(
+                    6,
+                    PlanContextualOperationKind::Find,
+                    PlanRowExpression::Constant {
+                        constant_id: PlanConstantId(0),
+                    },
+                ),
+            ],
+            Vec::new(),
+            vec![(ListId(0), "rows")],
+            vec![
+                (FieldId(10), "rows.value"),
+                (FieldId(11), "rows.keep"),
+                (FieldId(20), "mapped"),
+                (FieldId(21), "filtered"),
+                (FieldId(22), "retained"),
+                (FieldId(23), "every"),
+                (FieldId(24), "any"),
+                (FieldId(25), "found"),
+                (FieldId(26), "not_found"),
+            ],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    let snapshot = session.snapshot().unwrap();
+    assert_eq!(
+        snapshot.fields[&FieldId(20)],
+        Value::List(vec![number(1), number(2), number(3)])
+    );
+    let expected_rows = snapshot.lists[&ListId(0)][1..]
+        .iter()
+        .map(|row| Value::Row {
+            id: row.id,
+            fields: BTreeMap::new(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshot.fields[&FieldId(21)],
+        Value::List(expected_rows.clone())
+    );
+    assert_eq!(snapshot.fields[&FieldId(22)], Value::List(expected_rows));
+    assert_eq!(snapshot.fields[&FieldId(23)], Value::Bool(false));
+    assert_eq!(snapshot.fields[&FieldId(24)], Value::Bool(true));
+    assert_eq!(
+        snapshot.fields[&FieldId(25)],
+        Value::Record(BTreeMap::from([
+            ("$tag".to_owned(), Value::Text("Found".to_owned())),
+            (
+                "value".to_owned(),
+                Value::Row {
+                    id: snapshot.lists[&ListId(0)][1].id,
+                    fields: BTreeMap::new(),
+                },
+            ),
+        ]))
+    );
+    assert_eq!(
+        snapshot.fields[&FieldId(26)],
+        Value::Record(BTreeMap::from([(
+            "$tag".to_owned(),
+            Value::Text("NotFound".to_owned()),
+        )]))
+    );
+}
+
+#[test]
+fn nested_contextual_collections_disambiguate_same_local_id_by_owner() {
+    let constant_expression = |constant_id| PlanRowExpression::Constant {
+        constant_id: PlanConstantId(constant_id),
+    };
+    let expression = contextual_collection(
+        0,
+        PlanContextualOperationKind::Map,
+        PlanRowExpression::ListLiteral {
+            items: vec![constant_expression(0), constant_expression(1)],
+        },
+        contextual_collection(
+            1,
+            PlanContextualOperationKind::Map,
+            PlanRowExpression::ListLiteral {
+                items: vec![constant_expression(2), constant_expression(3)],
+            },
+            PlanRowExpression::NumberInfix {
+                op: "+".into(),
+                left: Box::new(contextual_local(0, &[])),
+                right: Box::new(contextual_local(1, &[])),
+            },
+        ),
+    );
+    let session = MachineInstance::new(
+        plan(
+            RootOutputDemand::All,
+            [1, 10, 2, 3]
+                .into_iter()
+                .enumerate()
+                .map(|(id, value)| constant(id, number_constant(value)))
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![derived(
+                0,
+                20,
+                (0..4)
+                    .map(|id| ValueRef::Constant(PlanConstantId(id)))
+                    .collect(),
+                Some(expression),
+            )],
+            Vec::new(),
+            Vec::new(),
+            vec![(FieldId(20), "nested")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.snapshot().unwrap().fields[&FieldId(20)],
+        Value::List(vec![
+            Value::List(vec![number(3), number(4)]),
+            Value::List(vec![number(12), number(13)]),
+        ])
+    );
+}
+
+#[test]
+fn contextual_collection_validation_visitors_and_hashing_are_structural() {
+    let list = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: None,
+        row_field_ids: vec![FieldId(10)],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![PlanInitialListRow {
+            fields: vec![PlanInitialListField {
+                name: "label".into(),
+                field_id: Some(FieldId(10)),
+                value: PlanConstantValue::Text {
+                    value: "first".into(),
+                },
+            }],
+        }],
+    };
+    let expression =
+        |owner: usize, operation: PlanContextualOperationKind, local: usize, projection: &str| {
+            PlanRowExpression::ContextualCollection {
+                owner: PlanStaticOwnerId(owner),
+                operation,
+                source: Box::new(PlanRowExpression::Field {
+                    input: ValueRef::List(ListId(0)),
+                }),
+                row_local: PlanLocalId(local),
+                body: Box::new(PlanRowExpression::Object {
+                    fields: vec![
+                        PlanRowObjectField {
+                            name: "row".into(),
+                            value: PlanRowExpression::Local {
+                                owner: PlanStaticOwnerId(owner),
+                                local: PlanLocalId(local),
+                                projection: vec![projection.to_owned()],
+                            },
+                            spread: false,
+                        },
+                        PlanRowObjectField {
+                            name: "status".into(),
+                            value: PlanRowExpression::Intrinsic {
+                                intrinsic: PlanIntrinsic::SessionInfoStatus,
+                            },
+                            spread: false,
+                        },
+                    ],
+                }),
+                index_lookup: None,
+            }
+        };
+    let machine = |expression| {
+        plan(
+            RootOutputDemand::All,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![list.clone()],
+            vec![derived(
+                0,
+                20,
+                vec![ValueRef::List(ListId(0))],
+                Some(expression),
+            )],
+            Vec::new(),
+            vec![(ListId(0), "rows")],
+            vec![(FieldId(10), "rows.label"), (FieldId(20), "mapped")],
+        )
+    };
+
+    let valid_expression = expression(7, PlanContextualOperationKind::Map, 3, "label");
+    let mut refs = Vec::new();
+    valid_expression.visit_value_refs(&mut |value| refs.push(value.clone()));
+    assert_eq!(refs, vec![ValueRef::List(ListId(0))]);
+    let mut intrinsics = Vec::new();
+    valid_expression.visit_intrinsics(&mut |intrinsic| intrinsics.push(intrinsic));
+    assert_eq!(intrinsics, vec![PlanIntrinsic::SessionInfoStatus]);
+
+    let valid_plan = machine(valid_expression.clone());
+    let valid_verification = verify_plan(&valid_plan).unwrap();
+    assert!(
+        valid_verification
+            .checks
+            .iter()
+            .any(|check| { check.id == "row-expression-contextual-locals-resolve" && check.pass })
+    );
+
+    let invalid_plan = machine(PlanRowExpression::ContextualCollection {
+        owner: PlanStaticOwnerId(7),
+        operation: PlanContextualOperationKind::Map,
+        source: Box::new(PlanRowExpression::ListRef { list_id: ListId(0) }),
+        row_local: PlanLocalId(3),
+        body: Box::new(PlanRowExpression::Local {
+            owner: PlanStaticOwnerId(8),
+            local: PlanLocalId(3),
+            projection: Vec::new(),
+        }),
+        index_lookup: None,
+    });
+    let invalid_verification = verify_plan(&invalid_plan).unwrap();
+    assert!(
+        invalid_verification
+            .checks
+            .iter()
+            .any(|check| { check.id == "row-expression-contextual-locals-resolve" && !check.pass })
+    );
+
+    let base_hash = plan_sha256(&valid_plan).unwrap();
+    assert_eq!(base_hash, plan_sha256(&valid_plan).unwrap());
+    for changed in [
+        expression(8, PlanContextualOperationKind::Map, 3, "label"),
+        expression(7, PlanContextualOperationKind::Filter, 3, "label"),
+        expression(7, PlanContextualOperationKind::Map, 4, "label"),
+        expression(7, PlanContextualOperationKind::Map, 3, "other"),
+    ] {
+        assert_ne!(base_hash, plan_sha256(&machine(changed)).unwrap());
+    }
 }
 
 #[test]
@@ -972,27 +1125,12 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
             derived_kind: PlanDerivedKind::Pure,
             startup_recompute: true,
             expression: Some(PlanDerivedExpression::RowExpression {
-                expression: PlanRowExpression::BuiltinCall {
-                    function: "List/any".into(),
-                    input: Some(Box::new(PlanRowExpression::ListRef { list_id: ListId(0) })),
-                    args: vec![
-                        PlanRowCallArg {
-                            name: Some("binding".into()),
-                            value: PlanRowExpression::Constant {
-                                constant_id: PlanConstantId(1),
-                            },
-                        },
-                        PlanRowCallArg {
-                            name: Some("if".into()),
-                            value: PlanRowExpression::ObjectField {
-                                object: Box::new(PlanRowExpression::ListMapItem {
-                                    binding: "source".into(),
-                                }),
-                                field: "selected".into(),
-                            },
-                        },
-                    ],
-                },
+                expression: contextual_collection(
+                    1,
+                    PlanContextualOperationKind::Any,
+                    PlanRowExpression::ListRef { list_id: ListId(0) },
+                    contextual_local(1, &["selected"]),
+                ),
             }),
         },
         inputs: vec![ValueRef::List(ListId(0))],
@@ -1004,43 +1142,17 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
         2,
         30,
         vec![ValueRef::List(ListId(1))],
-        Some(PlanRowExpression::BuiltinCall {
-            function: "List/filter_field_equal".into(),
-            input: Some(Box::new(PlanRowExpression::ListRef { list_id: ListId(1) })),
-            args: vec![
-                PlanRowCallArg {
-                    name: Some("field".into()),
-                    value: PlanRowExpression::Constant {
-                        constant_id: PlanConstantId(2),
-                    },
-                },
-                PlanRowCallArg {
-                    name: Some("value".into()),
-                    value: PlanRowExpression::Constant {
-                        constant_id: PlanConstantId(0),
-                    },
-                },
-            ],
-        }),
+        Some(contextual_collection(
+            2,
+            PlanContextualOperationKind::Filter,
+            PlanRowExpression::ListRef { list_id: ListId(1) },
+            contextual_local(2, &["selected"]),
+        )),
     );
     let mut session = MachineInstance::new(
         plan(
             RootOutputDemand::All,
-            vec![
-                constant(0, PlanConstantValue::Bool { value: true }),
-                constant(
-                    1,
-                    PlanConstantValue::Text {
-                        value: "source".into(),
-                    },
-                ),
-                constant(
-                    2,
-                    PlanConstantValue::Text {
-                        value: "selected".into(),
-                    },
-                ),
-            ],
+            vec![constant(0, PlanConstantValue::Bool { value: true })],
             vec![select_route],
             vec![selected_state],
             vec![source_rows, projected_rows],
@@ -1281,115 +1393,143 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
 
 #[test]
 fn list_find_uses_typed_index_without_scanning() {
-    let list = ListStorageSlot {
-        id: PlanStorageId(1),
-        list_id: ListId(0),
-        scope_id: None,
-        row_field_ids: vec![FieldId(10), FieldId(11)],
-        capacity: None,
-        hidden_key_type: "Key".to_owned(),
-        has_generation: true,
-        initializer_kind: ListInitializerKind::RecordLiteral,
-        range: None,
-        initial_rows: ["a", "b"]
-            .into_iter()
-            .map(|key| PlanInitialListRow {
-                fields: vec![
-                    PlanInitialListField {
-                        name: "key".into(),
-                        field_id: Some(FieldId(10)),
-                        value: PlanConstantValue::Text { value: key.into() },
-                    },
-                    PlanInitialListField {
-                        name: "value".into(),
-                        field_id: Some(FieldId(11)),
-                        value: PlanConstantValue::Text {
-                            value: key.to_uppercase(),
-                        },
-                    },
-                ],
-            })
-            .collect(),
-    };
-    let projection = PlanOp {
-        id: PlanOpId(1),
-        kind: PlanOpKind::ListProjection {
-            projection: PlanListProjection::Find {
-                source_list: ListId(0),
-                field: "key".into(),
-                value: ValueRef::State(StateId(0)),
-            },
-        },
-        inputs: vec![ValueRef::List(ListId(0)), ValueRef::State(StateId(0))],
-        output: Some(ValueRef::Field(FieldId(0))),
-        indexed: false,
-        unresolved_executable_ref_count: 0,
-    };
-    let mut session = MachineInstance::new(
-        plan(
-            RootOutputDemand::All,
-            vec![
-                constant(0, PlanConstantValue::Text { value: "a".into() }),
-                constant(1, PlanConstantValue::Text { value: "b".into() }),
-            ],
-            vec![route(0, None)],
-            vec![ScalarStorageSlot {
-                id: PlanStorageId(0),
-                state_id: StateId(0),
-                value_type: PlanValueType::Text,
-                scope_id: None,
-                indexed: false,
-                initial_value_kind: InitialValueKind::Text,
-                initial_constant_id: Some(PlanConstantId(0)),
-                initial_root_field_path: None,
-                initial_row_field_path: None,
-                initial_expression: None,
-            }],
-            vec![list],
-            vec![projection, const_update(2, 0, 0, 1)],
-            vec![(StateId(0), "selector")],
-            vec![(ListId(0), "items")],
-            vec![
-                (FieldId(0), "selected"),
-                (FieldId(10), "items.key"),
-                (FieldId(11), "items.value"),
-            ],
-        ),
-        SessionOptions::default(),
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "typed-indexed-find-runtime.bn",
+        r#"
+store: [
+    choose: SOURCE
+    selector:
+        TEXT { a } |> HOLD selector {
+            choose.text |> THEN { choose.text }
+        }
+    items: LIST {
+        [key: TEXT { a }, value: TEXT { A }]
+        [key: TEXT { b }, value: TEXT { B }]
+    }
+    selected:
+        items
+        |> List/find(item, if: item.key == selector)
+        |> WHEN {
+            Found[value] => value.value
+            NotFound => TEXT { missing }
+        }
+]
+document: Document/new(
+    root: Element/label(element: [], label: store.selected)
+)
+"#,
+        TargetProfile::SoftwareDefault,
     )
     .unwrap();
+    let source = source_id(&compiled.plan, "store.choose");
+    let selected = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.selected")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("store.selected field id");
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
-    let turn = session.apply(event(1, 0, None)).unwrap();
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                text: Some("b".to_owned()),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
     assert!(turn.metrics.index_lookup_count >= 1);
     assert_eq!(turn.metrics.list_find_scan_count, 0);
-    let selected = session.snapshot().unwrap().fields[&FieldId(0)].clone();
-    let Value::Row { id, fields } = selected else {
-        panic!("List/find did not return a stable row identity");
-    };
-    assert!(fields.is_empty());
     assert_eq!(
         session
-            .project_current(&[ValueTarget::RowField {
-                row: id,
-                field: FieldId(11),
-            }])
-            .unwrap()[&ValueTarget::RowField {
-            row: id,
-            field: FieldId(11),
-        }],
+            .project_current(&[ValueTarget::Field(selected)])
+            .unwrap()[&ValueTarget::Field(selected)],
         Value::Text("B".into())
     );
 }
 
 #[test]
+fn list_filter_uses_the_same_typed_index_path() {
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "typed-indexed-filter-runtime.bn",
+        r#"
+store: [
+    choose: SOURCE
+    selector:
+        TEXT { a } |> HOLD selector {
+            choose.text |> THEN { choose.text }
+        }
+    items: LIST {
+        [key: TEXT { a }, value: TEXT { A }]
+        [key: TEXT { b }, value: TEXT { B }]
+    }
+    filtered:
+        items
+        |> List/filter(item, if: item.key == selector)
+    count: filtered |> List/length()
+]
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: store.count |> Number/to_text()
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let source = source_id(&compiled.plan, "store.choose");
+    let filtered = compiled
+        .plan
+        .debug_map
+        .list_slots
+        .iter()
+        .find(|list| list.label == "store.filtered")
+        .and_then(|list| list.id.strip_prefix("list:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(ListId)
+        .expect("store.filtered list id");
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                text: Some("b".to_owned()),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+    assert!(turn.metrics.index_lookup_count >= 1);
+    assert_eq!(turn.metrics.list_find_scan_count, 0);
+    let snapshot = session.snapshot().unwrap();
+    let rows = &snapshot.lists[&filtered];
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0]
+            .fields
+            .values()
+            .any(|value| value == &Value::Text("B".to_owned()))
+    );
+}
+
+#[test]
 fn compiled_prefix_query_uses_bounded_index_and_tracks_currentness() {
-    let mut compiled = compile_server_source(
+    let compiled = compile_server_source(
         "indexed-prefix-query.bn",
         INDEXED_PREFIX_QUERY_SOURCE,
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    compiled.plan.demand.root_derived_outputs = RootOutputDemand::All;
     let source = compiled
         .plan
         .source_routes
@@ -1400,21 +1540,28 @@ fn compiled_prefix_query_uses_bounded_index_and_tracks_currentness() {
     let results = compiled
         .plan
         .debug_map
-        .fields
+        .list_slots
         .iter()
         .find(|entry| entry.label == "store.results")
-        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|entry| entry.id.strip_prefix("list:"))
         .and_then(|id| id.parse::<usize>().ok())
-        .map(FieldId)
+        .map(ListId)
         .unwrap();
+    assert!(
+        compiled
+            .ir
+            .update_branches
+            .iter()
+            .any(|branch| branch.source == "store.change" && branch.target == "store.prefix"),
+        "compiled update branches: {:#?}; source routes: {:#?}",
+        compiled.ir.update_branches,
+        compiled.plan.source_routes,
+    );
     let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
-    let initial = session
-        .project_current(&[ValueTarget::Field(results)])
-        .unwrap()
-        .remove(&ValueTarget::Field(results))
-        .unwrap();
+    let (initial, initial_metrics) = session.list_value_current_with_metrics(results).unwrap();
     assert!(matches!(initial, Value::List(rows) if rows.len() == 2));
+    assert_eq!(initial_metrics.query_full_scan_count, 0);
 
     let turn = session
         .apply(SourceEvent {
@@ -1427,15 +1574,17 @@ fn compiled_prefix_query_uses_bounded_index_and_tracks_currentness() {
             },
         })
         .unwrap();
-    assert_eq!(turn.metrics.query_full_scan_count, 0);
-    assert!(turn.metrics.query_index_range_count >= 1);
-    assert_eq!(turn.metrics.query_rows_examined_count, 1);
-    assert_eq!(turn.metrics.query_result_count, 1);
-    let updated = session
-        .project_current(&[ValueTarget::Field(results)])
-        .unwrap()
-        .remove(&ValueTarget::Field(results))
-        .unwrap();
+    assert_eq!(turn.metrics.recomputed_list_count, 0);
+    let (updated, metrics) = session.list_value_current_with_metrics(results).unwrap();
+    assert_eq!(metrics.query_full_scan_count, 0);
+    assert!(
+        metrics.query_index_range_count >= 1,
+        "apply metrics: {:#?}; current-read metrics: {:#?}",
+        turn.metrics,
+        metrics,
+    );
+    assert_eq!(metrics.query_rows_examined_count, 1);
+    assert_eq!(metrics.query_result_count, 1);
     assert!(matches!(updated, Value::List(rows) if rows.len() == 1));
 }
 
@@ -1673,21 +1822,25 @@ fn list_map_records_preserve_source_row_identity() {
         0,
         0,
         vec![ValueRef::List(ListId(0))],
-        Some(PlanRowExpression::ListMap {
-            input: Box::new(PlanRowExpression::ListRef { list_id: ListId(0) }),
-            binding: "item".into(),
-            value: Box::new(PlanRowExpression::Object {
-                fields: vec![PlanRowObjectField {
-                    name: "title".into(),
-                    value: PlanRowExpression::ObjectField {
-                        object: Box::new(PlanRowExpression::ListMapItem {
-                            binding: "item".into(),
-                        }),
-                        field: "label".into(),
+        Some(contextual_collection(
+            0,
+            PlanContextualOperationKind::Map,
+            PlanRowExpression::ListRef { list_id: ListId(0) },
+            PlanRowExpression::Object {
+                fields: vec![
+                    PlanRowObjectField {
+                        name: String::new(),
+                        value: contextual_local(0, &[]),
+                        spread: true,
                     },
-                }],
-            }),
-        }),
+                    PlanRowObjectField {
+                        name: "title".into(),
+                        value: contextual_local(0, &["label"]),
+                        spread: false,
+                    },
+                ],
+            },
+        )),
     );
     let session = MachineInstance::new(
         plan(
@@ -1714,6 +1867,7 @@ fn list_map_records_preserve_source_row_identity() {
         panic!("List/map object result lost its source row identity");
     };
     assert_eq!(*id, source_row);
+    assert_eq!(fields["label"], Value::Text("first".into()));
     assert_eq!(fields["title"], Value::Text("first".into()));
 }
 
@@ -2593,6 +2747,17 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
         } => *field,
         other => panic!("unexpected response output ref: {other:?}"),
     };
+    let pending_priorities = match &compiled
+        .plan
+        .output_root("pending_priorities")
+        .unwrap()
+        .value
+    {
+        OutputValueRef::RuntimeValue {
+            value: ValueRef::List(list),
+        } => *list,
+        other => panic!("unexpected pending priorities output ref: {other:?}"),
+    };
     let source = compiled
         .plan
         .source_routes
@@ -2610,7 +2775,7 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
         ]))
     );
     assert_eq!(
-        session.output_value_current("pending_priorities").unwrap(),
+        session.list_value_current(pending_priorities).unwrap(),
         Value::List(vec![number(1), number(2)])
     );
 
@@ -2689,23 +2854,27 @@ store: [
     request: SOURCE
     found_value:
         request.method |> THEN {
-            List/find_value(
-                request.query
-                field: "name"
-                value: TEXT { q }
-                target: "value"
-                fallback: TEXT { missing }
+            request.query
+            |> List/find(
+                item
+                if: item.name == TEXT { q }
             )
+            |> WHEN {
+                Found[value] => value.value
+                NotFound => TEXT { missing }
+            }
         }
     found_row_name:
         request.method |> THEN {
-            List/find_value(
-                request.query
-                field: "name"
-                value: TEXT { q }
-                target: "name"
-                fallback: TEXT { missing }
+            request.query
+            |> List/find(
+                item
+                if: item.name == TEXT { q }
             )
+            |> WHEN {
+                Found[value] => value.name
+                NotFound => TEXT { missing }
+            }
         }
 ]
 
@@ -3005,13 +3174,15 @@ store: [
     )
     .unwrap()
     .plan;
-    assert!(
-        machine
-            .debug_map
-            .list_slots
-            .iter()
-            .all(|entry| !entry.label.contains("selected_ids"))
-    );
+    let optional_selected_ids = machine
+        .debug_map
+        .list_slots
+        .iter()
+        .find(|entry| entry.label == "store.optional_selected_ids")
+        .and_then(|entry| entry.id.strip_prefix("list:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(ListId)
+        .expect("optional selected IDs list");
     let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
     let selected = Value::List(vec![Value::Text("alpha".to_owned())]);
 
@@ -3020,9 +3191,7 @@ store: [
         selected
     );
     assert_eq!(
-        session
-            .root_value_current("store.optional_selected_ids")
-            .unwrap(),
+        session.list_value_current(optional_selected_ids).unwrap(),
         selected
     );
 }
@@ -3163,9 +3332,9 @@ store: [
         LIST {
             [name: TEXT { primary }]
         }
-        |> List/map(row, new: stream_row(row: row, asset: asset))
-        |> List/remove(row, when:
-            row.remove |> THEN { True }
+        |> List/map(item, new: stream_row(row: item, asset: asset))
+        |> List/remove(item, when:
+            item.remove |> THEN { True }
         )
 ]
 
@@ -3208,11 +3377,11 @@ store: [
         LIST {
             [name: TEXT { primary }]
         }
-        |> List/map(row, new: mapped_effect_row(row: row))
+        |> List/map(item, new: mapped_effect_row(row: item))
     mapped_request:
         rows
-        |> List/map(row, new: LATEST {
-            row.open |> THEN { Primary }
+        |> List/map(item, new: LATEST {
+            item.open |> THEN { Primary }
         })
         |> List/latest()
     request:
@@ -3270,8 +3439,8 @@ store: [
     }
     rows:
         seeds
-        |> List/map(seed_row, new:
-            wrap_row(row: seed_record(seed: seed_row))
+        |> List/map(item, new:
+            wrap_row(row: seed_record(seed: item))
         )
 ]
 
@@ -3849,7 +4018,7 @@ store: [
     reset: SOURCE
     seed_rows: LIST { [key: TEXT { row }] }
     rows:
-        seed_rows |> List/map(seed_row, new: selectable_row(seed_row: seed_row))
+        seed_rows |> List/map(item, new: selectable_row(seed_row: item))
     clock_result:
         ClockNotRequested |> HOLD clock_result {
             start |> THEN { Clock/wall() }
@@ -3872,8 +4041,8 @@ store: [
                 }
                 reset |> THEN { TEXT { fallback } }
                 rows
-                    |> List/map(row, new: LATEST {
-                        row.select |> THEN { row.key }
+                    |> List/map(item, new: LATEST {
+                        item.select |> THEN { item.key }
                     })
                     |> List/latest()
             }
@@ -4562,12 +4731,12 @@ store: [
             [name: TEXT { one }]
             [name: TEXT { two }]
         }
-        |> List/map(row, new: new_row(row: row))
+        |> List/map(item, new: new_row(row: item))
     fallback: SOURCE
     row_selected:
         rows
-        |> List/map(row, new:
-            row.controls.select.event.press |> THEN { row.name }
+        |> List/map(item, new:
+            item.controls.select.event.press |> THEN { item.name }
         )
         |> List/latest()
     selected:
@@ -5305,7 +5474,7 @@ store: [
             pulse |> THEN {
                 ownership == AccountOwned |> WHEN {
                     True => TEXT { }
-                    False => Text/is_empty(grant) |> WHEN {
+                    False => Text/is_empty(input: grant) |> WHEN {
                         True => TEXT { generated-grant }
                         False => grant
                     }
@@ -5396,8 +5565,8 @@ store: [
     candidate:
         add |> THEN {
             entries
-            |> List/any(entry, if:
-                entry.id == add.text
+            |> List/any(item, if:
+                item.id == add.text
             )
             |> WHEN {
                 True => SKIP
@@ -5409,13 +5578,13 @@ store: [
     entries:
         LIST {}
         |> List/append(item: candidate)
-        |> List/map(entry, new: entry_view(entry: entry))
+        |> List/map(item, new: entry_view(entry: item))
 ]
 
 FUNCTION entry_view(entry) {
-[
-    id: entry.id
-]
+    [
+        id: entry.id
+    ]
 }
 "#,
         TargetProfile::SoftwareDefault,
@@ -5492,15 +5661,15 @@ store: [
                 target: completed.target
             ]
         })
-        |> List/map(revision, new: revision_view(revision: revision))
+        |> List/map(item, new: revision_view(revision: item))
 ]
 
 FUNCTION revision_view(revision) {
-[
-    digest: revision.digest
-    compiler: revision.compiler
-    target: revision.target
-]
+    [
+        digest: revision.digest
+        compiler: revision.compiler
+        target: revision.target
+    ]
 }
 "#,
         TargetProfile::SoftwareDefault,
@@ -6068,30 +6237,35 @@ fn atomic_distributed_context_fixture() -> AtomicDistributedContextFixture {
                 value: PlanRowExpression::Intrinsic {
                     intrinsic: PlanIntrinsic::SessionInfoStatus,
                 },
+                spread: false,
             },
             PlanRowObjectField {
                 name: "principal".to_owned(),
                 value: PlanRowExpression::Intrinsic {
                     intrinsic: PlanIntrinsic::SessionInfoPrincipal,
                 },
+                spread: false,
             },
             PlanRowObjectField {
                 name: "first".to_owned(),
                 value: PlanRowExpression::Field {
                     input: ValueRef::DistributedImport(first_import.import_id),
                 },
+                spread: false,
             },
             PlanRowObjectField {
                 name: "second".to_owned(),
                 value: PlanRowExpression::Field {
                     input: ValueRef::DistributedImport(second_import.import_id),
                 },
+                spread: false,
             },
             PlanRowObjectField {
                 name: "call_result".to_owned(),
                 value: PlanRowExpression::Field {
                     input: ValueRef::DistributedImport(remote_call.result_import_id),
                 },
+                spread: false,
             },
         ],
     };

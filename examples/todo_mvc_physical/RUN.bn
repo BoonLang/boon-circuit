@@ -60,7 +60,7 @@ store: [
         |> List/append(item: title_to_save |> THEN {
             [title: title_to_save]
         })
-        |> List/map(todo, new: new_todo(title: todo.title |> Text/trim(), initial_completed: todo.completed |> WHEN { True => True, False => False, __ => False }))
+        |> List/map(item, new: new_todo(title: item.title |> Text/trim(), initial_completed: item.completed |> WHEN { True => True, False => False, __ => False }))
         |> List/retain(item, if: LATEST {
             True
             item.todo_elements.remove_todo_button.events.press
@@ -70,24 +70,24 @@ store: [
         })
     active_count:
         todos
-        |> List/retain(todo, if: todo.completed |> Bool/not())
+        |> List/retain(item, if: item.completed |> Bool/not())
         |> List/count()
     completed_count:
         todos
-        |> List/retain(todo, if: todo.completed)
+        |> List/retain(item, if: item.completed)
         |> List/count()
     has_todos:
-        active_count == 0 |> Bool/and(completed_count == 0) |> Bool/not()
+        active_count == 0 |> Bool/and(with: completed_count == 0) |> Bool/not()
     has_completed:
         completed_count > 0
     all_completed:
-        active_count == 0 |> Bool/and(completed_count > 0)
+        active_count == 0 |> Bool/and(with: completed_count > 0)
     visible_todos:
         todos
-        |> List/retain(todo, if: selected_filter |> WHEN {
+        |> List/retain(item, if: selected_filter |> WHEN {
             All => True
-            Active => todo.completed |> Bool/not()
-            Completed => todo.completed
+            Active => item.completed |> Bool/not()
+            Completed => item.completed
         })
 ]
 
@@ -550,7 +550,7 @@ FUNCTION todos_element() {
             height: [sizing: Fit, maximum: 300]
         ]
         items: visible_todos
-            |> List/map(old, new: old |> todo_element())
+            |> List/map(item, new: item |> todo_element())
     )
 }
 

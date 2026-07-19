@@ -1,5 +1,5 @@
 use boon_example_manifest::{ExampleEntry, ExampleManifest};
-use boon_ir::{TypedProgram, verify_hidden_identity, verify_static_schedule};
+use boon_ir::{ErasedProgram, verify_hidden_identity, verify_static_schedule};
 use boon_parser::{AstExpr, AstExprKind, AstStatement, ParsedProgram, parse_project, parse_source};
 pub use boon_plan::{
     ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, ProgramRole,
@@ -139,7 +139,7 @@ pub struct CompileProfile {
 #[derive(Clone, Debug)]
 pub struct CompiledMachinePlanFromSource {
     pub parsed: ParsedProgram,
-    pub ir: TypedProgram,
+    pub ir: ErasedProgram,
     pub plan: MachinePlan,
     pub profile: CompileProfile,
 }
@@ -150,12 +150,6 @@ enum CompilerDerivedTextExpression {
     EnterKeyRootTextTrimNonEmpty { path: String },
     SourceRootText { path: String },
     Other,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum CompilerFieldValue {
-    Text(String),
-    Bool(bool),
 }
 
 fn compiler_statement_ast_exprs(statement: &AstStatement, expressions: &[AstExpr]) -> Vec<AstExpr> {
@@ -205,8 +199,16 @@ fn collect_expr_ids(id: usize, expressions: &[AstExpr], ids: &mut BTreeSet<usize
         AstExprKind::Draining { input } => {
             collect_expr_ids(*input, expressions, ids);
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial, .. } => {
             collect_expr_ids(*initial, expressions, ids);
+        }
+        AstExprKind::Block { bindings, result } => {
+            for binding in bindings {
+                collect_expr_ids(binding.value, expressions, ids);
+            }
+            if let Some(result) = result {
+                collect_expr_ids(*result, expressions, ids);
+            }
         }
         AstExprKind::Then { input, output } => {
             collect_expr_ids(*input, expressions, ids);
@@ -252,52 +254,6 @@ fn collect_expr_ids(id: usize, expressions: &[AstExpr], ids: &mut BTreeSet<usize
     }
 }
 
-fn compiler_statement_calls_router_go_to(expressions: &[AstExpr]) -> bool {
-    expressions.iter().any(|expr| match &expr.kind {
-        AstExprKind::Call { function, .. } => function == "Router/go_to",
-        AstExprKind::Pipe { op, .. } => op == "Router/go_to",
-        _ => false,
-    })
-}
-
-fn compiler_source_then_field_value(
-    expressions: &[AstExpr],
-    source: &str,
-) -> Option<CompilerFieldValue> {
-    expressions.iter().find_map(|expr| {
-        let AstExprKind::Then {
-            input,
-            output: Some(output),
-        } = expr.kind
-        else {
-            return None;
-        };
-        expr_tree_mentions_source(expressions, input, source)
-            .then(|| scalar_field_value(expressions, output))
-            .flatten()
-    })
-}
-
-fn scalar_field_value(expressions: &[AstExpr], id: usize) -> Option<CompilerFieldValue> {
-    let expr = expressions.iter().find(|expr| expr.id == id)?;
-    match &expr.kind {
-        AstExprKind::Bool(value) => Some(CompilerFieldValue::Bool(*value)),
-        AstExprKind::StringLiteral(value)
-        | AstExprKind::TextLiteral(value)
-        | AstExprKind::Enum(value)
-        | AstExprKind::Tag(value)
-        | AstExprKind::Number(value) => Some(CompilerFieldValue::Text(value.clone())),
-        _ => {
-            let mut ids = BTreeSet::new();
-            collect_expr_ids(id, expressions, &mut ids);
-            expressions
-                .iter()
-                .filter(|expr| ids.contains(&expr.id) && expr.id != id)
-                .find_map(|expr| scalar_field_value(expressions, expr.id))
-        }
-    }
-}
-
 fn compiler_source_event_transform_text_expression(
     value: &boon_ir::DerivedValue,
     source: &str,
@@ -336,9 +292,9 @@ fn compiler_source_event_transform_text_expression(
 fn text_trim_input_path(expressions: &[AstExpr]) -> Option<String> {
     expressions.iter().find_map(|expr| match &expr.kind {
         AstExprKind::Pipe { input, op, .. } if op == "Text/trim" => expr_path(expressions, *input),
-        AstExprKind::Call { function, args } if function == "Text/trim" => args
+        AstExprKind::Call { function, args, .. } if function == "Text/trim" => args
             .iter()
-            .find(|arg| arg.name.is_none())
+            .find(|arg| arg.is_bare_binding())
             .and_then(|arg| expr_path(expressions, arg.value)),
         _ => None,
     })
@@ -405,7 +361,7 @@ fn canonical_sibling_path(owner: &str, path: &str) -> String {
 }
 
 pub fn compile_typed_program(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     target_profile: TargetProfile,
 ) -> Result<MachinePlan, PlanError> {
     compile_typed_program_with_identity(
@@ -418,7 +374,7 @@ pub fn compile_typed_program(
 /// Compiles with a host-supplied durable application identity. Callers that
 /// may persist state should use this API instead of the compatibility boundary.
 pub fn compile_typed_program_with_identity(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     target_profile: TargetProfile,
     application_identity: ApplicationIdentity,
 ) -> Result<MachinePlan, PlanError> {
@@ -431,7 +387,7 @@ pub fn compile_typed_program_with_identity(
 }
 
 pub fn compile_typed_program_with_persistence_identity(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     target_profile: TargetProfile,
     application_identity: ApplicationIdentity,
     schema_version: u64,
@@ -446,7 +402,7 @@ pub fn compile_typed_program_with_persistence_identity(
 }
 
 pub fn compile_typed_program_with_persistence_catalog(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     target_profile: TargetProfile,
     application_identity: ApplicationIdentity,
     schema_version: u64,
@@ -463,7 +419,7 @@ pub fn compile_typed_program_with_persistence_catalog(
 }
 
 pub fn compile_typed_program_for_role_with_persistence_catalog(
-    program: &TypedProgram,
+    program: &ErasedProgram,
     target_profile: TargetProfile,
     program_role: ProgramRole,
     application_identity: ApplicationIdentity,

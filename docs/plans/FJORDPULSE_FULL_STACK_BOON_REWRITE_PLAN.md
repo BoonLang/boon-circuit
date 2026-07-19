@@ -5,6 +5,16 @@ Date: 2026-07-16
 Status: implementation plan. No implementation or production-readiness claim is
 made by this document.
 
+## Reconciliation Checkpoint (2026-07-19)
+
+This reconciliation changes active language/compiler and distributed-package
+contracts; it does not claim FjordPulse implementation progress. The current
+parity inventory remains 338 scenarios classified `not_implemented` and the two
+backup/restore automation scenarios explicitly deferred. The pinned product
+revision, 108-story/340-scenario inventory, product behavior, budgets, security,
+persistence, Live mode, deployment target, and clear end condition remain the
+acceptance baseline.
+
 Reference FjordPulse revision:
 
 ```text
@@ -19,18 +29,22 @@ approval.
 
 ## Goal
 
-Build a complete, production-shaped FjordPulse implementation whose client and
-server application logic are Boon programs:
+Build a complete, production-shaped FjordPulse implementation whose Client,
+Session, and Server application logic is Boon:
 
 ```text
-FjordPulse Client Boon program
+FjordPulse Client island
     -> generic Rust/Wasm browser host
     -> retained Boon document and scene
     -> browser WebGPU
 
-FjordPulse Server Boon program
+FjordPulse Session island template
+    -> one resumable isolated instance per browser tab
+    -> adjacent-island demand, calls, policy, and scoped replies
+
+FjordPulse Server island
     -> generic Rust server host
-    -> HTTP, WebSocket, timers, outbound HTTP, secrets, and redb capabilities
+    -> external HTTP/WebSocket, timers, outbound HTTP, secrets, and redb
     -> Entur services
 ```
 
@@ -80,16 +94,17 @@ technology falsely. The initially approved delta classes are only:
   style documents;
 - Admin database/schema/migration DTOs describe Boon collections, indexes,
   migrations, and redb rather than SurrealDB INFO/SurrealQL objects;
-- Admin service topology describes one Boon Server and its durable publication
-  path rather than FrankenPHP, AMPHP, and a SurrealDB live-query bridge;
+- Admin service topology describes one process with per-tab Session islands,
+  one global Boon Server, and its durable publication path rather than
+  FrankenPHP, AMPHP, and a SurrealDB live-query bridge;
 - deployment identity uses `fjordpulse-boon.kavik.cz` and the single-container
   topology;
 - backup/restore automation checks are deferred exactly as stated below.
 
 Each approved delta needs old-field-to-new-field rationale, updated schema and
-valid/invalid fixtures, Client/Server version compatibility, and black-box
-evidence for the same user/operator intent. No other wire delta is accepted
-implicitly because the implementation is a rewrite.
+valid/invalid fixtures, external consumer/Server version compatibility, and
+black-box evidence for the same user/operator intent. No other wire delta is
+accepted implicitly because the implementation is a rewrite.
 
 ### Explicitly Deferred
 
@@ -117,9 +132,9 @@ replacement.
 
 ## Hard Invariants
 
-1. **Both product halves are Boon.** Client UI/workflow logic and server
-   routing/domain/scheduling logic are authored in Boon. Rust supplies generic
-   platform mechanisms only.
+1. **All three application islands are Boon.** Client UI/workflow logic,
+   per-tab Session policy, and global Server routing/domain/scheduling logic are
+   authored in Boon. Rust supplies generic platform mechanisms only.
 2. **One generic engine remains.** Parser, typechecker, IR, compiler, plan,
    executor, runtime, persistence, document, renderer, browser host, server
    host, and verifiers may not branch on `fjordpulse`, source paths, labels,
@@ -135,10 +150,12 @@ replacement.
 5. **No second renderer.** WebGPU renders the product. HTML/CSS may provide the
    minimal canvas host and semantic accessibility projection, but may not become
    a separately authored FjordPulse visual implementation.
-6. **No direct browser-to-Entur or browser-to-redb path.** The Client talks to
-   the Server over the declared same-origin HTTP/WS contracts. Only raster tile
-   provider traffic may leave the browser directly, through an allowlisted
-   public tile-source capability.
+6. **No direct Client/Server, browser-to-Entur, or browser-to-redb path.** The
+   application graph permits only Client <-> Session <-> Server. Internal
+   edges are compiler-derived typed values and calls, not source-declared
+   HTTP/WS/JSON/RPC. Only allowlisted raster tile traffic may leave the browser
+   directly. Pinned public HTTP/WSS contracts remain external Server boundaries
+   for compatibility clients and black-box evidence.
 7. **No implicit data mode.** `Deterministic` and `Live` are explicit immutable
    launch modes. Missing Live configuration is a startup failure, never a
    fallback to fixtures.
@@ -153,28 +170,105 @@ replacement.
 10. **No readiness by documentation.** Completion requires fresh, source-bound
     executable evidence from the final implementation and the deployed domain.
 
+## Canonical Language And Compiler Contract
+
+FjordPulse source follows
+`BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md` without a local
+syntax variant or compatibility path. Every call has parentheses. Ordinary
+inputs use exact declared parameter names in declaration order; ordinary
+positional arguments and caller-renamed formals are errors. A pipe supplies
+only the first declared ordinary parameter.
+
+Contextual collection behavior is expressible by ordinary user functions with
+`OUT`, not by a hardcoded parser or backend template. A direct call creates the
+fresh canonical output with a bare entry:
+
+```boon
+stations
+|> List/map(
+    item
+    new: [value: item]
+)
+```
+
+A user wrapper declares its own output and forwards it by exact formal name:
+
+```boon
+FUNCTION map_stations(list, station: OUT, new) {
+    list
+    |> List/map(
+        item: station
+        new: new
+    )
+}
+
+stations
+|> Catalog/map_stations(
+    station
+    new: [value: station]
+)
+```
+
+Bare `station` creates the wrapper output. `item: station` connects that
+existing output to `List/map`'s canonical `item` formal; it does not rename the
+formal. `OUT` is compile-time wiring and is never runtime state, a source,
+persisted data, a transport value, or a host handle. Direct, one-wrapper, and
+multi-wrapper forms must erase to equivalent executable ownership and work.
+
+`PASS:` is separate compile-time context, may occur at most once, and must be
+the final call clause. It is not a function parameter, ordinary value, `OUT`,
+pipe receiver, persisted field, or wire value. Earlier argument expressions
+may use `PASSED` context without changing the final-position rule.
+
+Lexical declarations are collected before references are resolved. Functions,
+modules, `BLOCK` values, explicit record fields, and fresh call outputs are
+visible throughout their scope independently of textual order. This does not
+relax exact call-entry order. Same-name record fields require an explicit outer
+alias, and instantaneous type, output, value, temporal, or distributed cycles
+remain errors unless a real temporal boundary breaks them.
+
+Collection source uses only typed
+`List/find(item, if:) -> Found[value] | NotFound` and canonical
+`List/chunk(size:)` results with `.items` and `.label`.
+`List/find_value`, reflective field/target/fallback lookup, and caller-named
+chunk result fields are removed. Typed equality may select a compiler-owned
+index without changing the source API or adding a FjordPulse branch.
+
+`boon_typecheck` produces the authoritative `CheckedProgram` with resolved
+declarations, exact typed calls, scope effects, correlations, and collection
+predicates. `boon_ir` elaborates contextual functions in their declaring
+islands, validates output nets, expands transparent wrappers, erases `OUT` and
+`PASS`, and produces the authoritative `ErasedProgram`. Machine, document,
+distributed, persistence, browser/server host, and verifier backends consume
+only `ErasedProgram`; no backend rebinds positional arguments or rediscovers
+context from parser AST or function-name strings.
+
 ## Target Topology
 
 ```text
 Browser
   generic Rust/Wasm web host
-    compiled FjordPulse Client Boon artifact (ProgramRole::Document)
+    compiled FjordPulse Client island
     retained document + semantic accessibility projection
     retained raster MapViewport + geographic overlays
     WebGPU renderer
-    generic HTTP/WS client capabilities
+    opaque bounded Client/Session edge transport
           |
-          | HTTPS / WSS, same origin
+          | bounded canonical positional CBOR, same origin
           v
 Coolify-managed Traefik
           |
           | private container port 8080
           v
 generic Boon server host
-  compiled FjordPulse Server Boon artifact (ProgramRole::Server)
+  indexed FjordPulse Session template
+    one isolated resumable Session generation per browser tab
+  one global FjordPulse Server island
+    immutable in-process Session/Server values and calls
   deterministic turn executor and bounded task/effect scheduler
   redb persistence worker -> /var/lib/boon/fjordpulse/state.redb
   outbound HTTP capability -> Entur allowlist
+  external public HTTP/WSS compatibility adapters -> Server island
   static browser artifact service
 
 Browser MapViewport -> allowlisted MapTiler raster HTTPS tiles
@@ -182,7 +276,9 @@ Browser MapViewport -> allowlisted MapTiler raster HTTPS tiles
 
 TLS is terminated by Coolify/Traefik. The container serves the static browser
 bundle, `/api/*`, and `/live` from one port. There is no public database port,
-no embedded second reverse proxy, and no separate realtime replica.
+no embedded second reverse proxy, and no separate realtime replica. `/api/*`
+and `/live` are external product compatibility contracts; the FjordPulse Client
+does not use them as its internal graph transport.
 
 ## Ownership Boundary
 
@@ -200,6 +296,8 @@ no embedded second reverse proxy, and no separate realtime replica.
   reconnect, periodic fallback, stale-result rejection, and Focus behavior;
 - all layout, styling, visible states, accessible labels, and public/Admin copy;
 - the exact distinction between passenger state and position freshness;
+- per-tab Session demand, authentication projection, scoped reply, reconnect,
+  expiry, and degraded-currentness policy;
 - explicit `Deterministic` and `Live` mode behavior;
 - deterministic fixture data and scenario scripts.
 
@@ -211,13 +309,16 @@ no embedded second reverse proxy, and no separate realtime replica.
 - outbound HTTP transport, DNS, TLS validation, pooling, timeouts, and body
   byte limits;
 - request/response correlation and socket identity below the Boon data model;
+- hidden Client/Session edge IDs, tab resume tokens, Session generations,
+  bounded fair scheduling, and stale-frame rejection;
 - clocks, timers, secure randomness, environment/configuration, and host-vault
   secret references;
 - cryptographic primitives, constant-time secret verification, signed cookies,
   and secure cookie serialization exposed through typed generic contracts;
 - redb transactions, durability, repair, compaction, and single-writer locking;
 - browser URL/history, canvas, input translation, accessibility projection,
-  fetch/WebSocket mechanics, and IndexedDB;
+  IndexedDB, opaque Client/Session transport, and explicitly granted external
+  fetch/WebSocket mechanics;
 - raster tile fetch/decode/cache/upload mechanics and Web Mercator projection;
 - WGPU/WebGPU device, surface, retained render resources, and readback;
 - bounded host CPU, memory, filesystem, build, and persistence diagnostics.
@@ -228,9 +329,9 @@ room, map marker, layout, warning, or visible state.
 
 ## Production Package Shape
 
-Create one application package with two independently compiled programs and
-shared pure modules. Exact filenames may follow the package-manifest work, but
-the ownership must remain recognizable:
+Create one application package with linked Client, Session, and Server islands
+plus shared pure modules. Exact filenames may follow the package-manifest work,
+but the ownership must remain recognizable:
 
 ```text
 apps/fjordpulse/
@@ -247,9 +348,15 @@ apps/fjordpulse/
     RUN.bn
     App.bn
     Model/
-    Network/
+    Data/
     Theme/
     View/
+  Session/
+    RUN.bn
+    App.bn
+    Auth.bn
+    Demand.bn
+    Recovery.bn
   Server/
     RUN.bn
     Config.bn
@@ -272,19 +379,22 @@ apps/fjordpulse/
 The package manifest declares:
 
 - stable package identity;
-- one browser/client entry compiled as `ProgramRole::Document`;
-- one nonvisual server entry compiled as `ProgramRole::Server`;
+- one browser Client entry, one indexed resumable Session template, and one
+  global nonvisual Server entry;
 - source, generated fixture, asset, migration, scenario, and budget files;
-- capability profiles for each program;
-- compatible client/server protocol versions;
+- capability profiles for each island;
+- one linked graph/schema contract for derived Client/Session/Server edges and
+  separate compatible versions for genuine external HTTP/WSS contracts;
 - stable state namespaces for deterministic, staging, and production runs.
 
-The pair declaration is build metadata, not app-specific host code. The generic
-bundle loader must also work for an unrelated paired example.
+The island declaration is build metadata, not app-specific host code. The
+generic package loader must also work for an unrelated three-island example.
 
-Shared modules are compiled into each artifact. Client and Server do not share
-mutable memory or runtime handles. Their only production communication is the
-versioned HTTP/WS protocol.
+Shared modules are compiled into each island artifact. Islands do not share
+mutable memory or runtime handles. The compiler derives only adjacent
+Client/Session and Session/Server edges from qualified values and calls. Public
+HTTP/WSS is a separate external Server contract, not an alternate internal
+Client/Server path.
 
 ## Generic Platform Prerequisites
 
@@ -292,25 +402,50 @@ Application implementation may use a prerequisite only after its independent
 generic fixture, unit/integration suite, and plan verification pass. Concurrent
 or partial worktree changes do not count as completed capability.
 
-### P0: ProgramRole Server And Paired Bundles
+Every prerequisite below consumes post-erasure compiler output. The canonical
+OUT/PASS/call/binding migration and authoritative `CheckedProgram` ->
+`ErasedProgram` cutover are entry gates; no FjordPulse phase may retain a
+parser-AST, positional binder, runtime-OUT, or legacy island fallback to keep an
+intermediate artifact working.
 
-`ProgramRole::Server` must become a complete host boundary, not only an enum or
-an inference based on the absence of `document`.
+### P0: Client/Session/Server Islands And Linked Packages
+
+Client, Session, and Server must be typed compiler/runtime islands, not enum
+labels inferred from document presence or a legacy two-artifact bundle.
 
 Required semantics:
 
-- the manifest explicitly declares the expected role for every entry artifact;
-- compile fails when a Server artifact contains a document root or when a
-  Document artifact lacks its visual output contract;
-- a Server artifact exposes typed host output roots and typed source/effect
-  contracts without a document plan;
-- the plan verifier checks role, output contracts, capabilities, persistence,
-  and target profile together;
-- Server startup restores/migrates/settles before binding listeners, timers, or
-  outbound effect workers and before readiness becomes true;
-- one shared Server Session processes source turns in deterministic sequence;
+- the manifest explicitly declares one Client entry, one Session template, and
+  one Server entry, and compilation rejects wrong-island roots, capabilities,
+  references, and calls;
+- Client owns the visual document contract, Session is a nonvisual indexed
+  per-tab template, and Server is one global nonvisual authority;
+- only Client <-> Session <-> Server dependencies are legal; direct
+  Client/Server values, references, and calls fail compilation;
+- qualified values and exact named calls derive exports, imports, scoped
+  replies, and shared demand subscriptions without source-declared routes,
+  subscriptions, RPC, HTTP, JSON, synthetic result sources, or effects blocks;
+- Session is compiled once and instantiated with isolated state slabs, complete
+  hidden ownership ancestry, generation, deterministic row-scoped event
+  merging, and bounded fair scheduling;
+- the plan verifier checks island, output contracts, capabilities, persistence,
+  linked graph/schema hash, and target profile together;
+- Server startup restores/migrates/settles before admitting Session instances,
+  external listeners, timers, or outbound effect workers and before readiness;
 - request/socket correlation remains host-owned and cannot be persisted or
   compared as ordinary Boon data;
+- `SessionInfo/status()` and `SessionInfo/principal()` expose only their typed
+  role-restricted projections; Session IDs, resume tokens, credentials,
+  correlation IDs, hidden keys, generations, and binding identities never
+  become Boon values;
+- each tab resumes for 60 seconds through a host-managed session-storage token;
+  expiry or disconnect cancels owned work and stale generations fail closed;
+- Client/Session frames are bounded canonical positional CBOR containing
+  protocol version, graph and graph-schema hashes, edge ID, graph revision,
+  sequence, hidden Session generation, and one canonical Boon value;
+- in-process Session/Server edges pass immutable ordinary values directly;
+  indefinite, noncanonical, oversized, wrong-graph/schema, stale-generation,
+  unknown-edge, replayed, or out-of-order Client frames fail before dispatch;
 - asynchronous completions carry generic effect invocation identity and are
   rejected when stale, cancelled, or from a prior launch epoch;
 - bounded admission rejects overload before mutating authority;
@@ -318,14 +453,17 @@ Required semantics:
   the required Immediate persistence barrier, then exits;
 - forced termination restores only the last acknowledged redb epoch.
 
-Add an unrelated server fixture that serves a small JSON API, accepts a WS
-message, schedules a timer, persists a counter, restarts, and proves no document
-or example-specific host path exists. Add an unrelated paired bundle fixture
-whose Document and Server programs share a pure contract module.
+Add an unrelated three-island fixture that proves two tabs, isolated Session
+state, scoped replies, shared Server demand, fairness, reconnect/expiry,
+schema mismatch, stale-route rejection, and secret absence. Add a separate
+unrelated Server boundary fixture that serves a small external JSON API,
+accepts a public WS message, schedules a timer, persists a counter, and
+survives restart without an application-specific host path.
 
-Exit gate: the generic fixtures run through real loopback HTTP and WebSocket,
-survive restart, and pass the no-package-branch audit before FjordPulse Server
-routes are added.
+Exit gate: internal fixtures use bounded Client/Session CBOR and in-process
+Session/Server values, external fixtures use real loopback HTTP/WebSocket, and
+all survive restart and pass the no-package-branch audit before FjordPulse
+product behavior is added.
 
 ### P1: Real Number
 
@@ -370,7 +508,10 @@ migration gate remains green.
 
 Add a generic bounded JSON data and codec boundary. Do not parse JSON with Boon
 text splitting and do not expose `serde_json::Value` or Rust object identity to
-Boon.
+Boon. JSON is used only at genuine external boundaries: pinned public
+HTTP/WSS, Entur, tooling fixtures, and other explicitly external capabilities.
+Client/Session/Server graph edges carry ordinary typed values and never encode
+their internal transport as JSON.
 
 Required semantics:
 
@@ -396,10 +537,12 @@ unknown fields, missing fields, and native/Wasm equivalence.
 Exit gate: an unrelated Boon JSON echo/validation fixture passes fuzz/property
 tests and both host targets before Entur or FjordPulse contracts use the codec.
 
-### P3: Generic HTTP And WebSocket Capabilities
+### P3: Generic External HTTP And WebSocket Capabilities
 
-Implement both server-side and client-side transport contracts. Prefer mature
-Rust protocol/TLS libraries; do not hand-roll HTTP or WebSocket framing.
+Implement generic capabilities for genuine external server and outbound
+boundaries. Prefer mature Rust protocol/TLS libraries; do not hand-roll HTTP or
+WebSocket framing. These capabilities do not implement internal island edges:
+the FjordPulse Client reaches Server data only through Session.
 
 #### Server HTTP
 
@@ -439,20 +582,24 @@ it cannot grow memory without limit or block another connection.
 
 #### Outbound HTTP/WS
 
-Both program roles receive a generic effect contract for allowlisted outbound
-HTTP and, for platform completeness, outbound WebSocket. It supports method,
-headers, bounded body, connect/overall timeout, cancellation, response status,
-headers, and bounded bytes. The host owns pooling, DNS, TLS, redirects, and
-connection replacement. The capability profile restricts destinations by
-named endpoint, scheme, host, port, and path prefix so Boon cannot turn user
-input into arbitrary SSRF.
+An island receives a generic allowlisted outbound HTTP or WebSocket effect only
+when its manifest capability grants one. The contract supports method, headers,
+bounded body, connect/overall timeout, cancellation, response status, headers,
+and bounded bytes. The host owns pooling, DNS, TLS, redirects, and connection
+replacement. The capability profile restricts destinations by named endpoint,
+scheme, host, port, and path prefix so Boon cannot turn user input into
+arbitrary SSRF. FjordPulse grants Entur outbound HTTP to Server; it does not
+grant Client an internal-network bypass.
 
 #### Browser Client
 
-The browser host exposes same-origin fetch and WebSocket effects, lifecycle and
-online/offline sources, reconnect-safe cancellation, and response/frame byte
-limits. Product retry, subscription, stale-result, and fallback policy stays in
-the Client Boon program.
+The browser host exposes the opaque bounded Client/Session edge transport,
+lifecycle and online/offline sources, reconnect-safe cancellation, and frame
+limits. It also exposes the separately allowlisted raster-tile capability used
+by `MapViewport`. Product retry, demand, stale-result, fallback, and visible
+connection policy stays in Client and Session Boon. No internal URL, route,
+HTTP request, WebSocket subscription, JSON envelope, or synthetic result
+`SOURCE` appears in product source.
 
 #### Supporting Host Primitives
 
@@ -462,9 +609,11 @@ HMAC/signature verification, constant-time configured-secret checks, and
 bounded host-resource diagnostics. Secret bytes never enter Boon state, logs,
 reports, or JSON.
 
-Exit gate: generic loopback server/client fixtures prove HTTP request/response,
-outbound HTTP, WS lifecycle, rooms, malformed messages, cancellation, timeout,
-backpressure, reconnect, cookies, origin rejection, and clean/forced restart.
+Exit gate: generic external-boundary fixtures prove HTTP request/response,
+outbound HTTP, public WS lifecycle, rooms, malformed messages, cancellation,
+timeout, backpressure, cookies, origin rejection, and clean/forced restart.
+The P0 three-island fixture separately proves reconnect and typed internal
+transport without HTTP/JSON fallback.
 
 ### P4: Generic Indexed Queries Over Persistent Collections
 
@@ -496,9 +645,10 @@ QueryPlan
   optional bounded pure residual
 ```
 
-The language-facing API should be generic standard-library declarations and
-queries over keyed collections. Final syntax is decided in the platform slice;
-the semantic constraints are fixed:
+The language-facing API is the compiler-owned `List/query` contract documented
+in `LANGUAGE_SEMANTICS.md`, alongside canonical typed `List/find`. It remains a
+generic standard-library query over keyed collections; these semantic
+constraints are fixed:
 
 - key projections are closed, pure, typed, deterministic, and compiler-known;
 - supported keys include Text, Number, tagged values, and compound tuples;
@@ -540,21 +690,22 @@ for the Server artifact.
 
 Required production behavior:
 
-- stable application identity separates Client, Server, test, staging, and
-  production namespaces;
+- stable ownership namespaces distinguish Client, each per-tab Session, global
+  Server, test, staging, and production; only explicitly declared Server
+  authority is durable;
 - one redb database file lives under the mounted production data directory;
 - startup obtains an exclusive single-writer lock before restore;
 - restore, migration, index validation/rebuild, and output settling finish
-  before listener admission and readiness;
+  before Session/listener admission and readiness;
 - server mutations that are acknowledged to a remote client use Immediate
   durability at the required barrier;
 - high-frequency replaceable telemetry may use bounded Buffered coalescing when
   the UI and Admin report its pending tail honestly;
 - canonical state change and semantic realtime event/outbox intent commit in
   one authoritative turn;
-- WebSocket publication starts only after the required durable acknowledgement;
-  duplicate publication is harmless because event IDs/versions are stable and
-  clients reject old versions;
+- typed Session publication and external WebSocket fanout start only after the
+  required durable acknowledgement; duplicate publication is harmless because
+  event IDs/versions are stable and consumers reject old versions;
 - redb failure produces backpressure or failed readiness, not dropped authority;
 - clean shutdown flushes the acknowledged tail;
 - crash recovery restores the last acknowledged epoch and reconciles pending
@@ -572,6 +723,8 @@ Do not persist:
 - decoded JSON trees that can be remapped from canonical state;
 - HTTP response caches unless explicitly authoritative product cache records;
 - Client documents, layout, map tiles, GPU resources, or accessibility trees;
+- Session resume tokens, hidden generations, transient per-tab state, or edge
+  correlation;
 - query planner caches, currentness bits, reports, or proof images.
 
 Exit gate: forced-crash matrices, clean restart, schema migration, corrupt-copy
@@ -638,9 +791,11 @@ budgets on native WGPU and browser WebGPU with the same descriptor semantics.
 
 ### P7: Browser WebGPU Host
 
-Build a generic Rust/Wasm host for `ProgramRole::Document`. It must run the
-normal compiler artifact, Session, retained document, and renderer architecture
-rather than a browser-only FjordPulse implementation.
+Build a generic Rust/Wasm host for a Client island. It must run the normal
+linked `ErasedProgram` Client artifact, retained document, and renderer
+architecture rather than a browser-only FjordPulse implementation. The
+resumable Session island runs as an isolated server-host instance; it is not a
+second browser-authored application.
 
 Required capabilities:
 
@@ -650,7 +805,8 @@ Required capabilities:
 - retained document/layout/render state and the MapViewport path;
 - pointer, wheel, touch/pinch, keyboard, focus, IME, clipboard, resize, scale,
   visibility, and reduced-motion inputs;
-- asynchronous fetch, WebSocket, timer, URL/history, and IndexedDB effects;
+- opaque Client/Session edge transport, timer, URL/history, IndexedDB, and
+  separately allowlisted raster-tile effects;
 - minimal semantic DOM/accessibility projection derived from the same Boon
   document roles, names, values, actions, focus, order, links, and text;
 - no independently authored HTML/CSS FjordPulse layout;
@@ -664,17 +820,18 @@ Correctness CI may use a declared software WebGPU adapter. Release performance
 evidence must identify a hardware-backed adapter and fail if the run silently
 falls back to software. Browser support is capability-based: lack of required
 WebGPU or semantic APIs shows a small host-owned unsupported message before a
-program session starts.
+  Client island starts.
 
-Exit gate: Counter, TodoMVC, the generic map example, and a generic HTTP/WS
-client run in the browser host with semantic, visual, input, persistence, and
-performance evidence before FjordPulse Client is enabled.
+Exit gate: Counter, TodoMVC, the generic map example, and the Client from an
+unrelated three-island fixture run in the browser host with semantic, visual,
+input, persistence, reconnect, and performance evidence before FjordPulse
+Client is enabled.
 
-## Paired Program Contract
+## Client/Session/Server Program Contract
 
 ### Shared Pure Domain
 
-The Client and Server compile the same pure structural definitions for:
+Client, Session, and Server compile the same pure structural definitions for:
 
 - `Station`, `StationCluster`, `Coordinate`, and `BoundingBox`;
 - `Departure`, `DepartureBoard`, `StationTimetablePage`, and cursor metadata;
@@ -685,15 +842,17 @@ The Client and Server compile the same pure structural definitions for:
 - `JourneySnapshot`, geometry, calls, and upcoming stops;
 - `Watch`, watch type/state/priority, source state, and data state;
 - `MapConfig`, basemap descriptors, health, diagnostics, and Admin DTOs;
-- HTTP success/error envelopes;
-- realtime client commands, server frames, event versions, and protocol errors;
+- external HTTP success/error envelopes;
+- external realtime commands, frames, event versions, and protocol errors;
 - locale keys and canonical Norwegian/English copy data;
 - normalization, time-zone-facing labels, and validation helpers that are truly
   pure and target-independent.
 
-Wire DTOs and internal records are separate where ownership differs. Public
-Entur identifiers remain Text. RFC3339 timestamps remain Text at the wire
-boundary and are parsed into checked time values inside the programs.
+External wire DTOs and internal typed island values are separate where
+ownership differs. Public Entur identifiers remain Text. RFC3339 timestamps
+remain Text at genuine external boundaries and are parsed into checked time
+values inside the islands. Client/Session/Server edges do not reuse the public
+HTTP/realtime DTOs as internal envelopes.
 
 ### Client Boon Program
 
@@ -709,11 +868,12 @@ The Client owns one coherent application state machine covering:
   nearby vehicles, details, loading, stale, empty, retry, and cursor expiry;
 - selected vehicle, trail, journey, previous/next/upcoming stops, passenger
   classification, stale/lost state, refresh, Focus/follow/pause/resume/unfocus;
-- HTTP requests with structural generation fingerprints and stale completion
-  rejection;
-- WS connect/authenticate/subscribe/resubscribe/message-version/reconnect state;
-- periodic HTTP refresh only while realtime is degraded, with authoritative
-  snapshot replacement and no duplicate watch policy;
+- qualified Session requests and demands with structural generation ownership
+  and stale completion rejection;
+- visible Session status, authentication projection, demand resubscription,
+  semantic version, reconnect, and expiry state;
+- periodic authoritative snapshot demand only while shared publication is
+  degraded, with replacement and no duplicate watch policy;
 - contextual public health notices and source provenance separate from health;
 - Admin login/session/logout, status, infrastructure, watches, Entur log,
   realtime, persisted events, redb schema/index, and migration views;
@@ -723,7 +883,12 @@ Only explicit user preferences are durable in browser IndexedDB: locale,
 basemap, intro choice, and a valid canonical camera if approved by the product
 contract. Active sockets, pending requests, transient hover/focus, timers,
 diagnostics, map tiles, and server snapshots are reconstructed. A browser
-refresh resubscribes and asks the Server for current authoritative snapshots.
+refresh restores its Session and re-establishes demand for current authoritative
+snapshots.
+
+The Client has no direct Server reference or call. Browser refresh restores or
+creates its Session, re-establishes qualified demand, and obtains current
+authoritative snapshots through that Session.
 
 #### Physical Styling Contract
 
@@ -745,6 +910,33 @@ light/dark contrast where supported, hover/focus/pressed/selected states,
 disabled/error states, depth ordering, shadow clipping, responsive layouts,
 and deterministic WGPU/WebGPU evidence. A flat per-control style workaround is
 not an accepted final implementation.
+
+### Session Boon Program
+
+Each browser tab owns one resumable Session island instance. Session owns:
+
+- the only legal bridge between Client values/calls and Server values/calls;
+- per-tab request generations, demand subscriptions, scoped replies, and stale
+  completion rejection;
+- authentication/current-principal projection and the policy for what account
+  data Client may observe;
+- watch/focus demand contributed by this tab, reconnect/resume behavior, the
+  60-second expiry window, and cancellation when ownership ends;
+- bounded per-tab work, fair scheduling participation, and isolation from tabs
+  whose visible row keys or request values happen to match;
+- degradation and currentness state used by Client fallback behavior.
+
+Session is compiled once as an indexed template. The host instantiates hidden
+state and generation ownership per tab; Boon cannot read the Session ID, resume
+token, connection/correlation identity, hidden key, generation, or binding
+identity. Session calls Server with ordinary exact named syntax and receives
+ordinary typed values. It does not declare internal HTTP routes, RPC handlers,
+JSON envelopes, subscriptions, synthetic result sources, or transport effects.
+
+Qualified cross-island references use the canonical role-root syntax, for
+example `query: Client/search.query` and
+`results: Server/search(query: query)` in Session. Same-island declarations are
+unqualified, and direct Client/Server qualification is rejected.
 
 ### Server Boon Program
 
@@ -818,9 +1010,9 @@ failed Live dependency.
 - Advertises `Transport data: Entur` without claiming an individual request is
   healthy.
 
-The same Client and Server Boon source modules run in both modes. Mode-specific
-data is supplied by capability/configuration adapters, not `if fjordpulse` host
-branches or duplicated product programs.
+The same Client, Session, and Server Boon source modules run in both modes.
+Mode-specific data is supplied by capability/configuration adapters, not
+`if fjordpulse` host branches or duplicated product programs.
 
 ## Server Persistence And Query Model
 
@@ -829,10 +1021,12 @@ branches or duplicated product programs.
 Planned production identities:
 
 ```text
-client package:     cz.kavik.fjordpulse.client
-server package:     cz.kavik.fjordpulse.server
-deployment domain: fjordpulse-boon.kavik.cz
-production state:  production-v1
+application package:  cz.kavik.fjordpulse
+client island:        cz.kavik.fjordpulse.client
+session island:       cz.kavik.fjordpulse.session
+server island:        cz.kavik.fjordpulse.server
+deployment domain:    fjordpulse-boon.kavik.cz
+production state:     production-v1
 ```
 
 Tests and staging use distinct namespaces. The state namespace is never derived
@@ -858,8 +1052,9 @@ The Server's semantic collections replace the pinned SurrealDB tables:
 | persistence metadata | schema, migration edges/attempts, epochs, outbox, index status, and build compatibility |
 
 Nested snapshot and timetable data remain bounded document-shaped values so an
-HTTP resync is atomic. Stable links are Text IDs resolved by indexed queries;
-redb internal keys never cross the Boon or HTTP boundary.
+authoritative Session or external HTTP resync is atomic. Stable links are Text
+IDs resolved by indexed queries; redb internal keys never cross a Boon island
+or external HTTP boundary.
 
 ### Required Indexes And Bounds
 
@@ -892,14 +1087,19 @@ Entur or deterministic source completion
   -> one atomic authority turn updates canonical record
   -> same turn creates semantic event and durable publication intent
   -> redb Immediate acknowledgement where externally promised
-  -> generic WS host broadcasts the Boon-selected room frame
-  -> Client applies only a newer semantic version
+  -> one typed publication feeds subscribed Session demand
+       -> Client applies only a newer semantic version
+  -> the same semantic publication feeds the external WS compatibility adapter
+       -> generic WS host broadcasts the Boon-selected room frame
 ```
 
-There is no second direct broadcast after a canonical write. Full snapshots are
-authoritative; events are notifications. Reconnect joins the room, obtains a
-fresh snapshot, then accepts newer versions. The daily timetable does not emit
-realtime events and never enters station snapshot frames.
+There is no second semantic event or direct Client/Server broadcast after a
+canonical write. The internal typed edge and external WS adapter fan out from
+the same versioned publication intent. Full snapshots are authoritative;
+events are notifications. Session reconnect restores demand and obtains a fresh
+snapshot before accepting newer versions; an external WS client rejoins its
+room and follows the same rule. The daily timetable does not emit realtime
+events and never enters station snapshot frames.
 
 ### Restart And Redeploy Contract
 
@@ -919,7 +1119,8 @@ After a process kill, normal restart, and Coolify redeploy:
 - restore/migration/index validation completes before readiness;
 - all acknowledged values above are identical or have advanced only through an
   explicit post-restart source turn;
-- sockets reconnect and resubscribe; socket/room handles are new;
+- Client Sessions resume or reconnect and restore demand; external sockets
+  reconnect/resubscribe with new socket/room handles;
 - due watches resume without duplicate immediate Entur effects;
 - pending idempotent intents reconcile by stable invocation key;
 - no default/empty frame or empty API response is published before restore;
@@ -930,8 +1131,10 @@ These checks are blocking even though backup/restore automation is deferred.
 
 ## HTTP Contract Plan
 
-Preserve the pinned public routes, envelopes, and product behavior through the
-Server Boon program, subject only to the explicit compatibility-delta ledger:
+Preserve the pinned public routes, envelopes, and product behavior as a genuine
+external boundary of the Server Boon island, subject only to the explicit
+compatibility-delta ledger. These routes support compatibility consumers and
+black-box evidence; the in-product Client does not use them to cross islands:
 
 ```text
 GET    /api/health
@@ -986,13 +1189,15 @@ Contract requirements:
 
 ## WebSocket Contract Plan
 
-Keep the pinned command/event semantics. Keep protocol version 1 only if every
-wire field remains truthful and compatible. If removing a technology-specific
-field requires a wire change, make one explicit protocol-version bump, update
-both paired artifacts and fixtures, and reject mismatched versions; never change
-version 1 in place.
+Keep the pinned command/event semantics as a genuine external Server boundary.
+The in-product Client receives typed Server publication through Session and
+does not encode these commands/frames as internal graph transport. Keep
+protocol version 1 only if every external wire field remains truthful and
+compatible. If removing a technology-specific field requires a wire change,
+make one explicit protocol-version bump, update the external schemas and
+fixtures, and reject mismatched versions; never change version 1 in place.
 
-Client commands:
+External client commands:
 
 ```text
 watch_station       unwatch_station
@@ -1033,7 +1238,8 @@ Rules:
 - resubscribe and send authoritative snapshots after reconnect/restart;
 - compact movement events never duplicate full journey geometry/calls;
 - metadata-only refresh does not create a semantic-change event;
-- stale/duplicate event versions cannot regress Client state.
+- stale/duplicate event versions cannot regress an external consumer or the
+  internal Client projection derived from the same semantic publication.
 
 ## Entur And Freshness Plan
 
@@ -1097,7 +1303,8 @@ Required surfaces:
 - read-only Admin status, infrastructure, watches, Entur log, realtime, events,
   database/index, and migration views;
 - explicit loading, empty, stale, error, retry, degraded, and device-loss
-  states; lack of WebGPU is the generic host's pre-session unsupported state.
+  states; lack of WebGPU is the generic host's pre-Client-launch unsupported
+  state.
 
 Map behavior remains station-first. Initial load must not fetch/display all live
 vehicles. Selected transport remains visible above clusters and raster labels.
@@ -1121,8 +1328,12 @@ testable through the semantic projection.
   logs, state, reports, or redb ordinary authority.
 - Public demo Admin credentials are a separate explicitly enabled identity,
   default off, with an exact diagnostic-GET allowlist plus logout.
-- Sessions use Secure, HttpOnly, same-site cookies with bounded lifetime and
-  signed/verified host primitives.
+- External Admin authentication uses Secure, HttpOnly, same-site cookies with
+  bounded lifetime and signed/verified host primitives.
+- Island Session resumption uses a separate host-managed session-storage token
+  for at most 60 seconds. The token, Session ID, hidden generation, credentials,
+  and edge/correlation identities never enter Boon values, logs, reports, or
+  durable state; expiry cancels owned work and stale frames fail closed.
 - CORS and WS origins are exact allowlists. Production is same-origin.
 - Forwarded client addresses are accepted only from configured Coolify proxy
   hops; arbitrary forwarding headers are ignored.
@@ -1135,8 +1346,9 @@ testable through the semantic projection.
   payload dump.
 - Unknown measurements render as unavailable, never zero. Idle demand is not a
   successful Entur probe. Pending durability is not reported as durable.
-- Admin reports the actual single-process/single-redb topology and the explicit
-  absence of configured backup, HA, and multi-node capability.
+- Admin reports the actual single-process topology with per-tab Session islands,
+  one global Server, one redb writer, and the explicit absence of configured
+  backup, HA, and multi-node capability.
 
 ## Implementation Phases
 
@@ -1163,14 +1375,18 @@ failed prerequisite with product-specific code.
 Gate: 108 stories and 340 scenarios are accounted for exactly, with no
 unclassified or silently dropped item.
 
-### Phase 1: Complete ProgramRole Server And Bundle Model
+### Phase 1: Complete Client/Session/Server Island Model
 
-- Finish P0's generic role, output, lifecycle, and paired-package contracts.
-- Add the generic loopback Server and paired bundle fixtures.
-- Add release artifact serialization/loading and role/capability validation.
-- Prove restore-before-listen and bounded graceful/forced shutdown.
+- Finish P0's generic island, linked-package, output, lifecycle, and ownership
+  contracts.
+- Add the unrelated three-island and external Server-boundary fixtures.
+- Add release artifact serialization/loading plus island/capability/edge-schema
+  validation.
+- Prove Session isolation/resume/expiry, restore-before-admission, and bounded
+  graceful/forced shutdown.
 
-Gate: all generic role/server fixtures pass with no FjordPulse source present.
+Gate: all generic island/server fixtures pass with no FjordPulse source
+present.
 
 ### Phase 2: Complete Number And JSON
 
@@ -1185,9 +1401,9 @@ workaround is permitted in later phases.
 
 ### Phase 3: Complete Generic HTTP/WS And Host Services
 
-- Implement server listener, browser client, outbound transport, rooms,
-  correlation, timers, clocks, secrets, cookies, crypto, trusted proxy, and
-  diagnostics contracts.
+- Implement external server listener/client fixtures, outbound transport,
+  rooms, correlation, timers, clocks, secrets, cookies, crypto, trusted proxy,
+  and diagnostics contracts.
 - Add real loopback integration, fault injection, backpressure, and restart.
 - Bind host sources/effects through typed plan metadata rather than output-name
   string conventions.
@@ -1207,7 +1423,8 @@ Gate: P4 and P5 generic data gates pass before importing a FjordPulse catalog.
 ### Phase 5: Complete Browser WebGPU And MapViewport
 
 - Bring the retained document/scene renderer to Wasm WebGPU.
-- Add semantic projection and complete browser input/network/storage adapters.
+- Add semantic projection and complete browser input, Client/Session edge,
+  tile, and storage adapters.
 - Implement the generic retained raster MapViewport and unrelated map example.
 - Verify native/browser descriptor parity, tile retention, and hardware release
   performance.
@@ -1215,18 +1432,21 @@ Gate: P4 and P5 generic data gates pass before importing a FjordPulse catalog.
 Gate: P6 and P7 pass; a browser WebGPU map is visibly usable without any
 FjordPulse code.
 
-### Phase 6: Create Paired FjordPulse Skeleton In Deterministic Mode
+### Phase 6: Create FjordPulse Three-Island Skeleton In Deterministic Mode
 
-- Add package manifest, shared contracts, Client and Server entrypoints,
-  fixtures, scenarios, and budgets.
+- Add package manifest, shared contracts, Client, Session, and Server
+  entrypoints, fixtures, scenarios, and budgets.
 - Serve the WebGPU client from the generic Server host.
 - Implement mode/config bootstrap, health/readiness, map config, success/error
-  envelopes, WS connect/ping, Norwegian default, responsive shell, and a local
-  deterministic raster map.
-- Persist one generic Server authority value and prove browser/server restart.
+  envelopes, external WS connect/ping compatibility, internal Session
+  connect/resume, Norwegian default, responsive shell, and a local deterministic
+  raster map.
+- Persist one generic Server authority value and prove Client/Session/Server
+  restart and resumption.
 
-Gate: one end-to-end deterministic browser session reaches Server Boon over
-real loopback HTTP/WS, renders through WebGPU, and survives Server restart.
+Gate: one end-to-end deterministic browser Client reaches Server Boon only
+through its Session, renders through WebGPU, survives Session reconnect and
+Server restart, and the separate public HTTP/WSS contracts pass loopback tests.
 
 ### Phase 7: Catalog, Map, And Search
 
@@ -1255,10 +1475,11 @@ Gate: FP-015 through FP-025 and station portions of FP-049 through FP-056 pass.
 
 - Implement vehicle mapping, mode, passenger classification, freshness,
   observations, trail, journey/calls/geometry, previous/next/upcoming stops.
-- Implement watch/focus scheduling and full WS protocol publication/resync.
+- Implement watch/focus scheduling, typed Server-to-Session publication/resync,
+  and the full external WS compatibility protocol.
 - Implement selected/following/paused/stale/lost/non-passenger client behavior.
-- Prove one publication path, stale-version rejection, reconnection, and
-  periodic HTTP fallback.
+- Prove one semantic publication path, stale-version rejection, Session
+  reconnection, qualified snapshot fallback, and external HTTP/WS compatibility.
 
 Gate: FP-026 through FP-056 pass, including controlled outage and recovery.
 
@@ -1292,8 +1513,8 @@ product renderer.
 ### Phase 12: Coolify Production Deployment
 
 - Build one multi-stage image containing the generic Server binary, trusted
-  precompiled Server artifact, browser Wasm/WebGPU bundle, Client artifact, and
-  static assets.
+  precompiled Session template and Server artifact, browser Wasm/WebGPU bundle,
+  Client artifact, linked graph/schema metadata, and static assets.
 - Run as a non-root user with read-only root filesystem and one writable mounted
   data path.
 - Create a dedicated Coolify resource and persistent volume for
@@ -1337,7 +1558,7 @@ deployed SHA, with no tracked edit after report generation.
 | FP-009..014 | search open/close, Norwegian normalization, prefix/one-edit results, empty state, keyboard navigation, station/line/vehicle selection behavior |
 | FP-015..025 | station panel/watch, loading/fresh/empty/stale/error/retry, compact departures, daily timetable, serving/nearby grouping, coverage, scoped tabs, refresh |
 | FP-026..039 | vehicle details/trail, Focus start/follow/pause/resume/stop, stale/lost/retry, transport mode, passenger/non-passenger truthfulness |
-| FP-040..048 | browser WS, backend-only Entur, typed protocol, watches/rooms, reconnect/resync, degraded periodic refresh |
+| FP-040..048 | Session-mediated browser realtime, external WS compatibility, backend-only Entur, typed publication/protocol, watches/rooms, reconnect/resync, degraded periodic refresh |
 | FP-049..056 | Entur identity, departures/positions/journeys, focused refresh, shared limits, 429/backoff, freshness distinctions, no fabricated data |
 | FP-057..063 | redb production authority, atomic migrations, typed collections/indexes, station/vehicle/observation/event persistence and retention |
 | FP-064..070 | Admin auth, status/infrastructure, watches, Entur log, realtime, health/readiness, structured logs, read-only redb diagnostics |
@@ -1354,10 +1575,13 @@ representative happy path passed.
 
 ### Generic Platform Evidence
 
-- role/bundle plan verification and unrelated Server/Client fixtures;
+- CheckedProgram/ErasedProgram exact named-call, order-independent binding,
+  OUT/wrapper-equivalence, PASS-last, typed List/find, and canonical List/chunk
+  fixtures;
+- linked Client/Session/Server plan verification and unrelated two-tab fixtures;
 - Number native/Wasm/persistence/JSON/index golden tests;
 - bounded JSON fuzz/property and fixture tests;
-- loopback HTTP/WS/client/outbound transport tests;
+- external loopback HTTP/WS/outbound transport tests;
 - 60,000-row indexed query planner/no-scan/restart fixture;
 - generic MapViewport native/browser visual/input/cache/failure tests;
 - generic browser WebGPU document/input/accessibility/device-loss tests;
@@ -1380,7 +1604,8 @@ representative happy path passed.
 
 - Playwright or an equivalent browser driver may orchestrate the browser; it is
   not a product renderer and contains no application policy;
-- assertions use public HTTP/WS behavior, semantic accessibility projection,
+- assertions use derived Client/Session/Server behavior, separately exercise
+  public HTTP/WSS compatibility, and inspect semantic accessibility projection,
   app-owned frame/readback, canvas pixels, and generic runtime reports;
 - scenario behavior is manifest/data-driven. The verifier may not contain
   `if fjordpulse`, route-specific drawing, expected station coordinates, or
@@ -1399,6 +1624,12 @@ document, renderer, native/browser/server hosts, and verifiers for:
 - app-specific HTTP routes, JSON fields, query plans, map layers, geometry,
   pixels, or verifier expectations;
 - duplicate Number, JSON, runtime, renderer, or persistence paths;
+- positional or renamed ordinary calls, non-final/duplicated `PASS`, runtime
+  `OUT`, hardcoded contextual binders, parser/backend call rediscovery,
+  `List/find_value`, reflective find, or caller-renamed chunk fields;
+- direct Client/Server edges, legacy document/server bundle roles, internal
+  HTTP/JSON/RPC/subscription source contracts, or exposed hidden Session
+  identity;
 - request-time full scans for declared indexed operations;
 - direct redb calls outside generic persistence/query drivers;
 - direct Entur/MapTiler code outside Boon app modules and named host capability
@@ -1425,7 +1656,7 @@ from host and Boon processing.
 | pointer/wheel/keyboard input to presented frame | p95 <= 16.7 ms, p99 <= 25 ms |
 | cached-tile pan/zoom frame interval during scripted interaction | p95 <= 16.7 ms, p99 <= 25 ms |
 | search keystroke to visible local pending/result state | p95 <= 16.7 ms, p99 <= 25 ms |
-| WS frame receipt to visible retained update on deterministic loopback | p95 <= 33.4 ms, p99 <= 50 ms |
+| Server publication through Session to visible retained update | p95 <= 33.4 ms, p99 <= 50 ms |
 | mobile sheet snap/focus/layout frame | p95 <= 16.7 ms, p99 <= 25 ms |
 | decoded raster tile ready to presented GPU tile | p95 <= 33.4 ms, p99 <= 50 ms |
 | deterministic first usable shell on reference release host | <= 1,000 ms |
@@ -1435,8 +1666,8 @@ Additional browser requirements:
 
 - no task blocks the interactive thread for 50 ms or longer in the five-minute
   map/search/station/Focus scenario;
-- no normal update rebuilds the Client Session, full document, full overlay
-  list, or all tile textures;
+- no normal update rebuilds the Client island, its Session instance, full
+  document, full overlay list, or all tile textures;
 - resident decoded plus GPU tile caches remain within declared budget (initial
   target: at most 256 tiles and 128 MiB) and evict deterministically;
 - dense map responses remain at most 2,000 items and direct station markers at
@@ -1473,8 +1704,8 @@ Additional server requirements:
 - persistence/query/report work uses bounded queues and visible backpressure;
 - one production-shaped 30-minute Focus soak keeps memory, task count, redb file
   growth, event/log retention, and socket queues within declared bounds;
-- cleanup, compaction, import, and index rebuild do not violate browser/server
-  interaction budgets.
+- cleanup, compaction, import, and index rebuild do not violate
+  browser/Session/Server interaction budgets.
 
 Budget values may be tightened after a measured platform baseline. They may not
 be loosened merely to accommodate an app workaround or a repeated architectural
@@ -1491,6 +1722,7 @@ state. It performs no network-time code generation in the runtime stage. The
 runtime image contains:
 
 - generic Boon server host binary;
+- trusted compiled Session template and linked island metadata;
 - trusted compiled Server plan/artifact;
 - static generic browser host Wasm/loader;
 - trusted compiled Client plan/artifact;
@@ -1531,7 +1763,8 @@ capabilities are requested.
 - `/api/health` proves process/event-loop liveness and reports degraded
   dependencies without blocking on slow external probes.
 - `/api/readiness` is false until config, redb lock/restore/migration/indexes,
-  Server artifact, and listener admission are ready.
+  linked Client/Session/Server artifacts, and listener/Session admission are
+  ready.
 - Coolify health checks readiness for rollout and health for ongoing liveness.
 - SIGTERM stops admission, closes/announces WS shutdown, flushes bounded durable
   work, and exits within the declared grace period.
@@ -1591,11 +1824,14 @@ one final source revision:
 - the exact pinned parity manifest accounts for all 108 stories and 340
   scenarios, with only the explicitly named backup/restore automation items
   deferred;
-- one production package builds a Client Boon artifact and Server Boon artifact
-  with shared pure contracts and explicit compatible protocol versions;
-- generic independent gates pass for ProgramRole Server, paired bundles, real
-  Number, JSON, HTTP/WS, indexed queries, redb collections, retained raster
-  MapViewport, and browser WebGPU;
+- one production package builds linked Client, indexed Session-template, and
+  global Server `ErasedProgram` artifacts with shared pure contracts, one
+  internal graph/schema contract, and explicit external protocol versions;
+- generic independent gates pass for exact calls, OUT/wrapper erasure,
+  final-position PASS, order-independent bindings, typed List/find, canonical
+  List/chunk, Client/Session/Server isolation, real Number, external JSON and
+  HTTP/WSS, indexed queries, redb collections, retained raster MapViewport, and
+  browser WebGPU;
 - every non-deferred semantic, HTTP, WS, visual, responsive, accessibility,
   resilience, security, persistence, migration, and performance gate passes
   from fresh source-bound artifacts;
@@ -1618,12 +1854,14 @@ one final source revision:
 - deployment and Admin truthfully state that backup/restore automation, HA,
   clustering, and multi-node operation are not implemented;
 - final reports are generated after the last tracked edit and bind source SHA,
-  Client/Server artifact digests, schema/index hashes, image digest, browser
-  WebGPU adapter, dataset digest, and deployment URL.
+  Client/Session/Server artifact and internal graph digests, external protocol
+  versions, schema/index hashes, image digest, browser WebGPU adapter, dataset
+  digest, and deployment URL.
 
-Documentation, a static UI, a deterministic-only demo, a Server role enum, a
-redb proof of concept, a map screenshot, partial story coverage, stale reports,
-or a successful deployment without restart/redeploy proof is not completion.
+Documentation, a static UI, a deterministic-only demo, island declarations
+without executable isolation, a redb proof of concept, a map screenshot,
+partial story coverage, stale reports, or a successful deployment without
+restart/redeploy proof is not completion.
 
 ## References
 
@@ -1633,6 +1871,7 @@ Current Boon contracts:
 - `docs/architecture/RUNTIME_MODEL.md`
 - `docs/architecture/DELTA_PROTOCOL.md`
 - `docs/architecture/LANGUAGE_SEMANTICS.md`
+- `docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md`
 - `docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md`
 - `docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md`
 - `docs/plans/PERSONS_PRO_LOCAL_FIRST_IMPLEMENTATION_PLAN.md`

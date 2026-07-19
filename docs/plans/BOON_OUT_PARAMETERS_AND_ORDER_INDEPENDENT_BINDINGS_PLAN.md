@@ -65,7 +65,7 @@ FUNCTION map(list, item: OUT, new) {
 
 todos
 |> List/map(
-    item: OUT
+    item
     new: item.title
 )
 ```
@@ -110,7 +110,7 @@ The two reverse-flow mechanisms compose naturally:
 ```boon
 todos
 |> List/map(
-    todo: OUT
+    todo
     new: [
         title: todo.title
         events: [remove: SOURCE]
@@ -146,7 +146,7 @@ explained to users.
 
 ## Surface Syntax
 
-An output parameter is declared with `OUT` in a normal function signature:
+An output parameter is declared with `OUT` in a function signature:
 
 ```boon
 FUNCTION map(list, item: OUT, new) {
@@ -154,18 +154,19 @@ FUNCTION map(list, item: OUT, new) {
 }
 ```
 
-A caller creates a fresh output by passing `OUT` to the canonical parameter:
+A caller creates a fresh output by writing the canonical output name bare:
 
 ```boon
 items
 |> List/map(
-    item: OUT
+    item
     new: item.value * 2
 )
 ```
 
-The fresh local name is the declared parameter name, here `item`. Calls do not
-invent aliases for fresh outputs.
+The bare `item` is an output-binding declaration, not a positional value
+argument. Its name must exactly match the declared `item: OUT` parameter. Calls
+do not invent aliases for fresh outputs.
 
 A wrapper connects an existing output by naming it as the argument value:
 
@@ -206,7 +207,7 @@ FUNCTION map_values(dictionary, entry: OUT, new) {
 
 dictionary
 |> Dictionary/map_values(
-    entry: OUT
+    entry
     new: entry.value * 2
 )
 ```
@@ -220,14 +221,19 @@ output during compilation.
 All functions use one consistent call model:
 
 - Every call has parentheses.
-- Every written argument uses the function's declared parameter name.
-- Arguments appear in declaration order.
-- Unknown, missing, duplicated, or out-of-order arguments are errors.
+- An ordinary input is written `name: expression`.
+- A fresh output binding is written as its bare canonical name, such as
+  `item`.
+- An existing output is forwarded as `formal: existing_output`, such as
+  `item: entry`.
+- Bare call entries are never ordinary positional arguments.
+- Every call entry uses the function's declared parameter name and appears in
+  declaration order.
+- Unknown, missing, duplicated, renamed, or out-of-order entries are errors.
 - Parameter names are part of the function contract; callers cannot rename
   them.
-- An `OUT` argument may connect to an existing output with a different local
-  name because the right-hand side is an expression lookup, not a renamed
-  parameter.
+- An output may connect to an existing output with a different local name
+  because the right-hand side is a lookup, not a renamed formal parameter.
 - The pipe supplies the first ordinary parameter and only changes where that
   argument is written.
 
@@ -236,7 +242,7 @@ These are equivalent:
 ```boon
 List/map(
     list: items
-    item: OUT
+    item
     new: item.value * 2
 )
 ```
@@ -244,7 +250,7 @@ List/map(
 ```boon
 items
 |> List/map(
-    item: OUT
+    item
     new: item.value * 2
 )
 ```
@@ -252,14 +258,29 @@ items
 The pipe does not introduce a second receiver convention. It is syntax for
 moving the first declared argument to the left.
 
-A bare output argument such as this is rejected:
+A bare identifier is rejected when the corresponding formal parameter is an
+ordinary input:
 
 ```boon
-items |> List/map(item, new: item.value)
+calculate(value)
 ```
 
-Requiring `item: OUT`, `item: item`, or `item: entry` keeps output creation and
-output forwarding visibly distinct and catches one-colon mistakes.
+The author must write `calculate(value: expression)`. Conversely,
+`item: OUT` is not valid call syntax: `OUT` marks a function declaration, not a
+runtime value passed by the caller.
+
+The canonical distinction is therefore:
+
+```boon
+item          -- create the fresh output declared as item: OUT
+item: item    -- forward an existing output with the same local name
+item: entry   -- forward an existing output with a different local name
+```
+
+If a wrapper accidentally creates a fresh output instead of forwarding its own
+declared output, the wrapper output remains structurally undriven. That is a
+hard compiler error even when the wrapper output is referenced elsewhere; the
+language does not rely only on an unused-parameter warning.
 
 ## Order-Independent Lexical Binding
 
@@ -349,7 +370,7 @@ all sibling arguments.
 ```boon
 List/map(
     list: outer_item.children
-    item: OUT
+    item
     new: item.title
 )
 ```
@@ -357,7 +378,8 @@ List/map(
 Here:
 
 - `list:` is evaluated in the parent scope and can read `outer_item`;
-- `item: OUT` creates the per-row output;
+- bare `item` creates the per-row output declared by the function as
+  `item: OUT`;
 - `new:` is evaluated under that output and reads the fresh `item`.
 
 The compiler derives this relationship from the function body and stores it in
@@ -398,9 +420,10 @@ OutNet
   consumers
 ```
 
-`parameter: OUT` allocates a fresh, initially undriven compile-time net.
-It does not allocate a runtime row, list, object, source, state slot, effect, or
-queue.
+An `item: OUT` function parameter declares an output formal. A bare `item` in
+the corresponding call slot allocates its fresh, initially undriven
+compile-time net. It does not allocate a runtime row, list, object, source,
+state slot, effect, or queue.
 
 `parameter: existing_output` aliases or unifies the callee port with an
 existing net in the enclosing scope. The right-hand side lookup must not fall
@@ -455,7 +478,7 @@ valid:
 ```boon
 items
 |> List/map(
-    item: OUT
+    item
     new: Button[text: TEXT { Delete }]
 )
 ```
@@ -543,6 +566,24 @@ Parameter
 Storing function parameters as only strings is insufficient because it loses
 `OUT` before typechecking.
 
+Call syntax must also preserve whether an entry was bare or named:
+
+```text
+ParsedCallEntry
+  BareBinding { canonical_name, source_span }
+  Named { canonical_name, expression, source_span }
+
+TypedCallEntry
+  FreshOut { formal, output_net }
+  ForwardOut { formal, enclosing_output_net }
+  Input { formal, expression }
+```
+
+There is no generic unnamed-expression call entry. A parsed bare binding is
+valid only when its canonical name and position match an `OUT` formal. A named
+entry is classified as an ordinary input or output forwarding only after the
+callee signature is resolved.
+
 ### Unified Declaration Collection
 
 One declaration-collection and resolution model should serve functions,
@@ -571,7 +612,7 @@ functions. The end state has no separately hardcoded contextual-call syntax.
 
 Before backend lowering:
 
-1. Bind exact named arguments in declaration order.
+1. Bind exact named inputs and bare outputs in declaration order.
 2. Apply the pipe to the first ordinary parameter when present.
 3. Allocate fresh output nets.
 4. Resolve forwarded outputs in the enclosing lexical scope.
@@ -592,9 +633,15 @@ implementation terms such as templates or binders.
 
 Required errors include:
 
-- expected `OUT` creation or an existing output for parameter `item`;
+- expected bare output binding `item` or a forwarded existing output for
+  parameter `item: OUT`;
+- bare `value` cannot fill ordinary input `value`; write `value: expression`;
+- `item: OUT` is not call syntax; write bare `item` to create the output;
+- bare output name does not match the canonical function parameter;
 - `entry` is an ordinary value and cannot drive output parameter `item`;
 - no enclosing output named `entry` exists;
+- wrapper output `entry` has no structural producer; if forwarding was
+  intended, write `item: entry`;
 - output `entry` has two structural producers;
 - output forwarding creates an alias cycle;
 - output shape or runtime island is incompatible;
@@ -607,14 +654,38 @@ Required errors include:
 Warnings are not sufficient for invalid ownership, identity, or output
 forwarding.
 
+## Editor And Tooling Contract
+
+Bare output bindings are terse but must not be visually indistinguishable from
+ordinary references in the Boon editor.
+
+The parser and typed program expose enough ranges for the IDE to provide:
+
+- a distinct semantic style for a fresh output binding;
+- matching reference highlighting inside dependent call expressions;
+- hover text such as `OUT item, supplied by List/map`;
+- hover or connection information such as
+  `List/map.item -> Dictionary/map_values.entry` for forwarding;
+- jump-to-signature and jump-to-forwarded-output navigation;
+- an optional, user-toggleable inline `OUT` hint beside a bare binding;
+- inline zero-driver, multiple-driver, incompatible-output, and shadowing
+  diagnostics.
+
+Correctness cannot depend on colors, hover state, or the IDE being present.
+The grammar is unambiguous in plain text because ordinary positional arguments
+do not exist and bare call entries can only create canonical `OUT` bindings.
+
 ## Adjacent Language Consistency
 
 The migration should also enforce already-agreed call consistency:
 
 - all function calls require parentheses;
-- all argument labels are canonical and exact;
+- all ordinary argument labels and bare output-binding names are canonical and
+  exact;
 - argument renaming is removed from every function, not only collection
   operators;
+- ordinary positional arguments are removed; a bare call entry exclusively
+  declares a fresh `OUT` binding;
 - a pipe supplies the first ordinary parameter;
 - one-input `LATEST` is rejected because it performs no merge or selection;
 - user documentation does not expose compiler-internal contextual-template or
@@ -626,8 +697,9 @@ The migration should also enforce already-agreed call consistency:
    that encode this contract before changing accepted syntax.
 2. Replace string-only function parameters with structured `Value` and `Out`
    declarations and preserve source spans.
-3. Implement exact named and ordered call binding, pipe desugaring, required
-   parentheses, and removal of argument-renaming fallbacks.
+3. Implement exact named inputs, bare output bindings, ordered call binding,
+   pipe desugaring, required parentheses, and removal of positional and
+   argument-renaming fallbacks.
 4. Centralize declaration collection and order-independent resolution for
    functions, modules, `BLOCK`, explicit record fields, and call outputs.
 5. Separate type constraints, output aliases, value dependencies, temporal
@@ -644,18 +716,22 @@ The migration should also enforce already-agreed call consistency:
    direct and wrapped plans.
 10. Move built-in collection operators to the same typed contextual-function
     model and migrate all examples and fixtures.
-11. Verify state, effect, event, persistence, Session, and distributed
+11. Add semantic tokens, matching-reference ranges, hover/navigation data, and
+    inline diagnostics for fresh and forwarded outputs to the dev editor.
+12. Verify state, effect, event, persistence, Session, and distributed
     invariants under nested and forwarded outputs.
-12. Remove superseded contextual-operator branches, positional call fallbacks,
+13. Remove superseded contextual-operator branches, positional call fallbacks,
     compatibility syntax, and stale tests rather than retaining two models.
 
 ## Verification Matrix
 
 ### Language And Typechecking
 
-- Fresh output creation with `item: OUT`.
+- Fresh output creation with bare `item` for a declared `item: OUT` formal.
 - Same-name forwarding with `item: item`.
 - Cross-name forwarding with `item: entry`.
+- Rejection of `item: OUT` at a call site.
+- Rejection of bare entries for ordinary input parameters.
 - Rejection of an ordinary value as an output target.
 - Rejection when the forwarding target does not exist in the enclosing scope.
 - Rejection of unknown, duplicated, missing, renamed, or out-of-order
@@ -668,9 +744,13 @@ The migration should also enforce already-agreed call consistency:
 - Rejection of incompatible type, shape, role, generation, presence, or
   correlation.
 - Rejection of output alias cycles, zero drivers, and multiple drivers.
+- Rejection of the wrapper typo where bare `item` creates a new output while
+  the wrapper's declared output remains undriven.
 - Rejection of incompatible parameter scope effects.
 - Rejection of unsupported branch-local producer combinations.
 - Rejection of one-input `LATEST`.
+- Semantic-token, hover, reference-range, and diagnostic snapshots distinguish
+  fresh output binding, output forwarding, and ordinary value references.
 
 ### Plan And Runtime
 
@@ -715,9 +795,9 @@ This plan is complete only when all of the following are true from final source:
 
 1. The documented fresh and forwarded `OUT` syntax compiles, including
    cross-name forwarding.
-2. Exact argument names, declaration positions, pipe semantics, and
-   order-independent lexical resolution are enforced consistently by every
-   compiler backend.
+2. Exact ordinary argument names, bare output-binding names, declaration
+   positions, pipe semantics, and order-independent lexical resolution are
+   enforced consistently by every compiler backend.
 3. Generic user-defined wrappers can express the collection examples without
    built-in-only contextual syntax.
 4. Direct and transparently wrapped forms normalize to equivalent executable
@@ -732,6 +812,9 @@ This plan is complete only when all of the following are true from final source:
    shortcut after contextual signatures have been migrated.
 9. Relevant workspace and manifest-backed verification gates pass from fresh
    artifacts.
+10. The Boon editor visibly distinguishes fresh output bindings, traces
+    forwarded outputs, and reports structural output errors without requiring
+    runtime execution.
 
 The work must not be marked complete because syntax parses, one example works,
 or output values happen to match. Structural plan equivalence and runtime
@@ -739,8 +822,16 @@ identity/work evidence are required.
 
 ## Rejected Alternatives
 
-- **Bare fresh output names:** `List/map(item, ...)` is too easy to confuse with
-  forwarding and hides output creation.
+- **Repeating `item: OUT` at calls:** `OUT` belongs to the function signature;
+  repeating it at every call adds noise, makes it resemble a runtime value, and
+  creates two possible spellings for fresh output binding.
+- **Using `old |> entry` for forwarding:** `|>` means runtime/dataflow
+  transformation into a called function. Output forwarding statically connects
+  two ports and has no evaluation order, so overloading the pipe would be
+  misleading. Use `old: entry`.
+- **Allowing bare ordinary positional arguments:** this would make
+  `List/map(item, ...)` ambiguous. Bare call entries are reserved exclusively
+  for fresh canonical `OUT` bindings.
 - **Call-site output renaming:** changing a declared parameter name at a call
   weakens the API contract. Cross-name forwarding already provides composition
   without renaming the formal parameter.

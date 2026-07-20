@@ -456,8 +456,8 @@ keys, not by visible rows.
 result:
     cells
     |> List/find(
-        cell
-        if: cell.address == target_address
+        item
+        if: item.address == target_address
     )
 ```
 
@@ -480,86 +480,104 @@ operator and cannot be renamed by caller arguments. `.items` is a lazy keyed
 slice preserving source item identity; `.label` is the canonical chunk label
 or index.
 
-## Compiler-Owned Indexed Queries
+## Typed List Views And Access Planning
 
-`List/query` declares a bounded query over one keyed `LIST`. The declaration is
-closed metadata: index fields, normalization, multiplicity, order, selection,
-residual kind, and limit are known when the machine plan is compiled. A host or
-application cannot inject an index name or an unplanned query shape.
+Filtering, ordering, bounds, and pagination remain ordinary typed list
+composition:
 
 ```boon
+view:
+    stations
+    |> List/filter(item, if:
+        item.city == selected_city
+    )
+    |> List/filter(item, if:
+        item.name
+        |> Text/trim()
+        |> Text/to_lowercase()
+        |> Text/starts_with(prefix: normalized_prefix)
+    )
+    |> List/sort_by(
+        item
+        key: item.name |> Text/to_lowercase()
+        direction: Ascending
+    )
+    |> List/then_by(
+        item
+        key: item.id
+        direction: Descending
+    )
+
 page:
-    catalog
-    |> List/query(
-        fields: TEXT { city,name }
-        normalization: TEXT { TrimLowercase,TrimLowercase }
-        select: Prefix
-        leading: city_key
-        prefix: name_prefix
-        limit: 20
-        unique: False
-        order: Ascending
-        residual: None
-        cursor: previous_page.cursor
+    view
+    |> List/page(
+        size: requested_size
+        after: requested_position
     )
 ```
 
-The result is a closed page record:
+The canonical contextual formal is `item`. A direct call creates it with bare
+`item`; a user wrapper forwards a compatible `OUT` using `item: wrapper_item`.
+`direction` defaults to `Ascending` in both ordering functions.
+
+`sort_by` starts a stable primary order. `then_by` refines equal preceding key
+groups and is accepted only when the checked input carries a compatible order
+chain. Stable rows equal under every declared key retain semantic source-list
+order. A later `sort_by` starts a new chain. Filtering, one-to-one keyed map,
+and `take` preserve compatible order provenance; reordering, expansion,
+incompatible branches, and unknown calls clear it. This provenance is erased
+after access planning and never becomes a runtime or Boon value.
+
+Initial ordering keys are finite `NUMBER`, ordinal `TEXT`, `BOOL`, and closed
+fieldless tags. Key expressions are total, deterministic, pure, and row-local.
+Every compound component keeps its own direction. Text normalization is normal
+typed composition and participates in semantic identity; there are no string
+field paths or user-visible index/normalization declarations.
+
+`take(count:)` is a lazy bounded LIST view. It stops upstream work only when the
+access plan proves the requested prefix complete. Operator order is observable:
+`sort_by |> take` is global top-N, while `take |> sort_by` sorts the source
+prefix. An optimizer cannot commute filter/map/order/take/page without proving
+value, stable-order, currentness, and work equivalence.
+
+`page(size:, after:)` is terminal over any deterministic LIST view. Its input
+position is `Start | Cursor[value: BYTES]`; its result is:
 
 ```text
-[rows: LIST<Row>, cursor: BYTES]
+Page[items: LIST<T>, next: End | Cursor[value: BYTES]]
+| PageExpired
+| InvalidPageCursor
+| InvalidPageSize
+| PageWorkLimitExceeded
 ```
 
-An empty cursor means there is no next page. A non-empty cursor is opaque. It
-binds the collection identity, recursive row-schema hash, index identity, query
-fingerprint, collection epoch, last ordered key, and stable row identity.
-Changing authority, schema, index projection, query bounds, residual, order, or
-limit makes an old cursor fail explicitly; it never restarts silently.
+Literal size outside `1..=10000` is a compile error. A dynamic invalid size
+returns `InvalidPageSize`; a product boundary may impose a smaller maximum.
+Candidate/residual budget exhaustion returns `PageWorkLimitExceeded`. Empty
+BYTES is never a terminal sentinel.
 
-Index declaration arguments:
+A cursor is revision-bound and identifies the semantic source, row schema,
+typed pipeline, transitive pure-function semantics, evaluated row-independent
+captures, upstream bounds, directions, hidden owner/Session/tenant scope,
+authority revision, last key, and stable source-order position. It excludes
+page size and physical index identity. Changed captures or scope reject the
+cursor; unavailable authority revision returns `PageExpired`. External hosts
+confidentially authenticate/seal the bounded token and expose no hidden IDs or
+validation detail to Boon.
 
-- `fields` is a comma-separated, ordered list of closed row-field paths. One to
-  eight fields form a compound tuple key.
-- `normalization` is one entry per field, or one shared entry: `Exact`,
-  `TrimLowercase`, or `Tokens`. Non-Text fields require `Exact`.
-- `multi_value` is an optional comma-separated subset of `fields`. A list-valued
-  projection or one `Tokens` projection creates several index keys without
-  duplicating authority rows. At most one field may expand.
-- `unique` defaults to `False`. Conflicting inserts or updates fail atomically.
-- `order` is `Ascending` or `Descending`. Every order ends with hidden stable
-  row identity as its deterministic tie-break.
+The compiler recognizes exact/range/prefix/Boolean opportunities in these typed
+expressions and chooses a bounded physical access plan. It may use a direct
+lookup, ordered hot index, lazy union/intersection, incremental view, or a
+measured scan of a statically small LIST. No optimizer miss silently becomes an
+unbounded scan. Indexes contain typed keys and row identities, not reconstructed
+records, and precise field/range dependencies limit updates and wakeups.
 
-Supported key scalars are `Bool`, finite `Number`, `Text`, and closed fieldless
-tags. A compound key is supplied as a list or record in declared field order.
-Selection contracts are:
+Canonical rows persist once. Required compiler-generated indexes are derived
+runtime machinery rebuilt and validated before readiness, then kept hot and
+updated from committed authority turns. Native and Wasm use one deterministic
+key codec and access kernel. redb and IndexedDB are never queried synchronously
+from application requests, Session turns, input, layout, or rendering.
 
-- `select: Exact`, with `key`;
-- `select: Prefix`, with optional compound `leading` and Text `prefix`;
-- `select: Range`, with optional `lower`/`upper` and static
-  `lower_inclusive`/`upper_inclusive` flags;
-- `select: Union` or `Intersection`, with bounded `keys`.
-
-One optional bounded pure residual may further test only index-selected
-candidates: `FieldEqual`, `TextContains`, `NumberRange`, or `Wgs84Radius`. Its
-arguments use `residual_field`/`residual_value`, `needle`, `minimum`/`maximum`,
-or latitude/longitude field paths plus center and radius values. Residual work
-does not authorize a full collection scan.
-
-`limit` is mandatory and must be `1..=10000`. Query execution has a separate
-bounded candidate budget. A declared indexed query fails on an unknown index,
-stale cursor, invalid key, excessive expansion, excessive candidates, or
-corrupt index authority. It never falls back to `List/filter` or a full scan.
-Metrics identify the selected index and report ranges, keys visited, candidates,
-rows examined, residual evaluations, returned rows, cursor production, elapsed
-time, and full scans. The full-scan count for `List/query` must remain zero.
-
-Inserts, field updates, removals, restore, migration, and retention update or
-rebuild derived index state from the same canonical row authority. In-memory
-and redb execution use the same index projection and query engine. Interactive
-sessions query current committed in-memory authority; redb is not touched by a
-render or input frame.
-
-`List/query_prefix` remains source-compatible shorthand for a single ascending
-Text-prefix index and returns only the row list. It lowers through the same
-compiler-owned collection/index plan and canonical query engine; it is not a
-second executor implementation.
+The full implementation, removal, cursor, performance, persistence, and
+cross-target contract is
+`docs/plans/TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md`.

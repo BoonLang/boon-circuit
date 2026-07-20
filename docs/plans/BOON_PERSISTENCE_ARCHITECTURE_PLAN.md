@@ -565,6 +565,35 @@ Append then remove must not resurrect initial rows or reuse an old key after
 restart. Derived mapped fields, source bindings, lookup indexes, filters,
 chunks, and summaries are reconstructed.
 
+### Derived Typed List Access Indexes
+
+`TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md` is authoritative for typed
+filter/order/take/page access. Persistence stores canonical LIST authority and
+its revision exactly once. Compiler-generated equality, range, prefix, compound,
+and ordering indexes are runtime machinery under the classification above; they
+are not authoritative tables, another journal, or a second collection model.
+
+Restore or hot activation builds all required indexes into the unpublished
+candidate Session, validates their schema/access-plan identity and bounds, and
+publishes readiness only after they are usable. A physical-plan change rebuilds
+derived indexes without migrating canonical rows. Corrupt authority or a failed
+required-index build fails readiness. Native rebuild runs off the render/input
+thread; browser rebuild is worker-backed or cooperatively yielded and cannot
+freeze the main thread.
+
+After readiness, the same hot deterministic index kernel serves native and
+Wasm. Committed row turns update only affected index entries using typed field
+dependency masks, then enqueue the existing canonical persistence delta.
+Normal application requests, Session turns, input, layout, and rendering never
+query redb or IndexedDB. The separate persistent-query collection, index tables,
+journal, and driver are deleted; useful restart/corruption fixtures move into
+this canonical persistence path.
+
+This policy deliberately targets datasets whose declared access indexes fit the
+target memory budget, including FjordPulse's 58,500-station catalog. A future
+larger-than-memory database is a separate explicit domain/host design rather
+than hidden disk execution added to ordinary `List`.
+
 ### Large Bytes
 
 Small authoritative `BYTES` values stay inline. Values above a measured bounded

@@ -7,6 +7,7 @@ NovyWave, Cells, and FjordPulse objective from the current HEAD.
 Read AGENTS.md and these contracts before editing:
 
 - docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md
+- docs/plans/TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md
 - docs/architecture/LANGUAGE_SEMANTICS.md
 - docs/architecture/BYTES_SEMANTICS.md
 - docs/architecture/NATIVE_GPU_PIPELINE.md
@@ -20,6 +21,13 @@ Authority and conflict rules:
   order-independent lexical bindings, contextual functions, List/find,
   List/chunk, checked/elaborated programs, keyed ownership, migration, and its
   Clear End Condition.
+- The typed-list plan is authoritative for filtering, stable ordering,
+  order-chain provenance, take/page semantics, view-instance cursors, physical
+  access planning, hot native/Wasm indexes, removal of List/query and
+  List/query_prefix, deletion of the old boon_query/boon_query_redb worlds, and
+  its Clear End Condition.
+  It supersedes conflicting query, cursor, and persistent-index guidance in
+  older plans.
 - The Client/Session/Server contract below supersedes conflicting older
   Client/Server pairing, ProgramRole::Document, internal HTTP/JSON,
   SessionInfo, and transport details.
@@ -30,7 +38,8 @@ Authority and conflict rules:
   dd6e750c2ca9dec3041f66ceda31d30379d4027a, 108 stories, 340 scenarios,
   product behavior, budgets, security, persistence, Live mode, deployment, and
   Clear End Condition. Reconcile its package language with
-  Client/Session/Server; do not weaken its product requirements.
+  Client/Session/Server and its data access with the typed-list plan; do not
+  weaken its product requirements.
 - NATIVE_GPU_PIPELINE.md and its manifest are authoritative for native input,
   WGPU proof, performance evidence, and final report inventory.
 
@@ -40,9 +49,12 @@ Current checkpoint to preserve and verify rather than redo:
   infrastructure, positional CBOR framing, SessionInfo intrinsics, immutable
   bytes::Bytes values, bounded file/content effects, Wellen integration, real
   VCD/FST/GHW fixtures, and real NovyWave effect/data paths;
-- docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md is an
-  implementation-ready design, but its compiler/runtime cutover is not yet
-  implemented;
+- commit a12c9e1 contains a large partial CheckedProgram/OUT/typed-collection
+  lowering checkpoint, but the OUT plan's ErasedProgram-only backend cutover,
+  deletion audits, and clear end condition are not complete;
+- the typed-list replacement is specified but not implemented: reflective
+  query syntax, QueryCollectionState, boon_query, and boon_query_redb remain in
+  the current tree and must be replaced, not wrapped;
 - native reports predating the OUT and source migrations are stale evidence and
   must not be refreshed until the architecture and source stabilize;
 - Cells previously met its interaction budgets, but the new generic collection
@@ -77,14 +89,15 @@ Execution strategy:
 
 Phase 0: reconcile contracts and freeze executable fixtures
 
-- Update LANGUAGE_SEMANTICS, NovyWave, FjordPulse, and related active contracts
-  so they reference one OUT/PASS-last/call/list API and one
-  Client/Session/Server model. Delete conflicting active guidance rather than
-  documenting both forms.
+- Verify LANGUAGE_SEMANTICS, persistence, NovyWave, FjordPulse, and related
+  active contracts reference one OUT/PASS-last/call API, one typed-list access
+  architecture, and one Client/Session/Server model. Delete conflicting active
+  guidance rather than documenting both forms.
 - Add small unrelated contract fixtures for direct, one-wrapper, and
   multi-wrapper contextual functions; final-position PASS; typed List/find;
-  canonical List/chunk; nested keyed state; effect cancellation; stale event
-  routing; distributed ownership; and visible-window materialization.
+  canonical List/chunk; stable sort/then-by chains; terminal page variants;
+  nested keyed state; effect cancellation; stale event routing; distributed
+  ownership; and visible-window materialization.
 - Compare normalized executable sections and bounded work, not only parser AST
   or final output values.
 
@@ -138,7 +151,47 @@ Phase 1: implement the OUT compiler and runtime cutover completely
 - Run the OUT plan's deletion scans and direct/wrapper executable-equivalence,
   ownership, distribution, persistence, editor, and 2,600-row window tests.
 
-Phase 2: preserve and finish distributed/session architecture
+Phase 2: implement typed list access and delete the query world
+
+- Implement every item and every Clear End Condition in
+  TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md after ErasedProgram is the only
+  backend input. Do not bolt the replacement onto parser AST rediscovery or the
+  existing duplicate query collection.
+- Freeze canonical `item` OUT signatures for filter/find/sort_by/then_by,
+  default Ascending direction, stable equal-key source order, checked order-
+  chain propagation/erasure, exact operator-order semantics, accepted key
+  types, Bool/or, dynamic page bounds, and closed page result variants.
+- Lower typed filter/order/take/page views and evaluated capture identities from
+  CheckedProgram/ErasedProgram. Infer bounded exact/range/prefix/union/
+  intersection access without string field paths, CSV metadata, user index
+  names, or user-visible residual modes.
+- Build one seekable hot index/currentness kernel over canonical PlanExecutor
+  rows. Use typed structural keys, stable source-order tokens, direction-aware
+  native/Wasm encoding, lazy bounded branch iterators, field-dependency masks,
+  precise range subscriptions, static index deduplication, and hard memory/
+  fanout/candidate/rebuild budgets. Never build an index on first interaction.
+- Implement revision-bound terminal List/page with direct keyset seek, complete
+  evaluated-capture and hidden scope identity, explicit expiry/invalid-size/
+  invalid-cursor/work-limit variants, and host-owned confidential cursor
+  sealing. Hidden IDs and keys never enter Boon data or reports.
+- Persist canonical LIST rows/revisions once through boon_persistence. Rebuild
+  and validate required derived indexes before readiness; native work stays off
+  input/render threads and browser work is worker-backed or yielded. Normal
+  requests, Session turns, input, layout, and rendering never query redb or
+  IndexedDB.
+- Migrate all Boon source, embedded fixtures, tests, and active docs in one
+  parser-aware cut. Delete the old query call registrations, AST/source
+  rediscovery, ListQuery/PlanQuery contracts, QueryCollectionState, record
+  mirroring, boon_query and boon_query_redb crates/paths, persistent query
+  tables/journal, aliases, fallbacks, and stale tests. Retain useful algorithms
+  only under the one generic typed access architecture.
+- Prove differential semantics, native/Wasm ordering and cursor parity,
+  restart/rebuild/corruption behavior, browser responsiveness, exact 58,500-
+  and 60,000-row bounded fixtures, Cells zero-scan/currentness/frame budgets,
+  deep-page work, mutation fanout, allocations/index bytes, and all deletion
+  scans before continuing.
+
+Phase 3: preserve and finish distributed/session architecture
 
 - Audit the existing implementation after ErasedProgram migration. Keep
   correct code; do not rebuild already-proven functionality merely because the
@@ -174,7 +227,7 @@ Phase 2: preserve and finish distributed/session architecture
   reconnect/expiry, schema mismatch, current SessionInfo, stale-route rejection,
   and complete secret absence.
 
-Phase 3: preserve and finish numbers, bytes, content, and streaming
+Phase 4: preserve and finish numbers, bytes, content, and streaming
 
 - Keep one observable finite IEEE-754 binary64 NUMBER with exact bounded
   conversions and no semantic integer/f128 promotion.
@@ -196,7 +249,7 @@ Phase 3: preserve and finish numbers, bytes, content, and streaming
   removal, disconnect, corrupt input, atomic writes, Busy, and terminal cleanup
   through executor, native, server, and browser/Wasm ownership paths.
 
-Phase 4: finish NovyWave
+Phase 5: finish NovyWave
 
 - Preserve the real Wellen and streaming work already present. Remove any
   remaining bootstrap waveform data from active behavior so committed real VCD,
@@ -211,7 +264,7 @@ Phase 4: finish NovyWave
   NOVYWAVE_BOON_REWRITE_PLAN.md without fixture substitution or
   example-specific host/runtime/renderer/verifier paths.
 
-Phase 5: preserve and freshly prove Cells
+Phase 6: preserve and freshly prove Cells
 
 - Migrate Cells naturally to typed List/find and canonical List/chunk. Keep
   sparse demand-current values/errors, indexed lookup, dependency/range fanout,
@@ -228,21 +281,22 @@ Phase 5: preserve and freshly prove Cells
   virtualization, or retained-render architecture rather than accumulating
   local timing patches.
 
-Phase 6: finish FjordPulse
+Phase 7: finish FjordPulse
 
 - Convert the package and plans to Client/Session/Server islands while
   preserving the pinned source revision and exact parity inventory.
 - Complete every non-deferred phase 0 through 13 in the FjordPulse plan:
-  generic external HTTP/WS capabilities, bounded external JSON, indexed
-  collections, the 60k generic query fixture, 58,500-station queries, retained
-  MapViewport, browser WebGPU, accessibility projection, deterministic and Live
-  modes, Entur/raster providers, public/Admin workflows, security, redb
-  persistence, migrations, restart/redeploy, and Coolify deployment.
+  generic external HTTP/WS capabilities, bounded external JSON, typed indexed
+  list access, the 60k generic fixture, 58,500-station exact/prefix/token/
+  spatial/range/deep-page access, retained MapViewport, browser WebGPU,
+  accessibility projection, deterministic and Live modes, Entur/raster
+  providers, public/Admin workflows, security, canonical redb persistence,
+  migrations, restart/redeploy, and Coolify deployment.
 - Product logic and Session policy remain Boon. Rust contains only generic
   platform mechanisms. No request-time catalog scan, fixture-response
   substitution, direct browser Entur/redb access, handwritten application
-  JS/TS, HTML/CSS product renderer, or FjordPulse-specific generic-code branch
-  is allowed.
+  JS/TS, HTML/CSS product renderer, request-time persistence scan, or
+  FjordPulse-specific generic-code branch is allowed.
 - Convert all 338 not_implemented parity scenarios to fresh passing evidence.
   Only the two explicitly deferred backup/restore automation scenarios may
   remain deferred.
@@ -250,7 +304,8 @@ Phase 6: finish FjordPulse
 Final verification and absolute stop condition:
 
 - Run independent adversarial reviews for OUT/compiler genericity, executable
-  erasure and wrapper equivalence, nested ownership/event safety,
+  erasure and wrapper equivalence, typed-list semantics/access/currentness,
+  native/Wasm cursor and persistence isolation, nested ownership/event safety,
   Session isolation/security, streaming cleanup, native proof integrity,
   NovyWave real-data ownership, Cells performance, and FjordPulse parity.
 - Final scans must find no Python, semantic BYTE, SOURCE { ... }, invented
@@ -258,18 +313,26 @@ Final verification and absolute stop condition:
   fallback, positional/renamed calls, non-final PASS, ListMapBinding,
   List/find_value, reflective find, List/filter_field_equal,
   List/filter_field_not_equal, caller-renamed chunk fields, runtime OUT,
-  parser/backend contextual rediscovery, exposed hidden session identity,
-  positional owner/event fallback, example-specific shortcut, compatibility
-  runtime, temporary codemod, or stale report.
+  List/query, List/query_prefix, ListQuery/PlanQuery contracts,
+  QueryCollectionState, boon_query or boon_query_redb crates/paths, query field
+  CSV/path reflection, duplicate query authority/journal, request-time redb or
+  IndexedDB access, empty-BYTES page sentinel, parser/backend contextual
+  rediscovery, exposed hidden session identity, positional owner/event fallback,
+  example-specific shortcut, compatibility runtime, temporary codemod, or
+  stale report.
 - All OUT-plan language, plan-equivalence, keyed ownership, virtualization,
   editor, persistence, distributed, and deletion conditions must pass.
+- All typed-list-plan language, stable-order, cursor-scope, bounded-access,
+  currentness, native/Wasm, persistence-rebuild, Cells/FjordPulse performance,
+  and deletion conditions must pass.
 - All distributed/session/security and streaming lifecycle tests must pass.
 - Every NovyWave acceptance scenario and all Cells functional/performance
   budgets must pass.
 - All 108 FjordPulse stories and 340 classified scenarios must have the exact
-  permitted final status; indexed 58,500-station evidence, browser 60 FPS,
-  persistence/restart/migration, Live Entur operation, HTTPS/WSS, and production
-  deployment at https://fjordpulse-boon.kavik.cz must pass.
+  permitted final status; zero-scan bounded 58,500-station first/deep-page
+  evidence, browser 60 FPS, persistence/restart/migration, Live Entur operation,
+  HTTPS/WSS, and production deployment at https://fjordpulse-boon.kavik.cz must
+  pass.
 - From one final unchanged source revision, run every command in
   docs/architecture/native_gpu_handoff_manifest.json and then:
   cargo xtask verify-all --check-existing --report

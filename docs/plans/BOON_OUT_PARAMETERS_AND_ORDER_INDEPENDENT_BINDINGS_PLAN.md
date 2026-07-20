@@ -363,8 +363,8 @@ The canonical typed lookup is:
 result:
     cells
     |> List/find(
-        cell
-        if: cell.address == target_address
+        item
+        if: item.address == target_address
     )
 ```
 
@@ -389,7 +389,7 @@ typed row after handling `NotFound`.
 
 The typed predicate is semantic, not reflective. Equality of a current row
 field with a loop-invariant value, such as
-`cell.address == target_address`, is recognized by typed IR and may use the
+`item.address == target_address`, is recognized by typed IR and may use the
 existing field index. Cells address lookup must therefore report index hits and
 zero scans without a Cells-specific branch. Predicates that cannot use an
 index remain correct bounded/incremental predicates and report their scan work
@@ -402,6 +402,13 @@ projections, for example `List/filter(item, if: ...)` and
 `List/map(item, new: ...)`. Only genuine schema/index declarations may retain
 compile-time metadata. User data access must not be encoded as quoted field
 names merely to help a backend recognize an operation.
+
+`TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md` is authoritative for the
+stable sort/then-by order chain, take/page semantics, cursor identity, physical
+access planning, hot native/Wasm indexes, and complete removal of the older
+reflective query world. Those operators use the same canonical `item` OUT and
+wrapper forwarding rules defined here; they do not introduce another binder
+syntax.
 
 `List/filter_field_equal` and `List/filter_field_not_equal` are removed rather
 than retained as convenience aliases. Their canonical replacements are typed

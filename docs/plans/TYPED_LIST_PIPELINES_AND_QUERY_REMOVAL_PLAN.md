@@ -1,7 +1,10 @@
 # Typed List Pipelines And Query Removal Plan
 
-Status: proposed architecture and implementation plan. No implementation is
-claimed by this document.
+Status: authoritative replacement architecture and implementation plan. No
+implementation is claimed by this document. Its list-access, ordering,
+pagination, index, and query-removal contracts supersede conflicting active
+`List/query`, `List/query_prefix`, persistent-query-driver, and cursor guidance
+in older plans.
 
 ## Summary
 
@@ -12,16 +15,18 @@ typed, compositional list model.
 Replace them with ordinary typed list pipelines:
 
 - `List/filter(item, if:)` and `List/find(item, if:)` for predicates;
-- `List/sort_by(item, key:, direction:)` for the primary order;
-- `List/then_by(item, key:, direction:)` for additional lexicographic keys;
+- `List/sort_by(item, key:, direction: Ascending)` for the primary order;
+- `List/then_by(item, key:, direction: Ascending)` for additional
+  lexicographic keys;
 - `List/take(count:)` for a bounded list;
 - `List/page(size:, after:)` for revision-bound keyset pagination.
 
 The compiler derives logical access requirements from those typed expressions
 and chooses physical indexes. Index declarations, residual plans, query modes,
 field paths, normalization policy, and selected physical indexes are not Boon
-arguments. One canonical keyed LIST remains the row authority in memory and in
-persistence.
+arguments. One canonical keyed LIST remains the row authority. Persistence
+stores that authority once; compiler-generated indexes are reconstructable,
+bounded runtime machinery rather than a second durable query database.
 
 This plan is a clean replacement, not a compatibility migration. The final
 implementation must delete the old syntax, special lowering, runtime path, and
@@ -74,7 +79,6 @@ The semantic pipeline is independent of whether execution uses:
 - a direct keyed lookup;
 - an ordered in-memory index;
 - an index union or intersection;
-- a redb range;
 - an incremental filtered view;
 - a bounded scan for a statically small collection.
 
@@ -84,13 +88,18 @@ whose semantic view and revision are still available, or require source edits.
 The compiler may reject a server or persistent query when it cannot prove a
 bounded access path under the target profile. That diagnostic is an execution
 budget failure, not a request for the developer to spell a physical index in
-Boon.
+Boon. The first implementation keeps the generated access kernel in hot memory
+on native and browser targets. It does not synchronously query redb or
+IndexedDB from a request, input, layout, or render path.
 
 ## Canonical Boon API
 
 The examples in this section define the intended shape. Exact typechecker syntax
-must follow the canonical OUT and named-argument rules in
-`BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md`.
+follows the canonical OUT and named-argument rules in
+`BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md`. The contextual
+formal is named `item` in every operator below. A direct call creates that fresh
+binding with bare `item`; a wrapper forwards its own compatible `OUT` with
+`item: wrapper_item`.
 
 ### Typed Filtering
 
@@ -100,14 +109,14 @@ with ordinary predicates:
 ```boon
 oslo_stations:
     stations
-    |> List/filter(station, if:
-        station.city == selected_city
+    |> List/filter(item, if:
+        item.city == selected_city
     )
 
 matching_stations:
     oslo_stations
-    |> List/filter(station, if:
-        station.name
+    |> List/filter(item, if:
+        item.name
         |> Text/trim()
         |> Text/to_lowercase()
         |> Text/starts_with(prefix: normalized_search)
@@ -115,9 +124,10 @@ matching_stations:
 ```
 
 Repeated filters express conjunction. `Bool/and` and `Bool/or` express explicit
-Boolean composition. A range is two comparisons. Token membership is an
-ordinary typed token-list predicate. There is no `select:` mode and no user
-visible residual mode.
+Boolean composition; `Bool/or` must exist as an ordinary typed standard
+function before disjunction examples migrate. A range is two comparisons.
+Token membership is an ordinary typed token-list predicate. There is no
+`select:` mode and no user-visible residual mode.
 
 ### Typed Ordering
 
@@ -129,26 +139,45 @@ implementation rather than introduce a competing `List/order_by` name.
 ordered_stations:
     matching_stations
     |> List/sort_by(
-        station
-        key: station.city |> Text/to_lowercase()
+        item
+        key: item.city |> Text/to_lowercase()
         direction: Ascending
     )
     |> List/then_by(
-        station
-        key: station.name |> Text/to_lowercase()
+        item
+        key: item.name |> Text/to_lowercase()
         direction: Ascending
     )
 ```
 
+The canonical signatures are:
+
+```text
+List/sort_by(list, item: OUT, key, direction: Ascending) -> LIST<T>
+List/then_by(list, item: OUT, key, direction: Ascending) -> LIST<T>
+```
+
 `List/then_by` refines equal groups from the preceding order. A chain forms a
 typed lexicographic key without tuples, positional field names, or
-comma-separated metadata. Hidden stable row identity is always the final
-tie-breaker, so every ordered view is total and deterministic.
+comma-separated metadata. Both operations are stable: rows equal under every
+declared key preserve their current semantic source-list order. A second
+`List/sort_by` starts a new primary order rather than appending a key.
 
-The ordering key must be pure, deterministic, finite, and composed from closed
-typed values supported by the target profile. Ascending and descending are
-semantic directions, not separate physical indexes; an ordered index may be
-traversed in either direction.
+The checked program carries an order-chain qualifier that `sort_by` creates and
+`then_by` extends. It is compile-time information, not a Boon value or runtime
+wrapper. Direct calls and transparent user wrappers preserve it. Filtering,
+one-to-one keyed mapping, and `take` preserve a compatible chain; reordering,
+many-to-one/expanding transformations, incompatible branches, and unknown
+calls clear it. Calling `then_by` without a compatible preceding chain is a
+compile error. The qualifier is erased after access planning.
+
+The initial orderable values are finite `NUMBER`, ordinal `TEXT`, `BOOL`, and
+closed fieldless tags. Objects, LIST, BYTES, events, effects, and error-capable
+keys are rejected. Text normalization is explicit and its semantics/version
+participate in the view fingerprint. Each compound key component owns its
+direction. Reversing one physical traversal is valid only when it implements
+the complete requested direction vector; `(A ascending, B descending)` is not
+implemented by reversing an `(A ascending, B ascending)` index.
 
 ### Bounded Results
 
@@ -159,8 +188,11 @@ preview:
 ```
 
 `List/take` is a lazy bounded view preserving item type and source row identity.
-It must stop upstream work when enough matching rows are available. It must not
-materialize or sort the complete logical list merely to return the first page.
+It stops upstream work only when the chosen access plan proves that the prefix
+is complete. An unindexed sort of an allowed small LIST may still inspect the
+complete input. Operator order is semantic and may not be changed without a
+proof: `sort |> take` is a global top-N, while `take |> sort` sorts only the
+source prefix.
 
 ### Pagination
 
@@ -179,22 +211,34 @@ station_page:
 Start | Cursor[value: BYTES]
 ```
 
-The result preserves the row type:
+`List/page` is a terminal operation over a deterministic list view, not another
+lazy LIST node. Plain LIST sequence order is deterministic, so sorting is not
+required; an ordered chain pages in its declared order. The result preserves
+the row type:
 
 ```text
 Page[items: LIST<T>, next: End | Cursor[value: BYTES]]
 | PageExpired
-| InvalidPageCursor[code: TEXT]
+| InvalidPageCursor
+| InvalidPageSize
+| PageWorkLimitExceeded
 ```
 
 An empty byte string is not an end-of-page sentinel. Callers match `End` or
 `Cursor`. Cursor bytes are opaque application data: they may be stored and sent
 back, but modifying them can only produce `InvalidPageCursor`.
 
-`size` is bounded by the target profile and must be statically provable to be
-within that bound. The initial native/server maximum remains 10,000, but product
-code should use much smaller values. No page evaluation may inspect more than
-the candidate budget.
+`InvalidPageCursor` deliberately exposes no parser, authentication, tenant, or
+schema detail to application code. The dev inspector and bounded diagnostics
+may report the internal reason without turning it into a public oracle.
+
+`size` is a finite whole `NUMBER`. Invalid literal sizes are compile errors;
+dynamic values outside `1..=10000` return `InvalidPageSize`. Products may impose
+smaller typed boundary limits, such as FjordPulse's external `1..=50`. No page
+evaluation may exceed the target candidate/residual budget; exhaustion returns
+`PageWorkLimitExceeded` rather than scanning farther or returning a misleading
+partial page. `take |> page` pages only that bounded view, and the evaluated
+take count participates in cursor identity.
 
 ## Pagination Alternatives Considered
 
@@ -302,11 +346,18 @@ Every cursor binds:
 - cursor format version;
 - semantic source-list memory identity;
 - recursive row-schema identity;
-- canonical semantic pipeline fingerprint;
+- canonical typed pipeline identity and every transitively called pure function
+  semantic version;
+- canonical evaluated row-independent captures, including selected values,
+  normalized prefixes, range bounds, token sets, dynamic direction, upstream
+  `take` count, and normalization inputs;
 - source authority revision;
 - last ordered key components;
-- hidden stable row identity;
-- order directions.
+- the source-order position token and hidden stable row identity needed to
+  resume duplicate-key groups without changing their visible stable order;
+- order directions;
+- hidden owner/Session generation, authorization scope, and tenant scope when
+  the view is scoped.
 
 It does not bind:
 
@@ -321,13 +372,27 @@ not source formatting, field-name strings, or physical-plan IDs. The same
 cursor remains meaningful after a physical index change when the semantic view,
 schema, and bound revision remain available.
 
-The next page performs a direct ordered seek after `(last_key, row_identity)`.
-It must not regenerate the complete candidate set and discard earlier rows.
+Together these values form a versioned `ViewInstanceFingerprint`. Evaluated
+captures are encoded canonically, so a cursor for Oslo cannot page Bergen and a
+cursor from one Session/tenant cannot cross into another. Page size is excluded
+so a caller may request a different valid size; every semantic upstream bound
+is included. Hidden ownership participates in the host-side fingerprint but is
+never exposed as Boon data.
 
-For untrusted external transport, the host seals or authenticates the cursor.
-A plain checksum detects corruption but does not prevent a client from editing
-and recomputing the checksum. Authentication keys never enter Boon state,
-reports, persistence, or cursor-visible fields.
+The next page performs a direct ordered seek after
+`(last_key, source_order_token, row_identity)`. It must not regenerate the
+complete candidate set and discard earlier rows.
+
+For untrusted external transport, the host uses a versioned confidentiality-
+preserving authenticated seal; authentication without encryption is
+insufficient because hidden row and scope identity must not be disclosed. The
+host maps opaque cursor BYTES to bounded base64url only at an external HTTP
+boundary. Internal positional CBOR keeps it as bytes. Host keys, hidden IDs,
+and decoded cursor contents never enter Boon state, reports, persistence, URLs,
+or cursor-visible fields. The host defines bounded token size, key rotation,
+restart behavior, and accepted key versions. A browser-local host may use an
+ephemeral key when durable secure key storage is unavailable, but then reports
+that cursors expire across reload instead of silently accepting them.
 
 UI virtualization does not use `List/page`. Layout requests visible logical
 ranges with bounded overscan from a retained lazy list. Pagination is for an
@@ -353,6 +418,12 @@ Map(projection)
 Each row use carries static owner, local, `ListId`, and `FieldId` identities.
 No backend may rediscover row fields from source text, debug labels, object
 geometry, or string paths.
+
+The typed graph also carries the order-chain qualifier described above and a
+closed operation-order boundary. Optimizers may not commute `filter`, `map`,
+`sort_by`, `then_by`, `take`, or terminal `page` unless equivalence, stable
+order, currentness, and work bounds are proven. Branches must agree on item
+type and compatible order provenance or the order qualifier is cleared.
 
 ### Predicate Analysis
 
@@ -383,14 +454,17 @@ spatial indexes belong to separately typed libraries/backends.
 
 ### Logical And Physical Identity
 
-Maintain two distinct hashes:
+Maintain three distinct identities:
 
-- semantic view identity, used by currentness and cursors;
+- semantic pipeline identity for typed operator/function semantics;
+- view-instance fingerprint adding evaluated captures, authority revision, and
+  hidden owner/authorization scope, used by currentness and cursors;
 - physical access-plan identity, used by generated index storage and rebuilds.
 
-A new physical index or scan direction changes only the physical identity.
-Changing predicates, key functions, ordering, source memory, or schema changes
-the semantic identity and invalidates old cursors explicitly.
+A new physical index or equivalent traversal changes only physical identity.
+Changing predicates, key functions, ordering, source memory, schema, evaluated
+captures, revision, or hidden scope changes the relevant semantic/view-instance
+identity and invalidates old cursors explicitly.
 
 ### Boundedness
 
@@ -401,6 +475,14 @@ silently become an unbounded server scan.
 
 Diagnostics explain the semantic predicate that lacked a bounded access path.
 They do not tell the user to provide string field names or an index ID.
+
+Index inventory is static and bounded. The compiler deduplicates equivalent key
+projections, reuses compatible compound prefixes, and chooses an index only
+when its measured target cost fits profile limits. Recognizing an indexable
+predicate does not authorize creating an index for every `List/filter`.
+Compilation rejects plans exceeding limits for indexes per list, key parts,
+encoded key bytes, expanded keys per row, estimated index bytes, or per-turn
+affected-index fanout.
 
 ## Runtime Index Kernel
 
@@ -420,49 +502,82 @@ multiplicity policy
 physical schema/version identity
 ```
 
-The index maps ordered structural keys to stable `RowId`s. Row values remain in
-the canonical list storage. Index entries never duplicate complete records.
+The index maps ordered structural keys to source-order tokens and stable
+`RowId`s. Row values remain in the canonical list storage. Index entries never
+duplicate complete records. Stable equal-key order requires an order-maintenance
+token whose update cost is bounded and measured; rebuilding every shifted
+position after an insertion is not an accepted large-list implementation.
 
 Required operations are:
 
 - exact seek;
 - lower/upper range seek;
 - text-prefix range seek over an explicitly normalized Text key;
-- forward and reverse traversal;
-- bounded union and intersection of row identities;
+- direction-vector-aware traversal with one canonical order-preserving key
+  codec shared across native and Wasm;
+- lazy bounded k-way union and bounded intersection driven by the narrowest
+  compatible access range, without materializing complete candidate sets;
 - direct seek after a page cursor key;
 - incremental insert, remove, and old-key/new-key update;
-- deterministic hidden-row tie-breaking;
+- deterministic source-order continuation and row-identity disambiguation;
 - index rebuild and integrity validation.
 
+Index key expressions are row-only pure expressions over constants and total
+pure functions. Effects, host time, error-capable calls, and mutable global
+captures are rejected as physical index keys. Demand-current row fields cross
+an explicit currentness barrier during build/update and may not cause eager
+evaluation of unrelated expensive fields such as Cells values/errors.
+
 The runtime registers precise dynamic dependencies for the list structure,
-queried key range, and row fields evaluated by the residual predicate. A change
-outside the demanded range must not force a full result rebuild.
+queried key interval, and row fields evaluated by the residual predicate. A
+compiled field-dependency mask updates only indexes and views whose key or
+predicate inputs changed. A change outside the demanded interval must not wake
+or rebuild the complete result. No index may be created on the first user
+interaction.
+
+Execution uses seekable access iterators. Exact/range/prefix paging targets
+`O(log E + V)` work and `O(page size + active branch count)` transient memory,
+where `E` is index entries and `V` is visited candidates. Union/intersection,
+residual work, and dynamic invalidation have hard candidate, memory, fanout,
+and per-turn budgets with explicit failure rather than fallback scans.
 
 Metrics report logical rows, index seeks, key ranges, candidates, residual
 evaluations, returned rows, cursor seeks, index updates, rebuilds, bytes, and
 full scans. They must distinguish semantic list size from materialized and
-examined rows.
+examined rows. Reports also include allocation bytes, index bytes, expanded
+keys, affected-index fanout, dependency wake count, startup rebuild work/time,
+and work-limit failures.
 
 ## Persistence Architecture
 
-Canonical LIST rows are stored once. Generated indexes are derived storage and
-may be rebuilt from canonical rows after schema or physical-plan changes.
+Canonical LIST rows and authority revisions are stored once through the existing
+`boon_persistence` redb/IndexedDB tables and transactions. Generated indexes are
+derived runtime machinery and are not another durable authority, journal, or
+transaction system.
 
-Refactor useful `boon_query_redb` behavior into the canonical persistence path:
+At cold start or activation, the host restores canonical rows, builds every
+required generated index into a candidate runtime image, validates it, and only
+then publishes readiness. Native rebuild work runs off the render/input thread.
+Browser rebuild work is worker-backed or bounded and cooperatively yielded; it
+must not freeze the browser main thread. Corrupt authority fails closed.
+Failure to build a required bounded access path fails readiness rather than
+publishing an unindexed application.
 
-- atomic row and index updates;
-- authority revision tracking;
-- physical index plan validation;
-- index rebuild policy;
-- corruption detection;
-- bounded direct index-range reads;
-- restart and migration tests.
+Normal list access then uses the same hot in-memory kernel on native and Wasm.
+Neither redb nor IndexedDB is queried from an application request, Session turn,
+input frame, layout pass, or render hook. Authority mutations update canonical
+runtime rows and affected indexes in one prepared/committed turn, then enqueue
+the existing bounded persistence delta. Restore/rebuild equivalence proves that
+the derived image can always be reconstructed from canonical authority.
 
-The persistent server path must not load every row into a duplicate in-memory
-query collection merely to execute a page. Hot in-memory indexes are valid for
-interactive sessions, but cold/persistent execution must be able to seek redb
-index entries directly.
+Delete `boon_query_redb`, its index tables, journal, cloned collection state,
+and direct persistent query path. Delete the old public `boon_query` crate/name
+as well; useful index algorithms move into one generically named list-access
+kernel such as `boon_list_access` or the canonical executor ownership layer.
+Useful corruption and restart fixtures move to `boon_persistence`.
+A future dataset that cannot fit its required indexes in the declared memory
+budget needs an explicitly designed Database/domain capability. It does not
+justify turning ordinary `List` into a hidden cross-target disk database.
 
 `unique` is not a read argument. Application-level uniqueness can be expressed
 as an indexed typed existence check and append within one authoritative Server
@@ -487,23 +602,51 @@ normal Boolean expression. A compiler/backend may recognize a supported spatial
 function and select a spatial index, but correctness never depends on that
 optimization.
 
+"Optional" describes specialized acceleration, not FjordPulse behavior.
+FjordPulse must still express and pass exact station ID, normalized/multi-token
+prefix, bounded one-edit correction, spatial-cell plus exact WGS84 residual,
+time ranges, union/intersection, compound order, atomic uniqueness, and dynamic
+`1..=50` paging through these typed operators. Its first implementation may use
+typed precomputed spatial/text keys and bounded residuals instead of a dedicated
+R-tree or full-text engine, but may not scan the 58,500-row catalog.
+
+## Cross-Target Contract
+
+The logical view, key codec, stable ordering, cursor payload, and reference
+results are byte-for-byte deterministic across native and
+`wasm32-unknown-unknown`. Persisted/cursor fields use fixed-width integers and
+never `usize`.
+
+The deterministic access kernel owns no filesystem, thread, wall-clock, or
+`std::time::Instant` dependency. Hosts supply timing/instrumentation around it;
+the browser implementation must not call APIs that panic on Wasm. IndexedDB
+stores canonical authority only and is accessed asynchronously through the
+existing Rust host. Denied or evicted browser storage produces explicit
+durability status while the current in-memory application may continue; it
+never changes query semantics or silently moves disk work onto the UI thread.
+
 ## Clean Implementation Sequence
 
 ### 1. Freeze Replacement Semantics
 
 - Add canonical signatures and flow types for typed `List/sort_by`,
   `List/then_by`, `List/take`, and `List/page`.
-- Specify stable ordering, key types, page variants, cursor validation, and
-  expiry in `LANGUAGE_SEMANTICS.md`.
+- Specify stable ordering, order-chain propagation, operator-order semantics,
+  key types, dynamic page bounds, closed page variants, evaluated-capture
+  fingerprints, cursor sealing, and expiry in `LANGUAGE_SEMANTICS.md`.
 - Add compile-time negative tests for wrong OUT use, impure keys, unsupported
-  directions, unbounded page sizes, and invalid cursor variants.
+  directions, invalid `then_by` chains, invalid literal page sizes, unsupported
+  keys, and invalid cursor variants.
 
 ### 2. Build Typed Logical List Plans
 
 - Lower filter/order/take/page pipelines from ErasedProgram only.
 - Preserve generic row type through every operator and through `Page.items`.
-- Add semantic pipeline hashing independent of source formatting and physical
-  indexes.
+- Add semantic view-instance hashing over typed expressions, transitive pure
+  function semantics, evaluated captures, hidden owner scope, and authority
+  revision, independent of source formatting and physical indexes.
+- Preserve or clear checked order-chain provenance according to the explicit
+  operator rules, then erase it after access planning.
 - Extend the existing typed equality lookup inference instead of creating a
   second query extractor.
 
@@ -512,25 +655,35 @@ optimization.
 - Generalize the existing typed equality index into ordered typed keys.
 - Add exact, range, prefix, forward/reverse, union/intersection, and cursor
   seek operations.
+- Use one canonical direction-aware key codec and seekable lazy access iterator
+  on native and Wasm.
+- Add bounded source-order maintenance, field-dependency masks, index inventory
+  deduplication, compatible prefix reuse, and per-list memory/fanout limits.
 - Remove whole-record query mirroring and string-key reconstruction.
 - Keep one source-list authority and one row identity.
 
 ### 4. Implement Lazy Bounded Operators
 
-- Make filter/order chains lazy keyed views.
-- Make `take` stop upstream work after enough accepted rows.
+- Make filter/order chains lazy keyed views with stable equal-key order.
+- Make `take` stop upstream work after enough accepted rows only when the
+  access plan proves prefix completeness.
 - Make `page` seek after the cursor and read at most `size + 1` accepted rows.
 - Return `PageExpired` after a bound revision is unavailable.
-- Return `InvalidPageCursor` for malformed, foreign, wrong-schema, or
-  wrong-semantic-view cursors.
+- Return the closed page size, work-limit, expiry, and cursor variants without
+  arbitrary Text error codes.
+- Seal untrusted cursors in the host and prove scope/capture isolation.
 
-### 5. Integrate Persistence
+### 5. Integrate Restore And Persistence
 
-- Store canonical rows once in redb.
-- Maintain or rebuild derived typed indexes transactionally.
-- Execute bounded redb index ranges directly.
+- Store canonical rows and authority revision once through
+  `boon_persistence`; store no duplicate query authority or journal.
+- Rebuild and validate required hot indexes before readiness on native and Wasm.
+- Update affected hot indexes in the same runtime authority turn and persist
+  only canonical bounded deltas through the existing worker.
+- Delete the old `boon_query`/`boon_query_redb` crates and prove no redb/
+  IndexedDB access occurs on request, Session, input, layout, or render paths.
 - Verify restart, physical-plan replacement, authority revision, corruption,
-  and current-only cursor expiry.
+  browser storage failure, and current-only cursor expiry.
 
 ### 6. Migrate Boon Source And Tests
 
@@ -540,6 +693,7 @@ optimization.
   fixtures with ordinary typed pipelines.
 - Replace query-time uniqueness tests with atomic typed existence-check plus
   append tests.
+- Add `Bool/or` as an ordinary typed function before migrating disjunctions.
 - Update wrappers to prove that generic Boon functions can compose these
   operators without compiler-only source spellings.
 - Update language, runtime, persistence, FjordPulse, and unified-goal docs.
@@ -555,6 +709,10 @@ Delete, rather than rename or quarantine:
 - public `ListQuery*`, `PlanQuery*`, and query-projection contracts that exist
   only for the removed syntax;
 - executor `QueryCollectionState` and whole-record synchronization;
+- the old `boon_query` crate/public API after useful typed index algorithms move
+  into the one canonical list-access kernel;
+- the `boon_query_redb` crate, tables, journal, direct range execution, and
+  duplicate persistence authority;
 - compatibility shorthand and fallback branches;
 - obsolete examples, fixtures, reports, and tests.
 
@@ -573,6 +731,10 @@ tree has one path.
 
 - `filter`, `sort_by`, `then_by`, `take`, and `page` preserve exact row type.
 - wrappers around each operator preserve OUT binding and type identity.
+- direct calls use canonical `item`; wrappers may forward a typed OUT with
+  `item: wrapper_item` but cannot rename ordinary arguments.
+- `then_by` accepts only a compatible checked order chain; preservation,
+  invalidation, wrapper, and branch cases are covered.
 - renaming a row field updates typed references without query metadata edits.
 - string field paths and comma-separated field declarations are rejected.
 - page items preserve `T`; no open-object fallback is accepted.
@@ -589,6 +751,9 @@ reference implementation of:
 - conjunction and disjunction;
 - token membership union and intersection;
 - ascending, descending, and multi-key order;
+- stable equal-key source order and every mixed direction vector;
+- `sort |> take`, `take |> sort`, `filter |> take`, and `take |> page` without
+  illegal operator reordering;
 - take and every page boundary.
 
 The reference evaluator is test-only and must not become a runtime fallback.
@@ -598,6 +763,8 @@ The reference evaluator is test-only and must not become a runtime fallback.
 - recognized equality, range, and prefix predicates use typed indexes;
 - no field-name reflection occurs in runtime execution;
 - one row update changes only affected index entries and dependent views;
+- unrelated field updates touch zero indexes whose dependency masks exclude the
+  field;
 - unrelated row changes do not rebuild the complete result;
 - indexed and reference results remain exactly equal after inserts, updates,
   removes, restore, and migration;
@@ -606,34 +773,53 @@ The reference evaluator is test-only and must not become a runtime fallback.
 ### Pagination Tests
 
 - first and subsequent pages have deterministic, nonoverlapping rows;
-- every order includes the hidden row-identity tie-breaker;
+- equal declared keys retain source order and resume through a hidden
+  source-order position without changing visible order;
 - second-page work begins at the cursor seek and does not revisit earlier keys;
 - `End` and `Cursor` are explicit variants;
+- invalid literal size fails compilation; invalid dynamic size and work-budget
+  exhaustion return their closed variants;
 - same semantic view and current revision accept a cursor;
+- changed evaluated capture, Session/tenant scope, authorization scope, take
+  count, or transitive function semantics rejects a cursor;
 - mutation with current-only retention returns `PageExpired`;
 - another list, schema, predicate, order, or direction returns
   `InvalidPageCursor`;
 - a physical index replacement alone does not alter semantic cursor identity;
 - malformed and tampered external cursors fail authentication/validation;
+- external tokens disclose no hidden row, owner, Session, tenant, or schema
+  identity; key rotation/reload behavior is explicit;
 - page work and memory stay within configured budgets.
 
-### Persistence Tests
+### Persistence And Cross-Target Tests
 
-- row and index updates commit atomically;
-- restart preserves canonical rows, authority revision, and compatible indexes;
+- canonical row updates commit atomically and derived index updates observe the
+  same runtime authority turn;
+- restart preserves canonical rows and authority revision, then rebuilds an
+  equivalent hot index image before readiness;
 - incompatible physical indexes rebuild without changing semantic rows;
-- corrupt authority fails closed;
-- redb page execution performs bounded index reads without loading all rows;
-- no process handle, iterator pointer, credential, or authentication key enters
-  Boon-visible state or reports.
+- corrupt authority or failed required-index build fails readiness closed;
+- native redb and browser IndexedDB are untouched by normal query/request/input
+  execution after readiness;
+- native and Wasm produce identical order, cursor payload identity, page
+  results, expiry, and work counters for golden fixtures;
+- browser rebuild is worker-backed or yielded and does not block the main
+  thread; denied/evicted persistence reports durability failure honestly;
+- no process handle, iterator pointer, credential, authentication/sealing key,
+  or hidden owner identity enters Boon-visible state or reports.
 
 ### Product And Performance Tests
 
 - FjordPulse executes search over the required 58,500-station fixture through
   typed filter/order/take/page source;
-- prefix and compound lookup report zero full scans;
-- page latency and candidate work remain bounded under mutation and restart;
+- exact, prefix, compound, range, union/intersection, spatial-cell residual,
+  and deep-page paths report zero full scans;
+- first/deep page latency, candidate visits, allocations, index bytes, startup
+  rebuild, mutation fanout, and dependency wakes remain within declared native
+  and browser budgets;
 - Cells typed address lookup remains zero-scan and unaffected by this change;
+- Cells startup does not eagerly evaluate value/error or construct an index on
+  first click, and its exact click/scroll frame gates remain passing;
 - normal UI visible-range materialization remains separate from pagination;
 - no compiler/runtime/document/renderer/verifier branch uses an example name.
 
@@ -651,6 +837,8 @@ Required audit concepts include:
 - residual field-path strings;
 - compatibility prefix-query lowering;
 - duplicate query collection authority;
+- `boon_query`/`boon_query_redb`, their public query contracts, persistent
+  index tables/journal, and request-time persistent access;
 - user-visible physical index names or IDs;
 - empty-BYTES end-of-page sentinels.
 
@@ -669,13 +857,18 @@ This plan is complete only when all of the following are true:
 3. One canonical LIST authority owns rows; all indexes reference typed keys and
    stable row identities without reconstructed string-keyed records.
 4. Pagination follows the revision-bound keyset contract, returns explicit
-   terminal/error variants, and seeks directly after the cursor.
-5. In-memory and redb execution pass equivalence, mutation, restart, corruption,
-   bounded-work, and cursor tests.
+   terminal/error variants, binds every evaluated capture and hidden scope,
+   preserves stable order, and seeks directly after the cursor.
+5. One deterministic hot index kernel serves native and Wasm. Canonical
+   redb/IndexedDB authority rebuilds it before readiness; neither persistence
+   backend is queried on normal access paths, and both old query crates/names
+   are deleted after useful algorithms move to the one list-access kernel.
 6. FjordPulse's full station fixture and Cells address lookup pass their typed
-   zero-scan gates without example-specific code.
+   zero-scan, bounded-work, memory, startup, and frame gates without
+   example-specific code.
 7. The relevant compiler, plan, executor, persistence, example, and aggregate
-   verification suites pass from final source with fresh artifacts.
+   native/Wasm/browser verification suites pass from final source with fresh
+   artifacts.
 8. Independent reviews find no reflective query metadata, duplicate authority,
    hidden runtime fallback, compatibility alias, or stale report used as proof.
 

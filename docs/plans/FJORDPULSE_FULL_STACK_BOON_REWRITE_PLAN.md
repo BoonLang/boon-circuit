@@ -5,7 +5,7 @@ Date: 2026-07-16
 Status: implementation plan. No implementation or production-readiness claim is
 made by this document.
 
-## Reconciliation Checkpoint (2026-07-19)
+## Reconciliation Checkpoint (2026-07-20)
 
 This reconciliation changes active language/compiler and distributed-package
 contracts; it does not claim FjordPulse implementation progress. The current
@@ -14,6 +14,12 @@ backup/restore automation scenarios explicitly deferred. The pinned product
 revision, 108-story/340-scenario inventory, product behavior, budgets, security,
 persistence, Live mode, deployment target, and clear end condition remain the
 acceptance baseline.
+
+`TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md` supersedes this plan's older
+reflective query API, persistent query driver, and cursor internals. FjordPulse
+keeps every catalog/search/page behavior and bound below, but expresses them
+through typed `List/filter`, `List/sort_by`, `List/then_by`, `List/take`, and
+`List/page` pipelines over one canonical collection authority.
 
 Reference FjordPulse revision:
 
@@ -615,61 +621,62 @@ timeout, backpressure, cookies, origin rejection, and clean/forced restart.
 The P0 three-island fixture separately proves reconnect and typed internal
 transport without HTTP/JSON fallback.
 
-### P4: Generic Indexed Queries Over Persistent Collections
+### P4: Typed List Access Over Persistent Collection Authority
 
 FjordPulse's national station catalog and observation history must not be
 implemented with request-time `List/filter` scans. Extend the generic semantic
 memory plan rather than adding raw redb calls to Boon.
 
-Required plan concepts:
+Required compiler/runtime concepts:
 
 ```text
-CollectionPlan
+CanonicalListAuthority
   stable collection identity
   stable row identity and recursive row schema
   authoritative fields
   retention/migration metadata
 
-IndexPlan
-  stable index identity
-  ordered key projection
-  unique or multi-value policy
-  ascending/descending order
-  collation/normalization contract
+LogicalListView
+  typed filter predicates
+  stable sort/then-by chain
+  typed take/page bounds
+  evaluated capture and scope identity
 
-QueryPlan
+AccessPlan
   exact, prefix, lower/upper range
-  ordered union/intersection
-  limit and deterministic tie-break
-  opaque continuation cursor
-  optional bounded pure residual
+  lazy bounded union/intersection
+  ordered seek and stable source-order continuation
+  typed residual expression
 ```
 
-The language-facing API is the compiler-owned `List/query` contract documented
-in `LANGUAGE_SEMANTICS.md`, alongside canonical typed `List/find`. It remains a
-generic standard-library query over keyed collections; these semantic
-constraints are fixed:
+The language-facing API is the ordinary typed list pipeline documented in
+`LANGUAGE_SEMANTICS.md` and the typed-list replacement plan. Physical indexes
+are inferred from the checked/erased expressions and never appear as Boon
+arguments. These constraints are fixed:
 
 - key projections are closed, pure, typed, deterministic, and compiler-known;
-- supported keys include Text, Number, tagged values, and compound tuples;
-- multi-value projections support token/prefix indexes without duplicating
-  application rows;
-- every result has a deterministic total order ending in stable row identity;
-- limits are mandatory on externally triggered queries;
-- cursors bind index identity, query fingerprint, schema, epoch/version, and
-  last ordered key; stale/incompatible cursors fail explicitly;
-- a bounded residual predicate may examine only index-selected candidates;
-- query metrics report selected index, ranges, keys visited, rows examined,
-  residual count, returned count, and elapsed time;
-- a declared indexed request path may not silently fall back to a full scan;
-- inserts, updates, removals, migrations, and retention cleanup update index
-  entries atomically with row authority;
-- redb index entries are derived acceleration state with schema hashes. They
-  may be rebuilt from canonical authority, but are never allowed to disagree
-  silently;
+- supported keys are finite Number, ordinal Text, Bool, closed fieldless tags,
+  and compiler-formed compound order chains;
+- normalized whole-field/token keys are ordinary authoritative or pure derived
+  row fields, not string normalization declarations;
+- stable ordering preserves semantic source order for equal declared keys;
+- externally triggered pages use a dynamic product bound of `1..=50` and
+  return explicit invalid-size/work-limit/expiry/cursor variants;
+- cursors bind the typed pipeline, evaluated search/range/order captures,
+  schema, authority revision, hidden Session/tenant scope, and stable position;
+  stale/incompatible/scoped cursors fail explicitly;
+- a typed bounded residual predicate examines only index-selected candidates;
+- access metrics report ranges, keys visited, candidates, rows examined,
+  residual count, returned count, allocation/index bytes, mutation fanout,
+  rebuild work, and full scans;
+- a required indexed request path may not silently fall back to a full scan;
+- inserts, updates, removals, migrations, and retention cleanup update affected
+  hot index entries in the same authoritative runtime turn;
 - restore validates or rebuilds indexes before readiness; it does not publish
   an unindexed server;
-- in-memory and redb drivers execute the same golden query plans and ordering;
+- canonical rows/revisions persist once in redb while derived indexes remain hot
+  runtime machinery; there is no second persistent query driver or journal;
+- native and Wasm execute the same deterministic access kernel and ordering;
 - current Session queries see current committed authority, including a bounded
   not-yet-checkpointed tail, without waiting for request-time disk I/O;
 - persistence remains off the interactive browser/render path.
@@ -681,12 +688,14 @@ not in the executor or a FjordPulse host branch.
 
 Exit gate: a generic 60,000-row catalog fixture proves exact, prefix,
 multi-value, compound, spatial-cell-plus-residual, time-range, union,
-intersection, pagination, mutation, migration, restart, and no-scan evidence.
+intersection, first/deep pagination, mutation fanout, migration, restart,
+native/Wasm parity, bounded memory, and no-scan evidence.
 
 ### P5: redb Server Persistence
 
-Use the existing Boon persistence architecture and the generic query extension
-for the Server artifact.
+Use the existing Boon persistence architecture and canonical typed-list access
+kernel for the Server artifact. redb stores rows/revisions once and never serves
+normal request-time index reads.
 
 Required production behavior:
 
@@ -1053,12 +1062,12 @@ The Server's semantic collections replace the pinned SurrealDB tables:
 
 Nested snapshot and timetable data remain bounded document-shaped values so an
 authoritative Session or external HTTP resync is atomic. Stable links are Text
-IDs resolved by indexed queries; redb internal keys never cross a Boon island
+IDs resolved by typed indexed list access; redb internal keys never cross a Boon island
 or external HTTP boundary.
 
-### Required Indexes And Bounds
+### Required Typed Access Paths And Bounds
 
-| Query | Required generic index plan | Bound/evidence |
+| Access | Required compiler-owned access path | Bound/evidence |
 | --- | --- | --- |
 | station by ID | unique Text exact | one row |
 | map stations/clusters | spatial cell plus longitude/latitude ranges and exact bounds residual | complete matched total; at most 2,000 response items; direct markers only at zoom 9+ and at most 300 rows |
@@ -1410,13 +1419,18 @@ workaround is permitted in later phases.
 
 Gate: P3 passes with unrelated programs and no package-specific routing.
 
-### Phase 4: Complete Generic Indexed Query And redb Collection Support
+### Phase 4: Complete Typed List Access And Canonical Collection Persistence
 
-- Add compiler-known Collection/Index/Query plans and pure key projections.
-- Extend Session currentness/deltas and redb transactions atomically.
-- Add deterministic cursors, planner metrics, retention, rebuild, migration,
-  and no-scan rejection.
-- Prove the 60,000-row generic fixture and restart behavior.
+- Complete every condition in
+  `TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md`: checked typed views,
+  order-chain provenance, one hot access kernel, pure key projections, bounded
+  iterators, sealed scoped cursors, and deletion of the reflective query world.
+- Extend Session currentness/deltas and hot index updates atomically while redb
+  persists canonical rows/revisions once through `boon_persistence`.
+- Add access metrics, retention, pre-readiness rebuild, migration, native/Wasm
+  parity, browser responsiveness, and no-scan rejection.
+- Prove the 60,000-row generic fixture, deep paging, restart behavior, and the
+  absence of request-time redb/IndexedDB access.
 
 Gate: P4 and P5 generic data gates pass before importing a FjordPulse catalog.
 
@@ -1455,7 +1469,7 @@ Server restart, and the separate public HTTP/WSS contracts pass loopback tests.
 - Implement complete bounded viewport query and deterministic clustering.
 - Add camera URL, basemap, overlay, selected-station, place-label, search,
   keyboard, empty/error, and locale behavior.
-- Run the 58,500-row map/search regression and prove query plans.
+- Run the 58,500-row map/search regression and prove typed access plans.
 
 Gate: FP-001 through FP-014 and the corresponding contract/visual/performance
 scenarios pass in Deterministic mode.
@@ -1621,7 +1635,7 @@ document, renderer, native/browser/server hosts, and verifiers for:
 
 - `fjordpulse`, package IDs, source paths, station/vehicle IDs, route names, and
   example labels in production control flow;
-- app-specific HTTP routes, JSON fields, query plans, map layers, geometry,
+- app-specific HTTP routes, JSON fields, access plans, map layers, geometry,
   pixels, or verifier expectations;
 - duplicate Number, JSON, runtime, renderer, or persistence paths;
 - positional or renamed ordinary calls, non-final/duplicated `PASS`, runtime
@@ -1631,7 +1645,8 @@ document, renderer, native/browser/server hosts, and verifiers for:
   HTTP/JSON/RPC/subscription source contracts, or exposed hidden Session
   identity;
 - request-time full scans for declared indexed operations;
-- direct redb calls outside generic persistence/query drivers;
+- any direct redb calls outside canonical `boon_persistence`, any request-time
+  redb/IndexedDB access, or any duplicate persistent query driver/journal;
 - direct Entur/MapTiler code outside Boon app modules and named host capability
   configuration;
 - PHP, CakePHP, AMPHP, SolidJS, MapLibre, SurrealDB, Python, LocalStorage, or
@@ -1830,16 +1845,16 @@ one final source revision:
 - generic independent gates pass for exact calls, OUT/wrapper erasure,
   final-position PASS, order-independent bindings, typed List/find, canonical
   List/chunk, Client/Session/Server isolation, real Number, external JSON and
-  HTTP/WSS, indexed queries, redb collections, retained raster MapViewport, and
-  browser WebGPU;
+  HTTP/WSS, typed indexed list access, canonical redb collection persistence,
+  retained raster MapViewport, and browser WebGPU;
 - every non-deferred semantic, HTTP, WS, visual, responsive, accessibility,
   resilience, security, persistence, migration, and performance gate passes
   from fresh source-bound artifacts;
 - deterministic mode is fully reproducible and performs no public network
   access; Live mode is explicit, uses real Entur/raster services, and never
   falls back to fixture data;
-- the 58,500-station query fixture proves complete bounded map results and
-  indexed search without request-time catalog scans;
+- the 58,500-station fixture proves complete bounded map results, deep paging,
+  and indexed search without request-time catalog or persistence scans;
 - process/container restart and a normal Coolify redeploy preserve all
   acknowledged redb sentinel state, restore before readiness, and resume
   watches without duplicate effects;
@@ -1872,6 +1887,7 @@ Current Boon contracts:
 - `docs/architecture/DELTA_PROTOCOL.md`
 - `docs/architecture/LANGUAGE_SEMANTICS.md`
 - `docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md`
+- `docs/plans/TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md`
 - `docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md`
 - `docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md`
 - `docs/plans/PERSONS_PRO_LOCAL_FIRST_IMPLEMENTATION_PLAN.md`

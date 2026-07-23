@@ -4,11 +4,11 @@
 //! provenance for diagnostics and later structural-owner interning, but it is
 //! not a runtime value and is not serializable.
 
-use super::{StaticOwnerDef, StaticOwnerId};
+use super::{ExecutableParameterId, FunctionId, StaticOwnerDef, StaticOwnerId};
 use boon_typecheck::{
     CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedCallableSignature,
-    CheckedEvaluationScope, CheckedExprId, CheckedProgram, CheckedScopeKind, DeclId,
-    LexicalScopeId,
+    CheckedEvaluationScope, CheckedExprId, CheckedProgram, CheckedScopeKind, CheckedStatementId,
+    CheckedTypeSubstitution, DeclId, FlowType, LexicalScopeId, apply_checked_type_substitutions,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -35,6 +35,29 @@ macro_rules! typed_out_id {
 }
 
 typed_out_id!(OutCallInstanceId, OutPortId, OutNetId);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProducerRootParameter {
+    pub(crate) checked_expression: CheckedExprId,
+    pub(crate) parameter: ExecutableParameterId,
+    pub(crate) name: String,
+    pub(crate) flow_type: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProducerRoot {
+    pub(crate) identity: [u8; 32],
+    pub(crate) mode: crate::ProducerFunctionMode,
+    pub(crate) call: CheckedCallId,
+    pub(crate) function: FunctionId,
+    pub(crate) function_name: String,
+    pub(crate) result_statement: CheckedStatementId,
+    pub(crate) result_declaration: DeclId,
+    pub(crate) result_path: String,
+    pub(crate) result_type: FlowType,
+    pub(crate) invocation_source_expression: Option<CheckedExprId>,
+    pub(crate) parameters: Vec<ProducerRootParameter>,
+}
 
 /// Stable checked-program coordinates for one static call site.
 ///
@@ -67,8 +90,19 @@ pub(crate) struct OutCallInstance {
     pub(crate) parent_output: Option<DeclId>,
     parent_output_node: Option<usize>,
     pub(crate) inputs: Vec<OutInputBinding>,
-    pub(crate) passed: Option<ScopedCheckedExpr>,
+    pub(crate) passed: Option<PassedBinding>,
     pub(crate) ports: Vec<OutPortId>,
+    pub(crate) type_substitutions: Vec<CheckedTypeSubstitution>,
+    pub(crate) result: FlowType,
+    /// Present only when this concrete user call directly allocates runtime
+    /// resources. Pure forwarding wrappers deliberately have no owner.
+    pub(crate) owner: Option<StaticOwnerId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PassedBinding {
+    pub(crate) value: ScopedCheckedExpr,
+    pub(crate) evaluation_call: OutCallInstanceId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +171,14 @@ pub(crate) struct OutNet<Contract = ()> {
     pub(crate) ports: Vec<OutPort<Contract>>,
     pub(crate) nets: Vec<UnifiedOutNet>,
     pub(crate) static_owners: Vec<StaticOwnerDef>,
+    call_instance_by_checked_frame:
+        BTreeMap<(CheckedCallId, Option<OutCallInstanceId>), Option<OutCallInstanceId>>,
+    output_net_by_frame_target: BTreeMap<(Option<OutCallInstanceId>, DeclId), Option<OutNetId>>,
+    concrete_producers_by_checked: BTreeMap<CheckedCallId, Vec<ConcreteOutProducer>>,
+    producer_roots: Vec<ProducerRoot>,
+    producer_root_by_identity: BTreeMap<[u8; 32], OutCallInstanceId>,
+    producer_root_calls: BTreeSet<OutCallInstanceId>,
+    producer_parameter_by_expression: BTreeMap<CheckedExprId, ExecutableParameterId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,13 +195,10 @@ impl<Contract> OutNet<Contract> {
         call_id: CheckedCallId,
         frame: Option<OutCallInstanceId>,
     ) -> Option<OutCallInstanceId> {
-        let mut matches = self
-            .call_instances
-            .iter()
-            .filter(|call| call.provenance.call_id == call_id && call.parent == frame)
-            .map(|call| call.id);
-        let first = matches.next()?;
-        matches.next().is_none().then_some(first)
+        self.call_instance_by_checked_frame
+            .get(&(call_id, frame))
+            .copied()
+            .flatten()
     }
 
     pub(crate) fn net_for_port(&self, port: OutPortId) -> OutNetId {
@@ -168,6 +207,40 @@ impl<Contract> OutNet<Contract> {
 
     pub(crate) fn owner_for_net(&self, net: OutNetId) -> Option<StaticOwnerId> {
         self.nets[net.as_usize()].owner
+    }
+
+    pub(crate) fn owner_for_call(&self, call: OutCallInstanceId) -> Option<StaticOwnerId> {
+        self.call_instances[call.as_usize()].owner
+    }
+
+    pub(crate) fn owner_for_call_evaluation(
+        &self,
+        mut call: OutCallInstanceId,
+    ) -> Option<StaticOwnerId> {
+        // Producer roots are synthetic distributed call-site boundaries. Their
+        // parameter imports belong to the instance slab rather than to a
+        // lexical caller outside that slab.
+        if self.producer_root_calls.contains(&call) {
+            return self.owner_for_call(call);
+        }
+        let mut remaining = self.call_instances.len().saturating_add(1);
+        loop {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            let instance = self.call_instances.get(call.as_usize())?;
+            if let Some(output) = instance.parent_output {
+                return self
+                    .output_net_in_frame(instance.parent, output)
+                    .and_then(|net| self.owner_for_net(net));
+            }
+            let parent = instance.parent?;
+            if let Some(owner) = self.owner_for_call(parent) {
+                return Some(owner);
+            }
+            call = parent;
+        }
     }
 
     pub(crate) fn owner_scope_for_net(&self, net: OutNetId) -> Option<LexicalScopeId> {
@@ -182,29 +255,10 @@ impl<Contract> OutNet<Contract> {
         &self,
         call_id: CheckedCallId,
     ) -> Vec<ConcreteOutProducer> {
-        let mut producers = self
-            .call_instances
-            .iter()
-            .filter(|call| call.provenance.call_id == call_id)
-            .flat_map(|call| {
-                call.ports.iter().filter_map(move |port_id| {
-                    let port = &self.ports[port_id.as_usize()];
-                    let net = &self.nets[port.net.as_usize()];
-                    let is_producer = net
-                        .producers
-                        .iter()
-                        .any(|producer| producer.port == *port_id);
-                    is_producer.then_some(ConcreteOutProducer {
-                        call: call.id,
-                        port: *port_id,
-                        net: net.id,
-                        owner: net.owner?,
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        producers.sort_by_key(|producer| (producer.owner, producer.call, producer.port));
-        producers
+        self.concrete_producers_by_checked
+            .get(&call_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn output_net_in_frame(
@@ -212,27 +266,39 @@ impl<Contract> OutNet<Contract> {
         frame: Option<OutCallInstanceId>,
         target: DeclId,
     ) -> Option<OutNetId> {
-        if let Some(frame) = frame {
-            let call = &self.call_instances[frame.as_usize()];
-            if let Some(net) = call.ports.iter().find_map(|port_id| {
-                let port = &self.ports[port_id.as_usize()];
-                (port.formal == target).then_some(port.net)
-            }) {
-                return Some(net);
-            }
-        }
-        self.call_instances
+        self.output_net_by_frame_target
+            .get(&(frame, target))
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn producer_roots(&self) -> &[ProducerRoot] {
+        &self.producer_roots
+    }
+
+    pub(crate) fn producer_root_for_identity(
+        &self,
+        identity: [u8; 32],
+    ) -> Option<OutCallInstanceId> {
+        self.producer_root_by_identity.get(&identity).copied()
+    }
+
+    pub(crate) fn producer_parameter_for_expression(
+        &self,
+        expression: CheckedExprId,
+    ) -> Option<ExecutableParameterId> {
+        self.producer_parameter_by_expression
+            .get(&expression)
+            .copied()
+    }
+
+    pub(crate) fn producer_root_for_statement(
+        &self,
+        statement: CheckedStatementId,
+    ) -> Option<&ProducerRoot> {
+        self.producer_roots
             .iter()
-            .filter(|call| call.parent == frame)
-            .flat_map(|call| call.ports.iter())
-            .find_map(|port_id| {
-                let port = &self.ports[port_id.as_usize()];
-                matches!(
-                    port.binding,
-                    OutPortBinding::Fresh { output, .. } if output == target
-                )
-                .then_some(port.net)
-            })
+            .find(|root| root.result_statement == statement)
     }
 }
 
@@ -373,10 +439,30 @@ fn display_decl_ids(declarations: &[DeclId]) -> String {
         .join(", ")
 }
 
+fn insert_unique_index<K: Ord, V: Copy + Eq>(index: &mut BTreeMap<K, Option<V>>, key: K, value: V) {
+    index
+        .entry(key)
+        .and_modify(|existing| {
+            if existing.is_some_and(|existing| existing != value) {
+                *existing = None;
+            }
+        })
+        .or_insert(Some(value));
+}
+
 impl OutNet<()> {
+    #[cfg(test)]
     pub(crate) fn build(program: &CheckedProgram) -> OutNetBuild {
+        Self::build_with_producer_roots(program, Vec::new())
+    }
+
+    pub(crate) fn build_with_producer_roots(
+        program: &CheckedProgram,
+        producer_roots: Vec<ProducerRoot>,
+    ) -> OutNetBuild {
         Self::build_with(
             program,
+            producer_roots,
             |_, _, _| (),
             |kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
         )
@@ -389,6 +475,7 @@ impl<Contract> OutNet<Contract> {
     /// current `CheckedProgram` adapter.
     pub(crate) fn build_with<MakeContract, IsProducer>(
         program: &CheckedProgram,
+        producer_roots: Vec<ProducerRoot>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> OutNetBuild<Contract>
@@ -397,7 +484,13 @@ impl<Contract> OutNet<Contract> {
         IsProducer:
             FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
     {
-        OutNetBuilder::new(program, make_contract, is_structural_producer).build()
+        OutNetBuilder::new(
+            program,
+            producer_roots,
+            make_contract,
+            is_structural_producer,
+        )
+        .build()
     }
 }
 
@@ -432,10 +525,19 @@ struct PendingUnifiedNet {
     owner_anchors: Vec<OutPortId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum StaticOwnerNode {
+    Net(OutNetId),
+    Call(OutCallInstanceId),
+}
+
 struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     program: &'program CheckedProgram,
     signature_by_id: BTreeMap<DeclId, &'program CheckedCallableSignature>,
     calls_by_owner: BTreeMap<Option<DeclId>, Vec<usize>>,
+    resource_owning_callables: BTreeSet<DeclId>,
+    producer_roots: Vec<ProducerRoot>,
+    producer_identity_by_call: BTreeMap<CheckedCallId, [u8; 32]>,
     make_contract: MakeContract,
     is_structural_producer: IsProducer,
     call_instances: Vec<OutCallInstance>,
@@ -454,6 +556,7 @@ where
 {
     fn new(
         program: &'program CheckedProgram,
+        producer_roots: Vec<ProducerRoot>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> Self {
@@ -476,10 +579,18 @@ where
             });
         }
 
+        let resource_owning_callables = resource_owning_callables(program, &signature_by_id);
+        let producer_identity_by_call = producer_roots
+            .iter()
+            .map(|root| (root.call, root.identity))
+            .collect();
         Self {
             program,
             signature_by_id,
             calls_by_owner,
+            resource_owning_callables,
+            producer_roots,
+            producer_identity_by_call,
             make_contract,
             is_structural_producer,
             call_instances: Vec::new(),
@@ -519,6 +630,50 @@ where
             let instance = OutCallInstanceId(self.call_instances.len());
             let inherited_parent_output_node =
                 parent.and_then(|parent| self.call_instances[parent.as_usize()].parent_output_node);
+            let passed = checked_call
+                .pass
+                .map(|expression| PassedBinding {
+                    value: ScopedCheckedExpr {
+                        expression,
+                        frame: parent,
+                        evaluation_port: None,
+                        value_frame: None,
+                    },
+                    evaluation_call: instance,
+                })
+                .or_else(|| {
+                    parent.and_then(|parent| self.call_instances[parent.as_usize()].passed)
+                });
+            let inherited_substitutions = parent
+                .map(|parent| {
+                    self.call_instances[parent.as_usize()]
+                        .type_substitutions
+                        .clone()
+                })
+                .unwrap_or_default();
+            let mut substitutions = inherited_substitutions
+                .iter()
+                .map(|substitution| (substitution.variable, substitution.value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for substitution in &checked_call.type_substitutions {
+                substitutions.insert(
+                    substitution.variable,
+                    apply_checked_type_substitutions(&substitution.value, &inherited_substitutions),
+                );
+            }
+            let type_substitutions = substitutions
+                .into_iter()
+                .map(|(variable, value)| CheckedTypeSubstitution { variable, value })
+                .collect::<Vec<_>>();
+            let result_scheme = self
+                .signature_by_id
+                .get(&checked_call.callable)
+                .map(|signature| &signature.result)
+                .unwrap_or(&checked_call.result);
+            let result = FlowType {
+                mode: result_scheme.mode,
+                ty: apply_checked_type_substitutions(&result_scheme.ty, &type_substitutions),
+            };
             self.call_instances.push(OutCallInstance {
                 id: instance,
                 parent,
@@ -526,13 +681,11 @@ where
                 parent_output: self.nearest_repeated_output(checked_call.expression),
                 parent_output_node: inherited_parent_output_node,
                 inputs: Vec::new(),
-                passed: checked_call.pass.map(|expression| ScopedCheckedExpr {
-                    expression,
-                    frame: parent,
-                    evaluation_port: None,
-                    value_frame: None,
-                }),
+                passed,
                 ports: Vec::new(),
+                type_substitutions,
+                result,
+                owner: None,
             });
 
             let kind = self
@@ -819,84 +972,206 @@ where
             }
         }
 
-        let mut children = BTreeMap::<Option<OutNetId>, Vec<OutNetId>>::new();
-        for (index, parent) in parent_by_net.iter().copied().enumerate() {
-            if owner_anchor_by_net[index].is_some() {
-                children.entry(parent).or_default().push(OutNetId(index));
+        let resource_calls = self
+            .call_instances
+            .iter()
+            .filter(|call| {
+                self.resource_owning_callables
+                    .contains(&call.provenance.callable)
+                    || self
+                        .producer_identity_by_call
+                        .contains_key(&call.provenance.call_id)
+            })
+            .map(|call| call.id)
+            .collect::<BTreeSet<_>>();
+        let nearest_resource_call = |mut call: Option<OutCallInstanceId>| {
+            while let Some(candidate) = call {
+                if resource_calls.contains(&candidate) {
+                    return Some(candidate);
+                }
+                call = self.call_instances[candidate.as_usize()].parent;
             }
+            None
+        };
+
+        let parent_output_net_by_call = self
+            .call_instances
+            .iter()
+            .map(|instance| {
+                instance.parent_output_node.map(|node| {
+                    let root = self.union_find.find(node);
+                    net_by_root[&root]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let owner_parent = |parent_output: Option<OutNetId>,
+                            resource_parent: Option<OutCallInstanceId>| {
+            match (parent_output, resource_parent) {
+                (Some(output), Some(resource))
+                    if parent_output_net_by_call[resource.as_usize()] == Some(output) =>
+                {
+                    Some(StaticOwnerNode::Call(resource))
+                }
+                (Some(output), _) => Some(StaticOwnerNode::Net(output)),
+                (None, Some(resource)) => Some(StaticOwnerNode::Call(resource)),
+                (None, None) => None,
+            }
+        };
+
+        let mut children = BTreeMap::<Option<StaticOwnerNode>, Vec<StaticOwnerNode>>::new();
+        for call in resource_calls.iter().copied() {
+            let instance = &self.call_instances[call.as_usize()];
+            let parent = owner_parent(
+                parent_output_net_by_call[call.as_usize()],
+                nearest_resource_call(instance.parent),
+            );
+            children
+                .entry(parent)
+                .or_default()
+                .push(StaticOwnerNode::Call(call));
+        }
+        for (index, parent_net) in parent_by_net.iter().copied().enumerate() {
+            let Some(anchor) = owner_anchor_by_net[index] else {
+                continue;
+            };
+            let anchor_call = self.ports[anchor.as_usize()].call;
+            let parent = owner_parent(parent_net, nearest_resource_call(Some(anchor_call)));
+            children
+                .entry(parent)
+                .or_default()
+                .push(StaticOwnerNode::Net(OutNetId(index)));
         }
         for siblings in children.values_mut() {
-            siblings.sort_by_key(|net| {
-                let anchor = owner_anchor_by_net[net.as_usize()]
-                    .expect("owner forest contains only anchored nets");
-                let port = &self.ports[anchor.as_usize()];
-                let call = port.call;
-                let expression = self.call_instances[call.as_usize()].provenance.expression;
-                let expression_span = self
-                    .program
-                    .expressions
-                    .iter()
-                    .find(|candidate| candidate.id == expression)
-                    .map(|expression| expression.span)
-                    .unwrap_or_default();
-                let output_scope_span = match port.binding {
-                    OutPortBinding::Fresh { scope_id, .. } => self
-                        .program
-                        .scopes
-                        .iter()
-                        .find(|scope| scope.id == scope_id)
-                        .map(|scope| scope.span),
-                    OutPortBinding::Forward { .. } => None,
-                }
-                .unwrap_or(expression_span);
+            siblings.sort_by_key(|node| {
+                let producer_identity = match *node {
+                    StaticOwnerNode::Call(call) => self
+                        .producer_identity_by_call
+                        .get(&self.call_instances[call.as_usize()].provenance.call_id)
+                        .copied(),
+                    StaticOwnerNode::Net(_) => None,
+                };
+                let (scope_span, expression_span, expression, kind, ordinal) = match *node {
+                    StaticOwnerNode::Net(net) => {
+                        let anchor = owner_anchor_by_net[net.as_usize()]
+                            .expect("owner forest contains only anchored nets");
+                        let port = &self.ports[anchor.as_usize()];
+                        let call = port.call;
+                        let expression = self.call_instances[call.as_usize()].provenance.expression;
+                        let expression_span = self
+                            .program
+                            .expressions
+                            .iter()
+                            .find(|candidate| candidate.id == expression)
+                            .map(|expression| expression.span)
+                            .unwrap_or_default();
+                        let scope_span = match port.binding {
+                            OutPortBinding::Fresh { scope_id, .. } => self
+                                .program
+                                .scopes
+                                .iter()
+                                .find(|scope| scope.id == scope_id)
+                                .map(|scope| scope.span),
+                            OutPortBinding::Forward { .. } => None,
+                        }
+                        .unwrap_or(expression_span);
+                        (
+                            scope_span,
+                            expression_span,
+                            expression,
+                            1_u8,
+                            net.as_usize(),
+                        )
+                    }
+                    StaticOwnerNode::Call(call) => {
+                        let expression = self.call_instances[call.as_usize()].provenance.expression;
+                        let span = self
+                            .program
+                            .expressions
+                            .iter()
+                            .find(|candidate| candidate.id == expression)
+                            .map(|expression| expression.span)
+                            .unwrap_or_default();
+                        (span, span, expression, 0_u8, call.as_usize())
+                    }
+                };
                 (
-                    output_scope_span.start,
-                    output_scope_span.end,
+                    producer_identity.is_some(),
+                    producer_identity.unwrap_or([0; 32]),
+                    scope_span.start,
+                    scope_span.end,
                     expression_span.start,
                     expression_span.end,
                     expression,
-                    *net,
+                    kind,
+                    ordinal,
                 )
             });
         }
 
         fn assign_owner_tree(
-            parent_net: Option<OutNetId>,
+            parent_node: Option<StaticOwnerNode>,
             parent_owner: Option<StaticOwnerId>,
-            children: &BTreeMap<Option<OutNetId>, Vec<OutNetId>>,
+            children: &BTreeMap<Option<StaticOwnerNode>, Vec<StaticOwnerNode>>,
             owner_by_net: &mut [Option<StaticOwnerId>],
+            owner_by_call: &mut [Option<StaticOwnerId>],
             owners: &mut Vec<StaticOwnerDef>,
         ) {
-            for (child_ordinal, net) in children
-                .get(&parent_net)
+            for (child_ordinal, node) in children
+                .get(&parent_node)
                 .into_iter()
                 .flatten()
                 .copied()
                 .enumerate()
             {
-                if owner_by_net[net.as_usize()].is_some() {
+                let existing = match node {
+                    StaticOwnerNode::Net(net) => owner_by_net[net.as_usize()],
+                    StaticOwnerNode::Call(call) => owner_by_call[call.as_usize()],
+                };
+                if existing.is_some() {
                     continue;
                 }
                 let owner = StaticOwnerId(owners.len());
-                owner_by_net[net.as_usize()] = Some(owner);
+                match node {
+                    StaticOwnerNode::Net(net) => owner_by_net[net.as_usize()] = Some(owner),
+                    StaticOwnerNode::Call(call) => owner_by_call[call.as_usize()] = Some(owner),
+                }
                 owners.push(StaticOwnerDef {
                     id: owner,
                     parent: parent_owner,
                     child_ordinal: child_ordinal as u32,
                 });
-                assign_owner_tree(Some(net), Some(owner), children, owner_by_net, owners);
+                assign_owner_tree(
+                    Some(node),
+                    Some(owner),
+                    children,
+                    owner_by_net,
+                    owner_by_call,
+                    owners,
+                );
             }
         }
 
         let mut owner_by_net = vec![None; pending_nets.len()];
+        let mut owner_by_call = vec![None; self.call_instances.len()];
         let mut static_owners = Vec::new();
-        assign_owner_tree(None, None, &children, &mut owner_by_net, &mut static_owners);
+        assign_owner_tree(
+            None,
+            None,
+            &children,
+            &mut owner_by_net,
+            &mut owner_by_call,
+            &mut static_owners,
+        );
         for (index, anchor) in owner_anchor_by_net.iter().enumerate() {
             if anchor.is_some() && owner_by_net[index].is_none() {
                 self.diagnostics.push(OutNetDiagnostic::OwnerCycle {
                     net: OutNetId(index),
                 });
             }
+        }
+        for call in resource_calls {
+            self.call_instances[call.as_usize()].owner = owner_by_call[call.as_usize()];
         }
 
         let nets = pending_nets
@@ -916,7 +1191,7 @@ where
                 owner: owner_by_net[index],
                 owner_anchor: owner_anchor_by_net[index],
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         let ports = self
             .ports
@@ -934,14 +1209,90 @@ where
                     net: net_by_root[&root],
                 }
             })
+            .collect::<Vec<_>>();
+
+        let call_instances = self.call_instances;
+        let mut call_instance_by_checked_frame = BTreeMap::new();
+        let mut output_net_by_frame_target = BTreeMap::new();
+        let mut concrete_producers_by_checked =
+            BTreeMap::<CheckedCallId, Vec<ConcreteOutProducer>>::new();
+        for call in &call_instances {
+            insert_unique_index(
+                &mut call_instance_by_checked_frame,
+                (call.provenance.call_id, call.parent),
+                call.id,
+            );
+            for port_id in &call.ports {
+                let port = &ports[port_id.as_usize()];
+                insert_unique_index(
+                    &mut output_net_by_frame_target,
+                    (Some(call.id), port.formal),
+                    port.net,
+                );
+                if let OutPortBinding::Fresh { output, .. } = port.binding {
+                    insert_unique_index(
+                        &mut output_net_by_frame_target,
+                        (call.parent, output),
+                        port.net,
+                    );
+                }
+                let net = &nets[port.net.as_usize()];
+                if net
+                    .producers
+                    .iter()
+                    .any(|producer| producer.port == *port_id)
+                    && let Some(owner) = net.owner
+                {
+                    concrete_producers_by_checked
+                        .entry(call.provenance.call_id)
+                        .or_default()
+                        .push(ConcreteOutProducer {
+                            call: call.id,
+                            port: *port_id,
+                            net: net.id,
+                            owner,
+                        });
+                }
+            }
+        }
+        for producers in concrete_producers_by_checked.values_mut() {
+            producers.sort_by_key(|producer| (producer.owner, producer.call, producer.port));
+        }
+
+        let producer_root_by_identity = self
+            .producer_roots
+            .iter()
+            .filter_map(|root| {
+                call_instances
+                    .iter()
+                    .find(|call| call.provenance.call_id == root.call && call.parent.is_none())
+                    .map(|call| (root.identity, call.id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let producer_root_calls = producer_root_by_identity.values().copied().collect();
+        let producer_parameter_by_expression = self
+            .producer_roots
+            .iter()
+            .flat_map(|root| {
+                root.parameters
+                    .iter()
+                    .map(|parameter| (parameter.checked_expression, parameter.parameter))
+            })
             .collect();
 
         OutNetBuild {
             graph: OutNet {
-                call_instances: self.call_instances,
+                call_instances,
                 ports,
                 nets,
                 static_owners,
+                call_instance_by_checked_frame,
+                output_net_by_frame_target,
+                concrete_producers_by_checked,
+                producer_roots: self.producer_roots,
+                producer_root_by_identity,
+                producer_root_calls,
+                producer_parameter_by_expression,
             },
             diagnostics: self.diagnostics,
         }
@@ -984,6 +1335,71 @@ impl UnionFind {
             self.ranks[left_root] += 1;
         }
     }
+}
+
+fn resource_owning_callables(
+    program: &CheckedProgram,
+    signatures: &BTreeMap<DeclId, &CheckedCallableSignature>,
+) -> BTreeSet<DeclId> {
+    fn function_owner_for_scope(
+        program: &CheckedProgram,
+        mut scope: LexicalScopeId,
+    ) -> Option<DeclId> {
+        loop {
+            let checked = program
+                .scopes
+                .iter()
+                .find(|candidate| candidate.id == scope)?;
+            if checked.kind == CheckedScopeKind::Function {
+                return checked.owner;
+            }
+            scope = checked.parent?;
+        }
+    }
+
+    let calls = program
+        .calls
+        .iter()
+        .map(|call| (call.id, call))
+        .collect::<BTreeMap<_, _>>();
+    let mut owners = BTreeSet::new();
+
+    for expression in &program.expressions {
+        let Some(owner) = function_owner_for_scope(program, expression.scope_id) else {
+            continue;
+        };
+        let directly_allocates = match expression.kind {
+            boon_typecheck::CheckedExpressionKind::Source
+            | boon_typecheck::CheckedExpressionKind::Hold { .. }
+            | boon_typecheck::CheckedExpressionKind::Latest { .. } => true,
+            boon_typecheck::CheckedExpressionKind::Call { call } => calls
+                .get(&call)
+                .and_then(|call| signatures.get(&call.callable))
+                .is_some_and(|callable| {
+                    callable.kind != CheckedCallableKind::User
+                        && (callable.effect.writes_state
+                            || callable.effect.emits_source
+                            || callable.effect.invokes_host)
+                }),
+            _ => false,
+        };
+        if directly_allocates {
+            owners.insert(owner);
+        }
+    }
+
+    for statement in &program.statements {
+        if !matches!(
+            statement.kind,
+            boon_typecheck::CheckedStatementKind::List { .. }
+        ) {
+            continue;
+        }
+        if let Some(owner) = function_owner_for_scope(program, statement.scope_id) {
+            owners.insert(owner);
+        }
+    }
+    owners
 }
 
 fn alias_cycle_diagnostics(program: &CheckedProgram) -> Vec<OutNetDiagnostic> {
@@ -1134,6 +1550,7 @@ mod tests {
                 start: 0,
                 end: 0,
             }],
+            contexts: Vec::new(),
             result: unknown_flow_type(),
             role: ProgramRole::Client,
             effect: CheckedEffectSummary::default(),
@@ -1162,7 +1579,9 @@ mod tests {
                 output,
                 scope_id: LexicalScopeId(output.0),
             }],
+            contexts: Vec::new(),
             pass: None,
+            type_substitutions: Vec::new(),
             result: unknown_flow_type(),
             role: ProgramRole::Client,
             span: CheckedSpan::default(),
@@ -1188,7 +1607,9 @@ mod tests {
                 target,
                 target_name: "item".to_owned(),
             }],
+            contexts: Vec::new(),
             pass: None,
+            type_substitutions: Vec::new(),
             result: unknown_flow_type(),
             role: ProgramRole::Client,
             span: CheckedSpan::default(),
@@ -1484,6 +1905,7 @@ mod tests {
                     end: 0,
                 },
             ],
+            contexts: Vec::new(),
             result: unknown_flow_type(),
             role: ProgramRole::Client,
             effect: CheckedEffectSummary::default(),
@@ -1525,7 +1947,9 @@ mod tests {
                 owner_callable: None,
                 function: "two_outputs".to_owned(),
                 entries,
+                contexts: Vec::new(),
                 pass: None,
+                type_substitutions: Vec::new(),
                 result: unknown_flow_type(),
                 role: ProgramRole::Client,
                 span: CheckedSpan::default(),

@@ -12,17 +12,18 @@ use boon_persistence::{
 };
 use boon_plan::{
     ApplicationIdentity, ApplicationPlan, EffectReplay, FiniteReal, MachinePlan, MemoryKind,
-    ProgramRole,
+    ProgramRole, SourceRouteToken,
 };
 pub(crate) use boon_runtime::ProgramCompletionObservation;
 use boon_runtime::{
     DistributedProgramBundle, DocumentPatch, DocumentPatchStatus, HostEffectRouter,
-    HostEffectWorker, LiveRuntime, ObservedProgramCompletion, PersistentRuntime,
-    PersistentRuntimeStartup, PersistentRuntimeStartupDisposition, ProgramArtifact,
+    HostEffectWorker, LiveRuntime, ObservedProgramCompletion, PersistentActivationError,
+    PersistentPlanBuildRequest, PersistentRuntime, PersistentRuntimeStartup,
+    PersistentRuntimeStartupDisposition, PreparedPersistentPlanActivation, ProgramArtifact,
     ProgramArtifactDrive, ProgramArtifactLaneKind, ProgramArtifactLaneOutcome,
     ProgramArtifactTurnKind, ProgramDiagnostic, ProgramDocumentHost, ProgramHostDiagnostic,
-    ProgramHostRequest, ProgramRejection, ProgramRequestId, ProgramSessionId, RowId,
-    RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload, Value,
+    ProgramHostRequest, ProgramRejection, ProgramRequestId, ProgramSessionId, RuntimePhaseTimings,
+    RuntimeTurn, SessionOptions, SourcePayload, Value,
 };
 use boon_server_runtime::{
     InProcessDistributedRuntime, InProcessPoll, InProcessTransientEffectOwner,
@@ -32,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{
@@ -53,6 +55,21 @@ pub(crate) const STATE_ROOT_ENV: &str = "BOON_PLAYGROUND_STATE_ROOT";
 const EFFECT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_TRANSIENT_COMPLETIONS_PER_POLL: usize = 8;
 const HOST_LIFECYCLE_STARTED_SOURCE: &str = "host.lifecycle.started";
+static NEXT_RUNTIME_VIEW_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeOwnerStamp {
+    owner_id: u64,
+    generation: u64,
+}
+
+fn next_runtime_view_owner_id() -> ViewResult<u64> {
+    NEXT_RUNTIME_VIEW_OWNER_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| "runtime view owner identity exhausted".to_owned())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostIdentityMode {
@@ -121,6 +138,7 @@ struct InputModifiers {
 
 pub struct RuntimeView {
     runtime: RuntimeBackend,
+    owner_id: u64,
     machine_plan: Arc<MachinePlan>,
     program_host: ProgramDocumentHost,
     application: ApplicationIdentity,
@@ -273,6 +291,20 @@ pub struct RuntimePlanChange {
     pub durable_epoch: u64,
     pub through_turn_sequence: u64,
     pub migration: Option<MigrationPreview>,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimePlanPublishError {
+    AuthorityStale(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for RuntimePlanPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuthorityStale(message) | Self::Failed(message) => formatter.write_str(message),
+        }
+    }
 }
 
 impl RuntimeView {
@@ -452,6 +484,7 @@ impl RuntimeView {
         };
         let mut view = Self {
             runtime: RuntimeBackend::Distributed(runtime),
+            owner_id: next_runtime_view_owner_id()?,
             machine_plan: machine_plan.clone(),
             program_host,
             application,
@@ -649,6 +682,7 @@ impl RuntimeView {
             (runtime.has_effect_work() || transient_host.has_work()).then_some(Instant::now());
         let mut view = Self {
             runtime: RuntimeBackend::Single(runtime),
+            owner_id: next_runtime_view_owner_id()?,
             machine_plan,
             program_host,
             application,
@@ -730,19 +764,59 @@ impl RuntimeView {
         &mut self,
         plan: Arc<MachinePlan>,
     ) -> ViewResult<RuntimePlanChange> {
+        let prepared = self
+            .prepare_machine_plan_build(plan)?
+            .build()
+            .map_err(|error| error.to_string())?;
+        self.activate_prepared_machine_plan(prepared)
+    }
+
+    pub fn prepare_machine_plan_build(
+        &self,
+        plan: Arc<MachinePlan>,
+    ) -> ViewResult<PersistentPlanBuildRequest> {
         validate_preview_plan(&plan)?;
         if &plan.application.identity != self.application_identity() {
             return Err("replacement plan belongs to a different application identity".to_owned());
         }
-        let target_schema_version = plan.persistence.schema_version;
+        self.runtime
+            .single()?
+            .prepare_machine_plan_build(plan, SessionOptions::default())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn activate_prepared_machine_plan(
+        &mut self,
+        prepared: PreparedPersistentPlanActivation,
+    ) -> ViewResult<RuntimePlanChange> {
+        self.publish_prepared_machine_plan(prepared)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn publish_prepared_machine_plan(
+        &mut self,
+        prepared: PreparedPersistentPlanActivation,
+    ) -> Result<RuntimePlanChange, RuntimePlanPublishError> {
         let activation = self
             .runtime
-            .single_mut()?
-            .activate_machine_plan(plan, SessionOptions::default())
-            .map_err(|error| error.to_string())?;
+            .single_mut()
+            .map_err(RuntimePlanPublishError::Failed)?
+            .activate_prepared_machine_plan(prepared)
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    PersistentActivationError::StalePreparedCandidate { .. }
+                ) {
+                    RuntimePlanPublishError::AuthorityStale(error.to_string())
+                } else {
+                    RuntimePlanPublishError::Failed(error.to_string())
+                }
+            })?;
         let acknowledgement = activation.acknowledgement;
         let migration = activation.migration;
-        self.install_replacement_runtime(activation.mount, false)?;
+        self.install_replacement_runtime(activation.mount, false)
+            .map_err(RuntimePlanPublishError::Failed)?;
+        let target_schema_version = self.persistence_schema_version;
         let durable_epoch = acknowledgement
             .as_ref()
             .map_or(self.persistence_status.durable_epoch, |ack| ack.epoch);
@@ -859,6 +933,13 @@ impl RuntimeView {
         match &self.runtime {
             RuntimeBackend::Single(runtime) => runtime.generation(),
             RuntimeBackend::Distributed(_) => 1,
+        }
+    }
+
+    pub(crate) fn owner_stamp(&self) -> RuntimeOwnerStamp {
+        RuntimeOwnerStamp {
+            owner_id: self.owner_id,
+            generation: self.parent_runtime_generation(),
         }
     }
 
@@ -1629,7 +1710,7 @@ impl RuntimeView {
         }
         let mut changed = false;
         for path in due {
-            changed |= self.dispatch_source(&path, None, SourcePayload::default())?;
+            changed |= self.dispatch_root_source(&path, SourcePayload::default())?;
         }
         Ok(changed)
     }
@@ -1659,45 +1740,121 @@ impl RuntimeView {
     }
 
     #[cfg(test)]
-    fn row_target_for_source_text(
+    fn source_route_for_source_text(
         &self,
         path: &str,
         text: &str,
         occurrence: usize,
-    ) -> ViewResult<Option<RowId>> {
-        match &self.runtime {
-            RuntimeBackend::Single(runtime) => runtime
-                .runtime()
-                .row_target_for_source_text(path, text, occurrence)
-                .map_err(|error| error.to_string()),
-            RuntimeBackend::Distributed(runtime) => runtime
-                .client_row_target_for_source_text(path, text, occurrence)
-                .map_err(|error| error.to_string()),
-        }
+    ) -> ViewResult<Option<SourceRouteToken>> {
+        let frame = self.retained_frame();
+        Ok(frame
+            .nodes
+            .values()
+            .filter(|node| document_subtree_contains_text(frame, &node.id, text))
+            .flat_map(|node| &node.source_bindings)
+            .filter(|binding| binding.source_path == path)
+            .filter_map(|binding| binding.route.clone())
+            .nth(occurrence))
     }
 
-    pub fn scenario_target_row(
+    #[cfg(test)]
+    fn source_route_diagnostics(&self, path: &str, text: &str) -> String {
+        let frame = self.retained_frame();
+        let path_bindings = frame
+            .nodes
+            .values()
+            .flat_map(|node| {
+                node.source_bindings
+                    .iter()
+                    .filter(move |binding| binding.source_path == path)
+                    .map(move |binding| {
+                        let leaf = binding
+                            .route
+                            .as_ref()
+                            .and_then(|route| route.owner.leaf())
+                            .map(|row| format!("{}:{}:{}", row.list.0, row.key, row.generation))
+                            .unwrap_or_else(|| "none".to_owned());
+                        format!(
+                            "{}[route={},leaf={},text={}]",
+                            node.id.0,
+                            binding.route.is_some(),
+                            leaf,
+                            document_subtree_contains_text(frame, &node.id, text)
+                        )
+                    })
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        let text_subtrees = frame
+            .nodes
+            .values()
+            .filter(|node| document_subtree_contains_text(frame, &node.id, text))
+            .map(|node| {
+                let paths = node
+                    .source_bindings
+                    .iter()
+                    .map(|binding| binding.source_path.as_str())
+                    .take(4)
+                    .collect::<Vec<_>>();
+                format!("{}{:?}", node.id.0, paths)
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        let text_binding_nodes = frame
+            .nodes
+            .values()
+            .filter(|node| {
+                !node.source_bindings.is_empty()
+                    && document_subtree_contains_text(frame, &node.id, text)
+            })
+            .map(|node| {
+                (
+                    node.id.0.as_str(),
+                    node.source_bindings
+                        .iter()
+                        .map(|binding| binding.source_path.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        let related_binding_paths = frame
+            .nodes
+            .values()
+            .flat_map(|node| &node.source_bindings)
+            .map(|binding| binding.source_path.as_str())
+            .filter(|candidate| candidate.contains("select_signal"))
+            .collect::<BTreeSet<_>>();
+        format!(
+            "path_bindings={path_bindings:?}; text_subtrees={text_subtrees:?}; \
+             text_binding_nodes={text_binding_nodes:?}; related_binding_paths={related_binding_paths:?}; \
+             frame_nodes={}",
+            frame.nodes.len()
+        )
+    }
+
+    #[cfg(test)]
+    fn source_route_for_key(
         &self,
-        source_path: &str,
-        target_text: Option<&str>,
-        address: Option<&str>,
-        occurrence: Option<u64>,
-    ) -> ViewResult<Option<(u64, u64)>> {
-        let Some(target_text) = target_text.or(address) else {
-            return Ok(None);
-        };
-        let occurrence = usize::try_from(occurrence.unwrap_or(0))
-            .map_err(|_| "scenario target occurrence exceeds usize".to_owned())?;
-        let row = match &self.runtime {
-            RuntimeBackend::Single(runtime) => runtime
-                .runtime()
-                .row_target_for_source_text(source_path, target_text, occurrence)
-                .map_err(|error| error.to_string())?,
-            RuntimeBackend::Distributed(runtime) => runtime
-                .client_row_target_for_source_text(source_path, target_text, occurrence)
-                .map_err(|error| error.to_string())?,
-        };
-        Ok(row.map(|row| (row.key, row.generation)))
+        path: &str,
+        key: u64,
+        generation: u64,
+    ) -> ViewResult<SourceRouteToken> {
+        match &self.runtime {
+            RuntimeBackend::Single(runtime) => {
+                let row = runtime
+                    .runtime()
+                    .row_target_for_source_path(path, key, generation)
+                    .map_err(|error| error.to_string())?;
+                runtime
+                    .runtime()
+                    .source_route_token_for_path(path, &[row])
+                    .map_err(|error| error.to_string())
+            }
+            RuntimeBackend::Distributed(_) => {
+                Err("test-only key targeting cannot synthesize distributed owner routes".to_owned())
+            }
+        }
     }
 
     pub fn take_patches(&mut self) -> Vec<DocumentPatch> {
@@ -2031,11 +2188,7 @@ impl RuntimeView {
             node: node_id.to_owned(),
             source_path: Some(binding.source_path.clone()),
             source_intent: Some(binding.intent.clone()),
-            row_key: style_u64(node, &["row_key", "target_key", "__row_key"]),
-            row_generation: style_u64(
-                node,
-                &["row_generation", "target_generation", "__row_generation"],
-            ),
+            source_route: binding.route.clone(),
             scroll_root: None,
             center_x: 0.0,
             center_y: 0.0,
@@ -2086,6 +2239,7 @@ impl RuntimeView {
         let mut routed = target.clone();
         routed.source_path = Some(binding.source_path);
         routed.source_intent = Some(binding.intent);
+        routed.source_route = binding.route;
         self.dispatch_target(&routed, payload)
     }
 
@@ -2115,55 +2269,30 @@ impl RuntimeView {
         external_url_scheme_is_allowed(url).then(|| url.clone())
     }
 
-    fn dispatch_target(
-        &mut self,
-        target: &HitTarget,
-        mut payload: SourcePayload,
-    ) -> ViewResult<bool> {
+    fn dispatch_target(&mut self, target: &HitTarget, payload: SourcePayload) -> ViewResult<bool> {
         let Some(path) = target.source_path.as_deref() else {
             return Ok(false);
         };
-        if target.row_key.is_none()
-            && let Some(field) = self.source_row_lookup_field(path).map(str::to_owned)
-            && let Some(value) = self
-                .retained_frame()
-                .nodes
-                .get(&DocumentNodeId(target.node.clone()))
-                .and_then(|node| node.style.get(&field))
-                .and_then(style_payload_value)
-        {
-            match (field.as_str(), value) {
-                ("address", Value::Text(value)) => payload.address = Some(value),
-                ("key", Value::Text(value)) => payload.key = Some(value),
-                ("text", Value::Text(value)) => payload.text = Some(value),
-                (field, value) => {
-                    payload.fields.insert(field.to_owned(), value);
-                }
-            }
-        }
-        let row_scoped = self
-            .program_host
-            .source_is_row_scoped(path)
-            .or_else(|| self.source_is_row_scoped(path));
-        let row = if row_scoped == Some(true) {
-            self.row_target(path, target.row_key, target.row_generation)?
-        } else {
-            None
-        };
-        self.dispatch_source(path, row, payload)
+        let route = target.source_route.clone().ok_or_else(|| {
+            format!(
+                "retained hit target `{}` has no typed source route",
+                target.node
+            )
+        })?;
+        self.dispatch_source(path, route, payload)
     }
 
     fn dispatch_source(
         &mut self,
         path: &str,
-        row: Option<RowId>,
+        route: SourceRouteToken,
         payload: SourcePayload,
     ) -> ViewResult<bool> {
         let next_sequence = self.sequence.saturating_add(1);
         if self.program_host.owns_source_route(path) {
             let (turn, patches) = self
                 .program_host
-                .dispatch(next_sequence, path, row, payload)
+                .dispatch(next_sequence, path, route, payload)
                 .map_err(|error| error.to_string())?;
             let source_sequence = turn.source_sequence.ok_or_else(|| {
                 format!("child source dispatch `{path}` produced no source sequence")
@@ -2178,7 +2307,7 @@ impl RuntimeView {
             RuntimeBackend::Single(runtime) => {
                 let event = runtime
                     .runtime()
-                    .source_event(next_sequence, path, row, payload)
+                    .source_event(next_sequence, route, payload)
                     .map_err(|error| error.to_string())?;
                 let turn = runtime.dispatch(event).map_err(|error| error.to_string())?;
                 self.capture_scenario_turn(path, &turn);
@@ -2192,7 +2321,7 @@ impl RuntimeView {
             }
             RuntimeBackend::Distributed(runtime) => {
                 runtime
-                    .dispatch_client_scoped(path, row, payload)
+                    .dispatch_client_route(route, payload)
                     .map_err(|error| error.to_string())?;
                 let changed = self.poll_distributed_runtime(Instant::now())?;
                 if self.sequence < next_sequence {
@@ -2207,18 +2336,24 @@ impl RuntimeView {
         }
     }
 
-    fn source_row_lookup_field(&self, path: &str) -> Option<&str> {
+    fn root_source_route(&self, path: &str) -> ViewResult<SourceRouteToken> {
+        if let Some(route) = self.program_host.source_route_token(path) {
+            return Ok(route.clone());
+        }
         match &self.runtime {
-            RuntimeBackend::Single(runtime) => runtime.runtime().source_row_lookup_field(path),
-            RuntimeBackend::Distributed(runtime) => runtime.client_source_row_lookup_field(path),
+            RuntimeBackend::Single(runtime) => runtime
+                .runtime()
+                .source_route_token_for_path(path, &[])
+                .map_err(|error| error.to_string()),
+            RuntimeBackend::Distributed(runtime) => runtime
+                .client_source_route_token_for_path(path)
+                .map_err(|error| error.to_string()),
         }
     }
 
-    fn source_is_row_scoped(&self, path: &str) -> Option<bool> {
-        match &self.runtime {
-            RuntimeBackend::Single(runtime) => runtime.runtime().source_is_row_scoped(path),
-            RuntimeBackend::Distributed(runtime) => runtime.client_source_is_row_scoped(path),
-        }
+    fn dispatch_root_source(&mut self, path: &str, payload: SourcePayload) -> ViewResult<bool> {
+        let route = self.root_source_route(path)?;
+        self.dispatch_source(path, route, payload)
     }
 
     fn record_event_dispatch(&mut self, source_path: &str, source_sequence: u64) {
@@ -2737,35 +2872,6 @@ impl RuntimeView {
         }
     }
 
-    fn row_target(
-        &self,
-        source_path: &str,
-        key: Option<u64>,
-        generation: Option<u64>,
-    ) -> ViewResult<Option<RowId>> {
-        let Some(key) = key else {
-            return Ok(None);
-        };
-        if self.program_host.owns_source_route(source_path) {
-            return self
-                .program_host
-                .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
-                .map(Some)
-                .map_err(|error| error.to_string());
-        }
-        match &self.runtime {
-            RuntimeBackend::Single(runtime) => runtime
-                .runtime()
-                .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
-                .map(Some)
-                .map_err(|error| error.to_string()),
-            RuntimeBackend::Distributed(runtime) => runtime
-                .client_row_target_for_source_path(source_path, key, generation.unwrap_or(1))
-                .map(Some)
-                .map_err(|error| error.to_string()),
-        }
-    }
-
     fn queue_program_update(
         &mut self,
         patches: Vec<DocumentPatch>,
@@ -2808,7 +2914,7 @@ impl RuntimeView {
                 .program_host
                 .lifecycle_source_paths(&rejection.session, "rejected");
             for path in paths {
-                changed |= self.dispatch_source(&path, None, payload.clone())?;
+                changed |= self.dispatch_root_source(&path, payload.clone())?;
             }
         }
         Ok(changed)
@@ -2940,7 +3046,7 @@ impl RuntimeView {
         }
         let payload =
             host_lifecycle_started_payload(self.host_identity_mode, self.host_identity_generation);
-        self.dispatch_source(HOST_LIFECYCLE_STARTED_SOURCE, None, payload)?;
+        self.dispatch_root_source(HOST_LIFECYCLE_STARTED_SOURCE, payload)?;
         Ok(())
     }
 }
@@ -2956,10 +3062,10 @@ fn dispatch_host_lifecycle_started(
     }
     let event = runtime
         .runtime()
-        .source_event(
+        .source_event_for_path(
             sequence,
             HOST_LIFECYCLE_STARTED_SOURCE,
-            None,
+            &[],
             host_lifecycle_started_payload(mode, generation),
         )
         .map_err(|error| error.to_string())?;
@@ -3483,18 +3589,6 @@ fn rejected_program_payload(diagnostic: &ProgramDiagnostic) -> SourcePayload {
     payload
 }
 
-fn style_payload_value(value: &StyleValue) -> Option<Value> {
-    match value {
-        StyleValue::Text(value) => Some(Value::Text(value.clone())),
-        StyleValue::Number(value) if value.is_finite() => {
-            FiniteReal::new(*value).ok().map(Value::Number)
-        }
-        StyleValue::Number(_) => None,
-        StyleValue::Bool(value) => Some(Value::Bool(*value)),
-        StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => None,
-    }
-}
-
 fn state_from_mount(patches: Vec<DocumentPatch>) -> ViewResult<DocumentState> {
     let root = patches.iter().find_map(|patch| match patch {
         DocumentPatch::UpsertNode(node)
@@ -3516,16 +3610,6 @@ fn state_from_mount(patches: Vec<DocumentPatch>) -> ViewResult<DocumentState> {
 
 fn source_sequence_after_turn(current: u64, source_sequence: Option<u64>) -> u64 {
     source_sequence.unwrap_or(current)
-}
-
-fn style_u64(node: &boon_document::DocumentNode, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| match node.style.get(*key) {
-        Some(StyleValue::Number(value)) if value.is_finite() && *value >= 0.0 => {
-            Some(*value as u64)
-        }
-        Some(StyleValue::Text(value)) => value.parse().ok(),
-        _ => None,
-    })
 }
 
 fn style_number(node: &boon_document::DocumentNode, keys: &[&str]) -> Option<f64> {
@@ -3569,15 +3653,41 @@ fn duration_us(duration: Duration) -> u64 {
 }
 
 #[cfg(test)]
+fn document_subtree_contains_text(
+    frame: &DocumentFrame,
+    root: &DocumentNodeId,
+    expected: &str,
+) -> bool {
+    let mut pending = vec![root.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(node_id) = pending.pop() {
+        if !visited.insert(node_id.clone()) {
+            continue;
+        }
+        let Some(node) = frame.nodes.get(&node_id) else {
+            continue;
+        };
+        if node
+            .text
+            .as_ref()
+            .is_some_and(|text| text.text == expected || text.text.contains(expected))
+        {
+            return true;
+        }
+        pending.extend(node.children.iter().cloned());
+    }
+    false
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::thread;
 
     fn dispatch_press(view: &mut RuntimeView, source: &str) {
-        view.dispatch_source(
+        view.dispatch_root_source(
             source,
-            None,
             SourcePayload {
                 fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
                 ..SourcePayload::default()
@@ -3629,16 +3739,51 @@ mod tests {
         let requested_signal_ids = view
             .root_value_current("store.real_signal_page_signal_ids")
             .unwrap();
+        let waveform_open = view
+            .root_value_current("store.real_waveform_open_result")
+            .unwrap();
+        assert!(
+            matches!(&waveform_open, Value::Record(fields)
+                if fields.get("$tag")
+                    == Some(&Value::Text("WaveformOpened".to_owned()))
+                    && fields.get("format")
+                        == Some(&Value::Text(expected_format.to_owned()))),
+            "{expected_format} selection did not reach the real Wellen artifact: \
+             {waveform_open:?}"
+        );
+        let hierarchy_page = view
+            .root_value_current("store.real_hierarchy_page_result")
+            .unwrap();
+        let file_stream = view
+            .root_value_current("store.real_file_stream_result")
+            .unwrap();
+        let selected_asset = view
+            .root_value_current("store.real_waveform_asset")
+            .unwrap();
         let signal_page = view
             .root_value_current("store.real_signal_page_result")
             .unwrap();
+        let signal_request = view
+            .root_value_current("store.real_signal_page_request")
+            .unwrap();
+        let signal_request_fingerprint = view
+            .root_value_current("store.real_signal_page_request_fingerprint")
+            .unwrap();
         let Value::Record(signal_page) = signal_page else {
-            panic!("real signal page is not a tagged record: {signal_page:?}");
+            panic!(
+                "real signal page is not a tagged record: {signal_page:?}; active signal \
+                 {active_signal:?}; requested IDs {requested_signal_ids:?}; selected asset \
+                 {selected_asset:?}; file stream {file_stream:?}; open {waveform_open:?}; \
+                 hierarchy {hierarchy_page:?}; request {signal_request:?}; current fingerprint \
+                 {signal_request_fingerprint:?}"
+            );
         };
         let Some(Value::List(signals)) = signal_page.get("signals") else {
             panic!(
                 "real signal page has no bounded signal rows for active signal {active_signal:?} \
-                 and requested IDs {requested_signal_ids:?}: {signal_page:?}"
+                 and requested IDs {requested_signal_ids:?}; selected asset {selected_asset:?}; \
+                 file stream {file_stream:?}; open {waveform_open:?}; hierarchy {hierarchy_page:?}; \
+                 signal page {signal_page:?}"
             );
         };
         assert_eq!(
@@ -3775,7 +3920,7 @@ mod tests {
                 .is_some_and(|text| text.text == "Distributed program fixture")
         }));
 
-        view.dispatch_source("store.increment", None, SourcePayload::default())
+        view.dispatch_root_source("store.increment", SourcePayload::default())
             .expect("dispatch Client event through distributed aggregate");
         assert_eq!(
             view.root_value_current("store.client_count").unwrap(),
@@ -3823,7 +3968,7 @@ document: Document/new(
         let mut view = RuntimeView::open_distributed_with_assets(bundle, true, &[])
             .expect("mount distributed Client effect fixture");
 
-        view.dispatch_source("store.randomize", None, SourcePayload::default())
+        view.dispatch_root_source("store.randomize", SourcePayload::default())
             .expect("dispatch Client random effect");
         let started = Instant::now();
         while view.effect_poll_deadline().is_some() {
@@ -3881,7 +4026,7 @@ document: Document/new(
             RuntimeView::open_for_scenario_with_assets(runtime.shared_machine_plan(), &[asset])
                 .unwrap();
 
-        view.dispatch_source("store.read", None, SourcePayload::default())
+        view.dispatch_root_source("store.read", SourcePayload::default())
             .unwrap();
         assert_eq!(view.transient_host.active_call_count(), 1);
         let started = Instant::now();
@@ -3928,6 +4073,12 @@ document: Document/new(
             &example.assets,
         )
         .unwrap();
+        assert_eq!(
+            view.root_value_current("store.real_signal_page_request")
+                .unwrap(),
+            Value::Text("SKIP".to_owned()),
+            "inactive NovyWave LATEST request must not be initialized from an untriggered arm"
+        );
         dispatch_press(&mut view, "store.elements.load_default_file");
         assert_eq!(view.transient_host.active_call_count(), 1);
         dispatch_press(&mut view, "store.elements.show_empty");
@@ -3945,7 +4096,46 @@ document: Document/new(
             2,
             "comparison mode must own exactly one FST stream and one VCD reference stream"
         );
+        view.begin_scenario_step("store.elements.select_ghw_file");
         dispatch_press(&mut view, "store.elements.select_ghw_file");
+        let selected_asset = view
+            .root_value_current("store.real_waveform_asset")
+            .unwrap();
+        assert!(
+            matches!(&selected_asset, Value::Record(fields)
+            if fields.get("$tag") == Some(&Value::Text("PackageAsset".to_owned()))
+                && fields.get("url")
+                    == Some(&Value::Text(
+                        "asset://novywave/simple_test.ghw".to_owned()
+                    ))),
+            "GHW selection did not update the primary package asset: {selected_asset:?}"
+        );
+        let ghw_turn = view
+            .scenario_trigger_turn
+            .as_ref()
+            .expect("GHW selection must capture its runtime turn");
+        let admitted_file_urls = ghw_turn
+            .transient_effects
+            .iter()
+            .filter_map(|invocation| {
+                let Value::Record(intent) = &invocation.intent else {
+                    return None;
+                };
+                let Some(Value::Record(file)) = intent.get("file") else {
+                    return None;
+                };
+                let Some(Value::Text(url)) = file.get("url") else {
+                    return None;
+                };
+                Some(url.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            admitted_file_urls,
+            vec!["asset://novywave/simple_test.ghw".to_owned()],
+            "GHW selection must replace all prior waveform streams with one GHW stream: \
+             {ghw_turn:#?}"
+        );
         assert_eq!(
             view.transient_host.active_call_count(),
             1,
@@ -3995,13 +4185,25 @@ document: Document/new(
             ("wave_27.fst", "FST"),
             ("simple_test.ghw", "GHW"),
         ] {
-            let target = view
-                .row_target_for_source_text("file_tree_row.file_row_elements.select_file", file, 0)
+            let route = view
+                .source_route_for_source_text(
+                    "store.file_tree_rows.file_row_elements.select_file",
+                    file,
+                    0,
+                )
                 .unwrap()
-                .unwrap();
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {file} file-row route: {}",
+                        view.source_route_diagnostics(
+                            "store.file_tree_rows.file_row_elements.select_file",
+                            file
+                        )
+                    )
+                });
             view.dispatch_source(
-                "file_tree_row.file_row_elements.select_file",
-                Some(target),
+                "store.file_tree_rows.file_row_elements.select_file",
+                route,
                 SourcePayload {
                     address: Some(file.to_owned()),
                     fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
@@ -4080,17 +4282,17 @@ document: Document/new(
             }
         }
 
-        let vcd_target = view
-            .row_target_for_source_text(
-                "file_tree_row.file_row_elements.select_file",
+        let vcd_route = view
+            .source_route_for_source_text(
+                "store.file_tree_rows.file_row_elements.select_file",
                 "simple.vcd",
                 0,
             )
             .unwrap()
             .unwrap();
         view.dispatch_source(
-            "file_tree_row.file_row_elements.select_file",
-            Some(vcd_target),
+            "store.file_tree_rows.file_row_elements.select_file",
+            vcd_route,
             SourcePayload {
                 address: Some("simple.vcd".to_owned()),
                 fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
@@ -4126,17 +4328,40 @@ document: Document/new(
                 Some((signal_id.clone(), name.clone()))
             })
             .expect("committed VCD must expose a real-valued signal");
-        let analog_target = view
-            .row_target_for_source_text(
-                "signal_row.signal_elements.select_signal",
-                &analog_signal_id,
+        let active_scope = view.root_value_current("store.active_scope").unwrap();
+        let first_signal_parent = view
+            .root_value_current("store.real_first_signal_parent_id")
+            .unwrap();
+        let search_result_count = view
+            .root_value_current("store.search_results_count")
+            .unwrap();
+        let search_result_keys = view
+            .root_value_current("store.search_results_key_summary")
+            .unwrap();
+        let search_result_names = view
+            .root_value_current("store.search_results_name_summary")
+            .unwrap();
+        let analog_route = view
+            .source_route_for_source_text(
+                "store.signal_catalog.signal_elements.select_signal",
+                &analog_signal_name,
                 0,
             )
             .unwrap()
-            .unwrap();
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing analog signal route: active_scope={active_scope:?}; \
+                     first_signal_parent={first_signal_parent:?}; search_count={search_result_count:?}; \
+                     search_keys={search_result_keys:?}; search_names={search_result_names:?}; {}",
+                    view.source_route_diagnostics(
+                        "store.signal_catalog.signal_elements.select_signal",
+                        &analog_signal_name
+                    )
+                )
+            });
         view.dispatch_source(
-            "signal_row.signal_elements.select_signal",
-            Some(analog_target),
+            "store.signal_catalog.signal_elements.select_signal",
+            analog_route,
             SourcePayload {
                 fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
                 ..SourcePayload::default()
@@ -4288,25 +4513,42 @@ document: Document/new(
                     .target_text
                     .as_deref()
                     .or(event.payload.address.as_deref());
-                let row_result = if let Some(target_text) = target_text {
-                    view.row_target_for_source_text(
+                let route_result = if let Some(target_text) = target_text {
+                    view.source_route_for_source_text(
                         &event.source,
                         target_text,
                         event.target_occurrence.unwrap_or(0),
                     )
                 } else if let Some(key) = event.target_key {
-                    view.row_target(&event.source, Some(key), event.target_generation)
+                    let Some(generation) = event.target_generation else {
+                        failures.push(format!(
+                            "{} target: key-targeted source requires an explicit generation",
+                            step.id
+                        ));
+                        continue;
+                    };
+                    view.source_route_for_key(&event.source, key, generation)
+                        .map(Some)
                 } else {
-                    Ok(None)
+                    view.root_source_route(&event.source).map(Some)
                 };
-                let row = match row_result {
-                    Ok(row) => row,
+                let route = match route_result {
+                    Ok(Some(route)) => route,
+                    Ok(None) => {
+                        failures.push(format!(
+                            "{} target: no typed source route: {}",
+                            step.id,
+                            view.source_route_diagnostics(&event.source, target_text.unwrap_or(""))
+                        ));
+                        continue;
+                    }
                     Err(error) => {
                         failures.push(format!("{} target: {error}", step.id));
                         continue;
                     }
                 };
-                if let Err(error) = view.dispatch_source(&event.source, row, event.payload.clone())
+                if let Err(error) =
+                    view.dispatch_source(&event.source, route, event.payload.clone())
                 {
                     failures.push(format!("{} dispatch: {error}", step.id));
                     continue;
@@ -4355,9 +4597,8 @@ document: Document/new(
             view.root_value_current("store.credential_count").unwrap(),
             Value::Number(FiniteReal::from_i64_exact(0).unwrap())
         );
-        view.dispatch_source(
+        view.dispatch_root_source(
             "store.elements.simulate_registration_cancel",
-            None,
             SourcePayload {
                 fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
                 ..SourcePayload::default()
@@ -4392,9 +4633,8 @@ document: Document/new(
             );
         }
 
-        view.dispatch_source(
+        view.dispatch_root_source(
             "store.elements.register_passkey",
-            None,
             SourcePayload {
                 fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
                 ..SourcePayload::default()

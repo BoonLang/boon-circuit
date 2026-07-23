@@ -1,6 +1,6 @@
 use crate::{
-    ApplicationIdentity, DocumentFrame, DocumentPatch, LiveRuntime, ProgramCapabilityProfile,
-    RowId, RuntimeSourceUnit, SessionOptions, SourcePayload,
+    ApplicationIdentity, DocumentFrame, DocumentPatch, LiveRuntime, MachineTemplate,
+    ProgramCapabilityProfile, RowId, RuntimeSourceUnit, SessionOptions, SourcePayload,
 };
 use boon_compiler::{
     COMPILER_ID, CompileProfile, CompilerSourceUnit, DistributedCompilerProgram,
@@ -23,7 +23,7 @@ use boon_persistence::{
 };
 use boon_plan::{
     DocumentConstructor, EffectBarrier, EffectReplay, MachinePlan, OutputContractKind, ProgramRole,
-    TargetProfile,
+    SourceRouteToken, TargetProfile,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,7 +36,7 @@ const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 const MAX_TRUSTED_PACKAGE_SOURCE_UNITS: usize = 256;
 const MAX_TRUSTED_PACKAGE_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const PROGRAM_ARTIFACT_FORMAT: u32 = 1;
-const PROGRAM_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.boon.machine-plan+cbor;version=1";
+const PROGRAM_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.boon.machine-plan+cbor;version=2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramLimits {
@@ -55,7 +55,7 @@ pub struct ProgramLimits {
     pub max_runtime_work_units_per_transaction: u64,
 }
 
-fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
+pub(crate) fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
     match profile {
         ProgramCapabilityProfile::PublicClient => ProgramLimits {
             max_source_units: 8,
@@ -185,7 +185,7 @@ impl fmt::Display for ProgramDiagnostic {
 
 impl std::error::Error for ProgramDiagnostic {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProgramArtifact {
     id: ContentArtifactId,
     revision: u64,
@@ -194,7 +194,24 @@ pub struct ProgramArtifact {
     capability_profile: ProgramCapabilityProfile,
     compile_profile: CompileProfile,
     plan: Arc<MachinePlan>,
+    template: MachineTemplate,
     content: Arc<ContentArtifact>,
+}
+
+impl fmt::Debug for ProgramArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProgramArtifact")
+            .field("id", &self.id)
+            .field("revision", &self.revision)
+            .field("source_digest", &self.source_digest)
+            .field("plan_digest", &self.plan_digest)
+            .field("capability_profile", &self.capability_profile)
+            .field("compile_profile", &self.compile_profile)
+            .field("plan", &self.plan)
+            .field("content", &self.content)
+            .finish()
+    }
 }
 
 impl PartialEq for ProgramArtifact {
@@ -236,6 +253,10 @@ impl ProgramArtifact {
 
     pub fn plan(&self) -> &Arc<MachinePlan> {
         &self.plan
+    }
+
+    pub fn machine_template(&self) -> &MachineTemplate {
+        &self.template
     }
 
     pub fn role(&self) -> ProgramRole {
@@ -403,6 +424,14 @@ fn decode_program_artifact(
         ));
     }
     validate_plan(revision, expected_capability, &stored.plan)?;
+    let plan = Arc::new(stored.plan);
+    let template = MachineTemplate::new_shared(Arc::clone(&plan)).map_err(|error| {
+        ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            error.to_string(),
+        )
+    })?;
     Ok(ProgramArtifact {
         id: artifact.id,
         revision,
@@ -410,7 +439,8 @@ fn decode_program_artifact(
         plan_digest: stored.plan_digest,
         capability_profile: stored.capability_profile,
         compile_profile: CompileProfile::default(),
-        plan: Arc::new(stored.plan),
+        plan,
+        template,
         content: Arc::new(artifact),
     })
 }
@@ -578,14 +608,24 @@ fn artifact_from_compiled(
             error.to_string(),
         )
     })?;
+    let compile_profile = compiled.profile;
+    let plan = Arc::new(compiled.plan);
+    let template = MachineTemplate::new_shared(Arc::clone(&plan)).map_err(|error| {
+        ProgramDiagnostic::new(
+            request.revision,
+            ProgramDiagnosticPhase::Artifact,
+            error.to_string(),
+        )
+    })?;
     Ok(ProgramArtifact {
         id: content.id,
         revision: request.revision,
         source_digest,
         plan_digest,
         capability_profile: request.capability_profile,
-        compile_profile: compiled.profile,
-        plan: Arc::new(compiled.plan),
+        compile_profile,
+        plan,
+        template,
         content: Arc::new(content),
     })
 }
@@ -601,9 +641,10 @@ impl ProgramSession {
     pub fn start(artifact: ProgramArtifact) -> Result<Self, ProgramDiagnostic> {
         let limits = program_limits(artifact.capability_profile());
         let id = deterministic_program_session_id(&artifact);
-        let runtime = LiveRuntime::from_shared_machine_plan(
-            Arc::clone(artifact.plan()),
+        let runtime = LiveRuntime::from_machine_template(
+            artifact.machine_template(),
             SessionOptions {
+                program_revision: artifact.revision(),
                 max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
                 ..SessionOptions::default()
             },
@@ -728,9 +769,12 @@ impl ProgramSession {
         let next_source_sequence = source_sequence
             .checked_add(1)
             .ok_or("program source sequence overflow")?;
-        let event = self
-            .runtime
-            .source_event(source_sequence, source_path, target, payload)?;
+        let event = self.runtime.source_event_for_path(
+            source_sequence,
+            source_path,
+            target.as_slice(),
+            payload,
+        )?;
         let runtime_turn = self.runtime.dispatch(event)?;
         self.next_source_sequence = next_source_sequence;
         Ok(ProgramSessionDispatch {
@@ -814,21 +858,64 @@ impl ProgramSession {
         self.runtime.distributed_export_value_current(export_id)
     }
 
-    pub fn evaluate_distributed_function(
-        &mut self,
-        export_id: boon_plan::ExportId,
-        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
-    ) -> crate::RuntimeResult<crate::Value> {
-        self.runtime
-            .evaluate_distributed_function(export_id, arguments)
-    }
-
-    pub fn distributed_call_arguments_current(
+    pub fn evaluate_distributed_function_instance_unsettled(
         &mut self,
         call_site_id: boon_plan::RemoteCallSiteId,
-    ) -> crate::RuntimeResult<BTreeMap<boon_plan::DistributedArgumentId, crate::Value>> {
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        export_id: boon_plan::ExportId,
+        content_revision: u64,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+    ) -> crate::RuntimeResult<(crate::Value, Option<crate::RuntimeTurn>)> {
         self.runtime
-            .distributed_call_arguments_current(call_site_id)
+            .evaluate_distributed_function_instance_unsettled(
+                call_site_id,
+                call_instance_id,
+                export_id,
+                content_revision,
+                arguments,
+            )
+    }
+
+    pub fn distributed_call_instances_current(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+    ) -> crate::RuntimeResult<Vec<crate::DistributedCurrentCallInstance>> {
+        self.runtime
+            .distributed_call_instances_current(call_site_id)
+    }
+
+    pub fn distributed_producer_call_result_current(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+    ) -> crate::RuntimeResult<crate::Value> {
+        self.runtime
+            .distributed_producer_call_result_current(call_site_id, call_instance_id)
+    }
+
+    pub fn update_distributed_call_result_instance_unsettled(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        content_revision: u64,
+        value: crate::Value,
+    ) -> crate::RuntimeResult<Option<crate::RuntimeTurn>> {
+        self.runtime
+            .update_distributed_call_result_instance_unsettled(
+                call_site_id,
+                call_instance_id,
+                content_revision,
+                value,
+            )
+    }
+
+    pub fn drop_producer_call_instance_unsettled(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+    ) -> crate::RuntimeResult<Option<crate::RuntimeTurn>> {
+        self.runtime
+            .drop_producer_call_instance_unsettled(call_site_id, call_instance_id)
     }
 }
 
@@ -860,7 +947,14 @@ impl crate::DistributedServerMachine for ProgramSession {
         turn: crate::RuntimeTurn,
         evaluation: Self::EvaluationMachine,
     ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
-        self.validate_distributed_server_evaluation(Some(&turn), &evaluation)?;
+        if let Err(error) = self.validate_distributed_server_evaluation(Some(&turn), &evaluation) {
+            return match self.runtime.rollback_unsettled_turn() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(distributed_machine_error(format!(
+                    "{error}; rollback failed: {rollback}"
+                ))),
+            };
+        }
         self.install_distributed_server_evaluation(evaluation);
         Ok(turn)
     }
@@ -871,7 +965,7 @@ impl crate::DistributedServerMachine for ProgramSession {
         payload: SourcePayload,
     ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
         self.runtime
-            .source_event(self.next_source_sequence, path, None, payload)
+            .source_event_for_path(self.next_source_sequence, path, &[], payload)
             .map_err(distributed_machine_error)
     }
 
@@ -881,7 +975,17 @@ impl crate::DistributedServerMachine for ProgramSession {
         payload: SourcePayload,
     ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
         self.runtime
-            .source_event_by_id(self.next_source_sequence, source, None, payload)
+            .source_event_by_id(self.next_source_sequence, source, payload)
+            .map_err(distributed_machine_error)
+    }
+
+    fn event_for_route(
+        &self,
+        route: boon_plan::SourceRouteToken,
+        payload: SourcePayload,
+    ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
+        self.runtime
+            .source_event(self.next_source_sequence, route, payload)
             .map_err(distributed_machine_error)
     }
 
@@ -906,25 +1010,68 @@ impl crate::DistributedServerMachine for ProgramSession {
             .map_err(distributed_machine_error)
     }
 
-    fn call_arguments(
+    fn current_call_instances(
         &mut self,
-        call: &boon_plan::RemoteCallSitePlan,
-    ) -> Result<
-        BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
-        crate::DistributedRuntimeError,
-    > {
+        call_site_id: boon_plan::RemoteCallSiteId,
+    ) -> Result<Vec<crate::DistributedCurrentCallInstance>, crate::DistributedRuntimeError> {
         self.runtime
-            .distributed_call_arguments_current(call.call_site_id)
+            .distributed_call_instances_current(call_site_id)
             .map_err(distributed_machine_error)
     }
 
-    fn evaluate_function(
+    fn producer_call_result_current(
         &mut self,
-        export_id: boon_plan::ExportId,
-        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
     ) -> Result<crate::Value, crate::DistributedRuntimeError> {
         self.runtime
-            .evaluate_distributed_function(export_id, arguments)
+            .distributed_producer_call_result_current(call_site_id, call_instance_id)
+            .map_err(distributed_machine_error)
+    }
+
+    fn evaluate_function_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        export_id: boon_plan::ExportId,
+        demand_revision: u64,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+    ) -> Result<(crate::Value, Option<crate::RuntimeTurn>), crate::DistributedRuntimeError> {
+        self.runtime
+            .evaluate_distributed_function_instance_unsettled(
+                call_site_id,
+                call_instance_id,
+                export_id,
+                demand_revision,
+                arguments,
+            )
+            .map_err(distributed_machine_error)
+    }
+
+    fn update_current_call_result_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        content_revision: u64,
+        value: crate::Value,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::DistributedRuntimeError> {
+        self.runtime
+            .update_distributed_call_result_instance_unsettled(
+                call_site_id,
+                call_instance_id,
+                content_revision,
+                value,
+            )
+            .map_err(distributed_machine_error)
+    }
+
+    fn drop_producer_call_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::DistributedRuntimeError> {
+        self.runtime
+            .drop_producer_call_instance_unsettled(call_site_id, call_instance_id)
             .map_err(distributed_machine_error)
     }
 
@@ -1003,6 +1150,34 @@ impl crate::DistributedServerMachine for ProgramSession {
         self.runtime.set_transient_effect_scope(scope);
     }
 
+    fn set_machine_origin(
+        &mut self,
+        origin: crate::SessionOrigin,
+    ) -> Result<(), crate::DistributedRuntimeError> {
+        let origin = crate::MachineOrigin::new(origin.slot(), origin.generation())
+            .map_err(distributed_machine_error)?;
+        self.runtime
+            .set_machine_origin(origin)
+            .map_err(distributed_machine_error)
+    }
+
+    fn reset_machine_origin(&mut self) -> Result<(), crate::DistributedRuntimeError> {
+        self.runtime
+            .reset_machine_origin()
+            .map_err(distributed_machine_error)
+    }
+
+    fn drop_producer_origin(
+        &mut self,
+        origin: crate::SessionOrigin,
+    ) -> Result<Vec<crate::TransientEffectCallId>, crate::DistributedRuntimeError> {
+        let origin = crate::MachineOrigin::new(origin.slot(), origin.generation())
+            .map_err(distributed_machine_error)?;
+        self.runtime
+            .drop_producer_origin(origin)
+            .map_err(distributed_machine_error)
+    }
+
     fn root_value_current(
         &mut self,
         name: &str,
@@ -1053,6 +1228,7 @@ impl PersistentProgramSession {
         let (runtime, startup) = crate::PersistentRuntime::from_shared_machine_plan(
             Arc::clone(artifact.plan()),
             SessionOptions {
+                program_revision: artifact.revision(),
                 max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
                 ..SessionOptions::default()
             },
@@ -1195,34 +1371,68 @@ impl PersistentProgramSession {
             .prepare_distributed_effect_cancellation(call_ids, immediate)
     }
 
+    pub fn prepare_distributed_function_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        export_id: boon_plan::ExportId,
+        demand_revision: u64,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+        immediate: bool,
+    ) -> Result<(crate::Value, Option<crate::RuntimeTurn>), crate::PersistentDispatchError> {
+        self.runtime.prepare_distributed_function_instance(
+            call_site_id,
+            call_instance_id,
+            export_id,
+            demand_revision,
+            arguments,
+            immediate,
+        )
+    }
+
+    pub fn prepare_distributed_call_result_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        content_revision: u64,
+        value: crate::Value,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::PersistentDispatchError> {
+        self.runtime.prepare_distributed_call_result_instance(
+            call_site_id,
+            call_instance_id,
+            content_revision,
+            value,
+        )
+    }
+
+    pub fn prepare_drop_producer_call_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        immediate: bool,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::PersistentDispatchError> {
+        self.runtime
+            .prepare_drop_producer_call_instance(call_site_id, call_instance_id, immediate)
+    }
+
     pub fn commit_prepared_distributed_turn(
         &mut self,
         turn: crate::RuntimeTurn,
-    ) -> Result<(crate::RuntimeTurn, Option<CommitAck>), crate::PersistentDispatchError> {
-        self.commit_prepared_distributed_turn_with_protocol_state(turn, Vec::new())
-    }
-
-    pub fn commit_prepared_distributed_turn_with_protocol_state(
-        &mut self,
-        turn: crate::RuntimeTurn,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<(crate::RuntimeTurn, Option<CommitAck>), crate::PersistentDispatchError> {
+    ) -> Result<crate::PersistentDistributedCommit, crate::PersistentDispatchError> {
         let source_sequence = turn.source_sequence;
         if let Some(source_sequence) = source_sequence {
             if source_sequence != self.next_source_sequence {
-                return Err(crate::PersistentDispatchError::Runtime(
-                    "prepared Server source sequence changed before commit".to_owned(),
+                return Err(self.fail_prepared_distributed_commit(
+                    "prepared Server source sequence changed before commit",
                 ));
             }
-            self.next_source_sequence.checked_add(1).ok_or_else(|| {
-                crate::PersistentDispatchError::Runtime(
-                    "program source sequence overflow".to_owned(),
-                )
-            })?;
+            if self.next_source_sequence.checked_add(1).is_none() {
+                return Err(
+                    self.fail_prepared_distributed_commit("program source sequence overflow")
+                );
+            }
         }
-        let committed = self
-            .runtime
-            .commit_prepared_distributed_turn(turn, protocol_state_changes)?;
+        let committed = self.runtime.commit_prepared_distributed_turn(turn)?;
         if source_sequence.is_some() {
             self.next_source_sequence += 1;
         }
@@ -1267,29 +1477,37 @@ impl PersistentProgramSession {
         Ok(())
     }
 
-    pub fn prepare_protocol_checkpoint(
-        &mut self,
-    ) -> Result<crate::RuntimeTurn, crate::PersistentDispatchError> {
-        self.runtime.prepare_distributed_protocol_checkpoint()
-    }
-
     pub fn commit_prepared_distributed_server_evaluation(
         &mut self,
         turn: crate::RuntimeTurn,
         evaluation: ProgramSession,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<(crate::RuntimeTurn, Option<CommitAck>), crate::PersistentDispatchError> {
-        self.validate_distributed_server_evaluation(Some(&turn), &evaluation)
-            .map_err(|error| crate::PersistentDispatchError::Runtime(error.to_string()))?;
-        self.runtime
-            .validate_distributed_server_evaluation(&evaluation.runtime, true)?;
-        let committed = self
+    ) -> Result<crate::PersistentDistributedCommit, crate::PersistentDispatchError> {
+        if let Err(error) = self.validate_distributed_server_evaluation(Some(&turn), &evaluation) {
+            return Err(self.fail_prepared_distributed_commit(error));
+        }
+        if let Err(error) = self
             .runtime
-            .commit_prepared_distributed_turn(turn, protocol_state_changes)?;
+            .validate_distributed_server_evaluation(&evaluation.runtime, true)
+        {
+            return Err(self.fail_prepared_distributed_commit(error));
+        }
+        let committed = self.runtime.commit_prepared_distributed_turn(turn)?;
         self.runtime
             .install_distributed_server_evaluation(evaluation.runtime);
         self.next_source_sequence = evaluation.next_source_sequence;
         Ok(committed)
+    }
+
+    fn fail_prepared_distributed_commit(
+        &mut self,
+        error: impl std::fmt::Display,
+    ) -> crate::PersistentDispatchError {
+        match self.runtime.rollback_prepared_distributed_turn() {
+            Ok(()) => crate::PersistentDispatchError::Runtime(error.to_string()),
+            Err(rollback) => crate::PersistentDispatchError::Runtime(format!(
+                "{error}; rollback failed: {rollback}"
+            )),
+        }
     }
 
     fn evaluation_next_source_sequence(
@@ -1353,7 +1571,7 @@ impl PersistentProgramSession {
         let event = self
             .runtime
             .runtime()
-            .source_event(source_sequence, source_path, target, payload)
+            .source_event_for_path(source_sequence, source_path, target.as_slice(), payload)
             .map_err(|error| crate::PersistentDispatchError::Runtime(error.to_string()))?;
         Ok((source_sequence, next_source_sequence, event))
     }
@@ -1468,19 +1686,8 @@ impl crate::DistributedServerMachine for PersistentProgramSession {
         turn: crate::RuntimeTurn,
         evaluation: Self::EvaluationMachine,
     ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
-        self.commit_prepared_distributed_server_evaluation(turn, evaluation, Vec::new())
-            .map(|(turn, _)| turn)
-            .map_err(distributed_machine_error)
-    }
-
-    fn commit_prepared_evaluation_with_protocol_state(
-        &mut self,
-        turn: crate::RuntimeTurn,
-        evaluation: Self::EvaluationMachine,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
-        self.commit_prepared_distributed_server_evaluation(turn, evaluation, protocol_state_changes)
-            .map(|(turn, _)| turn)
+        self.commit_prepared_distributed_server_evaluation(turn, evaluation)
+            .map(|committed| committed.turn)
             .map_err(distributed_machine_error)
     }
 
@@ -1491,7 +1698,7 @@ impl crate::DistributedServerMachine for PersistentProgramSession {
     ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
         self.runtime
             .runtime()
-            .source_event(self.next_source_sequence, path, None, payload)
+            .source_event_for_path(self.next_source_sequence, path, &[], payload)
             .map_err(distributed_machine_error)
     }
 
@@ -1502,7 +1709,18 @@ impl crate::DistributedServerMachine for PersistentProgramSession {
     ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
         self.runtime
             .runtime()
-            .source_event_by_id(self.next_source_sequence, source, None, payload)
+            .source_event_by_id(self.next_source_sequence, source, payload)
+            .map_err(distributed_machine_error)
+    }
+
+    fn event_for_route(
+        &self,
+        route: boon_plan::SourceRouteToken,
+        payload: SourcePayload,
+    ) -> Result<crate::SourceEvent, crate::DistributedRuntimeError> {
+        self.runtime
+            .runtime()
+            .source_event(self.next_source_sequence, route, payload)
             .map_err(distributed_machine_error)
     }
 
@@ -1523,25 +1741,69 @@ impl crate::DistributedServerMachine for PersistentProgramSession {
             .map_err(distributed_machine_error)
     }
 
-    fn call_arguments(
+    fn current_call_instances(
         &mut self,
-        call: &boon_plan::RemoteCallSitePlan,
-    ) -> Result<
-        BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
-        crate::DistributedRuntimeError,
-    > {
+        call_site_id: boon_plan::RemoteCallSiteId,
+    ) -> Result<Vec<crate::DistributedCurrentCallInstance>, crate::DistributedRuntimeError> {
         self.runtime
-            .distributed_call_arguments_current(call.call_site_id)
+            .distributed_call_instances_current(call_site_id)
             .map_err(distributed_machine_error)
     }
 
-    fn evaluate_function(
+    fn producer_call_result_current(
         &mut self,
-        export_id: boon_plan::ExportId,
-        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
     ) -> Result<crate::Value, crate::DistributedRuntimeError> {
         self.runtime
-            .evaluate_distributed_function(export_id, arguments)
+            .distributed_producer_call_result_current(call_site_id, call_instance_id)
+            .map_err(distributed_machine_error)
+    }
+
+    fn evaluate_function_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        export_id: boon_plan::ExportId,
+        demand_revision: u64,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+    ) -> Result<(crate::Value, Option<crate::RuntimeTurn>), crate::DistributedRuntimeError> {
+        self.runtime
+            .prepare_distributed_function_instance(
+                call_site_id,
+                call_instance_id,
+                export_id,
+                demand_revision,
+                arguments,
+                true,
+            )
+            .map_err(distributed_machine_error)
+    }
+
+    fn update_current_call_result_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        content_revision: u64,
+        value: crate::Value,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::DistributedRuntimeError> {
+        self.runtime
+            .prepare_distributed_call_result_instance(
+                call_site_id,
+                call_instance_id,
+                content_revision,
+                value,
+            )
+            .map_err(distributed_machine_error)
+    }
+
+    fn drop_producer_call_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+    ) -> Result<Option<crate::RuntimeTurn>, crate::DistributedRuntimeError> {
+        self.runtime
+            .prepare_drop_producer_call_instance(call_site_id, call_instance_id, true)
             .map_err(distributed_machine_error)
     }
 
@@ -1587,29 +1849,8 @@ impl crate::DistributedServerMachine for PersistentProgramSession {
         turn: crate::RuntimeTurn,
     ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
         self.commit_prepared_distributed_turn(turn)
-            .map(|(turn, _)| turn)
+            .map(|committed| committed.turn)
             .map_err(distributed_machine_error)
-    }
-
-    fn commit_prepared_turn_with_protocol_state(
-        &mut self,
-        turn: crate::RuntimeTurn,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
-        self.commit_prepared_distributed_turn_with_protocol_state(turn, protocol_state_changes)
-            .map(|(turn, _)| turn)
-            .map_err(distributed_machine_error)
-    }
-
-    fn prepare_protocol_checkpoint(
-        &mut self,
-    ) -> Result<crate::RuntimeTurn, crate::DistributedRuntimeError> {
-        PersistentProgramSession::prepare_protocol_checkpoint(self)
-            .map_err(distributed_machine_error)
-    }
-
-    fn supports_protocol_state(&self) -> bool {
-        true
     }
 
     fn rollback_prepared_turn(&mut self) -> Result<(), crate::DistributedRuntimeError> {
@@ -1625,6 +1866,34 @@ impl crate::DistributedServerMachine for PersistentProgramSession {
 
     fn set_transient_effect_scope(&mut self, scope: u64) {
         self.runtime.set_transient_effect_scope(scope);
+    }
+
+    fn set_machine_origin(
+        &mut self,
+        origin: crate::SessionOrigin,
+    ) -> Result<(), crate::DistributedRuntimeError> {
+        let origin = crate::MachineOrigin::new(origin.slot(), origin.generation())
+            .map_err(distributed_machine_error)?;
+        self.runtime
+            .set_machine_origin(origin)
+            .map_err(distributed_machine_error)
+    }
+
+    fn reset_machine_origin(&mut self) -> Result<(), crate::DistributedRuntimeError> {
+        self.runtime
+            .reset_machine_origin()
+            .map_err(distributed_machine_error)
+    }
+
+    fn drop_producer_origin(
+        &mut self,
+        origin: crate::SessionOrigin,
+    ) -> Result<Vec<crate::TransientEffectCallId>, crate::DistributedRuntimeError> {
+        let origin = crate::MachineOrigin::new(origin.slot(), origin.generation())
+            .map_err(distributed_machine_error)?;
+        self.runtime
+            .drop_producer_origin(origin)
+            .map_err(distributed_machine_error)
     }
 
     fn root_value_current(
@@ -2289,6 +2558,7 @@ pub enum ProgramHostCompletion {
 struct ProgramSourceRoute {
     session: ProgramSessionId,
     source_path: String,
+    route: SourceRouteToken,
 }
 
 #[derive(Clone)]
@@ -2919,61 +3189,15 @@ impl ProgramDocumentHost {
             .collect()
     }
 
-    pub fn source_is_row_scoped(&self, route: &str) -> Option<bool> {
-        let route = self.source_routes.get(route)?;
-        self.programs
-            .get(&route.session)?
-            .controller
-            .active()?
-            .runtime()
-            .source_is_row_scoped(&route.source_path)
-    }
-
-    pub fn row_target_for_source_text(
-        &self,
-        route: &str,
-        text: &str,
-        occurrence: usize,
-    ) -> crate::RuntimeResult<Option<RowId>> {
-        let route = self
-            .source_routes
-            .get(route)
-            .ok_or_else(|| format!("embedded program has no source route `{route}`"))?;
-        let program = self
-            .programs
-            .get(&route.session)
-            .and_then(|program| program.controller.active())
-            .ok_or_else(|| format!("embedded program `{}` is not active", route.session.0))?;
-        program
-            .runtime()
-            .row_target_for_source_text(&route.source_path, text, occurrence)
-    }
-
-    pub fn row_target_for_source_path(
-        &self,
-        route: &str,
-        key: u64,
-        generation: u64,
-    ) -> crate::RuntimeResult<RowId> {
-        let route = self
-            .source_routes
-            .get(route)
-            .ok_or_else(|| format!("embedded program has no source route `{route}`"))?;
-        let program = self
-            .programs
-            .get(&route.session)
-            .and_then(|program| program.controller.active())
-            .ok_or_else(|| format!("embedded program `{}` is not active", route.session.0))?;
-        program
-            .runtime()
-            .row_target_for_source_path(&route.source_path, key, generation)
+    pub fn source_route_token(&self, route: &str) -> Option<&SourceRouteToken> {
+        self.source_routes.get(route).map(|route| &route.route)
     }
 
     pub fn dispatch(
         &mut self,
         sequence: u64,
         route: &str,
-        target: Option<RowId>,
+        source_route: SourceRouteToken,
         payload: SourcePayload,
     ) -> crate::RuntimeResult<(crate::RuntimeTurn, Vec<DocumentPatch>)> {
         let route = self
@@ -2981,15 +3205,21 @@ impl ProgramDocumentHost {
             .get(route)
             .cloned()
             .ok_or_else(|| format!("embedded program has no source route `{route}`"))?;
+        if route.route != source_route {
+            return Err(format!(
+                "embedded source route `{}` is stale or belongs to another owner instance",
+                route.source_path
+            )
+            .into());
+        }
         let program = self
             .programs
             .get_mut(&route.session)
             .and_then(|program| program.controller.active_mut())
             .ok_or_else(|| format!("embedded program `{}` is not active", route.session.0))?;
-        let event =
-            program
-                .runtime()
-                .source_event(sequence, &route.source_path, target, payload)?;
+        let event = program
+            .runtime()
+            .source_event(sequence, source_route, payload)?;
         let turn = program.runtime_mut().dispatch(event)?;
         let hosts = self.hosts_for_session(&route.session);
         let patches = self.refresh_projections(Some(&hosts));
@@ -3082,13 +3312,16 @@ fn project_program(
         for binding in &mut node.source_bindings {
             let original_path = binding.source_path.clone();
             let route_key = source_route_key(host, &original_path);
-            source_routes.insert(
-                route_key.clone(),
-                ProgramSourceRoute {
-                    session: session.clone(),
-                    source_path: original_path,
-                },
-            );
+            if let Some(route) = binding.route.clone() {
+                source_routes.insert(
+                    route_key.clone(),
+                    ProgramSourceRoute {
+                        session: session.clone(),
+                        source_path: original_path,
+                        route,
+                    },
+                );
+            }
             binding.id =
                 SourceBindingId(format!("embedded/{}/{}", namespace(&host.0), binding.id.0));
             binding.source_path = route_key;
@@ -3527,9 +3760,7 @@ store: [
     request_received: SOURCE
     request_count:
         0 |> HOLD request_count {
-            LATEST {
-                store.request_received |> THEN { request_count + 1 }
-            }
+            store.request_received |> THEN { request_count + 1 }
         }
 ]
 
@@ -3621,6 +3852,61 @@ scene: Scene/Element/text(
             .nodes
             .values()
             .any(|node| node.text.as_ref().is_some_and(|text| text.text == expected))
+    }
+
+    #[test]
+    fn retained_inline_indexed_find_stays_current_without_rebuilding_the_document() {
+        let mut runtime = LiveRuntime::from_source(
+            "retained-inline-indexed-find.bn",
+            r#"
+store: [
+    select_missing: SOURCE
+    select_a: SOURCE
+    selected:
+        TEXT { b } |> HOLD selected {
+            LATEST {
+                store.select_missing |> THEN { TEXT { missing } }
+                store.select_a |> THEN { TEXT { a } }
+            }
+        }
+    items: LIST {
+        [key: TEXT { a }, value: TEXT { A }]
+        [key: TEXT { b }, value: TEXT { B }]
+    }
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label:
+            store.items
+            |> List/find(item, if: item.key == store.selected)
+            |> WHEN {
+                Found[value] => value.value
+                NotFound => TEXT { missing }
+            }
+    )
+)
+"#,
+        )
+        .unwrap();
+        assert!(frame_has_text(runtime.document_frame().unwrap(), "B"));
+
+        let missing = runtime
+            .source_event_for_path(1, "store.select_missing", &[], SourcePayload::default())
+            .unwrap();
+        let missing_turn = runtime.dispatch(missing).unwrap();
+        assert!(!missing_turn.document_patches.is_empty());
+        assert!(frame_has_text(runtime.document_frame().unwrap(), "missing"));
+        assert_eq!(missing_turn.materialization.full_evaluation_count, 1);
+
+        let found = runtime
+            .source_event_for_path(2, "store.select_a", &[], SourcePayload::default())
+            .unwrap();
+        let found_turn = runtime.dispatch(found).unwrap();
+        assert!(!found_turn.document_patches.is_empty());
+        assert!(frame_has_text(runtime.document_frame().unwrap(), "A"));
+        assert_eq!(found_turn.materialization.full_evaluation_count, 1);
     }
 
     #[test]
@@ -3883,6 +4169,7 @@ document: Document/new(
         assert_eq!(dispatched.runtime_turn.transient_effects.len(), 1);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn persistent_transient_completion_is_an_acknowledged_authority_turn() {
         let artifact = compile_program_artifact(&server_request(
@@ -4024,9 +4311,7 @@ store: [
     increment: Client/store.increment
     count:
         0 |> HOLD count {
-            LATEST {
-                increment |> THEN { count + 1 }
-            }
+            increment |> THEN { count + 1 }
         }
 ]
 
@@ -4087,9 +4372,7 @@ store: [
     increment: Client/store.increment
     count:
         40 |> HOLD count {
-            LATEST {
-                increment |> THEN { count + 1 }
-            }
+            increment |> THEN { count + 1 }
         }
     adjusted_count: count + 1
 ]
@@ -4308,13 +4591,26 @@ FUNCTION render() {
     }
 
     #[test]
-    fn public_client_profile_rejects_host_effects_and_oversized_source() {
+    fn public_client_profile_rejects_consequential_effects_and_oversized_source() {
         let effectful = compile_program_artifact(&request(
             1,
             r#"
-path: TEXT { profile.txt }
-contents: File/read_text(path: path)
-scene: Scene/Element/text(element: [], style: [], text: contents)
+store: [
+    register: SOURCE
+    result:
+        NotStarted |> HOLD result {
+            register |> THEN {
+                DevelopmentPasskey/register(
+                    workspace_id: TEXT { workspace }
+                    workspace_grant_id: TEXT { grant }
+                    account_id: TEXT { account }
+                    credential_count: 0
+                    simulation: Success
+                )
+            }
+        }
+]
+scene: Scene/Element/text(element: [], style: [], text: TEXT { profile })
 "#,
         ))
         .unwrap_err();
@@ -4475,18 +4771,23 @@ scene: Scene/Element/program(
             &requests[0].request_id,
             compile_program_artifact(&requests[0].compile),
         );
-        let route = host
+        let (route, source_route) = host
             .frame()
             .nodes
             .values()
             .find(|node| node.text.as_ref().is_some_and(|text| text.text == "Before"))
             .and_then(|node| node.primary_source_binding())
-            .map(|binding| binding.source_path.clone())
+            .and_then(|binding| {
+                binding
+                    .route
+                    .clone()
+                    .map(|source_route| (binding.source_path.clone(), source_route))
+            })
             .expect("composed child button source route");
         assert!(host.owns_source_route(&route));
 
         let (_, patches) = host
-            .dispatch(1, &route, None, SourcePayload::default())
+            .dispatch(1, &route, source_route, SourcePayload::default())
             .unwrap();
         assert!(!patches.is_empty());
         assert!(

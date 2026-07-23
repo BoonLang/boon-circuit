@@ -1,7 +1,4 @@
-use boon_parser::{
-    AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind,
-    BytesSizeSyntax, ParsedProgram, ParserItem as AstItem, ProgramKind,
-};
+use boon_parser::ParsedProgram;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -18,17 +15,16 @@ pub use semantic_migration::*;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ErasedProgram {
-    pub kind: ProgramKind,
     pub executable: ExecutableProgram,
-    pub storage: StorageCatalog,
+    pub scope_index: ErasedScopeIndex,
     pub expression_count: usize,
-    pub expressions: Vec<AstExpr>,
     pub expression_coverage: ExpressionCoverage,
     #[serde(default)]
     pub distributed_references: DistributedReferences,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_function_instances: Vec<ProducerFunctionInstance>,
     pub semantic_index: SemanticIndex,
     pub graph_node_count: usize,
-    pub nodes: Vec<IrNode>,
     pub row_scopes: Vec<RowScope>,
     pub sources: Vec<SourcePort>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -41,16 +37,13 @@ pub struct ErasedProgram {
     pub migration_edges: Vec<MigrationEdge>,
     pub output_values: Vec<OutputRootValue>,
     pub derived_values: Vec<DerivedValue>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub immediate_dependencies: Vec<ImmediateDependency>,
     pub dependencies: Vec<DependencyEdge>,
     pub possible_causes: Vec<PossibleCause>,
-    pub update_branches: Vec<UpdateBranch>,
-    pub list_operations: Vec<ListOperation>,
-    pub list_projections: Vec<ListProjection>,
-    pub functions: Vec<FunctionDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub static_owners: Vec<StaticOwnerDef>,
+    pub state_update_arms: Vec<StateUpdateArm>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_mutations: Vec<ListMutation>,
+    pub list_projections: Vec<ListProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub materializations: Vec<ContextualMaterialization>,
     pub view_bindings: Vec<ViewBinding>,
@@ -66,7 +59,7 @@ pub struct DistributedReferences {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub value_references: Vec<DistributedValueReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pure_calls: Vec<DistributedPureCall>,
+    pub calls: Vec<DistributedCall>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -85,19 +78,83 @@ pub fn distributed_event_source_path(canonical_path: &str) -> String {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DistributedPureCall {
-    pub expr_id: ExprId,
+pub struct DistributedCall {
+    pub expression: ExecutableExprId,
+    pub owner: Option<StaticOwnerId>,
     pub canonical_function: String,
     pub producer_role: boon_typecheck::ProgramRole,
-    pub result_type: boon_typecheck::Type,
-    pub arguments: Vec<DistributedPureCallArgument>,
+    pub result: boon_typecheck::FlowType,
+    pub effect: boon_typecheck::CheckedEffectSummary,
+    pub arguments: Vec<DistributedCallArgument>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invocation_arms: Vec<TriggerOwnedArm>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DistributedPureCallArgument {
+pub struct DistributedCallArgument {
     pub name: String,
-    pub expr_id: ExprId,
-    pub argument_type: boon_typecheck::Type,
+    pub value: ExecutableExprId,
+    pub flow_type: boon_typecheck::FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProducerFunctionInstance {
+    pub identity: [u8; 32],
+    pub owner: StaticOwnerId,
+    pub function: FunctionId,
+    pub function_name: String,
+    pub result_field: FieldId,
+    pub result_path: String,
+    pub root: ExecutableExprId,
+    pub mode: ProducerFunctionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_source: Option<SourceId>,
+    pub arguments: Vec<ProducerFunctionArgument>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerFunctionMode {
+    Current,
+    Invocation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProducerFunctionArgument {
+    pub name: String,
+    pub parameter: ExecutableParameterId,
+    pub flow_type: boon_typecheck::FlowType,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_expressions: Vec<ExecutableExprId>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProducerFunctionLoweringRequest {
+    pub identity: [u8; 32],
+    pub local_function: String,
+    pub mode: ProducerFunctionMode,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDistributedReferences {
+    value_references: Vec<DistributedValueReference>,
+    calls: Vec<PendingDistributedCall>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDistributedCall {
+    checked_expression: boon_typecheck::CheckedExprId,
+    canonical_function: String,
+    producer_role: boon_typecheck::ProgramRole,
+    result: boon_typecheck::FlowType,
+    effect: boon_typecheck::CheckedEffectSummary,
+    arguments: Vec<PendingDistributedCallArgument>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDistributedCallArgument {
+    name: String,
+    flow_type: boon_typecheck::FlowType,
 }
 
 macro_rules! typed_usize_ids {
@@ -128,7 +185,6 @@ typed_usize_ids!(
     ExecutableStatementId,
     ExecutableSourceId,
     ExecutableStateId,
-    NodeId,
     ScopeId,
     SourceId,
     StateId,
@@ -138,7 +194,8 @@ typed_usize_ids!(
     SourceUnitId,
     FunctionId,
     StaticOwnerId,
-    StorageBindingId,
+    ErasedBindingId,
+    ErasedReadId,
     DiagnosticSpanId,
     SemanticSymbolId,
     SemanticMemoryId,
@@ -340,10 +397,8 @@ pub struct ExpressionCoverage {
     pub distributed_reference_expression_count: usize,
     pub unknown_ast_expression_count: usize,
     pub ignored_unknown_ast_expression_count: usize,
-    pub unknown_initial_value_count: usize,
     pub unknown_list_initializer_count: usize,
     pub unknown_list_initial_value_count: usize,
-    pub unknown_update_expression_count: usize,
     pub unknown_list_predicate_count: usize,
     pub unknown_derived_value_count: usize,
     pub unknown_labels: Vec<String>,
@@ -358,10 +413,8 @@ impl ExpressionCoverage {
             distributed_reference_expression_count: 0,
             unknown_ast_expression_count: 0,
             ignored_unknown_ast_expression_count: 0,
-            unknown_initial_value_count: 0,
             unknown_list_initializer_count: 0,
             unknown_list_initial_value_count: 0,
-            unknown_update_expression_count: 0,
             unknown_list_predicate_count: 0,
             unknown_derived_value_count: 0,
             unknown_labels: Vec::new(),
@@ -371,39 +424,11 @@ impl ExpressionCoverage {
 
     pub fn unknown_total(&self) -> usize {
         self.unknown_ast_expression_count
-            + self.unknown_initial_value_count
             + self.unknown_list_initializer_count
             + self.unknown_list_initial_value_count
-            + self.unknown_update_expression_count
             + self.unknown_list_predicate_count
             + self.unknown_derived_value_count
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IrNode {
-    pub id: NodeId,
-    pub name: String,
-    pub kind: IrNodeKind,
-    pub indexed: bool,
-    pub expr_id: Option<ExprId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum IrNodeKind {
-    SourceRead,
-    PureCall,
-    When,
-    While,
-    Then,
-    Latest,
-    Hold,
-    ListAppend,
-    ListRemove,
-    ListMap,
-    ListRetain,
-    Aggregate,
-    RenderLowering,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -422,12 +447,6 @@ pub struct SourcePort {
     pub scope_id: Option<ScopeId>,
     pub interval_ms: Option<u64>,
     pub payload_schema: SourcePayloadSchema,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HostEffectCallArgument {
-    pub name: String,
-    pub value_expr_id: ExprId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -463,14 +482,6 @@ pub struct SourcePayloadSchema {
     pub fields: Vec<SourcePayloadField>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub typed_fields: Vec<SourcePayloadDescriptor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub row_lookup_field: Option<String>,
-}
-
-impl SourcePayloadSchema {
-    pub fn row_lookup_field_name(&self) -> Option<&str> {
-        self.row_lookup_field.as_deref()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -489,7 +500,7 @@ pub enum SourcePayloadField {
 }
 
 impl SourcePayloadField {
-    fn from_name(name: &str) -> Self {
+    pub fn from_name(name: &str) -> Self {
         match name {
             "address" => Self::Address,
             "bytes" => Self::Bytes,
@@ -499,7 +510,7 @@ impl SourcePayloadField {
         }
     }
 
-    fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Address => "address",
             Self::Bytes => "bytes",
@@ -514,6 +525,8 @@ impl SourcePayloadField {
 pub struct ListMemory {
     pub id: ListId,
     pub name: String,
+    #[serde(default)]
+    pub source_line: usize,
     pub row_scope_id: Option<ScopeId>,
     pub hidden_key_type: String,
     pub has_generation: bool,
@@ -526,6 +539,7 @@ pub struct ListMemory {
 pub struct StateCell {
     pub id: StateId,
     pub path: String,
+    pub published: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -535,8 +549,6 @@ pub struct StateCell {
     pub statement_id: usize,
     pub scope_id: Option<ScopeId>,
     pub hold_name: String,
-    pub initial_value: InitialValue,
-    pub initial_expr_id: Option<ExprId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expression_ids: Vec<ExprId>,
     pub indexed: bool,
@@ -592,101 +604,7 @@ pub struct ListProjection {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ListProjectionKind {
-    Chunk {
-        size: Option<usize>,
-        item_field: String,
-        label_field: String,
-    },
-    TextPrefix {
-        field: String,
-        prefix: String,
-        limit: Option<usize>,
-        normalization: ListTextNormalization,
-    },
-    IndexedQuery {
-        fields: Vec<ListQueryIndexField>,
-        selection: ListQuerySelection,
-        residual: Option<ListQueryResidual>,
-        limit: Option<usize>,
-        cursor: Option<String>,
-        unique: bool,
-        order: ListQueryOrder,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ListTextNormalization {
-    Exact,
-    TrimLowercase,
-    Tokens,
-    Unknown { value: String },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ListQueryIndexField {
-    pub path: Vec<String>,
-    pub normalization: ListTextNormalization,
-    pub multi_value: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ListQueryOrder {
-    Ascending,
-    Descending,
-    Unknown { value: String },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ListQuerySelection {
-    Exact {
-        key: String,
-    },
-    TextPrefix {
-        leading: Option<String>,
-        prefix: String,
-    },
-    Range {
-        lower: Option<String>,
-        lower_inclusive: bool,
-        upper: Option<String>,
-        upper_inclusive: bool,
-    },
-    Union {
-        keys: String,
-    },
-    Intersection {
-        keys: String,
-    },
-    Unknown {
-        value: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ListQueryResidual {
-    FieldEqual {
-        path: Vec<String>,
-        value: String,
-    },
-    TextContains {
-        path: Vec<String>,
-        needle: String,
-    },
-    NumberRange {
-        path: Vec<String>,
-        minimum: Option<String>,
-        maximum: Option<String>,
-    },
-    Wgs84Radius {
-        latitude_path: Vec<String>,
-        longitude_path: Vec<String>,
-        center_latitude: String,
-        center_longitude: String,
-        radius_meters: String,
-    },
-    Unknown {
-        value: String,
-    },
+    Chunk { size: Option<usize> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -698,6 +616,11 @@ pub struct ListInitialRecord {
 pub struct ListRowInitialField {
     pub name: String,
     pub value: InitialValue,
+    /// Exact checked executable value for this field. Static fields introduced
+    /// by a closed record spread may omit it because `value` is already the
+    /// complete, lossless constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<ExecutableExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -720,7 +643,6 @@ pub struct DerivedValue {
     pub indexed: bool,
     pub scope_id: Option<ScopeId>,
     pub startup_recompute: bool,
-    pub statement: AstStatement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -741,6 +663,17 @@ pub struct TriggerOwnedArm {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StateUpdateArm {
+    pub state: StateId,
+    pub cause: EventCause,
+    pub gate_checked_expr_id: boon_typecheck::CheckedExprId,
+    pub gate_expression_id: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StaticOwnerId>,
+    pub output_expression_id: ExecutableExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputRootValue {
     pub root: String,
     pub value_path: String,
@@ -751,10 +684,9 @@ pub struct OutputRootValue {
     pub statement_id: usize,
     pub executable_statement_id: ExecutableStatementId,
     pub value_expression_id: ExecutableExprId,
-    pub storage_binding_id: StorageBindingId,
+    pub binding_id: ErasedBindingId,
     pub line: usize,
     pub typed_contract_known: bool,
-    pub statement: AstStatement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -764,14 +696,6 @@ pub enum DerivedValueKind {
     Aggregate,
     Pure,
     Unknown,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct FunctionDefinition {
-    pub id: FunctionId,
-    pub name: String,
-    pub args: Vec<String>,
-    pub statement: AstStatement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -785,6 +709,12 @@ pub enum MaterializationResultKind {
 #[serde(transparent)]
 pub struct MaterializationLocalId(pub u32);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ExecutableCallContextId {
+    pub call_instance: usize,
+    pub ordinal: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableExpression {
     pub id: ExecutableExprId,
@@ -793,14 +723,35 @@ pub struct ExecutableExpression {
     pub effect: boon_typecheck::CheckedEffectSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
+    /// Exact semantic resource path after contextual call expansion. This is
+    /// diagnostic/addressing metadata, never runtime ownership identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_binding_path: Option<String>,
     pub kind: ExecutableExpressionKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableRecordField {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<boon_typecheck::DeclId>,
     pub name: String,
     pub value: ExecutableExprId,
     pub spread: bool,
+    #[serde(default)]
+    pub resource_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableBlockBinding {
+    pub declaration: boon_typecheck::DeclId,
+    pub value: ExecutableExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutableTextSegment {
+    Static { value: String },
+    Dynamic { value: ExecutableExprId },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -813,8 +764,17 @@ pub struct ExecutableCallArgument {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableSelectArm {
-    pub pattern: Vec<String>,
+    pub pattern: boon_typecheck::CheckedMatchPattern,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<ExecutablePatternBinding>,
     pub output: ExecutableExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutablePatternBinding {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projection: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -829,22 +789,31 @@ pub enum ExecutableCallableKind {
 pub enum ExecutableExpressionKind {
     CanonicalRead {
         target: boon_typecheck::DeclId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        storage_binding: Option<StorageBindingId>,
         path: String,
+        projection: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<boon_typecheck::CheckedSourceRead>,
+    },
+    LocalRead {
+        declaration: boon_typecheck::DeclId,
         projection: Vec<String>,
     },
     ExternalRead {
         canonical_path: String,
     },
+    ElementState {
+        context: ExecutableCallContextId,
+        projection: Vec<String>,
+    },
     Drain {
         target: boon_typecheck::DeclId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        storage_binding: Option<StorageBindingId>,
         path: String,
         projection: Vec<String>,
     },
     Text(String),
+    TextTemplate {
+        segments: Vec<ExecutableTextSegment>,
+    },
     Number(String),
     BytesByte(u8),
     Bool(bool),
@@ -860,6 +829,8 @@ pub enum ExecutableExpressionKind {
         callable_kind: ExecutableCallableKind,
         name: String,
         arguments: Vec<ExecutableCallArgument>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        contexts: Vec<ExecutableCallContextId>,
     },
     Materialize {
         materialization: usize,
@@ -891,12 +862,16 @@ pub enum ExecutableExpressionKind {
         right: ExecutableExprId,
     },
     MatchArm {
-        pattern: Vec<String>,
+        pattern: boon_typecheck::CheckedMatchPattern,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<ExecutableExprId>,
     },
     Object(Vec<ExecutableRecordField>),
     Record(Vec<ExecutableRecordField>),
+    Block {
+        bindings: Vec<ExecutableBlockBinding>,
+        result: ExecutableExprId,
+    },
     List {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capacity: Option<usize>,
@@ -929,9 +904,12 @@ pub enum ContextualOperationKind {
     Map,
     Filter,
     Retain,
+    Remove,
     Every,
     Any,
     Find,
+    SortBy,
+    ThenBy,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -963,6 +941,7 @@ pub struct ExecutableStateDef {
     pub id: ExecutableStateId,
     pub declaration: boon_typecheck::DeclId,
     pub expression: ExecutableExprId,
+    pub initial: ExecutableExprId,
     pub binding_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
@@ -1040,14 +1019,270 @@ pub enum ExecutableStatementKind {
     Expression,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StorageCatalog {
-    pub bindings: Vec<StorageBinding>,
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ErasedRowBinding {
+    pub list: ListId,
+    pub scope: ScopeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StorageBinding {
-    pub id: StorageBindingId,
+pub struct ErasedOwnerDef {
+    pub id: StaticOwnerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<StaticOwnerId>,
+    pub child_ordinal: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_row: Option<ErasedRowBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_row: Option<ErasedRowBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_row: Option<ErasedRowBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedLocalDef {
+    pub owner: StaticOwnerId,
+    pub local: MaterializationLocalId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<ErasedRowBinding>,
+    pub source: ExecutableExprId,
+    pub item_type: boon_typecheck::Type,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<ErasedLocalMember>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captures: Vec<ErasedLocalCapture>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedLocalMember {
+    pub path: Vec<String>,
+    pub target: ErasedLocalMemberTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from: Option<ErasedLocalMemberForwarding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedLocalMemberForwarding {
+    pub owner: StaticOwnerId,
+    pub local: MaterializationLocalId,
+    pub path: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedLocalCapture {
+    pub source_owner: StaticOwnerId,
+    pub source_local: MaterializationLocalId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projection: Vec<String>,
+    pub field: FieldId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum ErasedLocalMemberTarget {
+    Field(FieldId),
+    Source(SourceId),
+    State(StateId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErasedFieldRole {
+    Value,
+    ListAuthority,
+    ValueAuthority,
+    Capture,
+}
+
+impl ErasedFieldRole {
+    pub const fn is_value(self) -> bool {
+        matches!(self, Self::Value | Self::ValueAuthority)
+    }
+
+    pub const fn is_authority(self) -> bool {
+        matches!(self, Self::ListAuthority | Self::ValueAuthority)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedFieldDef {
+    pub id: FieldId,
+    pub role: ErasedFieldRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<boon_typecheck::DeclId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_owner: Option<StaticOwnerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<FieldId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<ErasedRowBinding>,
+    pub name: String,
+    pub diagnostic_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<ExecutableStatementId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<ExecutableExprId>,
+    #[serde(default)]
+    pub resource_only: bool,
+    pub flow_type: boon_typecheck::FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedReadBinding {
+    pub id: ErasedReadId,
+    pub expression: ExecutableExprId,
+    pub target: ErasedReadTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedSourceDef {
+    pub source: SourceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_owner: Option<StaticOwnerId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_ancestry: Vec<StaticOwnerId>,
+    pub origin: ErasedSourceOrigin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ErasedSourceOrigin {
+    Executable {
+        executable: ExecutableSourceId,
+        binding: ErasedBindingId,
+    },
+    DistributedImport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedDependencyUse {
+    pub dependent: ErasedBindingId,
+    pub expression: ExecutableExprId,
+    pub target: ErasedDependencyTarget,
+    pub timing: ErasedDependencyTiming,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ErasedDependencyTarget {
+    ExternalRead { read: ErasedReadId },
+    ExternalCall { reference: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ErasedDependencyTiming {
+    Immediate,
+    After {
+        boundaries: Vec<ErasedTemporalBoundary>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum ErasedTemporalBoundary {
+    Source(SourceId),
+    State(StateId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ErasedReadTarget {
+    Binding {
+        binding: ErasedBindingId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
+    },
+    SourcePayload {
+        binding: ErasedBindingId,
+        source: SourceId,
+        field: SourcePayloadField,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
+    },
+    StateProjection {
+        binding: ErasedBindingId,
+        state: StateId,
+        fields: Vec<String>,
+    },
+    Expression {
+        expression: ExecutableExprId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
+    },
+    Local {
+        declaration: boon_typecheck::DeclId,
+        value: ExecutableExprId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
+    },
+    ExternalValue {
+        reference: usize,
+    },
+    MaterializationLocal {
+        owner: StaticOwnerId,
+        local: MaterializationLocalId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
+    },
+    FunctionParameter {
+        parameter: ExecutableParameterId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedScopeIndex {
+    pub owners: Vec<ErasedOwnerDef>,
+    pub locals: Vec<ErasedLocalDef>,
+    pub fields: Vec<ErasedFieldDef>,
+    pub bindings: Vec<ErasedBinding>,
+    pub sources: Vec<ErasedSourceDef>,
+    pub reads: Vec<ErasedReadBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_values: Vec<ErasedRowValue>,
+    pub dependencies: Vec<ErasedDependencyUse>,
+}
+
+impl ErasedScopeIndex {
+    pub fn owner_descends_from(
+        &self,
+        candidate: StaticOwnerId,
+        ancestor: StaticOwnerId,
+    ) -> Result<bool, String> {
+        let mut next = Some(candidate);
+        let mut remaining = self.owners.len().saturating_add(1);
+        while let Some(owner) = next {
+            if owner == ancestor {
+                return Ok(true);
+            }
+            if remaining == 0 {
+                return Err("erased static owner ancestry contains a cycle".to_owned());
+            }
+            remaining -= 1;
+            next = self
+                .owners
+                .get(owner.as_usize())
+                .filter(|definition| definition.id == owner)
+                .ok_or_else(|| format!("missing erased static owner {owner}"))?
+                .parent;
+        }
+        Ok(false)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedRowValue {
+    pub expression: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projection: Vec<String>,
+    pub row: ErasedRowBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedBinding {
+    pub id: ErasedBindingId,
     pub declaration: boon_typecheck::DeclId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_owner: Option<StaticOwnerId>,
@@ -1056,19 +1291,17 @@ pub struct StorageBinding {
     pub flow_type: boon_typecheck::FlowType,
     pub producer: ExecutableExprId,
     pub diagnostic_path: String,
-    pub kind: StorageBindingKind,
+    pub target: ErasedBindingTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StorageBindingKind {
+pub enum ErasedBindingTarget {
     Value {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         field: Option<FieldId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        list: Option<ListId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        row_scope: Option<ScopeId>,
+        row: Option<ErasedRowBinding>,
     },
     Source {
         executable: ExecutableSourceId,
@@ -1077,6 +1310,11 @@ pub enum StorageBindingKind {
     State {
         executable: ExecutableStateId,
         runtime: StateId,
+        published: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<FieldId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row: Option<ErasedRowBinding>,
     },
 }
 
@@ -1086,6 +1324,10 @@ pub struct ContextualMaterialization {
     pub operation: ContextualOperationKind,
     pub source: ExecutableExprId,
     pub body: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<ExecutableExprId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited_order: Vec<ContextualOrderKey>,
     pub result_kind: MaterializationResultKind,
     pub row_local: MaterializationLocalId,
     pub owner: StaticOwnerId,
@@ -1093,8 +1335,33 @@ pub struct ContextualMaterialization {
     pub source_list_id: Option<ListId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_scope_id: Option<ScopeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_list_id: Option<ListId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_scope_id: Option<ScopeId>,
     pub item_type: boon_typecheck::Type,
     pub result_type: boon_typecheck::Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextualOrderKey {
+    pub operation: ContextualOperationKind,
+    pub body: ExecutableExprId,
+    pub direction: ExecutableExprId,
+}
+
+impl ContextualMaterialization {
+    pub fn expression_roots(&self) -> Vec<ExecutableExprId> {
+        let mut roots = Vec::with_capacity(3 + self.inherited_order.len() * 2);
+        roots.push(self.source);
+        roots.push(self.body);
+        roots.extend(self.direction);
+        for key in &self.inherited_order {
+            roots.push(key.body);
+            roots.push(key.direction);
+        }
+        roots
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1113,310 +1380,35 @@ pub struct DependencyEdge {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ImmediateDependency {
-    pub dependent: String,
-    pub dependency: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PossibleCause {
     pub target: String,
     pub sources: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UpdateBranch {
-    pub target: String,
-    pub source: String,
-    pub expression: UpdateExpression,
-    pub guard: Option<UpdateGuard>,
-    pub indexed: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum UpdateGuard {
-    ValueOneOf { input: String, values: Vec<String> },
-    ListIsNotEmpty { input: String, expected: bool },
-    ValuesEqual { left: String, right: String },
-    ValuesNotEqual { left: String, right: String },
-    All { guards: Vec<UpdateGuard> },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UpdateMatchArm {
-    pub pattern: String,
-    pub output: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UpdateValueMatchArm {
-    pub pattern: String,
-    pub output: UpdateValueExpression,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum UpdateValueExpression {
-    Const {
-        value: String,
-    },
-    ReadPath {
-        path: String,
-    },
-    MatchConst {
-        input: String,
-        arms: Vec<UpdateValueMatchArm>,
-    },
-    MatchTextIsEmptyConst {
-        input: String,
-        arms: Vec<UpdateValueMatchArm>,
-    },
-    NumberInfix {
-        left: String,
-        op: String,
-        right: String,
-    },
-    MatchInfixConst {
-        left: String,
-        op: String,
-        right: String,
-        arms: Vec<UpdateValueMatchArm>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BytesScalarArg {
-    Static(u64),
-    Path(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum UpdateExpression {
-    SourcePayload {
-        path: String,
-    },
-    Const {
-        value: String,
-    },
-    NumberInfix {
-        left: String,
-        op: String,
-        right: String,
-    },
-    ProjectTime {
-        pointer_x: String,
-        pointer_width: String,
-        viewport_start: String,
-        viewport_end: String,
-        fallback: String,
-    },
-    PreviousValue {
-        path: String,
-    },
-    ReadPath {
-        path: String,
-    },
-    TextTrimOrPrevious {
-        path: String,
-        previous: String,
-    },
-    PrefixPayloadConcat {
-        prefix: String,
-        payload_path: String,
-        separator: String,
-    },
-    PrefixRootConcat {
-        prefix: String,
-        path: String,
-        separator: String,
-    },
-    BoolNot {
-        path: String,
-    },
-    BytesLength {
-        path: String,
-    },
-    BytesIsEmpty {
-        path: String,
-    },
-    BytesGet {
-        path: String,
-        index: u64,
-    },
-    ListGet {
-        path: String,
-        index: u64,
-    },
-    BytesSet {
-        path: String,
-        index: u64,
-        value: u8,
-    },
-    BytesSlice {
-        path: String,
-        offset: BytesScalarArg,
-        byte_count: BytesScalarArg,
-    },
-    BytesTake {
-        path: String,
-        byte_count: BytesScalarArg,
-    },
-    BytesDrop {
-        path: String,
-        byte_count: BytesScalarArg,
-    },
-    BytesZeros {
-        byte_count: u64,
-    },
-    BytesToHex {
-        path: String,
-    },
-    BytesFromHex {
-        path: String,
-    },
-    BytesToBase64 {
-        path: String,
-    },
-    BytesFromBase64 {
-        path: String,
-    },
-    BytesReadUnsigned {
-        path: String,
-        offset: u64,
-        byte_count: u64,
-        endian: String,
-    },
-    BytesReadSigned {
-        path: String,
-        offset: u64,
-        byte_count: u64,
-        endian: String,
-    },
-    BytesWriteUnsigned {
-        path: String,
-        offset: u64,
-        byte_count: u64,
-        endian: String,
-        value: i64,
-    },
-    BytesWriteSigned {
-        path: String,
-        offset: u64,
-        byte_count: u64,
-        endian: String,
-        value: i64,
-    },
-    HostEffect {
-        operation: String,
-        call_expr_id: ExprId,
-        arguments: Vec<HostEffectCallArgument>,
-    },
-    BytesFind {
-        haystack: String,
-        needle: String,
-    },
-    BytesStartsWith {
-        path: String,
-        prefix: String,
-    },
-    BytesEndsWith {
-        path: String,
-        suffix: String,
-    },
-    TextToBytes {
-        path: String,
-        encoding: String,
-    },
-    TextToNumber {
-        path: String,
-    },
-    BytesToText {
-        path: String,
-        encoding: String,
-    },
-    BytesConcat {
-        left: String,
-        right: String,
-    },
-    BytesEqual {
-        left: String,
-        right: String,
-    },
-    MatchConst {
-        input: String,
-        arms: Vec<UpdateMatchArm>,
-    },
-    MatchValueConst {
-        input: String,
-        arms: Vec<UpdateValueMatchArm>,
-    },
-    MatchTextIsEmptyConst {
-        input: String,
-        arms: Vec<UpdateValueMatchArm>,
-    },
-    MatchInfixConst {
-        left: UpdateValueExpression,
-        op: String,
-        right: UpdateValueExpression,
-        arms: Vec<UpdateValueMatchArm>,
-    },
-    Unknown {
-        summary: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ListOperation {
+pub struct ListMutation {
     pub list_id: ListId,
-    pub list: String,
-    pub kind: ListOperationKind,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct UnboundListOperation {
-    list: String,
-    kind: ListOperationKind,
+    pub site: ExecutableExprId,
+    pub ordinal: u32,
+    pub cause: EventCause,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StaticOwnerId>,
+    pub kind: ListMutationKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ListOperationKind {
+pub enum ListMutationKind {
     Append {
-        trigger: String,
-        fields: Vec<ListAppendField>,
+        gate: ExecutableExprId,
+        item: ExecutableExprId,
     },
     Remove {
-        source: String,
-        predicate: ListPredicate,
+        gate: ExecutableExprId,
+        owner: StaticOwnerId,
+        row_local: MaterializationLocalId,
+        predicate: ExecutableExprId,
+        remove_when: bool,
     },
-    Retain {
-        target: String,
-        predicate: ListPredicate,
-    },
-    Count {
-        target: String,
-        predicate: ListPredicate,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ListAppendField {
-    pub name: String,
-    pub value: ListAppendFieldValue,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ListAppendFieldValue {
-    Source { path: String },
-    Const { value: String },
-    TypedConst { value: InitialValue },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ListPredicate {
-    AlwaysTrue,
-    RowFieldBool { path: String },
-    RowFieldBoolNot { path: String },
-    SelectedFilterVisibility { selector: String, row_field: String },
-    Unknown { summary: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1428,24 +1420,18 @@ pub struct ViewBinding {
     pub target: ViewBindingTarget,
     pub kind: ViewBindingKind,
     pub scope_id: Option<ScopeId>,
-    pub source_id: Option<SourceId>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ViewBindingTarget {
-    Storage {
-        binding: StorageBindingId,
+    Read {
+        read: ErasedReadId,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        projection: Vec<String>,
+        additional_projection: Vec<String>,
     },
-    MaterializationLocal {
-        owner: StaticOwnerId,
-        local: MaterializationLocalId,
-        projection: Vec<String>,
-    },
-    ExternalExpression {
-        expression: ExecutableExprId,
+    Source {
+        source: SourceId,
     },
 }
 
@@ -1468,20 +1454,395 @@ pub fn lower_with_external_types(
     program: &ParsedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
 ) -> Result<ErasedProgram, String> {
-    lower_with_typecheck(program, external_types, true)
+    lower_with_typecheck(program, external_types, true, &[])
 }
 
 pub fn lower_runtime_with_external_types(
     program: &ParsedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
 ) -> Result<ErasedProgram, String> {
-    lower_with_typecheck(program, external_types, false)
+    lower_with_typecheck(program, external_types, false, &[])
+}
+
+pub fn lower_runtime_with_external_types_and_producer_functions(
+    program: &ParsedProgram,
+    external_types: &boon_typecheck::ExternalTypeEnvironment,
+    requests: &[ProducerFunctionLoweringRequest],
+) -> Result<ErasedProgram, String> {
+    lower_with_typecheck(program, external_types, false, requests)
+}
+
+fn producer_identity_text(identity: [u8; 32]) -> String {
+    identity.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn next_synthetic_checked_id(next: &mut u32, kind: &str) -> Result<u32, String> {
+    let id = *next;
+    *next = next
+        .checked_add(1)
+        .ok_or_else(|| format!("checked {kind} IDs are exhausted"))?;
+    Ok(id)
+}
+
+fn checked_scope_is_within(
+    program: &boon_typecheck::CheckedProgram,
+    mut scope: boon_typecheck::LexicalScopeId,
+    ancestor: boon_typecheck::LexicalScopeId,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    while visited.insert(scope) {
+        if scope == ancestor {
+            return true;
+        }
+        let Some(parent) = program
+            .scopes
+            .iter()
+            .find(|candidate| candidate.id == scope)
+            .and_then(|scope| scope.parent)
+        else {
+            break;
+        };
+        scope = parent;
+    }
+    false
+}
+
+fn checked_function_requires_pass(
+    program: &boon_typecheck::CheckedProgram,
+    callable: &boon_typecheck::CheckedCallableSignature,
+) -> bool {
+    !callable.contexts.is_empty()
+        || program.expressions.iter().any(|expression| {
+            checked_scope_is_within(program, expression.scope_id, callable.scope_id)
+                && matches!(
+                    expression.kind,
+                    boon_typecheck::CheckedExpressionKind::Passed { .. }
+                )
+        })
+}
+
+fn elaborate_producer_function_roots(
+    program: &mut boon_typecheck::CheckedProgram,
+    requests: &[ProducerFunctionLoweringRequest],
+) -> Result<Vec<out_net::ProducerRoot>, String> {
+    let mut requests = requests.to_vec();
+    requests.sort();
+    requests.dedup();
+    for request in &requests {
+        if request.identity.iter().all(|byte| *byte == 0) {
+            return Err("producer function lowering request identity must be nonzero".to_owned());
+        }
+    }
+    for pair in requests.windows(2) {
+        if pair[0].identity == pair[1].identity {
+            return Err(format!(
+                "producer function identity {} is requested for both `{}` and `{}`",
+                producer_identity_text(pair[0].identity),
+                pair[0].local_function,
+                pair[1].local_function,
+            ));
+        }
+    }
+
+    let mut resolved = Vec::with_capacity(requests.len());
+    for request in requests {
+        let matches = program
+            .callables
+            .iter()
+            .filter(|callable| {
+                callable.kind == boon_typecheck::CheckedCallableKind::User
+                    && callable.name == request.local_function
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let callable = match matches.as_slice() {
+            [callable] => callable.clone(),
+            [] => {
+                return Err(format!(
+                    "producer function `{}` does not resolve to a user function",
+                    request.local_function
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "producer function `{}` resolves ambiguously to {} user functions",
+                    request.local_function,
+                    matches.len()
+                ));
+            }
+        };
+        if callable.result.mode != boon_typecheck::FlowMode::Continuous {
+            return Err(format!(
+                "producer function `{}` result must be continuous, found {:?}",
+                request.local_function, callable.result.mode
+            ));
+        }
+        let out_parameters = callable
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.kind != boon_typecheck::CheckedParameterKind::Value)
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>();
+        if !out_parameters.is_empty() {
+            return Err(format!(
+                "producer function `{}` has unsupported OUT parameter(s): {}",
+                request.local_function,
+                out_parameters.join(", ")
+            ));
+        }
+        if checked_function_requires_pass(program, &callable) {
+            return Err(format!(
+                "producer function `{}` has an unsupported PASS-in-signature requirement",
+                request.local_function
+            ));
+        }
+        if callable.result_expression.is_none() {
+            return Err(format!(
+                "producer function `{}` has no checked result expression",
+                request.local_function
+            ));
+        }
+        let span = program
+            .declarations
+            .iter()
+            .find(|declaration| declaration.id == callable.decl_id)
+            .map(|declaration| declaration.span)
+            .unwrap_or_default();
+        resolved.push((request, callable, span));
+    }
+
+    let mut next_declaration = program
+        .declarations
+        .iter()
+        .map(|declaration| declaration.id.0)
+        .max()
+        .map_or(0, |id| id.saturating_add(1));
+    let mut next_expression = program
+        .expressions
+        .iter()
+        .map(|expression| expression.id.0)
+        .max()
+        .map_or(0, |id| id.saturating_add(1));
+    let mut next_call = program
+        .calls
+        .iter()
+        .map(|call| call.id.0)
+        .max()
+        .map_or(0, |id| id.saturating_add(1));
+    let mut next_statement = program
+        .statements
+        .iter()
+        .map(|statement| statement.id.0)
+        .max()
+        .map_or(0, |id| id.saturating_add(1));
+    let mut roots = Vec::with_capacity(resolved.len());
+
+    for (function_ordinal, (request, callable, span)) in resolved.into_iter().enumerate() {
+        let function = FunctionId(function_ordinal);
+        let identity_text = producer_identity_text(request.identity);
+        let result_path = format!("@producer/{identity_text}/result");
+        let invocation = request.mode == ProducerFunctionMode::Invocation;
+        let invocation_flow = boon_typecheck::FlowType {
+            mode: boon_typecheck::FlowMode::PresentOrAbsent,
+            ty: callable.result.ty.clone(),
+        };
+        let invocation_source = if invocation {
+            let declaration = boon_typecheck::DeclId(next_synthetic_checked_id(
+                &mut next_declaration,
+                "declaration",
+            )?);
+            let expression = boon_typecheck::CheckedExprId(next_synthetic_checked_id(
+                &mut next_expression,
+                "expression",
+            )?);
+            let source_flow = boon_typecheck::FlowType {
+                mode: boon_typecheck::FlowMode::PresentOrAbsent,
+                ty: boon_typecheck::Type::Unknown,
+            };
+            program
+                .declarations
+                .push(boon_typecheck::CheckedDeclaration {
+                    id: declaration,
+                    scope_id: program.root_scope,
+                    name: format!("__producer_{identity_text}_invoke"),
+                    kind: boon_typecheck::CheckedDeclarationKind::Source,
+                    flow_type: source_flow.clone(),
+                    value: Some(expression),
+                    body_scope: None,
+                    span,
+                });
+            program.expressions.push(boon_typecheck::CheckedExpression {
+                id: expression,
+                scope_id: program.root_scope,
+                declaration: Some(declaration),
+                flow_type: source_flow,
+                effect: boon_typecheck::CheckedEffectSummary {
+                    emits_source: true,
+                    ..boon_typecheck::CheckedEffectSummary::default()
+                },
+                kind: boon_typecheck::CheckedExpressionKind::Source,
+                span,
+            });
+            Some(expression)
+        } else {
+            None
+        };
+        let result_declaration = boon_typecheck::DeclId(next_synthetic_checked_id(
+            &mut next_declaration,
+            "declaration",
+        )?);
+        let mut parameters = callable.parameters.clone();
+        parameters.sort_by_key(|parameter| parameter.ordinal);
+        let mut root_parameters = Vec::with_capacity(parameters.len());
+        let mut entries = Vec::with_capacity(parameters.len());
+        for parameter in parameters {
+            let checked_expression = boon_typecheck::CheckedExprId(next_synthetic_checked_id(
+                &mut next_expression,
+                "expression",
+            )?);
+            let executable_parameter = ExecutableParameterId {
+                function,
+                ordinal: parameter.ordinal,
+            };
+            program.expressions.push(boon_typecheck::CheckedExpression {
+                id: checked_expression,
+                scope_id: program.root_scope,
+                declaration: None,
+                flow_type: parameter.flow_type.clone(),
+                effect: boon_typecheck::CheckedEffectSummary::default(),
+                kind: boon_typecheck::CheckedExpressionKind::Read {
+                    target: parameter.decl_id,
+                    projection: Vec::new(),
+                    source: None,
+                },
+                span,
+            });
+            entries.push(boon_typecheck::CheckedCallEntry::Input {
+                formal: parameter.decl_id,
+                name: parameter.name.clone(),
+                value: checked_expression,
+                from_pipe: false,
+                evaluation_scope: parameter.evaluation_scope,
+            });
+            root_parameters.push(out_net::ProducerRootParameter {
+                checked_expression,
+                parameter: executable_parameter,
+                name: parameter.name,
+                flow_type: parameter.flow_type,
+            });
+        }
+
+        let call =
+            boon_typecheck::CheckedCallId(next_synthetic_checked_id(&mut next_call, "call")?);
+        let call_expression = boon_typecheck::CheckedExprId(next_synthetic_checked_id(
+            &mut next_expression,
+            "expression",
+        )?);
+        let result_expression = if invocation {
+            boon_typecheck::CheckedExprId(next_synthetic_checked_id(
+                &mut next_expression,
+                "expression",
+            )?)
+        } else {
+            call_expression
+        };
+        let result_statement = boon_typecheck::CheckedStatementId(next_synthetic_checked_id(
+            &mut next_statement,
+            "statement",
+        )?);
+        program
+            .declarations
+            .push(boon_typecheck::CheckedDeclaration {
+                id: result_declaration,
+                scope_id: program.root_scope,
+                name: format!("__producer_{identity_text}_result"),
+                kind: boon_typecheck::CheckedDeclarationKind::Field,
+                flow_type: if invocation {
+                    invocation_flow.clone()
+                } else {
+                    callable.result.clone()
+                },
+                value: Some(result_expression),
+                body_scope: None,
+                span,
+            });
+        program.calls.push(boon_typecheck::CheckedCall {
+            id: call,
+            expression: call_expression,
+            callable: callable.decl_id,
+            owner_callable: None,
+            function: callable.name.clone(),
+            entries,
+            contexts: Vec::new(),
+            pass: None,
+            type_substitutions: Vec::new(),
+            result: callable.result.clone(),
+            role: callable.role,
+            span,
+        });
+        program.expressions.push(boon_typecheck::CheckedExpression {
+            id: call_expression,
+            scope_id: program.root_scope,
+            declaration: (!invocation).then_some(result_declaration),
+            flow_type: callable.result.clone(),
+            effect: callable.effect,
+            kind: boon_typecheck::CheckedExpressionKind::Call { call },
+            span,
+        });
+        if let Some(source_expression) = invocation_source {
+            program.expressions.push(boon_typecheck::CheckedExpression {
+                id: result_expression,
+                scope_id: program.root_scope,
+                declaration: Some(result_declaration),
+                flow_type: invocation_flow.clone(),
+                effect: boon_typecheck::CheckedEffectSummary {
+                    emits_source: true,
+                    ..callable.effect
+                },
+                kind: boon_typecheck::CheckedExpressionKind::Then {
+                    input: source_expression,
+                    output: Some(call_expression),
+                },
+                span,
+            });
+        }
+        program.statements.push(boon_typecheck::CheckedStatement {
+            id: result_statement,
+            scope_id: program.root_scope,
+            kind: boon_typecheck::CheckedStatementKind::Field {
+                declaration: result_declaration,
+            },
+            value: Some(result_expression),
+            value_use: boon_typecheck::CheckedValueUse::RuntimeValue,
+            children: Vec::new(),
+            span,
+        });
+        roots.push(out_net::ProducerRoot {
+            identity: request.identity,
+            mode: request.mode,
+            call,
+            function,
+            function_name: callable.name,
+            result_statement,
+            result_declaration,
+            result_path,
+            result_type: if invocation {
+                invocation_flow
+            } else {
+                callable.result
+            },
+            invocation_source_expression: invocation_source,
+            parameters: root_parameters,
+        });
+    }
+    Ok(roots)
 }
 
 fn lower_with_typecheck(
     program: &ParsedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
     include_type_hints: bool,
+    producer_requests: &[ProducerFunctionLoweringRequest],
 ) -> Result<ErasedProgram, String> {
     let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
     let trace_phase = |phase: &str, elapsed_ms: f64| {
@@ -1557,8 +1918,26 @@ fn lower_with_typecheck(
     let checked_program = check_output
         .program
         .ok_or_else(|| "typecheck produced no CheckedProgram for valid source".to_owned())?;
+    lower_checked(checked_program, producer_requests)
+}
+
+pub fn lower_checked(
+    mut checked_program: boon_typecheck::CheckedProgram,
+    producer_requests: &[ProducerFunctionLoweringRequest],
+) -> Result<ErasedProgram, String> {
+    let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
+    let trace_phase = |phase: &str, elapsed_ms: f64| {
+        if trace_lower {
+            eprintln!("boon_ir lower {phase}: {elapsed_ms:.3}ms");
+        }
+    };
     validate_checked_program_for_lowering(&checked_program)?;
-    let out_net = out_net::OutNet::build(&checked_program);
+    let source_expression_count = checked_program
+        .lowering_metadata
+        .original_source_expression_count;
+    let producer_roots =
+        elaborate_producer_function_roots(&mut checked_program, producer_requests)?;
+    let out_net = out_net::OutNet::build_with_producer_roots(&checked_program, producer_roots);
     if out_net.has_errors() {
         return Err(out_net
             .diagnostics
@@ -1567,32 +1946,20 @@ fn lower_with_typecheck(
             .collect::<Vec<_>>()
             .join("; "));
     }
-    let mut distributed_references = distributed_references(&checked_program, external_types)?;
-    let nodes_started = Instant::now();
-    let nodes = source_driven_nodes(program);
-    let nodes_ms = lower_elapsed_ms(nodes_started);
-    trace_phase("source_driven_nodes", nodes_ms);
-    let fields_started = Instant::now();
-    let fields = typed_field_defs(program);
-    bind_distributed_reference_aliases(&fields, &mut distributed_references.value_references);
-    let fields_ms = lower_elapsed_ms(fields_started);
-    trace_phase("typed_field_defs", fields_ms);
-    let direct_sources_started = Instant::now();
-    let mut direct_sources = direct_source_refs_by_path(&fields, program, &checked_program)?;
-    add_distributed_event_source_refs(
-        &fields,
-        &distributed_references.value_references,
-        &mut direct_sources,
-    );
-    let direct_sources_ms = lower_elapsed_ms(direct_sources_started);
-    trace_phase("direct_source_refs", direct_sources_ms);
-    let row_scopes_started = Instant::now();
-    let mut row_scopes = row_scopes(program);
-    let row_scopes_ms = lower_elapsed_ms(row_scopes_started);
-    trace_phase("row_scopes", row_scopes_ms);
+    let pending_distributed_references =
+        distributed_references(&checked_program, &checked_program.external_types)?;
+    let mut distributed_references = DistributedReferences {
+        value_references: pending_distributed_references.value_references.clone(),
+        calls: Vec::new(),
+    };
+    // Row scopes and list storage are structural products of checked
+    // contextual materializations. Parser-discovered row-scope metadata was a
+    // second ownership model and was discarded by
+    // `materialize_typed_derived_list_storage` later in this pass.
+    let mut row_scopes = Vec::new();
     let sources_started = Instant::now();
-    let mut sources = program
-        .source_ports
+    let mut sources = checked_program
+        .sources
         .iter()
         .enumerate()
         .map(|(id, source)| SourcePort {
@@ -1600,18 +1967,14 @@ fn lower_with_typecheck(
             binding_path: source.binding_path.clone(),
             executable_source_id: None,
             static_owner: None,
-            source_expr_id: source.expr_id.map(ExprId),
+            source_expr_id: source
+                .expression
+                .map(|expression| ExprId(expression.0 as usize)),
             source_line: source.line,
             scoped: source.scoped,
-            scope_id: scope_id_for_path(&row_scopes, &source.path),
+            scope_id: None,
             interval_ms: source.interval_ms,
-            payload_schema: source_payload_schema(
-                program,
-                &fields,
-                &direct_sources,
-                &typecheck_report,
-                &source.path,
-            ),
+            payload_schema: source_payload_schema(&checked_program.lowering_metadata, &source.path),
             path: source.path.clone(),
         })
         .collect::<Vec<_>>();
@@ -1647,163 +2010,97 @@ fn lower_with_typecheck(
             payload_schema: SourcePayloadSchema {
                 fields: Vec::new(),
                 typed_fields: Vec::new(),
-                row_lookup_field: None,
             },
         });
     }
     let sources_ms = lower_elapsed_ms(sources_started);
     trace_phase("sources", sources_ms);
-    let state_cells_started = Instant::now();
-    let mut state_cells = program
-        .state_cells
-        .iter()
-        .enumerate()
-        .map(|(id, cell)| {
-            let field = fields.iter().find(|field| field.path == cell.path);
-            let mut expression_ids = cell
-                .expr_id
-                .into_iter()
-                .map(ExprId)
-                .chain(
-                    field
-                        .into_iter()
-                        .flat_map(|field| field.ast_exprs.iter())
-                        .map(|expr| ExprId(expr.id)),
-                )
-                .collect::<Vec<_>>();
-            expression_ids.sort_unstable();
-            expression_ids.dedup();
-            StateCell {
-                id: StateId(id),
-                path: cell.path.clone(),
-                semantic_path: None,
-                executable_state_id: None,
-                static_owner: None,
-                statement_id: field.map_or(usize::MAX, |field| field.statement.id),
-                scope_id: scope_id_for_path(&row_scopes, &cell.path),
-                hold_name: cell.hold_name.clone(),
-                initial_value: field
-                    .map(|field| field_initial_value(field, &row_scopes, &fields))
-                    .unwrap_or_else(|| InitialValue::Unknown {
-                        summary: "missing initial value".to_owned(),
-                    }),
-                initial_expr_id: field
-                    .and_then(field_initial_expr)
-                    .map(|expr| ExprId(expr.id)),
-                expression_ids,
-                indexed: cell.indexed,
-                source_line: cell.line,
-            }
-        })
-        .collect::<Vec<_>>();
-    let state_cells_ms = lower_elapsed_ms(state_cells_started);
-    trace_phase("state_cells", state_cells_ms);
-    let mut immediate_dependencies =
-        immediate_field_dependencies(&fields, &state_cells, &typecheck_report);
-    let verify_cycles_started = Instant::now();
-    verify_combinational_field_cycles(program, &fields, &state_cells)?;
-    let verify_cycles_ms = lower_elapsed_ms(verify_cycles_started);
-    trace_phase("verify_combinational_field_cycles", verify_cycles_ms);
-    let lists_started = Instant::now();
-    let mut lists = program
-        .list_memories
-        .iter()
-        .filter(|list| !is_output_registry_value_path(&list.name))
-        .enumerate()
-        .map(|(id, list)| ListMemory {
-            id: ListId(id),
-            name: list.name.clone(),
-            row_scope_id: scope_id_for_list(&row_scopes, &list.name),
-            hidden_key_type: hidden_key_type(&list.name),
-            has_generation: true,
-            graph_clones_per_item: 0,
-            capacity: list.capacity,
-            initializer: list_initializer(program, list),
-        })
-        .collect::<Vec<_>>();
-    let lists_ms = lower_elapsed_ms(lists_started);
-    trace_phase("lists", lists_ms);
-    if nodes
-        .iter()
-        .any(|node| matches!(node.kind, IrNodeKind::ListMap) && !node.indexed)
-    {
-        return Err("List/map node must be indexed".to_owned());
-    }
-    let dependencies_started = Instant::now();
-    let mut candidate_sources = CandidateSourceIndex::new(&fields, &direct_sources, &state_cells);
-    let mut dependencies = dependency_edges(program, &state_cells, &mut candidate_sources);
-    let dependencies_ms = lower_elapsed_ms(dependencies_started);
-    trace_phase("dependency_edges", dependencies_ms);
-    let possible_causes_started = Instant::now();
-    let mut possible_causes = possible_causes(&state_cells, &mut candidate_sources);
-    let possible_causes_ms = lower_elapsed_ms(possible_causes_started);
-    trace_phase("possible_causes", possible_causes_ms);
-    let update_branches_started = Instant::now();
-    let resolved_constants = ResolvedConstantLookup::new(&typecheck_report);
-    let mut update_branches = update_branches(
-        program,
-        &state_cells,
-        &fields,
-        &direct_sources,
-        &mut candidate_sources,
-        &resolved_constants,
-    );
-    verify_host_effect_calls_scheduled(program, &update_branches)?;
-    let update_branches_ms = lower_elapsed_ms(update_branches_started);
-    trace_phase("update_branches", update_branches_ms);
-    let list_operations_started = Instant::now();
-    let unbound_list_operations = unbound_list_operations(program);
-    let list_projections_started = Instant::now();
-    let list_projections = list_projections(program);
-    let list_projections_ms = lower_elapsed_ms(list_projections_started);
-    trace_phase("list_projections", list_projections_ms);
-    let functions_started = Instant::now();
-    let functions = function_definitions(program);
-    let functions_ms = lower_elapsed_ms(functions_started);
-    trace_phase("function_definitions", functions_ms);
+    // Executable expansion is the sole authority for state and list resource
+    // allocation. The old parser-derived records were overwritten below and
+    // could disagree with contextual expansion before being discarded.
+    let mut lists = Vec::new();
+    let contextual_materializations_started = Instant::now();
     let (mut materializations, materialization_expressions) =
         contextual_materializations(&checked_program, &out_net.graph)?;
+    trace_phase(
+        "contextual_materializations",
+        lower_elapsed_ms(contextual_materializations_started),
+    );
+    let executable_started = Instant::now();
     let mut executable = contextual_expansion::derive_executable_program(
         &checked_program,
         &out_net.graph,
         &materializations,
-        &distributed_references,
         materialization_expressions,
     )
     .map_err(|error| error.to_string())?;
-    let derived_list_storage =
-        materialize_typed_derived_list_storage(&executable, &mut row_scopes, &mut lists)?;
-    let mut list_operations = bind_list_operations(unbound_list_operations, &lists)?;
-    let list_operations_ms = lower_elapsed_ms(list_operations_started);
-    trace_phase("list_operations", list_operations_ms);
-    let materialization_target_lists =
-        materialization_target_lists(&executable, &materializations, &derived_list_storage)?;
-    let mut resource_aliases = bind_executable_state_resources(
+    trace_phase(
+        "derive_executable_program",
+        lower_elapsed_ms(executable_started),
+    );
+    distributed_references.calls = concrete_distributed_calls(
+        &executable,
+        &materializations,
+        &pending_distributed_references.calls,
+    )?;
+    bind_distributed_reference_aliases(
+        &checked_program,
+        &executable,
+        &mut distributed_references.value_references,
+    )?;
+    let derived_list_storage_started = Instant::now();
+    let derived_list_storage = materialize_typed_derived_list_storage(
+        &checked_program,
+        &executable,
+        &materializations,
+        &mut row_scopes,
+        &mut lists,
+    )?;
+    trace_phase(
+        "materialize_typed_derived_list_storage",
+        lower_elapsed_ms(derived_list_storage_started),
+    );
+    let materialization_target_lists = materialization_target_lists(
+        &executable,
+        &materializations,
+        &derived_list_storage,
+        &out_net.graph.static_owners,
+    )?;
+    bind_contextual_materialization_targets(
+        &materialization_target_lists,
+        &lists,
+        &mut materializations,
+    )?;
+    let list_projections_started = Instant::now();
+    let list_projections = executable_list_projections(
+        &executable,
+        &materializations,
+        &derived_list_storage,
+        &lists,
+    )?;
+    trace_phase(
+        "list_projections",
+        lower_elapsed_ms(list_projections_started),
+    );
+    let (mut state_cells, mut resource_aliases) = bind_executable_state_resources(
+        &checked_program,
         &executable,
         &materialization_target_lists,
         &lists,
-        &mut state_cells,
     )?;
     let source_aliases = bind_executable_source_resources(
         &checked_program,
         &executable,
         &materialization_target_lists,
         &lists,
-        program.source_ports.len(),
+        checked_program.sources.len(),
         &mut sources,
     )?;
     merge_resource_aliases(&mut resource_aliases, source_aliases)?;
-    canonicalize_update_branches(&mut update_branches, &resource_aliases);
-    canonicalize_runtime_resource_metadata(
-        &mut immediate_dependencies,
-        &mut dependencies,
-        &mut possible_causes,
-        &mut list_operations,
-        &mut state_cells,
-        &resource_aliases,
-    );
+    resource_aliases.bind_owner_parents(&out_net.graph.static_owners)?;
     bind_contextual_materialization_storage(
         &executable,
+        &out_net.graph.static_owners,
         &derived_list_storage,
         &row_scopes,
         &lists,
@@ -1811,52 +2108,166 @@ fn lower_with_typecheck(
         &state_cells,
         &mut materializations,
     )?;
+    let list_mutations_started = Instant::now();
+    let list_mutations = exact_list_mutations(
+        &executable,
+        &out_net.graph.static_owners,
+        &derived_list_storage,
+        &row_scopes,
+        &sources,
+        &state_cells,
+        &materializations,
+    )?;
+    trace_phase("list_mutations", lower_elapsed_ms(list_mutations_started));
+    let producer_result_owners = producer_result_owners(&out_net.graph)?;
+    bind_producer_invocation_source_owners(
+        &out_net.graph,
+        &executable,
+        &producer_result_owners,
+        &mut sources,
+    )?;
+    let mut erased_fields = build_erased_fields(
+        &checked_program,
+        &executable,
+        &lists,
+        &derived_list_storage,
+        &materializations,
+        &list_mutations,
+        &producer_result_owners,
+    )?;
+    let producer_function_instances = concrete_producer_function_instances(
+        &out_net.graph,
+        &executable,
+        &erased_fields,
+        &sources,
+    )?;
+    bind_indexed_state_fields(
+        &checked_program,
+        &executable,
+        &lists,
+        &state_cells,
+        &mut erased_fields,
+    )?;
     let derived_values_started = Instant::now();
     let mut derived_values = derived_values(
-        program,
+        &checked_program,
         &executable,
+        &out_net.graph.static_owners,
         &row_scopes,
         &derived_list_storage,
-        &fields,
+        &erased_fields,
         &state_cells,
         &sources,
         &materializations,
+        &producer_function_instances,
         &distributed_references.value_references,
     )?;
-    for value in &mut derived_values {
-        value.path = canonical_resource_path(&value.path, &resource_aliases);
-        for source in &mut value.sources {
-            *source = canonical_resource_path(source, &resource_aliases);
-        }
-    }
-    let derived_values_ms = lower_elapsed_ms(derived_values_started);
-    trace_phase("derived_values", derived_values_ms);
-    let semantic_fields = semantic_field_entries(
-        &fields,
-        &row_scopes,
-        &state_cells,
-        &lists,
-        &derived_list_storage,
-    );
-    let storage = build_storage_catalog(
+    derived_values.extend(producer_derived_values(
         &executable,
         &out_net.graph.static_owners,
+        &row_scopes,
+        &derived_list_storage,
+        &state_cells,
+        &sources,
+        &materializations,
+        &producer_function_instances,
+    )?);
+    let state_update_arms = state_update_arms(
+        &executable,
+        &out_net.graph.static_owners,
+        &row_scopes,
+        &derived_list_storage,
+        &sources,
+        &state_cells,
+        &materializations,
+    )?;
+    let dependencies_started = Instant::now();
+    let mut dependencies = exact_dependency_edges(&state_update_arms, &sources, &state_cells)?;
+    let dependencies_ms = lower_elapsed_ms(dependencies_started);
+    trace_phase("dependency_edges", dependencies_ms);
+    let possible_causes_started = Instant::now();
+    let mut possible_causes = exact_possible_causes(&state_update_arms, &sources, &state_cells)?;
+    let possible_causes_ms = lower_elapsed_ms(possible_causes_started);
+    trace_phase("possible_causes", possible_causes_ms);
+    verify_executable_host_effect_calls_scheduled(&executable, &state_update_arms)?;
+    canonicalize_runtime_resource_metadata(
+        &mut dependencies,
+        &mut possible_causes,
+        &mut state_cells,
+        &sources,
+        &resource_aliases,
+    )?;
+    let derived_values_ms = lower_elapsed_ms(derived_values_started);
+    trace_phase("derived_values", derived_values_ms);
+    bind_derived_field_ids(&mut derived_values, &erased_fields)?;
+    let semantic_fields = semantic_field_entries(&erased_fields, &derived_values, &state_cells);
+    let mut scope_index = build_erased_scope_index(
+        &executable,
+        &out_net.graph.static_owners,
+        &materializations,
         &sources,
         &state_cells,
         &lists,
         &derived_list_storage,
-        &derived_values,
-        &semantic_fields,
+        std::mem::take(&mut erased_fields),
     )?;
-    bind_executable_storage_reads(&mut executable, &storage, &out_net.graph.static_owners)?;
+    mark_forwarded_executable_resource_fields(&mut executable, &scope_index)?;
+    bind_detached_state_captures(
+        &executable,
+        &materializations,
+        &sources,
+        &lists,
+        &state_update_arms,
+        &mut scope_index,
+    )?;
+    let read_roots = executable_read_root_bindings(
+        &checked_program,
+        &executable,
+        &materializations,
+        &scope_index,
+        &out_net.graph.static_owners,
+    )?;
+    scope_index.reads = build_erased_read_bindings(
+        &executable,
+        &out_net.graph.static_owners,
+        &materializations,
+        &sources,
+        &scope_index,
+        &distributed_references,
+        &read_roots,
+    )?;
+    scope_index.row_values = build_erased_row_values(&executable, &materializations, &scope_index)?;
+    scope_index.dependencies = build_erased_dependency_uses(
+        &executable,
+        &materializations,
+        &distributed_references,
+        &scope_index,
+    )?;
+    bind_distributed_call_invocation_arms(
+        &executable,
+        &out_net.graph.static_owners,
+        &scope_index,
+        &derived_list_storage,
+        &row_scopes,
+        &sources,
+        &state_cells,
+        &materializations,
+        &mut distributed_references.calls,
+    )?;
     let output_values_started = Instant::now();
-    let output_values = output_root_values(program, &typecheck_report, &executable, &storage)?;
+    let output_values = output_root_values(
+        &checked_program,
+        &checked_program.lowering_metadata,
+        &executable,
+        &scope_index,
+    )?;
     let output_values_ms = lower_elapsed_ms(output_values_started);
     trace_phase("output_values", output_values_ms);
     let view_bindings_started = Instant::now();
     let view_bindings = view_bindings(
         &executable,
-        &storage,
+        &out_net.graph.static_owners,
+        &scope_index,
         &derived_list_storage,
         &output_values,
         &row_scopes,
@@ -1868,71 +2279,71 @@ fn lower_with_typecheck(
     trace_phase("view_bindings", view_bindings_ms);
     let expression_coverage_started = Instant::now();
     let expression_coverage = expression_coverage(
-        program,
-        &nodes,
-        &state_cells,
+        &checked_program,
+        source_expression_count,
+        &executable,
         &lists,
         &derived_values,
-        &update_branches,
-        &list_operations,
         &distributed_references,
     );
     let expression_coverage_ms = lower_elapsed_ms(expression_coverage_started);
     trace_phase("expression_coverage", expression_coverage_ms);
     let semantic_index_started = Instant::now();
     let semantic_index = semantic_index(
-        program,
+        &checked_program,
         &row_scopes,
         &sources,
         &lists,
-        &functions,
         &view_bindings,
-        &typecheck_report,
+        &output_values,
+        &checked_program.lowering_metadata,
         semantic_fields,
     );
     let semantic_index_ms = lower_elapsed_ms(semantic_index_started);
     trace_phase("semantic_index", semantic_index_ms);
     let semantic_migration_started = Instant::now();
     let (semantic_memory, migration_edges) = lower_semantic_memory_and_migrations(
-        program,
-        &fields,
-        &row_scopes,
+        &checked_program,
+        &executable,
         &state_cells,
         &lists,
+        &materializations,
         &derived_list_storage,
-        &typecheck_report,
+        &scope_index,
     )?;
     let semantic_migration_ms = lower_elapsed_ms(semantic_migration_started);
     trace_phase("semantic_memory_and_migrations", semantic_migration_ms);
+    let graph_node_count = executable.expressions.len();
     let typed = ErasedProgram {
-        kind: program.kind,
         executable,
-        storage,
-        expression_count: program.expressions.len(),
-        expressions: program.expressions.clone(),
+        scope_index,
+        expression_count: source_expression_count,
         expression_coverage,
         distributed_references,
+        producer_function_instances,
         semantic_index,
-        graph_node_count: nodes.len(),
-        nodes,
+        graph_node_count,
         row_scopes,
         sources,
-        host_ports: host_port_declarations(&typecheck_report),
+        host_ports: host_port_declarations(&checked_program.lowering_metadata),
         output_values,
         dependencies,
         possible_causes,
-        update_branches,
-        list_operations,
+        state_update_arms,
+        list_mutations,
         list_projections,
-        functions,
-        static_owners: out_net.graph.static_owners.clone(),
         materializations,
         view_bindings,
-        expression_types: typecheck_report.expr_type_table,
-        function_types: typecheck_report.function_type_table,
-        named_value_types: typecheck_report.named_value_type_table,
+        expression_types: checked_program.lowering_metadata.expr_type_table.clone(),
+        function_types: checked_program
+            .lowering_metadata
+            .function_type_table
+            .clone(),
+        named_value_types: checked_program
+            .lowering_metadata
+            .named_value_type_table
+            .clone(),
         derived_values,
-        immediate_dependencies,
         state_cells,
         lists,
         semantic_memory,
@@ -1941,7 +2352,7 @@ fn lower_with_typecheck(
         static_schedule_verified: true,
     };
     let verify_static_started = Instant::now();
-    verify_storage_catalog(&typed)?;
+    verify_erased_scope_index(&typed)?;
     verify_static_schedule(&typed)?;
     let verify_static_ms = lower_elapsed_ms(verify_static_started);
     trace_phase("verify_static_schedule", verify_static_ms);
@@ -1952,23 +2363,1855 @@ fn lower_with_typecheck(
     Ok(typed)
 }
 
-fn build_storage_catalog(
+fn producer_result_owners(
+    out_net: &out_net::OutNet,
+) -> Result<BTreeMap<ExecutableStatementId, StaticOwnerId>, String> {
+    out_net
+        .producer_roots()
+        .iter()
+        .map(|root| {
+            let call = out_net
+                .producer_root_for_identity(root.identity)
+                .ok_or_else(|| {
+                    format!(
+                        "producer function identity {} has no concrete root call frame",
+                        producer_identity_text(root.identity)
+                    )
+                })?;
+            let instance = out_net
+                .call_instances
+                .get(call.as_usize())
+                .filter(|instance| instance.id == call && instance.parent.is_none())
+                .ok_or_else(|| {
+                    format!(
+                        "producer function identity {} root frame is not static",
+                        producer_identity_text(root.identity)
+                    )
+                })?;
+            let owner = instance.owner.ok_or_else(|| {
+                format!(
+                    "producer function identity {} root frame has no static owner",
+                    producer_identity_text(root.identity)
+                )
+            })?;
+            Ok((
+                ExecutableStatementId(root.result_statement.0 as usize),
+                owner,
+            ))
+        })
+        .collect()
+}
+
+fn producer_invocation_source_id(
+    producer: &out_net::ProducerRoot,
+    executable: &ExecutableProgram,
+    sources: &[SourcePort],
+) -> Result<Option<SourceId>, String> {
+    let Some(checked_expression) = producer.invocation_source_expression else {
+        return Ok(None);
+    };
+    let expression = executable
+        .expressions
+        .iter()
+        .find(|expression| {
+            expression.checked_expr_id == checked_expression
+                && matches!(expression.kind, ExecutableExpressionKind::Source { .. })
+        })
+        .ok_or_else(|| {
+            format!(
+                "producer function identity {} has no executable invocation SOURCE",
+                producer_identity_text(producer.identity)
+            )
+        })?;
+    let executable_source = executable
+        .sources
+        .iter()
+        .find(|source| source.expression == expression.id)
+        .ok_or_else(|| {
+            format!(
+                "producer function identity {} invocation expression has no source definition",
+                producer_identity_text(producer.identity)
+            )
+        })?;
+    sources
+        .iter()
+        .find(|source| source.executable_source_id == Some(executable_source.id))
+        .map(|source| Some(source.id))
+        .ok_or_else(|| {
+            format!(
+                "producer function identity {} invocation SOURCE has no runtime source",
+                producer_identity_text(producer.identity)
+            )
+        })
+}
+
+fn bind_producer_invocation_source_owners(
+    out_net: &out_net::OutNet,
+    executable: &ExecutableProgram,
+    result_owners: &BTreeMap<ExecutableStatementId, StaticOwnerId>,
+    sources: &mut [SourcePort],
+) -> Result<(), String> {
+    for producer in out_net.producer_roots() {
+        let Some(source_id) = producer_invocation_source_id(producer, executable, sources)? else {
+            continue;
+        };
+        let statement = ExecutableStatementId(producer.result_statement.0 as usize);
+        let owner = result_owners.get(&statement).copied().ok_or_else(|| {
+            format!(
+                "producer function identity {} invocation SOURCE has no call-site owner",
+                producer_identity_text(producer.identity)
+            )
+        })?;
+        let source = sources
+            .get_mut(source_id.as_usize())
+            .filter(|source| source.id == source_id)
+            .ok_or_else(|| "producer invocation source ID is not canonical".to_owned())?;
+        source.static_owner = Some(owner);
+    }
+    Ok(())
+}
+
+fn concrete_producer_function_instances(
+    out_net: &out_net::OutNet,
+    executable: &ExecutableProgram,
+    fields: &[ErasedFieldDef],
+    sources: &[SourcePort],
+) -> Result<Vec<ProducerFunctionInstance>, String> {
+    let result_owners = producer_result_owners(out_net)?;
+    let mut instances = Vec::with_capacity(out_net.producer_roots().len());
+    for producer in out_net.producer_roots() {
+        let statement_id = ExecutableStatementId(producer.result_statement.0 as usize);
+        let statement = executable
+            .statements
+            .iter()
+            .find(|statement| statement.id == statement_id)
+            .ok_or_else(|| {
+                format!(
+                    "producer function identity {} has no executable result statement {}",
+                    producer_identity_text(producer.identity),
+                    statement_id
+                )
+            })?;
+        let root = statement.value.ok_or_else(|| {
+            format!(
+                "producer function identity {} result statement {} has no value",
+                producer_identity_text(producer.identity),
+                statement_id
+            )
+        })?;
+        let owner = result_owners[&statement_id];
+        let result_fields = fields
+            .iter()
+            .filter(|field| {
+                field.statement == Some(statement_id)
+                    && field.declaration == Some(producer.result_declaration)
+                    && field.diagnostic_path == producer.result_path
+                    && field.static_owner == Some(owner)
+            })
+            .collect::<Vec<_>>();
+        let result_field = match result_fields.as_slice() {
+            [field] => field.id,
+            _ => {
+                return Err(format!(
+                    "producer function identity {} result has {} exact erased fields",
+                    producer_identity_text(producer.identity),
+                    result_fields.len()
+                ));
+            }
+        };
+        let function = executable
+            .functions
+            .iter()
+            .find(|function| function.id == producer.function)
+            .ok_or_else(|| {
+                format!(
+                    "producer function identity {} has no concrete function {}",
+                    producer_identity_text(producer.identity),
+                    producer.function
+                )
+            })?;
+        if function.root != root || function.name != producer.function_name {
+            return Err(format!(
+                "producer function identity {} concrete function metadata differs from its root",
+                producer_identity_text(producer.identity)
+            ));
+        }
+        let arguments = producer
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let mut input_expressions = executable
+                    .expressions
+                    .iter()
+                    .filter_map(|expression| match expression.kind {
+                        ExecutableExpressionKind::FunctionParameter {
+                            parameter: candidate,
+                            ..
+                        } if candidate == parameter.parameter => Some(expression.id),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                input_expressions.sort_unstable();
+                input_expressions.dedup();
+                ProducerFunctionArgument {
+                    name: parameter.name.clone(),
+                    parameter: parameter.parameter,
+                    flow_type: parameter.flow_type.clone(),
+                    input_expressions,
+                }
+            })
+            .collect();
+        instances.push(ProducerFunctionInstance {
+            identity: producer.identity,
+            owner,
+            function: producer.function,
+            function_name: producer.function_name.clone(),
+            result_field,
+            result_path: producer.result_path.clone(),
+            root,
+            mode: producer.mode,
+            invocation_source: producer_invocation_source_id(producer, executable, sources)?,
+            arguments,
+        });
+    }
+    instances.sort_by_key(|instance| instance.identity);
+    Ok(instances)
+}
+
+fn build_erased_fields(
+    checked: &boon_typecheck::CheckedProgram,
+    executable: &ExecutableProgram,
+    lists: &[ListMemory],
+    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    materializations: &[ContextualMaterialization],
+    list_mutations: &[ListMutation],
+    producer_result_owners: &BTreeMap<ExecutableStatementId, StaticOwnerId>,
+) -> Result<Vec<ErasedFieldDef>, String> {
+    let owner_rows = materializations
+        .iter()
+        .map(|materialization| {
+            let source_row = paired_row_binding(
+                materialization.source_list_id,
+                materialization.source_scope_id,
+                "source",
+                materialization.owner,
+            )?;
+            let target_row = paired_row_binding(
+                materialization.target_list_id,
+                materialization.target_scope_id,
+                "target",
+                materialization.owner,
+            )?;
+            Ok((materialization.owner, target_row.or(source_row)))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let statement_parents = executable_statement_parents(executable);
+    let direct_storage_statements = direct_erased_storage_statements(executable);
+    let mut fields = Vec::new();
+    let mut statement_fields = BTreeMap::new();
+    for statement in &executable.statements {
+        if !direct_storage_statements.contains(&statement.id) {
+            continue;
+        }
+        let (name, diagnostic_path) = match &statement.kind {
+            ExecutableStatementKind::Field { name, path } => (name.clone(), path.clone()),
+            ExecutableStatementKind::List {
+                name: Some(name),
+                path: Some(path),
+                ..
+            } => (name.clone(), path.clone()),
+            ExecutableStatementKind::Source {
+                name: Some(name),
+                path: Some(path),
+                ..
+            }
+            | ExecutableStatementKind::Hold {
+                name: Some(name),
+                path: Some(path),
+                ..
+            } => (name.clone(), path.clone()),
+            _ => continue,
+        };
+        let (Some(declaration), Some(producer), Some(flow_type)) = (
+            statement.declaration,
+            statement.value,
+            statement.flow_type.clone(),
+        ) else {
+            continue;
+        };
+        let expression = executable
+            .expressions
+            .get(producer.as_usize())
+            .filter(|expression| expression.id == producer)
+            .ok_or_else(|| {
+                format!(
+                    "field declaration {} statement {} references missing producer {producer}",
+                    declaration.0, statement.id
+                )
+            })?;
+        let id = FieldId(fields.len());
+        let static_owner = producer_result_owners
+            .get(&statement.id)
+            .copied()
+            .or(expression.owner);
+        statement_fields.insert(statement.id, id);
+        fields.push(ErasedFieldDef {
+            id,
+            role: ErasedFieldRole::Value,
+            declaration: Some(declaration),
+            static_owner,
+            parent: None,
+            row: static_owner.and_then(|owner| owner_rows.get(&owner).copied().flatten()),
+            name,
+            diagnostic_path,
+            statement: Some(statement.id),
+            producer: Some(producer),
+            resource_only: false,
+            flow_type,
+        });
+    }
+    for field in &mut fields {
+        field.parent = field
+            .statement
+            .and_then(|statement| statement_parents.get(&statement))
+            .and_then(|parent| statement_fields.get(parent))
+            .copied();
+    }
+
+    for (statement, storage) in list_storage {
+        let row = ErasedRowBinding {
+            list: storage.list_id,
+            scope: storage.row_scope_id,
+        };
+        let list = lists
+            .get(storage.list_id.as_usize())
+            .filter(|list| list.id == storage.list_id)
+            .ok_or_else(|| {
+                format!(
+                    "typed list statement {statement} references missing ListId {}",
+                    storage.list_id
+                )
+            })?;
+        if list.row_scope_id != Some(storage.row_scope_id) {
+            return Err(format!(
+                "typed list statement {statement} row scope {} differs from ListId {}",
+                storage.row_scope_id, storage.list_id
+            ));
+        }
+        let owners = materializations
+            .iter()
+            .filter(|materialization| materialization.target_list_id == Some(storage.list_id))
+            .map(|materialization| materialization.owner)
+            .collect::<BTreeSet<_>>();
+        let owner = match owners.into_iter().collect::<Vec<_>>().as_slice() {
+            [] => None,
+            [owner] => Some(*owner),
+            _ => None,
+        };
+        let parent = statement_fields.get(statement).copied();
+        let item_shape = match &storage.item_type {
+            boon_typecheck::Type::Object(shape) => Some(shape),
+            _ => None,
+        };
+        for name in &storage.item_fields {
+            if fields
+                .iter()
+                .any(|field| field.row == Some(row) && field.name == *name)
+            {
+                continue;
+            }
+            let candidates = exact_record_field_candidates(
+                executable,
+                materializations,
+                storage.list_id,
+                *statement,
+                name,
+            )?;
+            let (declaration, producer, field_owner, resource_only) = match candidates.as_slice() {
+                [] => (None, None, owner, false),
+                [(declaration, producer, field_owner, resource_only)] => (
+                    Some(*declaration),
+                    Some(*producer),
+                    field_owner.or(owner),
+                    *resource_only,
+                ),
+                _ => (None, None, owner, false),
+            };
+            if executable.sources.iter().any(|source| {
+                Some(source.declaration) == declaration
+                    && Some(source.expression) == producer
+                    && source.owner == field_owner
+            }) {
+                continue;
+            }
+            let flow_type = boon_typecheck::FlowType {
+                mode: boon_typecheck::FlowMode::Continuous,
+                ty: item_shape
+                    .and_then(|shape| shape.fields.get(name))
+                    .cloned()
+                    .unwrap_or(boon_typecheck::Type::Unknown),
+            };
+            fields.push(ErasedFieldDef {
+                id: FieldId(fields.len()),
+                role: ErasedFieldRole::Value,
+                declaration,
+                static_owner: field_owner,
+                parent,
+                row: Some(row),
+                name: name.clone(),
+                diagnostic_path: format!("{}.{}", list.name, name),
+                statement: Some(*statement),
+                producer,
+                resource_only,
+                flow_type,
+            });
+        }
+    }
+
+    let indexed_state_fields = fields
+        .iter()
+        .filter(|field| field.row.is_some())
+        .filter(|field| {
+            executable.states.iter().any(|state| {
+                field.declaration == Some(state.declaration) && field.static_owner == state.owner
+            })
+        })
+        .map(|field| field.id)
+        .collect::<BTreeSet<_>>();
+
+    for (statement, storage) in list_storage {
+        let row = ErasedRowBinding {
+            list: storage.list_id,
+            scope: storage.row_scope_id,
+        };
+        let list = lists
+            .get(storage.list_id.as_usize())
+            .filter(|list| list.id == storage.list_id)
+            .ok_or_else(|| {
+                format!(
+                    "typed list statement {statement} references missing ListId {}",
+                    storage.list_id
+                )
+            })?;
+        let mut authority_types = BTreeMap::new();
+        let mut direct_constructor_fields = BTreeSet::new();
+        for item in list_mutations
+            .iter()
+            .filter(|mutation| mutation.list_id == storage.list_id)
+            .filter_map(|mutation| match &mutation.kind {
+                ListMutationKind::Append { item, .. } => Some(*item),
+                ListMutationKind::Remove { .. } => None,
+            })
+        {
+            for (name, ty) in exact_list_item_field_types(executable, item)?
+                .into_iter()
+                .filter(|(_, ty)| distributed_type_is_closed(ty))
+            {
+                direct_constructor_fields.insert(name.clone());
+                merge_authority_field_type(&mut authority_types, &name, ty)?;
+            }
+        }
+        for materialization in materializations.iter().filter(|materialization| {
+            materialization.operation == ContextualOperationKind::Map
+                && materialization.target_list_id == Some(storage.list_id)
+                && (materialization
+                    .source_list_id
+                    .is_none_or(|source| source == storage.list_id)
+                    || contextual_materialization_transfers_list_authority(
+                        executable,
+                        materialization,
+                    ))
+        }) {
+            if let boon_typecheck::Type::Object(shape) = &materialization.item_type {
+                for (name, ty) in shape.fields.iter().filter(|(name, ty)| {
+                    distributed_type_is_closed(ty)
+                        && !row_field_contains_source(executable, &fields, row, name)
+                }) {
+                    direct_constructor_fields.insert(name.clone());
+                    merge_authority_field_type(&mut authority_types, name, ty.clone())?;
+                }
+            }
+        }
+        let derives_distinct_map_rows = matches!(
+            list.initializer,
+            ListInitializer::Empty | ListInitializer::Unknown { .. }
+        ) && materializations.iter().any(|materialization| {
+            materialization.operation == ContextualOperationKind::Map
+                && materialization.target_list_id == Some(storage.list_id)
+        });
+        if derives_distinct_map_rows && let boon_typecheck::Type::Object(shape) = &storage.item_type
+        {
+            for (name, ty) in shape.fields.iter().filter(|(name, ty)| {
+                distributed_type_is_closed(ty)
+                    && !row_field_contains_source(executable, &fields, row, name)
+            }) {
+                merge_authority_field_type(&mut authority_types, name, ty.clone())?;
+            }
+        }
+        match &list.initializer {
+            ListInitializer::RecordLiteral { rows } => {
+                for field in rows.iter().flat_map(|row| &row.fields) {
+                    direct_constructor_fields.insert(field.name.clone());
+                    merge_authority_field_type(
+                        &mut authority_types,
+                        &field.name,
+                        initial_value_checked_type(&field.value),
+                    )?;
+                }
+            }
+            ListInitializer::Range { .. } => {
+                for name in ["index", "value"] {
+                    direct_constructor_fields.insert(name.to_owned());
+                    merge_authority_field_type(
+                        &mut authority_types,
+                        name,
+                        boon_typecheck::Type::Number,
+                    )?;
+                }
+            }
+            ListInitializer::Empty | ListInitializer::Unknown { .. } => {}
+        }
+        let parent = statement_fields.get(statement).copied();
+        for (name, ty) in authority_types {
+            if fields.iter().any(|field| {
+                field.row == Some(row)
+                    && field.name == name
+                    && indexed_state_fields.contains(&field.id)
+            }) && !direct_constructor_fields.contains(&name)
+            {
+                continue;
+            }
+            let shared = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| {
+                    field.row == Some(row)
+                        && field.name == name
+                        && field.role == ErasedFieldRole::Value
+                        && field.static_owner.is_none()
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if let [index] = shared.as_slice() {
+                let field = &mut fields[*index];
+                merge_value_authority_field_type(
+                    &field.diagnostic_path,
+                    &mut field.flow_type.ty,
+                    ty,
+                )?;
+                field.role = ErasedFieldRole::ValueAuthority;
+                continue;
+            }
+            fields.push(ErasedFieldDef {
+                id: FieldId(fields.len()),
+                role: ErasedFieldRole::ListAuthority,
+                declaration: None,
+                static_owner: None,
+                parent,
+                row: Some(row),
+                name: name.clone(),
+                diagnostic_path: format!("@authority/{}/{name}", storage.list_id.as_usize()),
+                statement: Some(*statement),
+                producer: None,
+                resource_only: false,
+                flow_type: boon_typecheck::FlowType {
+                    mode: boon_typecheck::FlowMode::Continuous,
+                    ty,
+                },
+            });
+        }
+    }
+
+    let mut parent_index = 0;
+    while parent_index < fields.len() {
+        let parent = fields[parent_index].clone();
+        parent_index += 1;
+        let Some(producer) = parent.producer else {
+            continue;
+        };
+        let expression = executable
+            .expressions
+            .get(producer.as_usize())
+            .filter(|expression| expression.id == producer)
+            .ok_or_else(|| {
+                format!(
+                    "erased field {} references missing record producer {producer}",
+                    parent.id
+                )
+            })?;
+        let record_fields = match &expression.kind {
+            ExecutableExpressionKind::Object(record_fields)
+            | ExecutableExpressionKind::Record(record_fields)
+            | ExecutableExpressionKind::TaggedObject {
+                fields: record_fields,
+                ..
+            } => record_fields,
+            _ => continue,
+        };
+        for record_field in record_fields.iter().filter(|field| !field.spread) {
+            if fields.iter().any(|field| {
+                field.parent == Some(parent.id)
+                    && field.name == record_field.name
+                    && field.producer == Some(record_field.value)
+            }) {
+                continue;
+            }
+            let value = executable
+                .expressions
+                .get(record_field.value.as_usize())
+                .filter(|expression| expression.id == record_field.value)
+                .ok_or_else(|| {
+                    format!(
+                        "erased record field `{}.{}` references missing producer {}",
+                        parent.diagnostic_path, record_field.name, record_field.value
+                    )
+                })?;
+            fields.push(ErasedFieldDef {
+                id: FieldId(fields.len()),
+                role: ErasedFieldRole::Value,
+                declaration: record_field.declaration,
+                static_owner: value.owner.or(parent.static_owner),
+                parent: Some(parent.id),
+                row: None,
+                name: record_field.name.clone(),
+                diagnostic_path: format!("{}.{}", parent.diagnostic_path, record_field.name),
+                statement: None,
+                producer: Some(record_field.value),
+                resource_only: record_field.resource_only,
+                flow_type: value.flow_type.clone(),
+            });
+        }
+    }
+
+    for field in &fields {
+        if let Some(declaration) = field.declaration
+            && !checked
+                .declarations
+                .iter()
+                .any(|candidate| candidate.id == declaration)
+        {
+            return Err(format!(
+                "erased FieldId {} references missing checked declaration {}",
+                field.id, declaration.0
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+fn contextual_materialization_transfers_list_authority(
+    executable: &ExecutableProgram,
+    materialization: &ContextualMaterialization,
+) -> bool {
+    executable
+        .expressions
+        .get(materialization.source.as_usize())
+        .is_some_and(|expression| {
+            expression.id == materialization.source
+                && matches!(expression.kind, ExecutableExpressionKind::Drain { .. })
+        })
+}
+
+fn bind_indexed_state_fields(
+    checked: &boon_typecheck::CheckedProgram,
+    executable: &ExecutableProgram,
+    lists: &[ListMemory],
+    states: &[StateCell],
+    fields: &mut Vec<ErasedFieldDef>,
+) -> Result<(), String> {
+    for state in states
+        .iter()
+        .filter(|state| state.published && state.scope_id.is_some())
+    {
+        let executable_state = state
+            .executable_state_id
+            .and_then(|state| executable.states.get(state.as_usize()))
+            .filter(|candidate| Some(candidate.id) == state.executable_state_id)
+            .ok_or_else(|| format!("indexed StateId {} has no exact executable state", state.id))?;
+        let expression = executable
+            .expressions
+            .get(executable_state.expression.as_usize())
+            .filter(|expression| expression.id == executable_state.expression)
+            .ok_or_else(|| {
+                format!(
+                    "indexed executable state {} has no producer {}",
+                    executable_state.id, executable_state.expression
+                )
+            })?;
+        let declaration = checked
+            .declarations
+            .iter()
+            .find(|declaration| declaration.id == executable_state.declaration)
+            .ok_or_else(|| {
+                format!(
+                    "indexed executable state {} references missing declaration {}",
+                    executable_state.id, executable_state.declaration.0
+                )
+            })?;
+        let row_scope = state
+            .scope_id
+            .expect("filtered indexed state has row scope");
+        let matching_lists = lists
+            .iter()
+            .filter(|list| list.row_scope_id == Some(row_scope))
+            .collect::<Vec<_>>();
+        let [list] = matching_lists.as_slice() else {
+            return Err(format!(
+                "indexed executable state {} scope {} belongs to {} lists",
+                executable_state.id,
+                row_scope,
+                matching_lists.len()
+            ));
+        };
+        let row = ErasedRowBinding {
+            list: list.id,
+            scope: row_scope,
+        };
+        let field_name = state
+            .semantic_path
+            .as_deref()
+            .and_then(|path| path.rsplit('.').next())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&declaration.name);
+        if fields.iter().any(|field| {
+            field.row == Some(row)
+                && field.declaration == Some(executable_state.declaration)
+                && field.static_owner == executable_state.owner
+                && field.producer == Some(executable_state.expression)
+        }) {
+            continue;
+        }
+        let placeholders = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| {
+                field.role == ErasedFieldRole::Value
+                    && field.row == Some(row)
+                    && field.name == field_name
+                    && field.declaration.is_none()
+                    && field.producer.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let diagnostic_path = state
+            .semantic_path
+            .clone()
+            .unwrap_or_else(|| format!("{}.{}", list.name, declaration.name));
+        match placeholders.as_slice() {
+            [index] => {
+                let field = &mut fields[*index];
+                field.declaration = Some(executable_state.declaration);
+                field.static_owner = executable_state.owner;
+                field.producer = Some(executable_state.expression);
+                field.resource_only = false;
+                field.flow_type = expression.flow_type.clone();
+                field.diagnostic_path = diagnostic_path;
+            }
+            [] => fields.push(ErasedFieldDef {
+                id: FieldId(fields.len()),
+                role: ErasedFieldRole::Value,
+                declaration: Some(executable_state.declaration),
+                static_owner: executable_state.owner,
+                parent: None,
+                row: Some(row),
+                name: field_name.to_owned(),
+                diagnostic_path,
+                statement: None,
+                producer: Some(executable_state.expression),
+                resource_only: false,
+                flow_type: expression.flow_type.clone(),
+            }),
+            _ => {
+                return Err(format!(
+                    "indexed executable state {} (`{}`) has {} unowned row-field placeholders",
+                    executable_state.id,
+                    diagnostic_path,
+                    placeholders.len()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn executable_statement_parents(
+    executable: &ExecutableProgram,
+) -> BTreeMap<ExecutableStatementId, ExecutableStatementId> {
+    executable
+        .statements
+        .iter()
+        .flat_map(|parent| parent.children.iter().map(move |child| (*child, parent.id)))
+        .collect()
+}
+
+fn direct_erased_storage_statements(
+    executable: &ExecutableProgram,
+) -> BTreeSet<ExecutableStatementId> {
+    let parents = executable_statement_parents(executable);
+    executable
+        .statements
+        .iter()
+        .filter(|statement| {
+            let Some(parent) = parents.get(&statement.id) else {
+                return true;
+            };
+            executable
+                .statements
+                .iter()
+                .find(|candidate| candidate.id == *parent)
+                .is_some_and(|parent| {
+                    parent.declaration.is_some()
+                        && matches!(parent.kind, ExecutableStatementKind::Field { .. })
+                })
+        })
+        .map(|statement| statement.id)
+        .collect()
+}
+
+fn row_field_contains_source(
+    executable: &ExecutableProgram,
+    fields: &[ErasedFieldDef],
+    row: ErasedRowBinding,
+    name: &str,
+) -> bool {
+    fields
+        .iter()
+        .filter(|field| field.row == Some(row) && field.name == name && field.role.is_value())
+        .filter_map(|field| field.producer)
+        .any(|producer| executable_expression_contains_source(executable, producer))
+}
+
+fn executable_expression_contains_source(
+    executable: &ExecutableProgram,
+    root: ExecutableExprId,
+) -> bool {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        if !visited.insert(expression) {
+            continue;
+        }
+        let Some(expression) = executable
+            .expressions
+            .get(expression.as_usize())
+            .filter(|candidate| candidate.id == expression)
+        else {
+            continue;
+        };
+        if matches!(&expression.kind, ExecutableExpressionKind::Source { .. }) {
+            return true;
+        }
+        pending.extend(executable_expression_children(&expression.kind));
+    }
+    false
+}
+
+fn exact_record_field_candidates(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    list: ListId,
+    statement: ExecutableStatementId,
+    name: &str,
+) -> Result<
+    Vec<(
+        boon_typecheck::DeclId,
+        ExecutableExprId,
+        Option<StaticOwnerId>,
+        bool,
+    )>,
+    String,
+> {
+    let mut roots = materializations
+        .iter()
+        .filter(|materialization| materialization.target_list_id == Some(list))
+        .map(|materialization| materialization.body)
+        .collect::<Vec<_>>();
+    if let Some(root) = executable
+        .statements
+        .iter()
+        .find(|candidate| candidate.id == statement)
+        .and_then(|candidate| candidate.value)
+    {
+        roots.push(root);
+    }
+    let mut pending = roots;
+    let mut visited = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let expression = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+            .ok_or_else(|| format!("field discovery reaches missing expression {expression_id}"))?;
+        match &expression.kind {
+            ExecutableExpressionKind::Object(fields)
+            | ExecutableExpressionKind::Record(fields)
+            | ExecutableExpressionKind::TaggedObject { fields, .. } => {
+                for field in fields {
+                    if !field.spread
+                        && field.name == name
+                        && let Some(declaration) = field.declaration
+                    {
+                        candidates.insert((
+                            declaration,
+                            field.value,
+                            expression.owner,
+                            field.resource_only,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        pending.extend(executable_expression_children(&expression.kind));
+    }
+    Ok(candidates.into_iter().collect())
+}
+
+fn preceding_map_owner(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    mut expression: ExecutableExprId,
+) -> Result<Option<StaticOwnerId>, String> {
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(expression) {
+            return Err(format!(
+                "contextual source expression {expression} contains a materialization cycle"
+            ));
+        }
+        let value = executable
+            .expressions
+            .get(expression.as_usize())
+            .filter(|candidate| candidate.id == expression)
+            .ok_or_else(|| {
+                format!("contextual source references missing expression {expression}")
+            })?;
+        match value.kind {
+            ExecutableExpressionKind::Materialize { materialization } => {
+                let materialization = materializations
+                    .get(materialization)
+                    .filter(|candidate| candidate.id == materialization)
+                    .ok_or_else(|| {
+                        format!(
+                            "contextual source expression {expression} references missing materialization {materialization}"
+                        )
+                    })?;
+                if materialization.operation == ContextualOperationKind::Map {
+                    return Ok(Some(materialization.owner));
+                }
+                expression = materialization.source;
+            }
+            ExecutableExpressionKind::Draining { input }
+            | ExecutableExpressionKind::Project { input, .. } => expression = input,
+            ExecutableExpressionKind::Block { result, .. } => expression = result,
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn merge_authority_field_type(
+    fields: &mut BTreeMap<String, boon_typecheck::Type>,
+    name: &str,
+    candidate: boon_typecheck::Type,
+) -> Result<(), String> {
+    match fields.entry(name.to_owned()) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let merged = compatible_storage_type(entry.get(), &candidate).ok_or_else(|| {
+                format!(
+                    "list authority field `{name}` has incompatible checked types {:?} and {candidate:?}",
+                    entry.get()
+                )
+            })?;
+            entry.insert(merged);
+        }
+    }
+    Ok(())
+}
+
+fn merge_value_authority_field_type(
+    path: &str,
+    value: &mut boon_typecheck::Type,
+    authority: boon_typecheck::Type,
+) -> Result<(), String> {
+    let merged = compatible_storage_type(value, &authority).ok_or_else(|| {
+        format!(
+            "list field `{path}` has incompatible value and authority types {value:?} and {authority:?}"
+        )
+    })?;
+    *value = merged;
+    Ok(())
+}
+
+fn compatible_storage_type(
+    left: &boon_typecheck::Type,
+    right: &boon_typecheck::Type,
+) -> Option<boon_typecheck::Type> {
+    if *left == boon_typecheck::Type::Unknown {
+        return Some(right.clone());
+    }
+    if *right == boon_typecheck::Type::Unknown || left == right {
+        return Some(left.clone());
+    }
+    match (left, right) {
+        (boon_typecheck::Type::VariantSet(existing), boon_typecheck::Type::VariantSet(extra)) => {
+            let mut variants = existing.clone();
+            variants.extend(extra.iter().cloned());
+            variants.sort_by_key(authority_variant_sort_key);
+            variants.dedup();
+            Some(boon_typecheck::Type::VariantSet(variants))
+        }
+        (boon_typecheck::Type::Bytes(_), boon_typecheck::Type::Bytes(_)) => Some(
+            boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic),
+        ),
+        _ => None,
+    }
+}
+
+fn authority_variant_sort_key(variant: &boon_typecheck::Variant) -> String {
+    match variant {
+        boon_typecheck::Variant::Tag(tag) => format!("0:{tag}"),
+        boon_typecheck::Variant::Tagged { tag, fields } => {
+            format!("1:{tag}:{}", fields.fields.len())
+        }
+    }
+}
+
+fn initial_value_checked_type(value: &InitialValue) -> boon_typecheck::Type {
+    match value {
+        InitialValue::Text { .. } => boon_typecheck::Type::Text,
+        InitialValue::Number { .. } => boon_typecheck::Type::Number,
+        InitialValue::Bool { value } => {
+            boon_typecheck::Type::VariantSet(vec![boon_typecheck::Variant::Tag(
+                if *value { "True" } else { "False" }.to_owned(),
+            )])
+        }
+        InitialValue::Bytes { fixed_len, .. } => boon_typecheck::Type::Bytes(
+            fixed_len.map_or(boon_typecheck::BytesType::Dynamic, |length| {
+                boon_typecheck::BytesType::Fixed(length)
+            }),
+        ),
+        InitialValue::Enum { value } => {
+            boon_typecheck::Type::VariantSet(vec![boon_typecheck::Variant::Tag(value.clone())])
+        }
+        InitialValue::Data { .. }
+        | InitialValue::RootInitialField { .. }
+        | InitialValue::RowInitialField { .. }
+        | InitialValue::Unknown { .. } => boon_typecheck::Type::Unknown,
+    }
+}
+
+fn static_owner_descends_from(
+    mut candidate: StaticOwnerId,
+    ancestor: StaticOwnerId,
+    owners: &[StaticOwnerDef],
+) -> bool {
+    loop {
+        if candidate == ancestor {
+            return true;
+        }
+        let Some(parent) = owners
+            .get(candidate.as_usize())
+            .filter(|owner| owner.id == candidate)
+            .and_then(|owner| owner.parent)
+        else {
+            return false;
+        };
+        candidate = parent;
+    }
+}
+
+fn erased_local_members(
     executable: &ExecutableProgram,
     static_owners: &[StaticOwnerDef],
+    materializations: &[ContextualMaterialization],
+    fields: &[ErasedFieldDef],
+    sources: &[SourcePort],
+    states: &[StateCell],
+    lists: &[ListMemory],
+    materialization: &ContextualMaterialization,
+    row: Option<ErasedRowBinding>,
+) -> Result<Vec<ErasedLocalMember>, String> {
+    let Some(row) = row else {
+        return Ok(Vec::new());
+    };
+    let preceding_owner =
+        preceding_map_owner(executable, materializations, materialization.source)?;
+    let list = lists
+        .iter()
+        .find(|list| list.id == row.list)
+        .ok_or_else(|| {
+            format!(
+                "contextual owner {} local {} references missing ListId {}",
+                materialization.owner, materialization.row_local.0, row.list
+            )
+        })?;
+    let relative_path = |path: &str| -> Result<Vec<String>, String> {
+        path.strip_prefix(&list.name)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            .filter(|suffix| !suffix.is_empty())
+            .map(|suffix| suffix.split('.').map(str::to_owned).collect())
+            .ok_or_else(|| {
+                format!(
+                    "row-scoped resource `{path}` is not structurally owned by list `{}`",
+                    list.name
+                )
+            })
+    };
+    let mut members = BTreeMap::<Vec<String>, ErasedLocalMemberTarget>::new();
+    for source in sources
+        .iter()
+        .filter(|source| source.scope_id == Some(row.scope))
+    {
+        let path = relative_path(&source.path)?;
+        if let Some(previous) =
+            members.insert(path.clone(), ErasedLocalMemberTarget::Source(source.id))
+        {
+            return Err(format!(
+                "contextual owner {} local {} path `{}` resolves to both {previous:?} and source {}",
+                materialization.owner,
+                materialization.row_local.0,
+                path.join("."),
+                source.id
+            ));
+        }
+    }
+    for state in states
+        .iter()
+        .filter(|state| state.scope_id == Some(row.scope) && state.published)
+    {
+        let semantic_path = state.semantic_path.as_deref().ok_or_else(|| {
+            format!(
+                "published row-scoped state {} has no semantic path",
+                state.id
+            )
+        })?;
+        let path = relative_path(semantic_path)?;
+        if let Some(previous) =
+            members.insert(path.clone(), ErasedLocalMemberTarget::State(state.id))
+        {
+            return Err(format!(
+                "contextual owner {} local {} path `{}` resolves to both {previous:?} and state {}",
+                materialization.owner,
+                materialization.row_local.0,
+                path.join("."),
+                state.id
+            ));
+        }
+    }
+    let mut field_names = typed_item_field_names(&materialization.item_type);
+    if field_names.is_empty() {
+        field_names = fields
+            .iter()
+            .filter(|field| field.row == Some(row))
+            .map(|field| field.name.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+    for name in field_names {
+        let path = vec![name.clone()];
+        if members.contains_key(&path) {
+            continue;
+        }
+        let candidates = fields
+            .iter()
+            .filter(|field| field.row == Some(row) && field.name == name)
+            .collect::<Vec<_>>();
+        let preferred = if let Some(owner) = preceding_owner {
+            candidates
+                .iter()
+                .copied()
+                .filter(|field| {
+                    field.role.is_value()
+                        && field.static_owner.is_some_and(|candidate| {
+                            static_owner_descends_from(candidate, owner, static_owners)
+                        })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let authority = candidates
+                .iter()
+                .copied()
+                .filter(|field| field.role.is_authority())
+                .collect::<Vec<_>>();
+            if authority.is_empty() {
+                let ownerless = candidates
+                    .iter()
+                    .copied()
+                    .filter(|field| field.role.is_value() && field.static_owner.is_none())
+                    .collect::<Vec<_>>();
+                if ownerless.is_empty() {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|field| field.role.is_value())
+                        .collect::<Vec<_>>()
+                } else {
+                    ownerless
+                }
+            } else {
+                authority
+            }
+        };
+        let [field] = preferred.as_slice() else {
+            let source = executable
+                .expressions
+                .get(materialization.source.as_usize())
+                .filter(|expression| expression.id == materialization.source);
+            return Err(format!(
+                "contextual owner {} local {} field `{name}` resolves to {} preferred fields among {:?}; operation={:?}, source={}, checked_source={:?}, resource={:?}, source_kind={:?}, list=`{}` (line {}), preceding_owner={preceding_owner:?}, item_type={:?}",
+                materialization.owner,
+                materialization.row_local.0,
+                preferred.len(),
+                candidates
+                    .iter()
+                    .map(|field| (field.id, field.role, field.static_owner))
+                    .collect::<Vec<_>>(),
+                materialization.operation,
+                materialization.source,
+                source.map(|expression| expression.checked_expr_id.0),
+                source.and_then(|expression| expression.resource_binding_path.as_deref()),
+                source.map(|expression| &expression.kind),
+                list.name,
+                list.source_line,
+                materialization.item_type,
+            ));
+        };
+        members.insert(path, ErasedLocalMemberTarget::Field(field.id));
+    }
+    Ok(members
+        .into_iter()
+        .map(|(path, target)| ErasedLocalMember {
+            path,
+            target,
+            forwarded_from: None,
+        })
+        .collect())
+}
+
+fn materialization_local_projection(
+    executable: &ExecutableProgram,
+    expression: ExecutableExprId,
+) -> Result<Option<(StaticOwnerId, MaterializationLocalId, Vec<String>)>, String> {
+    fn resolve(
+        executable: &ExecutableProgram,
+        expression: ExecutableExprId,
+        visiting: &mut BTreeSet<ExecutableExprId>,
+    ) -> Result<Option<(StaticOwnerId, MaterializationLocalId, Vec<String>)>, String> {
+        if !visiting.insert(expression) {
+            return Err(format!(
+                "materialization-local projection contains a cycle at expression {expression}"
+            ));
+        }
+        let value = executable
+            .expressions
+            .get(expression.as_usize())
+            .filter(|candidate| candidate.id == expression)
+            .ok_or_else(|| {
+                format!("materialization-local projection references missing {expression}")
+            })?;
+        let result = match &value.kind {
+            ExecutableExpressionKind::MaterializationLocal {
+                owner,
+                local,
+                projection,
+            } => Some((*owner, *local, projection.clone())),
+            ExecutableExpressionKind::Project { input, fields } => {
+                resolve(executable, *input, visiting)?.map(|(owner, local, mut projection)| {
+                    projection.extend(fields.iter().cloned());
+                    (owner, local, projection)
+                })
+            }
+            ExecutableExpressionKind::Block { result, .. } => {
+                resolve(executable, *result, visiting)?
+            }
+            _ => None,
+        };
+        visiting.remove(&expression);
+        Ok(result)
+    }
+
+    resolve(executable, expression, &mut BTreeSet::new())
+}
+
+fn executable_expression_is_source_group(
+    executable: &ExecutableProgram,
+    expression: ExecutableExprId,
+) -> Result<bool, String> {
+    fn check(
+        executable: &ExecutableProgram,
+        expression: ExecutableExprId,
+        visiting: &mut BTreeSet<ExecutableExprId>,
+    ) -> Result<bool, String> {
+        if !visiting.insert(expression) {
+            return Err(format!(
+                "source-group expression contains a cycle at {expression}"
+            ));
+        }
+        let value = executable
+            .expressions
+            .get(expression.as_usize())
+            .filter(|candidate| candidate.id == expression)
+            .ok_or_else(|| format!("source-group check references missing {expression}"))?;
+        let result = match &value.kind {
+            ExecutableExpressionKind::Source { .. } => true,
+            ExecutableExpressionKind::Object(fields)
+            | ExecutableExpressionKind::Record(fields)
+            | ExecutableExpressionKind::TaggedObject { fields, .. } => {
+                if fields.is_empty() {
+                    false
+                } else {
+                    let mut all_sources = true;
+                    for field in fields {
+                        if !check(executable, field.value, visiting)? {
+                            all_sources = false;
+                            break;
+                        }
+                    }
+                    all_sources
+                }
+            }
+            ExecutableExpressionKind::Block { result, .. } => check(executable, *result, visiting)?,
+            _ => false,
+        };
+        visiting.remove(&expression);
+        Ok(result)
+    }
+
+    check(executable, expression, &mut BTreeSet::new())
+}
+
+fn resource_members_for_projection<'a>(
+    local: &'a ErasedLocalDef,
+    projection: &[String],
+    fields: &[ErasedFieldDef],
+) -> Option<Vec<&'a ErasedLocalMember>> {
+    let exact_sources = local
+        .members
+        .iter()
+        .filter(|member| {
+            member.path == projection && matches!(member.target, ErasedLocalMemberTarget::Source(_))
+        })
+        .collect::<Vec<_>>();
+    if !exact_sources.is_empty() {
+        return Some(exact_sources);
+    }
+
+    let covering_fields = local
+        .members
+        .iter()
+        .filter_map(|member| match member.target {
+            ErasedLocalMemberTarget::Field(field) if projection.starts_with(&member.path) => {
+                Some((member.path.len(), field))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some((_, field)) = covering_fields.iter().max_by_key(|(len, _)| *len) {
+        let resource_only = fields
+            .get(field.as_usize())
+            .filter(|candidate| candidate.id == *field)
+            .is_some_and(|field| field.resource_only);
+        if !resource_only {
+            return None;
+        }
+    }
+
+    let resources = local
+        .members
+        .iter()
+        .filter(|member| {
+            member.path.starts_with(projection)
+                && matches!(member.target, ErasedLocalMemberTarget::Source(_))
+        })
+        .collect::<Vec<_>>();
+    (!resources.is_empty()).then_some(resources)
+}
+
+fn resource_field_local_projection(
+    executable: &ExecutableProgram,
+    field: &ErasedFieldDef,
+    fields: &[ErasedFieldDef],
+    materializations: &[ContextualMaterialization],
+    locals: &[ErasedLocalDef],
+) -> Result<Option<(StaticOwnerId, MaterializationLocalId, Vec<String>)>, String> {
+    if let Some(producer) = field.producer
+        && let Some(projection) = materialization_local_projection(executable, producer)?
+    {
+        return Ok(Some(projection));
+    }
+    let mut candidates = BTreeSet::new();
+    if field.role.is_authority() {
+        candidates.extend(
+            fields
+                .iter()
+                .filter(|candidate| {
+                    candidate.id != field.id
+                        && candidate.row == field.row
+                        && candidate.name == field.name
+                        && candidate.role.is_value()
+                        && candidate.resource_only
+                })
+                .filter_map(|candidate| candidate.producer)
+                .map(|producer| materialization_local_projection(executable, producer))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten(),
+        );
+    }
+    if let Some(row) = field.row {
+        for materialization in materializations
+            .iter()
+            .filter(|materialization| materialization.target_list_id == Some(row.list))
+        {
+            let Some(local) = locals.iter().find(|local| {
+                local.owner == materialization.owner && local.local == materialization.row_local
+            }) else {
+                continue;
+            };
+            let projection = vec![field.name.clone()];
+            if resource_members_for_projection(local, &projection, fields).is_some() {
+                candidates.insert((local.owner, local.local, projection));
+            }
+        }
+    }
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [candidate] => Ok(Some(candidate.clone())),
+        _ => {
+            let signatures = candidates
+                .iter()
+                .map(|(owner, local, projection)| {
+                    let local = locals
+                        .iter()
+                        .find(|candidate| candidate.owner == *owner && candidate.local == *local)?;
+                    let members = resource_members_for_projection(local, projection, fields)?;
+                    let mut signature = members
+                        .into_iter()
+                        .filter_map(|member| {
+                            let ErasedLocalMemberTarget::Source(source) = member.target else {
+                                return None;
+                            };
+                            let suffix = member.path.strip_prefix(projection.as_slice())?;
+                            Some((suffix.to_vec(), source))
+                        })
+                        .collect::<Vec<_>>();
+                    signature
+                        .sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+                    Some(signature)
+                })
+                .collect::<Option<Vec<_>>>();
+            if signatures
+                .as_ref()
+                .is_some_and(|signatures| signatures.windows(2).all(|pair| pair[0] == pair[1]))
+            {
+                return Ok(candidates.first().cloned());
+            }
+            let details = candidates
+                .iter()
+                .map(|(owner, local, projection)| {
+                    let operation = materializations
+                        .iter()
+                        .find(|materialization| {
+                            materialization.owner == *owner && materialization.row_local == *local
+                        })
+                        .map(|materialization| materialization.operation);
+                    let members = locals
+                        .iter()
+                        .find(|candidate| candidate.owner == *owner && candidate.local == *local)
+                        .and_then(|candidate| {
+                            resource_members_for_projection(candidate, projection, fields)
+                        })
+                        .map(|members| {
+                            members
+                                .into_iter()
+                                .map(|member| {
+                                    (
+                                        member.path.clone(),
+                                        member.target,
+                                        member.forwarded_from.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                    (owner, local, projection, operation, members)
+                })
+                .collect::<Vec<_>>();
+            Err(format!(
+                "resource FieldId {} has {} forwarding producers: {:?}",
+                field.id,
+                candidates.len(),
+                details
+            ))
+        }
+    }
+}
+
+fn propagate_forwarded_local_resources(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    fields: &mut [ErasedFieldDef],
+    locals: &mut [ErasedLocalDef],
+) -> Result<(), String> {
+    let iteration_limit = fields.len().saturating_add(locals.len()).saturating_add(1);
+    for _ in 0..iteration_limit {
+        let locals_snapshot = locals.to_vec();
+        let fields_snapshot = fields.to_vec();
+        let mut changed = false;
+
+        let mut newly_resource_only = Vec::new();
+        for field in fields_snapshot.iter().filter(|field| !field.resource_only) {
+            if field.role.is_authority() {
+                let value_fields = fields_snapshot
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.id != field.id
+                            && candidate.row == field.row
+                            && candidate.name == field.name
+                            && candidate.role.is_value()
+                    })
+                    .collect::<Vec<_>>();
+                if !value_fields.is_empty()
+                    && value_fields.iter().all(|candidate| candidate.resource_only)
+                {
+                    newly_resource_only.push(field.id);
+                    continue;
+                }
+            }
+            if let Some(row) = field.row
+                && materializations
+                    .iter()
+                    .filter(|materialization| materialization.target_list_id == Some(row.list))
+                    .filter_map(|materialization| {
+                        locals_snapshot.iter().find(|local| {
+                            local.owner == materialization.owner
+                                && local.local == materialization.row_local
+                        })
+                    })
+                    .any(|local| {
+                        resource_members_for_projection(
+                            local,
+                            std::slice::from_ref(&field.name),
+                            &fields_snapshot,
+                        )
+                        .is_some()
+                    })
+            {
+                newly_resource_only.push(field.id);
+                continue;
+            }
+            let Some(producer) = field.producer else {
+                continue;
+            };
+            if executable_expression_is_source_group(executable, producer)? {
+                newly_resource_only.push(field.id);
+                continue;
+            }
+            let Some((owner, local, projection)) =
+                materialization_local_projection(executable, producer)?
+            else {
+                continue;
+            };
+            let source = locals_snapshot
+                .iter()
+                .find(|candidate| candidate.owner == owner && candidate.local == local)
+                .ok_or_else(|| {
+                    format!(
+                        "field {} forwards missing materialization local {}:{}",
+                        field.id, owner, local.0
+                    )
+                })?;
+            if resource_members_for_projection(source, &projection, &fields_snapshot).is_some() {
+                newly_resource_only.push(field.id);
+            }
+        }
+        for field in newly_resource_only {
+            let target = fields
+                .get_mut(field.as_usize())
+                .filter(|candidate| candidate.id == field)
+                .ok_or_else(|| format!("missing forwarded resource FieldId {field}"))?;
+            target.resource_only = true;
+            changed = true;
+        }
+
+        let fields_snapshot = fields.to_vec();
+        let locals_snapshot = locals.to_vec();
+        for local in locals.iter_mut() {
+            let mut members = local
+                .members
+                .iter()
+                .cloned()
+                .map(|member| (member.path.clone(), member))
+                .collect::<BTreeMap<_, _>>();
+            let field_members = local
+                .members
+                .iter()
+                .filter_map(|member| match member.target {
+                    ErasedLocalMemberTarget::Field(field) => Some((member.clone(), field)),
+                    ErasedLocalMemberTarget::Source(_) | ErasedLocalMemberTarget::State(_) => None,
+                })
+                .collect::<Vec<_>>();
+            for (member, field_id) in field_members {
+                let field = fields_snapshot
+                    .get(field_id.as_usize())
+                    .filter(|candidate| candidate.id == field_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "owner {} local {} member `{}` references missing FieldId {field_id}",
+                            local.owner,
+                            local.local.0,
+                            member.path.join(".")
+                        )
+                    })?;
+                if !field.resource_only {
+                    continue;
+                }
+
+                if members.remove(&member.path).is_some() {
+                    changed = true;
+                }
+
+                if let Some((source_owner, source_local, projection)) =
+                    resource_field_local_projection(
+                        executable,
+                        field,
+                        &fields_snapshot,
+                        materializations,
+                        &locals_snapshot,
+                    )?
+                {
+                    let source = locals_snapshot
+                        .iter()
+                        .find(|candidate| {
+                            candidate.owner == source_owner && candidate.local == source_local
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "resource field {} forwards missing materialization local {}:{}",
+                                field.id, source_owner, source_local.0
+                            )
+                        })?;
+                    let resources =
+                        resource_members_for_projection(source, &projection, &fields_snapshot)
+                            .ok_or_else(|| {
+                                format!(
+                                    "resource field {} producer {} has no source members at `{}`",
+                                    field.id,
+                                    field.producer.map_or_else(
+                                        || "authority".to_owned(),
+                                        |id| id.to_string()
+                                    ),
+                                    projection.join(".")
+                                )
+                            })?;
+                    for resource in resources {
+                        let suffix = resource
+                            .path
+                            .strip_prefix(projection.as_slice())
+                            .ok_or_else(|| {
+                                format!(
+                                    "resource member `{}` is outside forwarded projection `{}`",
+                                    resource.path.join("."),
+                                    projection.join(".")
+                                )
+                            })?;
+                        let mut path = member.path.clone();
+                        path.extend_from_slice(suffix);
+                        let forwarded = ErasedLocalMember {
+                            path: path.clone(),
+                            target: resource.target,
+                            forwarded_from: Some(ErasedLocalMemberForwarding {
+                                owner: source_owner,
+                                local: source_local,
+                                path: resource.path.clone(),
+                            }),
+                        };
+                        match members.entry(path.clone()) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(forwarded);
+                            }
+                            std::collections::btree_map::Entry::Occupied(entry)
+                                if entry.get().target == forwarded.target
+                                    || (matches!(
+                                        entry.get().target,
+                                        ErasedLocalMemberTarget::Source(_)
+                                    ) && entry.get().forwarded_from.is_none()) => {}
+                            std::collections::btree_map::Entry::Occupied(entry) => {
+                                return Err(format!(
+                                    "owner {} local {} forwarded resource `{}` conflicts with {:?}",
+                                    local.owner,
+                                    local.local.0,
+                                    path.join("."),
+                                    entry.get().target
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            local.members = members.into_values().collect();
+        }
+
+        if !changed {
+            for local in locals.iter() {
+                for member in &local.members {
+                    if let ErasedLocalMemberTarget::Field(field) = member.target
+                        && fields
+                            .get(field.as_usize())
+                            .filter(|candidate| candidate.id == field)
+                            .is_some_and(|field| field.resource_only)
+                    {
+                        return Err(format!(
+                            "owner {} local {} retains resource-only FieldId {} at `{}`",
+                            local.owner,
+                            local.local.0,
+                            field,
+                            member.path.join(".")
+                        ));
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+    Err("forwarded materialization resources did not reach a fixed point".to_owned())
+}
+
+fn mark_forwarded_executable_resource_fields(
+    executable: &mut ExecutableProgram,
+    scope_index: &ErasedScopeIndex,
+) -> Result<(), String> {
+    let mut forwarded = Vec::new();
+    for (expression_index, expression) in executable.expressions.iter().enumerate() {
+        let fields = match &expression.kind {
+            ExecutableExpressionKind::Object(fields)
+            | ExecutableExpressionKind::Record(fields)
+            | ExecutableExpressionKind::TaggedObject { fields, .. } => fields,
+            _ => continue,
+        };
+        for (field_index, field) in fields.iter().enumerate() {
+            if field.resource_only {
+                continue;
+            }
+            if executable_expression_is_source_group(executable, field.value)? {
+                forwarded.push((expression_index, field_index));
+                continue;
+            }
+            let Some((owner, local, projection)) =
+                materialization_local_projection(executable, field.value)?
+            else {
+                continue;
+            };
+            let source = scope_index
+                .locals
+                .iter()
+                .find(|candidate| candidate.owner == owner && candidate.local == local)
+                .ok_or_else(|| {
+                    format!(
+                        "record field `{}` forwards missing materialization local {}:{}",
+                        field.name, owner, local.0
+                    )
+                })?;
+            if resource_members_for_projection(source, &projection, &scope_index.fields).is_some() {
+                forwarded.push((expression_index, field_index));
+            }
+        }
+    }
+    for (expression_index, field_index) in forwarded {
+        let expression = executable
+            .expressions
+            .get_mut(expression_index)
+            .ok_or_else(|| format!("missing executable expression index {expression_index}"))?;
+        let fields = match &mut expression.kind {
+            ExecutableExpressionKind::Object(fields)
+            | ExecutableExpressionKind::Record(fields)
+            | ExecutableExpressionKind::TaggedObject { fields, .. } => fields,
+            _ => {
+                return Err(format!(
+                    "executable expression {} stopped being a record",
+                    expression.id
+                ));
+            }
+        };
+        let field = fields.get_mut(field_index).ok_or_else(|| {
+            format!(
+                "executable expression {} is missing record field index {field_index}",
+                expression.id
+            )
+        })?;
+        field.resource_only = true;
+    }
+    Ok(())
+}
+
+fn bind_derived_field_ids(
+    derived_values: &mut [DerivedValue],
+    fields: &[ErasedFieldDef],
+) -> Result<(), String> {
+    for value in derived_values {
+        let matches = fields
+            .iter()
+            .filter(|field| field.statement == Some(value.executable_statement_id))
+            .filter(|field| field.diagnostic_path == value.path)
+            .collect::<Vec<_>>();
+        let field = match matches.as_slice() {
+            [field] => *field,
+            [] => {
+                let by_statement = fields
+                    .iter()
+                    .filter(|field| field.statement == Some(value.executable_statement_id))
+                    .collect::<Vec<_>>();
+                let [field] = by_statement.as_slice() else {
+                    return Err(format!(
+                        "derived value `{}` statement {} has {} exact erased fields",
+                        value.path,
+                        value.executable_statement_id,
+                        by_statement.len()
+                    ));
+                };
+                *field
+            }
+            _ => {
+                return Err(format!(
+                    "derived value `{}` statement {} has {} exact erased fields",
+                    value.path,
+                    value.executable_statement_id,
+                    matches.len()
+                ));
+            }
+        };
+        value.id = field.id;
+        value.scope_id = field.row.map(|row| row.scope);
+        value.indexed = field.row.is_some();
+    }
+    Ok(())
+}
+
+fn build_erased_scope_index(
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    materializations: &[ContextualMaterialization],
     sources: &[SourcePort],
     states: &[StateCell],
     lists: &[ListMemory],
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    derived_values: &[DerivedValue],
-    semantic_fields: &[SemanticFieldEntry],
-) -> Result<StorageCatalog, String> {
+    fields: Vec<ErasedFieldDef>,
+) -> Result<ErasedScopeIndex, String> {
     let mut bindings = Vec::new();
+    let direct_storage_statements = direct_erased_storage_statements(executable);
     for statement in &executable.statements {
-        let (Some(declaration), Some(flow_type), Some(producer)) = (
-            statement.declaration,
-            statement.flow_type.clone(),
-            statement.value,
-        ) else {
+        if !direct_storage_statements.contains(&statement.id) {
+            continue;
+        }
+        let (Some(declaration), Some(producer)) = (statement.declaration, statement.value) else {
             continue;
         };
         let diagnostic_path = match &statement.kind {
@@ -1991,6 +4234,7 @@ fn build_storage_catalog(
                     declaration.0
                 )
             })?;
+        let flow_type = expression.flow_type.clone();
         let owns_direct_resource = executable.sources.iter().any(|source| {
             source.declaration == declaration
                 && source.owner == expression.owner
@@ -2004,37 +4248,57 @@ fn build_storage_catalog(
             continue;
         }
         let list = if matches!(&flow_type.ty, boon_typecheck::Type::List(_)) {
-            list_storage
-                .get(&statement.id)
-                .map(|storage| storage.list_id)
-                .ok_or_else(|| {
-                    format!(
-                        "typed list declaration {} (`{diagnostic_path}`) has no allocated ListId",
-                        declaration.0
-                    )
-                })?
-                .into()
+            if let Some(storage) = list_storage.get(&statement.id) {
+                Some(storage.list_id)
+            } else if let Some(target) = direct_list_alias_target(executable, statement) {
+                let candidates = executable
+                    .statements
+                    .iter()
+                    .filter(|candidate| candidate.declaration == Some(target))
+                    .filter_map(|candidate| list_storage.get(&candidate.id))
+                    .map(|storage| storage.list_id)
+                    .collect::<BTreeSet<_>>();
+                let candidates = candidates.into_iter().collect::<Vec<_>>();
+                let [list] = candidates.as_slice() else {
+                    return Err(format!(
+                        "list alias declaration {} (`{diagnostic_path}`) target {} has {} keyed storage bindings",
+                        declaration.0,
+                        target.0,
+                        candidates.len()
+                    ));
+                };
+                Some(*list)
+            } else {
+                None
+            }
         } else {
             None
         };
-        let derived_value = derived_values
-            .iter()
-            .find(|value| value.executable_statement_id == statement.id);
-        let field = if list.is_none()
-            && let Some(derived_value) = derived_value
-        {
-            let candidates = semantic_fields
+        let field = if list.is_none() {
+            let candidates = fields
                 .iter()
-                .filter(|field| {
-                    field.statement_id == statement.id.0 && field.scope_id == derived_value.scope_id
-                })
+                .filter(|field| field.statement == Some(statement.id))
+                .filter(|field| field.declaration == Some(declaration))
+                .filter(|field| field.static_owner == expression.owner)
                 .collect::<Vec<_>>();
             let [field] = candidates.as_slice() else {
+                let statement_fields = fields
+                    .iter()
+                    .filter(|field| field.statement == Some(statement.id))
+                    .map(|field| {
+                        (
+                            field.id,
+                            field.declaration,
+                            field.static_owner,
+                            field.diagnostic_path.as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 return Err(format!(
-                    "derived storage declaration {} (`{diagnostic_path}`) statement {} scope {:?} has {} semantic fields",
+                    "value declaration {} (`{diagnostic_path}`) statement {} owner {:?} has {} exact fields; statement fields={statement_fields:?}",
                     declaration.0,
                     statement.id,
-                    derived_value.scope_id,
+                    expression.owner,
                     candidates.len()
                 ));
             };
@@ -2042,25 +4306,18 @@ fn build_storage_catalog(
         } else {
             None
         };
-        let row_scope = list.and_then(|list_id| {
-            lists
-                .get(list_id.as_usize())
-                .filter(|list| list.id == list_id)
-                .and_then(|list| list.row_scope_id)
-        });
-        bindings.push(StorageBinding {
-            id: StorageBindingId(bindings.len()),
+        let row = list
+            .map(|list_id| erased_row_binding_for_list(lists, list_id))
+            .transpose()?;
+        bindings.push(ErasedBinding {
+            id: ErasedBindingId(bindings.len()),
             declaration,
             static_owner: expression.owner,
             owner_ancestry: static_owner_ancestry(expression.owner, static_owners)?,
             flow_type,
             producer,
             diagnostic_path,
-            kind: StorageBindingKind::Value {
-                field,
-                list,
-                row_scope,
-            },
+            target: ErasedBindingTarget::Value { field, row },
         });
     }
     for source in &executable.sources {
@@ -2073,15 +4330,15 @@ fn build_storage_catalog(
             .get(source.expression.as_usize())
             .filter(|expression| expression.id == source.expression)
             .ok_or_else(|| format!("executable source {} has no producer", source.id))?;
-        bindings.push(StorageBinding {
-            id: StorageBindingId(bindings.len()),
+        bindings.push(ErasedBinding {
+            id: ErasedBindingId(bindings.len()),
             declaration: source.declaration,
             static_owner: source.owner,
             owner_ancestry: static_owner_ancestry(source.owner, static_owners)?,
             flow_type: expression.flow_type.clone(),
             producer: source.expression,
             diagnostic_path: runtime.path.clone(),
-            kind: StorageBindingKind::Source {
+            target: ErasedBindingTarget::Source {
                 executable: source.id,
                 runtime: runtime.id,
             },
@@ -2097,26 +4354,130 @@ fn build_storage_catalog(
             .get(state.expression.as_usize())
             .filter(|expression| expression.id == state.expression)
             .ok_or_else(|| format!("executable state {} has no producer", state.id))?;
-        bindings.push(StorageBinding {
-            id: StorageBindingId(bindings.len()),
+        let (field, row) = if let Some(row_scope) = runtime.scope_id {
+            let lists = lists
+                .iter()
+                .filter(|list| list.row_scope_id == Some(row_scope))
+                .collect::<Vec<_>>();
+            let [list] = lists.as_slice() else {
+                return Err(format!(
+                    "indexed executable state {} (`{}`) scope {} belongs to {} lists",
+                    state.id,
+                    runtime.semantic_path.as_deref().unwrap_or(&runtime.path),
+                    row_scope,
+                    lists.len()
+                ));
+            };
+            let field = if runtime.published {
+                let candidates = fields
+                    .iter()
+                    .filter(|field| {
+                        field.declaration == Some(state.declaration)
+                            && field.static_owner == state.owner
+                            && field.row.map(|row| row.scope) == Some(row_scope)
+                            && field.producer == Some(state.expression)
+                    })
+                    .collect::<Vec<_>>();
+                let [field] = candidates.as_slice() else {
+                    let declaration_fields = fields
+                        .iter()
+                        .filter(|field| field.declaration == Some(state.declaration))
+                        .map(|field| {
+                            (
+                                field.id,
+                                field.role,
+                                field.static_owner,
+                                field.row,
+                                field.name.as_str(),
+                                field.diagnostic_path.as_str(),
+                                field.statement,
+                                field.producer,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let runtime_states = states
+                        .iter()
+                        .filter(|candidate| candidate.executable_state_id == Some(state.id))
+                        .map(|candidate| {
+                            (
+                                candidate.id,
+                                candidate.scope_id,
+                                candidate.published,
+                                candidate.semantic_path.as_deref(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "indexed executable state {} (`{}`) declaration {} owner {:?} scope {} has {} exact fields; declaration fields={declaration_fields:?}; runtime states={runtime_states:?}",
+                        state.id,
+                        runtime.semantic_path.as_deref().unwrap_or(&runtime.path),
+                        state.declaration.0,
+                        state.owner,
+                        row_scope,
+                        candidates.len()
+                    ));
+                };
+                Some(field.id)
+            } else {
+                None
+            };
+            (
+                field,
+                Some(ErasedRowBinding {
+                    list: list.id,
+                    scope: row_scope,
+                }),
+            )
+        } else {
+            let candidates = fields
+                .iter()
+                .filter(|field| {
+                    field.declaration == Some(state.declaration)
+                        && field.static_owner == state.owner
+                        && field.row.is_none()
+                })
+                .collect::<Vec<_>>();
+            let field = if runtime.published {
+                match candidates.as_slice() {
+                    [] => None,
+                    [field] => Some(field.id),
+                    _ => {
+                        return Err(format!(
+                            "root executable state {} (`{}`) has {} exact fields",
+                            state.id,
+                            runtime.semantic_path.as_deref().unwrap_or(&runtime.path),
+                            candidates.len()
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            (field, None)
+        };
+        bindings.push(ErasedBinding {
+            id: ErasedBindingId(bindings.len()),
             declaration: state.declaration,
             static_owner: state.owner,
             owner_ancestry: static_owner_ancestry(state.owner, static_owners)?,
             flow_type: expression.flow_type.clone(),
             producer: state.expression,
             diagnostic_path: runtime.path.clone(),
-            kind: StorageBindingKind::State {
+            target: ErasedBindingTarget::State {
                 executable: state.id,
                 runtime: runtime.id,
+                published: runtime.published,
+                field,
+                row,
             },
         });
     }
     let mut identities = BTreeSet::new();
     for binding in &bindings {
-        let kind = match binding.kind {
-            StorageBindingKind::Value { .. } => 0_u8,
-            StorageBindingKind::Source { .. } => 1,
-            StorageBindingKind::State { .. } => 2,
+        let kind = match binding.target {
+            ErasedBindingTarget::Value { .. } => 0_u8,
+            ErasedBindingTarget::Source { .. } => 1,
+            ErasedBindingTarget::State { .. } => 2,
         };
         if !identities.insert((
             binding.declaration,
@@ -2130,7 +4491,607 @@ fn build_storage_catalog(
             ));
         }
     }
-    Ok(StorageCatalog { bindings })
+    let erased_sources = sources
+        .iter()
+        .map(|source| {
+            let origin = match source.executable_source_id {
+                Some(executable) => {
+                    let candidates = bindings
+                        .iter()
+                        .filter_map(|binding| match binding.target {
+                            ErasedBindingTarget::Source {
+                                executable: binding_executable,
+                                runtime,
+                            } if binding_executable == executable && runtime == source.id => {
+                                Some(binding.id)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let [binding] = candidates.as_slice() else {
+                        return Err(format!(
+                            "source `{}` has {} exact executable storage bindings",
+                            source.path,
+                            candidates.len()
+                        ));
+                    };
+                    ErasedSourceOrigin::Executable {
+                        executable,
+                        binding: *binding,
+                    }
+                }
+                None if source.path.starts_with("@distributed/") => {
+                    if source.static_owner.is_some() || source.scope_id.is_some() || source.scoped {
+                        return Err(format!(
+                            "distributed ingress source `{}` must be structurally root owned",
+                            source.path
+                        ));
+                    }
+                    ErasedSourceOrigin::DistributedImport
+                }
+                None => {
+                    return Err(format!(
+                        "source `{}` has neither executable nor distributed ingress origin",
+                        source.path
+                    ));
+                }
+            };
+            Ok(ErasedSourceDef {
+                source: source.id,
+                static_owner: source.static_owner,
+                owner_ancestry: static_owner_ancestry(source.static_owner, static_owners)?,
+                origin,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let owners = static_owners
+        .iter()
+        .map(|owner| {
+            let materialization = materializations
+                .iter()
+                .find(|materialization| materialization.owner == owner.id);
+            let source_row = materialization
+                .map(|materialization| {
+                    paired_row_binding(
+                        materialization.source_list_id,
+                        materialization.source_scope_id,
+                        "source",
+                        owner.id,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let target_row = materialization
+                .map(|materialization| {
+                    paired_row_binding(
+                        materialization.target_list_id,
+                        materialization.target_scope_id,
+                        "target",
+                        owner.id,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            Ok(ErasedOwnerDef {
+                id: owner.id,
+                parent: owner.parent,
+                child_ordinal: owner.child_ordinal,
+                source_row,
+                target_row,
+                authority_row: target_row.or(source_row),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut fields = fields;
+    let mut locals = materializations
+        .iter()
+        .map(|materialization| {
+            let row = paired_row_binding(
+                materialization.source_list_id,
+                materialization.source_scope_id,
+                "source",
+                materialization.owner,
+            )?;
+            Ok(ErasedLocalDef {
+                owner: materialization.owner,
+                local: materialization.row_local,
+                row,
+                source: materialization.source,
+                item_type: materialization.item_type.clone(),
+                members: erased_local_members(
+                    executable,
+                    static_owners,
+                    materializations,
+                    &fields,
+                    sources,
+                    states,
+                    lists,
+                    materialization,
+                    row,
+                )?,
+                captures: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    propagate_forwarded_local_resources(executable, materializations, &mut fields, &mut locals)?;
+    Ok(ErasedScopeIndex {
+        owners,
+        locals,
+        fields,
+        bindings,
+        sources: erased_sources,
+        reads: Vec::new(),
+        row_values: Vec::new(),
+        dependencies: Vec::new(),
+    })
+}
+
+type DetachedStateCaptureKey = (
+    StaticOwnerId,
+    MaterializationLocalId,
+    StaticOwnerId,
+    MaterializationLocalId,
+    Vec<String>,
+    ErasedRowBinding,
+);
+
+fn bind_detached_state_captures(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    sources: &[SourcePort],
+    lists: &[ListMemory],
+    state_update_arms: &[StateUpdateArm],
+    scope_index: &mut ErasedScopeIndex,
+) -> Result<(), String> {
+    let mut requests = BTreeMap::<DetachedStateCaptureKey, boon_typecheck::Type>::new();
+    for binding in &scope_index.bindings {
+        let ErasedBindingTarget::State {
+            executable: executable_state,
+            runtime,
+            row: Some(state_row),
+            ..
+        } = binding.target
+        else {
+            continue;
+        };
+        let state = executable
+            .states
+            .get(executable_state.as_usize())
+            .filter(|state| state.id == executable_state)
+            .ok_or_else(|| {
+                format!(
+                    "indexed state binding {} references missing executable state {}",
+                    binding.id, executable_state
+                )
+            })?;
+        let state_owner = binding.static_owner.ok_or_else(|| {
+            format!(
+                "indexed state {} (`{}`) has no static owner",
+                executable_state, binding.diagnostic_path
+            )
+        })?;
+        let target_materialization = nearest_state_row_materialization(
+            state_owner,
+            state_row,
+            materializations,
+            scope_index,
+        )?;
+        collect_detached_state_capture_requests(
+            executable,
+            materializations,
+            scope_index,
+            state.initial,
+            state_row,
+            target_materialization,
+            None,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut requests,
+        )?;
+        for arm in state_update_arms.iter().filter(|arm| arm.state == runtime) {
+            let event_list = event_cause_row_list(arm.cause, sources, lists)?;
+            collect_detached_state_capture_requests(
+                executable,
+                materializations,
+                scope_index,
+                arm.output_expression_id,
+                state_row,
+                target_materialization,
+                event_list,
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &mut requests,
+            )?;
+        }
+    }
+
+    for ((target_owner, target_local, source_owner, source_local, projection, target_row), ty) in
+        requests
+    {
+        let target_materialization = materializations.iter().find(|materialization| {
+            materialization.owner == target_owner && materialization.row_local == target_local
+        });
+        let reads_transferred_authority = target_materialization.is_some_and(|materialization| {
+            contextual_materialization_transfers_list_authority(executable, materialization)
+                && projection.first().is_some_and(|name| {
+                    scope_index.fields.iter().any(|field| {
+                        field.row == Some(target_row)
+                            && field.name == *name
+                            && field.role.is_authority()
+                    })
+                })
+        });
+        if reads_transferred_authority {
+            continue;
+        }
+        let target = scope_index
+            .locals
+            .iter()
+            .position(|local| local.owner == target_owner && local.local == target_local)
+            .ok_or_else(|| {
+                format!(
+                    "detached capture target owner {} local {} is missing",
+                    target_owner, target_local.0
+                )
+            })?;
+        let ordinal = scope_index.locals[target].captures.len();
+        let name = format!(
+            "@capture/{}/{}/{}",
+            target_owner.as_usize(),
+            target_local.0,
+            ordinal
+        );
+        if scope_index
+            .fields
+            .iter()
+            .any(|field| field.row == Some(target_row) && field.name == name)
+        {
+            return Err(format!(
+                "detached capture `{name}` collides with existing row storage"
+            ));
+        }
+        let field = FieldId(scope_index.fields.len());
+        scope_index.fields.push(ErasedFieldDef {
+            id: field,
+            role: ErasedFieldRole::Capture,
+            declaration: None,
+            static_owner: None,
+            parent: None,
+            row: Some(target_row),
+            name: name.clone(),
+            diagnostic_path: format!(
+                "{name}/from/{}/{}{}",
+                source_owner.as_usize(),
+                source_local.0,
+                projection
+                    .iter()
+                    .map(|field| format!("/{field}"))
+                    .collect::<String>()
+            ),
+            statement: None,
+            producer: None,
+            resource_only: false,
+            flow_type: boon_typecheck::FlowType {
+                mode: boon_typecheck::FlowMode::Continuous,
+                ty,
+            },
+        });
+        scope_index.locals[target]
+            .captures
+            .push(ErasedLocalCapture {
+                source_owner,
+                source_local,
+                projection,
+                field,
+            });
+    }
+    Ok(())
+}
+
+fn nearest_state_row_materialization(
+    mut owner: StaticOwnerId,
+    row: ErasedRowBinding,
+    materializations: &[ContextualMaterialization],
+    scope_index: &ErasedScopeIndex,
+) -> Result<(StaticOwnerId, MaterializationLocalId), String> {
+    loop {
+        if let Some(materialization) = materializations.iter().find(|materialization| {
+            materialization.owner == owner
+                && materialization.target_list_id == Some(row.list)
+                && materialization.target_scope_id == Some(row.scope)
+        }) {
+            if materialization.operation != ContextualOperationKind::Map {
+                return Err(format!(
+                    "indexed state row {}/{} is owned by non-map contextual operation {:?}",
+                    row.list, row.scope, materialization.operation
+                ));
+            }
+            return Ok((materialization.owner, materialization.row_local));
+        }
+        let definition = scope_index
+            .owners
+            .get(owner.as_usize())
+            .filter(|definition| definition.id == owner)
+            .ok_or_else(|| format!("indexed state references missing owner {owner}"))?;
+        let Some(parent) = definition.parent else {
+            return Err(format!(
+                "indexed state row {}/{} has no owning contextual map",
+                row.list, row.scope
+            ));
+        };
+        owner = parent;
+    }
+}
+
+fn event_cause_row_list(
+    cause: EventCause,
+    sources: &[SourcePort],
+    lists: &[ListMemory],
+) -> Result<Option<ListId>, String> {
+    let EventCause::Source(source) = cause else {
+        return Ok(None);
+    };
+    let source = sources
+        .get(source.as_usize())
+        .filter(|candidate| candidate.id == source)
+        .ok_or_else(|| format!("state update references missing source {source}"))?;
+    let Some(scope) = source.scope_id else {
+        return Ok(None);
+    };
+    let candidates = lists
+        .iter()
+        .filter(|list| list.row_scope_id == Some(scope))
+        .map(|list| list.id)
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [list] => Ok(Some(*list)),
+        _ => Err(format!(
+            "scoped source `{}` scope {} resolves to {} row lists",
+            source.path,
+            scope,
+            candidates.len()
+        )),
+    }
+}
+
+fn contextual_list_reaches(
+    materializations: &[ContextualMaterialization],
+    source: ListId,
+    target: ListId,
+) -> bool {
+    if source == target {
+        return true;
+    }
+    let mut pending = vec![source];
+    let mut visited = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        for materialization in materializations.iter().filter(|materialization| {
+            matches!(
+                materialization.operation,
+                ContextualOperationKind::Map
+                    | ContextualOperationKind::Filter
+                    | ContextualOperationKind::Retain
+            ) && materialization.source_list_id == Some(current)
+        }) {
+            let Some(next) = materialization.target_list_id else {
+                continue;
+            };
+            if next == target {
+                return true;
+            }
+            pending.push(next);
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_detached_state_capture_requests(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    scope_index: &ErasedScopeIndex,
+    expression_id: ExecutableExprId,
+    state_row: ErasedRowBinding,
+    target: (StaticOwnerId, MaterializationLocalId),
+    event_list: Option<ListId>,
+    active_owners: &mut BTreeSet<StaticOwnerId>,
+    visited: &mut BTreeSet<(ExecutableExprId, Vec<StaticOwnerId>)>,
+    requests: &mut BTreeMap<DetachedStateCaptureKey, boon_typecheck::Type>,
+) -> Result<(), String> {
+    let active_key = active_owners.iter().copied().collect::<Vec<_>>();
+    if !visited.insert((expression_id, active_key)) {
+        return Ok(());
+    }
+    let expression = executable
+        .expressions
+        .get(expression_id.as_usize())
+        .filter(|expression| expression.id == expression_id)
+        .ok_or_else(|| format!("detached capture references missing expression {expression_id}"))?;
+    match &expression.kind {
+        ExecutableExpressionKind::MaterializationLocal {
+            owner,
+            local,
+            projection,
+        } if !active_owners.contains(owner) => {
+            let source = scope_index
+                .locals
+                .iter()
+                .find(|candidate| candidate.owner == *owner && candidate.local == *local)
+                .ok_or_else(|| {
+                    format!(
+                        "detached capture expression {} references missing owner {} local {}",
+                        expression_id, owner, local.0
+                    )
+                })?;
+            if source.row == Some(state_row) {
+                return Ok(());
+            }
+            if source.row.is_some_and(|row| {
+                event_list.is_some_and(|event_list| {
+                    contextual_list_reaches(materializations, event_list, row.list)
+                })
+            }) {
+                return Ok(());
+            }
+            if !scope_index.owner_descends_from(target.0, *owner)? {
+                return Err(format!(
+                    "state row {}/{} cannot capture owner {} local {} from unrelated target owner {}",
+                    state_row.list, state_row.scope, owner, local.0, target.0
+                ));
+            }
+            let key = (
+                target.0,
+                target.1,
+                *owner,
+                *local,
+                projection.clone(),
+                state_row,
+            );
+            if let Some(previous) = requests.get(&key)
+                && previous != &expression.flow_type.ty
+            {
+                return Err(format!(
+                    "detached owner {} local {} projection `{}` has incompatible capture types {previous:?} and {:?}",
+                    owner,
+                    local.0,
+                    projection.join("."),
+                    expression.flow_type.ty
+                ));
+            }
+            requests.insert(key, expression.flow_type.ty.clone());
+        }
+        ExecutableExpressionKind::Materialize { materialization } => {
+            let materialization = materializations
+                .get(*materialization)
+                .filter(|candidate| candidate.id == *materialization)
+                .ok_or_else(|| {
+                    format!(
+                        "detached capture expression {} references missing materialization {}",
+                        expression_id, materialization
+                    )
+                })?;
+            collect_detached_state_capture_requests(
+                executable,
+                materializations,
+                scope_index,
+                materialization.source,
+                state_row,
+                target,
+                event_list,
+                active_owners,
+                visited,
+                requests,
+            )?;
+            if let Some(direction) = materialization.direction {
+                collect_detached_state_capture_requests(
+                    executable,
+                    materializations,
+                    scope_index,
+                    direction,
+                    state_row,
+                    target,
+                    event_list,
+                    active_owners,
+                    visited,
+                    requests,
+                )?;
+            }
+            for key in &materialization.inherited_order {
+                collect_detached_state_capture_requests(
+                    executable,
+                    materializations,
+                    scope_index,
+                    key.direction,
+                    state_row,
+                    target,
+                    event_list,
+                    active_owners,
+                    visited,
+                    requests,
+                )?;
+            }
+            active_owners.insert(materialization.owner);
+            let mut body_result = collect_detached_state_capture_requests(
+                executable,
+                materializations,
+                scope_index,
+                materialization.body,
+                state_row,
+                target,
+                event_list,
+                active_owners,
+                visited,
+                requests,
+            );
+            for key in &materialization.inherited_order {
+                if body_result.is_ok() {
+                    body_result = collect_detached_state_capture_requests(
+                        executable,
+                        materializations,
+                        scope_index,
+                        key.body,
+                        state_row,
+                        target,
+                        event_list,
+                        active_owners,
+                        visited,
+                        requests,
+                    );
+                }
+            }
+            active_owners.remove(&materialization.owner);
+            body_result?;
+        }
+        _ => {
+            for child in executable_expression_children(&expression.kind) {
+                collect_detached_state_capture_requests(
+                    executable,
+                    materializations,
+                    scope_index,
+                    child,
+                    state_row,
+                    target,
+                    event_list,
+                    active_owners,
+                    visited,
+                    requests,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn paired_row_binding(
+    list: Option<ListId>,
+    scope: Option<ScopeId>,
+    role: &str,
+    owner: StaticOwnerId,
+) -> Result<Option<ErasedRowBinding>, String> {
+    match (list, scope) {
+        (None, None) => Ok(None),
+        (Some(list), Some(scope)) => Ok(Some(ErasedRowBinding { list, scope })),
+        _ => Err(format!(
+            "contextual owner {owner} has an incomplete {role} row binding: list={list:?}, scope={scope:?}"
+        )),
+    }
+}
+
+fn erased_row_binding_for_list(
+    lists: &[ListMemory],
+    list: ListId,
+) -> Result<ErasedRowBinding, String> {
+    let memory = lists
+        .get(list.as_usize())
+        .filter(|memory| memory.id == list)
+        .ok_or_else(|| format!("missing ListId {list}"))?;
+    let scope = memory
+        .row_scope_id
+        .ok_or_else(|| format!("ListId {list} has no exact row scope"))?;
+    Ok(ErasedRowBinding { list, scope })
 }
 
 fn static_owner_ancestry(
@@ -2155,12 +5116,12 @@ fn static_owner_ancestry(
     Ok(result)
 }
 
-fn storage_binding_for_read(
-    storage: &StorageCatalog,
+fn erased_binding_for_read(
+    scope_index: &ErasedScopeIndex,
     static_owners: &[StaticOwnerDef],
     declaration: boon_typecheck::DeclId,
     owner: Option<StaticOwnerId>,
-) -> Result<StorageBindingId, String> {
+) -> Result<ErasedBindingId, String> {
     let mut lexical_owners = static_owner_ancestry(owner, static_owners)?;
     lexical_owners.reverse();
     let lexical_owners = lexical_owners
@@ -2168,11 +5129,20 @@ fn storage_binding_for_read(
         .map(Some)
         .chain(std::iter::once(None));
     for lexical_owner in lexical_owners {
-        let candidates = storage
+        let candidates = scope_index
             .bindings
             .iter()
             .filter(|binding| {
                 binding.declaration == declaration && binding.static_owner == lexical_owner
+            })
+            .filter(|binding| {
+                !matches!(
+                    binding.target,
+                    ErasedBindingTarget::State {
+                        published: false,
+                        ..
+                    }
+                )
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
@@ -2180,18 +5150,18 @@ fn storage_binding_for_read(
         }
         let preferred_kind = candidates
             .iter()
-            .map(|binding| match binding.kind {
-                StorageBindingKind::Value { .. } => 0_u8,
-                StorageBindingKind::State { .. } | StorageBindingKind::Source { .. } => 1,
+            .map(|binding| match binding.target {
+                ErasedBindingTarget::Value { .. } => 0_u8,
+                ErasedBindingTarget::State { .. } | ErasedBindingTarget::Source { .. } => 1,
             })
             .min()
             .expect("non-empty candidates");
         let preferred = candidates
             .into_iter()
             .filter(|binding| {
-                (match binding.kind {
-                    StorageBindingKind::Value { .. } => 0_u8,
-                    StorageBindingKind::State { .. } | StorageBindingKind::Source { .. } => 1,
+                (match binding.target {
+                    ErasedBindingTarget::Value { .. } => 0_u8,
+                    ErasedBindingTarget::State { .. } | ErasedBindingTarget::Source { .. } => 1,
                 }) == preferred_kind
             })
             .collect::<Vec<_>>();
@@ -2209,17 +5179,25 @@ fn storage_binding_for_read(
     ))
 }
 
-fn bind_executable_storage_reads(
-    executable: &mut ExecutableProgram,
-    storage: &StorageCatalog,
+fn executable_read_root_bindings(
+    checked: &boon_typecheck::CheckedProgram,
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    scope_index: &ErasedScopeIndex,
     static_owners: &[StaticOwnerDef],
-) -> Result<(), String> {
+) -> Result<BTreeMap<ExecutableExprId, ErasedBindingId>, String> {
+    let reachable = reachable_executable_expression_ids(executable, materializations)?;
     let expression_owners = executable
         .expressions
         .iter()
         .map(|expression| (expression.id, expression.owner))
         .collect::<BTreeMap<_, _>>();
-    for expression in &mut executable.expressions {
+    let mut bindings = BTreeMap::new();
+    for expression in executable
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+    {
         let target = match &expression.kind {
             ExecutableExpressionKind::CanonicalRead { target, .. }
             | ExecutableExpressionKind::Drain { target, .. } => Some(*target),
@@ -2228,7 +5206,7 @@ fn bind_executable_storage_reads(
         let Some(target) = target else {
             continue;
         };
-        let binding = storage_binding_for_read(storage, static_owners, target, expression.owner)
+        let binding = erased_binding_for_read(scope_index, static_owners, target, expression.owner)
             .map_err(|error| {
                 let producers = executable
                     .statements
@@ -2258,32 +5236,1702 @@ fn bind_executable_storage_reads(
                     .filter(|state| state.declaration == target)
                     .map(|state| (state.id, state.expression, state.owner))
                     .collect::<Vec<_>>();
+                let equivalent_reads = executable
+                    .expressions
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.checked_expr_id == expression.checked_expr_id
+                            && matches!(
+                                candidate.kind,
+                                ExecutableExpressionKind::CanonicalRead { .. }
+                                    | ExecutableExpressionKind::Drain { .. }
+                            )
+                    })
+                    .map(|candidate| {
+                        (
+                            candidate.id,
+                            candidate.owner,
+                            static_owner_ancestry(candidate.owner, static_owners),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let checked_declaration = checked
+                    .declarations
+                    .iter()
+                    .find(|declaration| declaration.id == target)
+                    .map(|declaration| {
+                        (
+                            declaration.name.as_str(),
+                            declaration.kind,
+                            declaration.scope_id,
+                            declaration.span,
+                        )
+                    });
+                let checked_read = checked
+                    .expressions
+                    .iter()
+                    .find(|candidate| candidate.id == expression.checked_expr_id)
+                    .map(|candidate| (candidate.scope_id, candidate.span));
                 format!(
-                    "{error}; executable read {} from checked expression {} ({:?}) sees declaration producers {:?}, sources {:?}, states {:?}",
+                    "{error}; executable read {} from checked expression {} ({:?}, checked {:?}) targets checked declaration {:?}, and sees equivalent reads {:?}, declaration producers {:?}, sources {:?}, states {:?}",
                     expression.id,
                     expression.checked_expr_id.0,
                     expression.kind,
+                    checked_read,
+                    checked_declaration,
+                    equivalent_reads,
                     producers,
                     sources,
                     states
                 )
             })?;
-        match &mut expression.kind {
-            ExecutableExpressionKind::CanonicalRead {
-                storage_binding, ..
+        if bindings.insert(expression.id, binding).is_some() {
+            return Err(format!(
+                "executable read {} has duplicate root bindings",
+                expression.id
+            ));
+        }
+    }
+    Ok(bindings)
+}
+
+fn erased_binding_read_target(
+    executable: &ExecutableProgram,
+    sources: &[SourcePort],
+    scope_index: &ErasedScopeIndex,
+    binding: ErasedBindingId,
+    projection: &[String],
+    read_flow_type: &boon_typecheck::FlowType,
+) -> Result<ErasedReadTarget, String> {
+    let mut binding = binding;
+    let mut consumed = 0;
+    while let Some((projected, projected_count)) =
+        exact_projected_binding(scope_index, binding, &projection[consumed..])?
+    {
+        binding = projected;
+        consumed += projected_count;
+    }
+    let remaining = &projection[consumed..];
+    let storage = scope_index
+        .bindings
+        .get(binding.as_usize())
+        .filter(|candidate| candidate.id == binding)
+        .ok_or_else(|| format!("missing erased binding {binding}"))?;
+    match storage.target {
+        ErasedBindingTarget::Source { .. } if storage.flow_type == *read_flow_type => {
+            Ok(ErasedReadTarget::Binding {
+                binding,
+                projection: Vec::new(),
+            })
+        }
+        ErasedBindingTarget::Source { runtime, .. } if !remaining.is_empty() => {
+            erased_source_payload_read(sources, binding, runtime, remaining).map_err(|error| {
+                format!(
+                    "{error}; read binding {binding} (`{}`) consumed {consumed} of projection `{}`",
+                    storage.diagnostic_path,
+                    projection.join(".")
+                )
+            })
+        }
+        ErasedBindingTarget::State { .. } if storage.flow_type == *read_flow_type => {
+            Ok(ErasedReadTarget::Binding {
+                binding,
+                projection: Vec::new(),
+            })
+        }
+        ErasedBindingTarget::State { runtime, .. } if !remaining.is_empty() => {
+            Ok(ErasedReadTarget::StateProjection {
+                binding,
+                state: runtime,
+                fields: remaining.to_vec(),
+            })
+        }
+        ErasedBindingTarget::Value { field, row: None }
+            if field.is_none()
+                || matches!(
+                    executable
+                        .expressions
+                        .get(storage.producer.as_usize())
+                        .map(|expression| &expression.kind),
+                    Some(
+                        ExecutableExpressionKind::Object(_)
+                            | ExecutableExpressionKind::Record(_)
+                            | ExecutableExpressionKind::TaggedObject { .. }
+                    )
+                ) =>
+        {
+            let (expression, remaining) =
+                exact_executable_record_projection(executable, storage.producer, remaining)?;
+            let resources = scope_index
+                .bindings
+                .iter()
+                .filter(|candidate| candidate.producer == expression)
+                .filter(|candidate| {
+                    matches!(
+                        candidate.target,
+                        ErasedBindingTarget::Source { .. } | ErasedBindingTarget::State { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            match resources.as_slice() {
+                [] => Ok(ErasedReadTarget::Expression {
+                    expression,
+                    projection: remaining.to_vec(),
+                }),
+                [resource] => match resource.target {
+                    ErasedBindingTarget::Source { .. }
+                        if resource.flow_type == *read_flow_type =>
+                    {
+                        Ok(ErasedReadTarget::Binding {
+                            binding: resource.id,
+                            projection: Vec::new(),
+                        })
+                    }
+                    ErasedBindingTarget::Source { runtime, .. } if !remaining.is_empty() => {
+                        erased_source_payload_read(
+                            sources,
+                            resource.id,
+                            runtime,
+                            remaining,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "{error}; expression {expression} projected from binding {binding} (`{}`)",
+                                storage.diagnostic_path
+                            )
+                        })
+                    }
+                    ErasedBindingTarget::State { runtime, .. } if !remaining.is_empty() => {
+                        Ok(ErasedReadTarget::StateProjection {
+                            binding: resource.id,
+                            state: runtime,
+                            fields: remaining.to_vec(),
+                        })
+                    }
+                    ErasedBindingTarget::Source { .. }
+                    | ErasedBindingTarget::State { .. } => Ok(ErasedReadTarget::Binding {
+                        binding: resource.id,
+                        projection: Vec::new(),
+                    }),
+                    ErasedBindingTarget::Value { .. } => unreachable!("filtered resource target"),
+                },
+                _ => Err(format!(
+                    "executable expression {expression} has {} exact state/source bindings",
+                    resources.len()
+                )),
             }
-            | ExecutableExpressionKind::Drain {
-                storage_binding, ..
-            } => *storage_binding = Some(binding),
-            _ => unreachable!("target was read from this expression kind"),
+        }
+        _ => Ok(ErasedReadTarget::Binding {
+            binding,
+            projection: remaining.to_vec(),
+        }),
+    }
+}
+
+fn exact_projected_binding(
+    scope_index: &ErasedScopeIndex,
+    binding: ErasedBindingId,
+    projection: &[String],
+) -> Result<Option<(ErasedBindingId, usize)>, String> {
+    let root = scope_index
+        .bindings
+        .get(binding.as_usize())
+        .filter(|candidate| candidate.id == binding)
+        .ok_or_else(|| format!("missing erased binding {binding}"))?;
+    let ErasedBindingTarget::Value {
+        field: Some(mut field),
+        ..
+    } = root.target
+    else {
+        return Ok(None);
+    };
+    let mut deepest = None;
+    for (index, name) in projection.iter().enumerate() {
+        let fields = scope_index
+            .fields
+            .iter()
+            .filter(|candidate| candidate.parent == Some(field) && candidate.name == *name)
+            .collect::<Vec<_>>();
+        let child = match fields.as_slice() {
+            [] => return Ok(None),
+            [child] => *child,
+            _ => {
+                return Err(format!(
+                    "erased field {field} projection `{name}` resolves to {} child fields",
+                    fields.len()
+                ));
+            }
+        };
+        field = child.id;
+        let exact = scope_index
+            .bindings
+            .iter()
+            .filter(|candidate| {
+                child.producer == Some(candidate.producer)
+                    && candidate.static_owner == child.static_owner
+            })
+            .collect::<Vec<_>>();
+        let bindings = if exact.is_empty() {
+            let Some(declaration) = child.declaration else {
+                continue;
+            };
+            scope_index
+                .bindings
+                .iter()
+                .filter(|candidate| {
+                    candidate.declaration == declaration
+                        && candidate.static_owner == child.static_owner
+                })
+                .collect::<Vec<_>>()
+        } else {
+            exact
+        };
+        match bindings.as_slice() {
+            [] => {}
+            [projected] if projected.id != binding => {
+                deepest = Some((projected.id, index + 1));
+            }
+            [..] if bindings.iter().all(|projected| projected.id == binding) => {}
+            _ => {}
+        }
+    }
+    Ok(deepest)
+}
+
+fn erased_source_payload_read(
+    sources: &[SourcePort],
+    binding: ErasedBindingId,
+    source: SourceId,
+    projection: &[String],
+) -> Result<ErasedReadTarget, String> {
+    let source_port = sources
+        .get(source.as_usize())
+        .filter(|candidate| candidate.id == source)
+        .ok_or_else(|| format!("missing SourceId {source}"))?;
+    let (field_name, projection) = projection.split_first().ok_or_else(|| {
+        format!(
+            "source `{}` has an empty payload projection",
+            source_port.path
+        )
+    })?;
+    let fields = source_port
+        .payload_schema
+        .fields
+        .iter()
+        .filter(|field| field.name() == field_name)
+        .collect::<Vec<_>>();
+    let [field] = fields.as_slice() else {
+        return Err(format!(
+            "source `{}` payload projection `{field_name}` resolves to {} fields",
+            source_port.path,
+            fields.len()
+        ));
+    };
+    Ok(ErasedReadTarget::SourcePayload {
+        binding,
+        source,
+        field: (*field).clone(),
+        projection: projection.to_vec(),
+    })
+}
+
+fn erased_exact_source_read_target(
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    sources: &[SourcePort],
+    scope_index: &ErasedScopeIndex,
+    owner: Option<StaticOwnerId>,
+    source_read: &boon_typecheck::CheckedSourceRead,
+) -> Result<ErasedReadTarget, String> {
+    let mut lexical_owners = static_owner_ancestry(owner, static_owners)?;
+    lexical_owners.reverse();
+    for lexical_owner in lexical_owners
+        .into_iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+    {
+        let candidates = scope_index
+            .bindings
+            .iter()
+            .filter(|binding| binding.static_owner == lexical_owner)
+            .filter_map(|binding| {
+                let ErasedBindingTarget::Source {
+                    executable: source,
+                    runtime,
+                } = binding.target
+                else {
+                    return None;
+                };
+                let definition = executable
+                    .sources
+                    .get(source.as_usize())
+                    .filter(|definition| definition.id == source)?;
+                let producer = executable
+                    .expressions
+                    .get(definition.expression.as_usize())
+                    .filter(|producer| producer.id == definition.expression)?;
+                (producer.checked_expr_id == source_read.expression)
+                    .then_some((binding.id, runtime))
+            })
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [] => continue,
+            [(binding, _)] if source_read.payload_projection.is_empty() => {
+                return Ok(ErasedReadTarget::Binding {
+                    binding: *binding,
+                    projection: Vec::new(),
+                });
+            }
+            [(binding, runtime)] => {
+                return erased_source_payload_read(
+                    sources,
+                    *binding,
+                    *runtime,
+                    &source_read.payload_projection,
+                );
+            }
+            _ => {
+                return Err(format!(
+                    "checked SOURCE expression {} owner {:?} resolves to {} exact source bindings",
+                    source_read.expression.0,
+                    lexical_owner,
+                    candidates.len()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "checked SOURCE expression {} read from owner {:?} has no lexical source binding",
+        source_read.expression.0, owner
+    ))
+}
+
+fn exact_executable_record_projection<'a>(
+    executable: &ExecutableProgram,
+    mut expression: ExecutableExprId,
+    projection: &'a [String],
+) -> Result<(ExecutableExprId, &'a [String]), String> {
+    let mut remaining = projection;
+    while let Some((field_name, rest)) = remaining.split_first() {
+        let value = executable
+            .expressions
+            .get(expression.as_usize())
+            .filter(|candidate| candidate.id == expression)
+            .ok_or_else(|| format!("read projection reaches missing expression {expression}"))?;
+        let fields = match &value.kind {
+            ExecutableExpressionKind::Object(fields)
+            | ExecutableExpressionKind::Record(fields)
+            | ExecutableExpressionKind::TaggedObject { fields, .. } => fields,
+            _ => break,
+        };
+        let matches = fields
+            .iter()
+            .filter(|field| !field.spread && field.name == *field_name)
+            .collect::<Vec<_>>();
+        let field = match matches.as_slice() {
+            [] => break,
+            [field] => *field,
+            _ => {
+                return Err(format!(
+                    "expression {expression} projection `{field_name}` resolves to {} fields",
+                    matches.len()
+                ));
+            }
+        };
+        expression = field.value;
+        remaining = rest;
+    }
+    Ok((expression, remaining))
+}
+
+fn build_erased_row_values(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    scope_index: &ErasedScopeIndex,
+) -> Result<Vec<ErasedRowValue>, String> {
+    let expression_ids = reachable_executable_expression_ids(executable, materializations)?;
+    let mut resolver = ErasedRowValueResolver {
+        executable,
+        materializations,
+        scope_index,
+        row_memo: BTreeMap::new(),
+        list_memo: BTreeMap::new(),
+        visiting_rows: BTreeSet::new(),
+        visiting_lists: BTreeSet::new(),
+    };
+    let mut values = Vec::new();
+    for expression in expression_ids {
+        values.extend(
+            resolver
+                .row_values(expression)?
+                .into_iter()
+                .map(|(projection, row)| ErasedRowValue {
+                    expression,
+                    projection,
+                    row,
+                }),
+        );
+    }
+    Ok(values)
+}
+
+type ErasedRowValueMap = BTreeMap<Vec<String>, ErasedRowBinding>;
+
+struct ErasedRowValueResolver<'a> {
+    executable: &'a ExecutableProgram,
+    materializations: &'a [ContextualMaterialization],
+    scope_index: &'a ErasedScopeIndex,
+    row_memo: BTreeMap<ExecutableExprId, ErasedRowValueMap>,
+    list_memo: BTreeMap<ExecutableExprId, Option<ErasedRowBinding>>,
+    visiting_rows: BTreeSet<ExecutableExprId>,
+    visiting_lists: BTreeSet<ExecutableExprId>,
+}
+
+impl ErasedRowValueResolver<'_> {
+    fn expression(&self, id: ExecutableExprId) -> Result<&ExecutableExpression, String> {
+        self.executable
+            .expressions
+            .get(id.as_usize())
+            .filter(|expression| expression.id == id)
+            .ok_or_else(|| format!("row provenance references missing expression {id}"))
+    }
+
+    fn row_values(&mut self, id: ExecutableExprId) -> Result<ErasedRowValueMap, String> {
+        if let Some(values) = self.row_memo.get(&id) {
+            return Ok(values.clone());
+        }
+        if !self.visiting_rows.insert(id) {
+            return Ok(BTreeMap::new());
+        }
+        let kind = self.expression(id)?.kind.clone();
+        let values = self.row_values_for_kind(id, kind);
+        self.visiting_rows.remove(&id);
+        let values = values?;
+        self.row_memo.insert(id, values.clone());
+        Ok(values)
+    }
+
+    fn row_values_for_kind(
+        &mut self,
+        expression: ExecutableExprId,
+        kind: ExecutableExpressionKind,
+    ) -> Result<ErasedRowValueMap, String> {
+        match kind {
+            ExecutableExpressionKind::CanonicalRead { .. }
+            | ExecutableExpressionKind::LocalRead { .. }
+            | ExecutableExpressionKind::ExternalRead { .. }
+            | ExecutableExpressionKind::Drain { .. }
+            | ExecutableExpressionKind::MaterializationLocal { .. }
+            | ExecutableExpressionKind::FunctionParameter { .. } => {
+                self.row_values_for_read(expression)
+            }
+            ExecutableExpressionKind::Materialize { materialization } => {
+                let materialization = self
+                    .materializations
+                    .get(materialization)
+                    .filter(|candidate| candidate.id == materialization)
+                    .ok_or_else(|| {
+                        format!(
+                            "row provenance expression {expression} references missing materialization {materialization}"
+                        )
+                    })?;
+                if materialization.operation != ContextualOperationKind::Find {
+                    return Ok(BTreeMap::new());
+                }
+                let Some(row) = paired_row_binding(
+                    materialization.source_list_id,
+                    materialization.source_scope_id,
+                    "source",
+                    materialization.owner,
+                )?
+                else {
+                    return Ok(BTreeMap::new());
+                };
+                Ok(BTreeMap::from([(vec!["value".to_owned()], row)]))
+            }
+            ExecutableExpressionKind::Call {
+                name, arguments, ..
+            } if matches!(name.as_str(), "List/get" | "List/latest") => {
+                let source = arguments
+                    .iter()
+                    .find(|argument| argument.name == "list")
+                    .or_else(|| arguments.iter().find(|argument| argument.ordinal == 0))
+                    .ok_or_else(|| {
+                        format!("{name} expression {expression} has no typed list argument")
+                    })?;
+                Ok(self
+                    .list_row(source.value)?
+                    .map(|row| BTreeMap::from([(Vec::new(), row)]))
+                    .unwrap_or_default())
+            }
+            ExecutableExpressionKind::Object(fields)
+            | ExecutableExpressionKind::Record(fields)
+            | ExecutableExpressionKind::TaggedObject { fields, .. } => {
+                let mut values = BTreeMap::new();
+                for field in fields.into_iter().filter(|field| !field.spread) {
+                    let nested = self
+                        .row_values(field.value)?
+                        .into_iter()
+                        .map(|(mut path, row)| {
+                            path.insert(0, field.name.clone());
+                            (path, row)
+                        })
+                        .collect();
+                    merge_erased_row_values(
+                        &mut values,
+                        nested,
+                        &format!("expression {expression} field `{}`", field.name),
+                    )?;
+                }
+                Ok(values)
+            }
+            ExecutableExpressionKind::Block { result, .. } => self.row_values(result),
+            ExecutableExpressionKind::Project { input, fields } => {
+                Ok(project_erased_row_values(self.row_values(input)?, &fields))
+            }
+            ExecutableExpressionKind::When { arms, .. } => {
+                self.merge_row_value_branches(expression, arms.into_iter().map(|arm| arm.output))
+            }
+            ExecutableExpressionKind::Latest { branches } => {
+                self.merge_row_value_branches(expression, branches.into_iter())
+            }
+            ExecutableExpressionKind::Hold {
+                initial, updates, ..
+            } => self.merge_row_value_branches(expression, std::iter::once(initial).chain(updates)),
+            ExecutableExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | ExecutableExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => self.row_values(output),
+            ExecutableExpressionKind::Draining { input } => self.row_values(input),
+            _ => Ok(BTreeMap::new()),
+        }
+    }
+
+    fn merge_row_value_branches(
+        &mut self,
+        expression: ExecutableExprId,
+        branches: impl Iterator<Item = ExecutableExprId>,
+    ) -> Result<ErasedRowValueMap, String> {
+        let mut values = BTreeMap::new();
+        for branch in branches {
+            let branch_values = self.row_values(branch)?;
+            merge_erased_row_values(
+                &mut values,
+                branch_values,
+                &format!("expression {expression} branch {branch}"),
+            )?;
+        }
+        Ok(values)
+    }
+
+    fn row_values_for_read(
+        &mut self,
+        expression: ExecutableExprId,
+    ) -> Result<ErasedRowValueMap, String> {
+        let Some(read) = self
+            .scope_index
+            .reads
+            .iter()
+            .find(|read| read.expression == expression)
+        else {
+            return Ok(BTreeMap::new());
+        };
+        match &read.target {
+            ErasedReadTarget::Binding {
+                binding,
+                projection,
+            } => {
+                let binding = self.binding(*binding)?;
+                Ok(project_erased_row_values(
+                    self.row_values(binding.producer)?,
+                    projection,
+                ))
+            }
+            ErasedReadTarget::Expression {
+                expression,
+                projection,
+            } => Ok(project_erased_row_values(
+                self.row_values(*expression)?,
+                projection,
+            )),
+            ErasedReadTarget::Local {
+                value, projection, ..
+            } => Ok(project_erased_row_values(
+                self.row_values(*value)?,
+                projection,
+            )),
+            ErasedReadTarget::MaterializationLocal {
+                owner,
+                local,
+                projection,
+            } if projection.is_empty() => {
+                let rows = self
+                    .scope_index
+                    .locals
+                    .iter()
+                    .filter(|candidate| candidate.owner == *owner && candidate.local == *local)
+                    .filter_map(|candidate| candidate.row)
+                    .collect::<BTreeSet<_>>();
+                let rows = rows.into_iter().collect::<Vec<_>>();
+                match rows.as_slice() {
+                    [row] => Ok(BTreeMap::from([(Vec::new(), *row)])),
+                    [] => Ok(BTreeMap::new()),
+                    rows => Err(format!(
+                        "materialization local {owner}:{} has multiple exact row owners {rows:?}",
+                        local.0
+                    )),
+                }
+            }
+            ErasedReadTarget::SourcePayload { .. }
+            | ErasedReadTarget::StateProjection { .. }
+            | ErasedReadTarget::ExternalValue { .. }
+            | ErasedReadTarget::MaterializationLocal { .. }
+            | ErasedReadTarget::FunctionParameter { .. } => Ok(BTreeMap::new()),
+        }
+    }
+
+    fn list_row(
+        &mut self,
+        expression: ExecutableExprId,
+    ) -> Result<Option<ErasedRowBinding>, String> {
+        if let Some(row) = self.list_memo.get(&expression) {
+            return Ok(*row);
+        }
+        if !self.visiting_lists.insert(expression) {
+            return Ok(None);
+        }
+        let kind = self.expression(expression)?.kind.clone();
+        let mut rows =
+            self.scope_index
+                .bindings
+                .iter()
+                .filter(|binding| binding.producer == expression)
+                .filter_map(|binding| match binding.target {
+                    ErasedBindingTarget::Value { row, .. }
+                    | ErasedBindingTarget::State { row, .. } => row,
+                    ErasedBindingTarget::Source { .. } => None,
+                })
+                .collect::<BTreeSet<_>>();
+        match kind {
+            ExecutableExpressionKind::CanonicalRead { .. }
+            | ExecutableExpressionKind::LocalRead { .. }
+            | ExecutableExpressionKind::Drain { .. } => {
+                let Some(read) = self
+                    .scope_index
+                    .reads
+                    .iter()
+                    .find(|read| read.expression == expression)
+                else {
+                    self.visiting_lists.remove(&expression);
+                    self.list_memo.insert(expression, None);
+                    return Ok(None);
+                };
+                match &read.target {
+                    ErasedReadTarget::Binding {
+                        binding,
+                        projection,
+                    } if projection.is_empty() => match self.binding(*binding)?.target {
+                        ErasedBindingTarget::Value { row: Some(row), .. }
+                        | ErasedBindingTarget::State { row: Some(row), .. } => {
+                            rows.insert(row);
+                        }
+                        _ => {}
+                    },
+                    ErasedReadTarget::Expression {
+                        expression: target,
+                        projection,
+                    }
+                    | ErasedReadTarget::Local {
+                        value: target,
+                        projection,
+                        ..
+                    } if projection.is_empty() => {
+                        if let Some(row) = self.list_row(*target)? {
+                            rows.insert(row);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ExecutableExpressionKind::Materialize { materialization } => {
+                let materialization = self
+                    .materializations
+                    .get(materialization)
+                    .filter(|candidate| candidate.id == materialization)
+                    .ok_or_else(|| {
+                        format!(
+                            "list provenance expression {expression} references missing materialization {materialization}"
+                        )
+                    })?;
+                if let Some(row) = paired_row_binding(
+                    materialization.target_list_id,
+                    materialization.target_scope_id,
+                    "target",
+                    materialization.owner,
+                )? {
+                    rows.insert(row);
+                } else if matches!(
+                    materialization.operation,
+                    ContextualOperationKind::Filter
+                        | ContextualOperationKind::Retain
+                        | ContextualOperationKind::Remove
+                ) && let Some(row) = paired_row_binding(
+                    materialization.source_list_id,
+                    materialization.source_scope_id,
+                    "source",
+                    materialization.owner,
+                )? {
+                    rows.insert(row);
+                }
+            }
+            ExecutableExpressionKind::Block { result, .. } => {
+                if let Some(row) = self.list_row(result)? {
+                    rows.insert(row);
+                }
+            }
+            ExecutableExpressionKind::Project { input, fields } if fields.is_empty() => {
+                if let Some(row) = self.list_row(input)? {
+                    rows.insert(row);
+                }
+            }
+            ExecutableExpressionKind::When { arms, .. } => {
+                for arm in arms {
+                    if let Some(row) = self.list_row(arm.output)? {
+                        rows.insert(row);
+                    }
+                }
+            }
+            ExecutableExpressionKind::Latest { branches } => {
+                for branch in branches {
+                    if let Some(row) = self.list_row(branch)? {
+                        rows.insert(row);
+                    }
+                }
+            }
+            ExecutableExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | ExecutableExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => {
+                if let Some(row) = self.list_row(output)? {
+                    rows.insert(row);
+                }
+            }
+            ExecutableExpressionKind::Draining { input } => {
+                if let Some(row) = self.list_row(input)? {
+                    rows.insert(row);
+                }
+            }
+            ExecutableExpressionKind::Call {
+                name, arguments, ..
+            } if name == "List/append" => {
+                if let Some(source) = arguments
+                    .iter()
+                    .find(|argument| argument.name == "list")
+                    .or_else(|| arguments.iter().find(|argument| argument.ordinal == 0))
+                    && let Some(row) = self.list_row(source.value)?
+                {
+                    rows.insert(row);
+                }
+            }
+            _ => {}
+        }
+        self.visiting_lists.remove(&expression);
+        let rows = rows.into_iter().collect::<Vec<_>>();
+        let row = match rows.as_slice() {
+            [] => None,
+            [row] => Some(*row),
+            rows => {
+                return Err(format!(
+                    "list expression {expression} has multiple exact row owners {rows:?}"
+                ));
+            }
+        };
+        self.list_memo.insert(expression, row);
+        Ok(row)
+    }
+
+    fn binding(&self, id: ErasedBindingId) -> Result<&ErasedBinding, String> {
+        self.scope_index
+            .bindings
+            .get(id.as_usize())
+            .filter(|binding| binding.id == id)
+            .ok_or_else(|| format!("row provenance references missing binding {id}"))
+    }
+}
+
+fn project_erased_row_values(
+    values: ErasedRowValueMap,
+    projection: &[String],
+) -> ErasedRowValueMap {
+    if projection.is_empty() {
+        return values;
+    }
+    values
+        .into_iter()
+        .filter_map(|(path, row)| {
+            path.strip_prefix(projection)
+                .map(|remaining| (remaining.to_vec(), row))
+        })
+        .collect()
+}
+
+fn merge_erased_row_values(
+    target: &mut ErasedRowValueMap,
+    source: ErasedRowValueMap,
+    context: &str,
+) -> Result<(), String> {
+    for (projection, row) in source {
+        if let Some(existing) = target.insert(projection.clone(), row)
+            && existing != row
+        {
+            return Err(format!(
+                "{context} row projection `{}` has conflicting owners {existing:?} and {row:?}",
+                projection.join(".")
+            ));
         }
     }
     Ok(())
 }
 
-fn verify_storage_catalog(program: &ErasedProgram) -> Result<(), String> {
-    for (index, binding) in program.storage.bindings.iter().enumerate() {
-        if binding.id != StorageBindingId(index) {
+fn build_erased_read_bindings(
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    materializations: &[ContextualMaterialization],
+    sources: &[SourcePort],
+    scope_index: &ErasedScopeIndex,
+    distributed: &DistributedReferences,
+    read_roots: &BTreeMap<ExecutableExprId, ErasedBindingId>,
+) -> Result<Vec<ErasedReadBinding>, String> {
+    let roots = executable_expression_roots(executable);
+    let reachable = reachable_executable_expression_ids(executable, materializations)?;
+    let mut targets = BTreeMap::<ExecutableExprId, ErasedReadTarget>::new();
+    for expression in executable
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        let target = match &expression.kind {
+            ExecutableExpressionKind::CanonicalRead {
+                projection, source, ..
+            } => {
+                if let Some(source) = source {
+                    Some(erased_exact_source_read_target(
+                        executable,
+                        static_owners,
+                        sources,
+                        scope_index,
+                        expression.owner,
+                        source,
+                    )?)
+                } else {
+                    let binding = read_roots.get(&expression.id).copied().ok_or_else(|| {
+                        format!(
+                            "executable read {} has no exact root binding",
+                            expression.id
+                        )
+                    })?;
+                    Some(erased_binding_read_target(
+                        executable,
+                        sources,
+                        scope_index,
+                        binding,
+                        projection,
+                        &expression.flow_type,
+                    )?)
+                }
+            }
+            ExecutableExpressionKind::Drain { projection, .. } => {
+                let binding = read_roots.get(&expression.id).copied().ok_or_else(|| {
+                    format!(
+                        "executable read {} has no exact root binding",
+                        expression.id
+                    )
+                })?;
+                Some(erased_binding_read_target(
+                    executable,
+                    sources,
+                    scope_index,
+                    binding,
+                    projection,
+                    &expression.flow_type,
+                )?)
+            }
+            ExecutableExpressionKind::ExternalRead { canonical_path } => {
+                let matches = distributed
+                    .value_references
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, reference)| reference.canonical_path == *canonical_path)
+                    .filter(|(_, reference)| {
+                        reference.expr_id.as_usize() == expression.checked_expr_id.0 as usize
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                let [reference] = matches.as_slice() else {
+                    return Err(format!(
+                        "external read {} (`{canonical_path}`) checked expression {} has {} exact distributed references",
+                        expression.id,
+                        expression.checked_expr_id.0,
+                        matches.len()
+                    ));
+                };
+                Some(ErasedReadTarget::ExternalValue {
+                    reference: *reference,
+                })
+            }
+            ExecutableExpressionKind::MaterializationLocal {
+                owner,
+                local,
+                projection,
+            } => {
+                if !scope_index
+                    .locals
+                    .iter()
+                    .any(|candidate| candidate.owner == *owner && candidate.local == *local)
+                {
+                    return Err(format!(
+                        "materialization local read {} references missing owner {} local {}",
+                        expression.id, owner, local.0
+                    ));
+                }
+                Some(ErasedReadTarget::MaterializationLocal {
+                    owner: *owner,
+                    local: *local,
+                    projection: projection.clone(),
+                })
+            }
+            ExecutableExpressionKind::FunctionParameter {
+                parameter,
+                projection,
+            } => Some(ErasedReadTarget::FunctionParameter {
+                parameter: *parameter,
+                projection: projection.clone(),
+            }),
+            _ => None,
+        };
+        if let Some(target) = target {
+            targets.insert(expression.id, target);
+        }
+    }
+
+    for root in roots {
+        collect_local_read_targets(
+            executable,
+            root,
+            &BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut targets,
+        )?;
+    }
+    for materialization in materializations.iter().filter(|materialization| {
+        reachable.contains(&materialization.source)
+            || reachable.contains(&materialization.body)
+            || materialization
+                .direction
+                .is_some_and(|direction| reachable.contains(&direction))
+            || materialization
+                .inherited_order
+                .iter()
+                .any(|key| reachable.contains(&key.body) || reachable.contains(&key.direction))
+    }) {
+        for root in materialization.expression_roots() {
+            collect_local_read_targets(
+                executable,
+                root,
+                &BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &mut targets,
+            )?;
+        }
+    }
+    for expression in executable
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        if matches!(expression.kind, ExecutableExpressionKind::LocalRead { .. })
+            && !targets.contains_key(&expression.id)
+        {
+            return Err(format!(
+                "local read {} is not reachable from an exact erased BLOCK",
+                expression.id
+            ));
+        }
+    }
+    Ok(targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, (expression, target))| ErasedReadBinding {
+            id: ErasedReadId(index),
+            expression,
+            target,
+        })
+        .collect())
+}
+
+fn executable_expression_roots(executable: &ExecutableProgram) -> Vec<ExecutableExprId> {
+    let child_statements = executable
+        .statements
+        .iter()
+        .flat_map(|statement| statement.children.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut roots = executable
+        .statements
+        .iter()
+        .filter(|statement| !child_statements.contains(&statement.id))
+        .filter_map(|statement| statement.value)
+        .chain(executable.roots.iter().map(|root| root.expression))
+        .chain(executable.functions.iter().map(|function| function.root))
+        .chain(executable.sources.iter().map(|source| source.expression))
+        .chain(executable.states.iter().map(|state| state.expression))
+        .collect::<Vec<_>>();
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
+
+fn runtime_executable_expression_roots(executable: &ExecutableProgram) -> Vec<ExecutableExprId> {
+    let child_statements = executable
+        .statements
+        .iter()
+        .flat_map(|statement| statement.children.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut roots = executable
+        .statements
+        .iter()
+        .filter(|statement| !child_statements.contains(&statement.id))
+        .filter_map(|statement| statement.value)
+        .chain(executable.roots.iter().map(|root| root.expression))
+        .chain(executable.sources.iter().map(|source| source.expression))
+        .chain(executable.states.iter().map(|state| state.expression))
+        .collect::<Vec<_>>();
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
+
+pub(crate) fn reachable_executable_expression_ids(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+) -> Result<BTreeSet<ExecutableExprId>, String> {
+    reachable_executable_expression_ids_from_roots(
+        executable,
+        materializations,
+        executable_expression_roots(executable),
+    )
+}
+
+fn reachable_runtime_expression_ids(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+) -> Result<BTreeSet<ExecutableExprId>, String> {
+    reachable_executable_expression_ids_from_roots(
+        executable,
+        materializations,
+        runtime_executable_expression_roots(executable),
+    )
+}
+
+fn reachable_executable_expression_ids_from_roots(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    mut pending: Vec<ExecutableExprId>,
+) -> Result<BTreeSet<ExecutableExprId>, String> {
+    let mut reachable = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !reachable.insert(expression_id) {
+            continue;
+        }
+        let expression = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|candidate| candidate.id == expression_id)
+            .ok_or_else(|| {
+                format!("executable reachability reaches missing expression {expression_id}")
+            })?;
+        if let ExecutableExpressionKind::Materialize { materialization } = expression.kind {
+            let materialization = materializations
+                .get(materialization)
+                .filter(|candidate| candidate.id == materialization)
+                .ok_or_else(|| {
+                    format!(
+                        "executable reachability reaches missing materialization {materialization}"
+                    )
+                })?;
+            pending.extend(materialization.expression_roots());
+        }
+        pending.extend(executable_expression_children(&expression.kind));
+    }
+    Ok(reachable)
+}
+
+fn build_erased_dependency_uses(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    distributed: &DistributedReferences,
+    scope_index: &ErasedScopeIndex,
+) -> Result<Vec<ErasedDependencyUse>, String> {
+    let reachable = reachable_executable_expression_ids(executable, materializations)?;
+    let mut subjects = BTreeSet::<(ExecutableExprId, ErasedDependencyTarget)>::new();
+    for read in &scope_index.reads {
+        if !matches!(read.target, ErasedReadTarget::ExternalValue { .. }) {
+            continue;
+        }
+        subjects.insert((
+            read.expression,
+            ErasedDependencyTarget::ExternalRead { read: read.id },
+        ));
+    }
+    for (reference, call) in distributed.calls.iter().enumerate() {
+        let expression = executable
+            .expressions
+            .get(call.expression.as_usize())
+            .filter(|expression| expression.id == call.expression)
+            .ok_or_else(|| {
+                format!(
+                    "distributed call `{}` references missing executable expression {}",
+                    call.canonical_function, call.expression
+                )
+            })?;
+        if !reachable.contains(&expression.id)
+            || !matches!(
+                &expression.kind,
+                ExecutableExpressionKind::Call {
+                    callable_kind: ExecutableCallableKind::External,
+                    name,
+                    ..
+                } if name == &call.canonical_function
+            )
+        {
+            return Err(format!(
+                "distributed call `{}` does not reference a reachable matching external call",
+                call.canonical_function
+            ));
+        }
+        subjects.insert((
+            expression.id,
+            ErasedDependencyTarget::ExternalCall { reference },
+        ));
+    }
+    let mut dependencies = Vec::new();
+    for (expression, target) in subjects {
+        if let Some(dependency) = erased_dependency_use_for_expression(
+            executable,
+            materializations,
+            scope_index,
+            expression,
+            target,
+        )? {
+            dependencies.push(dependency);
+        }
+    }
+    dependencies.sort_by_key(|dependency| {
+        (
+            dependency.dependent,
+            dependency.expression,
+            dependency.target.clone(),
+        )
+    });
+    Ok(dependencies)
+}
+
+fn erased_dependency_use_for_expression(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    scope_index: &ErasedScopeIndex,
+    expression: ExecutableExprId,
+    target: ErasedDependencyTarget,
+) -> Result<Option<ErasedDependencyUse>, String> {
+    let mut candidates = scope_index
+        .bindings
+        .iter()
+        .filter_map(|binding| {
+            executable_expression_distance(
+                executable,
+                materializations,
+                binding.producer,
+                expression,
+            )
+            .map(|distance| (binding, distance))
+        })
+        .collect::<Vec<_>>();
+    let priority = |binding: &ErasedBinding| match binding.target {
+        ErasedBindingTarget::State { .. } => 0_u8,
+        ErasedBindingTarget::Source { .. } => 1,
+        ErasedBindingTarget::Value { .. } => 2,
+    };
+    candidates.sort_by(|(left, left_distance), (right, right_distance)| {
+        left_distance
+            .cmp(right_distance)
+            .then_with(|| priority(left).cmp(&priority(right)))
+            .then_with(|| right.owner_ancestry.len().cmp(&left.owner_ancestry.len()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let Some((dependent, distance)) = candidates.first().copied() else {
+        return Ok(None);
+    };
+    let equally_specific = candidates
+        .iter()
+        .take_while(|(candidate, candidate_distance)| {
+            *candidate_distance == distance
+                && priority(candidate) == priority(dependent)
+                && candidate.owner_ancestry.len() == dependent.owner_ancestry.len()
+        })
+        .map(|(candidate, _)| candidate.id)
+        .collect::<Vec<_>>();
+    if equally_specific.len() != 1 {
+        return Err(format!(
+            "external dependency expression {expression} has {} equally specific erased owners {equally_specific:?}",
+            equally_specific.len()
+        ));
+    }
+    let timing = match dependent.target {
+        ErasedBindingTarget::State { runtime, .. } => ErasedDependencyTiming::After {
+            boundaries: vec![ErasedTemporalBoundary::State(runtime)],
+        },
+        ErasedBindingTarget::Source { runtime, .. } => ErasedDependencyTiming::After {
+            boundaries: vec![ErasedTemporalBoundary::Source(runtime)],
+        },
+        ErasedBindingTarget::Value { .. } => ErasedDependencyTiming::Immediate,
+    };
+    Ok(Some(ErasedDependencyUse {
+        dependent: dependent.id,
+        expression,
+        target,
+        timing,
+    }))
+}
+
+fn executable_expression_distance(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    root: ExecutableExprId,
+    target: ExecutableExprId,
+) -> Option<usize> {
+    let mut pending = vec![(root, 0_usize)];
+    let mut best = BTreeMap::<ExecutableExprId, usize>::new();
+    while let Some((expression_id, distance)) = pending.pop() {
+        if best
+            .get(&expression_id)
+            .is_some_and(|known| *known <= distance)
+        {
+            continue;
+        }
+        best.insert(expression_id, distance);
+        if expression_id == target {
+            continue;
+        }
+        let expression = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|candidate| candidate.id == expression_id)?;
+        let next_distance = distance.saturating_add(1);
+        if let ExecutableExpressionKind::Materialize { materialization } = expression.kind {
+            let materialization = materializations
+                .get(materialization)
+                .filter(|candidate| candidate.id == materialization)?;
+            pending.extend(
+                materialization
+                    .expression_roots()
+                    .into_iter()
+                    .map(|root| (root, next_distance)),
+            );
+        }
+        pending.extend(
+            executable_expression_children(&expression.kind)
+                .into_iter()
+                .map(|child| (child, next_distance)),
+        );
+    }
+    best.get(&target).copied()
+}
+
+fn collect_local_read_targets(
+    executable: &ExecutableProgram,
+    expression_id: ExecutableExprId,
+    locals: &BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
+    active: &mut BTreeSet<ExecutableExprId>,
+    targets: &mut BTreeMap<ExecutableExprId, ErasedReadTarget>,
+) -> Result<(), String> {
+    if !active.insert(expression_id) {
+        return Ok(());
+    }
+    let expression = executable
+        .expressions
+        .get(expression_id.as_usize())
+        .filter(|expression| expression.id == expression_id)
+        .ok_or_else(|| {
+            format!("read binding traversal reaches missing expression {expression_id}")
+        })?;
+    match &expression.kind {
+        ExecutableExpressionKind::LocalRead {
+            declaration,
+            projection,
+        } => {
+            let Some(value) = locals.get(declaration).copied() else {
+                active.remove(&expression_id);
+                return Ok(());
+            };
+            let target = ErasedReadTarget::Local {
+                declaration: *declaration,
+                value,
+                projection: projection.clone(),
+            };
+            if let Some(previous) = targets.insert(expression.id, target.clone())
+                && previous != target
+            {
+                return Err(format!(
+                    "local read {} resolves to incompatible erased bindings",
+                    expression.id
+                ));
+            }
+        }
+        ExecutableExpressionKind::Block { bindings, result } => {
+            let mut nested = locals.clone();
+            for binding in bindings {
+                nested.insert(binding.declaration, binding.value);
+            }
+            for binding in bindings {
+                collect_local_read_targets(executable, binding.value, &nested, active, targets)?;
+            }
+            collect_local_read_targets(executable, *result, &nested, active, targets)?;
+        }
+        _ => {
+            for child in executable_expression_children(&expression.kind) {
+                collect_local_read_targets(executable, child, locals, active, targets)?;
+            }
+        }
+    }
+    active.remove(&expression_id);
+    Ok(())
+}
+
+fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
+    for (index, owner) in program.scope_index.owners.iter().enumerate() {
+        if owner.id != StaticOwnerId(index) {
+            return Err(format!(
+                "erased owner at index {index} has non-dense ID {}",
+                owner.id
+            ));
+        }
+        if owner.authority_row != owner.target_row.or(owner.source_row) {
+            return Err(format!(
+                "erased owner {} has inconsistent authority row",
+                owner.id
+            ));
+        }
+    }
+    for (index, field) in program.scope_index.fields.iter().enumerate() {
+        if field.id != FieldId(index) {
+            return Err(format!(
+                "erased field at index {index} has non-dense ID {}",
+                field.id
+            ));
+        }
+        if let Some(row) = field.row {
+            verify_erased_row(program, row, &format!("FieldId {}", field.id))?;
+        }
+        if field.role == ErasedFieldRole::ListAuthority
+            && (field.row.is_none() || field.declaration.is_some() || field.producer.is_some())
+        {
+            return Err(format!(
+                "list authority FieldId {} must be hidden row storage without a declaration or producer",
+                field.id
+            ));
+        }
+        if field.role == ErasedFieldRole::Capture
+            && (field.row.is_none()
+                || field.declaration.is_some()
+                || field.producer.is_some()
+                || field.static_owner.is_some())
+        {
+            return Err(format!(
+                "capture FieldId {} must be hidden row storage without a declaration, producer, or semantic owner",
+                field.id
+            ));
+        }
+    }
+    for local in &program.scope_index.locals {
+        if let Some(row) = local.row {
+            verify_erased_row(
+                program,
+                row,
+                &format!("owner {} local {}", local.owner, local.local.0),
+            )?;
+        }
+        if program
+            .executable
+            .expressions
+            .get(local.source.as_usize())
+            .is_none_or(|expression| expression.id != local.source)
+        {
+            return Err(format!(
+                "owner {} local {} references missing source {}",
+                local.owner, local.local.0, local.source
+            ));
+        }
+        let target_row = program
+            .scope_index
+            .owners
+            .get(local.owner.as_usize())
+            .filter(|owner| owner.id == local.owner)
+            .and_then(|owner| owner.target_row);
+        let mut capture_identities = BTreeSet::new();
+        for capture in &local.captures {
+            if !capture_identities.insert((
+                capture.source_owner,
+                capture.source_local,
+                capture.projection.clone(),
+            )) {
+                return Err(format!(
+                    "owner {} local {} has a duplicate detached capture",
+                    local.owner, local.local.0
+                ));
+            }
+            if !program.scope_index.locals.iter().any(|source| {
+                source.owner == capture.source_owner && source.local == capture.source_local
+            }) {
+                return Err(format!(
+                    "owner {} local {} capture references missing source owner {} local {}",
+                    local.owner, local.local.0, capture.source_owner, capture.source_local.0
+                ));
+            }
+            if !program
+                .scope_index
+                .owner_descends_from(local.owner, capture.source_owner)?
+            {
+                return Err(format!(
+                    "owner {} local {} capture source owner {} is not an ancestor",
+                    local.owner, local.local.0, capture.source_owner
+                ));
+            }
+            let field = program
+                .scope_index
+                .fields
+                .get(capture.field.as_usize())
+                .filter(|field| field.id == capture.field)
+                .ok_or_else(|| {
+                    format!(
+                        "owner {} local {} capture references missing FieldId {}",
+                        local.owner, local.local.0, capture.field
+                    )
+                })?;
+            if field.role != ErasedFieldRole::Capture || field.row != target_row {
+                return Err(format!(
+                    "owner {} local {} capture FieldId {} is not hidden storage on its target row",
+                    local.owner, local.local.0, capture.field
+                ));
+            }
+        }
+        let list_name = local
+            .row
+            .and_then(|row| program.lists.get(row.list.as_usize()))
+            .filter(|list| local.row.is_some_and(|row| list.id == row.list))
+            .map(|list| list.name.as_str());
+        let relative_path = |path: &str| {
+            list_name
+                .and_then(|list| path.strip_prefix(list))
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .map(|suffix| suffix.split('.').map(str::to_owned).collect::<Vec<_>>())
+        };
+        let mut paths = BTreeSet::new();
+        for member in &local.members {
+            if member.path.is_empty()
+                || member.path.iter().any(String::is_empty)
+                || !paths.insert(member.path.clone())
+            {
+                return Err(format!(
+                    "owner {} local {} contains an empty or duplicate member path `{}`",
+                    local.owner,
+                    local.local.0,
+                    member.path.join(".")
+                ));
+            }
+            match member.target {
+                ErasedLocalMemberTarget::Field(field) => {
+                    if member.forwarded_from.is_some() {
+                        return Err(format!(
+                            "owner {} local {} scalar member `{}` has resource forwarding metadata",
+                            local.owner,
+                            local.local.0,
+                            member.path.join(".")
+                        ));
+                    }
+                    let field = program
+                        .scope_index
+                        .fields
+                        .get(field.as_usize())
+                        .filter(|candidate| candidate.id == field)
+                        .ok_or_else(|| {
+                            format!(
+                                "owner {} local {} member `{}` references missing FieldId {field}",
+                                local.owner,
+                                local.local.0,
+                                member.path.join(".")
+                            )
+                        })?;
+                    if field.row != local.row
+                        || member.path.len() != 1
+                        || member.path[0] != field.name
+                    {
+                        return Err(format!(
+                            "owner {} local {} member `{}` is inconsistent with FieldId {}",
+                            local.owner,
+                            local.local.0,
+                            member.path.join("."),
+                            field.id
+                        ));
+                    }
+                }
+                ErasedLocalMemberTarget::Source(source) => {
+                    let source = program
+                        .sources
+                        .get(source.as_usize())
+                        .filter(|candidate| candidate.id == source)
+                        .ok_or_else(|| {
+                            format!(
+                                "owner {} local {} member `{}` references missing SourceId {source}",
+                                local.owner, local.local.0, member.path.join(".")
+                            )
+                        })?;
+                    if let Some(forwarding) = member.forwarded_from.as_ref() {
+                        let upstream = program
+                            .scope_index
+                            .locals
+                            .iter()
+                            .find(|candidate| {
+                                candidate.owner == forwarding.owner
+                                    && candidate.local == forwarding.local
+                            })
+                            .ok_or_else(|| {
+                                format!(
+                                    "owner {} local {} member `{}` forwards from missing local {}:{}",
+                                    local.owner,
+                                    local.local.0,
+                                    member.path.join("."),
+                                    forwarding.owner,
+                                    forwarding.local.0
+                                )
+                            })?;
+                        let upstream_members = upstream
+                            .members
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.path == forwarding.path
+                                    && candidate.target
+                                        == ErasedLocalMemberTarget::Source(source.id)
+                            })
+                            .collect::<Vec<_>>();
+                        if upstream_members.len() != 1 {
+                            return Err(format!(
+                                "owner {} local {} member `{}` forwards source {} from {} exact upstream members",
+                                local.owner,
+                                local.local.0,
+                                member.path.join("."),
+                                source.id,
+                                upstream_members.len()
+                            ));
+                        }
+                        let Some(root_name) = member.path.first() else {
+                            unreachable!("empty member paths were rejected above");
+                        };
+                        let mut forwarding_paths = BTreeSet::new();
+                        for field in program.scope_index.fields.iter().filter(|field| {
+                            field.row == local.row
+                                && field.name == *root_name
+                                && field.resource_only
+                        }) {
+                            let Some((owner, source_local, projection)) =
+                                resource_field_local_projection(
+                                    &program.executable,
+                                    field,
+                                    &program.scope_index.fields,
+                                    &program.materializations,
+                                    &program.scope_index.locals,
+                                )?
+                            else {
+                                continue;
+                            };
+                            if owner != forwarding.owner || source_local != forwarding.local {
+                                continue;
+                            }
+                            let Some(suffix) = forwarding.path.strip_prefix(projection.as_slice())
+                            else {
+                                continue;
+                            };
+                            let mut expected = vec![field.name.clone()];
+                            expected.extend_from_slice(suffix);
+                            if expected == member.path {
+                                forwarding_paths.insert((owner, source_local, projection));
+                            }
+                        }
+                        if forwarding_paths.len() != 1 {
+                            return Err(format!(
+                                "owner {} local {} member `{}` has {} exact resource forwarding paths",
+                                local.owner,
+                                local.local.0,
+                                member.path.join("."),
+                                forwarding_paths.len()
+                            ));
+                        }
+                    } else if source.scope_id != local.row.map(|row| row.scope)
+                        || relative_path(&source.path).is_none_or(|path| path != member.path)
+                    {
+                        return Err(format!(
+                            "owner {} local {} member `{}` is inconsistent with source `{}`",
+                            local.owner,
+                            local.local.0,
+                            member.path.join("."),
+                            source.path
+                        ));
+                    }
+                }
+                ErasedLocalMemberTarget::State(state) => {
+                    if member.forwarded_from.is_some() {
+                        return Err(format!(
+                            "owner {} local {} state member `{}` has unsupported forwarding metadata",
+                            local.owner,
+                            local.local.0,
+                            member.path.join(".")
+                        ));
+                    }
+                    let state = program
+                        .state_cells
+                        .get(state.as_usize())
+                        .filter(|candidate| candidate.id == state)
+                        .ok_or_else(|| {
+                            format!(
+                                "owner {} local {} member `{}` references missing StateId {state}",
+                                local.owner,
+                                local.local.0,
+                                member.path.join(".")
+                            )
+                        })?;
+                    if state.scope_id != local.row.map(|row| row.scope)
+                        || relative_path(&state.path).is_none_or(|path| path != member.path)
+                    {
+                        return Err(format!(
+                            "owner {} local {} member `{}` is inconsistent with state `{}`",
+                            local.owner,
+                            local.local.0,
+                            member.path.join("."),
+                            state.path
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for (index, binding) in program.scope_index.bindings.iter().enumerate() {
+        if binding.id != ErasedBindingId(index) {
             return Err(format!(
                 "storage binding at index {index} has non-dense ID {}",
                 binding.id
@@ -2297,7 +6945,8 @@ fn verify_storage_catalog(program: &ErasedProgram) -> Result<(), String> {
         }
         for (depth, owner) in binding.owner_ancestry.iter().copied().enumerate() {
             let definition = program
-                .static_owners
+                .scope_index
+                .owners
                 .get(owner.as_usize())
                 .filter(|definition| definition.id == owner)
                 .ok_or_else(|| {
@@ -2341,49 +6990,25 @@ fn verify_storage_catalog(program: &ErasedProgram) -> Result<(), String> {
                 expression.flow_type,
             ));
         }
-        match binding.kind {
-            StorageBindingKind::Value {
-                field,
-                list,
-                row_scope,
-            } => {
+        match binding.target {
+            ErasedBindingTarget::Value { field, row } => {
                 if let Some(field) = field
                     && !program
-                        .semantic_index
+                        .scope_index
                         .fields
                         .iter()
                         .any(|value| value.id == field)
                 {
                     return Err(format!(
-                        "storage binding {} references missing semantic FieldId {field}",
+                        "erased binding {} references missing FieldId {field}",
                         binding.id
                     ));
                 }
-                if let Some(list) = list {
-                    let memory = program
-                        .lists
-                        .get(list.as_usize())
-                        .filter(|memory| memory.id == list)
-                        .ok_or_else(|| {
-                            format!(
-                                "storage binding {} references missing ListId {list}",
-                                binding.id
-                            )
-                        })?;
-                    if memory.row_scope_id != row_scope {
-                        return Err(format!(
-                            "storage binding {} row scope differs from ListId {list}",
-                            binding.id
-                        ));
-                    }
-                } else if row_scope.is_some() {
-                    return Err(format!(
-                        "storage binding {} has a row scope without a ListId",
-                        binding.id
-                    ));
+                if let Some(row) = row {
+                    verify_erased_row(program, row, &format!("binding {}", binding.id))?;
                 }
             }
-            StorageBindingKind::Source {
+            ErasedBindingTarget::Source {
                 executable,
                 runtime,
             } => {
@@ -2398,9 +7023,10 @@ fn verify_storage_catalog(program: &ErasedProgram) -> Result<(), String> {
                     ));
                 }
             }
-            StorageBindingKind::State {
+            ErasedBindingTarget::State {
                 executable,
                 runtime,
+                ..
             } => {
                 if !program
                     .executable
@@ -2419,7 +7045,94 @@ fn verify_storage_catalog(program: &ErasedProgram) -> Result<(), String> {
             }
         }
     }
+    for (index, source) in program.scope_index.sources.iter().enumerate() {
+        let expected_id = SourceId(index);
+        if source.source != expected_id {
+            return Err(format!(
+                "erased source at index {index} has non-dense SourceId {}",
+                source.source
+            ));
+        }
+        let runtime = program
+            .sources
+            .get(index)
+            .filter(|candidate| candidate.id == source.source)
+            .ok_or_else(|| format!("erased source {} has no runtime source", source.source))?;
+        if source.static_owner != runtime.static_owner
+            || source.owner_ancestry.last().copied() != source.static_owner
+        {
+            return Err(format!(
+                "erased source {} has inconsistent structural ownership",
+                source.source
+            ));
+        }
+        for (depth, owner) in source.owner_ancestry.iter().copied().enumerate() {
+            let definition = program
+                .scope_index
+                .owners
+                .get(owner.as_usize())
+                .filter(|definition| definition.id == owner)
+                .ok_or_else(|| {
+                    format!(
+                        "erased source {} references missing owner {owner}",
+                        source.source
+                    )
+                })?;
+            let expected_parent = depth
+                .checked_sub(1)
+                .map(|parent| source.owner_ancestry[parent]);
+            if definition.parent != expected_parent {
+                return Err(format!(
+                    "erased source {} owner ancestry is not structural at {owner}",
+                    source.source
+                ));
+            }
+        }
+        match source.origin {
+            ErasedSourceOrigin::Executable {
+                executable,
+                binding,
+            } => {
+                let valid_binding = program
+                    .scope_index
+                    .bindings
+                    .get(binding.as_usize())
+                    .is_some_and(|candidate| {
+                        candidate.id == binding
+                            && matches!(
+                                candidate.target,
+                                ErasedBindingTarget::Source {
+                                    executable: candidate_executable,
+                                    runtime: candidate_runtime,
+                                } if candidate_executable == executable
+                                    && candidate_runtime == source.source
+                            )
+                    });
+                if runtime.executable_source_id != Some(executable) || !valid_binding {
+                    return Err(format!(
+                        "erased source {} has an invalid executable origin",
+                        source.source
+                    ));
+                }
+            }
+            ErasedSourceOrigin::DistributedImport => {
+                if runtime.executable_source_id.is_some()
+                    || !runtime.path.starts_with("@distributed/")
+                    || source.static_owner.is_some()
+                {
+                    return Err(format!(
+                        "erased source {} has an invalid distributed ingress origin",
+                        source.source
+                    ));
+                }
+            }
+        }
+    }
+    let direct_storage_statements = direct_erased_storage_statements(&program.executable);
     for statement in &program.executable.statements {
+        if !direct_storage_statements.contains(&statement.id) {
+            continue;
+        }
         let Some(declaration) = statement.declaration else {
             continue;
         };
@@ -2429,18 +7142,24 @@ fn verify_storage_catalog(program: &ErasedProgram) -> Result<(), String> {
                 declaration.0, statement.id
             ));
         };
-        if !matches!(&flow_type.ty, boon_typecheck::Type::List(_)) {
+        if flow_type.mode != boon_typecheck::FlowMode::Continuous
+            || !matches!(
+                &flow_type.ty,
+                boon_typecheck::Type::List(item)
+                    if matches!(item.as_ref(), boon_typecheck::Type::Object(_))
+            )
+        {
             continue;
         }
         let matches = program
-            .storage
+            .scope_index
             .bindings
             .iter()
             .filter(|binding| {
                 binding.declaration == declaration
                     && matches!(
-                        binding.kind,
-                        StorageBindingKind::Value { list: Some(_), .. }
+                        binding.target,
+                        ErasedBindingTarget::Value { row: Some(_), .. }
                     )
             })
             .count();
@@ -2450,6 +7169,353 @@ fn verify_storage_catalog(program: &ErasedProgram) -> Result<(), String> {
                 declaration.0
             ));
         }
+    }
+    let mut read_expressions = BTreeSet::new();
+    for (index, read) in program.scope_index.reads.iter().enumerate() {
+        if read.id != ErasedReadId(index) {
+            return Err(format!(
+                "erased read at index {index} has non-dense ID {}",
+                read.id
+            ));
+        }
+        let expression = program
+            .executable
+            .expressions
+            .get(read.expression.as_usize())
+            .filter(|expression| expression.id == read.expression)
+            .ok_or_else(|| {
+                format!(
+                    "erased read {} references missing expression {}",
+                    read.id, read.expression
+                )
+            })?;
+        if !matches!(
+            expression.kind,
+            ExecutableExpressionKind::CanonicalRead { .. }
+                | ExecutableExpressionKind::LocalRead { .. }
+                | ExecutableExpressionKind::ExternalRead { .. }
+                | ExecutableExpressionKind::Drain { .. }
+                | ExecutableExpressionKind::MaterializationLocal { .. }
+                | ExecutableExpressionKind::FunctionParameter { .. }
+        ) {
+            return Err(format!(
+                "erased read {} targets non-read expression {}",
+                read.id, read.expression
+            ));
+        }
+        if !read_expressions.insert(read.expression) {
+            return Err(format!(
+                "executable expression {} has multiple erased read targets",
+                read.expression
+            ));
+        }
+        match &read.target {
+            ErasedReadTarget::Binding {
+                binding,
+                projection,
+            } => {
+                let binding = program
+                    .scope_index
+                    .bindings
+                    .get(binding.as_usize())
+                    .filter(|candidate| candidate.id == *binding)
+                    .ok_or_else(|| {
+                        format!("erased read {} references missing {binding}", read.id)
+                    })?;
+                if !projection.is_empty()
+                    && matches!(
+                        binding.target,
+                        ErasedBindingTarget::Source { .. } | ErasedBindingTarget::State { .. }
+                    )
+                {
+                    return Err(format!(
+                        "erased read {} leaves a projection on a source/state binding",
+                        read.id
+                    ));
+                }
+            }
+            ErasedReadTarget::SourcePayload {
+                binding,
+                source,
+                field,
+                ..
+            } => {
+                if !program.scope_index.bindings.iter().any(|candidate| {
+                    candidate.id == *binding
+                        && matches!(
+                            candidate.target,
+                            ErasedBindingTarget::Source { runtime, .. } if runtime == *source
+                        )
+                }) {
+                    return Err(format!(
+                        "erased read {} has mismatched source binding {binding}",
+                        read.id
+                    ));
+                }
+                let source = program
+                    .sources
+                    .get(source.as_usize())
+                    .filter(|candidate| candidate.id == *source)
+                    .ok_or_else(|| {
+                        format!(
+                            "erased read {} references missing SourceId {source}",
+                            read.id
+                        )
+                    })?;
+                if !source.payload_schema.fields.contains(field) {
+                    return Err(format!(
+                        "erased read {} references absent payload field {field:?} on `{}`",
+                        read.id, source.path
+                    ));
+                }
+            }
+            ErasedReadTarget::StateProjection {
+                binding,
+                state,
+                fields,
+            } => {
+                if fields.is_empty() {
+                    return Err(format!(
+                        "erased read {} has an empty state projection",
+                        read.id
+                    ));
+                }
+                if !program
+                    .state_cells
+                    .iter()
+                    .any(|candidate| candidate.id == *state)
+                {
+                    return Err(format!(
+                        "erased read {} references missing StateId {state}",
+                        read.id
+                    ));
+                }
+                if !program.scope_index.bindings.iter().any(|candidate| {
+                    candidate.id == *binding
+                        && matches!(
+                            candidate.target,
+                            ErasedBindingTarget::State { runtime, .. } if runtime == *state
+                        )
+                }) {
+                    return Err(format!(
+                        "erased read {} has mismatched state binding {binding}",
+                        read.id
+                    ));
+                }
+            }
+            ErasedReadTarget::Expression {
+                expression: target, ..
+            } => {
+                if *target == read.expression {
+                    return Err(format!(
+                        "erased read {} recursively targets itself",
+                        read.id
+                    ));
+                }
+                if !program
+                    .executable
+                    .expressions
+                    .iter()
+                    .any(|candidate| candidate.id == *target)
+                {
+                    return Err(format!(
+                        "erased read {} references missing expression {target}",
+                        read.id
+                    ));
+                }
+            }
+            ErasedReadTarget::Local { value, .. } => {
+                if !program
+                    .executable
+                    .expressions
+                    .iter()
+                    .any(|candidate| candidate.id == *value)
+                {
+                    return Err(format!(
+                        "erased read {} references missing local expression {value}",
+                        read.id
+                    ));
+                }
+            }
+            ErasedReadTarget::ExternalValue { reference } => {
+                if program
+                    .distributed_references
+                    .value_references
+                    .get(*reference)
+                    .is_none()
+                {
+                    return Err(format!(
+                        "erased read {} references missing external value {reference}",
+                        read.id
+                    ));
+                }
+            }
+            ErasedReadTarget::MaterializationLocal { owner, local, .. } => {
+                if !program
+                    .scope_index
+                    .locals
+                    .iter()
+                    .any(|candidate| candidate.owner == *owner && candidate.local == *local)
+                {
+                    return Err(format!(
+                        "erased read {} references missing owner {owner} local {}",
+                        read.id, local.0
+                    ));
+                }
+            }
+            ErasedReadTarget::FunctionParameter { parameter, .. } => {
+                if !program.executable.functions.iter().any(|function| {
+                    function.id == parameter.function
+                        && function
+                            .parameters
+                            .iter()
+                            .any(|candidate| candidate.id == *parameter)
+                }) {
+                    return Err(format!(
+                        "erased read {} references missing function parameter {:?}",
+                        read.id, parameter
+                    ));
+                }
+            }
+        }
+    }
+    let mut row_value_keys = BTreeSet::new();
+    for row_value in &program.scope_index.row_values {
+        if program
+            .executable
+            .expressions
+            .get(row_value.expression.as_usize())
+            .is_none_or(|expression| expression.id != row_value.expression)
+        {
+            return Err(format!(
+                "erased row value references missing expression {}",
+                row_value.expression
+            ));
+        }
+        if row_value.projection.iter().any(String::is_empty)
+            || !row_value_keys.insert((row_value.expression, row_value.projection.clone()))
+        {
+            return Err(format!(
+                "erased row value expression {} has an empty or duplicate projection `{}`",
+                row_value.expression,
+                row_value.projection.join(".")
+            ));
+        }
+        verify_erased_row(
+            program,
+            row_value.row,
+            &format!(
+                "row value {} projection `{}`",
+                row_value.expression,
+                row_value.projection.join(".")
+            ),
+        )?;
+    }
+    for dependency in &program.scope_index.dependencies {
+        let dependent = program
+            .scope_index
+            .bindings
+            .get(dependency.dependent.as_usize())
+            .filter(|binding| binding.id == dependency.dependent)
+            .ok_or_else(|| {
+                format!(
+                    "erased dependency references missing binding {}",
+                    dependency.dependent
+                )
+            })?;
+        let expression = program
+            .executable
+            .expressions
+            .get(dependency.expression.as_usize())
+            .filter(|expression| expression.id == dependency.expression)
+            .ok_or_else(|| {
+                format!(
+                    "erased dependency references missing expression {}",
+                    dependency.expression
+                )
+            })?;
+        match dependency.target {
+            ErasedDependencyTarget::ExternalRead { read: read_id } => {
+                let read = program
+                    .scope_index
+                    .reads
+                    .get(read_id.as_usize())
+                    .filter(|read| read.id == read_id && read.expression == dependency.expression)
+                    .ok_or_else(|| {
+                        format!(
+                            "erased dependency expression {} references a missing read",
+                            dependency.expression
+                        )
+                    })?;
+                if !matches!(read.target, ErasedReadTarget::ExternalValue { .. }) {
+                    return Err(format!(
+                        "erased dependency expression {} references a non-external read",
+                        dependency.expression
+                    ));
+                }
+            }
+            ErasedDependencyTarget::ExternalCall { reference } => {
+                let call = program
+                    .distributed_references
+                    .calls
+                    .get(reference)
+                    .ok_or_else(|| {
+                        format!(
+                            "erased dependency expression {} references missing external call {reference}",
+                            dependency.expression
+                        )
+                    })?;
+                if !matches!(
+                    &expression.kind,
+                    ExecutableExpressionKind::Call {
+                        callable_kind: ExecutableCallableKind::External,
+                        name,
+                        ..
+                    } if name == &call.canonical_function
+                ) {
+                    return Err(format!(
+                        "erased dependency expression {} does not match external call {reference}",
+                        dependency.expression
+                    ));
+                }
+            }
+        }
+        match (&dependency.timing, &dependent.target) {
+            (ErasedDependencyTiming::Immediate, ErasedBindingTarget::Value { .. }) => {}
+            (
+                ErasedDependencyTiming::After { boundaries },
+                ErasedBindingTarget::State { runtime, .. },
+            ) if boundaries.as_slice() == [ErasedTemporalBoundary::State(*runtime)] => {}
+            (
+                ErasedDependencyTiming::After { boundaries },
+                ErasedBindingTarget::Source { runtime, .. },
+            ) if boundaries.as_slice() == [ErasedTemporalBoundary::Source(*runtime)] => {}
+            _ => {
+                return Err(format!(
+                    "erased dependency expression {} has timing inconsistent with binding {}",
+                    dependency.expression, dependency.dependent
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_erased_row(
+    program: &ErasedProgram,
+    row: ErasedRowBinding,
+    context: &str,
+) -> Result<(), String> {
+    let list = program
+        .lists
+        .get(row.list.as_usize())
+        .filter(|list| list.id == row.list)
+        .ok_or_else(|| format!("{context} references missing ListId {}", row.list))?;
+    if list.row_scope_id != Some(row.scope) {
+        return Err(format!(
+            "{context} row scope {} differs from ListId {} scope {:?}",
+            row.scope, row.list, list.row_scope_id
+        ));
     }
     Ok(())
 }
@@ -2485,6 +7551,38 @@ fn validate_checked_program_for_lowering(
         .iter()
         .map(|call| call.id)
         .collect::<BTreeSet<_>>();
+    for source in &program.sources {
+        let expression = source.expression.ok_or_else(|| {
+            format!(
+                "checked source `{}` has no exact expression ownership",
+                source.path
+            )
+        })?;
+        let declaration = source.declaration.ok_or_else(|| {
+            format!(
+                "checked source `{}` has no exact declaration ownership",
+                source.path
+            )
+        })?;
+        let checked_expression = program
+            .expressions
+            .iter()
+            .find(|candidate| candidate.id == expression)
+            .ok_or_else(|| {
+                format!(
+                    "checked source `{}` references missing expression {}",
+                    source.path, expression.0
+                )
+            })?;
+        if checked_expression.declaration != Some(declaration)
+            || !declarations.contains(&declaration)
+        {
+            return Err(format!(
+                "checked source `{}` expression {} and declaration {} disagree",
+                source.path, expression.0, declaration.0
+            ));
+        }
+    }
     for scope in &program.scopes {
         if scope.parent.is_some_and(|parent| !scopes.contains(&parent)) {
             return Err(format!("checked scope {} has a missing parent", scope.id.0));
@@ -2692,8 +7790,9 @@ fn validate_checked_program_for_lowering(
 fn distributed_references(
     program: &boon_typecheck::CheckedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
-) -> Result<DistributedReferences, String> {
-    let mut references = DistributedReferences::default();
+) -> Result<PendingDistributedReferences, String> {
+    let mut value_references = Vec::new();
+    let mut calls = Vec::new();
     for expr in &program.expressions {
         match &expr.kind {
             boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path } => {
@@ -2718,7 +7817,7 @@ fn distributed_references(
                         "qualified external value `{canonical_path}` flow does not match its declaration"
                     ));
                 }
-                references.value_references.push(DistributedValueReference {
+                value_references.push(DistributedValueReference {
                     expr_id: ExprId(expr.id.0 as usize),
                     canonical_path: canonical_path.clone(),
                     local_alias_paths: Vec::new(),
@@ -2747,16 +7846,11 @@ fn distributed_references(
                         "typecheck accepted qualified external function `{function}` without an external signature"
                     )
                 })?;
-                if !signature.pure {
-                    return Err(format!(
-                        "typecheck accepted impure external function `{function}`"
-                    ));
-                }
-                ensure_distributed_flow_is_closed(
+                ensure_distributed_value_flow_is_closed(
                     &expr.flow_type,
                     &format!("qualified external call `{function}` result"),
                 )?;
-                ensure_distributed_flow_is_closed(
+                ensure_distributed_value_flow_is_closed(
                     &signature.result,
                     &format!("external function declaration `{function}` result"),
                 )?;
@@ -2777,42 +7871,158 @@ fn distributed_references(
                                 "typecheck accepted unknown argument `{name}` in qualified external call `{function}`"
                             )
                         })?;
-                    ensure_distributed_type_is_closed(
-                        &declared_argument.ty,
+                    ensure_distributed_value_flow_is_closed(
+                        &declared_argument.flow_type,
                         &format!("external function `{function}` argument `{name}`"),
                     )?;
-                    let actual = program
-                        .expressions
-                        .get(value.0 as usize)
-                        .map(|expression| &expression.flow_type)
-                        .ok_or_else(|| {
-                            format!(
-                                "qualified external call `{function}` argument `{name}` references missing expression {}",
-                                value.0
-                            )
-                        })?;
-                    ensure_distributed_flow_is_closed(
-                        actual,
-                        &format!("qualified external call `{function}` argument `{name}`"),
-                    )?;
-                    arguments.push(DistributedPureCallArgument {
+                    program.expressions.get(value.0 as usize).ok_or_else(|| {
+                        format!(
+                            "qualified external call `{function}` argument `{name}` references missing expression {}",
+                            value.0
+                        )
+                    })?;
+                    arguments.push(PendingDistributedCallArgument {
                         name: name.clone(),
-                        expr_id: ExprId(value.0 as usize),
-                        argument_type: declared_argument.ty.clone(),
+                        flow_type: declared_argument.flow_type.clone(),
                     });
                 }
-                references.pure_calls.push(DistributedPureCall {
-                    expr_id: ExprId(expr.id.0 as usize),
+                calls.push(PendingDistributedCall {
+                    checked_expression: expr.id,
                     canonical_function: function.clone(),
                     producer_role,
-                    result_type: signature.result.ty.clone(),
+                    result: expr.flow_type.clone(),
+                    effect: signature.effect,
                     arguments,
                 });
             }
             _ => {}
         }
     }
-    Ok(references)
+    Ok(PendingDistributedReferences {
+        value_references,
+        calls,
+    })
+}
+
+fn concrete_distributed_calls(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    pending: &[PendingDistributedCall],
+) -> Result<Vec<DistributedCall>, String> {
+    let reachable = reachable_runtime_expression_ids(executable, materializations)?;
+    let mut calls = Vec::new();
+    for expression in &executable.expressions {
+        if !reachable.contains(&expression.id) {
+            continue;
+        }
+        let ExecutableExpressionKind::Call {
+            callable_kind: ExecutableCallableKind::External,
+            name,
+            arguments,
+            ..
+        } = &expression.kind
+        else {
+            continue;
+        };
+        let matches = pending
+            .iter()
+            .filter(|call| {
+                call.checked_expression == expression.checked_expr_id
+                    && call.canonical_function == *name
+            })
+            .collect::<Vec<_>>();
+        let call = match matches.as_slice() {
+            [call] => *call,
+            [] => {
+                return Err(format!(
+                    "expanded external call {} (`{name}`) has no checked distributed contract",
+                    expression.id
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "expanded external call {} (`{name}`) has multiple checked distributed contracts",
+                    expression.id
+                ));
+            }
+        };
+        ensure_distributed_value_flow_is_closed(
+            &expression.flow_type,
+            &format!("expanded distributed call `{name}` result"),
+        )?;
+        if expression.flow_type != call.result {
+            return Err(format!(
+                "expanded distributed call `{name}` result flow differs from its checked contract"
+            ));
+        }
+        let mut concrete_arguments = Vec::with_capacity(arguments.len());
+        let mut names = BTreeSet::new();
+        for argument in arguments {
+            if !names.insert(argument.name.as_str()) {
+                return Err(format!(
+                    "expanded distributed call `{name}` repeats argument `{}`",
+                    argument.name
+                ));
+            }
+            let declared = call
+                .arguments
+                .iter()
+                .find(|candidate| candidate.name == argument.name)
+                .ok_or_else(|| {
+                    format!(
+                        "expanded distributed call `{name}` has unknown argument `{}`",
+                        argument.name
+                    )
+                })?;
+            let value = executable
+                .expressions
+                .get(argument.value.as_usize())
+                .filter(|candidate| candidate.id == argument.value)
+                .ok_or_else(|| {
+                    format!(
+                        "expanded distributed call `{name}` argument `{}` references missing expression {}",
+                        argument.name, argument.value
+                    )
+                })?;
+            ensure_distributed_value_flow_is_closed(
+                &value.flow_type,
+                &format!(
+                    "expanded distributed call `{name}` argument `{}`",
+                    argument.name
+                ),
+            )?;
+            if value.flow_type.ty != declared.flow_type.ty {
+                return Err(format!(
+                    "expanded distributed call `{name}` argument `{}` type differs from its checked contract",
+                    argument.name
+                ));
+            }
+            concrete_arguments.push(DistributedCallArgument {
+                name: argument.name.clone(),
+                value: argument.value,
+                flow_type: value.flow_type.clone(),
+            });
+        }
+        if concrete_arguments.len() != call.arguments.len() {
+            return Err(format!(
+                "expanded distributed call `{name}` has {} arguments, expected {}",
+                concrete_arguments.len(),
+                call.arguments.len()
+            ));
+        }
+        calls.push(DistributedCall {
+            expression: expression.id,
+            owner: expression.owner,
+            canonical_function: call.canonical_function.clone(),
+            producer_role: call.producer_role,
+            result: expression.flow_type.clone(),
+            effect: call.effect,
+            arguments: concrete_arguments,
+            invocation_arms: Vec::new(),
+        });
+    }
+    calls.sort_by_key(|call| call.expression);
+    Ok(calls)
 }
 
 fn distributed_function_role(function: &str) -> Option<boon_typecheck::ProgramRole> {
@@ -2822,22 +8032,11 @@ fn distributed_function_role(function: &str) -> Option<boon_typecheck::ProgramRo
 }
 
 fn distributed_role(namespace: &str) -> Option<boon_typecheck::ProgramRole> {
-    match namespace {
-        "Client" => Some(boon_typecheck::ProgramRole::Client),
-        "Session" => Some(boon_typecheck::ProgramRole::Session),
-        "Server" => Some(boon_typecheck::ProgramRole::Server),
-        _ => None,
-    }
-}
-
-fn ensure_distributed_flow_is_closed(
-    flow_type: &boon_typecheck::FlowType,
-    context: &str,
-) -> Result<(), String> {
-    if flow_type.mode != boon_typecheck::FlowMode::Continuous {
-        return Err(format!("{context} is not continuous"));
-    }
-    ensure_distributed_type_is_closed(&flow_type.ty, context)
+    Some(match boon_parser::program_role_root(namespace)? {
+        boon_parser::ProgramRoleRoot::Client => boon_typecheck::ProgramRole::Client,
+        boon_parser::ProgramRoleRoot::Session => boon_typecheck::ProgramRole::Session,
+        boon_parser::ProgramRoleRoot::Server => boon_typecheck::ProgramRole::Server,
+    })
 }
 
 fn ensure_distributed_value_flow_is_closed(
@@ -2891,13 +8090,13 @@ fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn semantic_index(
-    program: &ParsedProgram,
+    checked_program: &boon_typecheck::CheckedProgram,
     row_scopes: &[RowScope],
     sources: &[SourcePort],
     lists: &[ListMemory],
-    functions: &[FunctionDefinition],
     view_bindings: &[ViewBinding],
-    typecheck_report: &boon_typecheck::TypeCheckReport,
+    output_values: &[OutputRootValue],
+    typecheck_report: &boon_typecheck::CheckedProgramLoweringMetadata,
     semantic_fields: Vec<SemanticFieldEntry>,
 ) -> SemanticIndex {
     let payload_shape_by_source = typecheck_report
@@ -2911,8 +8110,8 @@ fn semantic_index(
         .iter()
         .map(|entry| entry.name.as_str())
         .collect::<BTreeSet<_>>();
-    let source_units = program
-        .files
+    let source_units = typecheck_report
+        .source_units
         .iter()
         .enumerate()
         .map(|(id, file)| SemanticSourceUnit {
@@ -2920,10 +8119,21 @@ fn semantic_index(
             path: file.path.clone(),
             module: file.module.clone(),
             start_line: file.start_line,
-            line_count: file.source.lines().count().max(1),
+            line_count: file.line_count,
         })
         .collect::<Vec<_>>();
-    let output_roots = semantic_output_roots(program, typecheck_report);
+    let output_roots = output_values
+        .iter()
+        .map(|output| SemanticOutputRootEntry {
+            root: output.root.clone(),
+            contract: output.contract,
+            demand: output.demand,
+            data_type: output.data_type.clone(),
+            statement_id: output.statement_id,
+            line: output.line,
+            typed_contract_known: output.typed_contract_known,
+        })
+        .collect::<Vec<_>>();
     let sources = sources
         .iter()
         .map(|source| {
@@ -2960,15 +8170,27 @@ fn semantic_index(
             row_scope: scope.row_scope.clone(),
         })
         .collect::<Vec<_>>();
-    let functions = functions
+    let functions = checked_program
+        .callables
         .iter()
+        .filter(|function| function.kind == boon_typecheck::CheckedCallableKind::User)
         .enumerate()
         .map(|(id, function)| SemanticFunctionEntry {
             id: FunctionId(id),
             name: function.name.clone(),
-            args: function.args.clone(),
-            statement_id: function.statement.id,
-            line: function.statement.line,
+            args: function
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect(),
+            statement_id: function
+                .body
+                .map_or(usize::MAX, |statement| statement.0 as usize),
+            line: checked_program
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == function.decl_id)
+                .map_or(0, |declaration| declaration.span.line),
             type_known: function_types.contains(function.name.as_str()),
         })
         .collect::<Vec<_>>();
@@ -2981,7 +8203,10 @@ fn semantic_index(
             path: binding.path.clone(),
             kind: binding.kind,
             scope_id: binding.scope_id,
-            source_id: binding.source_id,
+            source_id: match binding.target {
+                ViewBindingTarget::Source { source } => Some(source),
+                ViewBindingTarget::Read { .. } => None,
+            },
             render_contract_known: true,
         })
         .collect::<Vec<_>>();
@@ -2999,7 +8224,8 @@ fn semantic_index(
         })
         .collect::<Vec<_>>();
     let symbols = semantic_symbols(
-        program,
+        checked_program,
+        &source_units,
         &output_roots,
         &sources,
         &lists,
@@ -3009,17 +8235,23 @@ fn semantic_index(
         &view_bindings,
     );
     let readiness = semantic_index_readiness(
+        checked_program,
         &sources,
-        row_scopes.len(),
-        lists.len(),
-        program,
+        &row_scopes,
+        &lists,
         typecheck_report,
     );
     SemanticIndex {
         version: 1,
-        computed_from: "parser_ast_ir_typecheck_tables".to_owned(),
-        parser_policy_phase: "syntax_parse_then_semantic_index_policy_checks".to_owned(),
-        reuse_key: semantic_index_reuse_key(program, &readiness),
+        computed_from: "checked_program_erased_ir".to_owned(),
+        parser_policy_phase: "checked_semantics_only".to_owned(),
+        reuse_key: semantic_index_reuse_key(
+            &source_units,
+            &sources,
+            &lists,
+            &row_scopes,
+            &readiness,
+        ),
         output_roots,
         source_units,
         sources,
@@ -3032,15 +8264,13 @@ fn semantic_index(
         symbols,
         readiness,
         reuse: SemanticIndexReuse {
-            parser_reused_by_ir: true,
+            parser_reused_by_ir: false,
             typecheck_reused_by_ir: true,
             runtime_reports_reuse_index: true,
             shared_tables: vec![
-                "ParsedProgram.source_ports".to_owned(),
-                "ParsedProgram.list_memories".to_owned(),
-                "ParsedProgram.row_scope_functions".to_owned(),
-                "TypeCheckReport.source_payload_shape_table".to_owned(),
-                "TypeCheckReport.render_slot_table".to_owned(),
+                "CheckedProgram.sources".to_owned(),
+                "CheckedProgram.lowering_metadata.source_payload_shape_table".to_owned(),
+                "CheckedProgram.lowering_metadata.render_slot_table".to_owned(),
                 "ErasedProgram.semantic_index.output_roots".to_owned(),
                 "ErasedProgram.view_bindings".to_owned(),
             ],
@@ -3049,78 +8279,67 @@ fn semantic_index(
 }
 
 fn semantic_field_entries(
-    fields: &[FieldDef],
-    row_scopes: &[RowScope],
+    fields: &[ErasedFieldDef],
+    derived_values: &[DerivedValue],
     state_cells: &[StateCell],
-    lists: &[ListMemory],
-    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
 ) -> Vec<SemanticFieldEntry> {
-    let mut semantic_fields = fields
+    fields
         .iter()
-        .enumerate()
-        .map(|(id, field)| SemanticFieldEntry {
-            id: FieldId(id),
-            path: field.path.clone(),
-            local_name: field.local_name.clone(),
-            parent_path: field.parent_path.clone(),
-            scope_id: scope_id_for_path(row_scopes, &field.path),
-            statement_id: field.statement.id,
-            line: field.statement.line,
-            kind: semantic_field_kind(field, state_cells, lists),
-        })
-        .collect::<Vec<_>>();
-    for storage in derived_list_storage.values() {
-        let path = &storage.path;
-        let source = fields.iter().find(|field| field.path == *path);
-        for local_name in &storage.item_fields {
-            if semantic_fields.iter().any(|field| {
-                field.scope_id == Some(storage.row_scope_id) && field.local_name == *local_name
+        .filter(|field| field.role.is_value())
+        .map(|field| SemanticFieldEntry {
+            id: field.id,
+            path: field.diagnostic_path.clone(),
+            local_name: field.name.clone(),
+            parent_path: field
+                .parent
+                .and_then(|parent| fields.get(parent.as_usize()))
+                .map_or_else(String::new, |parent| parent.diagnostic_path.clone()),
+            scope_id: field.row.map(|row| row.scope),
+            statement_id: field.statement.map_or(usize::MAX, |statement| statement.0),
+            line: field
+                .statement
+                .and_then(|statement| {
+                    state_cells
+                        .iter()
+                        .find(|state| state.statement_id == statement.as_usize())
+                })
+                .map_or(0, |state| state.source_line),
+            kind: if state_cells.iter().any(|state| {
+                field
+                    .statement
+                    .is_some_and(|statement| state.statement_id == statement.as_usize())
             }) {
-                continue;
-            }
-            semantic_fields.push(SemanticFieldEntry {
-                id: FieldId(semantic_fields.len()),
-                path: format!("{path}.{local_name}"),
-                local_name: local_name.clone(),
-                parent_path: path.clone(),
-                scope_id: Some(storage.row_scope_id),
-                statement_id: source.map_or(usize::MAX, |field| field.statement.id),
-                line: source.map_or(0, |field| field.statement.line),
-                kind: "materialized_field".to_owned(),
-            });
-        }
-    }
-    semantic_fields
-}
-
-fn semantic_output_roots(
-    program: &ParsedProgram,
-    typecheck_report: &boon_typecheck::TypeCheckReport,
-) -> Vec<SemanticOutputRootEntry> {
-    output_root_declarations(program, typecheck_report)
-        .into_iter()
-        .map(|declaration| SemanticOutputRootEntry {
-            root: declaration.root,
-            contract: declaration.contract,
-            demand: SemanticOutputDemandPolicy::HostDemanded,
-            data_type: declaration.data_type,
-            statement_id: declaration.statement.id,
-            line: declaration.statement.line,
-            typed_contract_known: declaration.typed_contract_known,
+                "state".to_owned()
+            } else if let Some(derived) =
+                derived_values.iter().find(|derived| derived.id == field.id)
+            {
+                match derived.kind {
+                    DerivedValueKind::SourceEventTransform => "source_event_transform",
+                    DerivedValueKind::ListView => "list_view",
+                    DerivedValueKind::Aggregate => "aggregate",
+                    DerivedValueKind::Pure => "pure",
+                    DerivedValueKind::Unknown => "unknown",
+                }
+                .to_owned()
+            } else if field.row.is_some() {
+                "materialized_field".to_owned()
+            } else {
+                "field".to_owned()
+            },
         })
         .collect()
 }
 
 fn output_root_values(
-    program: &ParsedProgram,
-    typecheck_report: &boon_typecheck::TypeCheckReport,
+    checked_program: &boon_typecheck::CheckedProgram,
+    typecheck_report: &boon_typecheck::CheckedProgramLoweringMetadata,
     executable: &ExecutableProgram,
-    storage: &StorageCatalog,
+    scope_index: &ErasedScopeIndex,
 ) -> Result<Vec<OutputRootValue>, String> {
-    output_root_declarations(program, typecheck_report)
+    output_root_declarations(checked_program, typecheck_report)
         .into_iter()
         .map(|declaration| {
-            let executable_statement_id = ExecutableStatementId(declaration.statement.id);
+            let executable_statement_id = ExecutableStatementId(declaration.statement_id);
             let executable_statement = executable
                 .statements
                 .iter()
@@ -3143,13 +8362,13 @@ fn output_root_values(
                     declaration.value_path, executable_statement_id
                 )
             })?;
-            let bindings = storage
+            let bindings = scope_index
                 .bindings
                 .iter()
                 .filter(|binding| {
                     binding.declaration == declaration_id
                         && binding.producer == value_expression_id
-                        && matches!(binding.kind, StorageBindingKind::Value { .. })
+                        && matches!(binding.target, ErasedBindingTarget::Value { .. })
                 })
                 .collect::<Vec<_>>();
             let [binding] = bindings.as_slice() else {
@@ -3161,111 +8380,131 @@ fn output_root_values(
                     bindings.len()
                 ));
             };
+            let typed_contract_known = match declaration.contract {
+                SemanticOutputContractKind::RetainedVisual {
+                    kind: SemanticRetainedVisualKind::Document,
+                } => executable_expression_contains_call_prefix(
+                    executable,
+                    value_expression_id,
+                    &["Document/", "Element/"],
+                ),
+                SemanticOutputContractKind::RetainedVisual {
+                    kind: SemanticRetainedVisualKind::Scene,
+                } => executable_expression_contains_call_prefix(
+                    executable,
+                    value_expression_id,
+                    &["Scene/"],
+                ),
+                SemanticOutputContractKind::HostValue => declaration
+                    .data_type
+                    .as_ref()
+                    .is_some_and(semantic_data_type_is_closed),
+            };
             Ok(OutputRootValue {
                 root: declaration.root,
                 value_path: declaration.value_path,
                 contract: declaration.contract,
                 demand: SemanticOutputDemandPolicy::HostDemanded,
                 data_type: declaration.data_type,
-                statement_id: declaration.statement.id,
+                statement_id: declaration.statement_id,
                 executable_statement_id,
                 value_expression_id,
-                storage_binding_id: binding.id,
-                line: declaration.statement.line,
-                typed_contract_known: declaration.typed_contract_known,
-                statement: declaration.statement.clone(),
+                binding_id: binding.id,
+                line: declaration.line,
+                typed_contract_known,
             })
         })
         .collect()
 }
 
-struct OutputRootDeclaration<'a> {
+struct OutputRootDeclaration {
     root: String,
     value_path: String,
     contract: SemanticOutputContractKind,
     data_type: Option<SemanticDataType>,
-    typed_contract_known: bool,
-    statement: &'a AstStatement,
+    statement_id: usize,
+    line: usize,
 }
 
-fn output_root_declarations<'a>(
-    program: &'a ParsedProgram,
-    typecheck_report: &boon_typecheck::TypeCheckReport,
-) -> Vec<OutputRootDeclaration<'a>> {
+fn output_root_declarations(
+    program: &boon_typecheck::CheckedProgram,
+    typecheck_report: &boon_typecheck::CheckedProgramLoweringMetadata,
+) -> Vec<OutputRootDeclaration> {
     let mut declarations = Vec::new();
-    for statement in &program.ast.statements {
-        let AstStatementKind::Field { name } = &statement.kind else {
+    for statement in program
+        .statements
+        .iter()
+        .filter(|statement| statement.scope_id == program.root_scope)
+    {
+        let boon_typecheck::CheckedStatementKind::Field { declaration } = statement.kind else {
             continue;
         };
-        let visual_kind = match name.as_str() {
+        let Some(name) = program
+            .declarations
+            .iter()
+            .find(|candidate| candidate.id == declaration)
+            .map(|declaration| declaration.name.as_str())
+        else {
+            continue;
+        };
+        let visual_kind = match name {
             "document" => Some(SemanticRetainedVisualKind::Document),
             "scene" => Some(SemanticRetainedVisualKind::Scene),
             _ => None,
         };
         if let Some(kind) = visual_kind {
             declarations.push(OutputRootDeclaration {
-                root: name.clone(),
-                value_path: name.clone(),
+                root: name.to_owned(),
+                value_path: name.to_owned(),
                 contract: SemanticOutputContractKind::RetainedVisual { kind },
                 data_type: None,
-                typed_contract_known: retained_visual_contract_known(
-                    kind,
-                    statement,
-                    program,
-                    typecheck_report,
-                ),
-                statement,
+                statement_id: statement.id.0 as usize,
+                line: statement.span.line,
             });
             continue;
         }
         if name != "outputs" {
             continue;
         }
-        for output in &statement.children {
-            let name = match &output.kind {
-                AstStatementKind::Field { name }
-                | AstStatementKind::List {
-                    field: Some(name), ..
-                } => name,
-                _ => continue,
+        for output_id in &statement.children {
+            let Some(output) = program
+                .statements
+                .get(output_id.0 as usize)
+                .filter(|output| output.id == *output_id)
+            else {
+                continue;
+            };
+            let output_declaration = match output.kind {
+                boon_typecheck::CheckedStatementKind::Field { declaration } => Some(declaration),
+                boon_typecheck::CheckedStatementKind::List { declaration, .. } => declaration,
+                _ => None,
+            };
+            let Some(name) = output_declaration.and_then(|declaration| {
+                program
+                    .declarations
+                    .iter()
+                    .find(|candidate| candidate.id == declaration)
+                    .map(|declaration| declaration.name.as_str())
+            }) else {
+                continue;
             };
             let data_type = typecheck_report
                 .output_root_types
                 .iter()
-                .find(|entry| entry.statement_id == output.id && entry.name == *name)
+                .find(|entry| entry.statement_id == output.id.0 as usize && entry.name == name)
                 .map(|entry| semantic_data_type(&entry.ty));
             declarations.push(OutputRootDeclaration {
-                root: name.clone(),
+                root: name.to_owned(),
                 value_path: format!("outputs.{name}"),
                 contract: SemanticOutputContractKind::HostValue,
-                typed_contract_known: data_type.as_ref().is_some_and(semantic_data_type_is_closed),
                 data_type,
-                statement: output,
+                statement_id: output.id.0 as usize,
+                line: output.span.line,
             });
         }
     }
     declarations.sort_by(|left, right| left.root.cmp(&right.root));
     declarations
-}
-
-fn retained_visual_contract_known(
-    kind: SemanticRetainedVisualKind,
-    statement: &AstStatement,
-    program: &ParsedProgram,
-    typecheck_report: &boon_typecheck::TypeCheckReport,
-) -> bool {
-    if typecheck_report.has_errors() {
-        return false;
-    }
-    match kind {
-        SemanticRetainedVisualKind::Document => {
-            statement_contains_constructor(statement, program, "Document/")
-                || statement_contains_constructor(statement, program, "Element/")
-        }
-        SemanticRetainedVisualKind::Scene => {
-            statement_contains_constructor(statement, program, "Scene/")
-        }
-    }
 }
 
 fn semantic_data_type_is_closed(data_type: &SemanticDataType) -> bool {
@@ -3293,27 +8532,40 @@ fn semantic_data_type_is_closed(data_type: &SemanticDataType) -> bool {
     }
 }
 
-fn statement_contains_constructor(
-    statement: &AstStatement,
-    program: &ParsedProgram,
-    prefix: &str,
+fn executable_expression_contains_call_prefix(
+    program: &ExecutableProgram,
+    root: ExecutableExprId,
+    prefixes: &[&str],
 ) -> bool {
-    collect_statement_ast_exprs(statement, program)
-        .iter()
-        .any(|expr| match &expr.kind {
-            AstExprKind::Call { function, .. } => function.starts_with(prefix),
-            AstExprKind::Pipe { op, .. } => op.starts_with(prefix),
-            _ => false,
-        })
-        || statement
-            .children
-            .iter()
-            .any(|child| statement_contains_constructor(child, program, prefix))
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let Some(expression) = program
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+        else {
+            continue;
+        };
+        if matches!(
+            &expression.kind,
+            ExecutableExpressionKind::Call { name, .. }
+                if prefixes.iter().any(|prefix| name.starts_with(prefix))
+        ) {
+            return true;
+        }
+        pending.extend(executable_expression_children(&expression.kind));
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
 fn semantic_symbols(
-    program: &ParsedProgram,
+    program: &boon_typecheck::CheckedProgram,
+    source_units: &[SemanticSourceUnit],
     output_roots: &[SemanticOutputRootEntry],
     sources: &[SemanticSourceEntry],
     lists: &[SemanticListEntry],
@@ -3323,7 +8575,7 @@ fn semantic_symbols(
     view_bindings: &[SemanticViewBindingEntry],
 ) -> Vec<SemanticSymbolEntry> {
     let mut table = SemanticSymbolTable::default();
-    for file in &program.files {
+    for file in source_units {
         table.intern("source_unit_path", &file.path);
         if let Some(module) = &file.module {
             table.intern("module_path", module);
@@ -3356,43 +8608,36 @@ fn semantic_symbols(
         table.intern("field_path", &field.path);
         table.intern("field_name", &field.local_name);
     }
-    for operator in &program.operators {
-        table.intern("operator_name", operator);
-    }
     for expr in &program.expressions {
         match &expr.kind {
-            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
-                table.intern("tag", tag);
+            boon_typecheck::CheckedExpressionKind::Tag { name } => {
+                table.intern("tag", name);
             }
-            AstExprKind::TaggedObject { tag, fields } => {
+            boon_typecheck::CheckedExpressionKind::TaggedObject { tag, fields } => {
                 table.intern("tag", tag);
                 for field in fields {
                     table.intern("document_attr", &field.name);
                 }
             }
-            AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
+            boon_typecheck::CheckedExpressionKind::Object { fields }
+            | boon_typecheck::CheckedExpressionKind::Record { fields } => {
                 for field in fields {
                     table.intern("document_attr", &field.name);
                     table.intern("style_attr", &field.name);
                 }
             }
-            AstExprKind::Call { function, args, .. } => {
-                table.intern("operator_name", function);
-                for arg in args {
-                    if let Some(name) = arg.named_name() {
-                        table.intern("document_attr", name);
-                    }
-                }
-            }
-            AstExprKind::Pipe { op, args, .. } => {
-                table.intern("operator_name", op);
-                for arg in args {
-                    if let Some(name) = arg.named_name() {
-                        table.intern("document_attr", name);
-                    }
-                }
-            }
             _ => {}
+        }
+    }
+    for call in &program.calls {
+        table.intern("operator_name", &call.function);
+        for entry in &call.entries {
+            let name = match entry {
+                boon_typecheck::CheckedCallEntry::Input { name, .. }
+                | boon_typecheck::CheckedCallEntry::FreshOut { name, .. }
+                | boon_typecheck::CheckedCallEntry::ForwardOut { name, .. } => name,
+            };
+            table.intern("document_attr", name);
         }
     }
     for binding in view_bindings {
@@ -3438,36 +8683,19 @@ impl SemanticSymbolTable {
     }
 }
 
-fn semantic_field_kind(
-    field: &FieldDef,
-    state_cells: &[StateCell],
-    lists: &[ListMemory],
-) -> String {
-    if state_cells.iter().any(|cell| cell.path == field.path) {
-        "state_cell".to_owned()
-    } else if lists
-        .iter()
-        .any(|list| field.path == list.name || field.path.ends_with(&format!(".{}", list.name)))
-    {
-        "list_memory".to_owned()
-    } else {
-        "derived_value".to_owned()
-    }
-}
-
 fn semantic_index_readiness(
+    program: &boon_typecheck::CheckedProgram,
     sources: &[SemanticSourceEntry],
-    row_scope_count: usize,
-    list_count: usize,
-    program: &ParsedProgram,
-    typecheck_report: &boon_typecheck::TypeCheckReport,
+    row_scopes: &[SemanticRowScopeEntry],
+    lists: &[SemanticListEntry],
+    typecheck_report: &boon_typecheck::CheckedProgramLoweringMetadata,
 ) -> SemanticIndexReadiness {
     let source_payload_fallbacks = sources
         .iter()
         .filter(|source| !source.payload_schema_known)
         .map(|source| format!("{} has no source payload shape entry", source.path))
         .collect::<Vec<_>>();
-    let row_scope_fallbacks = if list_count > 0 && row_scope_count == 0 {
+    let row_scope_fallbacks = if !lists.is_empty() && row_scopes.is_empty() {
         vec!["lists exist but no row scope function was discovered".to_owned()]
     } else {
         Vec::new()
@@ -3488,7 +8716,7 @@ fn semantic_index_readiness(
         })
         .collect::<Vec<_>>();
     let route_critical_fallbacks = route_critical_unknown_reasons(typecheck_report);
-    let row_scope_ambiguity_fallbacks = row_scope_ambiguity_reasons(program);
+    let row_scope_ambiguity_fallbacks = row_scope_ambiguity_reasons(row_scopes);
     SemanticIndexReadiness {
         source_payload_schemas: SemanticKnowledgeStatus {
             known_count: sources.len().saturating_sub(source_payload_fallbacks.len()),
@@ -3506,22 +8734,22 @@ fn semantic_index_readiness(
             fallback_reasons: route_critical_fallbacks,
         },
         row_scopes: SemanticKnowledgeStatus {
-            known_count: row_scope_count,
+            known_count: row_scopes.len(),
             fallback_count: row_scope_fallbacks.len(),
             fallback_reasons: row_scope_fallbacks,
         },
         row_scope_ambiguity: SemanticKnowledgeStatus {
-            known_count: row_scope_count,
+            known_count: row_scopes.len(),
             fallback_count: row_scope_ambiguity_fallbacks.len(),
             fallback_reasons: row_scope_ambiguity_fallbacks,
         },
         selectors: SemanticKnowledgeStatus {
-            known_count: program.list_memories.len(),
+            known_count: lists.len(),
             fallback_count: selector_fallbacks.len(),
             fallback_reasons: selector_fallbacks.clone(),
         },
         selector_index_ambiguity: SemanticKnowledgeStatus {
-            known_count: program.list_memories.len(),
+            known_count: lists.len(),
             fallback_count: selector_fallbacks.len(),
             fallback_reasons: selector_fallbacks.clone(),
         },
@@ -3544,7 +8772,7 @@ fn semantic_index_readiness(
 }
 
 fn route_critical_unknown_reasons(
-    typecheck_report: &boon_typecheck::TypeCheckReport,
+    typecheck_report: &boon_typecheck::CheckedProgramLoweringMetadata,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     if typecheck_report.dynamic_fallback_count > 0 {
@@ -3567,10 +8795,10 @@ fn route_critical_unknown_reasons(
     reasons
 }
 
-fn row_scope_ambiguity_reasons(program: &ParsedProgram) -> Vec<String> {
+fn row_scope_ambiguity_reasons(row_scopes: &[SemanticRowScopeEntry]) -> Vec<String> {
     let mut seen = BTreeMap::<&str, &str>::new();
     let mut reasons = Vec::new();
-    for scope in &program.row_scope_functions {
+    for scope in row_scopes {
         if let Some(existing_list) = seen.insert(scope.row_scope.as_str(), scope.list.as_str())
             && existing_list != scope.list
         {
@@ -3583,15 +8811,17 @@ fn row_scope_ambiguity_reasons(program: &ParsedProgram) -> Vec<String> {
     reasons
 }
 
-fn selector_fallback_reasons(program: &ParsedProgram) -> Vec<String> {
+fn selector_fallback_reasons(program: &boon_typecheck::CheckedProgram) -> Vec<String> {
     program
         .expressions
         .iter()
         .filter_map(|expr| match &expr.kind {
-            AstExprKind::Unknown(tokens) if tokens.iter().any(|token| token.contains("List/")) => {
+            boon_typecheck::CheckedExpressionKind::Invalid { tokens }
+                if tokens.iter().any(|token| token.contains("List/")) =>
+            {
                 Some(format!(
-                    "list selector expression at line {} was parsed as unknown",
-                    expr.line
+                    "list selector expression at line {} is invalid after typecheck",
+                    expr.span.line
                 ))
             }
             _ => None,
@@ -3599,14 +8829,25 @@ fn selector_fallback_reasons(program: &ParsedProgram) -> Vec<String> {
         .collect()
 }
 
-fn semantic_index_reuse_key(program: &ParsedProgram, readiness: &SemanticIndexReadiness) -> String {
+fn semantic_index_reuse_key(
+    source_units: &[SemanticSourceUnit],
+    sources: &[SemanticSourceEntry],
+    lists: &[SemanticListEntry],
+    row_scopes: &[SemanticRowScopeEntry],
+    readiness: &SemanticIndexReadiness,
+) -> String {
+    let source_identity = source_units
+        .iter()
+        .map(|source| source.path.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
     format!(
         "semantic-index-v1:{}:{}:{}:{}:{}:{}",
-        program.path,
-        program.files.len(),
-        program.source_ports.len(),
-        program.list_memories.len(),
-        program.row_scope_functions.len(),
+        source_identity,
+        source_units.len(),
+        sources.len(),
+        lists.len(),
+        row_scopes.len(),
         readiness.dynamic_fallback_count
     )
 }
@@ -3630,44 +8871,12 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
     if !program.static_schedule_verified {
         return Err("static schedule verification did not run".to_owned());
     }
-    if program.graph_node_count != program.nodes.len() {
+    if program.graph_node_count != program.executable.expressions.len() {
         return Err(format!(
-            "graph_node_count {} does not match {} scheduled nodes",
+            "graph_node_count {} does not match {} canonical executable expressions",
             program.graph_node_count,
-            program.nodes.len()
+            program.executable.expressions.len()
         ));
-    }
-    for (index, node) in program.nodes.iter().enumerate() {
-        if node.id.as_usize() != index {
-            return Err(format!(
-                "scheduled node `{}` has id {}, expected {index}",
-                node.name, node.id
-            ));
-        }
-        if node
-            .expr_id
-            .is_some_and(|expr_id| expr_id.as_usize() >= program.expression_count)
-        {
-            return Err(format!(
-                "scheduled node `{}` references missing ExprId {:?}",
-                node.name, node.expr_id
-            ));
-        }
-        if matches!(
-            node.kind,
-            IrNodeKind::ListAppend
-                | IrNodeKind::ListRemove
-                | IrNodeKind::ListMap
-                | IrNodeKind::ListRetain
-                | IrNodeKind::Aggregate
-                | IrNodeKind::RenderLowering
-        ) && !node.indexed
-        {
-            return Err(format!(
-                "scheduled collection node `{}` is not indexed/keyed",
-                node.name
-            ));
-        }
     }
     verify_distributed_reference_schedule(program)?;
     verify_executable_schedule(program)?;
@@ -3754,10 +8963,22 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
             .iter()
             .map(|value| value.path.as_str()),
     )?;
-    for (index, value) in program.derived_values.iter().enumerate() {
-        if value.id.as_usize() != index {
+    let mut derived_field_ids = BTreeSet::new();
+    for value in &program.derived_values {
+        if !derived_field_ids.insert(value.id) {
             return Err(format!(
-                "derived value `{}` has FieldId {}, expected {index}",
+                "derived value `{}` reuses FieldId {}",
+                value.path, value.id
+            ));
+        }
+        if !program
+            .scope_index
+            .fields
+            .iter()
+            .any(|field| field.id == value.id)
+        {
+            return Err(format!(
+                "derived value `{}` references missing FieldId {}",
                 value.path, value.id
             ));
         }
@@ -3808,7 +9029,7 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
     }
     for target in typed_derived_list_targets(&program.executable)? {
         let binding = program
-            .storage
+            .scope_index
             .bindings
             .iter()
             .find(|binding| {
@@ -3820,11 +9041,14 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                     target.path
                 )
             })?;
-        let StorageBindingKind::Value {
-            list: Some(list),
-            row_scope: Some(row_scope),
+        let ErasedBindingTarget::Value {
+            row:
+                Some(ErasedRowBinding {
+                    list,
+                    scope: row_scope,
+                }),
             ..
-        } = binding.kind
+        } = binding.target
         else {
             return Err(format!(
                 "typed list declaration `{}` did not receive keyed ListId/ScopeId storage",
@@ -3903,11 +9127,38 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                 scope_id.as_usize()
             ));
         }
+        match &binding.target {
+            ViewBindingTarget::Read { read, .. } => {
+                if !program
+                    .scope_index
+                    .reads
+                    .get(read.as_usize())
+                    .is_some_and(|candidate| candidate.id == *read)
+                {
+                    return Err(format!(
+                        "view binding `{}.{}` references missing erased read {read}",
+                        binding.node_kind, binding.attr
+                    ));
+                }
+            }
+            ViewBindingTarget::Source { source } => {
+                if !program
+                    .sources
+                    .get(source.as_usize())
+                    .is_some_and(|candidate| candidate.id == *source)
+                {
+                    return Err(format!(
+                        "view binding `{}.{}` references missing source {source}",
+                        binding.node_kind, binding.attr
+                    ));
+                }
+            }
+        }
         match binding.kind {
             ViewBindingKind::Source => {
-                let Some(source_id) = binding.source_id else {
+                let ViewBindingTarget::Source { source: source_id } = binding.target else {
                     return Err(format!(
-                        "view source binding `{}.{}` has no SourceId",
+                        "view source binding `{}.{}` has no exact source target",
                         binding.node_kind, binding.attr
                     ));
                 };
@@ -3915,16 +9166,16 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                     || program.sources[source_id.as_usize()].path != binding.path
                 {
                     return Err(format!(
-                        "view source binding `{}.{}` does not match SourceId {:?}",
-                        binding.node_kind, binding.attr, binding.source_id
+                        "view source binding `{}.{}` does not match source {source_id}",
+                        binding.node_kind, binding.attr
                     ));
                 }
             }
             ViewBindingKind::Data | ViewBindingKind::Target => {
-                if binding.source_id.is_some() {
+                if matches!(binding.target, ViewBindingTarget::Source { .. }) {
                     return Err(format!(
-                        "view data binding `{}.{}` unexpectedly has SourceId {:?}",
-                        binding.node_kind, binding.attr, binding.source_id
+                        "view data binding `{}.{}` unexpectedly targets a source",
+                        binding.node_kind, binding.attr
                     ));
                 }
             }
@@ -4036,83 +9287,121 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
         require_known_symbol("dependency source", &edge.from, &known_symbols)?;
         require_known_symbol("dependency target", &edge.to, &known_symbols)?;
     }
-    for edge in &program.immediate_dependencies {
-        require_known_symbol(
-            "immediate dependency dependent",
-            &edge.dependent,
-            &known_symbols,
-        )?;
-        require_known_symbol(
-            "immediate dependency dependency",
-            &edge.dependency,
-            &known_symbols,
-        )?;
-    }
     for cause in &program.possible_causes {
         require_known_symbol("cause target", &cause.target, &known_symbols)?;
         for source in &cause.sources {
             require_known_symbol("cause source", source, &known_symbols)?;
         }
     }
-    let effect_result_states = program
-        .update_branches
-        .iter()
-        .filter_map(|branch| {
-            matches!(&branch.expression, UpdateExpression::HostEffect { .. })
-                .then_some(branch.target.as_str())
-        })
-        .collect::<BTreeSet<_>>();
-    for branch in &program.update_branches {
-        if !state_paths.contains(branch.target.as_str()) {
-            return Err(format!(
-                "update branch target `{}` is not a scheduled state cell",
-                branch.target
-            ));
-        }
-        if !source_paths.contains(branch.source.as_str())
-            && !state_paths.contains(branch.source.as_str())
-        {
-            return Err(format!(
-                "update branch trigger `{}` is neither a declared source nor a state cell",
-                branch.source
-            ));
-        }
-        if matches!(&branch.expression, UpdateExpression::HostEffect { .. })
-            && state_paths.contains(branch.source.as_str())
-            && !effect_result_states.contains(branch.source.as_str())
-        {
-            return Err(format!(
-                "host effect update trigger `{}` is not a typed host-effect result state",
-                branch.source
-            ));
-        }
-        verify_scheduled_update_expression(
-            &branch.expression,
-            &branch.target,
-            &branch.source,
-            &known_symbols,
-        )
-        .map_err(|error| {
-            format!(
-                "update branch `{}` from `{}` failed static schedule: {error}; expression={:?}",
-                branch.target, branch.source, branch.expression
-            )
-        })?;
+    for arm in &program.state_update_arms {
+        let state = program
+            .state_cells
+            .get(arm.state.as_usize())
+            .filter(|state| state.id == arm.state)
+            .ok_or_else(|| {
+                format!(
+                    "state update arm references missing target StateId {}",
+                    arm.state
+                )
+            })?;
+        let cause = event_cause_path_owned(arm.cause, &program.sources, &program.state_cells)?;
+        let gate = program
+            .executable
+            .expressions
+            .get(arm.gate_expression_id.as_usize())
+            .filter(|expression| {
+                expression.id == arm.gate_expression_id
+                    && expression.checked_expr_id == arm.gate_checked_expr_id
+                    && expression.owner == arm.owner
+            })
+            .ok_or_else(|| {
+                format!(
+                    "state update `{}` from `{cause}` has stale gate {}",
+                    state.path, arm.gate_expression_id
+                )
+            })?;
+        program
+            .executable
+            .expressions
+            .get(arm.output_expression_id.as_usize())
+            .filter(|expression| expression.id == arm.output_expression_id)
+            .ok_or_else(|| {
+                format!(
+                    "state update `{}` from `{cause}` gate {} has missing output {}",
+                    state.path, gate.id, arm.output_expression_id
+                )
+            })?;
     }
-    for operation in &program.list_operations {
-        let Some(list) = program.lists.get(operation.list_id.as_usize()) else {
+    for mutation in &program.list_mutations {
+        let Some(list) = program.lists.get(mutation.list_id.as_usize()) else {
             return Err(format!(
-                "list operation references missing ListId {} for `{}`",
-                operation.list_id, operation.list
+                "list mutation references missing ListId {}",
+                mutation.list_id
             ));
         };
-        if list.id != operation.list_id || list.name != operation.list {
+        if list.id != mutation.list_id {
             return Err(format!(
-                "list operation ListId {} resolves to `{}`, not `{}`",
-                operation.list_id, list.name, operation.list
+                "list mutation ListId {} resolves to inconsistent list `{}`",
+                mutation.list_id, list.name
             ));
         }
-        verify_scheduled_list_operation(&operation.kind, &source_paths, &known_symbols)?;
+        let cause = event_cause_path_owned(mutation.cause, &program.sources, &program.state_cells)?;
+        let verify_expression = |id: ExecutableExprId, role: &str| {
+            program
+                .executable
+                .expressions
+                .get(id.as_usize())
+                .filter(|expression| expression.id == id)
+                .ok_or_else(|| {
+                    format!(
+                        "list mutation {} from `{cause}` references missing {role} expression {id}",
+                        mutation.list_id
+                    )
+                })
+        };
+        match mutation.kind {
+            ListMutationKind::Append { gate, item } => {
+                verify_expression(gate, "gate")?;
+                verify_expression(item, "item")?;
+            }
+            ListMutationKind::Remove {
+                gate,
+                owner,
+                row_local,
+                predicate,
+                ..
+            } => {
+                verify_expression(gate, "gate")?;
+                verify_expression(predicate, "predicate")?;
+                if !program.materializations.iter().any(|materialization| {
+                    materialization.owner == owner
+                        && materialization.row_local == row_local
+                        && (materialization.source_list_id == Some(mutation.list_id)
+                            || materialization.target_list_id == Some(mutation.list_id))
+                }) {
+                    return Err(format!(
+                        "list mutation {} from `{cause}` has no exact contextual owner {} local {}; candidates={:?}",
+                        mutation.list_id,
+                        owner,
+                        row_local.0,
+                        program
+                            .materializations
+                            .iter()
+                            .filter(|materialization| {
+                                materialization.owner == owner
+                                    && materialization.row_local == row_local
+                            })
+                            .map(|materialization| (
+                                materialization.id,
+                                materialization.operation,
+                                materialization.source_list_id,
+                                materialization.target_list_id,
+                            ))
+                            .collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -4128,7 +9417,7 @@ fn verify_executable_schedule(program: &ErasedProgram) -> Result<(), String> {
         }
         if expression
             .owner
-            .is_some_and(|owner| owner.as_usize() >= program.static_owners.len())
+            .is_some_and(|owner| owner.as_usize() >= program.scope_index.owners.len())
         {
             return Err(format!(
                 "executable expression {} references missing static owner {:?}",
@@ -4205,16 +9494,20 @@ fn verify_executable_schedule(program: &ErasedProgram) -> Result<(), String> {
                 materialization.id
             ));
         }
-        if materialization.owner.as_usize() >= program.static_owners.len() {
+        if materialization.owner.as_usize() >= program.scope_index.owners.len() {
             return Err(format!(
                 "contextual materialization {} references missing static owner {}",
                 materialization.id, materialization.owner
             ));
         }
         for (label, root) in [
-            ("source", materialization.source),
-            ("body", materialization.body),
-        ] {
+            ("source", Some(materialization.source)),
+            ("body", Some(materialization.body)),
+            ("direction", materialization.direction),
+        ]
+        .into_iter()
+        .filter_map(|(label, root)| root.map(|root| (label, root)))
+        {
             if root.as_usize() >= expressions.len() {
                 return Err(format!(
                     "contextual materialization {} {label} references missing expression {}",
@@ -4222,17 +9515,46 @@ fn verify_executable_schedule(program: &ErasedProgram) -> Result<(), String> {
                 ));
             }
         }
+        for (key_index, key) in materialization.inherited_order.iter().enumerate() {
+            if !matches!(
+                key.operation,
+                ContextualOperationKind::SortBy | ContextualOperationKind::ThenBy
+            ) {
+                return Err(format!(
+                    "contextual materialization {} inherited order key {key_index} has non-order operation {:?}",
+                    materialization.id, key.operation
+                ));
+            }
+            if key_index == 0 && key.operation != ContextualOperationKind::SortBy {
+                return Err(format!(
+                    "contextual materialization {} inherited order chain does not start with List/sort_by",
+                    materialization.id
+                ));
+            }
+            for (label, root) in [("body", key.body), ("direction", key.direction)] {
+                if root.as_usize() >= expressions.len() {
+                    return Err(format!(
+                        "contextual materialization {} inherited order key {key_index} {label} references missing expression {}",
+                        materialization.id, root
+                    ));
+                }
+            }
+        }
+        if !materialization.inherited_order.is_empty()
+            && materialization.operation != ContextualOperationKind::ThenBy
+        {
+            return Err(format!(
+                "contextual materialization {} carries inherited order keys for non-then_by operation {:?}",
+                materialization.id, materialization.operation
+            ));
+        }
         let mut ancestor_locals = BTreeSet::new();
-        let mut ancestor = program.static_owners[materialization.owner.as_usize()].parent;
+        let mut ancestor = program.scope_index.owners[materialization.owner.as_usize()].parent;
         while let Some(owner) = ancestor {
-            let local = local_by_owner.get(&owner).copied().ok_or_else(|| {
-                format!(
-                    "contextual materialization {} has ancestor owner {} without a row local",
-                    materialization.id, owner
-                )
-            })?;
-            ancestor_locals.insert((owner, local));
-            ancestor = program.static_owners[owner.as_usize()].parent;
+            if let Some(local) = local_by_owner.get(&owner).copied() {
+                ancestor_locals.insert((owner, local));
+            }
+            ancestor = program.scope_index.owners[owner.as_usize()].parent;
         }
         verify_materialization_locals(
             expressions,
@@ -4240,6 +9562,22 @@ fn verify_executable_schedule(program: &ErasedProgram) -> Result<(), String> {
             &ancestor_locals,
             materialization.id,
         )?;
+        if let Some(direction) = materialization.direction {
+            verify_materialization_locals(
+                expressions,
+                direction,
+                &ancestor_locals,
+                materialization.id,
+            )?;
+        }
+        for key in &materialization.inherited_order {
+            verify_materialization_locals(
+                expressions,
+                key.direction,
+                &ancestor_locals,
+                materialization.id,
+            )?;
+        }
         let mut body_locals = ancestor_locals;
         body_locals.insert((materialization.owner, materialization.row_local));
         verify_materialization_locals(
@@ -4248,8 +9586,138 @@ fn verify_executable_schedule(program: &ErasedProgram) -> Result<(), String> {
             &body_locals,
             materialization.id,
         )?;
+        for key in &materialization.inherited_order {
+            verify_materialization_locals(expressions, key.body, &body_locals, materialization.id)?;
+        }
+    }
+    verify_runtime_executable_types(program)?;
+    Ok(())
+}
+
+fn verify_runtime_executable_types(program: &ErasedProgram) -> Result<(), String> {
+    let mut pending = Vec::new();
+    pending.extend(
+        program
+            .executable
+            .statements
+            .iter()
+            .filter_map(|statement| statement.value),
+    );
+    pending.extend(program.executable.roots.iter().map(|root| root.expression));
+    pending.extend(
+        program
+            .executable
+            .sources
+            .iter()
+            .map(|source| source.expression),
+    );
+    pending.extend(
+        program
+            .executable
+            .states
+            .iter()
+            .map(|state| state.expression),
+    );
+    pending.extend(
+        program
+            .materializations
+            .iter()
+            .flat_map(ContextualMaterialization::expression_roots),
+    );
+    pending.extend(
+        program
+            .state_update_arms
+            .iter()
+            .flat_map(|arm| [arm.gate_expression_id, arm.output_expression_id]),
+    );
+    pending.extend(program.derived_values.iter().flat_map(|derived| {
+        derived
+            .trigger_arms
+            .iter()
+            .flat_map(|arm| [arm.gate_expression_id, arm.output_expression_id])
+            .chain(derived.default_roots.iter().copied())
+    }));
+    pending.extend(
+        program
+            .output_values
+            .iter()
+            .map(|output| output.value_expression_id),
+    );
+    pending.extend(program.view_bindings.iter().filter_map(|binding| {
+        match &binding.target {
+            ViewBindingTarget::Read { read, .. } => program
+                .scope_index
+                .reads
+                .get(read.as_usize())
+                .filter(|candidate| candidate.id == *read)
+                .map(|read| read.expression),
+            _ => None,
+        }
+    }));
+
+    for materialization in &program.materializations {
+        for (label, ty) in [
+            ("item", &materialization.item_type),
+            ("result", &materialization.result_type),
+        ] {
+            if runtime_type_contains_var(ty) {
+                return Err(format!(
+                    "contextual materialization {} has unresolved runtime {label} type {ty:?}",
+                    materialization.id
+                ));
+            }
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let expression = program
+            .executable
+            .expressions
+            .get(expression_id.as_usize())
+            .ok_or_else(|| {
+                format!(
+                    "runtime type verification reaches missing executable expression {expression_id}"
+                )
+            })?;
+        if runtime_type_contains_var(&expression.flow_type.ty) {
+            return Err(format!(
+                "runtime executable expression {expression_id} has unresolved type {:?}",
+                expression.flow_type.ty
+            ));
+        }
+        pending.extend(executable_expression_children(&expression.kind));
     }
     Ok(())
+}
+
+fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
+    match ty {
+        boon_typecheck::Type::Var(_) => true,
+        boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
+        boon_typecheck::Type::Function { args, result } => {
+            args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
+        }
+        boon_typecheck::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
+        boon_typecheck::Type::VariantSet(variants) => {
+            variants.iter().any(|variant| match variant {
+                boon_typecheck::Variant::Tag(_) => false,
+                boon_typecheck::Variant::Tagged { fields, .. } => {
+                    fields.fields.values().any(runtime_type_contains_var)
+                }
+            })
+        }
+        boon_typecheck::Type::Text
+        | boon_typecheck::Type::Number
+        | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Skip
+        | boon_typecheck::Type::RenderContract
+        | boon_typecheck::Type::UnresolvedShape { .. }
+        | boon_typecheck::Type::Unknown => false,
+    }
 }
 
 fn verify_materialization_locals(
@@ -4285,7 +9753,9 @@ fn verify_materialization_locals(
 pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<ExecutableExprId> {
     match kind {
         ExecutableExpressionKind::CanonicalRead { .. }
+        | ExecutableExpressionKind::LocalRead { .. }
         | ExecutableExpressionKind::ExternalRead { .. }
+        | ExecutableExpressionKind::ElementState { .. }
         | ExecutableExpressionKind::Drain { .. }
         | ExecutableExpressionKind::Text(_)
         | ExecutableExpressionKind::Number(_)
@@ -4297,11 +9767,23 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
         | ExecutableExpressionKind::Delimiter
         | ExecutableExpressionKind::MaterializationLocal { .. }
         | ExecutableExpressionKind::FunctionParameter { .. } => Vec::new(),
+        ExecutableExpressionKind::TextTemplate { segments } => segments
+            .iter()
+            .filter_map(|segment| match segment {
+                ExecutableTextSegment::Static { .. } => None,
+                ExecutableTextSegment::Dynamic { value } => Some(*value),
+            })
+            .collect(),
         ExecutableExpressionKind::TaggedObject { fields, .. }
         | ExecutableExpressionKind::Object(fields)
         | ExecutableExpressionKind::Record(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
+        ExecutableExpressionKind::Block { bindings, result } => bindings
+            .iter()
+            .map(|binding| binding.value)
+            .chain(std::iter::once(*result))
+            .collect(),
         ExecutableExpressionKind::Call { arguments, .. } => {
             arguments.iter().map(|argument| argument.value).collect()
         }
@@ -4328,7 +9810,7 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
 
 fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), String> {
     let expected_count = program.distributed_references.value_references.len()
-        + program.distributed_references.pure_calls.len();
+        + program.distributed_references.calls.len();
     if program
         .expression_coverage
         .distributed_reference_expression_count
@@ -4343,9 +9825,10 @@ fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), 
     }
 
     let scheduled_expr_ids = program
-        .nodes
+        .executable
+        .expressions
         .iter()
-        .filter_map(|node| node.expr_id)
+        .map(|expression| ExprId(expression.checked_expr_id.0 as usize))
         .collect::<BTreeSet<_>>();
     let mut reference_expr_ids = BTreeSet::new();
     for reference in &program.distributed_references.value_references {
@@ -4371,27 +9854,45 @@ fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), 
         )?;
     }
 
-    for call in &program.distributed_references.pure_calls {
-        if !reference_expr_ids.insert(call.expr_id) {
+    let mut call_expressions = BTreeSet::new();
+    for call in &program.distributed_references.calls {
+        if !call_expressions.insert(call.expression) {
             return Err(format!(
                 "distributed expression {} is represented more than once",
-                call.expr_id
+                call.expression
             ));
         }
-        require_scheduled_distributed_expr(call.expr_id, &scheduled_expr_ids)?;
+        let expression = program
+            .executable
+            .expressions
+            .get(call.expression.as_usize())
+            .filter(|candidate| candidate.id == call.expression)
+            .ok_or_else(|| {
+                format!(
+                    "distributed call `{}` references missing executable expression {}",
+                    call.canonical_function, call.expression
+                )
+            })?;
+        if expression.owner != call.owner {
+            return Err(format!(
+                "distributed call `{}` executable owner does not match its concrete metadata",
+                call.canonical_function
+            ));
+        }
         if distributed_function_role(&call.canonical_function) != Some(call.producer_role) {
             return Err(format!(
                 "distributed call `{}` does not match producer role {:?}",
                 call.canonical_function, call.producer_role
             ));
         }
-        verify_distributed_metadata_type(
-            program,
-            call.expr_id,
-            boon_typecheck::FlowMode::Continuous,
-            &call.result_type,
-            &format!("distributed call `{}` result", call.canonical_function),
-        )?;
+        let result_context = format!("distributed call `{}` result", call.canonical_function);
+        ensure_distributed_value_flow_is_closed(&expression.flow_type, &result_context)?;
+        ensure_distributed_value_flow_is_closed(&call.result, &result_context)?;
+        if expression.flow_type != call.result {
+            return Err(format!(
+                "{result_context} executable type does not match its boundary type"
+            ));
+        }
         let mut names = BTreeSet::new();
         for argument in &call.arguments {
             if !names.insert(argument.name.as_str()) {
@@ -4400,15 +9901,28 @@ fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), 
                     call.canonical_function, argument.name
                 ));
             }
-            require_scheduled_distributed_expr(argument.expr_id, &scheduled_expr_ids)?;
             let context = format!(
                 "distributed call `{}` argument `{}`",
                 call.canonical_function, argument.name
             );
-            ensure_distributed_type_is_closed(&argument.argument_type, &context)?;
-            let checked =
-                distributed_expr_type(&program.expression_types, argument.expr_id.as_usize())?;
-            ensure_distributed_flow_is_closed(checked, &context)?;
+            ensure_distributed_value_flow_is_closed(&argument.flow_type, &context)?;
+            let value = program
+                .executable
+                .expressions
+                .get(argument.value.as_usize())
+                .filter(|candidate| candidate.id == argument.value)
+                .ok_or_else(|| {
+                    format!(
+                        "{context} references missing executable expression {}",
+                        argument.value
+                    )
+                })?;
+            ensure_distributed_value_flow_is_closed(&value.flow_type, &context)?;
+            if value.flow_type != argument.flow_type {
+                return Err(format!(
+                    "{context} executable type does not match its boundary type"
+                ));
+            }
         }
     }
     Ok(())
@@ -4491,24 +10005,6 @@ fn verify_scope_refs(
     Ok(())
 }
 
-fn row_scopes(program: &ParsedProgram) -> Vec<RowScope> {
-    let mut scopes = Vec::new();
-    for scope in &program.row_scope_functions {
-        if scopes.iter().any(|existing: &RowScope| {
-            existing.list == scope.list && existing.row_scope == scope.row_scope
-        }) {
-            continue;
-        }
-        scopes.push(RowScope {
-            id: ScopeId(scopes.len()),
-            list: scope.list.clone(),
-            function: scope.function.clone(),
-            row_scope: scope.row_scope.clone(),
-        });
-    }
-    scopes
-}
-
 fn scope_id_for_path(row_scopes: &[RowScope], path: &str) -> Option<ScopeId> {
     path.split('.').find_map(|segment| {
         row_scopes
@@ -4516,13 +10012,6 @@ fn scope_id_for_path(row_scopes: &[RowScope], path: &str) -> Option<ScopeId> {
             .find(|scope| scope.row_scope == segment)
             .map(|scope| scope.id)
     })
-}
-
-fn scope_id_for_list(row_scopes: &[RowScope], list: &str) -> Option<ScopeId> {
-    row_scopes
-        .iter()
-        .find(|scope| scope.list == list)
-        .map(|scope| scope.id)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4558,23 +10047,41 @@ fn executable_statement_name_path(kind: &ExecutableStatementKind) -> Option<(&st
     }
 }
 
+fn direct_list_alias_target(
+    executable: &ExecutableProgram,
+    statement: &ExecutableStatement,
+) -> Option<boon_typecheck::DeclId> {
+    let value = statement.value?;
+    let expression = executable
+        .expressions
+        .get(value.as_usize())
+        .filter(|expression| expression.id == value)?;
+    if !matches!(&expression.flow_type.ty, boon_typecheck::Type::List(_)) {
+        return None;
+    }
+    match &expression.kind {
+        ExecutableExpressionKind::CanonicalRead {
+            target, projection, ..
+        } if projection.is_empty() => Some(*target),
+        _ => None,
+    }
+}
+
 fn typed_derived_list_targets(
     executable: &ExecutableProgram,
 ) -> Result<Vec<TypedDerivedListTarget>, String> {
     let mut targets = Vec::new();
     let mut seen = BTreeSet::new();
+    let direct_storage_statements = direct_erased_storage_statements(executable);
     for statement in &executable.statements {
+        if !direct_storage_statements.contains(&statement.id) {
+            continue;
+        }
         let Some((name, path)) = executable_statement_name_path(&statement.kind) else {
             continue;
         };
         let Some(value) = statement.value else {
             continue;
-        };
-        let Some(declaration) = statement.declaration else {
-            return Err(format!(
-                "typed list-valued statement {} has no checked declaration",
-                statement.id
-            ));
         };
         let expression = executable
             .expressions
@@ -4582,14 +10089,35 @@ fn typed_derived_list_targets(
             .ok_or_else(|| {
                 format!("typed field `{path}` references missing executable expression {value}")
             })?;
+        if direct_list_alias_target(executable, statement).is_some() {
+            continue;
+        }
+        if expression.flow_type.mode == boon_typecheck::FlowMode::Absent {
+            continue;
+        }
         let boon_typecheck::Type::List(item_type) = &expression.flow_type.ty else {
             continue;
+        };
+        if !matches!(item_type.as_ref(), boon_typecheck::Type::Object(_)) {
+            continue;
+        }
+        let Some(declaration) = statement.declaration else {
+            return Err(format!(
+                "typed list-valued statement {} has no checked declaration",
+                statement.id
+            ));
         };
         if !seen.insert(declaration) {
             return Err(format!(
                 "checked declaration {} has more than one executable list storage target",
                 declaration.0
             ));
+        }
+        let mut item_fields = typed_item_field_names(item_type);
+        for field in executable_list_item_field_names(executable, value) {
+            if !item_fields.contains(&field) {
+                item_fields.push(field);
+            }
         }
         targets.push(TypedDerivedListTarget {
             statement: statement.id,
@@ -4605,10 +10133,238 @@ fn typed_derived_list_targets(
                 },
             },
             item_type: (**item_type).clone(),
-            item_fields: typed_item_field_names(item_type),
+            item_fields,
         });
     }
     Ok(targets)
+}
+
+fn executable_list_item_field_names(
+    executable: &ExecutableProgram,
+    root: ExecutableExprId,
+) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let Some(expression) = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+        else {
+            continue;
+        };
+        match &expression.kind {
+            ExecutableExpressionKind::Object(record_fields)
+            | ExecutableExpressionKind::Record(record_fields)
+            | ExecutableExpressionKind::TaggedObject {
+                fields: record_fields,
+                ..
+            } => {
+                for field in record_fields {
+                    if !field.spread && !fields.contains(&field.name) {
+                        fields.push(field.name.clone());
+                    }
+                }
+            }
+            ExecutableExpressionKind::Then { output, .. }
+            | ExecutableExpressionKind::MatchArm { output, .. } => {
+                pending.extend(output.iter().copied());
+            }
+            ExecutableExpressionKind::When { arms, .. } => {
+                pending.extend(arms.iter().map(|arm| arm.output));
+            }
+            ExecutableExpressionKind::Latest { branches } => {
+                pending.extend(branches.iter().copied());
+            }
+            ExecutableExpressionKind::Hold {
+                initial, updates, ..
+            } => {
+                pending.push(*initial);
+                pending.extend(updates.iter().copied());
+            }
+            ExecutableExpressionKind::List { items, .. } => {
+                pending.extend(items.iter().copied());
+            }
+            ExecutableExpressionKind::Draining { input }
+            | ExecutableExpressionKind::Project { input, .. } => {
+                pending.push(*input);
+            }
+            ExecutableExpressionKind::Block { bindings, result } => {
+                pending.extend(bindings.iter().map(|binding| binding.value));
+                pending.push(*result);
+            }
+            ExecutableExpressionKind::Materialize { .. } => {}
+            ExecutableExpressionKind::TextTemplate { .. } => {}
+            ExecutableExpressionKind::CanonicalRead { .. }
+            | ExecutableExpressionKind::LocalRead { .. }
+            | ExecutableExpressionKind::ExternalRead { .. }
+            | ExecutableExpressionKind::ElementState { .. }
+            | ExecutableExpressionKind::Drain { .. }
+            | ExecutableExpressionKind::Text(_)
+            | ExecutableExpressionKind::Number(_)
+            | ExecutableExpressionKind::BytesByte(_)
+            | ExecutableExpressionKind::Bool(_)
+            | ExecutableExpressionKind::Tag(_)
+            | ExecutableExpressionKind::Source { .. }
+            | ExecutableExpressionKind::Call { .. }
+            | ExecutableExpressionKind::Infix { .. }
+            | ExecutableExpressionKind::Bytes { .. }
+            | ExecutableExpressionKind::Delimiter
+            | ExecutableExpressionKind::MaterializationLocal { .. }
+            | ExecutableExpressionKind::FunctionParameter { .. } => {}
+        }
+    }
+    fields
+}
+
+fn exact_list_item_field_types(
+    executable: &ExecutableProgram,
+    root: ExecutableExprId,
+) -> Result<BTreeMap<String, boon_typecheck::Type>, String> {
+    let statement_values = executable
+        .statements
+        .iter()
+        .filter_map(|statement| Some((statement.declaration?, statement.value?)))
+        .collect::<BTreeMap<_, _>>();
+    let local_values = executable
+        .expressions
+        .iter()
+        .flat_map(|expression| match &expression.kind {
+            ExecutableExpressionKind::Block { bindings, .. } => bindings.as_slice(),
+            _ => &[],
+        })
+        .map(|binding| (binding.declaration, binding.value))
+        .collect::<BTreeMap<_, _>>();
+    let mut fields = BTreeMap::new();
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let expression = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+            .ok_or_else(|| {
+                format!("list item schema references missing expression {expression_id}")
+            })?;
+        match &expression.kind {
+            ExecutableExpressionKind::Object(record_fields)
+            | ExecutableExpressionKind::Record(record_fields)
+            | ExecutableExpressionKind::TaggedObject {
+                fields: record_fields,
+                ..
+            } => {
+                for field in record_fields {
+                    if field.spread {
+                        pending.push(field.value);
+                        continue;
+                    }
+                    let value = executable
+                        .expressions
+                        .get(field.value.as_usize())
+                        .filter(|value| value.id == field.value)
+                        .ok_or_else(|| {
+                            format!(
+                                "list item field `{}` references missing expression {}",
+                                field.name, field.value
+                            )
+                        })?;
+                    merge_authority_field_type(
+                        &mut fields,
+                        &field.name,
+                        value.flow_type.ty.clone(),
+                    )?;
+                }
+            }
+            ExecutableExpressionKind::Then { output, .. }
+            | ExecutableExpressionKind::MatchArm { output, .. } => {
+                pending.extend(output.iter().copied());
+            }
+            ExecutableExpressionKind::When { arms, .. } => {
+                pending.extend(arms.iter().map(|arm| arm.output));
+            }
+            ExecutableExpressionKind::Latest { branches } => {
+                pending.extend(branches.iter().copied());
+            }
+            ExecutableExpressionKind::Hold {
+                initial, updates, ..
+            } => {
+                pending.push(*initial);
+                pending.extend(updates.iter().copied());
+            }
+            ExecutableExpressionKind::List { items, .. } => {
+                pending.extend(items.iter().copied());
+            }
+            ExecutableExpressionKind::Draining { input } => pending.push(*input),
+            ExecutableExpressionKind::Project { input, .. } => {
+                if let boon_typecheck::Type::Object(shape) = &expression.flow_type.ty {
+                    for (name, ty) in &shape.fields {
+                        merge_authority_field_type(&mut fields, name, ty.clone())?;
+                    }
+                } else {
+                    pending.push(*input);
+                }
+            }
+            ExecutableExpressionKind::Block { result, .. } => pending.push(*result),
+            ExecutableExpressionKind::CanonicalRead {
+                target, projection, ..
+            } => {
+                if projection.is_empty() {
+                    if let Some(value) = statement_values.get(target) {
+                        pending.push(*value);
+                    }
+                } else if let boon_typecheck::Type::Object(shape) = &expression.flow_type.ty {
+                    for (name, ty) in &shape.fields {
+                        merge_authority_field_type(&mut fields, name, ty.clone())?;
+                    }
+                }
+            }
+            ExecutableExpressionKind::LocalRead {
+                declaration,
+                projection,
+            } => {
+                if projection.is_empty() {
+                    if let Some(value) = local_values.get(declaration) {
+                        pending.push(*value);
+                    }
+                } else if let boon_typecheck::Type::Object(shape) = &expression.flow_type.ty {
+                    for (name, ty) in &shape.fields {
+                        merge_authority_field_type(&mut fields, name, ty.clone())?;
+                    }
+                }
+            }
+            ExecutableExpressionKind::Call { .. } => {
+                if let boon_typecheck::Type::Object(shape) = &expression.flow_type.ty {
+                    for (name, ty) in &shape.fields {
+                        merge_authority_field_type(&mut fields, name, ty.clone())?;
+                    }
+                }
+            }
+            ExecutableExpressionKind::Materialize { .. }
+            | ExecutableExpressionKind::TextTemplate { .. }
+            | ExecutableExpressionKind::ExternalRead { .. }
+            | ExecutableExpressionKind::ElementState { .. }
+            | ExecutableExpressionKind::Drain { .. }
+            | ExecutableExpressionKind::Text(_)
+            | ExecutableExpressionKind::Number(_)
+            | ExecutableExpressionKind::BytesByte(_)
+            | ExecutableExpressionKind::Bool(_)
+            | ExecutableExpressionKind::Tag(_)
+            | ExecutableExpressionKind::Source { .. }
+            | ExecutableExpressionKind::Infix { .. }
+            | ExecutableExpressionKind::Bytes { .. }
+            | ExecutableExpressionKind::Delimiter
+            | ExecutableExpressionKind::MaterializationLocal { .. }
+            | ExecutableExpressionKind::FunctionParameter { .. } => {}
+        }
+    }
+    Ok(fields)
 }
 
 fn typed_item_field_names(item_type: &boon_typecheck::Type) -> Vec<String> {
@@ -4626,110 +10382,48 @@ fn typed_item_field_names(item_type: &boon_typecheck::Type) -> Vec<String> {
 }
 
 fn materialize_typed_derived_list_storage(
+    checked: &boon_typecheck::CheckedProgram,
     executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
     row_scopes: &mut Vec<RowScope>,
     lists: &mut Vec<ListMemory>,
 ) -> Result<BTreeMap<ExecutableStatementId, DerivedListStorageIds>, String> {
     let targets = typed_derived_list_targets(executable)?;
-    let mut target_paths_by_local = BTreeMap::<String, Vec<String>>::new();
-    for target in &targets {
-        target_paths_by_local
-            .entry(target.local_name.clone())
-            .or_default()
-            .push(target.path.clone());
-    }
-    for paths in target_paths_by_local.values_mut() {
-        paths.sort();
-        paths.dedup();
-    }
-    for list in lists.iter_mut() {
-        if targets.iter().any(|target| target.path == list.name) {
-            continue;
-        }
-        let Some(paths) = target_paths_by_local.get(&list.name) else {
-            continue;
-        };
-        let [path] = paths.as_slice() else {
-            return Err(format!(
-                "parsed list storage `{}` ambiguously matches checked paths {}",
-                list.name,
-                paths.join(", ")
-            ));
-        };
-        list.name.clone_from(path);
-    }
-    for scope in row_scopes.iter_mut() {
-        if targets.iter().any(|target| target.path == scope.list) {
-            continue;
-        }
-        let Some(paths) = target_paths_by_local.get(&scope.list) else {
-            continue;
-        };
-        let [path] = paths.as_slice() else {
-            return Err(format!(
-                "row scope `{}` ambiguously refers to typed derived lists {}",
-                scope.row_scope,
-                paths.join(", ")
-            ));
-        };
-        scope.list.clone_from(path);
-    }
-    let target_paths = targets
-        .iter()
-        .map(|target| target.path.as_str())
-        .collect::<BTreeSet<_>>();
-    lists.retain(|list| target_paths.contains(list.name.as_str()));
-    for (id, list) in lists.iter_mut().enumerate() {
-        list.id = ListId(id);
-        list.row_scope_id = scope_id_for_list(row_scopes, &list.name);
-    }
+    lists.clear();
+    row_scopes.clear();
 
     let mut storage = BTreeMap::new();
     for target in targets {
-        let existing = lists.iter().position(|list| list.name == target.path);
-        let list_id = existing.map_or(ListId(lists.len()), ListId);
-        let matching_scopes = row_scopes
+        let checked_statement = checked
+            .statements
             .iter()
-            .filter(|scope| scope.list == target.path)
-            .map(|scope| scope.id)
-            .collect::<Vec<_>>();
-        let row_scope_id = match matching_scopes.as_slice() {
-            [scope] => *scope,
-            [] => {
-                let scope = ScopeId(row_scopes.len());
-                row_scopes.push(RowScope {
-                    id: scope,
-                    list: target.path.clone(),
-                    function: "typed_list".to_owned(),
-                    row_scope: format!("list_{}_row", list_id.as_usize()),
-                });
-                scope
-            }
-            _ => {
-                return Err(format!(
-                    "typed derived list target `{}` has ambiguous row scopes {:?}",
-                    target.path, matching_scopes
-                ));
-            }
+            .find(|statement| statement.id.0 as usize == target.statement.as_usize());
+        let source_line = checked_statement.map_or(0, |statement| statement.span.line);
+        let list_id = ListId(lists.len());
+        let row_scope_id = ScopeId(row_scopes.len());
+        row_scopes.push(RowScope {
+            id: row_scope_id,
+            list: target.path.clone(),
+            function: "checked_list".to_owned(),
+            row_scope: format!("list_{}_row", list_id.as_usize()),
+        });
+        let list = ListMemory {
+            id: list_id,
+            name: target.path.clone(),
+            source_line,
+            row_scope_id: Some(row_scope_id),
+            hidden_key_type: hidden_key_type(&target.path),
+            has_generation: true,
+            graph_clones_per_item: 0,
+            capacity: target.capacity,
+            initializer: executable_list_initializer(
+                executable,
+                materializations,
+                target.producer,
+                &target.path,
+            )?,
         };
-        if let Some(index) = existing {
-            lists[index].id = list_id;
-            lists[index].row_scope_id = Some(row_scope_id);
-            if lists[index].capacity.is_none() {
-                lists[index].capacity = target.capacity;
-            }
-        } else {
-            lists.push(ListMemory {
-                id: list_id,
-                name: target.path.clone(),
-                row_scope_id: Some(row_scope_id),
-                hidden_key_type: hidden_key_type(&target.path),
-                has_generation: true,
-                graph_clones_per_item: 0,
-                capacity: target.capacity,
-                initializer: ListInitializer::Empty,
-            });
-        }
+        lists.push(list);
         if storage
             .insert(
                 target.statement,
@@ -4752,312 +10446,599 @@ fn materialize_typed_derived_list_storage(
     Ok(storage)
 }
 
+fn inline_list_authority_root(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    root: ExecutableExprId,
+) -> Option<ExecutableExprId> {
+    fn walk(
+        executable: &ExecutableProgram,
+        materializations: &[ContextualMaterialization],
+        expression_id: ExecutableExprId,
+        visited: &mut BTreeSet<ExecutableExprId>,
+    ) -> Option<ExecutableExprId> {
+        if !visited.insert(expression_id) {
+            return None;
+        }
+        let expression = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)?;
+        match &expression.kind {
+            ExecutableExpressionKind::List { .. } => Some(expression_id),
+            ExecutableExpressionKind::Call { name, .. } if name == "List/range" => {
+                Some(expression_id)
+            }
+            ExecutableExpressionKind::Call { arguments, .. }
+                if matches!(expression.flow_type.ty, boon_typecheck::Type::List(_)) =>
+            {
+                let list_inputs = arguments
+                    .iter()
+                    .filter(|argument| {
+                        executable
+                            .expressions
+                            .get(argument.value.as_usize())
+                            .filter(|candidate| candidate.id == argument.value)
+                            .is_some_and(|candidate| {
+                                matches!(candidate.flow_type.ty, boon_typecheck::Type::List(_))
+                            })
+                    })
+                    .map(|argument| argument.value)
+                    .collect::<Vec<_>>();
+                let [input] = list_inputs.as_slice() else {
+                    return None;
+                };
+                walk(executable, materializations, *input, visited)
+            }
+            ExecutableExpressionKind::Materialize { materialization } => materializations
+                .get(*materialization)
+                .filter(|candidate| candidate.id == *materialization)
+                .and_then(|materialization| {
+                    walk(
+                        executable,
+                        materializations,
+                        materialization.source,
+                        visited,
+                    )
+                }),
+            ExecutableExpressionKind::Draining { input }
+            | ExecutableExpressionKind::Project { input, .. } => {
+                walk(executable, materializations, *input, visited)
+            }
+            ExecutableExpressionKind::Block { result, .. } => {
+                walk(executable, materializations, *result, visited)
+            }
+            ExecutableExpressionKind::Then { output, .. }
+            | ExecutableExpressionKind::MatchArm { output, .. } => {
+                output.and_then(|output| walk(executable, materializations, output, visited))
+            }
+            _ => None,
+        }
+    }
+
+    walk(executable, materializations, root, &mut BTreeSet::new())
+}
+
+fn executable_list_initializer(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    producer: ExecutableExprId,
+    path: &str,
+) -> Result<ListInitializer, String> {
+    let Some(root) = inline_list_authority_root(executable, materializations, producer) else {
+        return Ok(ListInitializer::Empty);
+    };
+    let expression = executable
+        .expressions
+        .get(root.as_usize())
+        .filter(|expression| expression.id == root)
+        .ok_or_else(|| format!("list `{path}` authority root {root} is missing"))?;
+    match &expression.kind {
+        ExecutableExpressionKind::List { items, .. } => {
+            if items.is_empty() {
+                return Ok(ListInitializer::Empty);
+            }
+            let mut rows = Vec::with_capacity(items.len());
+            for item in items {
+                rows.push(
+                    executable_initial_record(executable, *item).map_err(|error| {
+                        format!("list `{path}` authority item {item} is invalid: {error}")
+                    })?,
+                );
+            }
+            Ok(ListInitializer::RecordLiteral { rows })
+        }
+        ExecutableExpressionKind::Call {
+            name, arguments, ..
+        } if name == "List/range" => {
+            let bound = |name: &str| -> Result<i64, String> {
+                let argument = arguments
+                    .iter()
+                    .find(|argument| argument.name == name)
+                    .ok_or_else(|| format!("List/range authority has no `{name}` argument"))?;
+                let value = executable_static_data(
+                    executable,
+                    argument.value,
+                    &BTreeMap::new(),
+                    &mut BTreeSet::new(),
+                )?;
+                let boon_data::Value::Number(value) = value else {
+                    return Err(format!("List/range `{name}` is not a Number"));
+                };
+                value.to_i64_exact().map_err(|error| {
+                    format!("List/range `{name}` is not an exact integer: {error}")
+                })
+            };
+            Ok(ListInitializer::Range {
+                from: bound("from")?,
+                to: bound("to")?,
+            })
+        }
+        other => Err(format!(
+            "list `{path}` authority root {root} has unsupported executable shape {other:?}"
+        )),
+    }
+}
+
+fn executable_initial_record(
+    executable: &ExecutableProgram,
+    expression_id: ExecutableExprId,
+) -> Result<ListInitialRecord, String> {
+    let expression = executable
+        .expressions
+        .get(expression_id.as_usize())
+        .filter(|expression| expression.id == expression_id)
+        .ok_or_else(|| format!("missing executable expression {expression_id}"))?;
+    let fields = match &expression.kind {
+        ExecutableExpressionKind::Object(fields) | ExecutableExpressionKind::Record(fields) => {
+            fields
+        }
+        _ => {
+            let value = executable_static_data(
+                executable,
+                expression_id,
+                &BTreeMap::new(),
+                &mut BTreeSet::new(),
+            )?;
+            return initial_record_from_data(value)
+                .ok_or_else(|| format!("expression {expression_id} is not a record"));
+        }
+    };
+
+    let mut result = Vec::new();
+    for field in fields {
+        if field.spread {
+            let value = executable_static_data(
+                executable,
+                field.value,
+                &BTreeMap::new(),
+                &mut BTreeSet::new(),
+            )?;
+            let boon_data::Value::Record(fields) = value else {
+                return Err(format!(
+                    "spread field `{}` is not a static record",
+                    field.name
+                ));
+            };
+            result.extend(fields.into_iter().map(|(name, value)| ListRowInitialField {
+                name,
+                value: initial_value_from_data(value),
+                expression: None,
+            }));
+            continue;
+        }
+        result.push(ListRowInitialField {
+            name: field.name.clone(),
+            value: executable_initial_value(executable, field.value)?,
+            expression: Some(field.value),
+        });
+    }
+    Ok(ListInitialRecord { fields: result })
+}
+
+fn executable_initial_value(
+    executable: &ExecutableProgram,
+    expression_id: ExecutableExprId,
+) -> Result<InitialValue, String> {
+    if let Some(path) = executable_root_initial_path(executable, expression_id) {
+        return Ok(InitialValue::RootInitialField { path });
+    }
+    Ok(executable_static_data(
+        executable,
+        expression_id,
+        &BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .map(initial_value_from_data)
+    .unwrap_or_else(|_| InitialValue::Unknown {
+        summary: format!("executable expression {expression_id}"),
+    }))
+}
+
+fn executable_root_initial_path(
+    executable: &ExecutableProgram,
+    expression_id: ExecutableExprId,
+) -> Option<String> {
+    let expression = executable
+        .expressions
+        .get(expression_id.as_usize())
+        .filter(|expression| expression.id == expression_id)?;
+    match &expression.kind {
+        ExecutableExpressionKind::CanonicalRead {
+            path, projection, ..
+        } => Some(
+            std::iter::once(path.as_str())
+                .chain(projection.iter().map(String::as_str))
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        ExecutableExpressionKind::Project { input, fields } => {
+            let base = executable_root_initial_path(executable, *input)?;
+            Some(
+                std::iter::once(base.as_str())
+                    .chain(fields.iter().map(String::as_str))
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+        }
+        ExecutableExpressionKind::Draining { input } => {
+            executable_root_initial_path(executable, *input)
+        }
+        ExecutableExpressionKind::MatchArm {
+            output: Some(output),
+            ..
+        }
+        | ExecutableExpressionKind::Then {
+            output: Some(output),
+            ..
+        } => executable_root_initial_path(executable, *output),
+        _ => None,
+    }
+}
+
+fn executable_static_data(
+    executable: &ExecutableProgram,
+    expression_id: ExecutableExprId,
+    locals: &BTreeMap<boon_typecheck::DeclId, boon_data::Value>,
+    visiting: &mut BTreeSet<ExecutableExprId>,
+) -> Result<boon_data::Value, String> {
+    if !visiting.insert(expression_id) {
+        return Err(format!("static expression cycle at {expression_id}"));
+    }
+    let result = (|| {
+        let expression = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+            .ok_or_else(|| format!("missing executable expression {expression_id}"))?;
+        match &expression.kind {
+            ExecutableExpressionKind::Text(value) => Ok(boon_data::Value::Text(value.clone())),
+            ExecutableExpressionKind::Number(value) => value
+                .parse::<boon_data::FiniteReal>()
+                .map(boon_data::Value::Number)
+                .map_err(|error| format!("invalid finite Number `{value}`: {error}")),
+            ExecutableExpressionKind::BytesByte(value) => Ok(boon_data::Value::Bytes(
+                boon_data::Bytes::copy_from_slice(&[*value]),
+            )),
+            ExecutableExpressionKind::Bool(value) => Ok(boon_data::Value::Bool(*value)),
+            ExecutableExpressionKind::Tag(tag) => Ok(boon_data::Value::Variant {
+                tag: tag.clone(),
+                fields: BTreeMap::new(),
+            }),
+            ExecutableExpressionKind::TextTemplate { segments } => {
+                let mut text = String::new();
+                for segment in segments {
+                    match segment {
+                        ExecutableTextSegment::Static { value } => text.push_str(value),
+                        ExecutableTextSegment::Dynamic { value } => {
+                            let boon_data::Value::Text(value) =
+                                executable_static_data(executable, *value, locals, visiting)?
+                            else {
+                                return Err(format!(
+                                    "text template expression {value} is not static Text"
+                                ));
+                            };
+                            text.push_str(&value);
+                        }
+                    }
+                }
+                Ok(boon_data::Value::Text(text))
+            }
+            ExecutableExpressionKind::Object(fields) | ExecutableExpressionKind::Record(fields) => {
+                let fields = executable_static_record(executable, fields, locals, visiting)?;
+                Ok(boon_data::Value::Record(fields))
+            }
+            ExecutableExpressionKind::TaggedObject { tag, fields } => {
+                let fields = executable_static_record(executable, fields, locals, visiting)?;
+                Ok(boon_data::Value::Variant {
+                    tag: tag.clone(),
+                    fields,
+                })
+            }
+            ExecutableExpressionKind::List { items, .. } => items
+                .iter()
+                .map(|item| executable_static_data(executable, *item, locals, visiting))
+                .collect::<Result<Vec<_>, _>>()
+                .map(boon_data::Value::List),
+            ExecutableExpressionKind::Bytes { fixed_size, items } => {
+                let mut bytes = Vec::new();
+                for item in items {
+                    let boon_data::Value::Bytes(value) =
+                        executable_static_data(executable, *item, locals, visiting)?
+                    else {
+                        return Err(format!("BYTES item {item} is not static BYTES"));
+                    };
+                    bytes.extend_from_slice(&value);
+                }
+                if let Some(expected) = fixed_size {
+                    if items.is_empty() {
+                        bytes.resize(*expected, 0);
+                    } else if *expected != bytes.len() {
+                        return Err(format!(
+                            "BYTES literal has {} bytes, expected {expected}",
+                            bytes.len()
+                        ));
+                    }
+                }
+                Ok(boon_data::Value::Bytes(bytes.into()))
+            }
+            ExecutableExpressionKind::Block { bindings, result } => {
+                let mut scoped = locals.clone();
+                for binding in bindings {
+                    let value =
+                        executable_static_data(executable, binding.value, &scoped, visiting)?;
+                    scoped.insert(binding.declaration, value);
+                }
+                executable_static_data(executable, *result, &scoped, visiting)
+            }
+            ExecutableExpressionKind::LocalRead {
+                declaration,
+                projection,
+            } => {
+                let value = locals.get(declaration).cloned().ok_or_else(|| {
+                    format!("local declaration {} has no static binding", declaration.0)
+                })?;
+                executable_static_projection(value, projection)
+            }
+            ExecutableExpressionKind::CanonicalRead {
+                target, projection, ..
+            } => {
+                let value = executable
+                    .statements
+                    .iter()
+                    .find(|statement| statement.declaration == Some(*target))
+                    .and_then(|statement| statement.value)
+                    .ok_or_else(|| {
+                        format!("declaration {} has no static executable value", target.0)
+                    })?;
+                let value = executable_static_data(executable, value, locals, visiting)?;
+                executable_static_projection(value, projection)
+            }
+            ExecutableExpressionKind::Project { input, fields } => {
+                let value = executable_static_data(executable, *input, locals, visiting)?;
+                executable_static_projection(value, fields)
+            }
+            ExecutableExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            }
+            | ExecutableExpressionKind::Then {
+                output: Some(output),
+                ..
+            } => executable_static_data(executable, *output, locals, visiting),
+            other => Err(format!(
+                "expression {expression_id} has non-static executable shape {other:?}"
+            )),
+        }
+    })();
+    visiting.remove(&expression_id);
+    result
+}
+
+fn executable_static_record(
+    executable: &ExecutableProgram,
+    fields: &[ExecutableRecordField],
+    locals: &BTreeMap<boon_typecheck::DeclId, boon_data::Value>,
+    visiting: &mut BTreeSet<ExecutableExprId>,
+) -> Result<BTreeMap<String, boon_data::Value>, String> {
+    let mut result = BTreeMap::new();
+    for field in fields {
+        let value = executable_static_data(executable, field.value, locals, visiting)?;
+        if field.spread {
+            let boon_data::Value::Record(fields) = value else {
+                return Err(format!(
+                    "spread field `{}` is not a static record",
+                    field.name
+                ));
+            };
+            result.extend(fields);
+        } else {
+            result.insert(field.name.clone(), value);
+        }
+    }
+    Ok(result)
+}
+
+fn executable_static_projection(
+    mut value: boon_data::Value,
+    projection: &[String],
+) -> Result<boon_data::Value, String> {
+    for field in projection {
+        value = match value {
+            boon_data::Value::Record(mut fields)
+            | boon_data::Value::Variant { mut fields, .. }
+            | boon_data::Value::Error { mut fields, .. } => fields
+                .remove(field)
+                .ok_or_else(|| format!("static value has no field `{field}`"))?,
+            _ => {
+                return Err(format!(
+                    "cannot project `{field}` from non-record static value"
+                ));
+            }
+        };
+    }
+    Ok(value)
+}
+
+#[derive(Default)]
+struct RuntimeResourceAliases {
+    owned: BTreeMap<(Option<StaticOwnerId>, String), RuntimeResourceAliasTarget>,
+    owner_parents: BTreeMap<StaticOwnerId, Option<StaticOwnerId>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeResourceAliasTarget {
+    Source(SourceId),
+    State(StateId),
+}
+
+impl RuntimeResourceAliases {
+    fn bind_owner_parents(&mut self, owners: &[StaticOwnerDef]) -> Result<(), String> {
+        for owner in owners {
+            if let Some(previous) = self.owner_parents.insert(owner.id, owner.parent)
+                && previous != owner.parent
+            {
+                return Err(format!(
+                    "static owner {} has conflicting parents {previous:?} and {:?}",
+                    owner.id, owner.parent
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn owner_chain(
+        &self,
+        owner: Option<StaticOwnerId>,
+    ) -> Result<Vec<Option<StaticOwnerId>>, String> {
+        let mut chain = Vec::new();
+        let mut current = owner;
+        let mut visiting = BTreeSet::new();
+        while let Some(owner) = current {
+            if !visiting.insert(owner) {
+                return Err(format!("static owner ancestry contains a cycle at {owner}"));
+            }
+            chain.push(Some(owner));
+            current = self.owner_parents.get(&owner).copied().ok_or_else(|| {
+                format!("runtime resource alias references missing static owner {owner}")
+            })?;
+        }
+        chain.push(None);
+        Ok(chain)
+    }
+}
+
 fn insert_resource_alias(
-    aliases: &mut BTreeMap<String, String>,
+    aliases: &mut RuntimeResourceAliases,
+    owner: Option<StaticOwnerId>,
     from: &str,
-    to: &str,
+    target: RuntimeResourceAliasTarget,
 ) -> Result<(), String> {
-    if let Some(previous) = aliases.insert(from.to_owned(), to.to_owned())
-        && previous != to
+    let key = (owner, from.to_owned());
+    if let Some(previous) = aliases.owned.insert(key, target)
+        && previous != target
     {
         return Err(format!(
-            "runtime resource alias `{from}` resolves to both `{previous}` and `{to}`"
+            "runtime resource alias `{from}` for owner {owner:?} resolves to both {previous:?} and {target:?}"
         ));
     }
     Ok(())
 }
 
 fn merge_resource_aliases(
-    aliases: &mut BTreeMap<String, String>,
-    additions: BTreeMap<String, String>,
+    aliases: &mut RuntimeResourceAliases,
+    additions: RuntimeResourceAliases,
 ) -> Result<(), String> {
-    for (from, to) in additions {
-        insert_resource_alias(aliases, &from, &to)?;
+    for ((owner, from), target) in additions.owned {
+        insert_resource_alias(aliases, owner, &from, target)?;
     }
     Ok(())
 }
 
-fn canonical_resource_path(path: &str, aliases: &BTreeMap<String, String>) -> String {
-    if let Some(canonical) = aliases.get(path) {
-        return canonical.clone();
+fn runtime_resource_alias_target_path<'a>(
+    target: RuntimeResourceAliasTarget,
+    sources: &'a [SourcePort],
+    state_paths: &'a [String],
+) -> Result<&'a str, String> {
+    match target {
+        RuntimeResourceAliasTarget::Source(source) => sources
+            .get(source.as_usize())
+            .filter(|candidate| candidate.id == source)
+            .map(|source| source.path.as_str())
+            .ok_or_else(|| format!("runtime resource alias references missing SourceId {source}")),
+        RuntimeResourceAliasTarget::State(state) => state_paths
+            .get(state.as_usize())
+            .map(String::as_str)
+            .ok_or_else(|| format!("runtime resource alias references missing StateId {state}")),
     }
-    aliases
-        .iter()
-        .filter_map(|(alias, canonical)| {
-            path.strip_prefix(alias)
-                .filter(|suffix| suffix.starts_with('.'))
-                .map(|suffix| (alias.len(), format!("{canonical}{suffix}")))
-        })
-        .max_by_key(|(length, _)| *length)
-        .map_or_else(|| path.to_owned(), |(_, canonical)| canonical)
 }
 
-fn canonicalize_update_branches(branches: &mut [UpdateBranch], aliases: &BTreeMap<String, String>) {
-    for branch in branches {
-        branch.target = canonical_resource_path(&branch.target, aliases);
-        branch.source = canonical_resource_path(&branch.source, aliases);
-        if let Some(guard) = &mut branch.guard {
-            canonicalize_update_guard(guard, aliases);
+fn canonical_resource_path(
+    path: &str,
+    owner: Option<StaticOwnerId>,
+    aliases: &RuntimeResourceAliases,
+    sources: &[SourcePort],
+    state_paths: &[String],
+) -> Result<String, String> {
+    for owner in aliases.owner_chain(owner)? {
+        if let Some(target) = aliases.owned.get(&(owner, path.to_owned())) {
+            return Ok(
+                runtime_resource_alias_target_path(*target, sources, state_paths)?.to_owned(),
+            );
         }
-        canonicalize_update_expression(&mut branch.expression, aliases);
+        if let Some((_, target, suffix)) = aliases
+            .owned
+            .iter()
+            .filter(|((alias_owner, _), _)| *alias_owner == owner)
+            .filter_map(|((_, alias), target)| {
+                path.strip_prefix(alias)
+                    .filter(|suffix| suffix.starts_with('.'))
+                    .map(|suffix| (alias.len(), *target, suffix))
+            })
+            .max_by_key(|(length, _, _)| *length)
+        {
+            let canonical = runtime_resource_alias_target_path(target, sources, state_paths)?;
+            return Ok(format!("{canonical}{suffix}"));
+        }
     }
+    Ok(path.to_owned())
 }
 
 fn canonicalize_runtime_resource_metadata(
-    immediate_dependencies: &mut [ImmediateDependency],
     dependencies: &mut [DependencyEdge],
     possible_causes: &mut [PossibleCause],
-    list_operations: &mut [ListOperation],
     state_cells: &mut [StateCell],
-    aliases: &BTreeMap<String, String>,
-) {
-    for dependency in immediate_dependencies {
-        dependency.dependent = canonical_resource_path(&dependency.dependent, aliases);
-        dependency.dependency = canonical_resource_path(&dependency.dependency, aliases);
-    }
+    sources: &[SourcePort],
+    aliases: &RuntimeResourceAliases,
+) -> Result<(), String> {
+    let state_paths = state_cells
+        .iter()
+        .map(|state| state.path.clone())
+        .collect::<Vec<_>>();
+    let state_owners = state_cells
+        .iter()
+        .map(|state| (state.path.clone(), state.static_owner))
+        .collect::<BTreeMap<_, _>>();
     for dependency in dependencies {
-        dependency.from = canonical_resource_path(&dependency.from, aliases);
-        dependency.to = canonical_resource_path(&dependency.to, aliases);
+        let owner = state_owners.get(&dependency.to).copied().flatten();
+        dependency.from =
+            canonical_resource_path(&dependency.from, owner, aliases, sources, &state_paths)?;
+        dependency.to =
+            canonical_resource_path(&dependency.to, owner, aliases, sources, &state_paths)?;
     }
     for cause in possible_causes {
-        cause.target = canonical_resource_path(&cause.target, aliases);
+        let owner = state_owners.get(&cause.target).copied().flatten();
+        cause.target =
+            canonical_resource_path(&cause.target, owner, aliases, sources, &state_paths)?;
         for source in &mut cause.sources {
-            *source = canonical_resource_path(source, aliases);
+            *source = canonical_resource_path(source, owner, aliases, sources, &state_paths)?;
         }
         cause.sources.sort();
         cause.sources.dedup();
     }
-    for operation in list_operations {
-        operation.list = canonical_resource_path(&operation.list, aliases);
-        match &mut operation.kind {
-            ListOperationKind::Append { trigger, fields } => {
-                *trigger = canonical_resource_path(trigger, aliases);
-                for field in fields {
-                    match &mut field.value {
-                        ListAppendFieldValue::Source { path } => {
-                            *path = canonical_resource_path(path, aliases);
-                        }
-                        ListAppendFieldValue::TypedConst { value } => {
-                            canonicalize_initial_value(value, aliases);
-                        }
-                        ListAppendFieldValue::Const { .. } => {}
-                    }
-                }
-            }
-            ListOperationKind::Remove { source, predicate } => {
-                *source = canonical_resource_path(source, aliases);
-                canonicalize_list_predicate(predicate, aliases);
-            }
-            ListOperationKind::Retain { target, predicate }
-            | ListOperationKind::Count { target, predicate } => {
-                *target = canonical_resource_path(target, aliases);
-                canonicalize_list_predicate(predicate, aliases);
-            }
-        }
-    }
-    for state in state_cells {
-        canonicalize_initial_value(&mut state.initial_value, aliases);
-    }
-}
-
-fn canonicalize_initial_value(value: &mut InitialValue, aliases: &BTreeMap<String, String>) {
-    match value {
-        InitialValue::RootInitialField { path } | InitialValue::RowInitialField { path } => {
-            *path = canonical_resource_path(path, aliases);
-        }
-        InitialValue::Text { .. }
-        | InitialValue::Number { .. }
-        | InitialValue::Bool { .. }
-        | InitialValue::Bytes { .. }
-        | InitialValue::Enum { .. }
-        | InitialValue::Data { .. }
-        | InitialValue::Unknown { .. } => {}
-    }
-}
-
-fn canonicalize_list_predicate(predicate: &mut ListPredicate, aliases: &BTreeMap<String, String>) {
-    match predicate {
-        ListPredicate::RowFieldBool { path } | ListPredicate::RowFieldBoolNot { path } => {
-            *path = canonical_resource_path(path, aliases);
-        }
-        ListPredicate::SelectedFilterVisibility {
-            selector,
-            row_field,
-        } => {
-            *selector = canonical_resource_path(selector, aliases);
-            *row_field = canonical_resource_path(row_field, aliases);
-        }
-        ListPredicate::AlwaysTrue | ListPredicate::Unknown { .. } => {}
-    }
-}
-
-fn canonicalize_update_guard(guard: &mut UpdateGuard, aliases: &BTreeMap<String, String>) {
-    match guard {
-        UpdateGuard::ValueOneOf { input, .. } | UpdateGuard::ListIsNotEmpty { input, .. } => {
-            *input = canonical_resource_path(input, aliases);
-        }
-        UpdateGuard::ValuesEqual { left, right } | UpdateGuard::ValuesNotEqual { left, right } => {
-            *left = canonical_resource_path(left, aliases);
-            *right = canonical_resource_path(right, aliases);
-        }
-        UpdateGuard::All { guards } => {
-            for guard in guards {
-                canonicalize_update_guard(guard, aliases);
-            }
-        }
-    }
-}
-
-fn canonicalize_update_value_expression(
-    expression: &mut UpdateValueExpression,
-    aliases: &BTreeMap<String, String>,
-) {
-    match expression {
-        UpdateValueExpression::Const { .. } => {}
-        UpdateValueExpression::ReadPath { path } => {
-            *path = canonical_resource_path(path, aliases);
-        }
-        UpdateValueExpression::MatchConst { input, arms }
-        | UpdateValueExpression::MatchTextIsEmptyConst { input, arms } => {
-            *input = canonical_resource_path(input, aliases);
-            for arm in arms {
-                canonicalize_update_value_expression(&mut arm.output, aliases);
-            }
-        }
-        UpdateValueExpression::NumberInfix { left, right, .. }
-        | UpdateValueExpression::MatchInfixConst { left, right, .. } => {
-            *left = canonical_resource_path(left, aliases);
-            *right = canonical_resource_path(right, aliases);
-            if let UpdateValueExpression::MatchInfixConst { arms, .. } = expression {
-                for arm in arms {
-                    canonicalize_update_value_expression(&mut arm.output, aliases);
-                }
-            }
-        }
-    }
-}
-
-fn canonicalize_bytes_scalar_arg(
-    argument: &mut BytesScalarArg,
-    aliases: &BTreeMap<String, String>,
-) {
-    if let BytesScalarArg::Path(path) = argument {
-        *path = canonical_resource_path(path, aliases);
-    }
-}
-
-fn canonicalize_update_expression(
-    expression: &mut UpdateExpression,
-    aliases: &BTreeMap<String, String>,
-) {
-    match expression {
-        UpdateExpression::SourcePayload { path }
-        | UpdateExpression::PreviousValue { path }
-        | UpdateExpression::ReadPath { path }
-        | UpdateExpression::BoolNot { path }
-        | UpdateExpression::BytesLength { path }
-        | UpdateExpression::BytesIsEmpty { path }
-        | UpdateExpression::BytesGet { path, .. }
-        | UpdateExpression::ListGet { path, .. }
-        | UpdateExpression::BytesSet { path, .. }
-        | UpdateExpression::BytesToHex { path }
-        | UpdateExpression::BytesFromHex { path }
-        | UpdateExpression::BytesToBase64 { path }
-        | UpdateExpression::BytesFromBase64 { path }
-        | UpdateExpression::BytesReadUnsigned { path, .. }
-        | UpdateExpression::BytesReadSigned { path, .. }
-        | UpdateExpression::BytesWriteUnsigned { path, .. }
-        | UpdateExpression::BytesWriteSigned { path, .. }
-        | UpdateExpression::TextToBytes { path, .. }
-        | UpdateExpression::TextToNumber { path }
-        | UpdateExpression::BytesToText { path, .. } => {
-            *path = canonical_resource_path(path, aliases);
-        }
-        UpdateExpression::NumberInfix { left, right, .. }
-        | UpdateExpression::BytesConcat { left, right }
-        | UpdateExpression::BytesEqual { left, right } => {
-            *left = canonical_resource_path(left, aliases);
-            *right = canonical_resource_path(right, aliases);
-        }
-        UpdateExpression::ProjectTime {
-            pointer_x,
-            pointer_width,
-            viewport_start,
-            viewport_end,
-            fallback,
-        } => {
-            for path in [
-                pointer_x,
-                pointer_width,
-                viewport_start,
-                viewport_end,
-                fallback,
-            ] {
-                *path = canonical_resource_path(path, aliases);
-            }
-        }
-        UpdateExpression::TextTrimOrPrevious { path, previous } => {
-            *path = canonical_resource_path(path, aliases);
-            *previous = canonical_resource_path(previous, aliases);
-        }
-        UpdateExpression::PrefixPayloadConcat { payload_path, .. } => {
-            *payload_path = canonical_resource_path(payload_path, aliases);
-        }
-        UpdateExpression::PrefixRootConcat { path, .. } => {
-            *path = canonical_resource_path(path, aliases);
-        }
-        UpdateExpression::BytesSlice {
-            path,
-            offset,
-            byte_count,
-        } => {
-            *path = canonical_resource_path(path, aliases);
-            canonicalize_bytes_scalar_arg(offset, aliases);
-            canonicalize_bytes_scalar_arg(byte_count, aliases);
-        }
-        UpdateExpression::BytesTake { path, byte_count }
-        | UpdateExpression::BytesDrop { path, byte_count } => {
-            *path = canonical_resource_path(path, aliases);
-            canonicalize_bytes_scalar_arg(byte_count, aliases);
-        }
-        UpdateExpression::BytesFind { haystack, needle } => {
-            *haystack = canonical_resource_path(haystack, aliases);
-            *needle = canonical_resource_path(needle, aliases);
-        }
-        UpdateExpression::BytesStartsWith { path, prefix } => {
-            *path = canonical_resource_path(path, aliases);
-            *prefix = canonical_resource_path(prefix, aliases);
-        }
-        UpdateExpression::BytesEndsWith { path, suffix } => {
-            *path = canonical_resource_path(path, aliases);
-            *suffix = canonical_resource_path(suffix, aliases);
-        }
-        UpdateExpression::MatchConst { input, .. }
-        | UpdateExpression::MatchValueConst { input, .. }
-        | UpdateExpression::MatchTextIsEmptyConst { input, .. } => {
-            *input = canonical_resource_path(input, aliases);
-            if let UpdateExpression::MatchValueConst { arms, .. }
-            | UpdateExpression::MatchTextIsEmptyConst { arms, .. } = expression
-            {
-                for arm in arms {
-                    canonicalize_update_value_expression(&mut arm.output, aliases);
-                }
-            }
-        }
-        UpdateExpression::MatchInfixConst {
-            left, right, arms, ..
-        } => {
-            canonicalize_update_value_expression(left, aliases);
-            canonicalize_update_value_expression(right, aliases);
-            for arm in arms {
-                canonicalize_update_value_expression(&mut arm.output, aliases);
-            }
-        }
-        UpdateExpression::Const { .. }
-        | UpdateExpression::BytesZeros { .. }
-        | UpdateExpression::HostEffect { .. }
-        | UpdateExpression::Unknown { .. } => {}
-    }
+    Ok(())
 }
 
 fn source_metadata_matches_checked_expression(
@@ -5069,13 +11050,6 @@ fn source_metadata_matches_checked_expression(
         || source.source_line == checked_span.line,
         |expression| expression == checked_expression,
     )
-}
-
-fn state_metadata_matches_checked_expression(
-    state: &StateCell,
-    checked_expression: ExprId,
-) -> bool {
-    state.expression_ids.contains(&checked_expression)
 }
 
 fn is_canonical_resource_path(path: &str) -> bool {
@@ -5096,7 +11070,7 @@ fn bind_executable_source_resources(
     lists: &[ListMemory],
     parser_source_count: usize,
     sources: &mut Vec<SourcePort>,
-) -> Result<BTreeMap<String, String>, String> {
+) -> Result<RuntimeResourceAliases, String> {
     fn merge_metadata(
         source: ExecutableSourceId,
         records: &[&SourcePort],
@@ -5104,7 +11078,6 @@ fn bind_executable_source_resources(
         let mut interval_ms = None;
         let mut fields = BTreeSet::new();
         let mut typed_fields = BTreeMap::new();
-        let mut row_lookup_field = None;
         for record in records {
             if let Some(interval) = record.interval_ms {
                 if let Some(existing) = interval_ms
@@ -5128,16 +11101,6 @@ fn bind_executable_source_resources(
                     ));
                 }
             }
-            if let Some(candidate) = &record.payload_schema.row_lookup_field {
-                if let Some(existing) = &row_lookup_field
-                    && existing != candidate
-                {
-                    return Err(format!(
-                        "executable source {source} has conflicting row lookup fields `{existing}` and `{candidate}`"
-                    ));
-                }
-                row_lookup_field = Some(candidate.clone());
-            }
         }
         fields.extend(typed_fields.keys().cloned());
         Ok((
@@ -5148,7 +11111,6 @@ fn bind_executable_source_resources(
                     .into_iter()
                     .map(|(field, data_type)| SourcePayloadDescriptor { field, data_type })
                     .collect(),
-                row_lookup_field,
             },
         ))
     }
@@ -5167,7 +11129,7 @@ fn bind_executable_source_resources(
         .unwrap_or_default()
         .to_vec();
     let mut bound = Vec::with_capacity(executable.sources.len() + distributed_sources.len());
-    let mut aliases = BTreeMap::new();
+    let mut aliases = RuntimeResourceAliases::default();
     for executable_source in &executable.sources {
         let executable_expression = executable
             .expressions
@@ -5200,15 +11162,35 @@ fn bind_executable_source_resources(
             .iter()
             .filter(|source| {
                 source_metadata_matches_checked_expression(source, checked_expression, checked_span)
-                    && target.is_none_or(|(_, list)| source.scope_id == list.row_scope_id)
             })
             .collect::<Vec<_>>();
-        if matches.is_empty() {
+        let payload_projections = executable
+            .expressions
+            .iter()
+            .filter_map(|expression| match &expression.kind {
+                ExecutableExpressionKind::CanonicalRead {
+                    target,
+                    path,
+                    projection,
+                    ..
+                } if *target == executable_source.declaration && !projection.is_empty() => {
+                    let payload = executable_source_payload_projection(
+                        &executable_source.binding_path,
+                        path,
+                        projection,
+                    );
+                    (!payload.is_empty()).then_some(payload)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if matches.is_empty() && !payload_projections.is_empty() {
             return Err(format!(
-                "executable source {} (`{}` owner {:?}) has no parser metadata record; available {:?}",
+                "executable source {} (`{}` owner {:?}) has projected payload reads {:?} but no typed payload metadata; available parser metadata {:?}",
                 executable_source.id,
                 executable_source.binding_path,
                 executable_source.owner,
+                payload_projections,
                 parser_sources
                     .iter()
                     .map(|source| (&source.path, &source.binding_path, source.scope_id))
@@ -5217,17 +11199,35 @@ fn bind_executable_source_resources(
         }
         let (interval_ms, payload_schema) =
             merge_metadata(executable_source.id, matches.as_slice())?;
-        let canonical_path = target.map_or_else(
-            || executable_source.binding_path.clone(),
-            |(path, _)| format!("{path}.{}", executable_source.binding_path),
-        );
+        let expanded_path = executable_expression.resource_binding_path.as_deref();
+        let canonical_path = match (target, expanded_path) {
+            (Some((target, _)), Some(path))
+                if path == target || path.starts_with(&format!("{target}.")) =>
+            {
+                path.to_owned()
+            }
+            (Some((target, _)), _) => format!("{target}.{}", executable_source.binding_path),
+            (None, Some(path)) => path.to_owned(),
+            (None, None) => executable_source.binding_path.clone(),
+        };
+        let source_id = SourceId(bound.len());
         for metadata in matches {
-            insert_resource_alias(&mut aliases, &metadata.path, &canonical_path)?;
-            insert_resource_alias(&mut aliases, &metadata.binding_path, &canonical_path)?;
+            insert_resource_alias(
+                &mut aliases,
+                executable_source.owner,
+                &metadata.path,
+                RuntimeResourceAliasTarget::Source(source_id),
+            )?;
+            insert_resource_alias(
+                &mut aliases,
+                executable_source.owner,
+                &metadata.binding_path,
+                RuntimeResourceAliasTarget::Source(source_id),
+            )?;
         }
         let scope_id = target.and_then(|(_, list)| list.row_scope_id);
         bound.push(SourcePort {
-            id: SourceId(bound.len()),
+            id: source_id,
             path: canonical_path.clone(),
             binding_path: canonical_path,
             executable_source_id: Some(executable_source.id),
@@ -5248,13 +11248,112 @@ fn bind_executable_source_resources(
     Ok(aliases)
 }
 
+fn executable_source_payload_projection(
+    binding_path: &str,
+    declaration_path: &str,
+    projection: &[String],
+) -> Vec<String> {
+    if binding_path == declaration_path {
+        return projection.to_vec();
+    }
+    let Some(relative_source) = binding_path
+        .strip_prefix(declaration_path)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+    else {
+        return projection.to_vec();
+    };
+    let structural = relative_source
+        .split('.')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    projection
+        .strip_prefix(structural.as_slice())
+        .unwrap_or(projection)
+        .to_vec()
+}
+
+fn bind_distributed_reference_aliases(
+    checked: &boon_typecheck::CheckedProgram,
+    executable: &ExecutableProgram,
+    references: &mut [DistributedValueReference],
+) -> Result<(), String> {
+    for reference in references {
+        let checked_id = boon_typecheck::CheckedExprId(reference.expr_id.as_usize() as u32);
+        let expression = checked
+            .expressions
+            .get(checked_id.0 as usize)
+            .filter(|expression| expression.id == checked_id)
+            .ok_or_else(|| {
+                format!(
+                    "distributed value `{}` references missing checked expression {}",
+                    reference.canonical_path, checked_id.0
+                )
+            })?;
+        if !matches!(
+            &expression.kind,
+            boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path }
+                if canonical_path == &reference.canonical_path
+        ) {
+            return Err(format!(
+                "distributed value `{}` expression {} is not its exact checked external read",
+                reference.canonical_path, checked_id.0
+            ));
+        }
+        let executable_reads = executable
+            .expressions
+            .iter()
+            .filter(|candidate| candidate.checked_expr_id == checked_id)
+            .filter(|candidate| {
+                matches!(
+                    &candidate.kind,
+                    ExecutableExpressionKind::ExternalRead { canonical_path }
+                        if canonical_path == &reference.canonical_path
+                )
+            })
+            .map(|candidate| candidate.id)
+            .collect::<BTreeSet<_>>();
+        reference.local_alias_paths = executable
+            .statements
+            .iter()
+            .filter(|statement| {
+                statement
+                    .value
+                    .is_some_and(|value| executable_reads.contains(&value))
+            })
+            .filter_map(|statement| match &statement.kind {
+                ExecutableStatementKind::Field { path, .. }
+                | ExecutableStatementKind::List {
+                    path: Some(path), ..
+                }
+                | ExecutableStatementKind::Source {
+                    path: Some(path), ..
+                }
+                | ExecutableStatementKind::Hold {
+                    path: Some(path), ..
+                } => Some(path.clone()),
+                ExecutableStatementKind::List { path: None, .. }
+                | ExecutableStatementKind::Source { path: None, .. }
+                | ExecutableStatementKind::Hold { path: None, .. }
+                | ExecutableStatementKind::Block
+                | ExecutableStatementKind::Spread
+                | ExecutableStatementKind::Expression => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+    Ok(())
+}
+
 fn bind_executable_state_resources(
+    checked: &boon_typecheck::CheckedProgram,
     executable: &ExecutableProgram,
     materialization_targets: &BTreeMap<StaticOwnerId, ListId>,
     lists: &[ListMemory],
-    states: &mut [StateCell],
-) -> Result<BTreeMap<String, String>, String> {
-    let mut aliases = BTreeMap::new();
+) -> Result<(Vec<StateCell>, RuntimeResourceAliases), String> {
+    let mut aliases = RuntimeResourceAliases::default();
+    let mut states = Vec::with_capacity(executable.states.len());
+    let mut published = BTreeSet::new();
     for executable_state in &executable.states {
         let executable_expression = executable
             .expressions
@@ -5262,66 +11361,321 @@ fn bind_executable_state_resources(
             .filter(|expression| expression.id == executable_state.expression)
             .ok_or_else(|| {
                 format!(
-                    "executable state {} has no executable expression",
-                    executable_state.id
+                    "executable state {} has no executable expression {}",
+                    executable_state.id, executable_state.expression
                 )
             })?;
-        let checked_expression = ExprId(executable_expression.checked_expr_id.0 as usize);
+        let declaration = checked
+            .declarations
+            .iter()
+            .find(|declaration| declaration.id == executable_state.declaration)
+            .ok_or_else(|| {
+                format!(
+                    "executable state {} references missing declaration {}",
+                    executable_state.id, executable_state.declaration.0
+                )
+            })?;
+        let statement = executable_state_statement(checked, executable, executable_state)?;
+        let declared_path = executable_state_declared_path(statement.executable, executable_state)?;
+        let hold_name =
+            executable_state_hold_name(executable, executable_state, &statement, declaration)?;
+        executable
+            .expressions
+            .get(executable_state.initial.as_usize())
+            .filter(|expression| expression.id == executable_state.initial)
+            .ok_or_else(|| {
+                format!(
+                    "executable state {} has no executable initial expression {}",
+                    executable_state.id, executable_state.initial
+                )
+            })?;
+        let expression_ids =
+            executable_checked_expression_ids(executable, executable_state.expression)?;
+        let is_published = !executable.states.iter().any(|candidate| {
+            candidate.id != executable_state.id
+                && candidate.declaration == executable_state.declaration
+                && candidate.owner == executable_state.owner
+                && executable_expression_reaches(
+                    executable,
+                    candidate.expression,
+                    executable_state.expression,
+                )
+        });
         let target = executable_state
             .owner
             .and_then(|owner| materialization_targets.get(&owner))
             .and_then(|list| lists.get(list.as_usize()))
             .map(|list| (list.name.as_str(), list));
-        let available = states
-            .iter()
-            .map(|state| (state.path.clone(), state.scope_id))
-            .collect::<Vec<_>>();
-        let mut matches = states
-            .iter_mut()
-            .filter(|state| {
-                state_metadata_matches_checked_expression(state, checked_expression)
-                    && target.is_none_or(|(_, list)| state.scope_id == list.row_scope_id)
-            })
-            .collect::<Vec<_>>();
-        let [state] = matches.as_mut_slice() else {
-            return Err(format!(
-                "executable state {} (`{}` owner {:?}) matched {} runtime state cells; available {:?}",
-                executable_state.id,
-                executable_state.binding_path,
-                executable_state.owner,
-                matches.len(),
-                available
-            ));
-        };
-        if let Some(existing) = state.executable_state_id
-            && existing != executable_state.id
+        if is_published && !published.insert((executable_state.declaration, executable_state.owner))
         {
             return Err(format!(
-                "runtime state `{}` aliases executable states {} and {}",
-                state.path, existing, executable_state.id
+                "declaration {} owner {:?} publishes more than one executable state",
+                executable_state.declaration.0, executable_state.owner
             ));
         }
-        let semantic_path = target.map_or_else(
-            || {
-                is_canonical_resource_path(&executable_state.binding_path)
+        let semantic_path = is_published.then(|| {
+            match (
+                target,
+                executable_expression.resource_binding_path.as_deref(),
+            ) {
+                (Some((target, _)), Some(path))
+                    if path == target || path.starts_with(&format!("{target}.")) =>
+                {
+                    path.to_owned()
+                }
+                (Some((target, _)), _) => {
+                    format!("{target}.{}", executable_state.binding_path)
+                }
+                (None, Some(path)) => path.to_owned(),
+                (None, None) => is_canonical_resource_path(&executable_state.binding_path)
                     .then(|| executable_state.binding_path.clone())
-                    .unwrap_or_else(|| state.path.clone())
+                    .unwrap_or_else(|| declared_path.clone()),
+            }
+        });
+        let state_id = StateId(states.len());
+        if semantic_path.is_some() {
+            insert_resource_alias(
+                &mut aliases,
+                executable_state.owner,
+                &declared_path,
+                RuntimeResourceAliasTarget::State(state_id),
+            )?;
+        }
+        let scope_id = target.and_then(|(_, list)| list.row_scope_id);
+        let path = if is_published {
+            semantic_path.clone().ok_or_else(|| {
+                format!(
+                    "published executable state {} has no canonical semantic path",
+                    executable_state.id
+                )
+            })?
+        } else {
+            format!("$state.s{}", executable_state.id.0)
+        };
+        states.push(StateCell {
+            id: state_id,
+            path,
+            published: is_published,
+            semantic_path,
+            executable_state_id: Some(executable_state.id),
+            static_owner: executable_state.owner,
+            statement_id: statement.id,
+            scope_id,
+            hold_name: if is_published {
+                hold_name
+            } else {
+                format!("{}#internal", executable_state.binding_path)
             },
-            |(target, _)| format!("{target}.{}", executable_state.binding_path),
-        );
-        insert_resource_alias(&mut aliases, &state.path, &semantic_path)?;
-        state.path.clone_from(&semantic_path);
-        state.semantic_path = Some(semantic_path);
-        state.executable_state_id = Some(executable_state.id);
-        state.static_owner = executable_state.owner;
+            expression_ids,
+            indexed: scope_id.is_some(),
+            source_line: declaration.span.line,
+        });
     }
-    Ok(aliases)
+    if states.len() != executable.states.len()
+        || states.iter().enumerate().any(|(index, state)| {
+            state.id != StateId(index)
+                || state.executable_state_id != Some(ExecutableStateId(index))
+        })
+    {
+        return Err("executable states and runtime state cells are not bijective".to_owned());
+    }
+    Ok((states, aliases))
+}
+
+struct ExecutableStateStatement<'a> {
+    id: usize,
+    checked: &'a boon_typecheck::CheckedStatement,
+    executable: Option<&'a ExecutableStatement>,
+}
+
+fn executable_state_statement<'a>(
+    checked: &'a boon_typecheck::CheckedProgram,
+    executable: &'a ExecutableProgram,
+    state: &ExecutableStateDef,
+) -> Result<ExecutableStateStatement<'a>, String> {
+    let checked_candidates = checked
+        .statements
+        .iter()
+        .filter(|statement| {
+            checked_statement_declaration(&statement.kind) == Some(state.declaration)
+        })
+        .collect::<Vec<_>>();
+    let [checked_statement] = checked_candidates.as_slice() else {
+        return Err(format!(
+            "executable state {} declaration {} has {} checked statements",
+            state.id,
+            state.declaration.0,
+            checked_candidates.len()
+        ));
+    };
+    let executable_candidates = executable
+        .statements
+        .iter()
+        .filter(|statement| statement.declaration == Some(state.declaration))
+        .collect::<Vec<_>>();
+    let executable_statement = match executable_candidates.as_slice() {
+        [] => None,
+        [statement] => Some(*statement),
+        _ => {
+            return Err(format!(
+                "executable state {} declaration {} has {} executable statements",
+                state.id,
+                state.declaration.0,
+                executable_candidates.len()
+            ));
+        }
+    };
+    if let Some(executable_statement) = executable_statement
+        && executable_statement.id.as_usize() != checked_statement.id.0 as usize
+    {
+        return Err(format!(
+            "executable state {} declaration {} statement identity differs between checked {} and executable {}",
+            state.id, state.declaration.0, checked_statement.id.0, executable_statement.id
+        ));
+    }
+    Ok(ExecutableStateStatement {
+        id: checked_statement.id.0 as usize,
+        checked: checked_statement,
+        executable: executable_statement,
+    })
+}
+
+fn checked_statement_declaration(
+    kind: &boon_typecheck::CheckedStatementKind,
+) -> Option<boon_typecheck::DeclId> {
+    match kind {
+        boon_typecheck::CheckedStatementKind::Function { declaration }
+        | boon_typecheck::CheckedStatementKind::Field { declaration } => Some(*declaration),
+        boon_typecheck::CheckedStatementKind::Source { declaration, .. }
+        | boon_typecheck::CheckedStatementKind::Hold { declaration, .. }
+        | boon_typecheck::CheckedStatementKind::List { declaration, .. } => *declaration,
+        boon_typecheck::CheckedStatementKind::Block
+        | boon_typecheck::CheckedStatementKind::Spread
+        | boon_typecheck::CheckedStatementKind::Expression => None,
+    }
+}
+
+fn executable_state_declared_path(
+    statement: Option<&ExecutableStatement>,
+    state: &ExecutableStateDef,
+) -> Result<String, String> {
+    let path = statement
+        .and_then(|statement| match &statement.kind {
+            ExecutableStatementKind::Field { path, .. } => Some(path.as_str()),
+            ExecutableStatementKind::Hold {
+                path: Some(path), ..
+            }
+            | ExecutableStatementKind::List {
+                path: Some(path), ..
+            }
+            | ExecutableStatementKind::Source {
+                path: Some(path), ..
+            } => Some(path.as_str()),
+            ExecutableStatementKind::Hold { path: None, .. }
+            | ExecutableStatementKind::List { path: None, .. }
+            | ExecutableStatementKind::Source { path: None, .. }
+            | ExecutableStatementKind::Block
+            | ExecutableStatementKind::Spread
+            | ExecutableStatementKind::Expression => None,
+        })
+        .filter(|path| !path.is_empty())
+        .or_else(|| {
+            is_canonical_resource_path(&state.binding_path).then_some(state.binding_path.as_str())
+        })
+        .ok_or_else(|| {
+            format!(
+                "executable state {} declaration {} has no canonical statement path",
+                state.id, state.declaration.0
+            )
+        })?;
+    Ok(path.to_owned())
+}
+
+fn executable_state_hold_name(
+    executable: &ExecutableProgram,
+    state: &ExecutableStateDef,
+    statement: &ExecutableStateStatement<'_>,
+    declaration: &boon_typecheck::CheckedDeclaration,
+) -> Result<String, String> {
+    let expression = executable
+        .expressions
+        .get(state.expression.as_usize())
+        .filter(|expression| expression.id == state.expression)
+        .ok_or_else(|| format!("executable state {} has no state expression", state.id))?;
+    let name = match &expression.kind {
+        ExecutableExpressionKind::Hold { name, .. } if !name.is_empty() => Some(name.as_str()),
+        _ => statement
+            .executable
+            .and_then(|statement| match &statement.kind {
+                ExecutableStatementKind::Hold {
+                    hold_name: Some(name),
+                    ..
+                } if !name.is_empty() => Some(name.as_str()),
+                _ => None,
+            })
+            .or_else(|| match &statement.checked.kind {
+                boon_typecheck::CheckedStatementKind::Hold {
+                    name: Some(name), ..
+                } if !name.is_empty() => Some(name.as_str()),
+                _ => None,
+            })
+            .or_else(|| (!declaration.name.is_empty()).then_some(declaration.name.as_str())),
+    }
+    .ok_or_else(|| format!("executable state {} has no canonical HOLD name", state.id))?;
+    Ok(name.to_owned())
+}
+
+fn executable_checked_expression_ids(
+    executable: &ExecutableProgram,
+    root: ExecutableExprId,
+) -> Result<Vec<ExprId>, String> {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    let mut checked = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let expression = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+            .ok_or_else(|| {
+                format!("state expression graph references missing expression {expression_id}")
+            })?;
+        checked.insert(ExprId(expression.checked_expr_id.0 as usize));
+        pending.extend(executable_expression_children(&expression.kind));
+    }
+    Ok(checked.into_iter().collect())
+}
+
+fn executable_expression_reaches(
+    executable: &ExecutableProgram,
+    root: ExecutableExprId,
+    target: ExecutableExprId,
+) -> bool {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        if expression_id == target {
+            return true;
+        }
+        let Some(expression) = executable.expressions.get(expression_id.as_usize()) else {
+            continue;
+        };
+        pending.extend(executable_expression_children(&expression.kind));
+    }
+    false
 }
 
 fn materialization_target_lists(
     executable: &ExecutableProgram,
     materializations: &[ContextualMaterialization],
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    static_owners: &[StaticOwnerDef],
 ) -> Result<BTreeMap<StaticOwnerId, ListId>, String> {
     let mut owner_targets = BTreeMap::<StaticOwnerId, ListId>::new();
     for statement in &executable.statements {
@@ -5355,53 +11709,80 @@ fn materialization_target_lists(
                     )
                 })?;
             if let ExecutableExpressionKind::Materialize { materialization } = expression.kind {
-                let owner = materializations
+                let materialization = materializations
                     .get(materialization)
                     .filter(|candidate| candidate.id == materialization)
                     .ok_or_else(|| {
                         format!(
                             "state resource ownership reaches missing materialization {materialization}"
                         )
-                    })?
-                    .owner;
-                if let Some(existing) = owner_targets.insert(owner, storage.list_id)
+                    })?;
+                if let Some(existing) = owner_targets.insert(materialization.owner, storage.list_id)
                     && existing != storage.list_id
                 {
                     return Err(format!(
-                        "static owner {owner} ambiguously materializes ListId {existing} and {}",
-                        storage.list_id
+                        "static owner {} ambiguously materializes ListId {existing} and {}",
+                        materialization.owner, storage.list_id
                     ));
                 }
+                // A filtering/removal wrapper preserves ownership of rows produced by
+                // its source chain. Body materializations are intentionally excluded:
+                // they create child collections with independent ownership.
+                pending.push(materialization.source);
+                continue;
             }
             pending.extend(executable_expression_children(&expression.kind));
+        }
+    }
+    let materialization_owners = materializations
+        .iter()
+        .map(|materialization| materialization.owner)
+        .collect::<BTreeSet<_>>();
+    for owner in static_owners {
+        if owner_targets.contains_key(&owner.id) {
+            continue;
+        }
+        if materialization_owners.contains(&owner.id) {
+            continue;
+        }
+        let Some(parent) = owner.parent else {
+            continue;
+        };
+        if let Some(inherited) = owner_targets.get(&parent).copied() {
+            owner_targets.insert(owner.id, inherited);
         }
     }
     Ok(owner_targets)
 }
 
+fn bind_contextual_materialization_targets(
+    targets: &BTreeMap<StaticOwnerId, ListId>,
+    lists: &[ListMemory],
+    materializations: &mut [ContextualMaterialization],
+) -> Result<(), String> {
+    for materialization in materializations {
+        let Some(list_id) = targets.get(&materialization.owner).copied() else {
+            continue;
+        };
+        let list = lists
+            .get(list_id.as_usize())
+            .filter(|list| list.id == list_id)
+            .ok_or_else(|| {
+                format!(
+                    "contextual owner {} targets missing ListId {list_id}",
+                    materialization.owner
+                )
+            })?;
+        materialization.target_list_id = Some(list_id);
+        materialization.target_scope_id = list.row_scope_id;
+    }
+    Ok(())
+}
+
 fn source_payload_schema(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    direct_sources: &BTreeMap<String, Vec<String>>,
-    typecheck_report: &boon_typecheck::TypeCheckReport,
+    typecheck_report: &boon_typecheck::CheckedProgramLoweringMetadata,
     source: &str,
 ) -> SourcePayloadSchema {
-    let variants = source_ref_variants(source);
-    let mut payload_fields = BTreeSet::new();
-    for field in fields {
-        if !direct_sources_for_field(direct_sources, field)
-            .any(|direct_source| direct_source == source)
-        {
-            continue;
-        }
-        for variant in &variants {
-            payload_fields.extend(field.referenced_payload_fields(variant));
-        }
-    }
-    let row_lookup_field = source_row_lookup_field(program, fields, source);
-    if row_lookup_field.is_some() {
-        payload_fields.insert(SourcePayloadField::Address);
-    }
     let typed_payload_fields = typecheck_report
         .source_payload_shape_table
         .iter()
@@ -5414,12 +11795,11 @@ fn source_payload_schema(
                 .then(|| (SourcePayloadField::from_name(&field.name), data_type))
         })
         .collect::<BTreeMap<_, _>>();
-    payload_fields.extend(typed_payload_fields.keys().cloned());
+    let payload_fields = typed_payload_fields.keys().cloned().collect::<Vec<_>>();
     SourcePayloadSchema {
-        fields: payload_fields.iter().cloned().collect(),
+        fields: payload_fields.clone(),
         typed_fields: payload_fields
-            .iter()
-            .cloned()
+            .into_iter()
             .map(|field| SourcePayloadDescriptor {
                 data_type: typed_payload_fields
                     .get(&field)
@@ -5428,7 +11808,6 @@ fn source_payload_schema(
                 field,
             })
             .collect(),
-        row_lookup_field,
     }
 }
 
@@ -5443,7 +11822,9 @@ fn source_payload_data_type(field: &SourcePayloadField) -> SemanticDataType {
     }
 }
 
-fn host_port_declarations(report: &boon_typecheck::TypeCheckReport) -> Vec<HostPortDeclaration> {
+fn host_port_declarations(
+    report: &boon_typecheck::CheckedProgramLoweringMetadata,
+) -> Vec<HostPortDeclaration> {
     let mut declarations = Vec::with_capacity(
         usize::from(report.host_port_table.http.is_some())
             + usize::from(report.host_port_table.websocket.is_some()),
@@ -5469,118 +11850,6 @@ fn host_port_declarations(report: &boon_typecheck::TypeCheckReport) -> Vec<HostP
     declarations
 }
 
-fn source_row_lookup_field(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    source: &str,
-) -> Option<String> {
-    let source_scope = source.split('.').next()?;
-    let scope = program
-        .row_scope_functions
-        .iter()
-        .find(|scope| scope.row_scope == source_scope);
-    if let Some(scope) = scope
-        && let Some(explicit_address) = fields.iter().find_map(|field| {
-            field
-                .path
-                .strip_prefix(&format!("{}.", scope.row_scope))
-                .filter(|lookup| *lookup == "address")
-                .or_else(|| {
-                    field
-                        .path
-                        .rsplit_once(&format!(".{}.", scope.row_scope))
-                        .and_then(|(_, lookup)| (lookup == "address").then_some(lookup))
-                })
-                .map(str::to_owned)
-        })
-    {
-        return Some(explicit_address);
-    }
-    let mut candidates = Vec::new();
-    for field in fields {
-        let Some(branch) = field.source_branch(source) else {
-            continue;
-        };
-        let Some(SimpleThenUpdateValue::Path(path)) = branch.then_simple_update_value() else {
-            continue;
-        };
-        if let Some(scope) = scope {
-            let canonical =
-                canonical_scalar_update_path_for_source(field, &field.path, &path, fields, source);
-            if let Some(lookup) = canonical
-                .strip_prefix(&format!("{}.", scope.row_scope))
-                .filter(|lookup| !lookup.contains('.'))
-            {
-                candidates.push(lookup.to_owned());
-            }
-        } else if store_list_source_tail(source, program).is_some()
-            && let Some((row_alias, lookup)) = path.split_once('.')
-            && row_alias != "store"
-            && !lookup.contains('.')
-        {
-            candidates.push(lookup.to_owned());
-        }
-    }
-    select_source_row_lookup_field(source, candidates)
-}
-
-fn select_source_row_lookup_field(source: &str, candidates: Vec<String>) -> Option<String> {
-    candidates
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            let score = source_row_lookup_field_score(source, &candidate);
-            (score > 0).then_some((index, candidate, score))
-        })
-        .max_by_key(|(index, _, score)| (*score, std::cmp::Reverse(*index)))
-        .map(|(_, candidate, _)| candidate)
-}
-
-fn source_row_lookup_field_score(source: &str, candidate: &str) -> i32 {
-    let terms = source_row_lookup_intent_terms(source);
-    let mut score = 0;
-    if matches!(candidate, "id" | "key" | "unique_id") {
-        score += 50;
-    }
-    if candidate.ends_with("_id") || candidate.ends_with("_key") {
-        score += 45;
-    }
-    if candidate == "file" {
-        score += 25;
-    }
-    for term in terms {
-        if candidate == term {
-            score += 120;
-        }
-        if candidate == format!("{term}_key") || candidate == format!("{term}_id") {
-            score += 130;
-        }
-        if candidate.starts_with(&format!("{term}_")) {
-            score += 80;
-        }
-        if candidate.contains(&term) {
-            score += 50;
-        }
-    }
-    score
-}
-
-fn source_row_lookup_intent_terms(source: &str) -> Vec<String> {
-    let mut terms = BTreeSet::new();
-    for segment in source.split('.') {
-        for part in segment.split('_') {
-            if matches!(part, "select" | "row" | "rows" | "element" | "elements") {
-                continue;
-            }
-            if part.is_empty() {
-                continue;
-            }
-            terms.insert(part.to_owned());
-        }
-    }
-    terms.into_iter().collect()
-}
-
 fn contextual_materializations(
     checked: &boon_typecheck::CheckedProgram,
     out_graph: &out_net::OutNet,
@@ -5591,7 +11860,8 @@ fn contextual_materializations(
 
 fn view_bindings(
     executable: &ExecutableProgram,
-    storage: &StorageCatalog,
+    static_owners: &[StaticOwnerDef],
+    storage: &ErasedScopeIndex,
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
     output_values: &[OutputRootValue],
     row_scopes: &[RowScope],
@@ -5601,21 +11871,112 @@ fn view_bindings(
 ) -> Result<Vec<ViewBinding>, String> {
     let mut collector = ExecutableViewBindingCollector::new(
         executable,
+        static_owners,
         Some(storage),
         list_storage,
         row_scopes,
         sources,
         states,
         materializations,
-    );
+    )?;
     collector.collect_output_roots(output_values)?;
     let mut bindings = collector.bindings;
     normalize_view_binding_ids(&mut bindings);
     Ok(bindings)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn bind_distributed_call_invocation_arms(
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    storage: &ErasedScopeIndex,
+    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    row_scopes: &[RowScope],
+    sources: &[SourcePort],
+    states: &[StateCell],
+    materializations: &[ContextualMaterialization],
+    calls: &mut [DistributedCall],
+) -> Result<(), String> {
+    let mut collector = ExecutableViewBindingCollector::new(
+        executable,
+        static_owners,
+        Some(storage),
+        list_storage,
+        row_scopes,
+        sources,
+        states,
+        materializations,
+    )?;
+    for (reference, call) in calls.iter_mut().enumerate() {
+        let current_capable = call.result.mode == boon_typecheck::FlowMode::Continuous
+            && call
+                .arguments
+                .iter()
+                .all(|argument| argument.flow_type.mode == boon_typecheck::FlowMode::Continuous)
+            && !call.effect.emits_source
+            && !call.effect.invokes_host;
+        let dependent_roots = storage
+            .dependencies
+            .iter()
+            .filter(|dependency| {
+                matches!(
+                    dependency.target,
+                    ErasedDependencyTarget::ExternalCall { reference: candidate }
+                        if candidate == reference
+                )
+            })
+            .filter_map(|dependency| {
+                storage
+                    .bindings
+                    .get(dependency.dependent.as_usize())
+                    .filter(|binding| binding.id == dependency.dependent)
+                    .map(|binding| binding.producer)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut arms = Vec::new();
+        for root in dependent_roots {
+            let root_arms = if current_capable {
+                collector.trigger_owned_arms_before_expression(root, call.expression)?
+            } else {
+                collector.trigger_owned_arms_for_expression(root)?
+            };
+            for arm in root_arms {
+                if executable_expression_distance(
+                    executable,
+                    materializations,
+                    arm.output_expression_id,
+                    call.expression,
+                )
+                .is_some()
+                    && !arms.contains(&arm)
+                {
+                    arms.push(arm);
+                }
+            }
+        }
+        arms.sort_by_key(|arm| {
+            (
+                arm.cause,
+                arm.gate_expression_id,
+                arm.output_expression_id,
+                arm.owner,
+            )
+        });
+        call.invocation_arms = arms;
+        let requires_invocation = !current_capable;
+        if requires_invocation && call.invocation_arms.is_empty() {
+            return Err(format!(
+                "distributed call `{}` is stateful, effectful, or event-valued but has no exact SOURCE or state trigger",
+                call.canonical_function
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn bind_contextual_materialization_storage(
     executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
     row_scopes: &[RowScope],
     lists: &[ListMemory],
@@ -5626,19 +11987,21 @@ fn bind_contextual_materialization_storage(
     let storage = {
         let mut resolver = ExecutableViewBindingCollector::new(
             executable,
+            static_owners,
             None,
             list_storage,
             row_scopes,
             sources,
             states,
             materializations,
-        );
+        )?;
         materializations
             .iter()
             .map(|materialization| {
-                let scope =
+                let resolved_scope =
                     resolver.local_scope(materialization.owner, materialization.row_local)?;
-                let list = scope
+                let mut scope = resolved_scope;
+                let mut list = scope
                     .map(|scope| {
                         let mut matches =
                             lists.iter().filter(|list| list.row_scope_id == Some(scope));
@@ -5653,6 +12016,37 @@ fn bind_contextual_materialization_storage(
                     })
                     .transpose()?
                     .flatten();
+                if list.is_none()
+                    && inline_list_authority_root(
+                        executable,
+                        materializations,
+                        materialization.source,
+                    )
+                    .is_some()
+                {
+                    list = materialization.target_list_id;
+                    scope = materialization.target_scope_id;
+                }
+                if list.is_none()
+                    && matches!(
+                        materialization.operation,
+                        ContextualOperationKind::Filter
+                            | ContextualOperationKind::Retain
+                            | ContextualOperationKind::Remove
+                            | ContextualOperationKind::SortBy
+                            | ContextualOperationKind::ThenBy
+                    )
+                    && !matches!(
+                        executable
+                            .expressions
+                            .get(materialization.source.as_usize())
+                            .map(|expression| &expression.kind),
+                        Some(ExecutableExpressionKind::Materialize { .. })
+                    )
+                {
+                    list = materialization.target_list_id;
+                    scope = materialization.target_scope_id;
+                }
                 Ok((list, scope))
             })
             .collect::<Result<Vec<_>, String>>()?
@@ -5674,7 +12068,6 @@ fn normalize_view_binding_ids(bindings: &mut Vec<ViewBinding>) {
             binding.target.clone(),
             view_binding_kind_key(binding.kind),
             binding.scope_id.map(ScopeId::as_usize),
-            binding.source_id.map(SourceId::as_usize),
         ))
     });
     for (index, binding) in bindings.iter_mut().enumerate() {
@@ -5691,14 +12084,22 @@ fn view_binding_kind_key(kind: ViewBindingKind) -> u8 {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum ExecutableViewRead {
+struct ExecutableViewRead {
+    read: ErasedReadId,
+    additional_projection: Vec<String>,
+    diagnostic_path: String,
+    scope_id: Option<ScopeId>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ExecutableEventReference {
     Canonical {
         declaration: Option<boon_typecheck::DeclId>,
         owner: Option<StaticOwnerId>,
         path: String,
         projection: Vec<String>,
-        storage_binding: Option<StorageBindingId>,
         expression: ExecutableExprId,
+        source_expression: Option<boon_typecheck::CheckedExprId>,
     },
     Local {
         owner: StaticOwnerId,
@@ -5707,19 +12108,52 @@ enum ExecutableViewRead {
     },
 }
 
+fn executable_local_read_values(
+    executable: &ExecutableProgram,
+) -> Result<BTreeMap<ExecutableExprId, ExecutableExprId>, String> {
+    let mut targets = BTreeMap::new();
+    for expression in executable
+        .expressions
+        .iter()
+        .filter(|expression| matches!(expression.kind, ExecutableExpressionKind::Block { .. }))
+    {
+        collect_local_read_targets(
+            executable,
+            expression.id,
+            &BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut targets,
+        )?;
+    }
+    Ok(targets
+        .into_iter()
+        .filter_map(|(read, target)| match target {
+            ErasedReadTarget::Local { value, .. } => Some((read, value)),
+            _ => None,
+        })
+        .collect())
+}
+
 struct ExecutableViewBindingCollector<'a> {
     executable: &'a ExecutableProgram,
-    storage: Option<&'a StorageCatalog>,
+    static_owners: &'a [StaticOwnerDef],
+    storage: Option<&'a ErasedScopeIndex>,
     row_scopes: &'a [RowScope],
     sources: &'a [SourcePort],
     materializations: &'a [ContextualMaterialization],
     statement_values: BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
+    local_values_by_read: BTreeMap<ExecutableExprId, ExecutableExprId>,
     list_scopes_by_declaration: BTreeMap<boon_typecheck::DeclId, ScopeId>,
+    list_scopes_by_path: BTreeMap<String, ScopeId>,
     materializations_by_local: BTreeMap<(StaticOwnerId, MaterializationLocalId), usize>,
+    reads_by_expression: Vec<Option<ErasedReadId>>,
     states_by_declaration: BTreeMap<(boon_typecheck::DeclId, Option<StaticOwnerId>), StateId>,
-    host_effect_states: BTreeSet<StateId>,
     local_scope_cache: BTreeMap<(StaticOwnerId, MaterializationLocalId), Option<ScopeId>>,
     local_scope_visiting: BTreeSet<(StaticOwnerId, MaterializationLocalId)>,
+    event_causes_cache: BTreeMap<ExecutableExprId, Vec<EventCause>>,
+    source_candidates_cache:
+        BTreeMap<ExecutableEventReference, Vec<(String, SourceId, Option<ScopeId>)>>,
+    view_reads_cache: BTreeMap<ExecutableExprId, Vec<ExecutableViewRead>>,
     render_visited: BTreeSet<ExecutableExprId>,
     bindings: Vec<ViewBinding>,
 }
@@ -5727,13 +12161,14 @@ struct ExecutableViewBindingCollector<'a> {
 impl<'a> ExecutableViewBindingCollector<'a> {
     fn new(
         executable: &'a ExecutableProgram,
-        storage: Option<&'a StorageCatalog>,
+        static_owners: &'a [StaticOwnerDef],
+        storage: Option<&'a ErasedScopeIndex>,
         list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
         row_scopes: &'a [RowScope],
         sources: &'a [SourcePort],
         states: &[StateCell],
         materializations: &'a [ContextualMaterialization],
-    ) -> Self {
+    ) -> Result<Self, String> {
         let statement_values = executable
             .statements
             .iter()
@@ -5750,6 +12185,18 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                     .map(|declaration| (declaration, storage.row_scope_id))
             })
             .collect();
+        let mut list_scopes_by_path = BTreeMap::new();
+        for storage in list_storage.values() {
+            if let Some(previous) = list_scopes_by_path
+                .insert(storage.path.clone(), storage.row_scope_id)
+                && previous != storage.row_scope_id
+            {
+                return Err(format!(
+                    "typed list path `{}` resolves to both row scopes {previous} and {}",
+                    storage.path, storage.row_scope_id
+                ));
+            }
+        }
         let materializations_by_local = materializations
             .iter()
             .map(|materialization| {
@@ -5761,6 +12208,7 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             .collect();
         let states_by_declaration = states
             .iter()
+            .filter(|state| state.published)
             .filter_map(|state| {
                 let executable_state = state
                     .executable_state_id
@@ -5768,113 +12216,45 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 Some(((executable_state.declaration, state.static_owner), state.id))
             })
             .collect();
-        let mut collector = Self {
+        let mut reads_by_expression = vec![None; executable.expressions.len()];
+        if let Some(storage) = storage {
+            for read in &storage.reads {
+                if let Some(slot) = reads_by_expression.get_mut(read.expression.as_usize()) {
+                    *slot = Some(read.id);
+                }
+            }
+        }
+        Ok(Self {
             executable,
+            static_owners,
             storage,
             row_scopes,
             sources,
             materializations,
             statement_values,
+            local_values_by_read: executable_local_read_values(executable)?,
             list_scopes_by_declaration,
+            list_scopes_by_path,
             materializations_by_local,
+            reads_by_expression,
             states_by_declaration,
-            host_effect_states: BTreeSet::new(),
             local_scope_cache: BTreeMap::new(),
             local_scope_visiting: BTreeSet::new(),
+            event_causes_cache: BTreeMap::new(),
+            source_candidates_cache: BTreeMap::new(),
+            view_reads_cache: BTreeMap::new(),
             render_visited: BTreeSet::new(),
             bindings: Vec::new(),
-        };
-        collector.host_effect_states = states
-            .iter()
-            .filter_map(|state| {
-                let executable_state_id = state.executable_state_id?;
-                let executable_state = collector
-                    .executable
-                    .states
-                    .get(executable_state_id.as_usize())
-                    .filter(|definition| definition.id == executable_state_id)?;
-                collector
-                    .expression_invokes_host(executable_state.expression, &mut BTreeSet::new())
-                    .then_some(state.id)
-            })
-            .collect();
-        collector
-    }
-
-    fn expression_invokes_host(
-        &self,
-        id: ExecutableExprId,
-        visited: &mut BTreeSet<ExecutableExprId>,
-    ) -> bool {
-        if !visited.insert(id) {
-            return false;
-        }
-        let Ok(expression) = self.expression(id) else {
-            return false;
-        };
-        if expression.effect.invokes_host {
-            return true;
-        }
-        let children = match &expression.kind {
-            ExecutableExpressionKind::CanonicalRead { target, .. } => self
-                .statement_values
-                .get(target)
-                .copied()
-                .filter(|value| *value != id)
-                .into_iter()
-                .collect(),
-            ExecutableExpressionKind::Call { arguments, .. } => {
-                arguments.iter().map(|argument| argument.value).collect()
-            }
-            ExecutableExpressionKind::Materialize { materialization } => self
-                .materializations
-                .get(*materialization)
-                .map(|materialization| vec![materialization.body])
-                .unwrap_or_default(),
-            ExecutableExpressionKind::Draining { input }
-            | ExecutableExpressionKind::Project { input, .. } => vec![*input],
-            ExecutableExpressionKind::Hold {
-                initial, updates, ..
-            } => std::iter::once(*initial)
-                .chain(updates.iter().copied())
-                .collect(),
-            ExecutableExpressionKind::Latest { branches } => branches.clone(),
-            ExecutableExpressionKind::When { input, arms } => std::iter::once(*input)
-                .chain(arms.iter().map(|arm| arm.output))
-                .collect(),
-            ExecutableExpressionKind::Then { input, output } => std::iter::once(*input)
-                .chain(output.iter().copied())
-                .collect(),
-            ExecutableExpressionKind::Infix { left, right, .. } => vec![*left, *right],
-            ExecutableExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
-            ExecutableExpressionKind::Object(fields)
-            | ExecutableExpressionKind::Record(fields)
-            | ExecutableExpressionKind::TaggedObject { fields, .. } => {
-                fields.iter().map(|field| field.value).collect()
-            }
-            ExecutableExpressionKind::List { items, .. }
-            | ExecutableExpressionKind::Bytes { items, .. } => items.clone(),
-            ExecutableExpressionKind::ExternalRead { .. }
-            | ExecutableExpressionKind::Drain { .. }
-            | ExecutableExpressionKind::Source { .. }
-            | ExecutableExpressionKind::MaterializationLocal { .. }
-            | ExecutableExpressionKind::FunctionParameter { .. }
-            | ExecutableExpressionKind::Text(_)
-            | ExecutableExpressionKind::Number(_)
-            | ExecutableExpressionKind::BytesByte(_)
-            | ExecutableExpressionKind::Bool(_)
-            | ExecutableExpressionKind::Tag(_)
-            | ExecutableExpressionKind::Delimiter => Vec::new(),
-        };
-        children
-            .into_iter()
-            .any(|child| self.expression_invokes_host(child, visited))
+        })
     }
 
     fn event_causes_for_expression(
         &mut self,
         root: ExecutableExprId,
     ) -> Result<Vec<EventCause>, String> {
+        if let Some(cached) = self.event_causes_cache.get(&root) {
+            return Ok(cached.clone());
+        }
         let mut causes = BTreeSet::new();
         self.collect_event_causes(
             root,
@@ -5882,7 +12262,9 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             &mut BTreeSet::new(),
             &mut BTreeSet::new(),
         )?;
-        Ok(causes.into_iter().collect())
+        let causes = causes.into_iter().collect::<Vec<_>>();
+        self.event_causes_cache.insert(root, causes.clone());
+        Ok(causes)
     }
 
     fn trigger_owned_arms_for_statement(
@@ -5898,7 +12280,21 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         else {
             return Ok((Vec::new(), Vec::new()));
         };
-        let mut arms = BTreeMap::new();
+        let root_expression = self.expression(root)?;
+        let root_owns_event = matches!(
+            root_expression.flow_type.mode,
+            boon_typecheck::FlowMode::TickPresent | boon_typecheck::FlowMode::PresentOrAbsent
+        ) || matches!(
+            &root_expression.kind,
+            ExecutableExpressionKind::Latest { .. } | ExecutableExpressionKind::Hold { .. }
+        ) || matches!(
+            &root_expression.kind,
+            ExecutableExpressionKind::Call { name, .. } if name == "List/latest"
+        );
+        if !root_owns_event {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut arms = Vec::new();
         self.collect_trigger_owned_arms(root, &mut BTreeSet::new(), &mut arms)?;
         if arms.is_empty() {
             for cause in self.event_causes_for_expression(root)? {
@@ -5918,15 +12314,57 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             ExecutableExpressionKind::Hold { initial, .. } => vec![*initial],
             _ => Vec::new(),
         };
-        Ok((arms.into_values().collect(), default_roots))
+        Ok((arms, default_roots))
+    }
+
+    fn trigger_owned_arms_for_expression(
+        &mut self,
+        root: ExecutableExprId,
+    ) -> Result<Vec<TriggerOwnedArm>, String> {
+        let mut arms = Vec::new();
+        self.collect_trigger_owned_arms(root, &mut BTreeSet::new(), &mut arms)?;
+        if arms.is_empty() {
+            for cause in self.event_causes_for_expression(root)? {
+                self.insert_trigger_owned_arm(cause, root, root, &mut arms)?;
+            }
+        }
+        Ok(arms)
+    }
+
+    fn trigger_owned_arms_before_expression(
+        &mut self,
+        root: ExecutableExprId,
+        terminal: ExecutableExprId,
+    ) -> Result<Vec<TriggerOwnedArm>, String> {
+        let mut arms = Vec::new();
+        self.collect_trigger_owned_arms_until(
+            root,
+            Some(terminal),
+            &mut BTreeSet::new(),
+            &mut arms,
+        )?;
+        Ok(arms)
     }
 
     fn collect_trigger_owned_arms(
         &mut self,
         id: ExecutableExprId,
         visited: &mut BTreeSet<ExecutableExprId>,
-        arms: &mut BTreeMap<(EventCause, ExecutableExprId, ExecutableExprId), TriggerOwnedArm>,
+        arms: &mut Vec<TriggerOwnedArm>,
     ) -> Result<(), String> {
+        self.collect_trigger_owned_arms_until(id, None, visited, arms)
+    }
+
+    fn collect_trigger_owned_arms_until(
+        &mut self,
+        id: ExecutableExprId,
+        terminal: Option<ExecutableExprId>,
+        visited: &mut BTreeSet<ExecutableExprId>,
+        arms: &mut Vec<TriggerOwnedArm>,
+    ) -> Result<(), String> {
+        if terminal == Some(id) {
+            return Ok(());
+        }
         if !visited.insert(id) {
             return Ok(());
         }
@@ -5944,7 +12382,7 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                     return Ok(());
                 }
                 for arm in select_arms {
-                    self.collect_trigger_owned_arms(arm.output, visited, arms)?;
+                    self.collect_trigger_owned_arms_until(arm.output, terminal, visited, arms)?;
                 }
             }
             ExecutableExpressionKind::Then { input, output } => {
@@ -5957,52 +12395,212 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                     return Ok(());
                 }
                 if let Some(output) = output {
-                    self.collect_trigger_owned_arms(output, visited, arms)?;
+                    self.collect_trigger_owned_arms_until(output, terminal, visited, arms)?;
                 }
             }
             ExecutableExpressionKind::Hold { updates, .. }
             | ExecutableExpressionKind::Latest { branches: updates } => {
                 for update in updates {
-                    self.collect_trigger_owned_arms(update, visited, arms)?;
+                    let mut update_arms = Vec::new();
+                    self.collect_trigger_owned_arms_until(
+                        update,
+                        terminal,
+                        &mut BTreeSet::new(),
+                        &mut update_arms,
+                    )?;
+                    if update_arms.is_empty() {
+                        for cause in self.event_causes_for_expression(update)? {
+                            self.insert_trigger_owned_arm(cause, update, update, arms)?;
+                        }
+                    } else {
+                        for arm in update_arms {
+                            self.insert_trigger_owned_arm(
+                                arm.cause,
+                                arm.gate_expression_id,
+                                arm.output_expression_id,
+                                arms,
+                            )?;
+                        }
+                    }
                 }
             }
-            ExecutableExpressionKind::Call { arguments, .. } => {
+            ExecutableExpressionKind::Call {
+                name, arguments, ..
+            } => {
+                let preserves_trigger_output = name == "List/latest";
                 for argument in arguments {
-                    self.collect_trigger_owned_arms(argument.value, visited, arms)?;
+                    let mut argument_arms = Vec::new();
+                    self.collect_trigger_owned_arms_until(
+                        argument.value,
+                        terminal,
+                        &mut BTreeSet::new(),
+                        &mut argument_arms,
+                    )?;
+                    if argument_arms.is_empty()
+                        && self.expression(argument.value).is_ok_and(|expression| {
+                            matches!(
+                                expression.flow_type.mode,
+                                boon_typecheck::FlowMode::TickPresent
+                                    | boon_typecheck::FlowMode::PresentOrAbsent
+                            )
+                        })
+                    {
+                        for cause in self.event_causes_for_expression(argument.value)? {
+                            self.insert_trigger_owned_arm(
+                                cause,
+                                argument.value,
+                                if preserves_trigger_output {
+                                    argument.value
+                                } else {
+                                    id
+                                },
+                                arms,
+                            )?;
+                        }
+                    } else {
+                        for arm in argument_arms {
+                            self.insert_trigger_owned_arm(
+                                arm.cause,
+                                arm.gate_expression_id,
+                                if preserves_trigger_output {
+                                    arm.output_expression_id
+                                } else {
+                                    id
+                                },
+                                arms,
+                            )?;
+                        }
+                    }
                 }
             }
             ExecutableExpressionKind::Materialize { materialization } => {
                 let body = self.materialization(materialization)?.body;
-                self.collect_trigger_owned_arms(body, visited, arms)?;
+                self.collect_trigger_owned_arms_until(body, terminal, visited, arms)?;
             }
             ExecutableExpressionKind::Draining { input }
             | ExecutableExpressionKind::Project { input, .. } => {
-                self.collect_trigger_owned_arms(input, visited, arms)?;
+                self.collect_trigger_owned_arms_until(input, terminal, visited, arms)?;
             }
             ExecutableExpressionKind::Infix { left, right, .. } => {
-                self.collect_trigger_owned_arms(left, visited, arms)?;
-                self.collect_trigger_owned_arms(right, visited, arms)?;
+                self.collect_trigger_owned_arms_until(left, terminal, visited, arms)?;
+                self.collect_trigger_owned_arms_until(right, terminal, visited, arms)?;
             }
             ExecutableExpressionKind::MatchArm { output, .. } => {
                 if let Some(output) = output {
-                    self.collect_trigger_owned_arms(output, visited, arms)?;
+                    self.collect_trigger_owned_arms_until(output, terminal, visited, arms)?;
                 }
             }
             ExecutableExpressionKind::Object(fields)
             | ExecutableExpressionKind::Record(fields)
             | ExecutableExpressionKind::TaggedObject { fields, .. } => {
                 for field in fields {
-                    self.collect_trigger_owned_arms(field.value, visited, arms)?;
+                    self.collect_trigger_owned_arms_until(field.value, terminal, visited, arms)?;
                 }
+            }
+            ExecutableExpressionKind::Block { bindings, result } => {
+                for binding in bindings {
+                    self.collect_trigger_owned_arms_until(binding.value, terminal, visited, arms)?;
+                }
+                self.collect_trigger_owned_arms_until(result, terminal, visited, arms)?;
             }
             ExecutableExpressionKind::List { items, .. }
             | ExecutableExpressionKind::Bytes { items, .. } => {
                 for item in items {
-                    self.collect_trigger_owned_arms(item, visited, arms)?;
+                    self.collect_trigger_owned_arms_until(item, terminal, visited, arms)?;
                 }
             }
-            ExecutableExpressionKind::CanonicalRead { .. }
-            | ExecutableExpressionKind::ExternalRead { .. }
+            ExecutableExpressionKind::TextTemplate { segments } => {
+                for value in segments.into_iter().filter_map(|segment| match segment {
+                    ExecutableTextSegment::Static { .. } => None,
+                    ExecutableTextSegment::Dynamic { value } => Some(value),
+                }) {
+                    self.collect_trigger_owned_arms_until(value, terminal, visited, arms)?;
+                }
+            }
+            ExecutableExpressionKind::CanonicalRead {
+                target, projection, ..
+            } => {
+                if let Some(cause) = self
+                    .direct_event_reference(id)?
+                    .as_ref()
+                    .and_then(|read| self.state_event_cause(read))
+                {
+                    self.insert_trigger_owned_arm(cause, id, id, arms)?;
+                    return Ok(());
+                }
+                if let Some(producer) = self.statement_values.get(&target).copied()
+                    && producer != id
+                {
+                    let mut producer_arms = Vec::new();
+                    self.collect_trigger_owned_arms_until(
+                        producer,
+                        terminal,
+                        &mut BTreeSet::new(),
+                        &mut producer_arms,
+                    )?;
+                    if producer_arms.is_empty() {
+                        for cause in self.event_causes_for_expression(producer)? {
+                            self.insert_trigger_owned_arm(
+                                cause,
+                                producer,
+                                if projection.is_empty() { producer } else { id },
+                                arms,
+                            )?;
+                        }
+                    } else {
+                        for arm in producer_arms {
+                            self.insert_trigger_owned_arm(
+                                arm.cause,
+                                arm.gate_expression_id,
+                                if projection.is_empty() {
+                                    arm.output_expression_id
+                                } else {
+                                    id
+                                },
+                                arms,
+                            )?;
+                        }
+                    }
+                }
+            }
+            ExecutableExpressionKind::LocalRead { projection, .. } => {
+                if let Some(producer) = self.local_values_by_read.get(&id).copied()
+                    && producer != id
+                {
+                    let mut producer_arms = Vec::new();
+                    self.collect_trigger_owned_arms_until(
+                        producer,
+                        terminal,
+                        &mut BTreeSet::new(),
+                        &mut producer_arms,
+                    )?;
+                    if producer_arms.is_empty() {
+                        for cause in self.event_causes_for_expression(producer)? {
+                            self.insert_trigger_owned_arm(
+                                cause,
+                                producer,
+                                if projection.is_empty() { producer } else { id },
+                                arms,
+                            )?;
+                        }
+                    } else {
+                        for arm in producer_arms {
+                            self.insert_trigger_owned_arm(
+                                arm.cause,
+                                arm.gate_expression_id,
+                                if projection.is_empty() {
+                                    arm.output_expression_id
+                                } else {
+                                    id
+                                },
+                                arms,
+                            )?;
+                        }
+                    }
+                }
+            }
+            ExecutableExpressionKind::ExternalRead { .. }
+            | ExecutableExpressionKind::ElementState { .. }
             | ExecutableExpressionKind::Drain { .. }
             | ExecutableExpressionKind::Source { .. }
             | ExecutableExpressionKind::MaterializationLocal { .. }
@@ -6022,17 +12620,22 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         cause: EventCause,
         gate: ExecutableExprId,
         output: ExecutableExprId,
-        arms: &mut BTreeMap<(EventCause, ExecutableExprId, ExecutableExprId), TriggerOwnedArm>,
+        arms: &mut Vec<TriggerOwnedArm>,
     ) -> Result<(), String> {
         let gate_expression = self.expression(gate)?;
-        arms.entry((cause, gate, output))
-            .or_insert_with(|| TriggerOwnedArm {
+        if !arms.iter().any(|arm| {
+            arm.cause == cause
+                && arm.gate_expression_id == gate
+                && arm.output_expression_id == output
+        }) {
+            arms.push(TriggerOwnedArm {
                 cause,
                 gate_checked_expr_id: gate_expression.checked_expr_id,
                 gate_expression_id: gate,
                 owner: gate_expression.owner,
                 output_expression_id: output,
             });
+        }
         Ok(())
     }
 
@@ -6046,7 +12649,18 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         if !visited_expressions.insert(id) {
             return Ok(());
         }
-        if let Some(read) = self.direct_view_read_unscoped(id)? {
+        if let Some(producer) = self.local_values_by_read.get(&id).copied()
+            && producer != id
+        {
+            self.collect_event_causes(
+                producer,
+                causes,
+                visited_expressions,
+                visited_paths,
+            )?;
+            return Ok(());
+        }
+        if let Some(read) = self.direct_event_reference(id)? {
             let candidates = self.source_candidates(&read)?;
             if !candidates.is_empty() {
                 causes.extend(
@@ -6056,24 +12670,17 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 );
                 return Ok(());
             }
-            if let ExecutableViewRead::Canonical {
+            if let Some(cause) = self.state_event_cause(&read) {
+                causes.insert(cause);
+                return Ok(());
+            }
+            if let ExecutableEventReference::Canonical {
                 declaration,
-                owner,
+                owner: _,
                 path: _,
                 ..
             } = read
             {
-                if let Some(state_id) = declaration.and_then(|declaration| {
-                    self.states_by_declaration
-                        .get(&(declaration, owner))
-                        .or_else(|| self.states_by_declaration.get(&(declaration, None)))
-                        .copied()
-                }) {
-                    if self.host_effect_states.contains(&state_id) {
-                        causes.insert(EventCause::State(state_id));
-                    }
-                    return Ok(());
-                }
                 if let Some(declaration) = declaration
                     && visited_paths.insert(format!("decl:{}", declaration.0))
                     && let Some(value) = self.statement_values.get(&declaration).copied()
@@ -6107,8 +12714,20 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             | ExecutableExpressionKind::TaggedObject { fields, .. } => {
                 fields.into_iter().map(|field| field.value).collect()
             }
+            ExecutableExpressionKind::Block { bindings, result } => bindings
+                .into_iter()
+                .map(|binding| binding.value)
+                .chain(std::iter::once(result))
+                .collect(),
             ExecutableExpressionKind::List { items, .. }
             | ExecutableExpressionKind::Bytes { items, .. } => items,
+            ExecutableExpressionKind::TextTemplate { segments } => segments
+                .into_iter()
+                .filter_map(|segment| match segment {
+                    ExecutableTextSegment::Static { .. } => None,
+                    ExecutableTextSegment::Dynamic { value } => Some(value),
+                })
+                .collect(),
             ExecutableExpressionKind::ExternalRead { canonical_path } => {
                 let source_path = distributed_event_source_path(&canonical_path);
                 if let Some(source) = self
@@ -6121,6 +12740,8 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 Vec::new()
             }
             ExecutableExpressionKind::CanonicalRead { .. }
+            | ExecutableExpressionKind::LocalRead { .. }
+            | ExecutableExpressionKind::ElementState { .. }
             | ExecutableExpressionKind::Drain { .. }
             | ExecutableExpressionKind::Source { .. }
             | ExecutableExpressionKind::MaterializationLocal { .. }
@@ -6136,6 +12757,22 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             self.collect_event_causes(child, causes, visited_expressions, visited_paths)?;
         }
         Ok(())
+    }
+
+    fn state_event_cause(&self, read: &ExecutableEventReference) -> Option<EventCause> {
+        let ExecutableEventReference::Canonical {
+            declaration: Some(declaration),
+            owner,
+            ..
+        } = read
+        else {
+            return None;
+        };
+        self.states_by_declaration
+            .get(&(*declaration, *owner))
+            .or_else(|| self.states_by_declaration.get(&(*declaration, None)))
+            .copied()
+            .map(EventCause::State)
     }
 
     fn collect_output_roots(&mut self, outputs: &[OutputRootValue]) -> Result<(), String> {
@@ -6211,6 +12848,7 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 }
             }
             ExecutableExpressionKind::ExternalRead { .. } => {}
+            ExecutableExpressionKind::ElementState { .. } => {}
             ExecutableExpressionKind::Object(fields) | ExecutableExpressionKind::Record(fields) => {
                 self.collect_record_render(&fields)?;
             }
@@ -6221,6 +12859,12 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 for item in items {
                     self.collect_render(item)?;
                 }
+            }
+            ExecutableExpressionKind::Block { bindings, result } => {
+                for binding in bindings {
+                    self.collect_render(binding.value)?;
+                }
+                self.collect_render(result)?;
             }
             ExecutableExpressionKind::Project { input, .. }
             | ExecutableExpressionKind::Draining { input } => self.collect_render(input)?,
@@ -6259,6 +12903,8 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 }
             }
             ExecutableExpressionKind::Drain { .. }
+            | ExecutableExpressionKind::LocalRead { .. }
+            | ExecutableExpressionKind::TextTemplate { .. }
             | ExecutableExpressionKind::Text(_)
             | ExecutableExpressionKind::Number(_)
             | ExecutableExpressionKind::BytesByte(_)
@@ -6486,7 +13132,7 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         attr: Option<&str>,
         id: ExecutableExprId,
     ) -> Result<usize, String> {
-        let Some(read) = self.direct_view_read(id)? else {
+        let Some(read) = self.direct_event_reference(id)? else {
             return Ok(0);
         };
         let candidates = self.source_candidates(&read)?;
@@ -6502,13 +13148,9 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 node_kind: node_kind.to_owned(),
                 attr: canonical_event_attr(source_attr).to_owned(),
                 path: path.clone(),
-                target: ViewBindingTarget::Storage {
-                    binding: self.storage_binding_for_runtime_source(*source_id)?,
-                    projection: Vec::new(),
-                },
+                target: ViewBindingTarget::Source { source: *source_id },
                 kind: ViewBindingKind::Source,
                 scope_id: *scope_id,
-                source_id: Some(*source_id),
             });
         }
         Ok(candidates.len())
@@ -6516,20 +13158,44 @@ impl<'a> ExecutableViewBindingCollector<'a> {
 
     fn source_candidates(
         &mut self,
-        read: &ExecutableViewRead,
+        read: &ExecutableEventReference,
+    ) -> Result<Vec<(String, SourceId, Option<ScopeId>)>, String> {
+        if let Some(cached) = self.source_candidates_cache.get(read) {
+            return Ok(cached.clone());
+        }
+        let candidates = self.resolve_source_candidates(read)?;
+        self.source_candidates_cache
+            .insert(read.clone(), candidates.clone());
+        Ok(candidates)
+    }
+
+    fn resolve_source_candidates(
+        &mut self,
+        read: &ExecutableEventReference,
     ) -> Result<Vec<(String, SourceId, Option<ScopeId>)>, String> {
         let mut exact = Vec::new();
         let mut grouped = Vec::new();
         match read {
-            ExecutableViewRead::Canonical {
+            ExecutableEventReference::Canonical {
                 declaration,
                 owner,
                 path,
                 projection,
-                ..
+                expression,
+                source_expression,
             } => {
+                if let Some(source_id) = self.exact_source_id_for_expression(*expression)? {
+                    let source = self
+                        .sources
+                        .get(source_id.as_usize())
+                        .filter(|source| source.id == source_id)
+                        .ok_or_else(|| {
+                            format!("event reference points to missing source {source_id}")
+                        })?;
+                    return Ok(vec![(source.path.clone(), source.id, source.scope_id)]);
+                }
                 if let Some(declaration) = declaration {
-                    let exact_sources = self
+                    let owner_sources = self
                         .sources
                         .iter()
                         .filter(|source| {
@@ -6538,30 +13204,69 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                                 .and_then(|id| self.executable.sources.get(id.as_usize()))
                                 .is_some_and(|definition| {
                                     definition.declaration == *declaration
-                                        && (source.static_owner == *owner
-                                            || source.static_owner.is_none())
+                                        && source_expression.as_ref().is_none_or(
+                                            |source_expression| {
+                                                self.executable
+                                                    .expressions
+                                                    .get(definition.expression.as_usize())
+                                                    .is_some_and(|expression| {
+                                                        expression.id == definition.expression
+                                                            && expression.checked_expr_id
+                                                                == *source_expression
+                                                    })
+                                            },
+                                        )
                                 })
                         })
-                        .map(|source| (source.path.clone(), source.id, source.scope_id))
                         .collect::<Vec<_>>();
-                    if !exact_sources.is_empty() {
-                        return Ok(exact_sources);
+                    if !owner_sources.is_empty() {
+                        for lexical_owner in [*owner, None] {
+                            let candidates = owner_sources
+                                .iter()
+                                .filter(|source| source.static_owner == lexical_owner)
+                                .map(|source| (source.path.clone(), source.id, source.scope_id))
+                                .collect::<Vec<_>>();
+                            match candidates.as_slice() {
+                                [] => continue,
+                                [_] => return Ok(candidates),
+                                _ => {
+                                    return Err(format!(
+                                        "SOURCE declaration {} owner {:?} resolves to {} executable sources",
+                                        declaration.0,
+                                        lexical_owner,
+                                        candidates.len()
+                                    ));
+                                }
+                            }
+                        }
                     }
-                    return Ok(Vec::new());
+                    if let Some(source_expression) = source_expression {
+                        return Err(format!(
+                            "checked SOURCE expression {} declaration {} read `{}` owner {:?} has no executable source",
+                            source_expression.0,
+                            declaration.0,
+                            canonical_read_path(path, projection),
+                            owner
+                        ));
+                    }
                 }
                 let path = canonical_read_path(path, projection);
-                let prefix = format!("{path}.");
+                let distributed_path = distributed_event_source_path(&path);
+                let paths = [path, distributed_path];
                 let mut projected = Vec::new();
                 for source in self.sources {
                     let candidate = (source.path.clone(), source.id, source.scope_id);
-                    if source.path == path {
+                    if paths.iter().any(|path| source.path == *path) {
                         exact.push(candidate);
-                    } else if path
-                        .strip_prefix(&source.path)
-                        .is_some_and(|suffix| suffix.starts_with('.'))
-                    {
+                    } else if paths.iter().any(|path| {
+                        path.strip_prefix(&source.path)
+                            .is_some_and(|suffix| suffix.starts_with('.'))
+                    }) {
                         projected.push(candidate);
-                    } else if source.path.starts_with(&prefix) {
+                    } else if paths
+                        .iter()
+                        .any(|path| source.path.starts_with(&format!("{path}.")))
+                    {
                         grouped.push(candidate);
                     }
                 }
@@ -6569,13 +13274,15 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                     return Ok(projected);
                 }
             }
-            ExecutableViewRead::Local {
+            ExecutableEventReference::Local {
                 owner,
-                local: _,
+                local,
                 projection,
+                ..
             } => {
                 let projection = projection.join(".");
                 let prefix = format!("{projection}.");
+                self.local_scope(*owner, *local)?;
                 let mut pending = vec![*owner];
                 let mut visited = BTreeSet::new();
                 while let Some(candidate_owner) = pending.pop() {
@@ -6584,11 +13291,11 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                     }
                     let mut owner_exact = Vec::new();
                     let mut owner_grouped = Vec::new();
-                    for source in self
-                        .sources
-                        .iter()
-                        .filter(|source| source.static_owner == Some(candidate_owner))
-                    {
+                    for source in self.sources.iter().filter(|source| {
+                        source.static_owner.is_some_and(|source_owner| {
+                            self.owner_is_descendant_or_same(source_owner, candidate_owner)
+                        })
+                    }) {
                         let binding = source
                             .executable_source_id
                             .and_then(|id| self.executable.sources.get(id.as_usize()))
@@ -6628,6 +13335,105 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             Ok(grouped)
         } else {
             Ok(exact)
+        }
+    }
+
+    fn owner_is_descendant_or_same(
+        &self,
+        mut candidate: StaticOwnerId,
+        ancestor: StaticOwnerId,
+    ) -> bool {
+        loop {
+            if candidate == ancestor {
+                return true;
+            }
+            let Some(parent) = self
+                .static_owners
+                .get(candidate.as_usize())
+                .filter(|owner| owner.id == candidate)
+                .and_then(|owner| owner.parent)
+            else {
+                return false;
+            };
+            candidate = parent;
+        }
+    }
+
+    fn exact_source_id_for_expression(
+        &self,
+        expression: ExecutableExprId,
+    ) -> Result<Option<SourceId>, String> {
+        let definitions = self
+            .executable
+            .sources
+            .iter()
+            .filter(|source| source.expression == expression)
+            .collect::<Vec<_>>();
+        if definitions.len() > 1 {
+            return Err(format!(
+                "executable expression {expression} owns {} source definitions",
+                definitions.len()
+            ));
+        }
+        if let Some(definition) = definitions.first() {
+            let sources = self
+                .sources
+                .iter()
+                .filter(|source| source.executable_source_id == Some(definition.id))
+                .collect::<Vec<_>>();
+            return match sources.as_slice() {
+                [source] => Ok(Some(source.id)),
+                _ => Err(format!(
+                    "executable source {} has {} runtime sources",
+                    definition.id,
+                    sources.len()
+                )),
+            };
+        }
+
+        let Some(storage) = self.storage else {
+            return Ok(None);
+        };
+        let Some(read_id) = self
+            .reads_by_expression
+            .get(expression.as_usize())
+            .copied()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let read = storage
+            .reads
+            .get(read_id.as_usize())
+            .filter(|read| read.id == read_id && read.expression == expression)
+            .ok_or_else(|| {
+                format!(
+                    "event expression {expression} references inconsistent erased read {read_id}"
+                )
+            })?;
+        match read.target {
+            ErasedReadTarget::Binding { binding, .. } => {
+                let binding = storage
+                    .bindings
+                    .get(binding.as_usize())
+                    .filter(|candidate| candidate.id == binding)
+                    .ok_or_else(|| {
+                        format!("event erased read {read_id} references missing {binding}")
+                    })?;
+                match binding.target {
+                    ErasedBindingTarget::Source { runtime, .. } => Ok(Some(runtime)),
+                    ErasedBindingTarget::Value { .. } | ErasedBindingTarget::State { .. } => {
+                        Ok(None)
+                    }
+                }
+            }
+            ErasedReadTarget::SourcePayload { source, .. } => Ok(Some(source)),
+            ErasedReadTarget::StateProjection { .. }
+            | ErasedReadTarget::Expression { .. }
+            | ErasedReadTarget::Local { .. }
+            | ErasedReadTarget::ExternalValue { .. }
+            | ErasedReadTarget::MaterializationLocal { .. }
+            | ErasedReadTarget::FunctionParameter { .. } => Ok(None),
         }
     }
 
@@ -6740,12 +13546,8 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         id: ExecutableExprId,
         kind: ViewBindingKind,
     ) -> Result<(), String> {
-        let mut reads = BTreeSet::new();
-        self.collect_view_reads(id, &mut reads, &mut BTreeSet::new())?;
-        for read in reads {
-            let Some((path, scope_id, target)) = self.view_read_binding(&read)? else {
-                continue;
-            };
+        for read in self.view_reads_for_expression(id, &mut BTreeSet::new())? {
+            let (path, scope_id, target) = self.view_read_binding(&read)?;
             self.bindings.push(ViewBinding {
                 id: ViewBindingId(self.bindings.len()),
                 node_kind: node_kind.to_owned(),
@@ -6754,46 +13556,150 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 target,
                 kind,
                 scope_id,
-                source_id: None,
             });
         }
         Ok(())
     }
 
-    fn collect_view_reads(
-        &self,
+    fn view_reads_for_expression(
+        &mut self,
         id: ExecutableExprId,
-        reads: &mut BTreeSet<ExecutableViewRead>,
-        visited: &mut BTreeSet<ExecutableExprId>,
-    ) -> Result<(), String> {
-        if !visited.insert(id) {
-            return Ok(());
+        visiting: &mut BTreeSet<ExecutableExprId>,
+    ) -> Result<Vec<ExecutableViewRead>, String> {
+        if let Some(cached) = self.view_reads_cache.get(&id) {
+            return Ok(cached.clone());
         }
-        if let Some(read) = self.direct_view_read_unscoped(id)? {
+        if !visiting.insert(id) {
+            return Ok(Vec::new());
+        }
+        let mut reads = BTreeSet::new();
+        if let Some(read) = self.direct_view_read(id)? {
             reads.insert(read);
-            return Ok(());
+        } else {
+            let expression = self.expression(id)?.clone();
+            if !matches!(
+                expression.kind,
+                ExecutableExpressionKind::Materialize { .. }
+            ) {
+                for child in executable_expression_children(&expression.kind) {
+                    reads.extend(self.view_reads_for_expression(child, visiting)?);
+                }
+            }
         }
-        let expression = self.expression(id)?;
-        if matches!(
-            expression.kind,
-            ExecutableExpressionKind::Materialize { .. }
-        ) {
-            return Ok(());
-        }
-        for child in executable_expression_children(&expression.kind) {
-            self.collect_view_reads(child, reads, visited)?;
-        }
-        Ok(())
+        visiting.remove(&id);
+        let reads = reads.into_iter().collect::<Vec<_>>();
+        self.view_reads_cache.insert(id, reads.clone());
+        Ok(reads)
     }
 
-    fn direct_view_read(&self, id: ExecutableExprId) -> Result<Option<ExecutableViewRead>, String> {
-        self.direct_view_read_unscoped(id)
-    }
-
-    fn direct_view_read_unscoped(
-        &self,
+    fn direct_view_read(
+        &mut self,
         id: ExecutableExprId,
     ) -> Result<Option<ExecutableViewRead>, String> {
+        let expression = self.expression(id)?.clone();
+        let is_drain = matches!(&expression.kind, ExecutableExpressionKind::Drain { .. });
+        match expression.kind {
+            ExecutableExpressionKind::CanonicalRead {
+                target,
+                path,
+                projection,
+                ..
+            }
+            | ExecutableExpressionKind::Drain {
+                target,
+                path,
+                projection,
+            } => {
+                let read = self.exact_view_read(id)?;
+                if matches!(
+                    self.erased_read(read)?.target,
+                    ErasedReadTarget::Expression { .. }
+                ) && is_drain
+                {
+                    return Err(format!(
+                        "DRAIN view read {id} targets a transient expression"
+                    ));
+                }
+                let diagnostic_path = canonical_read_path(&path, &projection);
+                let scope_id = self
+                    .list_scopes_by_declaration
+                    .get(&target)
+                    .copied()
+                    .or_else(|| scope_id_for_path(self.row_scopes, &diagnostic_path));
+                Ok(Some(ExecutableViewRead {
+                    read,
+                    additional_projection: Vec::new(),
+                    diagnostic_path,
+                    scope_id,
+                }))
+            }
+            ExecutableExpressionKind::ExternalRead { canonical_path } => {
+                Ok(Some(ExecutableViewRead {
+                    read: self.exact_view_read(id)?,
+                    additional_projection: Vec::new(),
+                    diagnostic_path: canonical_path,
+                    scope_id: None,
+                }))
+            }
+            ExecutableExpressionKind::MaterializationLocal {
+                owner,
+                local,
+                projection,
+            } => {
+                if projection.is_empty() {
+                    return Ok(None);
+                }
+                let Some(scope_id) = self.local_scope(owner, local)? else {
+                    return Ok(None);
+                };
+                let row_scope = self
+                    .row_scopes
+                    .get(scope_id.as_usize())
+                    .ok_or_else(|| format!("view local references missing ScopeId {scope_id}"))?;
+                Ok(Some(ExecutableViewRead {
+                    read: self.exact_view_read(id)?,
+                    additional_projection: Vec::new(),
+                    diagnostic_path: format!("{}.{}", row_scope.list, projection.join(".")),
+                    scope_id: Some(scope_id),
+                }))
+            }
+            ExecutableExpressionKind::Project { input, fields } => {
+                let Some(mut read) = self.direct_view_read(input)? else {
+                    return Ok(None);
+                };
+                read.additional_projection.extend(fields.iter().cloned());
+                if !fields.is_empty() {
+                    read.diagnostic_path.push('.');
+                    read.diagnostic_path.push_str(&fields.join("."));
+                }
+                Ok(Some(read))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn exact_view_read(&self, expression: ExecutableExprId) -> Result<ErasedReadId, String> {
+        let read = self
+            .reads_by_expression
+            .get(expression.as_usize())
+            .copied()
+            .flatten()
+            .ok_or_else(|| format!("view expression {expression} has no exact erased read"))?;
+        self.erased_read(read)?;
+        Ok(read)
+    }
+
+    fn erased_read(&self, read: ErasedReadId) -> Result<&ErasedReadBinding, String> {
+        self.storage
+            .and_then(|storage| storage.reads.get(read.as_usize()))
+            .filter(|candidate| candidate.id == read)
+            .ok_or_else(|| format!("view references missing erased read {read}"))
+    }
+
+    fn direct_event_reference(
+        &self,
+        id: ExecutableExprId,
+    ) -> Result<Option<ExecutableEventReference>, String> {
         let expression = self.expression(id)?;
         let mut source_definitions = self
             .executable
@@ -6806,72 +13712,67 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                     "executable expression {id} owns more than one source definition"
                 ));
             }
-            return Ok(Some(ExecutableViewRead::Canonical {
+            return Ok(Some(ExecutableEventReference::Canonical {
                 declaration: Some(source.declaration),
                 owner: source.owner,
                 path: source.binding_path.clone(),
                 projection: Vec::new(),
-                storage_binding: self.storage_binding_for_source(source.id)?,
                 expression: id,
+                source_expression: Some(expression.checked_expr_id),
             }));
         }
         match &expression.kind {
             ExecutableExpressionKind::CanonicalRead {
                 target,
-                storage_binding,
                 path,
                 projection,
-            } => Ok(Some(ExecutableViewRead::Canonical {
+                source,
+            } => Ok(Some(ExecutableEventReference::Canonical {
                 declaration: Some(*target),
                 owner: expression.owner,
                 path: path.clone(),
                 projection: projection.clone(),
-                storage_binding: *storage_binding,
                 expression: id,
+                source_expression: source.as_ref().map(|source| source.expression),
+            })),
+            ExecutableExpressionKind::Drain {
+                target,
+                path,
+                projection,
+            } => Ok(Some(ExecutableEventReference::Canonical {
+                declaration: Some(*target),
+                owner: expression.owner,
+                path: path.clone(),
+                projection: projection.clone(),
+                expression: id,
+                source_expression: None,
             })),
             ExecutableExpressionKind::ExternalRead { canonical_path } => {
-                Ok(Some(ExecutableViewRead::Canonical {
+                Ok(Some(ExecutableEventReference::Canonical {
                     declaration: None,
                     owner: expression.owner,
                     path: canonical_path.clone(),
                     projection: Vec::new(),
-                    storage_binding: None,
                     expression: id,
+                    source_expression: None,
                 }))
             }
-            ExecutableExpressionKind::Drain {
-                target,
-                storage_binding,
-                path,
-                projection,
-            } => Ok(Some(ExecutableViewRead::Canonical {
-                declaration: Some(*target),
-                owner: expression.owner,
-                path: path.clone(),
-                projection: projection.clone(),
-                storage_binding: *storage_binding,
-                expression: id,
-            })),
             ExecutableExpressionKind::MaterializationLocal {
                 owner,
                 local,
                 projection,
-            } => Ok(Some(ExecutableViewRead::Local {
+            } => Ok(Some(ExecutableEventReference::Local {
                 owner: *owner,
                 local: *local,
                 projection: projection.clone(),
             })),
             ExecutableExpressionKind::Project { input, fields } => {
-                let Some(mut read) = self.direct_view_read_unscoped(*input)? else {
+                let Some(mut read) = self.direct_event_reference(*input)? else {
                     return Ok(None);
                 };
                 match &mut read {
-                    ExecutableViewRead::Canonical { projection, .. } => {
-                        if !fields.is_empty() {
-                            projection.extend(fields.iter().cloned());
-                        }
-                    }
-                    ExecutableViewRead::Local { projection, .. } => {
+                    ExecutableEventReference::Canonical { projection, .. }
+                    | ExecutableEventReference::Local { projection, .. } => {
                         projection.extend(fields.iter().cloned());
                     }
                 }
@@ -6881,110 +13782,19 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         }
     }
 
-    fn storage_binding_for_source(
-        &self,
-        source: ExecutableSourceId,
-    ) -> Result<Option<StorageBindingId>, String> {
-        let Some(storage) = self.storage else {
-            return Ok(None);
-        };
-        let matches = storage
-            .bindings
-            .iter()
-            .filter(|binding| {
-                matches!(
-                    binding.kind,
-                    StorageBindingKind::Source { executable, .. } if executable == source
-                )
-            })
-            .collect::<Vec<_>>();
-        let [binding] = matches.as_slice() else {
-            return Err(format!(
-                "executable source {source} has {} exact storage bindings",
-                matches.len()
-            ));
-        };
-        Ok(Some(binding.id))
-    }
-
-    fn storage_binding_for_runtime_source(
-        &self,
-        source: SourceId,
-    ) -> Result<StorageBindingId, String> {
-        let runtime = self
-            .sources
-            .get(source.as_usize())
-            .filter(|candidate| candidate.id == source)
-            .ok_or_else(|| format!("view binding references missing runtime source {source}"))?;
-        let executable = runtime.executable_source_id.ok_or_else(|| {
-            format!("runtime source {source} has no exact executable source identity")
-        })?;
-        self.storage_binding_for_source(executable)?.ok_or_else(|| {
-            "view source binding resolution requires the exact storage catalog".to_owned()
-        })
-    }
-
     fn view_read_binding(
-        &mut self,
+        &self,
         read: &ExecutableViewRead,
-    ) -> Result<Option<(String, Option<ScopeId>, ViewBindingTarget)>, String> {
-        match read {
-            ExecutableViewRead::Canonical {
-                declaration,
-                path,
-                projection,
-                storage_binding,
-                expression,
-                ..
-            } => {
-                let diagnostic_path = canonical_read_path(path, projection);
-                let scope = declaration
-                    .and_then(|declaration| {
-                        self.list_scopes_by_declaration.get(&declaration).copied()
-                    })
-                    .or_else(|| scope_id_for_path(self.row_scopes, &diagnostic_path));
-                let target = match storage_binding {
-                    Some(binding) => ViewBindingTarget::Storage {
-                        binding: *binding,
-                        projection: projection.clone(),
-                    },
-                    None if declaration.is_none() => ViewBindingTarget::ExternalExpression {
-                        expression: *expression,
-                    },
-                    None => {
-                        return Err(format!(
-                            "canonical view read `{diagnostic_path}` has no exact storage binding"
-                        ));
-                    }
-                };
-                Ok(Some((diagnostic_path, scope, target)))
-            }
-            ExecutableViewRead::Local {
-                owner,
-                local,
-                projection,
-            } => {
-                let Some(scope_id) = self.local_scope(*owner, *local)? else {
-                    return Ok(None);
-                };
-                if projection.is_empty() {
-                    return Ok(None);
-                }
-                let row_scope = self
-                    .row_scopes
-                    .get(scope_id.as_usize())
-                    .ok_or_else(|| format!("view local references missing ScopeId {scope_id}"))?;
-                Ok(Some((
-                    format!("{}.{}", row_scope.list, projection.join(".")),
-                    Some(scope_id),
-                    ViewBindingTarget::MaterializationLocal {
-                        owner: *owner,
-                        local: *local,
-                        projection: projection.clone(),
-                    },
-                )))
-            }
-        }
+    ) -> Result<(String, Option<ScopeId>, ViewBindingTarget), String> {
+        self.erased_read(read.read)?;
+        Ok((
+            read.diagnostic_path.clone(),
+            read.scope_id,
+            ViewBindingTarget::Read {
+                read: read.read,
+                additional_projection: read.additional_projection.clone(),
+            },
+        ))
     }
 
     fn local_scope(
@@ -7036,7 +13846,21 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         }
         let expression = self.expression(id)?.clone();
         match expression.kind {
-            ExecutableExpressionKind::CanonicalRead { target, .. } => {
+            ExecutableExpressionKind::CanonicalRead {
+                target,
+                path,
+                projection,
+                ..
+            }
+            | ExecutableExpressionKind::Drain {
+                target,
+                path,
+                projection,
+            } => {
+                let projected_path = canonical_read_path(&path, &projection);
+                if let Some(scope) = self.list_scopes_by_path.get(&projected_path).copied() {
+                    return Ok(Some(scope));
+                }
                 if let Some(scope) = self.list_scopes_by_declaration.get(&target).copied() {
                     return Ok(Some(scope));
                 }
@@ -7062,20 +13886,23 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 projection,
             } => {
                 let scope = self.local_scope(owner, local)?;
-                if projection.first().map(String::as_str) == Some("items")
-                    && let Some(scope) = scope
-                {
-                    return self.chunk_items_storage_scope_for_scope(scope);
+                match projection.first().map(String::as_str) {
+                    None => Ok(scope),
+                    Some("items") => match scope {
+                        Some(scope) => self.chunk_items_storage_scope_for_scope(scope),
+                        None => Ok(None),
+                    },
+                    Some(_) => Ok(None),
                 }
-                Ok(scope)
             }
             ExecutableExpressionKind::Project { input, fields } => {
-                if fields.first().map(String::as_str) == Some("items")
-                    && let Some(scope) = self.chunk_items_storage_scope(input)?
-                {
-                    return Ok(Some(scope));
+                match fields.first().map(String::as_str) {
+                    None => {
+                        self.storage_scope_for_expression(input, visited_expressions, visited_paths)
+                    }
+                    Some("items") => Ok(self.chunk_items_storage_scope(input)?),
+                    Some(_) => Ok(None),
                 }
-                self.storage_scope_for_expression(input, visited_expressions, visited_paths)
             }
             ExecutableExpressionKind::Draining { input } => {
                 self.storage_scope_for_expression(input, visited_expressions, visited_paths)
@@ -7421,582 +14248,13 @@ fn list_projection_view_symbols(program: &ErasedProgram) -> BTreeSet<String> {
         .collect()
 }
 
-fn verify_scheduled_update_expression(
-    value: &UpdateExpression,
-    target: &str,
-    source: &str,
-    known_symbols: &BTreeSet<&str>,
-) -> Result<(), String> {
-    match value {
-        UpdateExpression::SourcePayload { .. } | UpdateExpression::Const { .. } => Ok(()),
-        UpdateExpression::NumberInfix { left, op, right } => {
-            require_supported_numeric_update_op(op, "number infix")?;
-            if !is_number_literal(left) {
-                require_known_symbol("number infix left", left, known_symbols)?;
-            }
-            if !is_number_literal(right) {
-                require_known_symbol("number infix right", right, known_symbols)?;
-            }
-            Ok(())
-        }
-        UpdateExpression::ProjectTime {
-            pointer_x,
-            pointer_width,
-            viewport_start,
-            viewport_end,
-            fallback,
-        } => {
-            for (context, path) in [
-                ("project time pointer_x", pointer_x),
-                ("project time pointer_width", pointer_width),
-                ("project time viewport_start", viewport_start),
-                ("project time viewport_end", viewport_end),
-                ("project time fallback", fallback),
-            ] {
-                if !is_number_literal(path) && !source_payload_input_matches(path, source) {
-                    require_known_symbol(context, path, known_symbols)?;
-                }
-            }
-            Ok(())
-        }
-        UpdateExpression::MatchInfixConst {
-            left,
-            op,
-            right,
-            arms,
-        } => {
-            require_supported_numeric_update_op(op, "match number infix")?;
-            verify_update_value_expression(left, known_symbols, "match infix left")?;
-            verify_update_value_expression(right, known_symbols, "match infix right")?;
-            for arm in arms {
-                verify_update_value_expression(
-                    &arm.output,
-                    known_symbols,
-                    "match number infix arm",
-                )?;
-            }
-            Ok(())
-        }
-        UpdateExpression::PreviousValue { path } | UpdateExpression::ReadPath { path } => {
-            if source_payload_input_matches(path, source) {
-                Ok(())
-            } else {
-                require_known_symbol("update expression path", path, known_symbols)
-            }
-        }
-        UpdateExpression::BoolNot { path } => {
-            require_known_symbol("update expression path", path, known_symbols)
-        }
-        UpdateExpression::TextToNumber { path } => {
-            if source_payload_input_matches(path, source) {
-                Ok(())
-            } else {
-                require_known_symbol("text-to-number input", path, known_symbols)
-            }
-        }
-        UpdateExpression::BytesLength { path }
-        | UpdateExpression::BytesIsEmpty { path }
-        | UpdateExpression::BytesGet { path, .. }
-        | UpdateExpression::BytesSet { path, .. }
-        | UpdateExpression::BytesToHex { path }
-        | UpdateExpression::BytesFromHex { path }
-        | UpdateExpression::BytesToBase64 { path }
-        | UpdateExpression::BytesFromBase64 { path }
-        | UpdateExpression::BytesReadUnsigned { path, .. }
-        | UpdateExpression::BytesReadSigned { path, .. }
-        | UpdateExpression::BytesWriteUnsigned { path, .. }
-        | UpdateExpression::BytesWriteSigned { path, .. }
-        | UpdateExpression::TextToBytes { path, .. }
-        | UpdateExpression::BytesToText { path, .. } => {
-            require_known_symbol("bytes update path", path, known_symbols)
-        }
-        UpdateExpression::ListGet { path, .. } => {
-            if source_payload_input_matches(path, source) {
-                Ok(())
-            } else {
-                require_known_symbol("list get path", path, known_symbols)
-            }
-        }
-        UpdateExpression::BytesSlice {
-            path,
-            offset,
-            byte_count,
-        } => {
-            require_known_symbol("bytes update path", path, known_symbols)?;
-            require_known_bytes_scalar_arg("bytes slice offset", offset, known_symbols)?;
-            require_known_bytes_scalar_arg("bytes slice byte_count", byte_count, known_symbols)
-        }
-        UpdateExpression::BytesTake { path, byte_count }
-        | UpdateExpression::BytesDrop { path, byte_count } => {
-            require_known_symbol("bytes update path", path, known_symbols)?;
-            require_known_bytes_scalar_arg("bytes count", byte_count, known_symbols)
-        }
-        UpdateExpression::BytesZeros { .. } => Ok(()),
-        UpdateExpression::BytesConcat { left, right } => {
-            require_known_symbol("bytes concat left path", left, known_symbols)?;
-            require_known_symbol("bytes concat right path", right, known_symbols)
-        }
-        UpdateExpression::BytesEqual { left, right } => {
-            require_known_symbol("bytes equality left path", left, known_symbols)?;
-            require_known_symbol("bytes equality right path", right, known_symbols)
-        }
-        UpdateExpression::BytesFind { haystack, needle } => {
-            require_known_symbol("bytes find haystack path", haystack, known_symbols)?;
-            require_known_symbol("bytes find needle path", needle, known_symbols)
-        }
-        UpdateExpression::BytesStartsWith { path, prefix } => {
-            require_known_symbol("bytes starts_with path", path, known_symbols)?;
-            require_known_symbol("bytes starts_with prefix path", prefix, known_symbols)
-        }
-        UpdateExpression::BytesEndsWith { path, suffix } => {
-            require_known_symbol("bytes ends_with path", path, known_symbols)?;
-            require_known_symbol("bytes ends_with suffix path", suffix, known_symbols)
-        }
-        UpdateExpression::TextTrimOrPrevious { path, previous } => {
-            if path != "text" && path != "key" {
-                require_known_symbol("trim source", path, known_symbols)?;
-            }
-            require_known_symbol("trim previous", previous, known_symbols)
-        }
-        UpdateExpression::PrefixPayloadConcat {
-            prefix: _,
-            payload_path,
-            separator: _,
-        } => {
-            if source_payload_input_matches(payload_path, source) {
-                Ok(())
-            } else {
-                require_known_symbol("concat payload", payload_path, known_symbols)
-            }
-        }
-        UpdateExpression::PrefixRootConcat {
-            prefix: _,
-            path,
-            separator: _,
-        } => require_known_symbol("concat path", path, known_symbols),
-        UpdateExpression::MatchConst { input, .. } => {
-            if source_payload_input_matches(input, source) {
-                Ok(())
-            } else {
-                require_known_symbol("match input", input, known_symbols)
-            }
-        }
-        UpdateExpression::MatchValueConst { input, arms }
-        | UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
-            if !source_payload_input_matches(input, source) {
-                require_known_symbol("match value input", input, known_symbols)?;
-            }
-            for arm in arms {
-                verify_update_value_expression(&arm.output, known_symbols, "match value arm")?;
-            }
-            Ok(())
-        }
-        UpdateExpression::HostEffect {
-            operation,
-            arguments,
-            ..
-        } => {
-            if !boon_typecheck::is_typed_host_effect(operation) {
-                return Err(format!(
-                    "static schedule contains unknown typed host effect `{operation}`"
-                ));
-            }
-            if arguments.iter().any(|argument| argument.name.is_empty()) {
-                return Err(format!(
-                    "typed host effect `{operation}` contains an unnamed argument"
-                ));
-            }
-            Ok(())
-        }
-        UpdateExpression::Unknown { summary } => Err(format!(
-            "static schedule contains unsupported update expression for `{target}` from `{source}`: `{summary}`"
-        )),
-    }
-}
-
-fn require_known_bytes_scalar_arg(
-    context: &str,
-    arg: &BytesScalarArg,
-    known_symbols: &BTreeSet<&str>,
-) -> Result<(), String> {
-    match arg {
-        BytesScalarArg::Static(_) => Ok(()),
-        BytesScalarArg::Path(path) => require_known_symbol(context, path, known_symbols),
-    }
-}
-
-fn verify_update_value_expression(
-    value: &UpdateValueExpression,
-    known_symbols: &BTreeSet<&str>,
-    context: &str,
-) -> Result<(), String> {
-    match value {
-        UpdateValueExpression::Const { .. } => Ok(()),
-        UpdateValueExpression::ReadPath { path } => {
-            require_known_symbol(&format!("{context} path"), path, known_symbols)
-        }
-        UpdateValueExpression::MatchConst { input, arms } => {
-            require_known_symbol(&format!("{context} match input"), input, known_symbols)?;
-            for arm in arms {
-                verify_update_value_expression(
-                    &arm.output,
-                    known_symbols,
-                    "nested match const arm",
-                )?;
-            }
-            Ok(())
-        }
-        UpdateValueExpression::MatchTextIsEmptyConst { input, arms } => {
-            require_known_symbol(
-                &format!("{context} text-is-empty input"),
-                input,
-                known_symbols,
-            )?;
-            for arm in arms {
-                verify_update_value_expression(
-                    &arm.output,
-                    known_symbols,
-                    "nested text-is-empty arm",
-                )?;
-            }
-            Ok(())
-        }
-        UpdateValueExpression::NumberInfix { left, op, right } => {
-            require_supported_numeric_update_op(op, &format!("{context} number infix"))?;
-            if !is_number_literal(left) {
-                require_known_symbol(&format!("{context} number infix left"), left, known_symbols)?;
-            }
-            if !is_number_literal(right) {
-                require_known_symbol(
-                    &format!("{context} number infix right"),
-                    right,
-                    known_symbols,
-                )?;
-            }
-            Ok(())
-        }
-        UpdateValueExpression::MatchInfixConst {
-            left,
-            op,
-            right,
-            arms,
-        } => {
-            require_supported_numeric_update_op(op, &format!("{context} match number infix"))?;
-            if !is_number_literal(left) {
-                require_known_symbol(
-                    &format!("{context} match number infix left"),
-                    left,
-                    known_symbols,
-                )?;
-            }
-            if !is_number_literal(right) {
-                require_known_symbol(
-                    &format!("{context} match number infix right"),
-                    right,
-                    known_symbols,
-                )?;
-            }
-            for arm in arms {
-                verify_update_value_expression(
-                    &arm.output,
-                    known_symbols,
-                    "nested match number infix arm",
-                )?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn require_supported_numeric_update_op(op: &str, context: &str) -> Result<(), String> {
-    matches!(op, "+" | "-" | ">" | ">=" | "<" | "<=" | "==" | "!=")
-        .then_some(())
-        .ok_or_else(|| format!("{context} uses unsupported numeric operator `{op}`"))
-}
-
-fn source_payload_input_matches(input: &str, source: &str) -> bool {
-    source_payload_field_from_path(input, &source_ref_variants(source)).is_some()
-}
-
-fn verify_scheduled_list_operation(
-    value: &ListOperationKind,
-    source_paths: &BTreeSet<&str>,
-    known_symbols: &BTreeSet<&str>,
-) -> Result<(), String> {
-    match value {
-        ListOperationKind::Append { trigger, fields } => {
-            require_known_symbol("append trigger", trigger, known_symbols)?;
-            for field in fields {
-                if let ListAppendFieldValue::Source { path } = &field.value {
-                    require_known_symbol("append field source", path, known_symbols)?;
-                }
-            }
-            Ok(())
-        }
-        ListOperationKind::Remove { source, predicate } => {
-            if !source_paths.contains(source.as_str()) {
-                return Err(format!(
-                    "remove source `{source}` is not a declared source port"
-                ));
-            }
-            verify_scheduled_list_predicate(predicate, known_symbols)
-        }
-        ListOperationKind::Retain { target, predicate }
-        | ListOperationKind::Count { target, predicate } => {
-            require_known_symbol("list operation target", target, known_symbols)?;
-            verify_scheduled_list_predicate(predicate, known_symbols)
-        }
-    }
-}
-
-fn verify_scheduled_list_predicate(
-    value: &ListPredicate,
-    known_symbols: &BTreeSet<&str>,
-) -> Result<(), String> {
-    match value {
-        ListPredicate::AlwaysTrue => Ok(()),
-        ListPredicate::RowFieldBool { path } | ListPredicate::RowFieldBoolNot { path } => {
-            if is_row_local_field_path(path) {
-                return Ok(());
-            }
-            require_known_symbol("list predicate field", path, known_symbols)
-        }
-        ListPredicate::SelectedFilterVisibility {
-            selector,
-            row_field,
-        } => {
-            require_known_symbol("list predicate selector", selector, known_symbols)?;
-            if is_row_local_field_path(row_field) {
-                return Ok(());
-            }
-            require_known_symbol("list predicate row field", row_field, known_symbols)
-        }
-        ListPredicate::Unknown { summary } => Err(format!(
-            "static schedule contains unsupported list predicate `{summary}`"
-        )),
-    }
-}
-
-fn is_row_local_field_path(path: &str) -> bool {
-    let Some((row, field)) = path.split_once('.') else {
-        return false;
-    };
-    !field.is_empty() && value_starts_lowercase_identifier(row)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FieldCycleVisit {
-    Pending,
-    Visiting,
-    Complete,
-}
-
-fn field_symbol_dependency_graph(
-    fields: &[FieldDef],
-    excluded_paths: &BTreeSet<&str>,
-) -> (Vec<bool>, Vec<Vec<usize>>) {
-    let excluded_field = fields
-        .iter()
-        .map(|field| excluded_paths.contains(field.path.as_str()))
-        .collect::<Vec<_>>();
-    let fields_by_path = fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| (field.path.as_str(), index))
-        .collect::<BTreeMap<_, _>>();
-    let mut fields_by_local_name = BTreeMap::<&str, Vec<usize>>::new();
-    for (index, field) in fields.iter().enumerate() {
-        fields_by_local_name
-            .entry(field.local_name.as_str())
-            .or_default()
-            .push(index);
-    }
-    let mut dependency_edges = vec![Vec::<usize>::new(); fields.len()];
-    for (field_index, field) in fields.iter().enumerate() {
-        if excluded_field[field_index] {
-            continue;
-        }
-        let mut dependencies = BTreeSet::new();
-        for expr in &field.ast_exprs {
-            let raw = match &expr.kind {
-                AstExprKind::Identifier(value) => value.clone(),
-                AstExprKind::Path(parts) => parts.join("."),
-                _ => continue,
-            };
-            if let Some(dependency_index) =
-                scoped_field_reference_candidates(&field.parent_path, &raw)
-                    .into_iter()
-                    .find_map(|candidate| longest_field_path_prefix(&fields_by_path, &candidate))
-                && dependency_index != field_index
-                && !excluded_field[dependency_index]
-            {
-                dependencies.insert(dependency_index);
-            }
-            if !raw.contains('.')
-                && let Some(candidates) = fields_by_local_name.get(raw.as_str())
-            {
-                for &dependency_index in candidates {
-                    if dependency_index != field_index
-                        && !excluded_field[dependency_index]
-                        && expression_references_field(field, expr, &fields[dependency_index])
-                    {
-                        dependencies.insert(dependency_index);
-                    }
-                }
-            }
-        }
-        dependency_edges[field_index].extend(dependencies);
-    }
-    (excluded_field, dependency_edges)
-}
-
-fn immediate_field_dependencies(
-    fields: &[FieldDef],
-    state_cells: &[StateCell],
-    typecheck_report: &boon_typecheck::TypeCheckReport,
-) -> Vec<ImmediateDependency> {
-    let state_paths = state_cells
-        .iter()
-        .map(|state| state.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let flow_modes = typecheck_report
-        .named_value_type_table
-        .entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry.flow_type.mode))
-        .collect::<BTreeMap<_, _>>();
-    let (_, dependencies) = field_symbol_dependency_graph(fields, &BTreeSet::new());
-    let mut result = Vec::new();
-    for (field_index, dependency_indexes) in dependencies.into_iter().enumerate() {
-        let field = &fields[field_index];
-        if state_paths.contains(field.path.as_str())
-            || flow_modes.get(field.path.as_str()) != Some(&boon_typecheck::FlowMode::Continuous)
-        {
-            continue;
-        }
-        result.extend(
-            dependency_indexes
-                .into_iter()
-                .map(|dependency| ImmediateDependency {
-                    dependent: field.path.clone(),
-                    dependency: fields[dependency].path.clone(),
-                }),
-        );
-    }
-    result
-}
-
-fn scoped_field_reference_candidates(parent_path: &str, path: &str) -> Vec<String> {
-    let mut candidates = vec![path.to_owned()];
-    let mut scope = Some(parent_path);
-    while let Some(parent) = scope.filter(|parent| !parent.is_empty()) {
-        candidates.push(format!("{parent}.{path}"));
-        scope = parent.rsplit_once('.').map(|(ancestor, _)| ancestor);
-    }
-    candidates
-}
-
-fn longest_field_path_prefix(fields_by_path: &BTreeMap<&str, usize>, path: &str) -> Option<usize> {
-    let mut candidate = path;
-    loop {
-        if let Some(index) = fields_by_path.get(candidate) {
-            return Some(*index);
-        }
-        let (parent, _) = candidate.rsplit_once('.')?;
-        candidate = parent;
-    }
-}
-
-fn verify_combinational_field_cycles(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    state_cells: &[StateCell],
-) -> Result<(), String> {
-    let memory_paths = state_cells
-        .iter()
-        .map(|cell| cell.path.as_str())
-        .chain(
-            fields
-                .iter()
-                .filter(|field| {
-                    (field_is_list_memory_path(field, program) || field.has_operator("List/append"))
-                        && !is_output_registry_value_path(&field.path)
-                })
-                .map(|field| field.path.as_str()),
-        )
-        .collect::<BTreeSet<_>>();
-    let (memory_field, dependency_edges) = field_symbol_dependency_graph(fields, &memory_paths);
-
-    let mut visits = vec![FieldCycleVisit::Pending; fields.len()];
-    for (field_index, is_memory_field) in memory_field.iter().enumerate() {
-        if *is_memory_field {
-            continue;
-        }
-        let mut visiting = Vec::new();
-        verify_combinational_field_cycles_from(
-            field_index,
-            fields,
-            &dependency_edges,
-            &mut visits,
-            &mut visiting,
-        )?;
-    }
-    Ok(())
-}
-
-fn verify_combinational_field_cycles_from(
-    field_index: usize,
-    fields: &[FieldDef],
-    dependency_edges: &[Vec<usize>],
-    visits: &mut [FieldCycleVisit],
-    visiting: &mut Vec<usize>,
-) -> Result<(), String> {
-    match visits[field_index] {
-        FieldCycleVisit::Complete => return Ok(()),
-        FieldCycleVisit::Visiting => {
-            let position = visiting
-                .iter()
-                .position(|candidate| *candidate == field_index)
-                .unwrap_or(0);
-            let mut cycle = visiting[position..]
-                .iter()
-                .map(|index| fields[*index].path.as_str())
-                .collect::<Vec<_>>();
-            cycle.push(fields[field_index].path.as_str());
-            return Err(format!(
-                "combinational dependency cycle through pure/WHILE expressions must be broken by HOLD or another authoritative memory boundary: {}",
-                cycle.join(" -> ")
-            ));
-        }
-        FieldCycleVisit::Pending => {}
-    }
-    visits[field_index] = FieldCycleVisit::Visiting;
-    visiting.push(field_index);
-    for &dependency_index in &dependency_edges[field_index] {
-        verify_combinational_field_cycles_from(
-            dependency_index,
-            fields,
-            dependency_edges,
-            visits,
-            visiting,
-        )?;
-    }
-    visiting.pop();
-    visits[field_index] = FieldCycleVisit::Complete;
-    Ok(())
-}
-
 fn verify_identity_clean_identifiers(program: &ErasedProgram) -> Result<(), String> {
-    for node in &program.nodes {
-        reject_hidden_identity_identifier("node", &node.name)?;
-    }
     for source in &program.sources {
         reject_hidden_identity_identifier("source port", &source.path)?;
     }
     for cell in &program.state_cells {
         reject_hidden_identity_identifier("state cell", &cell.path)?;
         reject_hidden_identity_identifier("hold name", &cell.hold_name)?;
-        reject_initial_value_identity(&cell.initial_value)?;
     }
     for list in &program.lists {
         reject_hidden_identity_identifier("list", &list.name)?;
@@ -8018,100 +14276,12 @@ fn verify_identity_clean_identifiers(program: &ErasedProgram) -> Result<(), Stri
             reject_hidden_identity_identifier("cause source", source)?;
         }
     }
-    for branch in &program.update_branches {
-        reject_hidden_identity_identifier("update target", &branch.target)?;
-        reject_hidden_identity_identifier("update source", &branch.source)?;
-        reject_update_expression_identity(&branch.expression)?;
-    }
-    for operation in &program.list_operations {
-        reject_hidden_identity_identifier("list operation", &operation.list)?;
-        reject_list_operation_identity(&operation.kind)?;
-    }
     for projection in &program.list_projections {
         reject_hidden_identity_identifier("list projection target", &projection.target)?;
         reject_hidden_identity_identifier("list projection list", &projection.list)?;
-        match &projection.kind {
-            ListProjectionKind::Chunk {
-                item_field,
-                label_field,
-                ..
-            } => {
-                reject_hidden_identity_identifier("list chunk item field", item_field)?;
-                reject_hidden_identity_identifier("list chunk label field", label_field)?;
-            }
-            ListProjectionKind::TextPrefix { field, prefix, .. } => {
-                reject_hidden_identity_identifier("list query field", field)?;
-                reject_hidden_identity_identifier("list query prefix", prefix)?;
-            }
-            ListProjectionKind::IndexedQuery {
-                fields,
-                selection,
-                residual,
-                cursor,
-                ..
-            } => {
-                for field in fields {
-                    reject_hidden_identity_identifier(
-                        "indexed query field",
-                        &field.path.join("."),
-                    )?;
-                }
-                for value in list_query_selection_paths(selection) {
-                    reject_hidden_identity_identifier("indexed query selection", value)?;
-                }
-                if let Some(residual) = residual {
-                    for value in list_query_residual_paths(residual) {
-                        reject_hidden_identity_identifier("indexed query residual", value)?;
-                    }
-                }
-                if let Some(cursor) = cursor {
-                    reject_hidden_identity_identifier("indexed query cursor", cursor)?;
-                }
-            }
-        }
+        debug_assert!(matches!(&projection.kind, ListProjectionKind::Chunk { .. }));
     }
     Ok(())
-}
-
-fn list_query_selection_paths(selection: &ListQuerySelection) -> Vec<&str> {
-    match selection {
-        ListQuerySelection::Exact { key } => vec![key],
-        ListQuerySelection::TextPrefix { leading, prefix } => leading
-            .iter()
-            .map(String::as_str)
-            .chain(std::iter::once(prefix.as_str()))
-            .collect(),
-        ListQuerySelection::Range { lower, upper, .. } => lower
-            .iter()
-            .chain(upper.iter())
-            .map(String::as_str)
-            .collect(),
-        ListQuerySelection::Union { keys } | ListQuerySelection::Intersection { keys } => {
-            vec![keys]
-        }
-        ListQuerySelection::Unknown { .. } => Vec::new(),
-    }
-}
-
-fn list_query_residual_paths(residual: &ListQueryResidual) -> Vec<&str> {
-    match residual {
-        ListQueryResidual::FieldEqual { value, .. } => vec![value],
-        ListQueryResidual::TextContains { needle, .. } => vec![needle],
-        ListQueryResidual::NumberRange {
-            minimum, maximum, ..
-        } => minimum
-            .iter()
-            .chain(maximum.iter())
-            .map(String::as_str)
-            .collect(),
-        ListQueryResidual::Wgs84Radius {
-            center_latitude,
-            center_longitude,
-            radius_meters,
-            ..
-        } => vec![center_latitude, center_longitude, radius_meters],
-        ListQueryResidual::Unknown { .. } => Vec::new(),
-    }
 }
 
 fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
@@ -8150,256 +14320,6 @@ fn reject_list_initializer_identity(value: &ListInitializer) -> Result<(), Strin
         }
         ListInitializer::Range { .. } => Ok(()),
         ListInitializer::Empty => Ok(()),
-    }
-}
-
-fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), String> {
-    match value {
-        UpdateExpression::SourcePayload { path } => {
-            reject_hidden_identity_identifier("source payload", path)
-        }
-        UpdateExpression::PreviousValue { path }
-        | UpdateExpression::ReadPath { path }
-        | UpdateExpression::BoolNot { path }
-        | UpdateExpression::TextToNumber { path }
-        | UpdateExpression::BytesLength { path }
-        | UpdateExpression::BytesIsEmpty { path }
-        | UpdateExpression::BytesGet { path, .. }
-        | UpdateExpression::BytesSet { path, .. }
-        | UpdateExpression::BytesToHex { path }
-        | UpdateExpression::BytesFromHex { path }
-        | UpdateExpression::BytesToBase64 { path }
-        | UpdateExpression::BytesFromBase64 { path }
-        | UpdateExpression::BytesReadUnsigned { path, .. }
-        | UpdateExpression::BytesReadSigned { path, .. }
-        | UpdateExpression::BytesWriteUnsigned { path, .. }
-        | UpdateExpression::BytesWriteSigned { path, .. }
-        | UpdateExpression::TextToBytes { path, .. }
-        | UpdateExpression::BytesToText { path, .. } => {
-            reject_hidden_identity_identifier("update expression path", path)
-        }
-        UpdateExpression::ListGet { path, .. } => {
-            reject_hidden_identity_identifier("list get path", path)
-        }
-        UpdateExpression::BytesSlice {
-            path,
-            offset,
-            byte_count,
-        } => {
-            reject_hidden_identity_identifier("update expression path", path)?;
-            reject_bytes_scalar_arg_identity("bytes slice offset", offset)?;
-            reject_bytes_scalar_arg_identity("bytes slice byte_count", byte_count)
-        }
-        UpdateExpression::BytesTake { path, byte_count }
-        | UpdateExpression::BytesDrop { path, byte_count } => {
-            reject_hidden_identity_identifier("update expression path", path)?;
-            reject_bytes_scalar_arg_identity("bytes count", byte_count)
-        }
-        UpdateExpression::BytesZeros { .. } => Ok(()),
-        UpdateExpression::BytesConcat { left, right } => {
-            reject_hidden_identity_identifier("bytes concat left path", left)?;
-            reject_hidden_identity_identifier("bytes concat right path", right)
-        }
-        UpdateExpression::BytesEqual { left, right } => {
-            reject_hidden_identity_identifier("bytes equality left path", left)?;
-            reject_hidden_identity_identifier("bytes equality right path", right)
-        }
-        UpdateExpression::BytesFind { haystack, needle } => {
-            reject_hidden_identity_identifier("bytes find haystack path", haystack)?;
-            reject_hidden_identity_identifier("bytes find needle path", needle)
-        }
-        UpdateExpression::BytesStartsWith { path, prefix } => {
-            reject_hidden_identity_identifier("bytes starts_with path", path)?;
-            reject_hidden_identity_identifier("bytes starts_with prefix path", prefix)
-        }
-        UpdateExpression::BytesEndsWith { path, suffix } => {
-            reject_hidden_identity_identifier("bytes ends_with path", path)?;
-            reject_hidden_identity_identifier("bytes ends_with suffix path", suffix)
-        }
-        UpdateExpression::TextTrimOrPrevious { path, previous } => {
-            reject_hidden_identity_identifier("trim source", path)?;
-            reject_hidden_identity_identifier("trim previous", previous)
-        }
-        UpdateExpression::PrefixPayloadConcat {
-            prefix,
-            payload_path,
-            separator,
-        } => {
-            reject_hidden_identity_identifier("concat prefix", prefix)?;
-            reject_hidden_identity_identifier("concat payload", payload_path)?;
-            reject_hidden_identity_identifier("concat separator", separator)
-        }
-        UpdateExpression::PrefixRootConcat {
-            prefix,
-            path,
-            separator,
-        } => {
-            reject_hidden_identity_identifier("concat prefix", prefix)?;
-            reject_hidden_identity_identifier("concat path", path)?;
-            reject_hidden_identity_identifier("concat separator", separator)
-        }
-        UpdateExpression::NumberInfix { left, right, .. } => {
-            reject_hidden_identity_identifier("number infix left", left)?;
-            reject_hidden_identity_identifier("number infix right", right)
-        }
-        UpdateExpression::ProjectTime {
-            pointer_x,
-            pointer_width,
-            viewport_start,
-            viewport_end,
-            fallback,
-        } => {
-            reject_hidden_identity_identifier("project time pointer_x", pointer_x)?;
-            reject_hidden_identity_identifier("project time pointer_width", pointer_width)?;
-            reject_hidden_identity_identifier("project time viewport_start", viewport_start)?;
-            reject_hidden_identity_identifier("project time viewport_end", viewport_end)?;
-            reject_hidden_identity_identifier("project time fallback", fallback)
-        }
-        UpdateExpression::MatchInfixConst {
-            left, right, arms, ..
-        } => {
-            reject_update_value_expression_identity(left)?;
-            reject_update_value_expression_identity(right)?;
-            for arm in arms {
-                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
-                reject_update_value_expression_identity(&arm.output)?;
-            }
-            Ok(())
-        }
-        UpdateExpression::MatchConst { input, arms } => {
-            reject_hidden_identity_identifier("match input", input)?;
-            for arm in arms {
-                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
-                reject_hidden_identity_identifier("match output", &arm.output)?;
-            }
-            Ok(())
-        }
-        UpdateExpression::MatchValueConst { input, arms }
-        | UpdateExpression::MatchTextIsEmptyConst { input, arms } => {
-            reject_hidden_identity_identifier("match value input", input)?;
-            for arm in arms {
-                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
-                reject_update_value_expression_identity(&arm.output)?;
-            }
-            Ok(())
-        }
-        UpdateExpression::HostEffect {
-            operation,
-            arguments,
-            ..
-        } => {
-            reject_hidden_identity_identifier("host effect operation", operation)?;
-            for argument in arguments {
-                reject_hidden_identity_identifier("host effect argument", &argument.name)?;
-            }
-            Ok(())
-        }
-        UpdateExpression::Unknown { summary } => {
-            reject_hidden_identity_identifier("unknown update expression", summary)
-        }
-        UpdateExpression::Const { value } => {
-            reject_hidden_identity_identifier("const value", value)
-        }
-    }
-}
-
-fn reject_bytes_scalar_arg_identity(context: &str, arg: &BytesScalarArg) -> Result<(), String> {
-    match arg {
-        BytesScalarArg::Static(_) => Ok(()),
-        BytesScalarArg::Path(path) => reject_hidden_identity_identifier(context, path),
-    }
-}
-
-fn reject_update_value_expression_identity(value: &UpdateValueExpression) -> Result<(), String> {
-    match value {
-        UpdateValueExpression::Const { value } => {
-            reject_hidden_identity_identifier("match output const", value)
-        }
-        UpdateValueExpression::ReadPath { path } => {
-            reject_hidden_identity_identifier("match output path", path)
-        }
-        UpdateValueExpression::MatchConst { input, arms } => {
-            reject_hidden_identity_identifier("match output match input", input)?;
-            for arm in arms {
-                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
-                reject_update_value_expression_identity(&arm.output)?;
-            }
-            Ok(())
-        }
-        UpdateValueExpression::MatchTextIsEmptyConst { input, arms } => {
-            reject_hidden_identity_identifier("match output text-is-empty input", input)?;
-            for arm in arms {
-                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
-                reject_update_value_expression_identity(&arm.output)?;
-            }
-            Ok(())
-        }
-        UpdateValueExpression::NumberInfix { left, right, .. } => {
-            reject_hidden_identity_identifier("match output number infix left", left)?;
-            reject_hidden_identity_identifier("match output number infix right", right)
-        }
-        UpdateValueExpression::MatchInfixConst {
-            left, right, arms, ..
-        } => {
-            reject_hidden_identity_identifier("match output match number infix left", left)?;
-            reject_hidden_identity_identifier("match output match number infix right", right)?;
-            for arm in arms {
-                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
-                reject_update_value_expression_identity(&arm.output)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn reject_list_operation_identity(value: &ListOperationKind) -> Result<(), String> {
-    match value {
-        ListOperationKind::Append { trigger, fields } => {
-            reject_hidden_identity_identifier("append trigger", trigger)?;
-            for field in fields {
-                reject_hidden_identity_identifier("append field", &field.name)?;
-                match &field.value {
-                    ListAppendFieldValue::Source { path } => {
-                        reject_hidden_identity_identifier("append field source", path)?;
-                    }
-                    ListAppendFieldValue::Const { value } => {
-                        reject_hidden_identity_identifier("append field const", value)?;
-                    }
-                    ListAppendFieldValue::TypedConst { value } => {
-                        reject_initial_value_identity(value)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        ListOperationKind::Remove { source, predicate } => {
-            reject_hidden_identity_identifier("remove source", source)?;
-            reject_list_predicate_identity(predicate)
-        }
-        ListOperationKind::Retain { target, predicate }
-        | ListOperationKind::Count { target, predicate } => {
-            reject_hidden_identity_identifier("list operation target", target)?;
-            reject_list_predicate_identity(predicate)
-        }
-    }
-}
-
-fn reject_list_predicate_identity(value: &ListPredicate) -> Result<(), String> {
-    match value {
-        ListPredicate::RowFieldBool { path } | ListPredicate::RowFieldBoolNot { path } => {
-            reject_hidden_identity_identifier("list predicate field", path)
-        }
-        ListPredicate::SelectedFilterVisibility {
-            selector,
-            row_field,
-        } => {
-            reject_hidden_identity_identifier("list predicate selector", selector)?;
-            reject_hidden_identity_identifier("list predicate row field", row_field)
-        }
-        ListPredicate::Unknown { summary } => {
-            reject_hidden_identity_identifier("unknown list predicate", summary)
-        }
-        ListPredicate::AlwaysTrue => Ok(()),
     }
 }
 
@@ -8444,33 +14364,35 @@ fn hidden_identity_token(value: &str) -> Option<&'static str> {
 }
 
 fn expression_coverage(
-    program: &ParsedProgram,
-    nodes: &[IrNode],
-    state_cells: &[StateCell],
+    program: &boon_typecheck::CheckedProgram,
+    source_expression_count: usize,
+    executable: &ExecutableProgram,
     lists: &[ListMemory],
     derived_values: &[DerivedValue],
-    update_branches: &[UpdateBranch],
-    list_operations: &[ListOperation],
     distributed_references: &DistributedReferences,
 ) -> ExpressionCoverage {
     let mut coverage = ExpressionCoverage {
-        ast_expression_count: program.expressions.len(),
+        ast_expression_count: source_expression_count,
         distributed_reference_expression_count: distributed_references.value_references.len()
-            + distributed_references.pure_calls.len(),
+            + distributed_references.calls.len(),
         ..ExpressionCoverage::empty()
     };
-    let scheduled_expr_ids = nodes
+    let scheduled_expr_ids = executable
+        .expressions
         .iter()
-        .filter_map(|node| node.expr_id)
-        .map(ExprId::as_usize)
+        .map(|expression| expression.checked_expr_id.0 as usize)
         .collect::<BTreeSet<_>>();
-    for expr in &program.expressions {
-        if let AstExprKind::Unknown(tokens) = &expr.kind {
-            if scheduled_expr_ids.contains(&expr.id) {
+    for expr in program
+        .expressions
+        .iter()
+        .filter(|expression| (expression.id.0 as usize) < source_expression_count)
+    {
+        if let boon_typecheck::CheckedExpressionKind::Invalid { tokens } = &expr.kind {
+            if scheduled_expr_ids.contains(&(expr.id.0 as usize)) {
                 coverage.unknown_ast_expression_count += 1;
                 coverage.unknown_labels.push(format!(
-                    "scheduled ast expression line {}: {}",
-                    expr.line,
+                    "scheduled checked expression line {}: {}",
+                    expr.span.line,
                     if tokens.is_empty() {
                         "<empty>".to_owned()
                     } else {
@@ -8480,8 +14402,8 @@ fn expression_coverage(
             } else {
                 coverage.ignored_unknown_ast_expression_count += 1;
                 coverage.ignored_unknown_labels.push(format!(
-                    "ignored ast expression line {}: {}",
-                    expr.line,
+                    "ignored checked expression line {}: {}",
+                    expr.span.line,
                     if tokens.is_empty() {
                         "<empty>".to_owned()
                     } else {
@@ -8489,14 +14411,6 @@ fn expression_coverage(
                     }
                 ));
             }
-        }
-    }
-    for cell in state_cells {
-        if let InitialValue::Unknown { summary } = &cell.initial_value {
-            coverage.unknown_initial_value_count += 1;
-            coverage
-                .unknown_labels
-                .push(format!("initial value {}: {summary}", cell.path));
         }
     }
     for list in lists {
@@ -8523,23 +14437,6 @@ fn expression_coverage(
             ListInitializer::Range { .. } | ListInitializer::Empty => {}
         }
     }
-    for branch in update_branches {
-        if let UpdateExpression::Unknown { summary } = &branch.expression {
-            coverage.unknown_update_expression_count += 1;
-            coverage.unknown_labels.push(format!(
-                "update branch {} from {}: {summary}",
-                branch.target, branch.source
-            ));
-        }
-    }
-    for operation in list_operations {
-        for summary in unknown_predicate_summaries(&operation.kind) {
-            coverage.unknown_list_predicate_count += 1;
-            coverage
-                .unknown_labels
-                .push(format!("list operation {}: {summary}", operation.list));
-        }
-    }
     for value in derived_values {
         if matches!(value.kind, DerivedValueKind::Unknown) {
             coverage.unknown_derived_value_count += 1;
@@ -8551,1009 +14448,929 @@ fn expression_coverage(
     coverage
 }
 
-fn unknown_predicate_summaries(kind: &ListOperationKind) -> Vec<&str> {
-    match kind {
-        ListOperationKind::Remove { predicate, .. }
-        | ListOperationKind::Retain { predicate, .. }
-        | ListOperationKind::Count { predicate, .. } => match predicate {
-            ListPredicate::Unknown { summary } => vec![summary.as_str()],
-            ListPredicate::AlwaysTrue
-            | ListPredicate::RowFieldBool { .. }
-            | ListPredicate::RowFieldBoolNot { .. }
-            | ListPredicate::SelectedFilterVisibility { .. } => Vec::new(),
-        },
-        ListOperationKind::Append { .. } => Vec::new(),
+fn exact_dependency_edges(
+    arms: &[StateUpdateArm],
+    sources: &[SourcePort],
+    states: &[StateCell],
+) -> Result<Vec<DependencyEdge>, String> {
+    let mut edges = BTreeSet::new();
+    for arm in arms {
+        let target = states
+            .get(arm.state.as_usize())
+            .filter(|state| state.id == arm.state)
+            .ok_or_else(|| {
+                format!(
+                    "state update arm references missing target StateId {}",
+                    arm.state
+                )
+            })?;
+        let (from, source_indexed) = match arm.cause {
+            EventCause::Source(source) => {
+                let source = sources
+                    .get(source.as_usize())
+                    .filter(|candidate| candidate.id == source)
+                    .ok_or_else(|| {
+                        format!("state update arm references missing SourceId {source}")
+                    })?;
+                (source.path.clone(), source.scoped)
+            }
+            EventCause::State(state) => {
+                let state = states
+                    .get(state.as_usize())
+                    .filter(|candidate| candidate.id == state)
+                    .ok_or_else(|| {
+                        format!("state update arm references missing StateId {state}")
+                    })?;
+                (state.path.clone(), state.indexed)
+            }
+        };
+        edges.insert((from, target.path.clone(), target.indexed || source_indexed));
     }
+    Ok(edges
+        .into_iter()
+        .map(|(from, to, indexed)| DependencyEdge { from, to, indexed })
+        .collect())
 }
 
-fn source_driven_nodes(program: &ParsedProgram) -> Vec<IrNode> {
-    let mut nodes = program
-        .expressions
+fn exact_possible_causes(
+    arms: &[StateUpdateArm],
+    sources: &[SourcePort],
+    states: &[StateCell],
+) -> Result<Vec<PossibleCause>, String> {
+    let mut causes = states
         .iter()
-        .filter_map(expression_node)
-        .enumerate()
-        .map(|(id, mut node)| {
-            node.id = NodeId(id);
-            node
+        .map(|state| (state.id, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for arm in arms {
+        let source = event_cause_path_owned(arm.cause, sources, states)?;
+        let target = causes.get_mut(&arm.state).ok_or_else(|| {
+            format!(
+                "state update arm references missing target StateId {}",
+                arm.state
+            )
+        })?;
+        target.insert(source);
+    }
+    Ok(states
+        .iter()
+        .map(|state| PossibleCause {
+            target: state.path.clone(),
+            sources: causes
+                .remove(&state.id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
         })
-        .collect::<Vec<_>>();
-    for list in &program.list_memories {
-        push_generated(
-            &mut nodes,
-            &format!("render_{}_template", sanitize_node_name(&list.name)),
-            IrNodeKind::RenderLowering,
-            true,
-        );
-    }
-    nodes
+        .collect())
 }
 
-fn expression_node(expr: &AstExpr) -> Option<IrNode> {
-    let kind = expression_ir_node_kind(expr)?;
-    Some(IrNode {
-        id: NodeId(0),
-        name: format!(
-            "expr_{}_{}",
-            expr.id,
-            sanitize_node_name(&ast_expr_label(expr))
-        ),
-        indexed: expression_is_indexed(expr, &kind),
-        kind,
-        expr_id: Some(ExprId(expr.id)),
-    })
-}
-
-fn expression_ir_node_kind(expr: &AstExpr) -> Option<IrNodeKind> {
-    match &expr.kind {
-        AstExprKind::Source => Some(IrNodeKind::SourceRead),
-        AstExprKind::Hold { .. } => Some(IrNodeKind::Hold),
-        AstExprKind::ListLiteral { .. } => Some(IrNodeKind::ListMap),
-        AstExprKind::Latest => Some(IrNodeKind::Latest),
-        AstExprKind::When { .. } => Some(IrNodeKind::When),
-        AstExprKind::Then { .. } => Some(IrNodeKind::Then),
-        AstExprKind::Pipe { op, .. } => expression_operator_node_kind(std::slice::from_ref(op)),
-        AstExprKind::Call { function, .. } => {
-            expression_operator_node_kind(std::slice::from_ref(function))
-                .or(Some(IrNodeKind::PureCall))
-        }
-        AstExprKind::Drain { .. } | AstExprKind::Draining { .. } => None,
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::BytesLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::TaggedObject { .. }
-        | AstExprKind::Infix { .. }
-        | AstExprKind::Block { .. }
-        | AstExprKind::Record(_)
-        | AstExprKind::Object(_) => Some(IrNodeKind::PureCall),
-        AstExprKind::MatchArm { .. } | AstExprKind::Delimiter | AstExprKind::Unknown(_) => None,
+fn event_cause_path_owned(
+    cause: EventCause,
+    sources: &[SourcePort],
+    states: &[StateCell],
+) -> Result<String, String> {
+    match cause {
+        EventCause::Source(source_id) => sources
+            .get(source_id.as_usize())
+            .filter(|source| source.id == source_id)
+            .map(|source| source.path.clone())
+            .ok_or_else(|| format!("state update arm references missing SourceId {source_id}")),
+        EventCause::State(state_id) => states
+            .get(state_id.as_usize())
+            .filter(|state| state.id == state_id)
+            .map(|state| state.path.clone())
+            .ok_or_else(|| format!("state update arm references missing StateId {state_id}")),
     }
 }
 
-fn expression_operator_node_kind(operators: &[String]) -> Option<IrNodeKind> {
-    if operators.iter().any(|operator| operator == "List/append") {
-        Some(IrNodeKind::ListAppend)
-    } else if operators.iter().any(|operator| operator == "List/remove") {
-        Some(IrNodeKind::ListRemove)
-    } else if operators.iter().any(|operator| operator == "List/map") {
-        Some(IrNodeKind::ListMap)
-    } else if operators.iter().any(|operator| operator == "List/retain") {
-        Some(IrNodeKind::ListRetain)
-    } else if operators
-        .iter()
-        .any(|operator| operator == "List/count" || operator == "List/every")
-    {
-        Some(IrNodeKind::Aggregate)
-    } else if operators.iter().any(|operator| operator == "LATEST") {
-        Some(IrNodeKind::Latest)
-    } else if operators.iter().any(|operator| operator == "WHILE") {
-        Some(IrNodeKind::While)
-    } else if operators.iter().any(|operator| operator == "THEN") {
-        Some(IrNodeKind::Then)
-    } else if operators.iter().any(|operator| operator == "WHEN") {
-        Some(IrNodeKind::When)
-    } else if operators
-        .iter()
-        .any(|operator| operator.starts_with("Text/") || operator.starts_with("Bool/"))
-    {
-        Some(IrNodeKind::PureCall)
-    } else {
-        None
+fn event_cause_static_owner(
+    cause: EventCause,
+    sources: &[SourcePort],
+    states: &[StateCell],
+) -> Result<Option<StaticOwnerId>, String> {
+    match cause {
+        EventCause::Source(source_id) => sources
+            .get(source_id.as_usize())
+            .filter(|source| source.id == source_id)
+            .map(|source| source.static_owner)
+            .ok_or_else(|| format!("event cause references missing SourceId {source_id}")),
+        EventCause::State(state_id) => states
+            .get(state_id.as_usize())
+            .filter(|state| state.id == state_id)
+            .map(|state| state.static_owner)
+            .ok_or_else(|| format!("event cause references missing StateId {state_id}")),
     }
 }
 
-fn expression_is_indexed(_expr: &AstExpr, kind: &IrNodeKind) -> bool {
-    matches!(
-        kind,
-        IrNodeKind::ListAppend
-            | IrNodeKind::ListRemove
-            | IrNodeKind::ListMap
-            | IrNodeKind::ListRetain
-            | IrNodeKind::Aggregate
-            | IrNodeKind::RenderLowering
-    )
-}
-
-fn ast_expr_label(expr: &AstExpr) -> String {
-    match &expr.kind {
-        AstExprKind::Identifier(name)
-        | AstExprKind::Number(name)
-        | AstExprKind::Enum(name)
-        | AstExprKind::Tag(name) => format!("{:?}", name),
-        AstExprKind::Unknown(tokens) => tokens.join("_"),
-        AstExprKind::Delimiter => "delimiter".to_owned(),
-        AstExprKind::Path(parts) => boon_parser::canonical_value_path(parts),
-        AstExprKind::Drain { .. } => "drain".to_owned(),
-        AstExprKind::Draining { .. } => "draining".to_owned(),
-        AstExprKind::StringLiteral(_) => "string_literal".to_owned(),
-        AstExprKind::TextLiteral(_) => "text_literal".to_owned(),
-        AstExprKind::ByteLiteral { value, .. } => format!("byte_{value}"),
-        AstExprKind::BytesLiteral { .. } => "bytes".to_owned(),
-        AstExprKind::Bool(value) => format!("bool_{value}"),
-        AstExprKind::Source => "source".to_owned(),
-        AstExprKind::Call { function, .. } => function.clone(),
-        AstExprKind::Pipe { op, .. } => op.clone(),
-        AstExprKind::Hold { name, .. } => format!("hold_{name}"),
-        AstExprKind::Latest => "latest".to_owned(),
-        AstExprKind::When { .. } => "when".to_owned(),
-        AstExprKind::Then { .. } => "then".to_owned(),
-        AstExprKind::Infix { op, .. } => format!("infix_{op}"),
-        AstExprKind::MatchArm { .. } => "match_arm".to_owned(),
-        AstExprKind::Block { .. } => "block".to_owned(),
-        AstExprKind::Record(_) | AstExprKind::Object(_) => "object".to_owned(),
-        AstExprKind::TaggedObject { tag, .. } => format!("tagged_object_{tag}"),
-        AstExprKind::ListLiteral { .. } => "list".to_owned(),
-    }
-}
-
-fn push_generated(nodes: &mut Vec<IrNode>, name: &str, kind: IrNodeKind, indexed: bool) {
-    nodes.push(IrNode {
-        id: NodeId(nodes.len()),
-        name: name.to_owned(),
-        kind,
-        indexed,
-        expr_id: None,
-    });
-}
-
-fn dependency_edges(
-    program: &ParsedProgram,
-    cells: &[StateCell],
-    candidate_sources: &mut CandidateSourceIndex<'_>,
-) -> Vec<DependencyEdge> {
-    let mut edges = Vec::new();
-    for cell in cells {
-        for source in candidate_sources.candidate_sources(&cell.path) {
-            edges.push(DependencyEdge {
-                indexed: cell.indexed || path_has_parsed_row_scope(program, &source),
-                from: source,
-                to: cell.path.clone(),
-            });
-        }
-    }
-    edges
-}
-
-fn possible_causes(
-    cells: &[StateCell],
-    candidate_sources: &mut CandidateSourceIndex<'_>,
-) -> Vec<PossibleCause> {
-    cells
-        .iter()
-        .map(|cell| PossibleCause {
-            target: cell.path.clone(),
-            sources: candidate_sources.candidate_sources(&cell.path),
-        })
-        .collect()
-}
-
-fn update_branches(
-    program: &ParsedProgram,
-    cells: &[StateCell],
-    fields: &[FieldDef],
-    direct_sources: &BTreeMap<String, Vec<String>>,
-    candidate_sources: &mut CandidateSourceIndex<'_>,
-    resolved_constants: &ResolvedConstantLookup<'_>,
-) -> Vec<UpdateBranch> {
-    cells
-        .iter()
-        .flat_map(|cell| {
-            let Some(field) = fields.iter().find(|field| field.path == cell.path) else {
-                return Vec::new();
-            };
-            let mut branches = direct_sources_for_field(direct_sources, field)
-                .cloned()
-                .map(|source| {
-                    let branch = field.source_branch(&source).unwrap_or_default();
-                    let expression = update_expression_for_routed_branch(
-                        program,
-                        &cell.path,
-                        field,
-                        fields,
-                        &source,
-                        &source_ref_variants(&source),
-                        branch.clone(),
-                        resolved_constants,
-                    );
-                    let guard =
-                        update_guard_for_routed_branch(field, &source, &branch).or_else(|| {
-                            matches!(&expression, UpdateExpression::Const { value } if value.is_empty())
-                                .then(|| {
-                                    then_empty_dependency_guard(field, fields, &source, &branch)
-                                        .or_else(|| update_guard_for_field_source(field, &source))
-                                })
-                                .flatten()
-                        });
-                    UpdateBranch {
-                        expression,
-                        guard,
-                        indexed: cell.indexed,
-                        target: cell.path.clone(),
-                        source,
-                    }
-                })
-                .collect::<Vec<_>>();
-            branches.extend(derived_dependency_update_branches(
-                program,
-                fields,
-                field,
-                cell,
-                &branches,
-                candidate_sources,
-                resolved_constants,
-            ));
-            branches.extend(derived_then_empty_update_branches(
-                fields,
-                field,
-                cell,
-                direct_sources,
-            ));
-            branches
-        })
-        .collect()
-}
-
-fn verify_host_effect_calls_scheduled(
-    program: &ParsedProgram,
-    update_branches: &[UpdateBranch],
+fn verify_executable_host_effect_calls_scheduled(
+    executable: &ExecutableProgram,
+    state_update_arms: &[StateUpdateArm],
 ) -> Result<(), String> {
-    let scheduled = update_branches
-        .iter()
-        .filter_map(|branch| match &branch.expression {
-            UpdateExpression::HostEffect { call_expr_id, .. } => Some(call_expr_id.as_usize()),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    for expr in &program.expressions {
-        let AstExprKind::Call { function, .. } = &expr.kind else {
+    let mut calls = BTreeMap::<
+        (
+            boon_typecheck::CheckedExprId,
+            Option<StaticOwnerId>,
+            String,
+        ),
+        Vec<ExecutableExprId>,
+    >::new();
+    for expression in &executable.expressions {
+        let ExecutableExpressionKind::Call { name, .. } = &expression.kind else {
             continue;
         };
-        if boon_typecheck::is_typed_host_effect(function) && !scheduled.contains(&expr.id) {
+        if boon_typecheck::is_typed_host_effect(name) {
+            calls
+                .entry((expression.checked_expr_id, expression.owner, name.clone()))
+                .or_default()
+                .push(expression.id);
+        }
+    }
+    for ((checked, owner, name), expressions) in calls {
+        if !state_update_arms.iter().any(|arm| {
+            arm.owner == owner
+                && expressions.iter().any(|expression| {
+                    executable_expression_reaches(
+                        executable,
+                        arm.output_expression_id,
+                        *expression,
+                    )
+                })
+        }) {
             return Err(format!(
-                "typed host effect `{function}` on line {} is not a dependency-triggered HOLD update",
-                expr.line
+                "typed host effect `{name}` at checked expression {} owner {owner:?} has no exact state update arm; concrete expressions={expressions:?}",
+                checked.0,
             ));
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn derived_dependency_update_branches(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    field: &FieldDef,
-    cell: &StateCell,
-    existing_branches: &[UpdateBranch],
-    candidate_sources: &mut CandidateSourceIndex<'_>,
-    resolved_constants: &ResolvedConstantLookup<'_>,
-) -> Vec<UpdateBranch> {
-    let mut branches = Vec::new();
-    for dependency_path in candidate_sources.dependency_paths(&field.path) {
-        let Some(dependency) = fields
+fn exact_list_mutations(
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    row_scopes: &[RowScope],
+    sources: &[SourcePort],
+    states: &[StateCell],
+    materializations: &[ContextualMaterialization],
+) -> Result<Vec<ListMutation>, String> {
+    let mut collector = ExecutableViewBindingCollector::new(
+        executable,
+        static_owners,
+        None,
+        list_storage,
+        row_scopes,
+        sources,
+        states,
+        materializations,
+    )?;
+    let mut mutations = Vec::new();
+    for (statement_id, storage) in list_storage {
+        let root = executable
+            .statements
             .iter()
-            .find(|dependency| dependency.path == dependency_path)
-        else {
+            .find(|statement| statement.id == *statement_id)
+            .and_then(|statement| statement.value)
+            .ok_or_else(|| {
+                format!("typed list statement {statement_id} has no exact executable value")
+            })?;
+        collect_exact_list_mutations(
+            executable,
+            materializations,
+            &mut collector,
+            storage.list_id,
+            root,
+            &mut BTreeSet::new(),
+            &mut mutations,
+        )?;
+    }
+    for (ordinal, mutation) in mutations.iter_mut().enumerate() {
+        mutation.ordinal = ordinal.try_into().map_err(|_| {
+            "typed list mutation count exceeds the canonical u32 schedule range".to_owned()
+        })?;
+        mutation.owner = event_cause_static_owner(mutation.cause, sources, states)?;
+    }
+    Ok(mutations)
+}
+
+fn collect_exact_list_mutations(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    collector: &mut ExecutableViewBindingCollector<'_>,
+    list_id: ListId,
+    root: ExecutableExprId,
+    visited: &mut BTreeSet<ExecutableExprId>,
+    mutations: &mut Vec<ListMutation>,
+) -> Result<(), String> {
+    if !visited.insert(root) {
+        return Ok(());
+    }
+    let expression = executable
+        .expressions
+        .get(root.as_usize())
+        .filter(|expression| expression.id == root)
+        .ok_or_else(|| format!("list mutation pipeline references missing expression {root}"))?;
+    match &expression.kind {
+        ExecutableExpressionKind::Materialize { materialization } => {
+            let materialization = materializations.get(*materialization).ok_or_else(|| {
+                format!(
+                    "list mutation pipeline references missing materialization {materialization}"
+                )
+            })?;
+            collect_exact_list_mutations(
+                executable,
+                materializations,
+                collector,
+                list_id,
+                materialization.source,
+                visited,
+                mutations,
+            )?;
+            let remove_when = match materialization.operation {
+                ContextualOperationKind::Remove => Some(true),
+                ContextualOperationKind::Retain => Some(false),
+                ContextualOperationKind::Map
+                | ContextualOperationKind::Filter
+                | ContextualOperationKind::Every
+                | ContextualOperationKind::Any
+                | ContextualOperationKind::Find
+                | ContextualOperationKind::SortBy
+                | ContextualOperationKind::ThenBy => None,
+            };
+            if let Some(remove_when) = remove_when {
+                for arm in collector.trigger_owned_arms_for_expression(materialization.body)? {
+                    mutations.push(ListMutation {
+                        list_id,
+                        site: root,
+                        ordinal: 0,
+                        cause: arm.cause,
+                        owner: arm.owner,
+                        kind: ListMutationKind::Remove {
+                            gate: arm.gate_expression_id,
+                            owner: materialization.owner,
+                            row_local: materialization.row_local,
+                            predicate: arm.output_expression_id,
+                            remove_when,
+                        },
+                    });
+                }
+            }
+        }
+        ExecutableExpressionKind::Call {
+            name, arguments, ..
+        } if name == "List/append" => {
+            let list = arguments
+                .iter()
+                .find(|argument| argument.name == "list")
+                .map(|argument| argument.value)
+                .ok_or_else(|| {
+                    format!("List/append expression {root} has no typed `list` input")
+                })?;
+            let item = arguments
+                .iter()
+                .find(|argument| argument.name == "item")
+                .map(|argument| argument.value)
+                .ok_or_else(|| {
+                    format!("List/append expression {root} has no typed `item` input")
+                })?;
+            collect_exact_list_mutations(
+                executable,
+                materializations,
+                collector,
+                list_id,
+                list,
+                visited,
+                mutations,
+            )?;
+            for arm in collector.trigger_owned_arms_for_expression(item)? {
+                mutations.push(ListMutation {
+                    list_id,
+                    site: root,
+                    ordinal: 0,
+                    cause: arm.cause,
+                    owner: arm.owner,
+                    kind: ListMutationKind::Append {
+                        gate: arm.gate_expression_id,
+                        item: arm.output_expression_id,
+                    },
+                });
+            }
+        }
+        ExecutableExpressionKind::Call { arguments, .. } => {
+            if let Some(list) = arguments
+                .iter()
+                .find(|argument| argument.name == "list")
+                .map(|argument| argument.value)
+            {
+                collect_exact_list_mutations(
+                    executable,
+                    materializations,
+                    collector,
+                    list_id,
+                    list,
+                    visited,
+                    mutations,
+                )?;
+            }
+        }
+        ExecutableExpressionKind::Draining { input }
+        | ExecutableExpressionKind::Project { input, .. } => {
+            collect_exact_list_mutations(
+                executable,
+                materializations,
+                collector,
+                list_id,
+                *input,
+                visited,
+                mutations,
+            )?;
+        }
+        ExecutableExpressionKind::Block { bindings, result } => {
+            for value in bindings
+                .iter()
+                .map(|binding| binding.value)
+                .chain([*result])
+            {
+                collect_exact_list_mutations(
+                    executable,
+                    materializations,
+                    collector,
+                    list_id,
+                    value,
+                    visited,
+                    mutations,
+                )?;
+            }
+        }
+        ExecutableExpressionKind::When { arms, .. } => {
+            for arm in arms {
+                collect_exact_list_mutations(
+                    executable,
+                    materializations,
+                    collector,
+                    list_id,
+                    arm.output,
+                    visited,
+                    mutations,
+                )?;
+            }
+        }
+        ExecutableExpressionKind::Latest { branches } => {
+            for branch in branches {
+                collect_exact_list_mutations(
+                    executable,
+                    materializations,
+                    collector,
+                    list_id,
+                    *branch,
+                    visited,
+                    mutations,
+                )?;
+            }
+        }
+        ExecutableExpressionKind::CanonicalRead { .. }
+        | ExecutableExpressionKind::LocalRead { .. }
+        | ExecutableExpressionKind::ExternalRead { .. }
+        | ExecutableExpressionKind::ElementState { .. }
+        | ExecutableExpressionKind::Drain { .. }
+        | ExecutableExpressionKind::Text(_)
+        | ExecutableExpressionKind::TextTemplate { .. }
+        | ExecutableExpressionKind::Number(_)
+        | ExecutableExpressionKind::BytesByte(_)
+        | ExecutableExpressionKind::Bool(_)
+        | ExecutableExpressionKind::Tag(_)
+        | ExecutableExpressionKind::TaggedObject { .. }
+        | ExecutableExpressionKind::Source { .. }
+        | ExecutableExpressionKind::Hold { .. }
+        | ExecutableExpressionKind::Then { .. }
+        | ExecutableExpressionKind::Infix { .. }
+        | ExecutableExpressionKind::MatchArm { .. }
+        | ExecutableExpressionKind::Object(_)
+        | ExecutableExpressionKind::Record(_)
+        | ExecutableExpressionKind::List { .. }
+        | ExecutableExpressionKind::Bytes { .. }
+        | ExecutableExpressionKind::Delimiter
+        | ExecutableExpressionKind::MaterializationLocal { .. }
+        | ExecutableExpressionKind::FunctionParameter { .. } => {}
+    }
+    Ok(())
+}
+
+fn executable_list_projections(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    lists: &[ListMemory],
+) -> Result<Vec<ListProjection>, String> {
+    let lists_by_declaration = list_storage
+        .iter()
+        .filter_map(|(statement, storage)| {
+            executable
+                .statements
+                .iter()
+                .find(|candidate| candidate.id == *statement)
+                .and_then(|statement| statement.declaration)
+                .map(|declaration| (declaration, storage.list_id))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut projections = Vec::new();
+    let mut targets = BTreeSet::new();
+    for (statement_id, target) in list_storage {
+        let statement = executable
+            .statements
+            .iter()
+            .find(|candidate| candidate.id == *statement_id)
+            .ok_or_else(|| {
+                format!(
+                    "list storage '{}' references missing executable statement {}",
+                    target.path, statement_id
+                )
+            })?;
+        let Some(root) = statement.value else {
             continue;
         };
-        if !field_dependency_is_event_cause(field, dependency) {
+        let Some(chunk) = terminal_chunk_expression(executable, root, &mut BTreeSet::new())? else {
             continue;
+        };
+        let expression = executable
+            .expressions
+            .get(chunk.as_usize())
+            .filter(|candidate| candidate.id == chunk)
+            .ok_or_else(|| format!("chunk expression {chunk} is missing"))?;
+        let ExecutableExpressionKind::Call {
+            name, arguments, ..
+        } = &expression.kind
+        else {
+            return Err(format!(
+                "terminal chunk expression {chunk} is not an executable call"
+            ));
+        };
+        if name != "List/chunk" {
+            return Err(format!(
+                "terminal chunk expression {chunk} resolved to unexpected callable '{name}'"
+            ));
         }
-        for source in candidate_sources.event_sources_for_dependency(&dependency.path) {
-            if cell.indexed && candidate_sources.is_effect_result_state(&source) {
-                continue;
-            }
-            if existing_branches
-                .iter()
-                .chain(branches.iter())
-                .any(|branch: &UpdateBranch| branch.source == source)
-            {
-                continue;
-            }
-            let Some((expression, guard)) = update_expression_for_derived_dependency_source(
-                program,
-                &cell.path,
-                field,
-                fields,
-                dependency,
-                &source,
-                resolved_constants,
-            ) else {
-                continue;
-            };
-            branches.push(UpdateBranch {
-                expression,
-                guard,
-                indexed: cell.indexed,
-                target: cell.path.clone(),
-                source,
-            });
-        }
-    }
-    branches
-}
-
-fn derived_then_empty_update_branches(
-    fields: &[FieldDef],
-    field: &FieldDef,
-    cell: &StateCell,
-    direct_sources: &BTreeMap<String, Vec<String>>,
-) -> Vec<UpdateBranch> {
-    let mut branches = Vec::new();
-    for dependency in fields.iter().filter(|dependency| {
-        dependency.parent_path == field.parent_path
-            && dependency.path != field.path
-            && field.mentions_identifier_expr(&dependency.local_name)
-            && field.has_then_from_local_with_empty_output(&dependency.local_name)
-    }) {
-        for source in direct_sources_for_field(direct_sources, dependency).cloned() {
-            if branches
-                .iter()
-                .any(|branch: &UpdateBranch| branch.source == source)
-            {
-                continue;
-            }
-            branches.push(UpdateBranch {
-                expression: UpdateExpression::Const {
-                    value: String::new(),
-                },
-                guard: dependency
-                    .source_branch(&source)
-                    .and_then(|branch| update_guard_for_routed_branch(dependency, &source, &branch))
-                    .or_else(|| update_guard_for_field_source(dependency, &source)),
-                indexed: cell.indexed,
-                target: cell.path.clone(),
-                source,
-            });
-        }
-    }
-    branches
-}
-
-fn unbound_list_operations(program: &ParsedProgram) -> Vec<UnboundListOperation> {
-    let fields = typed_field_defs(program);
-    let mut operations = Vec::new();
-    for field in &fields {
-        let list_name = field
-            .path
-            .rsplit_once('.')
-            .map_or(field.path.as_str(), |(_, local)| local);
-        if !program
-            .list_memories
+        let list_arguments = arguments
             .iter()
-            .any(|list| list.name == list_name)
-        {
-            continue;
-        }
-        for append_expr in list_append_exprs(field) {
-            let Some(trigger) = list_append_trigger(field, append_expr) else {
-                continue;
-            };
-            let fields = list_append_fields(field, program, &fields, append_expr);
-            operations.push(UnboundListOperation {
-                list: field.path.clone(),
-                kind: ListOperationKind::Append { trigger, fields },
-            });
-        }
-        for source in direct_source_refs(field, program) {
-            let branch = field.source_branch(&source).unwrap_or_default();
-            if branch.has_token("List/remove")
-                || field.has_token("List/remove")
-                || (field.has_operator("List/retain") && branch.has_token("False"))
-            {
-                let canonical_row_scope = row_scope_for_list(program, list_name);
-                let row_scope = ast_call_argument(field, "List/retain")
-                    .or_else(|| canonical_row_scope.map(str::to_owned));
-                operations.push(UnboundListOperation {
-                    list: field.path.clone(),
-                    kind: ListOperationKind::Remove {
-                        predicate: list_remove_predicate(
-                            field,
-                            &source,
-                            &branch,
-                            row_scope.as_deref(),
-                            canonical_row_scope,
-                        ),
-                        source,
-                    },
-                });
-            }
-        }
-    }
-    for field in &fields {
-        if field.has_operator("List/count") {
-            let Some(list) = count_or_retain_source_list(field, program) else {
-                continue;
-            };
-            let row_scope = row_scope_for_list(program, &list)
-                .map(str::to_owned)
-                .or_else(|| ast_call_argument(field, "List/count"));
-            let canonical_row_scope = row_scope_for_list(program, &list);
-            operations.push(UnboundListOperation {
-                list,
-                kind: ListOperationKind::Count {
-                    target: field.path.clone(),
-                    predicate: list_retain_predicate(
-                        field,
-                        row_scope.as_deref(),
-                        canonical_row_scope,
-                    ),
-                },
-            });
-        } else if field.has_operator("List/retain") {
-            let Some(list) = count_or_retain_source_list(field, program) else {
-                continue;
-            };
-            let canonical_row_scope = row_scope_for_list(program, &list);
-            let row_scope = ast_call_argument(field, "List/retain")
-                .or_else(|| canonical_row_scope.map(str::to_owned));
-            let retain_predicate =
-                list_retain_predicate(field, row_scope.as_deref(), canonical_row_scope);
-            if field_is_derived_list_memory_view(field, program)
-                && matches!(retain_predicate, ListPredicate::Unknown { .. })
-            {
-                continue;
-            }
-            for source in
-                retain_remove_sources(field, program, row_scope.as_deref(), canonical_row_scope)
-            {
-                let branch = field.source_branch(&source).unwrap_or_default();
-                operations.push(UnboundListOperation {
-                    list: list.clone(),
-                    kind: ListOperationKind::Remove {
-                        predicate: list_retain_remove_predicate(
-                            field,
-                            &source,
-                            &branch,
-                            row_scope.as_deref(),
-                            canonical_row_scope,
-                        ),
-                        source,
-                    },
-                });
-            }
-            operations.push(UnboundListOperation {
-                list,
-                kind: ListOperationKind::Retain {
-                    target: field.path.clone(),
-                    predicate: retain_predicate,
-                },
-            });
-        }
-    }
-    operations
-}
-
-fn bind_list_operations(
-    operations: Vec<UnboundListOperation>,
-    lists: &[ListMemory],
-) -> Result<Vec<ListOperation>, String> {
-    let lists_by_path = lists
-        .iter()
-        .map(|list| (list.name.as_str(), list.id))
-        .collect::<BTreeMap<_, _>>();
-    operations
-        .into_iter()
-        .map(|operation| {
-            let list_id = lists_by_path
-                .get(operation.list.as_str())
-                .copied()
-                .ok_or_else(|| {
-                    format!(
-                        "list operation references unknown canonical list `{}`",
-                        operation.list
-                    )
-                })?;
-            Ok(ListOperation {
-                list_id,
-                list: operation.list,
-                kind: operation.kind,
-            })
-        })
-        .collect()
-}
-
-fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
-    typed_field_defs(program)
-        .into_iter()
-        .filter_map(|field| {
-            if field.has_operator("List/query") {
-                let field_paths = ast_named_call_argument(&field, "List/query", "fields")
-                    .map(|value| parse_query_csv(&value))
-                    .unwrap_or_default();
-                let normalizations = ast_named_call_argument(&field, "List/query", "normalization")
-                    .map(|value| parse_query_csv(&value))
-                    .unwrap_or_else(|| vec!["Exact".to_owned()]);
-                let multi_value = ast_named_call_argument(&field, "List/query", "multi_value")
-                    .map(|value| parse_query_csv(&value))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
-                let query_fields = field_paths
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, path)| ListQueryIndexField {
-                        multi_value: multi_value.contains(&path),
-                        path: parse_query_path(&path),
-                        normalization: parse_query_normalization(
-                            normalizations
-                                .get(index)
-                                .or_else(|| (normalizations.len() == 1).then(|| &normalizations[0]))
-                                .map(String::as_str)
-                                .unwrap_or("Unknown"),
-                        ),
-                    })
-                    .collect::<Vec<_>>();
-                let dynamic = |name: &str| {
-                    ast_named_call_argument(&field, "List/query", name)
-                        .map(|value| canonical_local_path(&value, &field.parent_path))
-                };
-                let selection_name =
-                    ast_named_call_argument(&field, "List/query", "select").unwrap_or_default();
-                let selection = match selection_name.as_str() {
-                    "Exact" => dynamic("key")
-                        .map(|key| ListQuerySelection::Exact { key })
-                        .unwrap_or_else(|| ListQuerySelection::Unknown {
-                            value: "Exact.key".to_owned(),
-                        }),
-                    "Prefix" => dynamic("prefix")
-                        .map(|prefix| ListQuerySelection::TextPrefix {
-                            leading: dynamic("leading"),
-                            prefix,
-                        })
-                        .unwrap_or_else(|| ListQuerySelection::Unknown {
-                            value: "Prefix.prefix".to_owned(),
-                        }),
-                    "Range" => ListQuerySelection::Range {
-                        lower: dynamic("lower"),
-                        lower_inclusive: static_query_bool(&field, "lower_inclusive", true),
-                        upper: dynamic("upper"),
-                        upper_inclusive: static_query_bool(&field, "upper_inclusive", true),
-                    },
-                    "Union" => dynamic("keys")
-                        .map(|keys| ListQuerySelection::Union { keys })
-                        .unwrap_or_else(|| ListQuerySelection::Unknown {
-                            value: "Union.keys".to_owned(),
-                        }),
-                    "Intersection" => dynamic("keys")
-                        .map(|keys| ListQuerySelection::Intersection { keys })
-                        .unwrap_or_else(|| ListQuerySelection::Unknown {
-                            value: "Intersection.keys".to_owned(),
-                        }),
-                    _ => ListQuerySelection::Unknown {
-                        value: selection_name,
-                    },
-                };
-                let residual_name = ast_named_call_argument(&field, "List/query", "residual")
-                    .unwrap_or_else(|| "None".to_owned());
-                let residual_path = |name: &str| {
-                    ast_named_call_argument(&field, "List/query", name)
-                        .map(|value| parse_query_path(&value))
-                        .unwrap_or_default()
-                };
-                let residual = match residual_name.as_str() {
-                    "None" => None,
-                    "FieldEqual" => Some(
-                        dynamic("residual_value")
-                            .map(|value| ListQueryResidual::FieldEqual {
-                                path: residual_path("residual_field"),
-                                value,
-                            })
-                            .unwrap_or_else(|| ListQueryResidual::Unknown {
-                                value: "FieldEqual.residual_value".to_owned(),
-                            }),
-                    ),
-                    "TextContains" => Some(
-                        dynamic("needle")
-                            .map(|needle| ListQueryResidual::TextContains {
-                                path: residual_path("residual_field"),
-                                needle,
-                            })
-                            .unwrap_or_else(|| ListQueryResidual::Unknown {
-                                value: "TextContains.needle".to_owned(),
-                            }),
-                    ),
-                    "NumberRange" => Some(ListQueryResidual::NumberRange {
-                        path: residual_path("residual_field"),
-                        minimum: dynamic("minimum"),
-                        maximum: dynamic("maximum"),
-                    }),
-                    "Wgs84Radius" => Some(
-                        match (
-                            dynamic("center_latitude"),
-                            dynamic("center_longitude"),
-                            dynamic("radius_meters"),
-                        ) {
-                            (
-                                Some(center_latitude),
-                                Some(center_longitude),
-                                Some(radius_meters),
-                            ) => ListQueryResidual::Wgs84Radius {
-                                latitude_path: residual_path("latitude_field"),
-                                longitude_path: residual_path("longitude_field"),
-                                center_latitude,
-                                center_longitude,
-                                radius_meters,
-                            },
-                            _ => ListQueryResidual::Unknown {
-                                value: "Wgs84Radius.bounds".to_owned(),
-                            },
-                        },
-                    ),
-                    _ => Some(ListQueryResidual::Unknown {
-                        value: residual_name,
-                    }),
-                };
-                return Some(ListProjection {
-                    target: field.path.clone(),
-                    list: ast_list_projection_argument(program, &field, "List/query")?,
-                    kind: ListProjectionKind::IndexedQuery {
-                        fields: query_fields,
-                        selection,
-                        residual,
-                        limit: ast_named_call_argument(&field, "List/query", "limit")
-                            .and_then(|value| value.parse::<usize>().ok()),
-                        cursor: dynamic("cursor"),
-                        unique: static_query_bool(&field, "unique", false),
-                        order: match ast_named_call_argument(&field, "List/query", "order")
-                            .as_deref()
-                            .unwrap_or("Ascending")
-                        {
-                            "Ascending" => ListQueryOrder::Ascending,
-                            "Descending" => ListQueryOrder::Descending,
-                            value => ListQueryOrder::Unknown {
-                                value: value.to_owned(),
-                            },
-                        },
-                    },
-                });
-            }
-            if field.has_operator("List/query_prefix") {
-                let normalization =
-                    ast_named_call_argument(&field, "List/query_prefix", "normalization")
-                        .unwrap_or_else(|| "Exact".to_owned());
-                return Some(ListProjection {
-                    target: field.path.clone(),
-                    list: ast_list_projection_argument(program, &field, "List/query_prefix")?,
-                    kind: ListProjectionKind::TextPrefix {
-                        field: ast_named_call_argument(&field, "List/query_prefix", "field")?,
-                        prefix: canonical_local_path(
-                            &ast_named_call_argument(&field, "List/query_prefix", "prefix")?,
-                            &field.parent_path,
-                        ),
-                        limit: ast_named_call_argument(&field, "List/query_prefix", "limit")
-                            .and_then(|value| value.parse::<usize>().ok()),
-                        normalization: match normalization.as_str() {
-                            "Exact" => ListTextNormalization::Exact,
-                            "TrimLowercase" => ListTextNormalization::TrimLowercase,
-                            "Tokens" => ListTextNormalization::Tokens,
-                            _ => ListTextNormalization::Unknown {
-                                value: normalization,
-                            },
-                        },
-                    },
-                });
-            }
-            if field.has_operator("List/chunk") {
-                return Some(ListProjection {
-                    target: field.path.clone(),
-                    list: ast_list_projection_argument(program, &field, "List/chunk")?,
-                    kind: ListProjectionKind::Chunk {
-                        size: ast_named_call_argument(&field, "List/chunk", "size")
-                            .and_then(|value| value.parse::<usize>().ok()),
-                        item_field: ast_named_call_argument(&field, "List/chunk", "items")
-                            .unwrap_or_else(|| "items".to_owned()),
-                        label_field: ast_named_call_argument(&field, "List/chunk", "label")
-                            .unwrap_or_else(|| "index".to_owned()),
-                    },
-                });
-            }
-            None
-        })
-        .collect()
-}
-
-fn parse_query_csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn parse_query_path(value: &str) -> Vec<String> {
-    value
-        .split('.')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn parse_query_normalization(value: &str) -> ListTextNormalization {
-    match value {
-        "Exact" => ListTextNormalization::Exact,
-        "TrimLowercase" => ListTextNormalization::TrimLowercase,
-        "Tokens" => ListTextNormalization::Tokens,
-        value => ListTextNormalization::Unknown {
-            value: value.to_owned(),
-        },
-    }
-}
-
-fn static_query_bool(field: &FieldDef, name: &str, default: bool) -> bool {
-    ast_named_call_argument(field, "List/query", name).map_or(default, |value| value == "True")
-}
-
-fn ast_list_projection_argument(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    function: &str,
-) -> Option<String> {
-    let raw = ast_named_call_argument(field, function, "list").or_else(|| {
-        field.ast_exprs.iter().find_map(|expression| {
-            let AstExprKind::Pipe { input, op, .. } = &expression.kind else {
-                return None;
-            };
-            (op == function)
-                .then(|| ast_argument_value(field, *input))
-                .flatten()
-        })
-    })?;
-    Some(
-        resolve_list_memory_argument(program, &raw, &field.parent_path)
-            .unwrap_or_else(|| canonical_local_path(&raw, &field.parent_path)),
-    )
-}
-
-fn resolve_list_memory_argument(
-    program: &ParsedProgram,
-    raw: &str,
-    parent_path: &str,
-) -> Option<String> {
-    let canonical = canonical_local_path(raw, parent_path);
-    for candidate in [raw, canonical.as_str()] {
-        if program
-            .list_memories
+            .filter(|argument| argument.name == "list")
+            .collect::<Vec<_>>();
+        let [list_argument] = list_arguments.as_slice() else {
+            return Err(format!(
+                "List/chunk expression {chunk} must have exactly one checked 'list' argument"
+            ));
+        };
+        let source_id = executable_list_id(
+            executable,
+            materializations,
+            &lists_by_declaration,
+            list_argument.value,
+            &mut BTreeSet::new(),
+        )?
+        .ok_or_else(|| {
+            format!("List/chunk expression {chunk} has no exact executable list provenance")
+        })?;
+        let source = lists
+            .get(source_id.as_usize())
+            .filter(|candidate| candidate.id == source_id)
+            .ok_or_else(|| {
+                format!(
+                    "List/chunk expression {chunk} references missing source ListId {source_id}"
+                )
+            })?;
+        let size_arguments = arguments
             .iter()
-            .any(|list| list.name == candidate)
-        {
-            return Some(candidate.to_owned());
+            .filter(|argument| argument.name == "size")
+            .collect::<Vec<_>>();
+        let [size_argument] = size_arguments.as_slice() else {
+            return Err(format!(
+                "List/chunk expression {chunk} must have exactly one checked 'size' argument"
+            ));
+        };
+        let size = match executable_static_data(
+            executable,
+            size_argument.value,
+            &BTreeMap::new(),
+            &mut BTreeSet::new(),
+        ) {
+            Ok(boon_data::Value::Number(value)) => value.to_usize_exact().ok(),
+            Ok(_) | Err(_) => None,
+        };
+        if !targets.insert(target.path.clone()) {
+            return Err(format!(
+                "list projection target '{}' was lowered more than once",
+                target.path
+            ));
         }
+        projections.push(ListProjection {
+            target: target.path.clone(),
+            list: source.name.clone(),
+            kind: ListProjectionKind::Chunk { size },
+        });
     }
-    let local = raw.rsplit_once('.').map(|(_, local)| local).unwrap_or(raw);
-    let prefix = format!("{local}_list_");
-    let mut matches = program
-        .list_memories
-        .iter()
-        .filter(|list| list.name.starts_with(&prefix))
-        .map(|list| list.name.clone())
-        .collect::<Vec<_>>();
-    matches.sort();
-    matches.dedup();
-    (matches.len() == 1).then(|| matches.remove(0))
+    Ok(projections)
 }
 
-fn derived_values(
-    program: &ParsedProgram,
+fn terminal_chunk_expression(
     executable: &ExecutableProgram,
+    expression: ExecutableExprId,
+    visiting: &mut BTreeSet<ExecutableExprId>,
+) -> Result<Option<ExecutableExprId>, String> {
+    if !visiting.insert(expression) {
+        return Err(format!(
+            "list projection expression {expression} contains an executable cycle"
+        ));
+    }
+    let candidate = executable
+        .expressions
+        .get(expression.as_usize())
+        .filter(|candidate| candidate.id == expression)
+        .ok_or_else(|| format!("list projection expression {expression} is missing"))?;
+    let result = match &candidate.kind {
+        ExecutableExpressionKind::Call { name, .. } if name == "List/chunk" => Some(expression),
+        ExecutableExpressionKind::Block { result, .. } => {
+            terminal_chunk_expression(executable, *result, visiting)?
+        }
+        ExecutableExpressionKind::Project { input, .. }
+        | ExecutableExpressionKind::Draining { input } => {
+            terminal_chunk_expression(executable, *input, visiting)?
+        }
+        ExecutableExpressionKind::Then {
+            output: Some(output),
+            ..
+        }
+        | ExecutableExpressionKind::MatchArm {
+            output: Some(output),
+            ..
+        } => terminal_chunk_expression(executable, *output, visiting)?,
+        ExecutableExpressionKind::When { arms, .. } => {
+            terminal_chunk_branches(executable, arms.iter().map(|arm| arm.output), visiting)?
+        }
+        ExecutableExpressionKind::Latest { branches } => {
+            terminal_chunk_branches(executable, branches.iter().copied(), visiting)?
+        }
+        _ => None,
+    };
+    visiting.remove(&expression);
+    Ok(result)
+}
+
+fn terminal_chunk_branches(
+    executable: &ExecutableProgram,
+    branches: impl Iterator<Item = ExecutableExprId>,
+    visiting: &mut BTreeSet<ExecutableExprId>,
+) -> Result<Option<ExecutableExprId>, String> {
+    let chunks = branches
+        .map(|branch| terminal_chunk_expression(executable, branch, visiting))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    match chunks.len() {
+        0 => Ok(None),
+        1 => Ok(chunks.into_iter().next().flatten()),
+        _ => {
+            Err("conditional list projection has inconsistent terminal chunk operations".to_owned())
+        }
+    }
+}
+
+fn executable_list_id(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    lists_by_declaration: &BTreeMap<boon_typecheck::DeclId, ListId>,
+    expression: ExecutableExprId,
+    visiting: &mut BTreeSet<ExecutableExprId>,
+) -> Result<Option<ListId>, String> {
+    if !visiting.insert(expression) {
+        return Err(format!(
+            "list provenance expression {expression} contains an executable cycle"
+        ));
+    }
+    let candidate = executable
+        .expressions
+        .get(expression.as_usize())
+        .filter(|candidate| candidate.id == expression)
+        .ok_or_else(|| format!("list provenance expression {expression} is missing"))?;
+    let result = match &candidate.kind {
+        ExecutableExpressionKind::CanonicalRead {
+            target, projection, ..
+        }
+        | ExecutableExpressionKind::LocalRead {
+            declaration: target,
+            projection,
+        } if projection.is_empty() => lists_by_declaration.get(target).copied(),
+        ExecutableExpressionKind::Materialize { materialization } => materializations
+            .get(*materialization)
+            .filter(|candidate| candidate.id == *materialization)
+            .and_then(|materialization| {
+                materialization
+                    .target_list_id
+                    .or(materialization.source_list_id)
+            }),
+        ExecutableExpressionKind::Block { result, .. } => executable_list_id(
+            executable,
+            materializations,
+            lists_by_declaration,
+            *result,
+            visiting,
+        )?,
+        ExecutableExpressionKind::Project { input, fields } if fields.is_empty() => {
+            executable_list_id(
+                executable,
+                materializations,
+                lists_by_declaration,
+                *input,
+                visiting,
+            )?
+        }
+        ExecutableExpressionKind::Draining { input } => executable_list_id(
+            executable,
+            materializations,
+            lists_by_declaration,
+            *input,
+            visiting,
+        )?,
+        ExecutableExpressionKind::Then {
+            output: Some(output),
+            ..
+        }
+        | ExecutableExpressionKind::MatchArm {
+            output: Some(output),
+            ..
+        } => executable_list_id(
+            executable,
+            materializations,
+            lists_by_declaration,
+            *output,
+            visiting,
+        )?,
+        ExecutableExpressionKind::Call { arguments, .. }
+            if matches!(candidate.flow_type.ty, boon_typecheck::Type::List(_)) =>
+        {
+            let list_inputs = arguments
+                .iter()
+                .filter(|argument| {
+                    executable
+                        .expressions
+                        .get(argument.value.as_usize())
+                        .filter(|input| input.id == argument.value)
+                        .is_some_and(|input| {
+                            matches!(input.flow_type.ty, boon_typecheck::Type::List(_))
+                        })
+                })
+                .map(|argument| argument.value)
+                .collect::<Vec<_>>();
+            let [input] = list_inputs.as_slice() else {
+                visiting.remove(&expression);
+                return Ok(None);
+            };
+            executable_list_id(
+                executable,
+                materializations,
+                lists_by_declaration,
+                *input,
+                visiting,
+            )?
+        }
+        _ => None,
+    };
+    visiting.remove(&expression);
+    Ok(result)
+}
+
+fn state_update_arms(
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
     row_scopes: &[RowScope],
     derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    fields: &[FieldDef],
-    state_cells: &[StateCell],
     sources: &[SourcePort],
+    state_cells: &[StateCell],
     materializations: &[ContextualMaterialization],
-    distributed_value_references: &[DistributedValueReference],
-) -> Result<Vec<DerivedValue>, String> {
-    let mut event_source_collector = ExecutableViewBindingCollector::new(
+) -> Result<Vec<StateUpdateArm>, String> {
+    let mut collector = ExecutableViewBindingCollector::new(
         executable,
+        static_owners,
         None,
         derived_list_storage,
         row_scopes,
         sources,
         state_cells,
         materializations,
-    );
-    let executable_field_statements = executable
-        .statements
-        .iter()
-        .filter_map(|statement| match (&statement.kind, statement.value) {
-            (ExecutableStatementKind::Field { path, .. }, Some(_))
-            | (
-                ExecutableStatementKind::List {
-                    path: Some(path), ..
-                },
-                Some(_),
-            ) => Some((path.as_str(), statement.id)),
-            _ => None,
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut typed_fields = fields.to_vec();
-    let semantic_items = program.ast.semantic_parser_items().collect::<Vec<_>>();
-    for target in typed_derived_list_targets(executable)? {
-        if typed_fields.iter().any(|field| field.path == target.path) {
+    )?;
+    let mut result = Vec::new();
+    for state in state_cells {
+        let Some(executable_state_id) = state.executable_state_id else {
             continue;
-        }
-        let Some(producer) = executable
-            .expressions
-            .get(target.producer.as_usize())
-            .filter(|expression| expression.id == target.producer)
-        else {
-            return Err(format!(
-                "typed list field `{}` references missing producer {}",
-                target.path, target.producer
-            ));
         };
-        if matches!(producer.kind, ExecutableExpressionKind::List { .. }) {
-            continue;
-        }
-        let statement = find_statement_by_id(&program.ast.statements, target.statement.0 as usize)
+        let executable_state = executable
+            .states
+            .get(executable_state_id.as_usize())
+            .filter(|candidate| candidate.id == executable_state_id)
             .ok_or_else(|| {
                 format!(
-                    "typed list field `{}` references missing AST statement {}",
-                    target.path, target.statement
+                    "state `{}` references missing executable state {}",
+                    state.path, executable_state_id
                 )
             })?;
-        let (parent_path, local_name) = target.path.rsplit_once('.').map_or_else(
-            || (String::new(), target.path.clone()),
-            |(parent, local)| (parent.to_owned(), local.to_owned()),
-        );
-        typed_fields.push(FieldDef {
-            path: target.path,
-            local_name,
-            parent_path,
-            statement: statement.clone(),
-            ast_items: collect_statement_ast_items(statement, &semantic_items),
-            ast_exprs: collect_statement_ast_exprs(statement, program),
-        });
+        for arm in collector.trigger_owned_arms_for_expression(executable_state.expression)? {
+            result.push(StateUpdateArm {
+                state: state.id,
+                cause: arm.cause,
+                gate_checked_expr_id: arm.gate_checked_expr_id,
+                gate_expression_id: arm.gate_expression_id,
+                owner: arm.owner,
+                output_expression_id: arm.output_expression_id,
+            });
+        }
     }
-    let candidate_fields = typed_fields
+    result.sort_by_key(|arm| {
+        (
+            arm.state,
+            arm.cause,
+            arm.gate_expression_id,
+            arm.output_expression_id,
+        )
+    });
+    result.dedup();
+    Ok(result)
+}
+
+fn derived_values(
+    checked: &boon_typecheck::CheckedProgram,
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    row_scopes: &[RowScope],
+    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    erased_fields: &[ErasedFieldDef],
+    state_cells: &[StateCell],
+    sources: &[SourcePort],
+    materializations: &[ContextualMaterialization],
+    producer_function_instances: &[ProducerFunctionInstance],
+    distributed_value_references: &[DistributedValueReference],
+) -> Result<Vec<DerivedValue>, String> {
+    let mut event_source_collector = ExecutableViewBindingCollector::new(
+        executable,
+        static_owners,
+        None,
+        derived_list_storage,
+        row_scopes,
+        sources,
+        state_cells,
+        materializations,
+    )?;
+    let output_roots = output_root_declarations(checked, &checked.lowering_metadata);
+    let retained_output_root_statements = output_roots
         .iter()
-        .filter(|field| {
-            let has_executable_statement =
-                executable_field_statements.contains_key(field.path.as_str());
-            let indexed_field = path_has_parsed_row_scope(program, &field.path);
-            let typed_list_view = executable_field_statements
-                .get(field.path.as_str())
-                .is_some_and(|statement| {
-                    derived_list_storage.contains_key(statement)
-                        && executable.statements.iter().any(|candidate| {
-                            candidate.id == *statement
-                                && matches!(candidate.kind, ExecutableStatementKind::Field { .. })
-                        })
-                });
-            let list_memory_path = field_is_list_memory_path(field, program)
-                && !is_output_registry_value_path(&field.path);
-            has_executable_statement
-                && !state_cells
+        .filter(|output| {
+            matches!(
+                output.contract,
+                SemanticOutputContractKind::RetainedVisual { .. }
+            )
+        })
+        .map(|output| ExecutableStatementId(output.statement_id))
+        .collect::<BTreeSet<_>>();
+    let host_output_root_statements = output_roots
+        .iter()
+        .filter(|output| matches!(output.contract, SemanticOutputContractKind::HostValue))
+        .map(|output| ExecutableStatementId(output.statement_id))
+        .collect::<BTreeSet<_>>();
+    let hold_body_statements = executable_hold_body_statement_ids(executable);
+    let candidates = executable
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            if hold_body_statements.contains(&statement.id) {
+                return None;
+            }
+            if retained_output_root_statements.contains(&statement.id) {
+                return None;
+            }
+            // Structural field groups define ownership and schema. Checked
+            // elaboration resolves their uses to concrete child producers, so
+            // compiling the parent as a scalar value would duplicate
+            // authority and send list mutation pipelines through the scalar
+            // backend.
+            if executable_statement_is_structural_group(executable, statement)
+                && !host_output_root_statements.contains(&statement.id)
+            {
+                return None;
+            }
+            let (_, path) = executable_statement_name_path(&statement.kind)?;
+            let value = statement.value?;
+            let field = erased_fields.iter().find(|field| {
+                field.statement == Some(statement.id)
+                    && field.diagnostic_path == path
+                    && field.role.is_value()
+                    && field.producer.is_some()
+            })?;
+            // A list expression is not necessarily keyed list authority.
+            // Closed scalar lists remain ordinary demand-current values and
+            // need a root field computation. Only declarations with exact
+            // materialized row storage are represented by `ListId` instead.
+            if (derived_list_storage.contains_key(&statement.id)
+                && matches!(
+                    executable
+                        .expressions
+                        .get(value.as_usize())
+                        .map(|value| &value.kind),
+                    Some(ExecutableExpressionKind::List { .. })
+                ))
+                || direct_list_alias_target(executable, statement).is_some()
+                || producer_function_instances
                     .iter()
-                    .any(|cell| cell.statement_id == field.statement.id)
-                && !program
-                    .source_ports
-                    .iter()
-                    .any(|source| source.path == field.path)
-                && !distributed_value_references.iter().any(|reference| {
+                    .any(|instance| instance.result_path == path && instance.root == value)
+                || field.static_owner.is_some_and(|owner| {
+                    producer_function_instances.iter().any(|instance| {
+                        static_owner_descends_from(owner, instance.owner, static_owners)
+                    })
+                })
+                || state_cells.iter().any(|state| {
+                    state.statement_id == statement.id.as_usize()
+                        && state
+                            .executable_state_id
+                            .and_then(|state| executable.states.get(state.as_usize()))
+                            .is_some_and(|state| state.expression == value)
+                })
+                || checked.sources.iter().any(|source| source.path == path)
+                || distributed_value_references.iter().any(|reference| {
                     matches!(
                         reference.flow_mode,
                         boon_typecheck::FlowMode::TickPresent
                             | boon_typecheck::FlowMode::PresentOrAbsent
-                    ) && reference.local_alias_paths.contains(&field.path)
+                    ) && reference
+                        .local_alias_paths
+                        .iter()
+                        .any(|alias| alias == path)
                 })
-                && (typed_list_view || indexed_field || !list_memory_path)
+            {
+                return None;
+            }
+            Some((statement, field))
         })
         .collect::<Vec<_>>();
-    let mut values = Vec::with_capacity(candidate_fields.len());
-    for (id, field) in candidate_fields.into_iter().enumerate() {
-        let executable_statement_id = executable_field_statements[field.path.as_str()];
-        let executable_statement = executable
-            .statements
-            .iter()
-            .find(|statement| statement.id == executable_statement_id)
-            .ok_or_else(|| {
-                format!(
-                    "derived value `{}` references missing executable statement {}",
-                    field.path, executable_statement_id
-                )
-            })?;
-        let checked_result_is_list = executable_statement
-            .flow_type
-            .as_ref()
-            .is_some_and(|flow_type| matches!(flow_type.ty, boon_typecheck::Type::List(_)));
-        let structural_group = field_is_structural_group(field);
-        let (trigger_arms, default_roots) = if structural_group {
+
+    let mut values = Vec::with_capacity(candidates.len());
+    for (statement, field) in candidates {
+        let structural_group = executable_statement_is_structural_group(executable, statement);
+        let materialized_storage = derived_list_storage.get(&statement.id).cloned();
+        if materialized_storage.is_none()
+            && !structural_group
+            && statement.flow_type.as_ref().is_some_and(|flow_type| {
+                flow_type.mode == boon_typecheck::FlowMode::Continuous
+                    && matches!(
+                        &flow_type.ty,
+                        boon_typecheck::Type::List(item)
+                            if matches!(item.as_ref(), boon_typecheck::Type::Object(_))
+                    )
+            })
+        {
+            return Err(format!(
+                "checked keyed list value `{}` has no materialized storage",
+                field.diagnostic_path
+            ));
+        }
+        let (trigger_arms, default_roots) = if structural_group || materialized_storage.is_some() {
             (Vec::new(), Vec::new())
         } else {
-            event_source_collector.trigger_owned_arms_for_statement(executable_statement_id)?
+            event_source_collector.trigger_owned_arms_for_statement(statement.id)?
         };
-        let event_causes = trigger_arms
+        let causes = trigger_arms
             .iter()
             .map(|arm| arm.cause)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let mut transform_sources = event_causes
+        let mut source_paths = causes
             .iter()
-            .map(|cause| match cause {
-                EventCause::Source(source_id) => sources
-                    .get(source_id.as_usize())
-                    .filter(|source| source.id == *source_id)
-                    .map(|source| source.path.clone())
-                    .ok_or_else(|| format!("event cause references missing SourceId {source_id}")),
-                EventCause::State(state_id) => state_cells
-                    .get(state_id.as_usize())
-                    .filter(|state| state.id == *state_id)
-                    .map(|state| state.path.clone())
-                    .ok_or_else(|| format!("event cause references missing StateId {state_id}")),
-            })
+            .map(|cause| event_cause_path_owned(*cause, sources, state_cells))
             .collect::<Result<Vec<_>, _>>()?;
-        transform_sources.sort();
-        transform_sources.dedup();
-        let materialized_storage = derived_list_storage.get(&executable_statement_id).cloned();
-        let list_memory_view = materialized_storage.is_some();
-        let indexed = path_has_parsed_row_scope(program, &field.path);
-        let scope_id = scope_id_for_path(row_scopes, &field.path);
-        let kind = if list_memory_view {
+        source_paths.sort();
+        source_paths.dedup();
+        let kind = if materialized_storage.is_some() {
             DerivedValueKind::ListView
         } else if structural_group {
             DerivedValueKind::Pure
         } else if !trigger_arms.is_empty() {
             DerivedValueKind::SourceEventTransform
+        } else if statement.value.is_some_and(|root| {
+            executable_expression_contains_exact_call(
+                executable,
+                root,
+                &[
+                    "List/count",
+                    "List/every",
+                    "List/sum",
+                    "List/page",
+                    "Text/join",
+                ],
+            )
+        }) {
+            DerivedValueKind::Aggregate
         } else {
-            match derived_value_kind(field, &[]) {
-                // A parser operator spelling cannot establish keyed list
-                // storage. Only the checked executable list type above can.
-                DerivedValueKind::ListView if checked_result_is_list => {
-                    return Err(format!(
-                        "checked list value `{}` has no keyed materialized storage",
-                        field.path
-                    ));
-                }
-                DerivedValueKind::ListView => DerivedValueKind::Pure,
-                // Event ownership comes only from exact executable arms.
-                DerivedValueKind::SourceEventTransform => DerivedValueKind::Pure,
-                kind => kind,
-            }
+            DerivedValueKind::Pure
         };
-        let (causes, sources, trigger_arms, default_roots) =
-            if kind == DerivedValueKind::SourceEventTransform {
-                (event_causes, transform_sources, trigger_arms, default_roots)
-            } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-            };
         values.push(DerivedValue {
-            id: FieldId(id),
-            executable_statement_id,
-            indexed,
-            scope_id,
-            startup_recompute: derived_value_startup_recompute(&kind),
-            kind,
+            id: FieldId(values.len()),
+            executable_statement_id: statement.id,
+            path: field.diagnostic_path.clone(),
+            kind: kind.clone(),
             materialized_list_id: materialized_storage.as_ref().map(|storage| storage.list_id),
             materialized_row_scope_id: materialized_storage
                 .as_ref()
@@ -9561,22 +15378,203 @@ fn derived_values(
             causes,
             trigger_arms,
             default_roots,
-            path: field.path.clone(),
-            sources,
-            statement: field.statement.clone(),
+            sources: source_paths,
+            indexed: field.row.is_some(),
+            scope_id: field.row.map(|row| row.scope),
+            startup_recompute: derived_value_startup_recompute(&kind),
         });
     }
     Ok(values)
 }
 
-fn field_is_structural_group(field: &FieldDef) -> bool {
-    field.statement.expr.is_none()
-        && !field.statement.children.is_empty()
-        && field.statement.children.iter().all(|child| {
-            matches!(
-                child.kind,
-                AstStatementKind::Field { .. } | AstStatementKind::Source { .. }
-            )
+fn executable_hold_body_statement_ids(
+    executable: &ExecutableProgram,
+) -> BTreeSet<ExecutableStatementId> {
+    let statements = executable
+        .statements
+        .iter()
+        .map(|statement| (statement.id, statement))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = executable
+        .statements
+        .iter()
+        .filter(|statement| matches!(statement.kind, ExecutableStatementKind::Hold { .. }))
+        .flat_map(|statement| statement.children.iter().copied())
+        .collect::<Vec<_>>();
+    let mut result = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !result.insert(id) {
+            continue;
+        }
+        if let Some(statement) = statements.get(&id) {
+            pending.extend(statement.children.iter().copied());
+        }
+    }
+    result
+}
+
+fn executable_expression_contains_exact_call(
+    program: &ExecutableProgram,
+    root: ExecutableExprId,
+    names: &[&str],
+) -> bool {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let Some(expression) = program
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+        else {
+            continue;
+        };
+        if matches!(
+            &expression.kind,
+            ExecutableExpressionKind::Call { name, .. }
+                if names.iter().any(|candidate| name == candidate)
+        ) {
+            return true;
+        }
+        pending.extend(executable_expression_children(&expression.kind));
+    }
+    false
+}
+#[allow(clippy::too_many_arguments)]
+fn producer_derived_values(
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    row_scopes: &[RowScope],
+    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    state_cells: &[StateCell],
+    sources: &[SourcePort],
+    materializations: &[ContextualMaterialization],
+    instances: &[ProducerFunctionInstance],
+) -> Result<Vec<DerivedValue>, String> {
+    let mut event_source_collector = ExecutableViewBindingCollector::new(
+        executable,
+        static_owners,
+        None,
+        derived_list_storage,
+        row_scopes,
+        sources,
+        state_cells,
+        materializations,
+    )?;
+    let mut values = Vec::with_capacity(instances.len());
+    for instance in instances {
+        let field = executable
+            .statements
+            .iter()
+            .find(|statement| {
+                statement.value == Some(instance.root)
+                    && matches!(
+                        &statement.kind,
+                        ExecutableStatementKind::Field { path, .. }
+                            if path == &instance.result_path
+                    )
+            })
+            .ok_or_else(|| {
+                format!(
+                    "producer function identity {} has no ordinary executable result field",
+                    producer_identity_text(instance.identity)
+                )
+            })?;
+        let materialized_storage = derived_list_storage.get(&field.id).cloned();
+        let structural_group = executable_statement_is_structural_group(executable, field);
+        let (trigger_arms, default_roots) = if structural_group || materialized_storage.is_some() {
+            (Vec::new(), Vec::new())
+        } else {
+            event_source_collector.trigger_owned_arms_for_statement(field.id)?
+        };
+        let causes = trigger_arms
+            .iter()
+            .map(|arm| arm.cause)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut source_paths = causes
+            .iter()
+            .map(|cause| match cause {
+                EventCause::Source(source) => sources
+                    .get(source.as_usize())
+                    .filter(|candidate| candidate.id == *source)
+                    .map(|source| source.path.clone())
+                    .ok_or_else(|| format!("event cause references missing SourceId {source}")),
+                EventCause::State(state) => state_cells
+                    .get(state.as_usize())
+                    .filter(|candidate| candidate.id == *state)
+                    .map(|state| state.path.clone())
+                    .ok_or_else(|| format!("event cause references missing StateId {state}")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        source_paths.sort();
+        source_paths.dedup();
+        let kind = if materialized_storage.is_some() {
+            DerivedValueKind::ListView
+        } else if !trigger_arms.is_empty() {
+            DerivedValueKind::SourceEventTransform
+        } else {
+            DerivedValueKind::Pure
+        };
+        values.push(DerivedValue {
+            id: instance.result_field,
+            executable_statement_id: field.id,
+            path: instance.result_path.clone(),
+            kind: kind.clone(),
+            materialized_list_id: materialized_storage.as_ref().map(|storage| storage.list_id),
+            materialized_row_scope_id: materialized_storage
+                .as_ref()
+                .map(|storage| storage.row_scope_id),
+            causes,
+            trigger_arms,
+            default_roots,
+            sources: source_paths,
+            indexed: false,
+            scope_id: None,
+            startup_recompute: derived_value_startup_recompute(&kind),
+        });
+    }
+    Ok(values)
+}
+
+fn executable_statement_is_structural_group(
+    executable: &ExecutableProgram,
+    statement: &ExecutableStatement,
+) -> bool {
+    matches!(statement.kind, ExecutableStatementKind::Field { .. })
+        && statement.value.is_some_and(|value| {
+            executable
+                .expressions
+                .get(value.as_usize())
+                .filter(|expression| expression.id == value)
+                .is_some_and(|expression| {
+                    matches!(
+                        expression.kind,
+                        ExecutableExpressionKind::Object(_)
+                            | ExecutableExpressionKind::Record(_)
+                            | ExecutableExpressionKind::TaggedObject { .. }
+                    )
+                })
+        })
+        && !statement.children.is_empty()
+        && statement.children.iter().all(|child| {
+            executable
+                .statements
+                .iter()
+                .find(|candidate| candidate.id == *child)
+                .is_some_and(|child| {
+                    matches!(
+                        child.kind,
+                        ExecutableStatementKind::Field { .. }
+                            | ExecutableStatementKind::Source { .. }
+                            | ExecutableStatementKind::Hold { .. }
+                            | ExecutableStatementKind::List { .. }
+                            | ExecutableStatementKind::Spread
+                    )
+                })
         })
 }
 
@@ -9595,427 +15593,6 @@ fn derived_value_startup_recompute(kind: &DerivedValueKind) -> bool {
     }
 }
 
-fn field_is_list_memory_path(field: &FieldDef, program: &ParsedProgram) -> bool {
-    program
-        .list_memories
-        .iter()
-        .any(|list| field.path.ends_with(&format!(".{}", list.name)) || field.path == list.name)
-}
-
-fn field_is_derived_list_memory_view(field: &FieldDef, program: &ParsedProgram) -> bool {
-    if !field_is_list_memory_path(field, program) || field.has_operator("List/append") {
-        return false;
-    }
-    let Some(list) = field_list_memory(field, program) else {
-        return false;
-    };
-    match list_initializer(program, list) {
-        ListInitializer::RecordLiteral { rows } => list_initializer_has_dynamic_fields(&rows),
-        ListInitializer::Range { .. } => false,
-        ListInitializer::Empty => field.has_any_operator(&DERIVED_LIST_VIEW_OPERATORS),
-        ListInitializer::Unknown { .. } => {
-            field.has_any_operator(&DERIVED_LIST_VIEW_OPERATORS)
-                || field_references_list_memory(field, program)
-        }
-    }
-}
-
-const DERIVED_LIST_VIEW_OPERATORS: [&str; 8] = [
-    "List/map",
-    "List/filter",
-    "List/retain",
-    "List/query",
-    "List/query_prefix",
-    "List/move_field_first",
-    "List/move_field_last",
-    "WHEN",
-];
-
-fn list_initializer_has_dynamic_fields(rows: &[ListInitialRecord]) -> bool {
-    rows.iter().any(|row| {
-        row.fields.iter().any(|field| {
-            matches!(
-                field.value,
-                InitialValue::Unknown { .. } | InitialValue::RootInitialField { .. }
-            )
-        })
-    })
-}
-
-fn field_references_list_memory(field: &FieldDef, program: &ParsedProgram) -> bool {
-    program
-        .list_memories
-        .iter()
-        .any(|list| list.name != field.local_name && field.mentions_identifier_expr(&list.name))
-}
-
-fn field_list_memory<'a>(
-    field: &FieldDef,
-    program: &'a ParsedProgram,
-) -> Option<&'a boon_parser::ParsedListMemory> {
-    let local = field
-        .path
-        .rsplit_once('.')
-        .map(|(_, local)| local)
-        .unwrap_or(&field.path);
-    program.list_memories.iter().find(|list| list.name == local)
-}
-
-fn function_definitions(program: &ParsedProgram) -> Vec<FunctionDefinition> {
-    let mut functions = Vec::new();
-    collect_function_definitions(&program.ast.statements, &mut functions);
-    functions
-}
-
-fn collect_function_definitions(
-    statements: &[AstStatement],
-    functions: &mut Vec<FunctionDefinition>,
-) {
-    for statement in statements {
-        if let AstStatementKind::Function { name, parameters } = &statement.kind {
-            functions.push(FunctionDefinition {
-                id: FunctionId(functions.len()),
-                name: name.clone(),
-                args: parameters
-                    .iter()
-                    .map(|parameter| parameter.name.clone())
-                    .collect(),
-                statement: statement.clone(),
-            });
-        }
-        collect_function_definitions(&statement.children, functions);
-    }
-}
-
-fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
-    if field.has_operator("List/count") || field.has_operator("List/every") {
-        DerivedValueKind::Aggregate
-    } else if field.has_operator("List/latest")
-        || field_terminal_pipeline_operator(field).is_some_and(list_scalar_reducer_operator)
-    {
-        if !sources.is_empty() || field.has_then_expr() {
-            DerivedValueKind::SourceEventTransform
-        } else {
-            DerivedValueKind::Pure
-        }
-    } else if field.has_any_operator(&[
-        "List/retain",
-        "List/filter",
-        "List/map",
-        "List/chunk",
-        "List/find",
-        "List/query",
-        "List/query_prefix",
-        "List/move_field_first",
-        "List/move_field_last",
-    ]) {
-        DerivedValueKind::ListView
-    } else if !sources.is_empty() || field.has_then_expr() {
-        DerivedValueKind::SourceEventTransform
-    } else if field.ast_items.is_empty() {
-        DerivedValueKind::Unknown
-    } else {
-        DerivedValueKind::Pure
-    }
-}
-
-fn field_terminal_pipeline_operator(field: &FieldDef) -> Option<&str> {
-    let expr_id = field
-        .statement
-        .children
-        .iter()
-        .rev()
-        .find_map(top_level_pipeline_statement_expr_id)
-        .or(field.statement.expr)?;
-    field
-        .ast_exprs
-        .iter()
-        .find(|expr| expr.id == expr_id)
-        .and_then(expr_operator)
-}
-
-fn top_level_pipeline_statement_expr_id(statement: &AstStatement) -> Option<usize> {
-    if let Some(expr_id) = statement
-        .children
-        .iter()
-        .rev()
-        .find_map(top_level_pipeline_statement_expr_id)
-    {
-        return Some(expr_id);
-    }
-    match statement.kind {
-        AstStatementKind::Expression
-        | AstStatementKind::Hold { .. }
-        | AstStatementKind::List { field: None, .. } => statement.expr,
-        _ => None,
-    }
-}
-
-fn expr_operator(expr: &AstExpr) -> Option<&str> {
-    match &expr.kind {
-        AstExprKind::Pipe { op, .. } => Some(op.as_str()),
-        AstExprKind::Call { function, .. } => Some(function.as_str()),
-        _ => None,
-    }
-}
-
-fn list_scalar_reducer_operator(operator: &str) -> bool {
-    matches!(operator, "Text/join" | "List/count" | "List/sum")
-}
-
-fn field_initial_value(
-    field: &FieldDef,
-    row_scopes: &[RowScope],
-    fields: &[FieldDef],
-) -> InitialValue {
-    let initial_expr = field_initial_expr(field);
-    let Some(expr) = initial_expr else {
-        return InitialValue::Unknown {
-            summary: "missing initial value".to_owned(),
-        };
-    };
-    let current_row_scope = row_scopes
-        .iter()
-        .find(|scope| field.path.starts_with(&format!("{}.", scope.row_scope)))
-        .map(|scope| scope.row_scope.as_str());
-    let value = ast_initial_value(expr, &field.ast_exprs, row_scopes, current_row_scope);
-    let InitialValue::RootInitialField { path } = value else {
-        return value;
-    };
-    let Some(current_row_scope) = current_row_scope else {
-        return InitialValue::RootInitialField { path };
-    };
-    let Some(canonical) = canonical_current_row_member_path(field, &path, fields) else {
-        return InitialValue::RootInitialField { path };
-    };
-    if canonical.starts_with(&format!("{current_row_scope}.")) {
-        InitialValue::RowInitialField { path: canonical }
-    } else {
-        InitialValue::RootInitialField { path }
-    }
-}
-
-fn field_initial_expr(field: &FieldDef) -> Option<&AstExpr> {
-    if let Some(initial) = field.ast_exprs.iter().find_map(|expr| match expr.kind {
-        AstExprKind::Hold { initial, .. } => Some(initial),
-        AstExprKind::Pipe { input, ref op, .. } if op == "HOLD" => Some(input),
-        _ => None,
-    }) {
-        let candidate = field.ast_exprs.iter().find(|expr| expr.id == initial)?;
-        if !matches!(candidate.kind, AstExprKind::Delimiter) {
-            return Some(candidate);
-        }
-        field.ast_exprs.iter().rev().find(|expr| {
-            expr.id < initial
-                && !matches!(
-                    expr.kind,
-                    AstExprKind::Delimiter | AstExprKind::Latest | AstExprKind::Hold { .. }
-                )
-                && !ast_expr_is_block_marker(expr)
-        })
-    } else {
-        field.ast_exprs.iter().find(|expr| {
-            !matches!(expr.kind, AstExprKind::Latest) && !ast_expr_is_block_marker(expr)
-        })
-    }
-}
-
-fn ast_expr_is_block_marker(expr: &AstExpr) -> bool {
-    matches!(&expr.kind, AstExprKind::Identifier(value) if value == "BLOCK")
-        || matches!(&expr.kind, AstExprKind::Unknown(tokens) if tokens.first().map(String::as_str) == Some("BLOCK") && tokens.last().map(String::as_str) == Some("{"))
-}
-
-fn ast_initial_value(
-    expr: &AstExpr,
-    expressions: &[AstExpr],
-    row_scopes: &[RowScope],
-    current_row_scope: Option<&str>,
-) -> InitialValue {
-    match &expr.kind {
-        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => InitialValue::Text {
-            value: value.clone(),
-        },
-        AstExprKind::Number(value) => InitialValue::Number {
-            value: value.clone(),
-        },
-        AstExprKind::ByteLiteral { value, .. } => InitialValue::Bytes {
-            bytes: vec![*value],
-            fixed_len: Some(1),
-        },
-        AstExprKind::BytesLiteral { size, items } => initial_bytes_value(size, items, expressions)
-            .unwrap_or_else(|| InitialValue::Unknown {
-                summary: ast_expr_label(expr),
-            }),
-        AstExprKind::Bool(value) => InitialValue::Bool { value: *value },
-        AstExprKind::Enum(value) | AstExprKind::Tag(value) if value == "Text/empty" => {
-            InitialValue::Text {
-                value: String::new(),
-            }
-        }
-        AstExprKind::Enum(value) | AstExprKind::Tag(value) => InitialValue::Enum {
-            value: value.clone(),
-        },
-        AstExprKind::Path(parts) if parts.as_slice() == ["Text/empty"] => InitialValue::Text {
-            value: String::new(),
-        },
-        AstExprKind::Path(parts)
-            if parts
-                .first()
-                .is_some_and(|root| row_scopes.iter().any(|scope| scope.row_scope == *root)) =>
-        {
-            InitialValue::RowInitialField {
-                path: parts[1..].join("."),
-            }
-        }
-        AstExprKind::Path(parts)
-            if parts.len() == 1 && value_starts_uppercase_identifier(&parts[0]) =>
-        {
-            InitialValue::Enum {
-                value: parts[0].clone(),
-            }
-        }
-        AstExprKind::Path(parts) => InitialValue::RootInitialField {
-            path: parts.join("."),
-        },
-        AstExprKind::Identifier(value)
-            if current_row_scope.is_some() && !value_starts_uppercase_identifier(value) =>
-        {
-            InitialValue::RowInitialField {
-                path: value.clone(),
-            }
-        }
-        AstExprKind::Identifier(value) if value_starts_uppercase_identifier(value) => {
-            InitialValue::Enum {
-                value: value.clone(),
-            }
-        }
-        AstExprKind::Identifier(value) => InitialValue::RootInitialField {
-            path: value.clone(),
-        },
-        _ => InitialValue::Unknown {
-            summary: ast_expr_label(expr),
-        },
-    }
-}
-
-fn initial_bytes_value(
-    size: &BytesSizeSyntax,
-    items: &[usize],
-    expressions: &[AstExpr],
-) -> Option<InitialValue> {
-    let mut bytes = Vec::new();
-    for item in items {
-        let item_expr = expressions.iter().find(|expr| expr.id == *item)?;
-        push_initial_bytes_expr(item_expr, expressions, &mut bytes)?;
-    }
-    if let BytesSizeSyntax::Fixed(expected) = size {
-        if items.is_empty() && *expected > 0 {
-            bytes.resize(*expected, 0);
-        } else if bytes.len() != *expected {
-            return None;
-        }
-    }
-    let fixed_len = match size {
-        BytesSizeSyntax::Dynamic => None,
-        BytesSizeSyntax::Infer => Some(bytes.len()),
-        BytesSizeSyntax::Fixed(expected) => Some(*expected),
-    };
-    Some(InitialValue::Bytes { bytes, fixed_len })
-}
-
-fn push_initial_bytes_expr(
-    expr: &AstExpr,
-    expressions: &[AstExpr],
-    bytes: &mut Vec<u8>,
-) -> Option<()> {
-    match &expr.kind {
-        AstExprKind::ByteLiteral { value, .. } => {
-            bytes.push(*value);
-            Some(())
-        }
-        AstExprKind::BytesLiteral { size, items } => {
-            let InitialValue::Bytes { bytes: nested, .. } =
-                initial_bytes_value(size, items, expressions)?
-            else {
-                return None;
-            };
-            bytes.extend(nested);
-            Some(())
-        }
-        _ => None,
-    }
-}
-
-fn list_initializer(
-    program: &ParsedProgram,
-    list: &boon_parser::ParsedListMemory,
-) -> ListInitializer {
-    let Some(items) = (list.line > 0)
-        .then(|| {
-            list_body_items(program, &list.name)
-                .or_else(|| list_body_items_by_line(program, list.line))
-        })
-        .flatten()
-    else {
-        if list.line == 0 {
-            return ListInitializer::Empty;
-        }
-        return ListInitializer::Unknown {
-            summary: "list body not found".to_owned(),
-        };
-    };
-    if items.iter().any(|item| item_has_symbol(item, "List/range")) {
-        return ListInitializer::Range {
-            from: extract_i64_arg_from_items(&items, "from").unwrap_or(0),
-            to: extract_i64_arg_from_items(&items, "to").unwrap_or(0),
-        };
-    }
-    if let Some(rows) = structured_list_record_rows(program, list)
-        && !rows.is_empty()
-    {
-        return ListInitializer::RecordLiteral { rows };
-    }
-    let rows = list_record_literal_rows(&items);
-    if !rows.is_empty() {
-        return ListInitializer::RecordLiteral { rows };
-    }
-    if items.iter().any(|item| item_has_symbol(item, "LIST")) {
-        ListInitializer::Empty
-    } else {
-        ListInitializer::Unknown {
-            summary: items.first().map(item_summary).unwrap_or_default(),
-        }
-    }
-}
-
-fn structured_list_record_rows(
-    program: &ParsedProgram,
-    list: &boon_parser::ParsedListMemory,
-) -> Option<Vec<ListInitialRecord>> {
-    let statement = find_list_statement(&program.ast.statements, list)?;
-    let rows = statement
-        .children
-        .iter()
-        .filter_map(|row| {
-            if matches!(row.kind, AstStatementKind::Block) {
-                structured_list_record_row(program, row)
-            } else {
-                row.expr
-                    .and_then(|expr_id| {
-                        static_initial_data_expr(
-                            program,
-                            expr_id,
-                            &BTreeMap::new(),
-                            &mut Vec::new(),
-                        )
-                    })
-                    .and_then(initial_record_from_data)
-            }
-        })
-        .collect::<Vec<_>>();
-    Some(rows)
-}
-
 fn initial_record_from_data(value: boon_data::Value) -> Option<ListInitialRecord> {
     let boon_data::Value::Record(fields) = value else {
         return None;
@@ -10026,6 +15603,7 @@ fn initial_record_from_data(value: boon_data::Value) -> Option<ListInitialRecord
             .map(|(name, value)| ListRowInitialField {
                 name,
                 value: initial_value_from_data(value),
+                expression: None,
             })
             .collect(),
     })
@@ -10046,7662 +15624,6 @@ fn initial_value_from_data(value: boon_data::Value) -> InitialValue {
             InitialValue::Enum { value: tag }
         }
         value => InitialValue::Data { value },
-    }
-}
-
-fn static_initial_data_expr(
-    program: &ParsedProgram,
-    expr_id: usize,
-    env: &BTreeMap<String, boon_data::Value>,
-    call_stack: &mut Vec<String>,
-) -> Option<boon_data::Value> {
-    let expr = program.expressions.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
-            Some(boon_data::Value::Text(value.clone()))
-        }
-        AstExprKind::Number(value) => value
-            .parse::<boon_data::FiniteReal>()
-            .ok()
-            .map(boon_data::Value::Number),
-        AstExprKind::ByteLiteral { value, .. } => boon_data::Value::integer(i64::from(*value)).ok(),
-        AstExprKind::BytesLiteral { size, items } => {
-            let InitialValue::Bytes { bytes, .. } =
-                initial_bytes_value(size, items, &program.expressions)?
-            else {
-                return None;
-            };
-            Some(boon_data::Value::Bytes(bytes.into()))
-        }
-        AstExprKind::Bool(value) => Some(boon_data::Value::Bool(*value)),
-        AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => Some(boon_data::Value::Variant {
-            tag: tag.clone(),
-            fields: BTreeMap::new(),
-        }),
-        AstExprKind::Identifier(name) => env.get(name).cloned(),
-        AstExprKind::Path(parts) if parts.len() == 1 => env.get(&parts[0]).cloned(),
-        AstExprKind::Record(fields) | AstExprKind::Object(fields) => fields
-            .iter()
-            .filter(|field| !field.spread)
-            .map(|field| {
-                Some((
-                    field.name.clone(),
-                    static_initial_data_expr(program, field.value, env, call_stack)?,
-                ))
-            })
-            .collect::<Option<BTreeMap<_, _>>>()
-            .map(boon_data::Value::Record),
-        AstExprKind::TaggedObject { tag, fields } => fields
-            .iter()
-            .filter(|field| !field.spread)
-            .map(|field| {
-                Some((
-                    field.name.clone(),
-                    static_initial_data_expr(program, field.value, env, call_stack)?,
-                ))
-            })
-            .collect::<Option<BTreeMap<_, _>>>()
-            .map(|fields| boon_data::Value::Variant {
-                tag: tag.clone(),
-                fields,
-            }),
-        AstExprKind::ListLiteral { items, .. } => items
-            .iter()
-            .map(|item| static_initial_data_expr(program, *item, env, call_stack))
-            .collect::<Option<Vec<_>>>()
-            .map(boon_data::Value::List),
-        AstExprKind::Call { function, .. } if function == "Text/empty" => {
-            Some(boon_data::Value::Text(String::new()))
-        }
-        AstExprKind::Call { function, args, .. } => {
-            static_initial_function_call(program, expr.id, function, args, env, call_stack)
-        }
-        _ => None,
-    }
-}
-
-fn static_initial_function_call(
-    program: &ParsedProgram,
-    call_expr_id: usize,
-    function: &str,
-    inline_args: &[boon_parser::AstCallArg],
-    outer_env: &BTreeMap<String, boon_data::Value>,
-    call_stack: &mut Vec<String>,
-) -> Option<boon_data::Value> {
-    if call_stack.len() >= 64 || call_stack.iter().any(|active| active == function) {
-        return None;
-    }
-    let definition = find_function_statement(&program.ast.statements, function)?;
-    let AstStatementKind::Function { parameters, .. } = &definition.kind else {
-        return None;
-    };
-    let mut argument_exprs = BTreeMap::<String, usize>::new();
-    for arg in inline_args {
-        argument_exprs.insert(arg.named_name()?.to_owned(), arg.value);
-    }
-    if inline_args.is_empty() {
-        let statement = find_statement_by_expr(&program.ast.statements, call_expr_id)?;
-        for child in &statement.children {
-            match &child.kind {
-                AstStatementKind::Field { name } => {
-                    argument_exprs.insert(name.clone(), child.expr?);
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut env = BTreeMap::new();
-    for parameter in parameters
-        .iter()
-        .filter(|parameter| parameter.kind == boon_parser::AstParameterKind::Value)
-    {
-        let expr_id = *argument_exprs.get(&parameter.name)?;
-        env.insert(
-            parameter.name.clone(),
-            static_initial_data_expr(program, expr_id, outer_env, call_stack)?,
-        );
-    }
-    call_stack.push(function.to_owned());
-    let result = static_initial_function_body(program, definition, &env, call_stack);
-    call_stack.pop();
-    result
-}
-
-fn static_initial_function_body(
-    program: &ParsedProgram,
-    definition: &AstStatement,
-    env: &BTreeMap<String, boon_data::Value>,
-    call_stack: &mut Vec<String>,
-) -> Option<boon_data::Value> {
-    if let Some(block) = definition.children.iter().find(|child| {
-        matches!(child.kind, AstStatementKind::Block)
-            && child
-                .children
-                .iter()
-                .any(|field| matches!(field.kind, AstStatementKind::Field { .. }))
-    }) {
-        let fields = block
-            .children
-            .iter()
-            .filter_map(|field| {
-                let AstStatementKind::Field { name } = &field.kind else {
-                    return None;
-                };
-                Some((
-                    name.clone(),
-                    static_initial_data_expr(program, field.expr?, env, call_stack)?,
-                ))
-            })
-            .collect::<BTreeMap<_, _>>();
-        if !fields.is_empty() {
-            return Some(boon_data::Value::Record(fields));
-        }
-    }
-    let result_expr = function_result_expr_id(definition, &program.expressions)?;
-    static_initial_data_expr(program, result_expr, env, call_stack)
-}
-
-fn find_function_statement<'a>(
-    statements: &'a [AstStatement],
-    function: &str,
-) -> Option<&'a AstStatement> {
-    statements.iter().find_map(|statement| {
-        let matches = matches!(
-            &statement.kind,
-            AstStatementKind::Function { name, .. }
-                if name == function
-                    || function.rsplit_once('/').is_some_and(|(_, suffix)| suffix == name)
-        );
-        matches
-            .then_some(statement)
-            .or_else(|| find_function_statement(&statement.children, function))
-    })
-}
-
-fn find_statement_by_expr(statements: &[AstStatement], expr_id: usize) -> Option<&AstStatement> {
-    statements.iter().find_map(|statement| {
-        (statement.expr == Some(expr_id))
-            .then_some(statement)
-            .or_else(|| find_statement_by_expr(&statement.children, expr_id))
-    })
-}
-
-fn find_statement_by_id(statements: &[AstStatement], statement_id: usize) -> Option<&AstStatement> {
-    statements.iter().find_map(|statement| {
-        (statement.id == statement_id)
-            .then_some(statement)
-            .or_else(|| find_statement_by_id(&statement.children, statement_id))
-    })
-}
-
-fn function_result_expr_id(statement: &AstStatement, expressions: &[AstExpr]) -> Option<usize> {
-    statement
-        .expr
-        .filter(|expr_id| {
-            expressions.iter().any(|expr| {
-                expr.id == *expr_id
-                    && matches!(
-                        expr.kind,
-                        AstExprKind::Record(_)
-                            | AstExprKind::Object(_)
-                            | AstExprKind::TaggedObject { .. }
-                            | AstExprKind::Call { .. }
-                            | AstExprKind::ListLiteral { .. }
-                    )
-            })
-        })
-        .or_else(|| {
-            statement
-                .children
-                .iter()
-                .rev()
-                .find_map(|child| function_result_expr_id(child, expressions))
-        })
-}
-
-fn find_list_statement<'a>(
-    statements: &'a [AstStatement],
-    list: &boon_parser::ParsedListMemory,
-) -> Option<&'a AstStatement> {
-    statements.iter().find_map(|statement| {
-        let matches_list = statement.line == list.line
-            && matches!(
-                &statement.kind,
-                AstStatementKind::List {
-                    field: Some(field),
-                    ..
-                } if field == &list.name
-            );
-        matches_list
-            .then_some(statement)
-            .or_else(|| find_list_statement(&statement.children, list))
-    })
-}
-
-fn structured_list_record_row(
-    program: &ParsedProgram,
-    statement: &AstStatement,
-) -> Option<ListInitialRecord> {
-    let fields = statement
-        .children
-        .iter()
-        .filter_map(|field| {
-            let AstStatementKind::Field { name } = &field.kind else {
-                return None;
-            };
-            let expr = field
-                .expr
-                .and_then(|expr_id| program.expressions.iter().find(|expr| expr.id == expr_id))?;
-            Some(ListRowInitialField {
-                name: name.clone(),
-                value: ast_initial_value(expr, &program.expressions, &[], None),
-            })
-        })
-        .collect::<Vec<_>>();
-    (!fields.is_empty()).then_some(ListInitialRecord { fields })
-}
-
-fn list_body_items_by_line(program: &ParsedProgram, line: usize) -> Option<Vec<AstItem>> {
-    let items = program.ast.semantic_parser_items().collect::<Vec<_>>();
-    items
-        .iter()
-        .position(|item| item.line == line)
-        .map(|item_index| collect_field_ast_items(&items, item_index, items[item_index].indent))
-}
-
-fn list_body_items(program: &ParsedProgram, list_name: &str) -> Option<Vec<AstItem>> {
-    let items = program.ast.semantic_parser_items().collect::<Vec<_>>();
-    for (item_index, item) in items.iter().enumerate() {
-        if item.field.as_deref() == Some(list_name) {
-            return Some(collect_field_ast_items(&items, item_index, item.indent));
-        }
-    }
-    None
-}
-
-fn list_record_literal_rows(items: &[AstItem]) -> Vec<ListInitialRecord> {
-    let mut rows = Vec::new();
-    let mut in_literal = false;
-    for item in items {
-        if item_has_symbol(item, "LIST") {
-            in_literal = true;
-            continue;
-        }
-        if item_has_symbol(item, "|>")
-            && item
-                .symbols
-                .iter()
-                .any(|lexeme| symbol_is_list_operator(lexeme))
-        {
-            break;
-        }
-        if !in_literal {
-            continue;
-        }
-        if let Some(record) = list_record_literal_item(item) {
-            rows.push(record);
-        }
-    }
-    rows
-}
-
-fn list_record_literal_item(item: &AstItem) -> Option<ListInitialRecord> {
-    if item.symbols.first().map(String::as_str) != Some("[")
-        || item.symbols.last().map(String::as_str) != Some("]")
-    {
-        return None;
-    }
-    let mut fields = Vec::new();
-    for part in split_top_level(&item.symbols[1..item.symbols.len() - 1], ",") {
-        if part.len() < 3 || part.get(1).map(String::as_str) != Some(":") {
-            continue;
-        }
-        let name = part[0].as_str();
-        if !is_name(name) {
-            continue;
-        }
-        fields.push(ListRowInitialField {
-            name: name.to_owned(),
-            value: literal_initial_value(&part[2..]),
-        });
-    }
-    (!fields.is_empty()).then_some(ListInitialRecord { fields })
-}
-
-fn literal_initial_value(tokens: &[String]) -> InitialValue {
-    if let Some(value) = string_literal_value(tokens) {
-        return InitialValue::Text { value };
-    }
-    if let Some(value) = text_literal_value(tokens) {
-        return InitialValue::Text { value };
-    }
-    if let Some(value) = signed_integer_literal_value(tokens) {
-        return InitialValue::Number {
-            value: value.to_string(),
-        };
-    }
-    if let Some(value) = byte_literal_value(tokens) {
-        return InitialValue::Bytes {
-            bytes: vec![value],
-            fixed_len: Some(1),
-        };
-    }
-    if let Some(value) = bytes_literal_value(tokens) {
-        return value;
-    }
-    let value = tokens_to_path(tokens);
-    match value.as_str() {
-        "True" => InitialValue::Bool { value: true },
-        "False" => InitialValue::Bool { value: false },
-        value if is_number_literal(value) => InitialValue::Number {
-            value: value.to_owned(),
-        },
-        value if value_starts_uppercase_identifier(value) => InitialValue::Enum {
-            value: value.to_owned(),
-        },
-        value if value_is_root_initial_field_ref(value) => InitialValue::RootInitialField {
-            path: value.to_owned(),
-        },
-        value => InitialValue::Unknown {
-            summary: value.to_owned(),
-        },
-    }
-}
-
-fn value_is_root_initial_field_ref(value: &str) -> bool {
-    !value.is_empty() && !value_starts_uppercase_identifier(value) && value.split('.').all(is_name)
-}
-
-fn signed_integer_literal_value(tokens: &[String]) -> Option<i64> {
-    match tokens {
-        [value] => value.parse::<i64>().ok(),
-        [sign, value] if sign == "-" && value.chars().all(|ch| ch.is_ascii_digit()) => {
-            value.parse::<i64>().ok().and_then(i64::checked_neg)
-        }
-        [sign, value] if sign == "+" && value.chars().all(|ch| ch.is_ascii_digit()) => {
-            value.parse::<i64>().ok()
-        }
-        _ => None,
-    }
-}
-
-fn is_number_literal(value: &str) -> bool {
-    value.parse::<f64>().is_ok_and(f64::is_finite)
-}
-
-fn byte_literal_value(tokens: &[String]) -> Option<u8> {
-    match tokens {
-        [base, suffix] => parse_byte_literal_token_parts(base, suffix),
-        [combined] => {
-            let split = combined.find('u')?;
-            let (base, suffix) = combined.split_at(split);
-            parse_byte_literal_token_parts(base, suffix)
-        }
-        _ => None,
-    }
-}
-
-fn parse_byte_literal_token_parts(base: &str, suffix: &str) -> Option<u8> {
-    let radix = match base {
-        "2" => 2,
-        "8" => 8,
-        "10" => 10,
-        "16" => 16,
-        _ => return None,
-    };
-    let digits = suffix.strip_prefix('u')?;
-    if digits.is_empty() || !digits.chars().all(|ch| ch.is_digit(radix)) {
-        return None;
-    }
-    let value = u16::from_str_radix(digits, radix).ok()?;
-    (value <= u8::MAX as u16).then_some(value as u8)
-}
-
-fn bytes_literal_value(tokens: &[String]) -> Option<InitialValue> {
-    if tokens.first().map(String::as_str) != Some("BYTES") {
-        return None;
-    }
-    let (fixed_len, body_open) = match tokens.get(1).map(String::as_str) {
-        Some("{") => (None, 1),
-        Some("[") => {
-            let size_close = matching_close_token(tokens, 1)?;
-            let fixed_len = match &tokens[2..size_close] {
-                [value] if value == "__" => Some(None),
-                [value] => Some(Some(value.parse::<usize>().ok()?)),
-                _ => return None,
-            }?;
-            if tokens.get(size_close + 1).map(String::as_str) != Some("{") {
-                return None;
-            }
-            (fixed_len, size_close + 1)
-        }
-        _ => return None,
-    };
-    let body_close = matching_close_token(tokens, body_open)?;
-    if body_close + 1 != tokens.len() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    if body_close > body_open + 1 {
-        for item in split_top_level(&tokens[body_open + 1..body_close], ",") {
-            if item.is_empty() {
-                continue;
-            }
-            if let Some(byte) = byte_literal_value(&item) {
-                bytes.push(byte);
-            } else if let Some(InitialValue::Bytes { bytes: nested, .. }) =
-                bytes_literal_value(&item)
-            {
-                bytes.extend(nested);
-            } else {
-                return None;
-            }
-        }
-    }
-    if let Some(expected) = fixed_len {
-        if bytes.is_empty() && expected > 0 {
-            bytes.resize(expected, 0);
-        } else if bytes.len() != expected {
-            return None;
-        }
-    }
-    Some(InitialValue::Bytes { bytes, fixed_len })
-}
-
-fn matching_close_token(tokens: &[String], open: usize) -> Option<usize> {
-    let (open_token, close_token) = match tokens.get(open).map(String::as_str)? {
-        "[" => ("[", "]"),
-        "{" => ("{", "}"),
-        "(" => ("(", ")"),
-        _ => return None,
-    };
-    let mut depth = 0usize;
-    for (index, token) in tokens.iter().enumerate().skip(open) {
-        if token == open_token {
-            depth += 1;
-        } else if token == close_token {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(index);
-            }
-        }
-    }
-    None
-}
-
-fn string_literal_value(tokens: &[String]) -> Option<String> {
-    let token = tokens.first()?;
-    if tokens.len() != 1 || !token.starts_with('"') || !token.ends_with('"') {
-        return None;
-    }
-    Some(token[1..token.len().saturating_sub(1)].replace("\\\"", "\""))
-}
-
-fn text_literal_value(tokens: &[String]) -> Option<String> {
-    if tokens.first().map(String::as_str) != Some("TEXT")
-        || tokens.get(1).map(String::as_str) != Some("{")
-    {
-        return None;
-    }
-    let close = tokens.iter().rposition(|token| token == "}")?;
-    Some(join_text_literal_tokens(&tokens[2..close]))
-}
-
-fn join_text_literal_tokens(tokens: &[String]) -> String {
-    let mut output = String::new();
-    let mut previous = "";
-    for token in tokens {
-        if output.is_empty() {
-            output.push_str(token);
-        } else if text_literal_needs_space(previous, token) {
-            output.push(' ');
-            output.push_str(token);
-        } else {
-            output.push_str(token);
-        }
-        previous = token;
-    }
-    output
-}
-
-fn text_literal_needs_space(previous: &str, current: &str) -> bool {
-    if matches!(
-        current,
-        "[" | "(" | "{" | "]" | ")" | "}" | "," | "." | ":" | ";" | "%"
-    ) {
-        return false;
-    }
-    if matches!(previous, "[" | "(" | "{" | "." | ":" | "#" | "/" | "%") {
-        return false;
-    }
-    if previous.chars().all(|ch| ch.is_ascii_digit())
-        && current
-            .chars()
-            .next()
-            .is_some_and(|ch| matches!(ch, 'x' | 'X'))
-    {
-        return false;
-    }
-    true
-}
-
-fn extract_i64_arg_from_items(items: &[AstItem], name: &str) -> Option<i64> {
-    items.iter().find_map(|item| {
-        item.symbols.windows(3).find_map(|window| {
-            (window[0] == name && window[1] == ":")
-                .then(|| window[2].parse().ok())
-                .flatten()
-        })
-    })
-}
-
-fn ast_call_argument(field: &FieldDef, function: &str) -> Option<String> {
-    ast_call_arguments(field, function).into_iter().next()
-}
-
-fn ast_call_arguments(field: &FieldDef, function: &str) -> Vec<String> {
-    let inline = field
-        .ast_exprs
-        .iter()
-        .find_map(|expr| match &expr.kind {
-            AstExprKind::Call {
-                function: call_function,
-                args,
-                ..
-            } if call_function == function => Some(args.as_slice()),
-            AstExprKind::Pipe { op, args, .. } if op == function => Some(args.as_slice()),
-            _ => None,
-        })
-        .into_iter()
-        .flatten()
-        .filter(|arg| arg.is_bare_binding())
-        .map(|arg| arg.name.clone())
-        .collect::<Vec<_>>();
-    if !inline.is_empty() {
-        return inline;
-    }
-    ast_multiline_call_statement(field, function)
-        .into_iter()
-        .flat_map(|statement| &statement.children)
-        .filter(|child| matches!(child.kind, AstStatementKind::Expression))
-        .filter_map(|child| child.expr)
-        .filter_map(|expr_id| ast_argument_value(field, expr_id))
-        .collect()
-}
-
-fn ast_named_call_argument(field: &FieldDef, function: &str, name: &str) -> Option<String> {
-    let inline = field
-        .ast_exprs
-        .iter()
-        .find_map(|expr| match &expr.kind {
-            AstExprKind::Call {
-                function: call_function,
-                args,
-                ..
-            } if call_function == function => Some(args.as_slice()),
-            AstExprKind::Pipe { op, args, .. } if op == function => Some(args.as_slice()),
-            _ => None,
-        })?
-        .iter()
-        .find(|arg| arg.named_name() == Some(name))
-        .and_then(|arg| ast_argument_value(field, arg.value));
-    inline.or_else(|| {
-        ast_multiline_call_statement(field, function)?
-            .children
-            .iter()
-            .find(|child| {
-                matches!(&child.kind, AstStatementKind::Field { name: field } if field == name)
-            })
-            .and_then(|child| child.expr)
-            .and_then(|expr_id| ast_argument_value(field, expr_id))
-    })
-}
-
-fn ast_multiline_call_statement<'a>(
-    field: &'a FieldDef,
-    function: &str,
-) -> Option<&'a AstStatement> {
-    fn find<'a>(
-        statement: &'a AstStatement,
-        expressions: &[AstExpr],
-        function: &str,
-    ) -> Option<&'a AstStatement> {
-        if statement.expr.is_some_and(|expr_id| {
-            expressions.iter().find(|expr| expr.id == expr_id).is_some_and(|expr| {
-                matches!(&expr.kind, AstExprKind::Call { function: called, .. } if called == function)
-                    || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == function)
-            })
-        }) {
-            return Some(statement);
-        }
-        statement
-            .children
-            .iter()
-            .find_map(|child| find(child, expressions, function))
-    }
-
-    find(&field.statement, &field.ast_exprs, function)
-}
-
-fn ast_argument_value(field: &FieldDef, expr_id: usize) -> Option<String> {
-    ast_argument_value_in_exprs(&field.ast_exprs, expr_id)
-}
-
-fn scalar_number_operand(field: &FieldDef, expr_id: usize, target: &str) -> Option<String> {
-    let value = ast_argument_value(field, expr_id)?;
-    if is_number_literal(&value) {
-        return Some(value);
-    }
-    let target_field = target
-        .rsplit_once('.')
-        .map(|(_, field)| field)
-        .unwrap_or(target);
-    let canonical = if value == field.local_name || value == target_field {
-        target.to_owned()
-    } else {
-        canonical_local_path(&value, &field.parent_path)
-    };
-    Some(canonical)
-}
-
-fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
-    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
-    Some(match &expr.kind {
-        AstExprKind::Identifier(value)
-        | AstExprKind::Enum(value)
-        | AstExprKind::Tag(value)
-        | AstExprKind::Number(value) => value.clone(),
-        AstExprKind::ByteLiteral { value, .. } => value.to_string(),
-        AstExprKind::Path(parts) => boon_parser::canonical_value_path(parts),
-        AstExprKind::Bool(true) => "True".to_owned(),
-        AstExprKind::Bool(false) => "False".to_owned(),
-        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => value.clone(),
-        AstExprKind::Unknown(tokens) => tokens_to_path(tokens),
-        AstExprKind::Delimiter => String::new(),
-        AstExprKind::Source
-        | AstExprKind::Drain { .. }
-        | AstExprKind::Draining { .. }
-        | AstExprKind::Call { .. }
-        | AstExprKind::Pipe { .. }
-        | AstExprKind::Hold { .. }
-        | AstExprKind::Latest
-        | AstExprKind::When { .. }
-        | AstExprKind::Then { .. }
-        | AstExprKind::Infix { .. }
-        | AstExprKind::MatchArm { .. }
-        | AstExprKind::Block { .. }
-        | AstExprKind::Record(_)
-        | AstExprKind::Object(_)
-        | AstExprKind::TaggedObject { .. }
-        | AstExprKind::BytesLiteral { .. }
-        | AstExprKind::ListLiteral { .. } => ast_expr_label(expr),
-    })
-}
-
-struct ResolvedConstantLookup<'a> {
-    by_expr_id: BTreeMap<usize, &'a boon_typecheck::ResolvedConstantValue>,
-}
-
-impl<'a> ResolvedConstantLookup<'a> {
-    fn new(report: &'a boon_typecheck::TypeCheckReport) -> Self {
-        Self {
-            by_expr_id: report
-                .resolved_constant_table
-                .entries
-                .iter()
-                .map(|entry| (entry.expr_id, &entry.value))
-                .collect(),
-        }
-    }
-
-    fn unsigned_integer(&self, expr_id: usize) -> Option<u64> {
-        match self.by_expr_id.get(&expr_id).copied()? {
-            boon_typecheck::ResolvedConstantValue::UnsignedInteger { value } => Some(*value),
-            _ => None,
-        }
-    }
-
-    fn signed_integer(&self, expr_id: usize) -> Option<i64> {
-        match self.by_expr_id.get(&expr_id).copied()? {
-            boon_typecheck::ResolvedConstantValue::SignedInteger { value } => Some(*value),
-            boon_typecheck::ResolvedConstantValue::UnsignedInteger { value } => {
-                i64::try_from(*value).ok()
-            }
-            _ => None,
-        }
-    }
-
-    fn symbol(&self, expr_id: usize) -> Option<&str> {
-        match self.by_expr_id.get(&expr_id).copied()? {
-            boon_typecheck::ResolvedConstantValue::Symbol { value } => Some(value.as_str()),
-            _ => None,
-        }
-    }
-}
-
-fn bytes_arg_expr_id<'a>(
-    args: &'a [AstCallArg],
-    names: &[&str],
-    _positional_index: usize,
-) -> Option<&'a AstCallArg> {
-    args.iter()
-        .find(|arg| arg.named_name().is_some_and(|name| names.contains(&name)))
-}
-
-fn bytes_get_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    args.iter()
-        .find(|arg| arg.named_name() == Some("input"))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn bytes_get_index_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<u64> {
-    let positional_index = if piped { 0 } else { 1 };
-    bytes_arg_expr_id(args, &["index"], positional_index)
-        .and_then(|arg| resolved_constants.unsigned_integer(arg.value))
-}
-
-fn bytes_set_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    bytes_get_input_arg_in_exprs(exprs, args)
-}
-
-fn bytes_set_index_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<u64> {
-    bytes_get_index_arg_in_exprs(resolved_constants, args, piped)
-}
-
-fn bytes_set_value_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg], piped: bool) -> Option<u8> {
-    let positional_index = if piped { 1 } else { 2 };
-    let arg = bytes_arg_expr_id(args, &["value"], positional_index)?;
-    let expr = exprs.iter().find(|expr| expr.id == arg.value)?;
-    let AstExprKind::BytesLiteral { size, items } = &expr.kind else {
-        return None;
-    };
-    let InitialValue::Bytes { bytes, fixed_len } = initial_bytes_value(size, items, exprs)? else {
-        return None;
-    };
-    (fixed_len == Some(1) && bytes.len() == 1).then(|| bytes[0])
-}
-
-fn bytes_u64_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    names: &[&str],
-    positional_index: usize,
-) -> Option<u64> {
-    bytes_arg_expr_id(args, names, positional_index)
-        .and_then(|arg| resolved_constants.unsigned_integer(arg.value))
-}
-
-fn bytes_scalar_arg_in_exprs(
-    exprs: &[AstExpr],
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    names: &[&str],
-    positional_index: usize,
-) -> Option<BytesScalarArg> {
-    let arg = bytes_arg_expr_id(args, names, positional_index)?;
-    if let Some(value) = resolved_constants.unsigned_integer(arg.value) {
-        return Some(BytesScalarArg::Static(value));
-    }
-    ast_argument_value_in_exprs(exprs, arg.value).map(BytesScalarArg::Path)
-}
-
-fn bytes_slice_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    bytes_get_input_arg_in_exprs(exprs, args)
-}
-
-fn bytes_slice_offset_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<u64> {
-    let positional_index = if piped { 0 } else { 1 };
-    bytes_u64_arg_in_exprs(
-        resolved_constants,
-        args,
-        &["offset", "start"],
-        positional_index,
-    )
-}
-
-fn bytes_slice_byte_count_arg_in_exprs(
-    exprs: &[AstExpr],
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<BytesScalarArg> {
-    let positional_index = if piped { 1 } else { 2 };
-    bytes_scalar_arg_in_exprs(
-        exprs,
-        resolved_constants,
-        args,
-        &["byte_count", "length", "count"],
-        positional_index,
-    )
-}
-
-fn bytes_count_arg_in_exprs(
-    exprs: &[AstExpr],
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<BytesScalarArg> {
-    let positional_index = if piped { 0 } else { 1 };
-    bytes_scalar_arg_in_exprs(
-        exprs,
-        resolved_constants,
-        args,
-        &["byte_count", "count", "length"],
-        positional_index,
-    )
-}
-
-fn bytes_zeros_byte_count_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-) -> Option<u64> {
-    bytes_u64_arg_in_exprs(
-        resolved_constants,
-        args,
-        &["byte_count", "count", "length"],
-        0,
-    )
-}
-
-fn bytes_i64_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    names: &[&str],
-    positional_index: usize,
-) -> Option<i64> {
-    bytes_arg_expr_id(args, names, positional_index)
-        .and_then(|arg| resolved_constants.signed_integer(arg.value))
-}
-
-fn bytes_numeric_offset_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<u64> {
-    let positional_index = if piped { 0 } else { 1 };
-    bytes_u64_arg_in_exprs(
-        resolved_constants,
-        args,
-        &["offset", "start"],
-        positional_index,
-    )
-}
-
-fn bytes_numeric_byte_count_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<u64> {
-    let positional_index = if piped { 1 } else { 2 };
-    bytes_u64_arg_in_exprs(
-        resolved_constants,
-        args,
-        &["byte_count", "count"],
-        positional_index,
-    )
-}
-
-fn bytes_numeric_endian_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<String> {
-    let positional_index = if piped { 2 } else { 3 };
-    let value = bytes_arg_expr_id(args, &["endian"], positional_index)
-        .and_then(|arg| resolved_constants.symbol(arg.value))?;
-    matches!(value, "Little" | "Big").then(|| value.to_owned())
-}
-
-fn bytes_numeric_value_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<i64> {
-    let positional_index = if piped { 3 } else { 4 };
-    bytes_i64_arg_in_exprs(resolved_constants, args, &["value"], positional_index)
-}
-
-fn bytes_equal_left_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    args.iter()
-        .find(|arg| arg.named_name() == Some("input"))
-        .or_else(|| args.iter().find(|arg| arg.named_name() == Some("left")))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn bytes_equal_right_arg_in_exprs(
-    exprs: &[AstExpr],
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<String> {
-    let positional_index = if piped { 0 } else { 1 };
-    args.iter()
-        .find(|arg| arg.named_name() == Some("with"))
-        .or_else(|| args.iter().find(|arg| arg.named_name() == Some("right")))
-        .or_else(|| args.iter().find(|arg| arg.named_name() == Some("other")))
-        .or_else(|| {
-            args.iter()
-                .filter(|arg| arg.is_bare_binding())
-                .nth(positional_index)
-        })
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn bytes_concat_left_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    bytes_equal_left_arg_in_exprs(exprs, args)
-}
-
-fn bytes_concat_right_arg_in_exprs(
-    exprs: &[AstExpr],
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<String> {
-    bytes_equal_right_arg_in_exprs(exprs, args, piped)
-}
-
-fn bytes_search_haystack_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    args.iter()
-        .find(|arg| arg.named_name() == Some("input"))
-        .or_else(|| args.iter().find(|arg| arg.named_name() == Some("haystack")))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn bytes_search_second_arg_in_exprs(
-    exprs: &[AstExpr],
-    args: &[AstCallArg],
-    piped: bool,
-    names: &[&str],
-) -> Option<String> {
-    let _ = piped;
-    args.iter()
-        .find(|arg| arg.named_name().is_some_and(|name| names.contains(&name)))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn text_to_bytes_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    args.iter()
-        .find(|arg| arg.named_name() == Some("input"))
-        .or_else(|| args.iter().find(|arg| arg.named_name() == Some("text")))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn bytes_to_text_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    args.iter()
-        .find(|arg| arg.named_name() == Some("input"))
-        .or_else(|| args.iter().find(|arg| arg.named_name() == Some("bytes")))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn bytes_text_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    args.iter()
-        .find(|arg| arg.named_name() == Some("input"))
-        .or_else(|| args.iter().find(|arg| arg.named_name() == Some("text")))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn bytes_input_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg]) -> Option<String> {
-    args.iter()
-        .find(|arg| arg.named_name() == Some("input"))
-        .or_else(|| args.iter().find(|arg| arg.named_name() == Some("bytes")))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))
-}
-
-fn bytes_encoding_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<String> {
-    let positional_index = if piped { 0 } else { 1 };
-    bytes_arg_expr_id(args, &["encoding"], positional_index)
-        .and_then(|arg| resolved_constants.symbol(arg.value))
-        .map(str::to_owned)
-}
-
-fn ast_simple_update_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
-    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::Identifier(value)
-        | AstExprKind::Enum(value)
-        | AstExprKind::Tag(value)
-        | AstExprKind::Number(value)
-        | AstExprKind::StringLiteral(value)
-        | AstExprKind::TextLiteral(value) => Some(value.clone()),
-        AstExprKind::ByteLiteral { value, .. } => Some(value.to_string()),
-        AstExprKind::Bool(true) => Some("True".to_owned()),
-        AstExprKind::Bool(false) => Some("False".to_owned()),
-        AstExprKind::Path(parts) if !parts.is_empty() => Some(parts.join(".")),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SimpleThenUpdateValue {
-    Const(String),
-    Path(String),
-}
-
-fn ast_simple_then_update_value_in_exprs(
-    exprs: &[AstExpr],
-    expr_id: usize,
-) -> Option<SimpleThenUpdateValue> {
-    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::Identifier(value) => Some(SimpleThenUpdateValue::Path(value.clone())),
-        AstExprKind::Path(parts) if !parts.is_empty() => {
-            Some(SimpleThenUpdateValue::Path(parts.join(".")))
-        }
-        AstExprKind::Enum(value)
-        | AstExprKind::Tag(value)
-        | AstExprKind::Number(value)
-        | AstExprKind::StringLiteral(value)
-        | AstExprKind::TextLiteral(value) => Some(SimpleThenUpdateValue::Const(value.clone())),
-        AstExprKind::ByteLiteral { value, .. } => {
-            Some(SimpleThenUpdateValue::Const(value.to_string()))
-        }
-        AstExprKind::Bool(true) => Some(SimpleThenUpdateValue::Const("True".to_owned())),
-        AstExprKind::Bool(false) => Some(SimpleThenUpdateValue::Const("False".to_owned())),
-        _ => None,
-    }
-}
-
-fn list_append_trigger(field: &FieldDef, append_expr: &AstExpr) -> Option<String> {
-    let AstExprKind::Pipe { args, .. } = &append_expr.kind else {
-        return None;
-    };
-    let item_arg = args.iter().find(|arg| arg.named_name() == Some("item"))?;
-    let value = field
-        .ast_exprs
-        .iter()
-        .find(|expr| expr.id == item_arg.value)?;
-    let trigger = match &value.kind {
-        AstExprKind::Then { input, .. } => ast_argument_value(field, *input)?,
-        AstExprKind::Pipe { input, .. } => ast_argument_value(field, *input)?,
-        _ => ast_argument_value(field, item_arg.value)?,
-    };
-    (!trigger.is_empty()).then(|| canonical_local_path(&trigger, &field.parent_path))
-}
-
-fn list_append_fields(
-    field: &FieldDef,
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    append_expr: &AstExpr,
-) -> Vec<ListAppendField> {
-    let literal_fields = list_append_item_record_fields(field, append_expr)
-        .map(|fields| {
-            fields
-                .iter()
-                .filter_map(|record_field| {
-                    let value = list_append_record_field_value(field, record_field.value)?;
-                    (!record_field.name.is_empty()).then(|| ListAppendField {
-                        name: record_field.name.clone(),
-                        value,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if !literal_fields.is_empty() {
-        return literal_fields;
-    }
-    let statement_fields = list_append_item_statement_fields(field, append_expr);
-    if !statement_fields.is_empty() {
-        return statement_fields;
-    }
-    let referenced_fields = list_append_referenced_record_fields(field, fields, append_expr);
-    if !referenced_fields.is_empty() {
-        return referenced_fields;
-    }
-    list_append_function_constructor_fields(field, program, fields, append_expr)
-}
-
-fn list_append_referenced_record_fields(
-    field: &FieldDef,
-    fields: &[FieldDef],
-    append_expr: &AstExpr,
-) -> Vec<ListAppendField> {
-    let Some(item_expr) = list_append_item_expr(field, append_expr) else {
-        return Vec::new();
-    };
-    let Some(path) = ast_argument_value(field, item_expr.id) else {
-        return Vec::new();
-    };
-    let path = canonical_local_path(&path, &field.parent_path);
-    fields
-        .iter()
-        .find(|candidate| candidate.path == path)
-        .and_then(|candidate| list_append_statement_fields(candidate, &candidate.statement))
-        .unwrap_or_default()
-}
-
-fn list_append_item_statement_fields(
-    field: &FieldDef,
-    append_expr: &AstExpr,
-) -> Vec<ListAppendField> {
-    statement_containing_expr(&field.statement, append_expr.id)
-        .or_else(|| statement_containing_span(&field.statement, append_expr.start, append_expr.end))
-        .and_then(|statement| list_append_statement_fields(field, statement))
-        .unwrap_or_default()
-}
-
-fn list_append_statement_fields(
-    field: &FieldDef,
-    statement: &AstStatement,
-) -> Option<Vec<ListAppendField>> {
-    let fields = statement
-        .children
-        .iter()
-        .filter_map(|child| {
-            let AstStatementKind::Field { name } = &child.kind else {
-                return None;
-            };
-            let value = list_append_record_field_value(field, child.expr?)?;
-            Some(ListAppendField {
-                name: name.clone(),
-                value,
-            })
-        })
-        .collect::<Vec<_>>();
-    if !fields.is_empty() {
-        return Some(fields);
-    }
-    statement
-        .children
-        .iter()
-        .find_map(|child| list_append_statement_fields(field, child))
-}
-
-fn list_append_item_record_fields<'a>(
-    field: &'a FieldDef,
-    append_expr: &AstExpr,
-) -> Option<&'a [AstRecordField]> {
-    let item_expr = list_append_item_expr(field, append_expr)?;
-    append_item_record_fields_from_expr(field, item_expr.id).or_else(|| {
-        let statement =
-            statement_containing_expr(&field.statement, append_expr.id).or_else(|| {
-                statement_containing_span(&field.statement, append_expr.start, append_expr.end)
-            })?;
-        append_item_record_fields_from_statement(field, statement)
-    })
-}
-
-fn statement_containing_span(
-    statement: &AstStatement,
-    start: usize,
-    end: usize,
-) -> Option<&AstStatement> {
-    if start < statement.start || end > statement.end {
-        return None;
-    }
-    statement
-        .children
-        .iter()
-        .find_map(|child| statement_containing_span(child, start, end))
-        .or(Some(statement))
-}
-
-fn append_item_record_fields_from_statement<'a>(
-    field: &'a FieldDef,
-    statement: &AstStatement,
-) -> Option<&'a [AstRecordField]> {
-    statement
-        .expr
-        .and_then(|expr| append_item_record_fields_from_expr(field, expr))
-        .or_else(|| {
-            statement
-                .children
-                .iter()
-                .find_map(|child| append_item_record_fields_from_statement(field, child))
-        })
-}
-
-fn append_item_record_fields_from_expr(
-    field: &FieldDef,
-    expr_id: usize,
-) -> Option<&[AstRecordField]> {
-    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::Record(_) | AstExprKind::Object(_) => record_fields_from_expr(expr),
-        AstExprKind::Then {
-            output: Some(output),
-            ..
-        } => append_item_record_fields_from_expr(field, *output),
-        AstExprKind::Pipe { args, .. } | AstExprKind::Call { args, .. } => args
-            .iter()
-            .find_map(|arg| append_item_record_fields_from_expr(field, arg.value)),
-        AstExprKind::Hold { initial, .. }
-        | AstExprKind::When { input: initial, .. }
-        | AstExprKind::Draining { input: initial } => {
-            append_item_record_fields_from_expr(field, *initial)
-        }
-        AstExprKind::Infix { left, right, .. } => append_item_record_fields_from_expr(field, *left)
-            .or_else(|| append_item_record_fields_from_expr(field, *right)),
-        AstExprKind::MatchArm {
-            output: Some(output),
-            ..
-        } => append_item_record_fields_from_expr(field, *output),
-        _ => None,
-    }
-}
-
-fn record_fields_from_expr(expr: &AstExpr) -> Option<&[AstRecordField]> {
-    match &expr.kind {
-        AstExprKind::Record(fields) | AstExprKind::Object(fields) => Some(fields.as_slice()),
-        _ => None,
-    }
-}
-
-fn list_append_function_constructor_fields(
-    field: &FieldDef,
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    append_expr: &AstExpr,
-) -> Vec<ListAppendField> {
-    let Some((function, arg_sources)) =
-        list_append_item_constructor_args(field, program, append_expr)
-    else {
-        return Vec::new();
-    };
-    let Some(row_scope) = row_scope_for_append_constructor(program, &function) else {
-        return Vec::new();
-    };
-    let prefix = format!("{row_scope}.");
-    let row_scopes = row_scopes(program);
-    fields
-        .iter()
-        .filter(|candidate| candidate.path.starts_with(&prefix))
-        .filter_map(|candidate| {
-            let InitialValue::RowInitialField { path } =
-                field_initial_value(candidate, &row_scopes, fields)
-            else {
-                return None;
-            };
-            let source = arg_sources.get(&path)?;
-            Some(ListAppendField {
-                name: candidate
-                    .path
-                    .strip_prefix(&prefix)
-                    .unwrap_or(candidate.local_name.as_str())
-                    .to_owned(),
-                value: ListAppendFieldValue::Source {
-                    path: source.clone(),
-                },
-            })
-        })
-        .collect()
-}
-
-fn list_append_record_field_value(
-    field: &FieldDef,
-    expr_id: usize,
-) -> Option<ListAppendFieldValue> {
-    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::StringLiteral(value)
-        | AstExprKind::TextLiteral(value)
-        | AstExprKind::Number(value)
-        | AstExprKind::Enum(value)
-        | AstExprKind::Tag(value) => Some(ListAppendFieldValue::Const {
-            value: value.clone(),
-        }),
-        AstExprKind::Bool(true) => Some(ListAppendFieldValue::Const {
-            value: "True".to_owned(),
-        }),
-        AstExprKind::Bool(false) => Some(ListAppendFieldValue::Const {
-            value: "False".to_owned(),
-        }),
-        AstExprKind::ByteLiteral { .. } | AstExprKind::BytesLiteral { .. } => {
-            Some(ListAppendFieldValue::TypedConst {
-                value: ast_initial_value(expr, &field.ast_exprs, &[], None),
-            })
-        }
-        AstExprKind::Identifier(value) => Some(ListAppendFieldValue::Source {
-            path: canonical_local_path(value, &field.parent_path),
-        }),
-        AstExprKind::Path(parts) if !parts.is_empty() => Some(ListAppendFieldValue::Source {
-            path: canonical_local_path(&parts.join("."), &field.parent_path),
-        }),
-        _ => {
-            let source = ast_argument_value(field, expr_id)?;
-            (!source.is_empty()).then(|| ListAppendFieldValue::Source {
-                path: canonical_local_path(&source, &field.parent_path),
-            })
-        }
-    }
-}
-
-fn list_append_item_constructor_args(
-    field: &FieldDef,
-    program: &ParsedProgram,
-    append_expr: &AstExpr,
-) -> Option<(String, BTreeMap<String, String>)> {
-    let item_expr = list_append_item_expr(field, append_expr)?;
-    match &item_expr.kind {
-        AstExprKind::Pipe {
-            input, op, args, ..
-        } => Some((
-            op.clone(),
-            constructor_arg_sources(
-                field,
-                program,
-                op,
-                Some(*input),
-                args,
-                field.parent_path.as_str(),
-            )?,
-        )),
-        AstExprKind::Call { function, args, .. } => Some((
-            function.clone(),
-            constructor_arg_sources(
-                field,
-                program,
-                function,
-                None,
-                args,
-                field.parent_path.as_str(),
-            )?,
-        )),
-        _ => None,
-    }
-}
-
-fn constructor_arg_sources(
-    field: &FieldDef,
-    program: &ParsedProgram,
-    function: &str,
-    piped_input: Option<usize>,
-    args: &[AstCallArg],
-    parent_path: &str,
-) -> Option<BTreeMap<String, String>> {
-    let function_args = function_arg_names(program, function)?;
-    let mut sources = BTreeMap::new();
-    if let Some(input) = piped_input {
-        let arg_name = function_args.first()?;
-        let source = ast_argument_value(field, input)?;
-        sources.insert(arg_name.clone(), canonical_local_path(&source, parent_path));
-    }
-    for arg in args {
-        let arg_name = arg.named_name()?.to_owned();
-        let source = ast_argument_value(field, arg.value)?;
-        sources.insert(arg_name, canonical_local_path(&source, parent_path));
-    }
-    Some(sources)
-}
-
-fn function_arg_names(program: &ParsedProgram, function: &str) -> Option<Vec<String>> {
-    function_definitions(program)
-        .into_iter()
-        .find(|definition| definition.name == function)
-        .map(|definition| definition.args)
-}
-
-fn row_scope_for_append_constructor<'a>(
-    program: &'a ParsedProgram,
-    function: &str,
-) -> Option<&'a str> {
-    program
-        .row_scope_functions
-        .iter()
-        .find(|scope| {
-            scope.function == function
-                || scope
-                    .function
-                    .strip_prefix("__source_row_scope_")
-                    .is_some_and(|source_function| source_function == function)
-        })
-        .map(|scope| scope.row_scope.as_str())
-}
-
-fn list_append_item_expr<'a>(field: &'a FieldDef, append_expr: &AstExpr) -> Option<&'a AstExpr> {
-    let AstExprKind::Pipe { args, .. } = &append_expr.kind else {
-        return None;
-    };
-    let item_arg = args.iter().find(|arg| arg.named_name() == Some("item"))?;
-    field
-        .ast_exprs
-        .iter()
-        .find(|expr| expr.id == item_arg.value)
-}
-
-fn list_append_exprs(field: &FieldDef) -> impl Iterator<Item = &AstExpr> {
-    field.ast_exprs.iter().filter(|expr| {
-        matches!(
-            &expr.kind,
-            AstExprKind::Pipe { op, .. } if op == "List/append"
-        )
-    })
-}
-
-fn retain_remove_sources(
-    field: &FieldDef,
-    program: &ParsedProgram,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Vec<String> {
-    let mut sources = direct_source_refs(field, program)
-        .into_iter()
-        .filter(|source| {
-            let scoped = program
-                .source_ports
-                .iter()
-                .find(|port| port.path == *source)
-                .is_some_and(|port| port.scoped);
-            scoped
-                || retain_source_predicate(field, source, row_scope, canonical_row_scope).is_some()
-        })
-        .collect::<Vec<_>>();
-    for source in &program.source_ports {
-        if retain_source_predicate(field, &source.path, row_scope, canonical_row_scope).is_some() {
-            push_unique(&mut sources, source.path.clone());
-        }
-    }
-    if !field.has_token("False") {
-        return sources;
-    }
-    for source in &program.source_ports {
-        if source.scoped
-            && source
-                .path
-                .split('.')
-                .any(|segment| segment.contains("remove") || segment.contains("delete"))
-            && source
-                .path
-                .split('.')
-                .any(|segment| field.has_token(segment))
-        {
-            push_unique(&mut sources, source.path.clone());
-        }
-    }
-    sources
-}
-
-fn list_retain_remove_predicate(
-    field: &FieldDef,
-    source: &str,
-    branch: &RoutedBranch,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> ListPredicate {
-    if !source.starts_with("store.")
-        && source
-            .split('.')
-            .any(|segment| segment.contains("remove") || segment.contains("delete"))
-    {
-        return ListPredicate::AlwaysTrue;
-    }
-    if branch.has_token("False") {
-        return ListPredicate::AlwaysTrue;
-    }
-    if let Some(retain_predicate) =
-        retain_source_predicate(field, source, row_scope, canonical_row_scope)
-        && let Some(remove_predicate) = invert_retain_predicate(retain_predicate)
-    {
-        return remove_predicate;
-    }
-    list_remove_predicate(field, source, branch, row_scope, canonical_row_scope)
-}
-
-fn retain_source_predicate(
-    field: &FieldDef,
-    source: &str,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<ListPredicate> {
-    list_remove_predicate_from_then_output(field, source, row_scope, canonical_row_scope).or_else(
-        || {
-            let branch = field.source_branch(source)?;
-            let path = row_field_path_in_exprs(branch.ast_exprs(), row_scope, canonical_row_scope)?;
-            let bool_not_path = branch.bool_not_path().and_then(|path| {
-                canonical_row_field_path_from_raw(&path, row_scope, canonical_row_scope)
-            });
-            if bool_not_path.as_deref() == Some(path.as_str()) {
-                Some(ListPredicate::RowFieldBoolNot { path })
-            } else {
-                Some(ListPredicate::RowFieldBool { path })
-            }
-        },
-    )
-}
-
-fn invert_retain_predicate(predicate: ListPredicate) -> Option<ListPredicate> {
-    match predicate {
-        ListPredicate::RowFieldBool { path } => Some(ListPredicate::RowFieldBoolNot { path }),
-        ListPredicate::RowFieldBoolNot { path } => Some(ListPredicate::RowFieldBool { path }),
-        ListPredicate::AlwaysTrue
-        | ListPredicate::SelectedFilterVisibility { .. }
-        | ListPredicate::Unknown { .. } => None,
-    }
-}
-
-fn list_remove_predicate(
-    field: &FieldDef,
-    source: &str,
-    branch: &RoutedBranch,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> ListPredicate {
-    if source
-        .split('.')
-        .any(|segment| segment.contains("remove") || segment.contains("delete"))
-    {
-        return ListPredicate::AlwaysTrue;
-    }
-    if let Some(predicate) =
-        list_remove_predicate_from_then_output(field, source, row_scope, canonical_row_scope)
-    {
-        return predicate;
-    }
-    if branch.has_bool_expr(true) {
-        return ListPredicate::AlwaysTrue;
-    }
-    if let Some(path) = row_field_path_in_exprs(branch.ast_exprs(), row_scope, canonical_row_scope)
-        && branch
-            .bool_not_path()
-            .and_then(|bool_not_path| {
-                canonical_row_field_path_from_raw(&bool_not_path, row_scope, canonical_row_scope)
-            })
-            .as_deref()
-            == Some(path.as_str())
-    {
-        return ListPredicate::RowFieldBoolNot { path };
-    }
-    if let Some(path) = row_field_path_in_exprs(branch.ast_exprs(), row_scope, canonical_row_scope)
-    {
-        return ListPredicate::RowFieldBool { path };
-    }
-    ListPredicate::Unknown {
-        summary: branch.summary(),
-    }
-}
-
-fn list_remove_predicate_from_then_output(
-    field: &FieldDef,
-    source: &str,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<ListPredicate> {
-    field.ast_exprs.iter().find_map(|expr| {
-        let AstExprKind::Then {
-            input,
-            output: Some(output),
-        } = expr.kind
-        else {
-            return None;
-        };
-        let input_path = ast_argument_value(field, input)?;
-        let matches_source = source_ref_variants(source).iter().any(|variant| {
-            path_matches_source_variant(&input_path, variant)
-                || path_matches_source_variant(
-                    &canonical_local_path(&input_path, &field.parent_path),
-                    variant,
-                )
-        });
-        if !matches_source {
-            return None;
-        }
-        list_predicate_from_expr(field, output, row_scope, canonical_row_scope)
-    })
-}
-
-fn path_matches_source_variant(path: &str, variant: &str) -> bool {
-    path == variant
-        || path
-            .strip_prefix(variant)
-            .is_some_and(|rest| rest.starts_with('.'))
-}
-
-fn list_predicate_from_expr(
-    field: &FieldDef,
-    expr_id: usize,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<ListPredicate> {
-    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::Bool(true) => Some(ListPredicate::AlwaysTrue),
-        AstExprKind::Latest => {
-            latest_default_list_predicate(field, expr_id, row_scope, canonical_row_scope)
-        }
-        AstExprKind::When { .. } => {
-            selected_filter_predicate_from_when_expr(field, expr_id, row_scope, canonical_row_scope)
-        }
-        AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
-            row_field_path_from_expr(field, *input, row_scope, canonical_row_scope)
-                .map(|path| ListPredicate::RowFieldBoolNot { path })
-        }
-        _ => row_field_path_from_expr(field, expr_id, row_scope, canonical_row_scope)
-            .map(|path| ListPredicate::RowFieldBool { path }),
-    }
-}
-
-fn latest_default_list_predicate(
-    field: &FieldDef,
-    latest_expr_id: usize,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<ListPredicate> {
-    let statement = statement_containing_expr(&field.statement, latest_expr_id)?;
-    statement
-        .children
-        .iter()
-        .find_map(|child| child.expr)
-        .and_then(|expr_id| {
-            list_predicate_from_expr(field, expr_id, row_scope, canonical_row_scope)
-        })
-}
-
-fn statement_containing_expr(statement: &AstStatement, expr_id: usize) -> Option<&AstStatement> {
-    if statement.expr == Some(expr_id) {
-        return Some(statement);
-    }
-    statement
-        .children
-        .iter()
-        .find_map(|child| statement_containing_expr(child, expr_id))
-}
-
-fn statement_containing_expr_graph<'a>(
-    statement: &'a AstStatement,
-    expr_id: usize,
-    expressions: &[AstExpr],
-) -> Option<&'a AstStatement> {
-    if statement.expr == Some(expr_id) {
-        return Some(statement);
-    }
-    if let Some(nested) = statement
-        .children
-        .iter()
-        .find_map(|child| statement_containing_expr_graph(child, expr_id, expressions))
-    {
-        return Some(nested);
-    }
-    statement
-        .expr
-        .is_some_and(|root| expr_contains_expr_id_in_exprs(expressions, root, expr_id))
-        .then_some(statement)
-}
-
-fn row_field_path_from_expr(
-    field: &FieldDef,
-    expr_id: usize,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<String> {
-    let row_scope = row_scope?;
-    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
-    let AstExprKind::Path(parts) = &expr.kind else {
-        return None;
-    };
-    row_field_path_from_parts(parts, row_scope, canonical_row_scope)
-}
-
-fn list_retain_predicate(
-    field: &FieldDef,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> ListPredicate {
-    if let Some(predicate) =
-        list_retain_predicate_from_ast_arg(field, row_scope, canonical_row_scope)
-    {
-        return predicate;
-    }
-    if let Some(predicate) = field.ast_exprs.iter().find_map(|expr| match expr.kind {
-        AstExprKind::When { .. } => {
-            selected_filter_predicate_from_when_expr(field, expr.id, row_scope, canonical_row_scope)
-        }
-        _ => None,
-    }) {
-        return predicate;
-    }
-    if let Some(path) = bool_not_path_in_exprs(&field.ast_exprs) {
-        let path = canonical_row_field_path_from_raw(&path, row_scope, canonical_row_scope)
-            .unwrap_or(path);
-        return ListPredicate::RowFieldBoolNot { path };
-    }
-    if let Some(path) = row_field_path_in_exprs(&field.ast_exprs, row_scope, canonical_row_scope) {
-        return ListPredicate::RowFieldBool { path };
-    }
-    ListPredicate::Unknown {
-        summary: field
-            .ast_items
-            .first()
-            .map(item_summary)
-            .unwrap_or_default(),
-    }
-}
-
-fn list_retain_predicate_from_ast_arg(
-    field: &FieldDef,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<ListPredicate> {
-    let retain = field.ast_exprs.iter().find(|expr| {
-        matches!(
-            &expr.kind,
-            AstExprKind::Pipe { op, .. } if op == "List/retain"
-        )
-    })?;
-    let AstExprKind::Pipe { args, .. } = &retain.kind else {
-        return None;
-    };
-    let predicate_arg = args
-        .iter()
-        .find(|arg| arg.named_name() == Some("if"))
-        .or_else(|| args.get(1))?;
-    list_predicate_from_expr(field, predicate_arg.value, row_scope, canonical_row_scope)
-}
-
-fn count_or_retain_source_list(field: &FieldDef, program: &ParsedProgram) -> Option<String> {
-    let field_local_name = field
-        .path
-        .rsplit_once('.')
-        .map_or(field.path.as_str(), |(_, local)| local);
-    if program
-        .list_memories
-        .iter()
-        .any(|list| list.name == field_local_name)
-    {
-        return Some(field.path.clone());
-    }
-    let count_or_retain = field.ast_exprs.iter().find(|expr| {
-        matches!(
-            &expr.kind,
-            AstExprKind::Pipe { op, .. }
-                if op == "List/count" || op == "List/retain" || op == "List/every"
-        )
-    })?;
-    let source = source_list_from_expr(field, count_or_retain.id)?;
-    let canonical = canonical_local_path(&source, &field.parent_path);
-    let local_name = canonical
-        .rsplit_once('.')
-        .map_or(canonical.as_str(), |(_, local)| local);
-    program
-        .list_memories
-        .iter()
-        .any(|list| list.name == local_name)
-        .then_some(canonical)
-}
-
-fn source_list_from_expr(field: &FieldDef, expr_id: usize) -> Option<String> {
-    let expr = field.ast_exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::Identifier(name) if is_name(name) => Some(name.clone()),
-        AstExprKind::Path(parts) if parts.len() == 1 => parts.first().cloned(),
-        AstExprKind::Pipe { input, .. } => source_list_from_expr(field, *input)
-            .or_else(|| previous_source_list_expr(field, *input)),
-        _ => None,
-    }
-}
-
-fn previous_source_list_expr(field: &FieldDef, before_id: usize) -> Option<String> {
-    field
-        .ast_exprs
-        .iter()
-        .filter(|candidate| candidate.id < before_id)
-        .rev()
-        .find_map(|candidate| match &candidate.kind {
-            AstExprKind::Identifier(name) if is_name(name) => Some(name.clone()),
-            AstExprKind::Path(parts) if parts.len() == 1 => parts.first().cloned(),
-            AstExprKind::Pipe { .. } => source_list_from_expr(field, candidate.id),
-            _ => None,
-        })
-}
-
-fn row_scope_for_list<'a>(program: &'a ParsedProgram, list_name: &str) -> Option<&'a str> {
-    program
-        .row_scope_functions
-        .iter()
-        .find(|scope| scope.list == list_name)
-        .map(|scope| scope.row_scope.as_str())
-}
-
-fn row_field_path_in_exprs(
-    exprs: &[AstExpr],
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<String> {
-    let row_scope = row_scope?;
-    exprs.iter().find_map(|expr| match &expr.kind {
-        AstExprKind::Path(parts) => {
-            row_field_path_from_parts(parts, row_scope, canonical_row_scope)
-        }
-        _ => None,
-    })
-}
-
-fn canonical_row_field_path_from_raw(
-    raw: &str,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<String> {
-    let row_scope = row_scope?;
-    let parts = raw.split('.').map(str::to_owned).collect::<Vec<_>>();
-    row_field_path_from_parts(&parts, row_scope, canonical_row_scope).or_else(|| {
-        let canonical = canonical_row_scope?;
-        raw.strip_prefix(canonical)
-            .is_some_and(|rest| rest.starts_with('.'))
-            .then(|| raw.to_owned())
-    })
-}
-
-fn selected_filter_predicate_from_when_expr(
-    field: &FieldDef,
-    when_expr_id: usize,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<ListPredicate> {
-    let expr = field_expr(field, when_expr_id)?;
-    let AstExprKind::When { input, .. } = expr.kind else {
-        return None;
-    };
-    let selector = ast_argument_value(field, input)?;
-    if selector.is_empty() {
-        return None;
-    }
-    let row_field =
-        selected_filter_row_field_for_when(field, when_expr_id, row_scope, canonical_row_scope)?;
-    Some(ListPredicate::SelectedFilterVisibility {
-        selector: canonical_local_path(&selector, &field.parent_path),
-        row_field,
-    })
-}
-
-fn selected_filter_row_field_for_when(
-    field: &FieldDef,
-    when_expr_id: usize,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<String> {
-    let mut outputs = Vec::new();
-    collect_match_arm_outputs_for_when(field, &field.statement, when_expr_id, &mut outputs);
-    if outputs.is_empty() {
-        outputs = match_arm_outputs_after_when_expr(field, when_expr_id);
-    }
-    let mut row_field = None;
-    for output in outputs {
-        let Some(candidate) =
-            selected_filter_row_field_from_expr(field, output, row_scope, canonical_row_scope)
-        else {
-            continue;
-        };
-        if row_field
-            .as_deref()
-            .is_some_and(|existing| existing != candidate)
-        {
-            return None;
-        }
-        row_field = Some(candidate);
-    }
-    row_field
-}
-
-fn collect_match_arm_outputs_for_when(
-    field: &FieldDef,
-    statement: &AstStatement,
-    when_expr_id: usize,
-    outputs: &mut Vec<usize>,
-) -> bool {
-    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
-        expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
-    });
-    if statement_contains_when {
-        for child in &statement.children {
-            if let Some(output) = match_arm_output(field, child) {
-                outputs.push(output);
-            }
-        }
-        if !outputs.is_empty() {
-            return true;
-        }
-    }
-    for child in &statement.children {
-        if collect_match_arm_outputs_for_when(field, child, when_expr_id, outputs) {
-            return true;
-        }
-    }
-    false
-}
-
-fn match_arm_output(field: &FieldDef, statement: &AstStatement) -> Option<usize> {
-    let expr_id = statement.expr?;
-    let expr = field_expr(field, expr_id)?;
-    let AstExprKind::MatchArm {
-        output: Some(output),
-        ..
-    } = expr.kind
-    else {
-        return None;
-    };
-    Some(output)
-}
-
-fn match_arm_outputs_after_when_expr(field: &FieldDef, when_expr_id: usize) -> Vec<usize> {
-    let Some(when_expr) = field_expr(field, when_expr_id) else {
-        return Vec::new();
-    };
-    let end_line = field
-        .ast_exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > when_expr.line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    field
-        .ast_exprs
-        .iter()
-        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
-        .filter_map(|expr| match &expr.kind {
-            AstExprKind::MatchArm {
-                output: Some(output),
-                ..
-            } => Some(*output),
-            _ => None,
-        })
-        .collect()
-}
-
-fn selected_filter_row_field_from_expr(
-    field: &FieldDef,
-    expr_id: usize,
-    row_scope: Option<&str>,
-    canonical_row_scope: Option<&str>,
-) -> Option<String> {
-    let row_scope = row_scope?;
-    let expr = field_expr(field, expr_id)?;
-    match &expr.kind {
-        AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
-            row_field_path_from_expr(field, *input, Some(row_scope), canonical_row_scope)
-        }
-        AstExprKind::Path(parts) => {
-            row_field_path_from_parts(parts, row_scope, canonical_row_scope)
-        }
-        AstExprKind::Bool(_) => None,
-        _ => None,
-    }
-}
-
-fn row_field_path_from_parts(
-    parts: &[String],
-    row_scope: &str,
-    canonical_row_scope: Option<&str>,
-) -> Option<String> {
-    let output_scope = canonical_row_scope.unwrap_or(row_scope);
-    parts.windows(2).find_map(|window| {
-        (window[0] == row_scope && is_name(&window[1]))
-            .then(|| format!("{output_scope}.{}", window[1]))
-    })
-}
-
-fn split_top_level(tokens: &[String], separator: &str) -> Vec<Vec<String>> {
-    let mut groups = Vec::new();
-    let mut current = Vec::new();
-    let mut depth = 0i32;
-    for token in tokens {
-        match token.as_str() {
-            "[" | "{" | "(" => depth += 1,
-            "]" | "}" | ")" => depth -= 1,
-            _ => {}
-        }
-        if token == separator && depth == 0 {
-            groups.push(std::mem::take(&mut current));
-        } else {
-            current.push(token.clone());
-        }
-    }
-    if !current.is_empty() {
-        groups.push(current);
-    }
-    groups
-}
-
-fn tokens_to_path(tokens: &[String]) -> String {
-    tokens
-        .iter()
-        .filter(|token| !matches!(token.as_str(), "{" | "}" | "[" | "]"))
-        .fold(String::new(), |mut output, token| {
-            if token == "."
-                || output.ends_with('.')
-                || output.is_empty()
-                || matches!(token.as_str(), ":" | "(" | ")")
-                || output.ends_with('(')
-                || output.ends_with(':')
-            {
-                output.push_str(token);
-            } else {
-                output.push(' ');
-                output.push_str(token);
-            }
-            output
-        })
-        .trim()
-        .to_owned()
-}
-
-fn dotted_path_parts(path: &str) -> Vec<&str> {
-    path.split('.').filter(|part| !part.is_empty()).collect()
-}
-
-fn path_parts_match_source_ref(candidate: &[String], expected: &[&str]) -> bool {
-    let candidate = candidate
-        .iter()
-        .filter(|part| part.as_str() != "PASSED")
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    if source_ref_parts_match(&candidate, expected) {
-        return true;
-    }
-    let candidate = candidate
-        .into_iter()
-        .filter(|part| *part != "events")
-        .collect::<Vec<_>>();
-    source_ref_parts_match(&candidate, expected)
-}
-
-fn source_ref_parts_match(candidate: &[&str], expected: &[&str]) -> bool {
-    if candidate
-        .iter()
-        .take(expected.len())
-        .copied()
-        .eq(expected.iter().copied())
-    {
-        return true;
-    }
-    expected.len() > 1
-        && candidate
-            .windows(expected.len())
-            .any(|window| window.iter().copied().eq(expected.iter().copied()))
-}
-
-fn item_summary(item: &AstItem) -> String {
-    tokens_to_path(&item.symbols)
-}
-
-fn is_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn item_has_symbol(item: &AstItem, symbol: &str) -> bool {
-    item.symbols.iter().any(|candidate| candidate == symbol)
-}
-
-fn item_starts_with_symbol(item: &AstItem, symbol: &str) -> bool {
-    item.symbols
-        .first()
-        .is_some_and(|candidate| candidate == symbol)
-}
-
-fn item_symbols_start_with_path(item: &AstItem, expected: &[&str]) -> bool {
-    if expected.is_empty() {
-        return false;
-    }
-    let joined = expected.join(".");
-    if item
-        .symbols
-        .first()
-        .is_some_and(|candidate| candidate == &joined)
-    {
-        return true;
-    }
-    let mut index = 0usize;
-    for (part_index, part) in expected.iter().enumerate() {
-        if item.symbols.get(index).map(String::as_str) != Some(*part) {
-            return false;
-        }
-        index += 1;
-        if part_index + 1 < expected.len() {
-            if item.symbols.get(index).map(String::as_str) != Some(".") {
-                return false;
-            }
-            index += 1;
-        }
-    }
-    true
-}
-
-fn symbol_is_list_operator(symbol: &str) -> bool {
-    matches!(
-        symbol,
-        "List/map"
-            | "List/filter"
-            | "List/range"
-            | "List/chunk"
-            | "List/find"
-            | "List/query"
-            | "List/query_prefix"
-            | "List/move_field_first"
-            | "List/move_field_last"
-            | "List/get"
-            | "List/append"
-            | "List/remove"
-            | "List/retain"
-            | "List/count"
-            | "List/sum"
-            | "List/every"
-    )
-}
-
-fn canonical_local_path(path: &str, parent_path: &str) -> String {
-    if path.contains('.') || path.contains('/') || parent_path.is_empty() {
-        path.to_owned()
-    } else {
-        format!("{parent_path}.{path}")
-    }
-}
-
-fn update_expression_for_derived_dependency_source(
-    program: &ParsedProgram,
-    target: &str,
-    field: &FieldDef,
-    fields: &[FieldDef],
-    dependency: &FieldDef,
-    source: &str,
-    resolved_constants: &ResolvedConstantLookup<'_>,
-) -> Option<(UpdateExpression, Option<UpdateGuard>)> {
-    let branch = field
-        .source_trigger_branch(&dependency.path)
-        .or_else(|| field.source_trigger_branch(&dependency.local_name))?;
-    let variants = source_ref_variants(source);
-    if dependency.has_operator("List/latest")
-        && branch_is_direct_dependency_passthrough(field, fields, dependency, &branch)
-        && let Some(dependency_branch) = dependency.source_branch(source)
-    {
-        let expression = update_expression_for_routed_branch(
-            program,
-            target,
-            dependency,
-            fields,
-            source,
-            &variants,
-            dependency_branch.clone(),
-            resolved_constants,
-        );
-        let guard = update_guard_for_routed_branch(dependency, source, &dependency_branch)
-            .or_else(|| update_guard_for_routed_branch(field, source, &branch));
-        return Some((expression, guard));
-    }
-    let expression = update_expression_for_routed_branch(
-        program,
-        target,
-        field,
-        fields,
-        &dependency.path,
-        &variants,
-        branch.clone(),
-        resolved_constants,
-    );
-    let guard = update_guard_for_routed_branch(field, source, &branch).or_else(|| {
-        branch_is_direct_dependency_passthrough(field, fields, dependency, &branch)
-            .then(|| {
-                dependency
-                    .source_branch(source)
-                    .and_then(|dependency_branch| {
-                        update_guard_for_routed_branch(dependency, source, &dependency_branch)
-                    })
-                    .or_else(|| update_guard_for_field_source(dependency, source))
-            })
-            .flatten()
-    });
-    Some((expression, guard))
-}
-
-fn branch_is_direct_dependency_passthrough(
-    field: &FieldDef,
-    fields: &[FieldDef],
-    dependency: &FieldDef,
-    branch: &RoutedBranch,
-) -> bool {
-    let Some(SimpleThenUpdateValue::Path(path)) = branch.simple_update_value() else {
-        return false;
-    };
-    canonical_scalar_update_path_for_source(field, &field.path, &path, fields, &dependency.path)
-        == dependency.path
-}
-
-fn update_guard_for_routed_branch(
-    field: &FieldDef,
-    source: &str,
-    branch: &RoutedBranch,
-) -> Option<UpdateGuard> {
-    let effect_calls = branch
-        .ast_exprs
-        .iter()
-        .filter_map(|expr| match &expr.kind {
-            AstExprKind::Call { function, .. }
-                if boon_typecheck::is_typed_host_effect(function) =>
-            {
-                Some(expr.id)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if let [effect_call] = effect_calls.as_slice()
-        && let Some(guard) = update_guard_for_effect_call(field, source, *effect_call)
-    {
-        return Some(guard);
-    }
-
-    let variants = source_ref_variants(source);
-    for expr in &branch.ast_exprs {
-        let AstExprKind::When { input, .. } = expr.kind else {
-            continue;
-        };
-        let input_path = ast_argument_value(field, input);
-        let values = non_skip_literal_match_patterns_after_when(branch, expr.line);
-        if values.is_empty() {
-            continue;
-        }
-        let Some(input) = input_path else {
-            continue;
-        };
-        let source_related = variants.iter().any(|variant| {
-            input == *variant
-                || input
-                    .strip_prefix(variant)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-        }) || source_payload_field_from_path(&input, &variants).is_some();
-        if !source_related {
-            continue;
-        }
-        let input = canonical_update_guard_input(field, source, &input, &variants);
-        return Some(UpdateGuard::ValueOneOf { input, values });
-    }
-    None
-}
-
-fn update_guard_for_effect_call(
-    field: &FieldDef,
-    source: &str,
-    effect_call_expr_id: usize,
-) -> Option<UpdateGuard> {
-    let mut guards = Vec::new();
-    collect_effect_call_guard_path(
-        field,
-        source,
-        &field.statement,
-        effect_call_expr_id,
-        &mut guards,
-    );
-    match guards.len() {
-        0 => None,
-        1 => guards.pop(),
-        _ => Some(UpdateGuard::All { guards }),
-    }
-}
-
-fn collect_effect_call_guard_path(
-    field: &FieldDef,
-    source: &str,
-    statement: &AstStatement,
-    effect_call_expr_id: usize,
-    guards: &mut Vec<UpdateGuard>,
-) -> bool {
-    if !statement_subtree_contains_expr(statement, effect_call_expr_id, &field.ast_exprs) {
-        return false;
-    }
-
-    if let Some(when_expr) = statement
-        .expr
-        .and_then(|root| first_when_expr_in_graph(field, root))
-    {
-        let matching_arm = statement.children.iter().find(|child| {
-            child
-                .expr
-                .and_then(|expr_id| field_expr(field, expr_id))
-                .is_some_and(|expr| matches!(expr.kind, AstExprKind::MatchArm { .. }))
-                && statement_subtree_contains_expr(child, effect_call_expr_id, &field.ast_exprs)
-        });
-        if let Some(arm) = matching_arm {
-            if let Some(guard) = update_guard_for_when_arm(field, source, when_expr, arm) {
-                guards.push(guard);
-            }
-            collect_effect_call_guard_path(field, source, arm, effect_call_expr_id, guards);
-            return true;
-        }
-    }
-
-    if let Some(child) = statement
-        .children
-        .iter()
-        .find(|child| statement_subtree_contains_expr(child, effect_call_expr_id, &field.ast_exprs))
-    {
-        collect_effect_call_guard_path(field, source, child, effect_call_expr_id, guards);
-    }
-    true
-}
-
-fn first_when_expr_in_graph(field: &FieldDef, root: usize) -> Option<usize> {
-    let mut expr_ids = vec![root];
-    collect_expr_ids_recursive(root, &field.ast_exprs, &mut expr_ids);
-    expr_ids.into_iter().find(|expr_id| {
-        field_expr(field, *expr_id).is_some_and(|expr| when_input_expr_id(expr).is_some())
-    })
-}
-
-fn when_input_expr_id(expr: &AstExpr) -> Option<usize> {
-    match &expr.kind {
-        AstExprKind::When { input, .. } => Some(*input),
-        AstExprKind::Pipe { input, op, .. } if matches!(op.as_str(), "WHEN" | "WHILE") => {
-            Some(*input)
-        }
-        _ => None,
-    }
-}
-
-fn update_guard_for_when_arm(
-    field: &FieldDef,
-    source: &str,
-    when_expr_id: usize,
-    arm: &AstStatement,
-) -> Option<UpdateGuard> {
-    let input = when_input_expr_id(field_expr(field, when_expr_id)?)?;
-    let AstExprKind::MatchArm { pattern, .. } = &field_expr(field, arm.expr?)?.kind else {
-        return None;
-    };
-    let value = match_const_pattern_label(pattern)?;
-    if value == "__" || value_starts_lowercase_identifier(&value) {
-        return None;
-    }
-    let variants = source_ref_variants(source);
-    if let AstExprKind::Pipe {
-        input: list_input,
-        op,
-        ..
-    } = &field_expr(field, input)?.kind
-        && op == "List/is_not_empty"
-        && matches!(value.as_str(), "True" | "False")
-    {
-        let raw_input = ast_argument_value(field, *list_input)?;
-        return Some(UpdateGuard::ListIsNotEmpty {
-            input: canonical_update_guard_input(field, source, &raw_input, &variants),
-            expected: value == "True",
-        });
-    }
-    if let AstExprKind::Infix { left, op, right } = &field_expr(field, input)?.kind {
-        let equality_required = match (op.as_str(), value.as_str()) {
-            ("==", "True") | ("!=", "False") => true,
-            ("!=", "True") | ("==", "False") => false,
-            _ => return None,
-        };
-        let left = canonical_update_guard_input(
-            field,
-            source,
-            &ast_argument_value(field, *left)?,
-            &variants,
-        );
-        let right = canonical_update_guard_input(
-            field,
-            source,
-            &ast_argument_value(field, *right)?,
-            &variants,
-        );
-        return Some(if equality_required {
-            UpdateGuard::ValuesEqual { left, right }
-        } else {
-            UpdateGuard::ValuesNotEqual { left, right }
-        });
-    }
-    let raw_input = ast_argument_value(field, input)?;
-    Some(UpdateGuard::ValueOneOf {
-        input: canonical_update_guard_input(field, source, &raw_input, &variants),
-        values: vec![value],
-    })
-}
-
-fn canonical_update_guard_input(
-    field: &FieldDef,
-    source: &str,
-    input: &str,
-    source_variants: &[String],
-) -> String {
-    for variant in source_variants {
-        if input == variant {
-            return source.to_owned();
-        }
-        if let Some(suffix) = input.strip_prefix(variant)
-            && suffix.starts_with('.')
-        {
-            return format!("{source}{suffix}");
-        }
-    }
-    canonical_local_path(input, &field.parent_path)
-}
-
-fn update_guard_for_field_source(field: &FieldDef, source: &str) -> Option<UpdateGuard> {
-    let branch = RoutedBranch {
-        items: field.ast_items.clone(),
-        ast_exprs: field.ast_exprs.clone(),
-    };
-    update_guard_for_routed_branch(field, source, &branch)
-}
-
-fn then_empty_dependency_guard(
-    field: &FieldDef,
-    fields: &[FieldDef],
-    source: &str,
-    _branch: &RoutedBranch,
-) -> Option<UpdateGuard> {
-    field.ast_exprs.iter().find_map(|expr| {
-        let AstExprKind::Then {
-            input,
-            output: Some(output),
-        } = expr.kind
-        else {
-            return None;
-        };
-        let output_expr = field
-            .ast_exprs
-            .iter()
-            .find(|candidate| candidate.id == output)?;
-        if ast_initial_value(output_expr, &field.ast_exprs, &[], None)
-            != (InitialValue::Text {
-                value: String::new(),
-            })
-        {
-            return None;
-        }
-        let input = ast_argument_value(field, input)?;
-        let dependency = fields.iter().find(|candidate| {
-            candidate.parent_path == field.parent_path
-                && (candidate.local_name == input || candidate.path == input)
-        })?;
-        dependency
-            .source_branch(source)
-            .and_then(|dependency_branch| {
-                update_guard_for_routed_branch(dependency, source, &dependency_branch)
-            })
-            .or_else(|| update_guard_for_field_source(dependency, source))
-    })
-}
-
-fn non_skip_literal_match_patterns_after_when(
-    branch: &RoutedBranch,
-    when_line: usize,
-) -> Vec<String> {
-    let end_line = branch
-        .ast_exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > when_line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    let has_non_skip_catch_all = branch
-        .ast_exprs
-        .iter()
-        .filter(|expr| expr.line >= when_line && expr.line < end_line)
-        .any(|expr| {
-            let AstExprKind::MatchArm { pattern, output } = &expr.kind else {
-                return false;
-            };
-            let Some(pattern) = match_const_pattern_label(pattern) else {
-                return false;
-            };
-            let catch_all = pattern == "__" || value_starts_lowercase_identifier(&pattern);
-            let skips = output.is_some_and(|output| {
-                ast_simple_update_value_in_exprs(&branch.ast_exprs, output)
-                    == Some("SKIP".to_owned())
-            });
-            catch_all && !skips
-        });
-    if has_non_skip_catch_all {
-        return Vec::new();
-    }
-    let mut values = branch
-        .ast_exprs
-        .iter()
-        .filter(|expr| expr.line >= when_line && expr.line < end_line)
-        .filter_map(|expr| {
-            let AstExprKind::MatchArm { pattern, output } = &expr.kind else {
-                return None;
-            };
-            let pattern = match_const_pattern_label(pattern)?;
-            if pattern == "__" || value_starts_lowercase_identifier(&pattern) {
-                return None;
-            }
-            if let Some(output) = output
-                && ast_simple_update_value_in_exprs(&branch.ast_exprs, *output)
-                    == Some("SKIP".to_owned())
-            {
-                return None;
-            }
-            Some(pattern)
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        values = branch
-            .items
-            .iter()
-            .filter(|item| {
-                item.line >= when_line
-                    && item.line < end_line
-                    && item.operators.iter().any(|operator| operator == "WHEN")
-            })
-            .flat_map(|item| non_skip_literal_match_patterns_from_symbols(&item.symbols))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-    }
-    values.sort();
-    values
-}
-
-fn non_skip_literal_match_patterns_from_symbols(symbols: &[String]) -> Vec<String> {
-    let mut values = Vec::new();
-    for (index, symbol) in symbols.iter().enumerate() {
-        if symbol != "=>" || index == 0 {
-            continue;
-        }
-        let Some(pattern) = symbols
-            .get(index - 1)
-            .and_then(|value| match_const_pattern_label(std::slice::from_ref(value)))
-        else {
-            continue;
-        };
-        if pattern == "__" || value_starts_lowercase_identifier(&pattern) {
-            continue;
-        }
-        if symbols.get(index + 1).is_some_and(|value| value == "SKIP") {
-            continue;
-        }
-        values.push(pattern);
-    }
-    values
-}
-
-#[allow(clippy::too_many_arguments)]
-fn update_expression_for_routed_branch(
-    program: &ParsedProgram,
-    target: &str,
-    field: &FieldDef,
-    fields: &[FieldDef],
-    branch_source: &str,
-    variants: &[String],
-    branch: RoutedBranch,
-    resolved_constants: &ResolvedConstantLookup<'_>,
-) -> UpdateExpression {
-    if branch.has_token("=>") && branch.has_token("False") && !branch.has_token("True") {
-        return UpdateExpression::Const {
-            value: "False".to_owned(),
-        };
-    }
-    if let Some(value) = branch_value_after_match(&branch, "Escape")
-        && value_starts_lowercase_identifier(value)
-    {
-        return UpdateExpression::PreviousValue {
-            path: value.to_owned(),
-        };
-    }
-    if let Some(path) = branch.bool_not_path().filter(|path| !path.is_empty()) {
-        return UpdateExpression::BoolNot { path };
-    }
-    if branch.has_token("Bool/not") {
-        return UpdateExpression::BoolNot {
-            path: target.to_owned(),
-        };
-    }
-    if bool_toggle_when_matches_source(field, branch_source) {
-        return UpdateExpression::BoolNot {
-            path: target.to_owned(),
-        };
-    }
-    if let Some(expression) = text_trim_or_previous_update(program, target, &branch) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_number_infix_expression(field, target) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_project_time_expression(field, target) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_length_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_is_empty_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_get_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_list_get_expression(field, target, fields, branch_source, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_set_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_slice_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_take_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_drop_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_zeros_expression(field, resolved_constants) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_to_hex_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_from_hex_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_to_base64_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_from_base64_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_read_unsigned_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_read_signed_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_write_unsigned_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_write_signed_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) = branch.host_effect_expression(field) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_text_to_number_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_text_to_bytes_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        branch.then_bytes_to_text_expression(field, target, fields, resolved_constants)
-    {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_concat_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_equal_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_find_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_starts_with_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_bytes_ends_with_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) =
-        prefix_payload_concat_update_expression_from_items(&branch.items, variants)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        guarded_then_function_match_update_expression(program, field, target, fields, branch_source)
-    {
-        return expression;
-    }
-    if let Some(expression) =
-        then_function_match_update_expression(program, field, target, fields, branch_source)
-    {
-        return expression;
-    }
-    if let Some(expression) = branch_text_is_empty_match_value_update_expression(
-        field,
-        target,
-        fields,
-        branch_source,
-        &branch,
-    ) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_prefix_payload_concat_expression(variants) {
-        return expression;
-    }
-    if let Some(expression) = branch.then_prefix_root_concat_expression(field, target, fields) {
-        return expression;
-    }
-    if let Some(expression) =
-        match_const_update_expression(field, target, fields, branch_source, &branch)
-    {
-        return expression;
-    }
-    if let Some(value) = branch.then_simple_update_value() {
-        return match value {
-            SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
-            SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
-                path: canonical_scalar_update_path_for_source(
-                    field,
-                    target,
-                    &path,
-                    fields,
-                    branch_source,
-                ),
-            },
-        };
-    }
-    if let Some(payload_field) = variants
-        .iter()
-        .find_map(|variant| field.first_referenced_payload_field(variant))
-    {
-        return UpdateExpression::SourcePayload {
-            path: payload_field,
-        };
-    }
-    if let Some(value) = branch.simple_update_value() {
-        return match value {
-            SimpleThenUpdateValue::Const(value) => UpdateExpression::Const { value },
-            SimpleThenUpdateValue::Path(path) => UpdateExpression::ReadPath {
-                path: canonical_scalar_update_path_for_source(
-                    field,
-                    target,
-                    &path,
-                    fields,
-                    branch_source,
-                ),
-            },
-        };
-    }
-    if !branch.is_empty() {
-        return UpdateExpression::Unknown {
-            summary: branch.summary(),
-        };
-    }
-    UpdateExpression::Unknown {
-        summary: "source reaches target through derived local field".to_owned(),
-    }
-}
-
-fn branch_text_is_empty_match_value_update_expression(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-    branch: &RoutedBranch,
-) -> Option<UpdateExpression> {
-    let (raw_input, text_is_empty_line) = branch_text_is_empty_input(branch)?;
-    let when_expr_id = branch
-        .ast_exprs
-        .iter()
-        .find(|expr| {
-            expr.line >= text_is_empty_line && matches!(expr.kind, AstExprKind::When { .. })
-        })
-        .map(|expr| expr.id)?;
-    let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
-    let mut arms = match_value_arms_for_when(field, target, fields, when_expr_id, Some(source));
-    if arms.is_empty() {
-        arms = branch_inline_match_value_arms(
-            field,
-            target,
-            fields,
-            source,
-            branch,
-            text_is_empty_line,
-        );
-    }
-    (!arms.is_empty()).then_some(UpdateExpression::MatchTextIsEmptyConst { input, arms })
-}
-
-fn branch_text_is_empty_input(branch: &RoutedBranch) -> Option<(String, usize)> {
-    for (index, item) in branch.items.iter().enumerate() {
-        if !item
-            .operators
-            .iter()
-            .any(|operator| operator == "Text/is_empty")
-            && !item_has_symbol(item, "Text/is_empty")
-        {
-            continue;
-        }
-        let input = branch.items[..index]
-            .iter()
-            .rev()
-            .find_map(text_is_empty_item_input_path)?;
-        return Some((input, item.line));
-    }
-    None
-}
-
-fn text_is_empty_item_input_path(item: &AstItem) -> Option<String> {
-    if item.symbols.iter().any(|symbol| {
-        matches!(
-            symbol.as_str(),
-            "|>" | "THEN" | "WHEN" | "=>" | "," | "Text/is_empty"
-        )
-    }) {
-        return None;
-    }
-    let value = item_summary(item);
-    (!value.is_empty()
-        && value != "SKIP"
-        && value != "True"
-        && value != "False"
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
-    .then_some(value)
-}
-
-fn branch_inline_match_value_arms(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-    branch: &RoutedBranch,
-    after_line: usize,
-) -> Vec<UpdateValueMatchArm> {
-    branch
-        .items
-        .iter()
-        .filter(|item| {
-            item.line >= after_line && item.operators.iter().any(|operator| operator == "WHEN")
-        })
-        .flat_map(|item| {
-            inline_match_value_arms_from_symbols(field, target, fields, source, &item.symbols)
-        })
-        .collect()
-}
-
-fn inline_match_value_arms_from_symbols(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-    symbols: &[String],
-) -> Vec<UpdateValueMatchArm> {
-    let mut arms = Vec::new();
-    for (index, symbol) in symbols.iter().enumerate() {
-        if symbol != "=>" || index == 0 {
-            continue;
-        }
-        let Some(pattern) = symbols
-            .get(index - 1)
-            .and_then(|value| match_const_pattern_label(std::slice::from_ref(value)))
-        else {
-            continue;
-        };
-        let Some(output) = symbols
-            .get(index + 1)
-            .filter(|value| !matches!(value.as_str(), "," | "}" | "{"))
-        else {
-            continue;
-        };
-        let output = inline_update_value_expression(field, target, fields, source, output);
-        arms.push(UpdateValueMatchArm { pattern, output });
-    }
-    arms
-}
-
-fn inline_update_value_expression(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-    value: &str,
-) -> UpdateValueExpression {
-    let path = canonical_scalar_update_path_for_source(field, target, value, fields, source);
-    if path == target || fields.iter().any(|candidate| candidate.path == path) {
-        UpdateValueExpression::ReadPath { path }
-    } else {
-        UpdateValueExpression::Const {
-            value: value.to_owned(),
-        }
-    }
-}
-
-fn then_function_match_update_expression(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-) -> Option<UpdateExpression> {
-    field.ast_exprs.iter().find_map(|expr| {
-        let AstExprKind::Then { input, output } = expr.kind else {
-            return None;
-        };
-        if !then_input_matches_source(field, input, source) {
-            return None;
-        }
-        let output = output.or_else(|| following_direct_then_call_expr_id(field, expr.line))?;
-        let output = field
-            .ast_exprs
-            .iter()
-            .find(|candidate| candidate.id == output)?;
-        let AstExprKind::Call { function, args, .. } = &output.kind else {
-            return None;
-        };
-        function_match_const_update_expression(program, field, target, fields, function, args)
-    })
-}
-
-fn following_direct_then_call_expr_id(field: &FieldDef, line: usize) -> Option<usize> {
-    field
-        .ast_exprs
-        .iter()
-        .filter(|candidate| candidate.line > line)
-        .find_map(|candidate| match candidate.kind {
-            AstExprKind::Call { .. } => Some(Some(candidate.id)),
-            AstExprKind::When { .. } | AstExprKind::MatchArm { .. } | AstExprKind::Then { .. } => {
-                Some(None)
-            }
-            _ => None,
-        })
-        .flatten()
-}
-
-fn guarded_then_function_match_update_expression(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-) -> Option<UpdateExpression> {
-    field.ast_exprs.iter().find_map(|expr| {
-        let AstExprKind::Then { input, output } = expr.kind else {
-            return None;
-        };
-        if !then_input_matches_source(field, input, source) {
-            return None;
-        }
-        let output = output.or_else(|| following_when_expr_id(field, expr))?;
-        guarded_function_match_update_expression_from_expr(
-            program, field, target, fields, output, source,
-        )
-    })
-}
-
-fn guarded_function_match_update_expression_from_expr(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    expr_id: usize,
-    source: &str,
-) -> Option<UpdateExpression> {
-    let expr = field_expr(field, expr_id)?;
-    let AstExprKind::When { input, .. } = expr.kind else {
-        return None;
-    };
-    let arms =
-        guarded_match_value_arms_after_when_expr(program, field, target, fields, expr.id, source);
-    if arms.is_empty() {
-        return None;
-    }
-    if let Some(input_expr) = field_expr(field, input)
-        && let AstExprKind::Infix { left, op, right } = &input_expr.kind
-    {
-        return Some(UpdateExpression::MatchInfixConst {
-            left: update_value_expression_from_expr(field, target, fields, *left, Some(source))?,
-            op: op.clone(),
-            right: update_value_expression_from_expr(field, target, fields, *right, Some(source))?,
-            arms,
-        });
-    }
-    if let Some(raw_input) = text_is_empty_input_path(field, input) {
-        let input =
-            canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
-        return Some(UpdateExpression::MatchTextIsEmptyConst { input, arms });
-    }
-    let raw_input = ast_argument_value(field, input)?;
-    let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
-    Some(UpdateExpression::MatchValueConst { input, arms })
-}
-
-fn guarded_match_value_arms_after_when_expr(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    when_expr_id: usize,
-    source: &str,
-) -> Vec<UpdateValueMatchArm> {
-    let mut arms = Vec::new();
-    collect_guarded_match_value_arms_for_when(
-        program,
-        field,
-        target,
-        fields,
-        &field.statement,
-        when_expr_id,
-        source,
-        &mut arms,
-    );
-    if !arms.is_empty() {
-        return arms;
-    }
-    let Some(when_expr) = field_expr(field, when_expr_id) else {
-        return Vec::new();
-    };
-    let end_line = field
-        .ast_exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > when_expr.line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    field
-        .ast_exprs
-        .iter()
-        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
-        .filter_map(|expr| {
-            guarded_match_value_arm_expr(program, field, target, fields, expr, source)
-        })
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_guarded_match_value_arms_for_when(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    statement: &AstStatement,
-    when_expr_id: usize,
-    source: &str,
-    arms: &mut Vec<UpdateValueMatchArm>,
-) -> bool {
-    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
-        expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
-    });
-    if statement_contains_when {
-        for child in &statement.children {
-            let Some(expr_id) = child.expr else {
-                continue;
-            };
-            let Some(expr) = field_expr(field, expr_id) else {
-                continue;
-            };
-            if let Some(arm) =
-                guarded_match_value_arm_expr(program, field, target, fields, expr, source)
-            {
-                arms.push(arm);
-            }
-        }
-        if !arms.is_empty() {
-            return true;
-        }
-    }
-    for child in &statement.children {
-        if collect_guarded_match_value_arms_for_when(
-            program,
-            field,
-            target,
-            fields,
-            child,
-            when_expr_id,
-            source,
-            arms,
-        ) {
-            return true;
-        }
-    }
-    false
-}
-
-fn guarded_match_value_arm_expr(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    expr: &AstExpr,
-    source: &str,
-) -> Option<UpdateValueMatchArm> {
-    let AstExprKind::MatchArm {
-        pattern,
-        output: Some(output),
-    } = &expr.kind
-    else {
-        return None;
-    };
-    let output =
-        guarded_update_value_expression_from_expr(program, field, target, fields, *output, source)?;
-    let pattern = match_const_pattern_label(pattern)?;
-    (!pattern.is_empty()).then_some(UpdateValueMatchArm { pattern, output })
-}
-
-fn guarded_update_value_expression_from_expr(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    expr_id: usize,
-    source: &str,
-) -> Option<UpdateValueExpression> {
-    let expr = field_expr(field, expr_id)?;
-    if let AstExprKind::Call { function, args, .. } = &expr.kind {
-        return function_match_const_update_value_expression(
-            program, field, target, fields, function, args,
-        );
-    }
-    update_value_expression_from_expr(field, target, fields, expr_id, Some(source))
-}
-
-fn function_match_const_update_value_expression(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    function: &str,
-    args: &[AstCallArg],
-) -> Option<UpdateValueExpression> {
-    let UpdateExpression::MatchConst { input, arms } =
-        function_match_const_update_expression(program, field, target, fields, function, args)?
-    else {
-        return None;
-    };
-    Some(UpdateValueExpression::MatchConst {
-        input,
-        arms: arms
-            .into_iter()
-            .map(|arm| UpdateValueMatchArm {
-                pattern: arm.pattern,
-                output: UpdateValueExpression::Const { value: arm.output },
-            })
-            .collect(),
-    })
-}
-
-fn function_match_const_update_expression(
-    program: &ParsedProgram,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    function: &str,
-    args: &[AstCallArg],
-) -> Option<UpdateExpression> {
-    let function = function_definition_for_call(program, function)?;
-    let function_expr_ids = statement_expr_ids_recursive(&function.statement, &program.expressions);
-    let function_exprs = function_expr_ids
-        .iter()
-        .filter_map(|expr_id| program.expressions.iter().find(|expr| expr.id == *expr_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    function_exprs.iter().find_map(|expr| {
-        let AstExprKind::When { input, .. } = expr.kind else {
-            return None;
-        };
-        let input_name = ast_argument_value_in_exprs(&function_exprs, input)?;
-        let call_input = function_call_arg_update_path(
-            field,
-            target,
-            fields,
-            &field.ast_exprs,
-            args,
-            &function.args,
-            &input_name,
-        )?;
-        let arms =
-            match_const_arms_for_statement_exprs(&function.statement, &function_exprs, expr.id);
-        (!arms.is_empty()).then_some(UpdateExpression::MatchConst {
-            input: call_input,
-            arms,
-        })
-    })
-}
-
-fn function_definition_for_call(
-    program: &ParsedProgram,
-    function: &str,
-) -> Option<FunctionDefinition> {
-    let definitions = function_definitions(program);
-    definitions
-        .iter()
-        .find(|definition| definition.name == function)
-        .cloned()
-        .or_else(|| {
-            let suffix = function.rsplit_once('/').map(|(_, name)| name)?;
-            definitions
-                .iter()
-                .find(|definition| definition.name == suffix)
-                .cloned()
-        })
-}
-
-fn statement_expr_ids_recursive(statement: &AstStatement, expressions: &[AstExpr]) -> Vec<usize> {
-    let mut ids = Vec::new();
-    collect_statement_expr_ids_recursive(statement, expressions, &mut ids);
-    ids
-}
-
-fn collect_statement_expr_ids_recursive(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-    ids: &mut Vec<usize>,
-) {
-    if let Some(expr_id) = statement.expr {
-        ids.push(expr_id);
-        collect_expr_ids_recursive(expr_id, expressions, ids);
-    }
-    for child in &statement.children {
-        collect_statement_expr_ids_recursive(child, expressions, ids);
-    }
-}
-
-fn collect_expr_ids_recursive(expr_id: usize, expressions: &[AstExpr], ids: &mut Vec<usize>) {
-    let Some(expr) = expressions.iter().find(|expr| expr.id == expr_id) else {
-        return;
-    };
-    let push_child = |child_id: usize, ids: &mut Vec<usize>| {
-        if !ids.contains(&child_id) {
-            ids.push(child_id);
-        }
-        collect_expr_ids_recursive(child_id, expressions, ids);
-    };
-    match &expr.kind {
-        AstExprKind::Call { args, .. } => {
-            for arg in args {
-                push_child(arg.value, ids);
-            }
-        }
-        AstExprKind::Pipe { input, args, .. } => {
-            push_child(*input, ids);
-            for arg in args {
-                push_child(arg.value, ids);
-            }
-        }
-        AstExprKind::Hold { initial, .. }
-        | AstExprKind::When { input: initial, .. }
-        | AstExprKind::Draining { input: initial } => {
-            push_child(*initial, ids);
-        }
-        AstExprKind::Then {
-            input,
-            output: Some(output),
-        } => {
-            push_child(*input, ids);
-            push_child(*output, ids);
-        }
-        AstExprKind::Then {
-            input,
-            output: None,
-        } => push_child(*input, ids),
-        AstExprKind::MatchArm {
-            output: Some(output),
-            ..
-        } => push_child(*output, ids),
-        AstExprKind::Block { bindings, result } => {
-            for binding in bindings {
-                push_child(binding.value, ids);
-            }
-            if let Some(result) = result {
-                push_child(*result, ids);
-            }
-        }
-        AstExprKind::Infix { left, right, .. } => {
-            push_child(*left, ids);
-            push_child(*right, ids);
-        }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
-            for record_field in fields {
-                push_child(record_field.value, ids);
-            }
-        }
-        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => {
-            for item in items {
-                push_child(*item, ids);
-            }
-        }
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::Drain { .. }
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::Source
-        | AstExprKind::Latest
-        | AstExprKind::MatchArm { output: None, .. }
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => {}
-    }
-}
-
-fn function_call_arg_update_path(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    call_exprs: &[AstExpr],
-    args: &[AstCallArg],
-    formals: &[String],
-    input_name: &str,
-) -> Option<String> {
-    let named_arg = args
-        .iter()
-        .find(|arg| arg.named_name() == Some(input_name))
-        .and_then(|arg| ast_argument_value_in_exprs(call_exprs, arg.value));
-    let positional_arg = formals
-        .iter()
-        .position(|formal| formal == input_name)
-        .and_then(|index| {
-            args.iter()
-                .filter(|arg| arg.is_bare_binding())
-                .nth(index)
-                .and_then(|arg| ast_argument_value_in_exprs(call_exprs, arg.value))
-        });
-    named_arg
-        .or(positional_arg)
-        .map(|path| canonical_scalar_update_path_with_fields(field, target, &path, fields))
-}
-
-fn match_const_update_expression(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-    branch: &RoutedBranch,
-) -> Option<UpdateExpression> {
-    field
-        .ast_exprs
-        .iter()
-        .find_map(|expr| {
-            let AstExprKind::When { input, .. } = expr.kind else {
-                return None;
-            };
-            expr_matches_source(field, input, source)
-                .then(|| {
-                    match_const_update_expression_from_expr(
-                        field,
-                        target,
-                        fields,
-                        expr.id,
-                        Some(source),
-                    )
-                })
-                .flatten()
-        })
-        .or_else(|| {
-            branch.ast_exprs.iter().find_map(|expr| {
-                let AstExprKind::When { input, .. } = expr.kind else {
-                    return None;
-                };
-                expr_matches_source(field, input, source)
-                    .then(|| {
-                        match_const_update_expression_from_expr(
-                            field,
-                            target,
-                            fields,
-                            expr.id,
-                            Some(source),
-                        )
-                    })
-                    .flatten()
-            })
-        })
-        .or_else(|| {
-            field.ast_exprs.iter().find_map(|expr| {
-                let AstExprKind::Then { input, .. } = expr.kind else {
-                    return None;
-                };
-                (then_input_matches_source(field, input, source)
-                    || branch
-                        .ast_exprs
-                        .iter()
-                        .any(|branch_expr| branch_expr.id == expr.id))
-                .then(|| {
-                    match_const_update_expression_from_then_expr(
-                        field,
-                        target,
-                        fields,
-                        expr.id,
-                        Some(source),
-                    )
-                })
-                .flatten()
-            })
-        })
-        .or_else(|| following_match_const_update_expression(field, target, fields, source, branch))
-        .or_else(|| inline_match_value_update_expression(field, target, fields, source, branch))
-}
-
-fn inline_match_value_update_expression(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-    branch: &RoutedBranch,
-) -> Option<UpdateExpression> {
-    let when = branch
-        .ast_exprs
-        .iter()
-        .find(|expr| matches!(expr.kind, AstExprKind::When { .. }))?;
-    let AstExprKind::When { input, .. } = when.kind else {
-        return None;
-    };
-    let arms = branch_inline_match_value_arms(field, target, fields, source, branch, when.line);
-    if arms.is_empty() {
-        return None;
-    }
-    if let Some(input_expr) = field_expr(field, input)
-        && let AstExprKind::Infix { left, op, right } = &input_expr.kind
-    {
-        return Some(UpdateExpression::MatchInfixConst {
-            left: update_value_expression_from_expr(field, target, fields, *left, Some(source))?,
-            op: op.clone(),
-            right: update_value_expression_from_expr(field, target, fields, *right, Some(source))?,
-            arms,
-        });
-    }
-    if let Some(raw_input) = text_is_empty_input_path(field, input) {
-        let input =
-            canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
-        return Some(UpdateExpression::MatchTextIsEmptyConst { input, arms });
-    }
-    let raw_input = ast_argument_value(field, input)?;
-    let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
-    Some(UpdateExpression::MatchValueConst { input, arms })
-}
-
-fn then_input_matches_source(field: &FieldDef, expr_id: usize, source: &str) -> bool {
-    expr_matches_source(field, expr_id, source)
-}
-
-fn expr_matches_source(field: &FieldDef, expr_id: usize, source: &str) -> bool {
-    let Some(input_path) = ast_argument_value(field, expr_id) else {
-        return false;
-    };
-    let input_parts = input_path
-        .split('.')
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let canonical_path = canonical_local_path(&input_path, &field.parent_path);
-    let canonical_parts = canonical_path
-        .split('.')
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    source_ref_variants(source).iter().any(|variant| {
-        let expected = dotted_path_parts(variant);
-        path_parts_match_source_ref(&input_parts, &expected)
-            || path_parts_match_source_ref(&canonical_parts, &expected)
-    })
-}
-
-fn bool_toggle_when_matches_source(field: &FieldDef, source: &str) -> bool {
-    field.ast_exprs.iter().any(|expr| {
-        let AstExprKind::Pipe { op, args, .. } = &expr.kind else {
-            return false;
-        };
-        op == "Bool/toggle"
-            && args
-                .iter()
-                .find(|arg| arg.named_name() == Some("when"))
-                .is_some_and(|arg| expr_matches_source(field, arg.value, source))
-    })
-}
-
-fn match_const_update_expression_from_then_expr(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    expr_id: usize,
-    source: Option<&str>,
-) -> Option<UpdateExpression> {
-    let expr = field_expr(field, expr_id)?;
-    let AstExprKind::Then { output, .. } = expr.kind else {
-        return None;
-    };
-    let output = output.or_else(|| following_when_expr_id(field, expr))?;
-    match_const_update_expression_from_expr(field, target, fields, output, source)
-}
-
-fn following_match_const_update_expression(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    source: &str,
-    branch: &RoutedBranch,
-) -> Option<UpdateExpression> {
-    branch.ast_exprs.iter().find_map(|expr| {
-        if !expr_matches_source(field, expr.id, source) {
-            return None;
-        }
-        let then = branch.ast_exprs.iter().find(|candidate| {
-            candidate.line > expr.line && matches!(candidate.kind, AstExprKind::Then { .. })
-        })?;
-        match_const_update_expression_from_then_expr(field, target, fields, then.id, Some(source))
-    })
-}
-
-fn following_when_expr_id(field: &FieldDef, parent: &AstExpr) -> Option<usize> {
-    nested_when_expr_id(&field.statement, parent.id, &field.ast_exprs).or_else(|| {
-        field
-            .ast_exprs
-            .iter()
-            .find(|candidate| {
-                candidate.id != parent.id
-                    && candidate.start >= parent.start
-                    && candidate.end <= parent.end
-                    && matches!(candidate.kind, AstExprKind::When { .. })
-            })
-            .map(|expr| expr.id)
-    })
-}
-
-fn nested_when_expr_id(
-    statement: &AstStatement,
-    parent_expr_id: usize,
-    exprs: &[AstExpr],
-) -> Option<usize> {
-    if statement.expr == Some(parent_expr_id) {
-        return statement
-            .children
-            .iter()
-            .find_map(|child| first_when_expr_id(child, exprs));
-    }
-    statement
-        .children
-        .iter()
-        .find_map(|child| nested_when_expr_id(child, parent_expr_id, exprs))
-}
-
-fn first_when_expr_id(statement: &AstStatement, exprs: &[AstExpr]) -> Option<usize> {
-    if let Some(expr_id) = statement.expr
-        && exprs
-            .iter()
-            .find(|expr| expr.id == expr_id)
-            .is_some_and(|expr| matches!(expr.kind, AstExprKind::When { .. }))
-    {
-        return Some(expr_id);
-    }
-    statement
-        .children
-        .iter()
-        .find_map(|child| first_when_expr_id(child, exprs))
-}
-
-fn match_const_update_expression_from_expr(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    expr_id: usize,
-    source: Option<&str>,
-) -> Option<UpdateExpression> {
-    let expr = field_expr(field, expr_id)?;
-    match &expr.kind {
-        AstExprKind::When { input, .. } => {
-            if let Some(expression) = match_infix_const_update_expression_from_input(
-                field, target, fields, *input, expr.id, source,
-            ) {
-                return Some(expression);
-            }
-            if let Some(expression) = match_text_is_empty_const_update_expression_from_input(
-                field, target, fields, *input, expr.id, source,
-            ) {
-                return Some(expression);
-            }
-            let raw_input = ast_argument_value(field, *input)?;
-            let input = source.map_or_else(
-                || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
-                |source| {
-                    canonical_scalar_update_path_for_source(
-                        field, target, &raw_input, fields, source,
-                    )
-                },
-            );
-            let arms = match_const_arms_for_when(field, expr.id);
-            if arms.is_empty() {
-                return None;
-            }
-            let value_arms = match_value_arms_for_when(field, target, fields, expr.id, source);
-            if match_value_arms_need_structured_update(&arms, &value_arms) {
-                Some(UpdateExpression::MatchValueConst {
-                    input,
-                    arms: value_arms,
-                })
-            } else {
-                Some(UpdateExpression::MatchConst { input, arms })
-            }
-        }
-        AstExprKind::Then {
-            output: Some(output),
-            ..
-        } => match_const_update_expression_from_expr(field, target, fields, *output, source),
-        _ => None,
-    }
-}
-
-fn match_text_is_empty_const_update_expression_from_input(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    input: usize,
-    when_expr_id: usize,
-    source: Option<&str>,
-) -> Option<UpdateExpression> {
-    let raw_input = text_is_empty_input_path(field, input)?;
-    let input = source.map_or_else(
-        || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
-        |source| canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source),
-    );
-    let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
-    (!arms.is_empty()).then_some(UpdateExpression::MatchTextIsEmptyConst { input, arms })
-}
-
-fn match_infix_const_update_expression_from_input(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    input: usize,
-    when_expr_id: usize,
-    source: Option<&str>,
-) -> Option<UpdateExpression> {
-    let input = field_expr(field, input)?;
-    let AstExprKind::Infix { left, op, right } = &input.kind else {
-        return None;
-    };
-    let left = update_value_expression_from_expr(field, target, fields, *left, source)?;
-    let right = update_value_expression_from_expr(field, target, fields, *right, source)?;
-    let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
-    (!arms.is_empty()).then_some(UpdateExpression::MatchInfixConst {
-        left,
-        op: op.clone(),
-        right,
-        arms,
-    })
-}
-
-fn text_is_empty_input_path(field: &FieldDef, expr_id: usize) -> Option<String> {
-    let expr = field_expr(field, expr_id)?;
-    match &expr.kind {
-        AstExprKind::Pipe { input, op, .. } if op == "Text/is_empty" => {
-            ast_argument_value(field, *input)
-        }
-        AstExprKind::Call { function, args, .. } if function == "Text/is_empty" => args
-            .iter()
-            .find(|arg| arg.is_bare_binding())
-            .and_then(|arg| ast_argument_value(field, arg.value)),
-        _ => None,
-    }
-}
-
-fn match_value_arms_for_when(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    when_expr_id: usize,
-    source: Option<&str>,
-) -> Vec<UpdateValueMatchArm> {
-    let mut arms = Vec::new();
-    collect_match_value_arms_for_when(
-        field,
-        target,
-        fields,
-        &field.statement,
-        when_expr_id,
-        &mut arms,
-        source,
-    );
-    if arms.is_empty() {
-        match_value_arms_after_when_expr(field, target, fields, when_expr_id, source)
-    } else {
-        arms
-    }
-}
-
-fn match_value_arms_need_structured_update(
-    const_arms: &[UpdateMatchArm],
-    value_arms: &[UpdateValueMatchArm],
-) -> bool {
-    if value_arms.len() != const_arms.len() {
-        return !value_arms.is_empty();
-    }
-    value_arms
-        .iter()
-        .zip(const_arms)
-        .any(|(value_arm, const_arm)| {
-            value_arm.pattern != const_arm.pattern
-                || !matches!(
-                    &value_arm.output,
-                    UpdateValueExpression::Const { value } if value == &const_arm.output
-                )
-        })
-}
-
-fn collect_match_value_arms_for_when(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    statement: &AstStatement,
-    when_expr_id: usize,
-    arms: &mut Vec<UpdateValueMatchArm>,
-    source: Option<&str>,
-) -> bool {
-    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
-        expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
-    });
-    if statement_contains_when {
-        for child in &statement.children {
-            if let Some(arm) = match_value_arm(field, target, fields, child, source) {
-                arms.push(arm);
-            }
-        }
-        if !arms.is_empty() {
-            return true;
-        }
-    }
-    for child in &statement.children {
-        if collect_match_value_arms_for_when(
-            field,
-            target,
-            fields,
-            child,
-            when_expr_id,
-            arms,
-            source,
-        ) {
-            return true;
-        }
-    }
-    false
-}
-
-fn match_value_arms_after_when_expr(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    when_expr_id: usize,
-    source: Option<&str>,
-) -> Vec<UpdateValueMatchArm> {
-    let Some(when_expr) = field_expr(field, when_expr_id) else {
-        return Vec::new();
-    };
-    let end_line = field
-        .ast_exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > when_expr.line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    field
-        .ast_exprs
-        .iter()
-        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
-        .filter_map(|expr| match_value_arm_expr(field, target, fields, expr, source))
-        .collect()
-}
-
-fn match_const_arms_for_when(field: &FieldDef, when_expr_id: usize) -> Vec<UpdateMatchArm> {
-    let mut arms = Vec::new();
-    collect_match_const_arms_for_when(field, &field.statement, when_expr_id, &mut arms);
-    if arms.is_empty() {
-        match_const_arms_after_when_expr(field, when_expr_id)
-    } else {
-        arms
-    }
-}
-
-fn match_const_arms_for_statement_exprs(
-    statement: &AstStatement,
-    exprs: &[AstExpr],
-    when_expr_id: usize,
-) -> Vec<UpdateMatchArm> {
-    let mut arms = Vec::new();
-    collect_match_const_arms_for_statement_exprs(statement, exprs, when_expr_id, &mut arms);
-    if arms.is_empty() {
-        match_const_arms_after_when_expr_in_exprs(exprs, when_expr_id)
-    } else {
-        arms
-    }
-}
-
-fn collect_match_const_arms_for_statement_exprs(
-    statement: &AstStatement,
-    exprs: &[AstExpr],
-    when_expr_id: usize,
-    arms: &mut Vec<UpdateMatchArm>,
-) -> bool {
-    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
-        expr_id == when_expr_id || expr_contains_expr_id_in_exprs(exprs, expr_id, when_expr_id)
-    });
-    if statement_contains_when {
-        for child in &statement.children {
-            if let Some(arm) = match_const_arm_in_exprs(exprs, child) {
-                arms.push(arm);
-            }
-        }
-        if !arms.is_empty() {
-            return true;
-        }
-    }
-    for child in &statement.children {
-        if collect_match_const_arms_for_statement_exprs(child, exprs, when_expr_id, arms) {
-            return true;
-        }
-    }
-    false
-}
-
-fn match_const_arms_after_when_expr_in_exprs(
-    exprs: &[AstExpr],
-    when_expr_id: usize,
-) -> Vec<UpdateMatchArm> {
-    let Some(when_expr) = exprs.iter().find(|expr| expr.id == when_expr_id) else {
-        return Vec::new();
-    };
-    let end_line = exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > when_expr.line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    exprs
-        .iter()
-        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
-        .filter_map(|expr| match_const_arm_expr_in_exprs(exprs, expr))
-        .collect()
-}
-
-fn match_const_arms_after_when_expr(field: &FieldDef, when_expr_id: usize) -> Vec<UpdateMatchArm> {
-    let Some(when_expr) = field_expr(field, when_expr_id) else {
-        return Vec::new();
-    };
-    let end_line = field
-        .ast_exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > when_expr.line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    field
-        .ast_exprs
-        .iter()
-        .filter(|expr| expr.line > when_expr.line && expr.line < end_line)
-        .filter_map(|expr| match_const_arm_expr(field, expr))
-        .collect()
-}
-
-fn collect_match_const_arms_for_when(
-    field: &FieldDef,
-    statement: &AstStatement,
-    when_expr_id: usize,
-    arms: &mut Vec<UpdateMatchArm>,
-) -> bool {
-    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
-        expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
-    });
-    if statement_contains_when {
-        for child in &statement.children {
-            if let Some(arm) = match_const_arm(field, child) {
-                arms.push(arm);
-            }
-        }
-        if !arms.is_empty() {
-            return true;
-        }
-    }
-    for child in &statement.children {
-        if collect_match_const_arms_for_when(field, child, when_expr_id, arms) {
-            return true;
-        }
-    }
-    false
-}
-
-fn match_const_arm(field: &FieldDef, statement: &AstStatement) -> Option<UpdateMatchArm> {
-    let expr_id = statement.expr?;
-    let expr = field_expr(field, expr_id)?;
-    match_const_arm_expr(field, expr)
-}
-
-fn match_const_arm_in_exprs(exprs: &[AstExpr], statement: &AstStatement) -> Option<UpdateMatchArm> {
-    let expr_id = statement.expr?;
-    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
-    match_const_arm_expr_in_exprs(exprs, expr)
-}
-
-fn match_const_arm_expr(field: &FieldDef, expr: &AstExpr) -> Option<UpdateMatchArm> {
-    match_const_arm_expr_in_exprs(&field.ast_exprs, expr)
-}
-
-fn match_value_arm(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    statement: &AstStatement,
-    source: Option<&str>,
-) -> Option<UpdateValueMatchArm> {
-    let expr_id = statement.expr?;
-    let expr = field_expr(field, expr_id)?;
-    match_value_arm_expr(field, target, fields, expr, source)
-}
-
-fn match_value_arm_expr(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    expr: &AstExpr,
-    source: Option<&str>,
-) -> Option<UpdateValueMatchArm> {
-    let AstExprKind::MatchArm {
-        pattern,
-        output: Some(output),
-    } = &expr.kind
-    else {
-        return None;
-    };
-    let output = update_value_expression_from_expr(field, target, fields, *output, source)?;
-    let pattern = match_const_pattern_label(pattern)?;
-    (!pattern.is_empty()).then_some(UpdateValueMatchArm { pattern, output })
-}
-
-fn update_value_expression_from_expr(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    expr_id: usize,
-    source: Option<&str>,
-) -> Option<UpdateValueExpression> {
-    let expr = field_expr(field, expr_id)?;
-    if matches!(expr.kind, AstExprKind::Identifier(_) | AstExprKind::Path(_)) {
-        let raw = ast_argument_value(field, expr_id)?;
-        let path = source.map_or_else(
-            || canonical_scalar_update_path_with_fields(field, target, &raw, fields),
-            |source| canonical_scalar_update_path_for_source(field, target, &raw, fields, source),
-        );
-        if path == target
-            || fields
-                .iter()
-                .any(|candidate| symbol_is_rooted_in(&path, &candidate.path))
-            || source.is_some_and(|source| source_payload_input_matches(&path, source))
-        {
-            return Some(UpdateValueExpression::ReadPath { path });
-        }
-    }
-    if let Some(value) = ast_simple_update_value_in_exprs(&field.ast_exprs, expr_id) {
-        return Some(UpdateValueExpression::Const { value });
-    }
-    if let AstExprKind::When { input, .. } = expr.kind {
-        if let Some(expression) =
-            update_value_match_infix_from_input(field, target, fields, input, expr.id, source)
-        {
-            return Some(expression);
-        }
-        if let Some(raw_input) = text_is_empty_input_path(field, input) {
-            let input = source.map_or_else(
-                || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
-                |source| {
-                    canonical_scalar_update_path_for_source(
-                        field, target, &raw_input, fields, source,
-                    )
-                },
-            );
-            let arms = match_value_arms_for_when(field, target, fields, expr.id, source);
-            if !arms.is_empty() {
-                return Some(UpdateValueExpression::MatchTextIsEmptyConst { input, arms });
-            }
-        }
-        let raw_input = ast_argument_value(field, input)?;
-        let input = source.map_or_else(
-            || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
-            |source| {
-                canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source)
-            },
-        );
-        let arms = match_value_arms_for_when(field, target, fields, expr.id, source);
-        if !arms.is_empty() {
-            return Some(UpdateValueExpression::MatchConst { input, arms });
-        }
-    }
-    let AstExprKind::Infix { left, op, right } = &expr.kind else {
-        return None;
-    };
-    let left = scalar_number_operand(field, *left, target)?;
-    let right = scalar_number_operand(field, *right, target)?;
-    Some(UpdateValueExpression::NumberInfix {
-        left,
-        op: op.clone(),
-        right,
-    })
-}
-
-fn update_value_match_infix_from_input(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    input: usize,
-    when_expr_id: usize,
-    source: Option<&str>,
-) -> Option<UpdateValueExpression> {
-    let input = field_expr(field, input)?;
-    let AstExprKind::Infix { left, op, right } = &input.kind else {
-        return None;
-    };
-    let left = scalar_number_operand(field, *left, target)?;
-    let right = scalar_number_operand(field, *right, target)?;
-    let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
-    (!arms.is_empty()).then_some(UpdateValueExpression::MatchInfixConst {
-        left,
-        op: op.clone(),
-        right,
-        arms,
-    })
-}
-
-fn match_const_arm_expr_in_exprs(exprs: &[AstExpr], expr: &AstExpr) -> Option<UpdateMatchArm> {
-    let AstExprKind::MatchArm {
-        pattern,
-        output: Some(output),
-    } = &expr.kind
-    else {
-        return None;
-    };
-    let output = ast_simple_update_value_in_exprs(exprs, *output)?;
-    let pattern = match_const_pattern_label(pattern)?;
-    (!pattern.is_empty()).then_some(UpdateMatchArm { pattern, output })
-}
-
-fn match_const_pattern_label(pattern: &[String]) -> Option<String> {
-    if pattern.is_empty() {
-        None
-    } else if let Some(value) = text_literal_value(pattern) {
-        Some(value)
-    } else if pattern.len() == 1 {
-        Some(pattern[0].clone())
-    } else {
-        Some(pattern.join("."))
-    }
-}
-
-fn expr_contains_expr_id_in_exprs(exprs: &[AstExpr], root: usize, needle: usize) -> bool {
-    expr_contains_expr_id_in_exprs_seen(exprs, root, needle, &mut BTreeSet::new())
-}
-
-fn expr_contains_expr_id_in_exprs_seen(
-    exprs: &[AstExpr],
-    root: usize,
-    needle: usize,
-    seen: &mut BTreeSet<usize>,
-) -> bool {
-    if root == needle {
-        return true;
-    }
-    if !seen.insert(root) {
-        return false;
-    }
-    let Some(expr) = exprs.iter().find(|expr| expr.id == root) else {
-        return false;
-    };
-    match &expr.kind {
-        AstExprKind::Call { args, .. } => args
-            .iter()
-            .any(|arg| expr_contains_expr_id_in_exprs_seen(exprs, arg.value, needle, seen)),
-        AstExprKind::Pipe { input, args, .. } => {
-            expr_contains_expr_id_in_exprs_seen(exprs, *input, needle, seen)
-                || args
-                    .iter()
-                    .any(|arg| expr_contains_expr_id_in_exprs_seen(exprs, arg.value, needle, seen))
-        }
-        AstExprKind::Hold { initial, .. }
-        | AstExprKind::When { input: initial, .. }
-        | AstExprKind::Draining { input: initial } => {
-            expr_contains_expr_id_in_exprs_seen(exprs, *initial, needle, seen)
-        }
-        AstExprKind::Then {
-            input,
-            output: Some(output),
-        } => {
-            expr_contains_expr_id_in_exprs_seen(exprs, *input, needle, seen)
-                || expr_contains_expr_id_in_exprs_seen(exprs, *output, needle, seen)
-        }
-        AstExprKind::Then {
-            input,
-            output: None,
-        } => expr_contains_expr_id_in_exprs_seen(exprs, *input, needle, seen),
-        AstExprKind::MatchArm {
-            output: Some(output),
-            ..
-        } => expr_contains_expr_id_in_exprs_seen(exprs, *output, needle, seen),
-        AstExprKind::Block { bindings, result } => {
-            bindings.iter().any(|binding| {
-                expr_contains_expr_id_in_exprs_seen(exprs, binding.value, needle, seen)
-            }) || result.is_some_and(|result| {
-                expr_contains_expr_id_in_exprs_seen(exprs, result, needle, seen)
-            })
-        }
-        AstExprKind::Infix { left, right, .. } => {
-            expr_contains_expr_id_in_exprs_seen(exprs, *left, needle, seen)
-                || expr_contains_expr_id_in_exprs_seen(exprs, *right, needle, seen)
-        }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => fields.iter().any(|record_field| {
-            expr_contains_expr_id_in_exprs_seen(exprs, record_field.value, needle, seen)
-        }),
-        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => items
-            .iter()
-            .any(|item| expr_contains_expr_id_in_exprs_seen(exprs, *item, needle, seen)),
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::Drain { .. }
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::Source
-        | AstExprKind::Latest
-        | AstExprKind::MatchArm { output: None, .. }
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => false,
-    }
-}
-
-fn expr_contains_expr_id(field: &FieldDef, root: usize, needle: usize) -> bool {
-    expr_contains_expr_id_seen(field, root, needle, &mut BTreeSet::new())
-}
-
-fn expr_contains_expr_id_seen(
-    field: &FieldDef,
-    root: usize,
-    needle: usize,
-    seen: &mut BTreeSet<usize>,
-) -> bool {
-    if root == needle {
-        return true;
-    }
-    if !seen.insert(root) {
-        return false;
-    }
-    let Some(expr) = field_expr(field, root) else {
-        return false;
-    };
-    match &expr.kind {
-        AstExprKind::Call { args, .. } => args
-            .iter()
-            .any(|arg| expr_contains_expr_id_seen(field, arg.value, needle, seen)),
-        AstExprKind::Pipe { input, args, .. } => {
-            expr_contains_expr_id_seen(field, *input, needle, seen)
-                || args
-                    .iter()
-                    .any(|arg| expr_contains_expr_id_seen(field, arg.value, needle, seen))
-        }
-        AstExprKind::Hold { initial, .. }
-        | AstExprKind::When { input: initial, .. }
-        | AstExprKind::Draining { input: initial } => {
-            expr_contains_expr_id_seen(field, *initial, needle, seen)
-        }
-        AstExprKind::Then {
-            input,
-            output: Some(output),
-        } => {
-            expr_contains_expr_id_seen(field, *input, needle, seen)
-                || expr_contains_expr_id_seen(field, *output, needle, seen)
-        }
-        AstExprKind::Then {
-            input,
-            output: None,
-        } => expr_contains_expr_id_seen(field, *input, needle, seen),
-        AstExprKind::MatchArm {
-            output: Some(output),
-            ..
-        } => expr_contains_expr_id_seen(field, *output, needle, seen),
-        AstExprKind::Block { bindings, result } => {
-            bindings
-                .iter()
-                .any(|binding| expr_contains_expr_id_seen(field, binding.value, needle, seen))
-                || result
-                    .is_some_and(|result| expr_contains_expr_id_seen(field, result, needle, seen))
-        }
-        AstExprKind::Infix { left, right, .. } => {
-            expr_contains_expr_id_seen(field, *left, needle, seen)
-                || expr_contains_expr_id_seen(field, *right, needle, seen)
-        }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => fields.iter().any(|record_field| {
-            expr_contains_expr_id_seen(field, record_field.value, needle, seen)
-        }),
-        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => items
-            .iter()
-            .any(|item| expr_contains_expr_id_seen(field, *item, needle, seen)),
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::Drain { .. }
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::Source
-        | AstExprKind::Latest
-        | AstExprKind::MatchArm { output: None, .. }
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => false,
-    }
-}
-
-fn canonical_scalar_update_path_with_fields(
-    field: &FieldDef,
-    target: &str,
-    value: &str,
-    fields: &[FieldDef],
-) -> String {
-    let target_field = target
-        .rsplit_once('.')
-        .map(|(_, field)| field)
-        .unwrap_or(target);
-    if value == field.local_name
-        || value == target_field
-        || field_hold_name(field).as_deref() == Some(value)
-    {
-        target.to_owned()
-    } else if let Some(path) = canonical_current_row_member_path(field, value, fields) {
-        path
-    } else if !value.contains('.') {
-        let child_path = format!("{}.{}", field.path, value);
-        if fields.iter().any(|candidate| candidate.path == child_path) {
-            child_path
-        } else if !field.parent_path.is_empty() {
-            let sibling_path = canonical_local_path(value, &field.parent_path);
-            if fields
-                .iter()
-                .any(|candidate| candidate.path == sibling_path)
-            {
-                sibling_path
-            } else if fields.iter().any(|candidate| candidate.path == value) {
-                value.to_owned()
-            } else {
-                sibling_path
-            }
-        } else if fields.iter().any(|candidate| candidate.path == value) {
-            value.to_owned()
-        } else {
-            canonical_local_path(value, &field.parent_path)
-        }
-    } else {
-        canonical_local_path(value, &field.parent_path)
-    }
-}
-
-fn canonical_current_row_member_path(
-    field: &FieldDef,
-    value: &str,
-    fields: &[FieldDef],
-) -> Option<String> {
-    if fields.iter().any(|candidate| candidate.path == value) {
-        return Some(value.to_owned());
-    }
-    let (_, tail) = value.split_once('.')?;
-    let mut parent = field.parent_path.as_str();
-    loop {
-        let candidate = format!("{parent}.{tail}");
-        if fields.iter().any(|field| field.path == candidate) {
-            return Some(candidate);
-        }
-        let Some((ancestor, _)) = parent.rsplit_once('.') else {
-            return None;
-        };
-        parent = ancestor;
-    }
-}
-
-fn canonical_scalar_update_path_for_source(
-    field: &FieldDef,
-    target: &str,
-    value: &str,
-    fields: &[FieldDef],
-    source: &str,
-) -> String {
-    if let Some(member_path) = canonical_source_member_path(source, value) {
-        return member_path;
-    }
-    let canonical = canonical_scalar_update_path_with_fields(field, target, value, fields);
-    if fields.iter().any(|candidate| candidate.path == canonical) {
-        return canonical;
-    }
-    let Some((source_scope, _)) = source.split_once('.') else {
-        return canonical;
-    };
-    let Some((_, value_tail)) = value.split_once('.') else {
-        return canonical;
-    };
-    let source_scoped = format!("{source_scope}.{value_tail}");
-    if fields
-        .iter()
-        .any(|candidate| candidate.path == source_scoped)
-    {
-        source_scoped
-    } else {
-        canonical
-    }
-}
-
-fn canonical_source_member_path(source: &str, value: &str) -> Option<String> {
-    let source_alias = std::iter::successors(Some(source), |candidate| {
-        candidate.split_once('.').map(|(_, suffix)| suffix)
-    })
-    .find(|candidate| {
-        value == *candidate
-            || value
-                .strip_prefix(*candidate)
-                .is_some_and(|suffix| suffix.starts_with('.'))
-    })?;
-    let suffix = value.strip_prefix(source_alias)?;
-    Some(format!("{source}{suffix}"))
-}
-
-fn canonical_bytes_scalar_arg(
-    field: &FieldDef,
-    target: &str,
-    arg: BytesScalarArg,
-    fields: &[FieldDef],
-) -> BytesScalarArg {
-    match arg {
-        BytesScalarArg::Static(value) => BytesScalarArg::Static(value),
-        BytesScalarArg::Path(path) => BytesScalarArg::Path(
-            canonical_scalar_update_path_with_fields(field, target, &path, fields),
-        ),
-    }
-}
-
-fn field_hold_name(field: &FieldDef) -> Option<String> {
-    match &field.statement.kind {
-        AstStatementKind::Hold { name, .. } => name.clone(),
-        _ => None,
-    }
-}
-
-fn field_expr(field: &FieldDef, expr_id: usize) -> Option<&AstExpr> {
-    field.ast_exprs.iter().find(|expr| expr.id == expr_id)
-}
-
-fn text_trim_or_previous_update(
-    program: &ParsedProgram,
-    target: &str,
-    branch: &RoutedBranch,
-) -> Option<UpdateExpression> {
-    if !path_has_parsed_row_scope(program, target) || !branch.has_operator("Text/trim") {
-        return None;
-    }
-    let mut previous = branch_value_after_match(branch, "TEXT")?;
-    let mut path = branch.text_trim_input_path()?;
-    if !value_starts_lowercase_identifier(&path) || !value_starts_lowercase_identifier(previous) {
-        return None;
-    }
-    let target_field = target.rsplit_once('.').map(|(_, field)| field)?;
-    if previous != target_field
-        && !branch
-            .items
-            .iter()
-            .any(|item| item.field.as_deref() == Some(previous))
-    {
-        previous = target_field;
-    }
-    if path.as_str() != "text"
-        && !branch
-            .items
-            .iter()
-            .any(|item| item.field.as_deref() == Some(path.as_str()))
-        && branch.references_path_tail("text")
-    {
-        path = "text".to_owned();
-    }
-    Some(UpdateExpression::TextTrimOrPrevious {
-        path,
-        previous: previous.to_owned(),
-    })
-}
-
-fn branch_value_after_match<'a>(branch: &'a RoutedBranch, label: &str) -> Option<&'a str> {
-    branch.items.iter().find_map(|item| {
-        let label_index = item.symbols.iter().position(|lexeme| lexeme == label)?;
-        let arrow_index = item.symbols[label_index..]
-            .iter()
-            .position(|lexeme| lexeme == "=>")
-            .map(|offset| label_index + offset)?;
-        item.symbols[arrow_index + 1..]
-            .iter()
-            .find(|lexeme| is_name(lexeme))
-            .map(String::as_str)
-    })
-}
-
-fn value_starts_lowercase_identifier(value: &str) -> bool {
-    value
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '_')
-}
-
-fn value_starts_uppercase_identifier(value: &str) -> bool {
-    value
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase())
-}
-
-fn path_has_parsed_row_scope(program: &ParsedProgram, path: &str) -> bool {
-    path.split('.').any(|segment| {
-        program
-            .row_scope_functions
-            .iter()
-            .any(|scope| scope.row_scope == segment)
-    })
-}
-
-fn bool_not_path_in_exprs(exprs: &[AstExpr]) -> Option<String> {
-    exprs
-        .iter()
-        .find_map(|expr| bool_not_path_from_expr(exprs, expr.id))
-}
-
-fn bool_not_path_from_expr(exprs: &[AstExpr], expr_id: usize) -> Option<String> {
-    let expr = exprs.iter().find(|expr| expr.id == expr_id)?;
-    match &expr.kind {
-        AstExprKind::Pipe { input, op, .. } if op == "Bool/not" => {
-            ast_argument_value_in_exprs(exprs, *input)
-        }
-        AstExprKind::Then {
-            output: Some(output),
-            ..
-        } => bool_not_path_from_expr(exprs, *output),
-        _ => None,
-    }
-}
-
-struct CandidateSourceIndex<'a> {
-    fields: &'a [FieldDef],
-    direct_sources: &'a BTreeMap<String, Vec<String>>,
-    effect_result_states: BTreeSet<String>,
-    fields_by_path: BTreeMap<&'a str, usize>,
-    dependencies_by_field: Vec<Vec<usize>>,
-    cache: BTreeMap<(String, bool), Vec<String>>,
-}
-
-impl<'a> CandidateSourceIndex<'a> {
-    fn new(
-        fields: &'a [FieldDef],
-        direct_sources: &'a BTreeMap<String, Vec<String>>,
-        state_cells: &[StateCell],
-    ) -> CandidateSourceIndex<'a> {
-        let empty_exclusions = BTreeSet::new();
-        let (_, dependencies_by_field) = field_symbol_dependency_graph(fields, &empty_exclusions);
-        let fields_by_path = fields
-            .iter()
-            .enumerate()
-            .map(|(index, field)| (field.path.as_str(), index))
-            .collect();
-        let effect_result_states = state_cells
-            .iter()
-            .filter_map(|state| {
-                fields
-                    .iter()
-                    .find(|field| field.path == state.path)
-                    .filter(|field| {
-                        field.ast_exprs.iter().any(|expr| match &expr.kind {
-                            AstExprKind::Call { function, .. } => {
-                                boon_typecheck::is_typed_host_effect(function)
-                            }
-                            _ => false,
-                        })
-                    })
-                    .map(|_| state.path.clone())
-            })
-            .collect();
-        CandidateSourceIndex {
-            fields,
-            direct_sources,
-            effect_result_states,
-            fields_by_path,
-            dependencies_by_field,
-            cache: BTreeMap::new(),
-        }
-    }
-
-    fn candidate_sources(&mut self, target: &str) -> Vec<String> {
-        let cache_key = (target.to_owned(), false);
-        if let Some(cached) = self.cache.get(&cache_key) {
-            return cached.clone();
-        }
-        let Some(&field_index) = self.fields_by_path.get(target) else {
-            self.cache.insert(cache_key, Vec::new());
-            return Vec::new();
-        };
-        let mut visiting = Vec::new();
-        self.candidate_sources_for_index(field_index, false, &mut visiting)
-    }
-
-    fn dependency_paths(&self, target: &str) -> Vec<String> {
-        let Some(&field_index) = self.fields_by_path.get(target) else {
-            return Vec::new();
-        };
-        self.dependencies_by_field[field_index]
-            .iter()
-            .map(|dependency| self.fields[*dependency].path.clone())
-            .collect()
-    }
-
-    fn event_sources_for_dependency(&mut self, dependency: &str) -> Vec<String> {
-        if self.effect_result_states.contains(dependency) {
-            return vec![dependency.to_owned()];
-        }
-        self.candidate_sources(dependency)
-    }
-
-    fn is_effect_result_state(&self, path: &str) -> bool {
-        self.effect_result_states.contains(path)
-    }
-
-    fn candidate_sources_for_index(
-        &mut self,
-        field_index: usize,
-        as_dependency: bool,
-        visiting: &mut Vec<usize>,
-    ) -> Vec<String> {
-        let path = self.fields[field_index].path.clone();
-        if as_dependency && self.effect_result_states.contains(&path) {
-            return vec![path];
-        }
-        if visiting.contains(&field_index) {
-            return Vec::new();
-        }
-        let cache_key = (path.clone(), as_dependency);
-        if let Some(cached) = self.cache.get(&cache_key) {
-            return cached.clone();
-        }
-        visiting.push(field_index);
-        let field = &self.fields[field_index];
-        let mut candidates = direct_sources_for_field(self.direct_sources, field)
-            .cloned()
-            .collect::<Vec<_>>();
-        for dependency_index in self.dependencies_by_field[field_index].clone() {
-            if !field_dependency_is_event_cause(field, &self.fields[dependency_index]) {
-                continue;
-            }
-            for source in self.candidate_sources_for_index(dependency_index, true, visiting) {
-                push_unique(&mut candidates, source);
-            }
-        }
-        visiting.pop();
-        self.cache.insert(cache_key, candidates.clone());
-        candidates
-    }
-}
-
-fn field_dependency_is_event_cause(field: &FieldDef, dependency: &FieldDef) -> bool {
-    let references = field
-        .ast_exprs
-        .iter()
-        .filter(|expr| expression_references_field(field, expr, dependency))
-        .map(|expr| expr.id)
-        .filter(|reference| !reference_is_list_map_collection(field, *reference))
-        .collect::<Vec<_>>();
-    if references.is_empty() {
-        return false;
-    }
-    let then_inputs = field
-        .ast_exprs
-        .iter()
-        .filter_map(|expr| match expr.kind {
-            AstExprKind::Then { input, .. } => Some(input),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if then_inputs.is_empty() {
-        return true;
-    }
-    if references.iter().any(|reference| {
-        then_inputs
-            .iter()
-            .any(|input| expr_contains_expr_id_in_exprs(&field.ast_exprs, *input, *reference))
-    }) {
-        return true;
-    }
-    let sampled_outputs = field
-        .ast_exprs
-        .iter()
-        .filter_map(|expr| match expr.kind {
-            AstExprKind::Then {
-                output: Some(output),
-                ..
-            }
-            | AstExprKind::MatchArm {
-                output: Some(output),
-                ..
-            } => Some(output),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    references.into_iter().any(|reference| {
-        !sampled_outputs
-            .iter()
-            .any(|output| expr_contains_expr_id_in_exprs(&field.ast_exprs, *output, reference))
-    })
-}
-
-fn reference_is_list_map_collection(field: &FieldDef, reference: usize) -> bool {
-    field.ast_exprs.iter().any(|expr| match &expr.kind {
-        AstExprKind::Pipe { input, op, .. } if op == "List/map" => {
-            expr_contains_expr_id_in_exprs(&field.ast_exprs, *input, reference)
-                || list_map_pipeline_prefix_contains_reference(field, expr.id, reference)
-        }
-        AstExprKind::Call { function, args, .. } if function == "List/map" => {
-            args.first().is_some_and(|input| {
-                expr_contains_expr_id_in_exprs(&field.ast_exprs, input.value, reference)
-            })
-        }
-        _ => false,
-    })
-}
-
-fn list_map_pipeline_prefix_contains_reference(
-    field: &FieldDef,
-    map_expr_id: usize,
-    reference: usize,
-) -> bool {
-    let statements = std::slice::from_ref(&field.statement);
-    let mut cursor = map_expr_id;
-    let mut visited = BTreeSet::new();
-    while visited.insert(cursor) {
-        let Some(previous) = previous_pipeline_expression_id(statements, cursor, &field.ast_exprs)
-        else {
-            return false;
-        };
-        if expr_contains_expr_id_in_exprs(&field.ast_exprs, previous, reference) {
-            return true;
-        }
-        cursor = previous;
-    }
-    false
-}
-
-fn previous_pipeline_expression_id(
-    statements: &[AstStatement],
-    marker_expr_id: usize,
-    expressions: &[AstExpr],
-) -> Option<usize> {
-    for statement in statements {
-        if let Some(expr_ids) = statement_pipeline_expression_ids(statement, expressions)
-            && let Some(position) = expr_ids
-                .iter()
-                .position(|expr_id| *expr_id == marker_expr_id)
-            && position > 0
-        {
-            return expr_ids.get(position - 1).copied();
-        }
-        if statement.expr == Some(marker_expr_id) {
-            return None;
-        }
-        if let Some(found) =
-            previous_pipeline_expression_id(&statement.children, marker_expr_id, expressions)
-        {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn statement_pipeline_expression_ids(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-) -> Option<Vec<usize>> {
-    let mut expr_ids = statement.expr.into_iter().collect::<Vec<_>>();
-    collect_pipeline_continuation_expr_ids(statement, expressions, &mut expr_ids);
-    (expr_ids.len() > 1
-        && !expression_is_pipeline_continuation(expr_ids[0], expressions)
-        && expr_ids
-            .iter()
-            .skip(1)
-            .all(|expr_id| expression_is_pipeline_continuation(*expr_id, expressions)))
-    .then_some(expr_ids)
-}
-
-fn collect_pipeline_continuation_expr_ids(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-    expr_ids: &mut Vec<usize>,
-) {
-    for child in statement.children.iter().filter(|child| {
-        matches!(child.kind, AstStatementKind::Expression)
-            && child
-                .expr
-                .is_some_and(|expr_id| expression_is_pipeline_continuation(expr_id, expressions))
-    }) {
-        if let Some(expr_id) = child.expr {
-            expr_ids.push(expr_id);
-        }
-        collect_pipeline_continuation_expr_ids(child, expressions, expr_ids);
-    }
-}
-
-fn expression_is_pipeline_continuation(expr_id: usize, expressions: &[AstExpr]) -> bool {
-    let input = match expressions
-        .iter()
-        .find(|expr| expr.id == expr_id)
-        .map(|expr| &expr.kind)
-    {
-        Some(AstExprKind::Pipe { input, .. })
-        | Some(AstExprKind::Then { input, .. })
-        | Some(AstExprKind::When { input, .. })
-        | Some(AstExprKind::Draining { input })
-        | Some(AstExprKind::Hold { initial: input, .. }) => *input,
-        _ => return false,
-    };
-    expression_chain_starts_with_pipeline_placeholder(input, expressions)
-}
-
-fn expression_chain_starts_with_pipeline_placeholder(
-    expr_id: usize,
-    expressions: &[AstExpr],
-) -> bool {
-    let Some(expr) = expressions.iter().find(|expr| expr.id == expr_id) else {
-        return false;
-    };
-    match &expr.kind {
-        AstExprKind::Delimiter => true,
-        AstExprKind::Unknown(tokens) => !tokens
-            .iter()
-            .any(|token| token.trim_start().starts_with('"')),
-        AstExprKind::Pipe { input, .. }
-        | AstExprKind::Then { input, .. }
-        | AstExprKind::When { input, .. }
-        | AstExprKind::Draining { input }
-        | AstExprKind::Hold { initial: input, .. } => {
-            expression_chain_starts_with_pipeline_placeholder(*input, expressions)
-        }
-        _ => false,
-    }
-}
-
-fn expression_references_field(field: &FieldDef, expr: &AstExpr, dependency: &FieldDef) -> bool {
-    let raw = match &expr.kind {
-        AstExprKind::Identifier(value) => {
-            if field.expression_has_match_binding(expr.id, value) {
-                return false;
-            }
-            value.as_str()
-        }
-        AstExprKind::Path(parts) => {
-            return expression_path_references_field(field, expr.id, parts, dependency);
-        }
-        _ => return false,
-    };
-    raw == dependency.path
-        || raw == dependency.local_name
-        || canonical_local_path(raw, &field.parent_path) == dependency.path
-}
-
-fn expression_path_references_field(
-    field: &FieldDef,
-    expr_id: usize,
-    parts: &[String],
-    dependency: &FieldDef,
-) -> bool {
-    if parts.is_empty() {
-        return false;
-    }
-    if field.expression_has_match_binding(expr_id, &parts[0]) {
-        return false;
-    }
-    let raw = parts.join(".");
-    path_is_or_is_within(&raw, &dependency.path)
-        || (parts.len() == 1 && parts[0] == dependency.local_name)
-        || scoped_field_reference_candidates(&field.parent_path, &raw)
-            .iter()
-            .any(|candidate| path_is_or_is_within(candidate, &dependency.path))
-}
-
-fn path_is_or_is_within(path: &str, root: &str) -> bool {
-    path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with('.'))
-}
-
-#[derive(Clone, Debug)]
-struct FieldDef {
-    path: String,
-    local_name: String,
-    parent_path: String,
-    statement: AstStatement,
-    ast_items: Vec<AstItem>,
-    ast_exprs: Vec<AstExpr>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct RoutedBranch {
-    items: Vec<AstItem>,
-    ast_exprs: Vec<AstExpr>,
-}
-
-impl RoutedBranch {
-    fn ast_exprs(&self) -> &[AstExpr] {
-        &self.ast_exprs
-    }
-
-    fn summary(&self) -> String {
-        self.items
-            .iter()
-            .map(item_summary)
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn has_token(&self, token: &str) -> bool {
-        self.items.iter().any(|item| item_has_symbol(item, token))
-    }
-
-    fn has_operator(&self, operator: &str) -> bool {
-        self.ast_exprs.iter().any(|expr| match &expr.kind {
-            AstExprKind::Pipe { op, .. } => op == operator,
-            AstExprKind::Call { function, .. } => function == operator,
-            _ => false,
-        })
-    }
-
-    fn has_bool_expr(&self, value: bool) -> bool {
-        self.ast_exprs.iter().any(|expr| {
-            matches!(
-                expr.kind,
-                AstExprKind::Bool(candidate) if candidate == value
-            )
-        })
-    }
-
-    fn references_path_tail(&self, path_tail: &str) -> bool {
-        self.ast_exprs.iter().any(|expr| match &expr.kind {
-            AstExprKind::Path(parts) => parts.last().map(String::as_str) == Some(path_tail),
-            _ => false,
-        })
-    }
-
-    fn then_simple_update_value(&self) -> Option<SimpleThenUpdateValue> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then { output, .. } = expr.kind else {
-                return None;
-            };
-            if let Some(output) = output {
-                return ast_simple_then_update_value_in_exprs(&self.ast_exprs, output);
-            }
-            self.ast_exprs
-                .iter()
-                .filter(|candidate| candidate.line > expr.line)
-                .find_map(|candidate| {
-                    ast_simple_then_update_value_in_exprs(&self.ast_exprs, candidate.id)
-                })
-        })
-    }
-
-    fn simple_update_value(&self) -> Option<SimpleThenUpdateValue> {
-        if self.ast_exprs.iter().any(|expr| {
-            matches!(
-                expr.kind,
-                AstExprKind::Then { .. } | AstExprKind::When { .. }
-            )
-        }) {
-            return None;
-        }
-        self.ast_exprs
-            .iter()
-            .find_map(|expr| ast_simple_then_update_value_in_exprs(&self.ast_exprs, expr.id))
-    }
-
-    fn then_number_infix_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then { output, .. } = expr.kind else {
-                return None;
-            };
-            let output = output.or_else(|| following_direct_then_call_expr_id(field, expr.line))?;
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let AstExprKind::Infix { left, op, right } = &output.kind else {
-                return None;
-            };
-            if op != "+" && op != "-" {
-                return None;
-            }
-            let left = scalar_number_operand(field, *left, target)?;
-            let right = scalar_number_operand(field, *right, target)?;
-            Some(UpdateExpression::NumberInfix {
-                left,
-                op: op.clone(),
-                right,
-            })
-        })
-    }
-
-    fn then_project_time_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let AstExprKind::Call { function, args, .. } = &output.kind else {
-                return None;
-            };
-            if function != "Number/project_time" {
-                return None;
-            }
-            let arg = |name: &str| {
-                args.iter()
-                    .find(|arg| arg.named_name() == Some(name))
-                    .and_then(|arg| scalar_number_operand(field, arg.value, target))
-            };
-            Some(UpdateExpression::ProjectTime {
-                pointer_x: arg("pointer_x")?,
-                pointer_width: arg("pointer_width")?,
-                viewport_start: arg("viewport_start")?,
-                viewport_end: arg("viewport_end")?,
-                fallback: arg("fallback")?,
-            })
-        })
-    }
-
-    fn then_bytes_length_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let raw_path = match &output.kind {
-                AstExprKind::Pipe { input, op, .. } if op == "Bytes/length" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?
-                }
-                AstExprKind::Call { function, args, .. } if function == "Bytes/length" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, args.first()?.value)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesLength {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-            })
-        })
-    }
-
-    fn then_bytes_is_empty_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let raw_path = match &output.kind {
-                AstExprKind::Pipe { input, op, .. } if op == "Bytes/is_empty" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?
-                }
-                AstExprKind::Call { function, args, .. } if function == "Bytes/is_empty" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, args.first()?.value)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesIsEmpty {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-            })
-        })
-    }
-
-    fn then_bytes_get_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, index) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/get" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_get_index_arg_in_exprs(resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/get" => (
-                    bytes_get_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_get_index_arg_in_exprs(resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesGet {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                index,
-            })
-        })
-    }
-
-    fn then_list_get_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        branch_source: &str,
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, index) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "List/get" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_get_index_arg_in_exprs(resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "List/get" => (
-                    bytes_get_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_get_index_arg_in_exprs(resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::ListGet {
-                path: canonical_scalar_update_path_for_source(
-                    field,
-                    target,
-                    &raw_path,
-                    fields,
-                    branch_source,
-                ),
-                index,
-            })
-        })
-    }
-
-    fn then_bytes_set_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, index, value) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/set" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_set_index_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_set_value_arg_in_exprs(&field.ast_exprs, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/set" => (
-                    bytes_set_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_set_index_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_set_value_arg_in_exprs(&field.ast_exprs, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesSet {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                index,
-                value,
-            })
-        })
-    }
-
-    fn then_bytes_slice_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, offset, byte_count) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/slice" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_slice_offset_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_slice_byte_count_arg_in_exprs(
-                        &field.ast_exprs,
-                        resolved_constants,
-                        args,
-                        true,
-                    )?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/slice" => (
-                    bytes_slice_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_slice_offset_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_slice_byte_count_arg_in_exprs(
-                        &field.ast_exprs,
-                        resolved_constants,
-                        args,
-                        false,
-                    )?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesSlice {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                offset: BytesScalarArg::Static(offset),
-                byte_count: canonical_bytes_scalar_arg(field, target, byte_count, fields),
-            })
-        })
-    }
-
-    fn then_bytes_take_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, byte_count) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/take" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_count_arg_in_exprs(&field.ast_exprs, resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/take" => (
-                    bytes_slice_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_count_arg_in_exprs(&field.ast_exprs, resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesTake {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                byte_count: canonical_bytes_scalar_arg(field, target, byte_count, fields),
-            })
-        })
-    }
-
-    fn then_bytes_drop_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, byte_count) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/drop" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_count_arg_in_exprs(&field.ast_exprs, resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/drop" => (
-                    bytes_slice_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_count_arg_in_exprs(&field.ast_exprs, resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesDrop {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                byte_count: canonical_bytes_scalar_arg(field, target, byte_count, fields),
-            })
-        })
-    }
-
-    fn then_bytes_zeros_expression(
-        &self,
-        field: &FieldDef,
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let byte_count = match &output.kind {
-                AstExprKind::Call { function, args, .. } if function == "Bytes/zeros" => {
-                    bytes_zeros_byte_count_arg_in_exprs(resolved_constants, args)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesZeros { byte_count })
-        })
-    }
-
-    fn then_bytes_to_hex_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let raw_path = match &output.kind {
-                AstExprKind::Pipe { input, op, .. } if op == "Bytes/to_hex" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?
-                }
-                AstExprKind::Call { function, args, .. } if function == "Bytes/to_hex" => {
-                    bytes_input_arg_in_exprs(&self.ast_exprs, args)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesToHex {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-            })
-        })
-    }
-
-    fn then_bytes_from_hex_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let raw_path = match &output.kind {
-                AstExprKind::Pipe { input, op, .. } if op == "Bytes/from_hex" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?
-                }
-                AstExprKind::Call { function, args, .. } if function == "Bytes/from_hex" => {
-                    bytes_text_input_arg_in_exprs(&self.ast_exprs, args)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesFromHex {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-            })
-        })
-    }
-
-    fn then_bytes_to_base64_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let raw_path = match &output.kind {
-                AstExprKind::Pipe { input, op, .. } if op == "Bytes/to_base64" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?
-                }
-                AstExprKind::Call { function, args, .. } if function == "Bytes/to_base64" => {
-                    bytes_input_arg_in_exprs(&self.ast_exprs, args)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesToBase64 {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-            })
-        })
-    }
-
-    fn then_bytes_from_base64_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let raw_path = match &output.kind {
-                AstExprKind::Pipe { input, op, .. } if op == "Bytes/from_base64" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?
-                }
-                AstExprKind::Call { function, args, .. } if function == "Bytes/from_base64" => {
-                    bytes_text_input_arg_in_exprs(&self.ast_exprs, args)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesFromBase64 {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-            })
-        })
-    }
-
-    fn then_bytes_read_unsigned_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, offset, byte_count, endian) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/read_unsigned" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_numeric_offset_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_endian_arg_in_exprs(resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/read_unsigned" => (
-                    bytes_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_numeric_offset_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_endian_arg_in_exprs(resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesReadUnsigned {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                offset,
-                byte_count,
-                endian,
-            })
-        })
-    }
-
-    fn then_bytes_read_signed_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, offset, byte_count, endian) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/read_signed" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_numeric_offset_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_endian_arg_in_exprs(resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/read_signed" => (
-                    bytes_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_numeric_offset_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_endian_arg_in_exprs(resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesReadSigned {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                offset,
-                byte_count,
-                endian,
-            })
-        })
-    }
-
-    fn then_bytes_write_unsigned_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, offset, byte_count, endian, value) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/write_unsigned" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_numeric_offset_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_endian_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_value_arg_in_exprs(resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/write_unsigned" => (
-                    bytes_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_numeric_offset_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_endian_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_value_arg_in_exprs(resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesWriteUnsigned {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                offset,
-                byte_count,
-                endian,
-                value,
-            })
-        })
-    }
-
-    fn then_bytes_write_signed_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = field
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, offset, byte_count, endian, value) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/write_signed" => (
-                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
-                    bytes_numeric_offset_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_endian_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_numeric_value_arg_in_exprs(resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/write_signed" => (
-                    bytes_input_arg_in_exprs(&field.ast_exprs, args)?,
-                    bytes_numeric_offset_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_byte_count_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_endian_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_numeric_value_arg_in_exprs(resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesWriteSigned {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                offset,
-                byte_count,
-                endian,
-                value,
-            })
-        })
-    }
-
-    fn host_effect_expression(&self, field: &FieldDef) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|output| {
-            let AstExprKind::Call { function, args, .. } = &output.kind else {
-                return None;
-            };
-            if !boon_typecheck::is_typed_host_effect(function) {
-                return None;
-            }
-            let arguments = if args.is_empty() {
-                statement_containing_expr_graph(&field.statement, output.id, &field.ast_exprs)
-                    .map(|statement| {
-                        statement
-                            .children
-                            .iter()
-                            .filter_map(|argument| {
-                                let name = match &argument.kind {
-                                    AstStatementKind::Field { name }
-                                    | AstStatementKind::List {
-                                        field: Some(name), ..
-                                    } => name,
-                                    _ => return None,
-                                };
-                                Some(HostEffectCallArgument {
-                                    name: name.clone(),
-                                    value_expr_id: ExprId(argument.expr?),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                args.iter()
-                    .map(|argument| {
-                        Some(HostEffectCallArgument {
-                            name: argument.named_name()?.to_owned(),
-                            value_expr_id: ExprId(argument.value),
-                        })
-                    })
-                    .collect::<Option<Vec<_>>>()?
-            };
-            Some(UpdateExpression::HostEffect {
-                operation: function.clone(),
-                call_expr_id: ExprId(output.id),
-                arguments,
-            })
-        })
-    }
-
-    fn then_text_to_number_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let raw_path = match &output.kind {
-                AstExprKind::Pipe { input, op, .. } if op == "Text/to_number" => {
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?
-                }
-                AstExprKind::Call { function, args, .. } if function == "Text/to_number" => {
-                    text_to_bytes_input_arg_in_exprs(&self.ast_exprs, args)?
-                }
-                _ => return None,
-            };
-            Some(UpdateExpression::TextToNumber {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-            })
-        })
-    }
-
-    fn then_text_to_bytes_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, encoding) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Text/to_bytes" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_encoding_arg_in_exprs(resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Text/to_bytes" => (
-                    text_to_bytes_input_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_encoding_arg_in_exprs(resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::TextToBytes {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                encoding,
-            })
-        })
-    }
-
-    fn then_bytes_to_text_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-        resolved_constants: &ResolvedConstantLookup<'_>,
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, encoding) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/to_text" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_encoding_arg_in_exprs(resolved_constants, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/to_text" => (
-                    bytes_to_text_input_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_encoding_arg_in_exprs(resolved_constants, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesToText {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                encoding,
-            })
-        })
-    }
-
-    fn then_bytes_concat_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_left, raw_right) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/concat" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_concat_right_arg_in_exprs(&self.ast_exprs, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/concat" => (
-                    bytes_concat_left_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_concat_right_arg_in_exprs(&self.ast_exprs, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesConcat {
-                left: canonical_scalar_update_path_with_fields(field, target, &raw_left, fields),
-                right: canonical_scalar_update_path_with_fields(field, target, &raw_right, fields),
-            })
-        })
-    }
-
-    fn then_bytes_equal_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_left, raw_right) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/equal" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_equal_right_arg_in_exprs(&self.ast_exprs, args, true)?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/equal" => (
-                    bytes_equal_left_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_equal_right_arg_in_exprs(&self.ast_exprs, args, false)?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesEqual {
-                left: canonical_scalar_update_path_with_fields(field, target, &raw_left, fields),
-                right: canonical_scalar_update_path_with_fields(field, target, &raw_right, fields),
-            })
-        })
-    }
-
-    fn then_bytes_find_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_haystack, raw_needle) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/find" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_search_second_arg_in_exprs(
-                        &self.ast_exprs,
-                        args,
-                        true,
-                        &["needle", "with"],
-                    )?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/find" => (
-                    bytes_search_haystack_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_search_second_arg_in_exprs(
-                        &self.ast_exprs,
-                        args,
-                        false,
-                        &["needle", "with"],
-                    )?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesFind {
-                haystack: canonical_scalar_update_path_with_fields(
-                    field,
-                    target,
-                    &raw_haystack,
-                    fields,
-                ),
-                needle: canonical_scalar_update_path_with_fields(
-                    field,
-                    target,
-                    &raw_needle,
-                    fields,
-                ),
-            })
-        })
-    }
-
-    fn then_bytes_starts_with_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, raw_prefix) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/starts_with" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_search_second_arg_in_exprs(
-                        &self.ast_exprs,
-                        args,
-                        true,
-                        &["prefix", "with"],
-                    )?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/starts_with" => (
-                    bytes_search_haystack_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_search_second_arg_in_exprs(
-                        &self.ast_exprs,
-                        args,
-                        false,
-                        &["prefix", "with"],
-                    )?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesStartsWith {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                prefix: canonical_scalar_update_path_with_fields(
-                    field,
-                    target,
-                    &raw_prefix,
-                    fields,
-                ),
-            })
-        })
-    }
-
-    fn then_bytes_ends_with_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
-                return None;
-            };
-            let output = self
-                .ast_exprs
-                .iter()
-                .find(|candidate| candidate.id == output)?;
-            let (raw_path, raw_suffix) = match &output.kind {
-                AstExprKind::Pipe {
-                    input, op, args, ..
-                } if op == "Bytes/ends_with" => (
-                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?,
-                    bytes_search_second_arg_in_exprs(
-                        &self.ast_exprs,
-                        args,
-                        true,
-                        &["suffix", "with"],
-                    )?,
-                ),
-                AstExprKind::Call { function, args, .. } if function == "Bytes/ends_with" => (
-                    bytes_search_haystack_arg_in_exprs(&self.ast_exprs, args)?,
-                    bytes_search_second_arg_in_exprs(
-                        &self.ast_exprs,
-                        args,
-                        false,
-                        &["suffix", "with"],
-                    )?,
-                ),
-                _ => return None,
-            };
-            Some(UpdateExpression::BytesEndsWith {
-                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
-                suffix: canonical_scalar_update_path_with_fields(
-                    field,
-                    target,
-                    &raw_suffix,
-                    fields,
-                ),
-            })
-        })
-    }
-
-    fn text_trim_input_path(&self) -> Option<String> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Pipe { input, op, .. } = &expr.kind else {
-                return None;
-            };
-            (op == "Text/trim").then(|| ast_argument_value_in_exprs(&self.ast_exprs, *input))?
-        })
-    }
-
-    fn bool_not_path(&self) -> Option<String> {
-        bool_not_path_in_exprs(&self.ast_exprs)
-    }
-
-    fn then_prefix_payload_concat_expression(
-        &self,
-        source_variants: &[String],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then { output, .. } = expr.kind else {
-                return None;
-            };
-            output
-                .and_then(|output| {
-                    prefix_payload_concat_update_expression(
-                        &self.ast_exprs,
-                        output,
-                        source_variants,
-                    )
-                    .or_else(|| {
-                        prefix_payload_concat_update_expression_using_input(
-                            &self.ast_exprs,
-                            output,
-                            source_variants,
-                        )
-                    })
-                })
-                .or_else(|| {
-                    prefix_payload_concat_update_expression_after_line(
-                        &self.ast_exprs,
-                        expr.line,
-                        source_variants,
-                    )
-                })
-                .or_else(|| {
-                    prefix_payload_concat_update_expression_from_items(&self.items, source_variants)
-                })
-        })
-    }
-
-    fn then_prefix_root_concat_expression(
-        &self,
-        field: &FieldDef,
-        target: &str,
-        fields: &[FieldDef],
-    ) -> Option<UpdateExpression> {
-        self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then { output, .. } = expr.kind else {
-                return None;
-            };
-            output
-                .and_then(|output| {
-                    prefix_root_concat_update_expression(
-                        &self.ast_exprs,
-                        output,
-                        field,
-                        target,
-                        fields,
-                    )
-                    .or_else(|| {
-                        prefix_root_concat_update_expression_using_input(
-                            &self.ast_exprs,
-                            output,
-                            field,
-                            target,
-                            fields,
-                        )
-                    })
-                })
-                .or_else(|| {
-                    prefix_root_concat_update_expression_after_line(
-                        &self.ast_exprs,
-                        expr.line,
-                        field,
-                        target,
-                        fields,
-                    )
-                })
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-}
-
-fn prefix_root_concat_update_expression_using_input(
-    exprs: &[AstExpr],
-    input: usize,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-) -> Option<UpdateExpression> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Pipe {
-            input: pipe_input, ..
-        } = &expr.kind
-        else {
-            return None;
-        };
-        (*pipe_input == input)
-            .then(|| prefix_root_concat_update_expression(exprs, expr.id, field, target, fields))
-            .flatten()
-    })
-}
-
-fn prefix_root_concat_update_expression_after_line(
-    exprs: &[AstExpr],
-    line: usize,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-) -> Option<UpdateExpression> {
-    let end_line = exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    exprs
-        .iter()
-        .filter(|expr| expr.line > line && expr.line < end_line)
-        .find_map(|expr| {
-            prefix_root_concat_update_expression(exprs, expr.id, field, target, fields)
-        })
-}
-
-fn prefix_root_concat_update_expression(
-    exprs: &[AstExpr],
-    output: usize,
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-) -> Option<UpdateExpression> {
-    let expr = exprs.iter().find(|expr| expr.id == output)?;
-    let AstExprKind::Pipe {
-        op, input, args, ..
-    } = &expr.kind
-    else {
-        return None;
-    };
-    if op != "Text/concat" {
-        return None;
-    }
-    let SimpleThenUpdateValue::Const(prefix) =
-        ast_simple_then_update_value_in_exprs(exprs, *input)?
-    else {
-        return None;
-    };
-    let raw_path = args
-        .iter()
-        .find(|arg| arg.named_name() == Some("with"))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
-    let path = canonical_scalar_update_path_with_fields(field, target, &raw_path, fields);
-    let separator = args
-        .iter()
-        .find(|arg| arg.named_name() == Some("separator"))
-        .and_then(|arg| ast_simple_then_update_value_in_exprs(exprs, arg.value))
-        .and_then(|value| match value {
-            SimpleThenUpdateValue::Const(value) => Some(value),
-            SimpleThenUpdateValue::Path(_) => None,
-        })
-        .unwrap_or_default();
-    Some(UpdateExpression::PrefixRootConcat {
-        prefix,
-        path,
-        separator,
-    })
-}
-
-fn prefix_payload_concat_update_expression_using_input(
-    exprs: &[AstExpr],
-    input: usize,
-    source_variants: &[String],
-) -> Option<UpdateExpression> {
-    exprs.iter().find_map(|expr| {
-        let AstExprKind::Pipe {
-            input: pipe_input, ..
-        } = &expr.kind
-        else {
-            return None;
-        };
-        (*pipe_input == input)
-            .then(|| prefix_payload_concat_update_expression(exprs, expr.id, source_variants))
-            .flatten()
-    })
-}
-
-fn prefix_payload_concat_update_expression_from_items(
-    items: &[AstItem],
-    source_variants: &[String],
-) -> Option<UpdateExpression> {
-    items.iter().find_map(|item| {
-        let summary = item_summary(item);
-        let concat_marker = " |> Text/concat";
-        let prefix_start = summary
-            .find("|> THEN TEXT ")
-            .map(|start| start + "|> THEN TEXT ".len())
-            .or_else(|| summary.strip_prefix("TEXT ").map(|_| "TEXT ".len()))?;
-        let prefix_end = summary[prefix_start..].find(concat_marker)? + prefix_start;
-        let prefix = summary[prefix_start..prefix_end].trim().to_owned();
-        if prefix.is_empty() {
-            return None;
-        }
-        let with_marker = "with:";
-        let with_start = summary.find(with_marker)? + with_marker.len();
-        let payload_tail = &summary[with_start..];
-        let payload_path = payload_tail
-            .split([',', ')'])
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        source_payload_field_from_path(&payload_path, source_variants)?;
-        let separator = summary
-            .split_once("separator:")
-            .map(|(_, tail)| tail.trim())
-            .and_then(|tail| {
-                tail.strip_prefix('"')
-                    .and_then(|quoted| quoted.find('"').map(|end| quoted[..end].to_owned()))
-            })
-            .unwrap_or_default();
-        Some(UpdateExpression::PrefixPayloadConcat {
-            prefix,
-            payload_path,
-            separator,
-        })
-    })
-}
-
-fn prefix_payload_concat_update_expression_after_line(
-    exprs: &[AstExpr],
-    line: usize,
-    source_variants: &[String],
-) -> Option<UpdateExpression> {
-    let end_line = exprs
-        .iter()
-        .filter(|expr| {
-            expr.line > line
-                && matches!(
-                    expr.kind,
-                    AstExprKind::When { .. } | AstExprKind::Then { .. }
-                )
-        })
-        .map(|expr| expr.line)
-        .min()
-        .unwrap_or(usize::MAX);
-    exprs
-        .iter()
-        .filter(|expr| expr.line > line && expr.line < end_line)
-        .find_map(|expr| prefix_payload_concat_update_expression(exprs, expr.id, source_variants))
-}
-
-fn prefix_payload_concat_update_expression(
-    exprs: &[AstExpr],
-    output: usize,
-    source_variants: &[String],
-) -> Option<UpdateExpression> {
-    let expr = exprs.iter().find(|expr| expr.id == output)?;
-    let AstExprKind::Pipe {
-        op, input, args, ..
-    } = &expr.kind
-    else {
-        return None;
-    };
-    if op != "Text/concat" {
-        return None;
-    }
-    let SimpleThenUpdateValue::Const(prefix) =
-        ast_simple_then_update_value_in_exprs(exprs, *input)?
-    else {
-        return None;
-    };
-    let payload_path = args
-        .iter()
-        .find(|arg| arg.named_name() == Some("with"))
-        .or_else(|| args.iter().find(|arg| arg.is_bare_binding()))
-        .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
-    source_payload_field_from_path(&payload_path, source_variants)?;
-    let separator = args
-        .iter()
-        .find(|arg| arg.named_name() == Some("separator"))
-        .and_then(|arg| ast_simple_then_update_value_in_exprs(exprs, arg.value))
-        .and_then(|value| match value {
-            SimpleThenUpdateValue::Const(value) => Some(value),
-            SimpleThenUpdateValue::Path(_) => None,
-        })
-        .unwrap_or_default();
-    Some(UpdateExpression::PrefixPayloadConcat {
-        prefix,
-        payload_path,
-        separator,
-    })
-}
-
-fn source_payload_field_from_path(path: &str, source_variants: &[String]) -> Option<String> {
-    source_variants.iter().find_map(|variant| {
-        let suffix = source_payload_suffix_from_variant(path, variant)?;
-        Some(match suffix {
-            "change.text" | "event.change.text" | "events.change.text" => "text".to_owned(),
-            "change.bytes" | "event.change.bytes" | "events.change.bytes" => "bytes".to_owned(),
-            "key_down.key" | "event.key_down.key" | "events.key_down.key" => "key".to_owned(),
-            "event.address" | "events.address" => "address".to_owned(),
-            _ if !suffix.contains('.') => suffix.to_owned(),
-            _ if suffix.starts_with("event.") => {
-                source_payload_field_from_event_suffix(&suffix["event.".len()..])?
-            }
-            _ if suffix.starts_with("events.") => {
-                source_payload_field_from_event_suffix(&suffix["events.".len()..])?
-            }
-            _ => return None,
-        })
-    })
-}
-
-fn source_payload_field_from_event_suffix(suffix: &str) -> Option<String> {
-    if !suffix.contains('.') {
-        return Some(suffix.to_owned());
-    }
-    let mut parts = suffix.split('.');
-    let _event_name = parts.next()?;
-    let payload_field = parts.next()?;
-    parts.next().is_none().then(|| payload_field.to_owned())
-}
-
-fn source_payload_suffix_from_variant<'a>(path: &'a str, variant: &str) -> Option<&'a str> {
-    if let Some(suffix) = path
-        .strip_prefix(variant)
-        .and_then(|suffix| suffix.strip_prefix('.'))
-    {
-        return Some(suffix);
-    }
-    let (base, event) = variant.rsplit_once('.')?;
-    for event_prefix in [
-        format!("{base}.event.{event}"),
-        format!("{base}.events.{event}"),
-    ] {
-        if let Some(suffix) = path
-            .strip_prefix(&event_prefix)
-            .and_then(|suffix| suffix.strip_prefix('.'))
-        {
-            return Some(suffix);
-        }
-    }
-    None
-}
-
-impl FieldDef {
-    fn expression_has_match_binding(&self, expr_id: usize, name: &str) -> bool {
-        statement_match_binding_for_expr(&self.statement, expr_id, name, &self.ast_exprs)
-    }
-
-    fn has_token(&self, token: &str) -> bool {
-        self.ast_items
-            .iter()
-            .any(|item| item_has_symbol(item, token))
-    }
-
-    fn has_operator(&self, operator: &str) -> bool {
-        self.ast_exprs.iter().any(|expr| match &expr.kind {
-            AstExprKind::Pipe { op, .. } => op == operator,
-            AstExprKind::Call { function, .. } => function == operator,
-            _ => false,
-        })
-    }
-
-    fn has_any_operator(&self, operators: &[&str]) -> bool {
-        operators.iter().any(|operator| self.has_operator(operator))
-    }
-
-    fn has_then_expr(&self) -> bool {
-        self.ast_exprs
-            .iter()
-            .any(|expr| matches!(expr.kind, AstExprKind::Then { .. }))
-    }
-
-    fn mentions_identifier_expr(&self, identifier: &str) -> bool {
-        self.ast_exprs.iter().any(|expr| match &expr.kind {
-            AstExprKind::Identifier(value) => value == identifier,
-            AstExprKind::Path(parts) => parts.iter().any(|part| part == identifier),
-            _ => false,
-        })
-    }
-
-    fn has_then_from_local_with_empty_output(&self, local_name: &str) -> bool {
-        self.ast_exprs.iter().any(|expr| {
-            let AstExprKind::Then {
-                input,
-                output: Some(output),
-            } = expr.kind
-            else {
-                return false;
-            };
-            ast_argument_value(self, input).as_deref() == Some(local_name)
-                && self
-                    .ast_exprs
-                    .iter()
-                    .find(|candidate| candidate.id == output)
-                    .is_some_and(|output| {
-                        ast_initial_value(output, &self.ast_exprs, &[], None)
-                            == InitialValue::Text {
-                                value: String::new(),
-                            }
-                    })
-        })
-    }
-
-    fn references_source_variant(&self, source_variant: &str) -> bool {
-        let path_parts = dotted_path_parts(source_variant);
-        self.ast_exprs.iter().any(|expr| match &expr.kind {
-            AstExprKind::Path(parts) => path_parts_match_source_ref(parts, &path_parts),
-            AstExprKind::Identifier(value) if path_parts.len() == 1 => value == path_parts[0],
-            _ => false,
-        })
-    }
-
-    fn first_referenced_payload_field(&self, source_variant: &str) -> Option<String> {
-        self.referenced_payload_fields(source_variant)
-            .into_iter()
-            .next()
-            .map(|field| match field {
-                SourcePayloadField::Address => "address".to_owned(),
-                SourcePayloadField::Bytes => "bytes".to_owned(),
-                SourcePayloadField::Key => "key".to_owned(),
-                SourcePayloadField::Named(name) => name,
-                SourcePayloadField::Text => "text".to_owned(),
-            })
-    }
-
-    fn referenced_payload_fields(&self, source_variant: &str) -> BTreeSet<SourcePayloadField> {
-        let variants = vec![source_variant.to_owned()];
-        self.ast_exprs
-            .iter()
-            .filter_map(|expr| match &expr.kind {
-                AstExprKind::Path(parts) => {
-                    source_payload_field_from_path(&parts.join("."), &variants)
-                }
-                _ => None,
-            })
-            .filter(|name| name != "__" && name != "SKIP")
-            .map(|name| SourcePayloadField::from_name(&name))
-            .collect()
-    }
-
-    fn source_branch(&self, source: &str) -> Option<RoutedBranch> {
-        source_ref_variants(source)
-            .iter()
-            .find_map(|variant| self.source_branch_variant(variant))
-    }
-
-    fn source_trigger_branch(&self, source: &str) -> Option<RoutedBranch> {
-        source_ref_variants(source)
-            .iter()
-            .find_map(|variant| self.source_trigger_branch_variant(variant))
-    }
-
-    fn source_branch_variant(&self, source_variant: &str) -> Option<RoutedBranch> {
-        let source_parts = dotted_path_parts(source_variant);
-        let start_line = self.ast_exprs.iter().find_map(|expr| match &expr.kind {
-            AstExprKind::Path(parts) if path_parts_match_source_ref(parts, &source_parts) => {
-                Some(expr.line)
-            }
-            AstExprKind::Identifier(value)
-                if source_parts.len() == 1 && value == source_parts[0] =>
-            {
-                Some(expr.line)
-            }
-            _ => None,
-        })?;
-        let start = self
-            .ast_items
-            .iter()
-            .position(|item| item.line == start_line)?;
-        let start_indent = self.ast_items[start].indent;
-        let mut depth = 0i32;
-        let mut items = Vec::new();
-        for (offset, item) in self.ast_items.iter().skip(start).enumerate() {
-            let same_indent_pipe_continuation =
-                item.indent == start_indent && item_starts_with_symbol(item, "|>");
-            if offset > 0 && item.indent <= start_indent && !same_indent_pipe_continuation {
-                break;
-            }
-            items.push(item.clone());
-            let scope_delta = item
-                .symbols
-                .iter()
-                .map(|lexeme| match lexeme.as_str() {
-                    "{" => 1,
-                    "}" => -1,
-                    _ => 0,
-                })
-                .sum::<i32>();
-            depth += scope_delta;
-            let has_indented_continuation =
-                self.ast_items.get(start + offset + 1).is_some_and(|next| {
-                    next.indent > start_indent
-                        || (next.indent == start_indent && item_starts_with_symbol(next, "|>"))
-                });
-            if offset == 0 && depth == 0 && scope_delta == 0 && !has_indented_continuation {
-                break;
-            }
-            if depth <= 0 && item_has_symbol(item, "}") {
-                break;
-            }
-        }
-        let lines = items.iter().map(|item| item.line).collect::<Vec<_>>();
-        let ast_exprs = self
-            .ast_exprs
-            .iter()
-            .filter(|expr| lines.contains(&expr.line))
-            .cloned()
-            .collect();
-        Some(RoutedBranch { items, ast_exprs })
-    }
-
-    fn source_trigger_branch_variant(&self, source_variant: &str) -> Option<RoutedBranch> {
-        let source_parts = dotted_path_parts(source_variant);
-        let start_line = self.ast_exprs.iter().find_map(|expr| {
-            let line_starts_with_source = self
-                .ast_items
-                .iter()
-                .find(|item| {
-                    item.line == expr.line
-                        && item.hold.is_none()
-                        && item_symbols_start_with_path(item, &source_parts)
-                })
-                .is_some();
-            if !line_starts_with_source {
-                return None;
-            }
-            match &expr.kind {
-                AstExprKind::Path(parts) if path_parts_match_source_ref(parts, &source_parts) => {
-                    Some(expr.line)
-                }
-                AstExprKind::Identifier(value)
-                    if source_parts.len() == 1 && value == source_parts[0] =>
-                {
-                    Some(expr.line)
-                }
-                _ => None,
-            }
-        })?;
-        self.branch_from_line(start_line)
-    }
-
-    fn branch_from_line(&self, start_line: usize) -> Option<RoutedBranch> {
-        let start = self
-            .ast_items
-            .iter()
-            .position(|item| item.line == start_line)?;
-        let start_indent = self.ast_items[start].indent;
-        let mut depth = 0i32;
-        let mut items = Vec::new();
-        for (offset, item) in self.ast_items.iter().skip(start).enumerate() {
-            let same_indent_pipe_continuation =
-                item.indent == start_indent && item_starts_with_symbol(item, "|>");
-            if offset > 0 && item.indent <= start_indent && !same_indent_pipe_continuation {
-                break;
-            }
-            items.push(item.clone());
-            let scope_delta = item
-                .symbols
-                .iter()
-                .map(|lexeme| match lexeme.as_str() {
-                    "{" => 1,
-                    "}" => -1,
-                    _ => 0,
-                })
-                .sum::<i32>();
-            depth += scope_delta;
-            let has_indented_continuation =
-                self.ast_items.get(start + offset + 1).is_some_and(|next| {
-                    next.indent > start_indent
-                        || (next.indent == start_indent && item_starts_with_symbol(next, "|>"))
-                });
-            if offset == 0 && depth == 0 && scope_delta == 0 && !has_indented_continuation {
-                break;
-            }
-            if depth <= 0 && item_has_symbol(item, "}") {
-                break;
-            }
-        }
-        let lines = items.iter().map(|item| item.line).collect::<Vec<_>>();
-        let ast_exprs = self
-            .ast_exprs
-            .iter()
-            .filter(|expr| lines.contains(&expr.line))
-            .cloned()
-            .collect();
-        Some(RoutedBranch { items, ast_exprs })
-    }
-}
-
-fn statement_match_binding_for_expr(
-    statement: &AstStatement,
-    expr_id: usize,
-    name: &str,
-    expressions: &[AstExpr],
-) -> bool {
-    let binds_name = statement
-        .expr
-        .and_then(|statement_expr_id| expressions.iter().find(|expr| expr.id == statement_expr_id))
-        .and_then(|expr| match &expr.kind {
-            AstExprKind::MatchArm { pattern, .. } => match_arm_binding_name(pattern),
-            _ => None,
-        })
-        .is_some_and(|binding| binding == name);
-    if binds_name && statement_subtree_contains_expr(statement, expr_id, expressions) {
-        return true;
-    }
-    statement
-        .children
-        .iter()
-        .any(|child| statement_match_binding_for_expr(child, expr_id, name, expressions))
-}
-
-fn statement_subtree_contains_expr(
-    statement: &AstStatement,
-    expr_id: usize,
-    expressions: &[AstExpr],
-) -> bool {
-    statement.expr.is_some_and(|root| {
-        root == expr_id || expr_contains_expr_id_in_exprs(expressions, root, expr_id)
-    }) || statement
-        .children
-        .iter()
-        .any(|child| statement_subtree_contains_expr(child, expr_id, expressions))
-}
-
-fn match_arm_binding_name(pattern: &[String]) -> Option<&str> {
-    let [name] = pattern else {
-        return None;
-    };
-    (name != "_" && name != "__" && value_starts_lowercase_identifier(name))
-        .then_some(name.as_str())
-}
-
-fn direct_source_refs_by_path(
-    fields: &[FieldDef],
-    program: &ParsedProgram,
-    checked: &boon_typecheck::CheckedProgram,
-) -> Result<BTreeMap<String, Vec<String>>, String> {
-    fn statement_declaration(
-        statement: &boon_typecheck::CheckedStatement,
-    ) -> Option<boon_typecheck::DeclId> {
-        match statement.kind {
-            boon_typecheck::CheckedStatementKind::Function { declaration }
-            | boon_typecheck::CheckedStatementKind::Field { declaration } => Some(declaration),
-            boon_typecheck::CheckedStatementKind::Source { declaration, .. }
-            | boon_typecheck::CheckedStatementKind::Hold { declaration, .. }
-            | boon_typecheck::CheckedStatementKind::List { declaration, .. } => declaration,
-            boon_typecheck::CheckedStatementKind::Block
-            | boon_typecheck::CheckedStatementKind::Spread
-            | boon_typecheck::CheckedStatementKind::Expression => None,
-        }
-    }
-
-    let mut source_paths = BTreeMap::<boon_typecheck::DeclId, BTreeSet<String>>::new();
-    for source in &program.source_ports {
-        let Some(expression_id) = source.expr_id else {
-            continue;
-        };
-        let expression = checked
-            .expressions
-            .get(expression_id)
-            .filter(|expression| expression.id.0 as usize == expression_id)
-            .ok_or_else(|| {
-                format!(
-                    "source metadata `{}` references missing checked expression {expression_id}",
-                    source.path
-                )
-            })?;
-        let declaration = expression.declaration.ok_or_else(|| {
-            format!(
-                "source metadata `{}` has no checked declaration ownership",
-                source.path
-            )
-        })?;
-        source_paths
-            .entry(declaration)
-            .or_default()
-            .insert(source.path.clone());
-    }
-
-    let mut result = BTreeMap::new();
-    for field in fields {
-        let statement_id = boon_typecheck::CheckedStatementId(field.statement.id as u32);
-        let declaration = checked
-            .statements
-            .iter()
-            .find(|statement| statement.id == statement_id)
-            .and_then(statement_declaration)
-            .ok_or_else(|| {
-                format!(
-                    "semantic field `{}` has no checked declaration ownership",
-                    field.path
-                )
-            })?;
-        let sources = checked
-            .expressions
-            .iter()
-            .filter(|expression| expression.declaration == Some(declaration))
-            .filter_map(|expression| match &expression.kind {
-                boon_typecheck::CheckedExpressionKind::Read { target, .. } => Some(*target),
-                _ => None,
-            })
-            .flat_map(|target| source_paths.get(&target).into_iter().flatten().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        result.insert(field.path.clone(), sources);
-    }
-    Ok(result)
-}
-
-fn add_distributed_event_source_refs(
-    fields: &[FieldDef],
-    references: &[DistributedValueReference],
-    direct_sources: &mut BTreeMap<String, Vec<String>>,
-) {
-    for reference in references.iter().filter(|reference| {
-        matches!(
-            reference.flow_mode,
-            boon_typecheck::FlowMode::TickPresent | boon_typecheck::FlowMode::PresentOrAbsent
-        )
-    }) {
-        let source_path = distributed_event_source_path(&reference.canonical_path);
-        for field in fields
-            .iter()
-            .filter(|field| reference.local_alias_paths.contains(&field.path))
-        {
-            let sources = direct_sources.entry(field.path.clone()).or_default();
-            push_unique(sources, source_path.clone());
-        }
-    }
-}
-
-fn bind_distributed_reference_aliases(
-    fields: &[FieldDef],
-    references: &mut [DistributedValueReference],
-) {
-    for reference in references {
-        reference.local_alias_paths = fields
-            .iter()
-            .filter(|field| field.statement.expr == Some(reference.expr_id.as_usize()))
-            .map(|field| field.path.clone())
-            .collect();
-    }
-}
-
-fn direct_sources_for_field<'a>(
-    direct_sources: &'a BTreeMap<String, Vec<String>>,
-    field: &FieldDef,
-) -> impl Iterator<Item = &'a String> {
-    direct_sources
-        .get(&field.path)
-        .into_iter()
-        .flat_map(|sources| sources.iter())
-}
-
-fn direct_source_refs(field: &FieldDef, program: &ParsedProgram) -> Vec<String> {
-    let mut sources = Vec::new();
-    for source in &program.source_ports {
-        if source_ref_variants_for_program(&source.path, program)
-            .iter()
-            .any(|variant| field.references_source_variant(variant))
-        {
-            push_unique(&mut sources, source.path.clone());
-        }
-    }
-    sources
-}
-
-fn source_ref_variants(path: &str) -> Vec<String> {
-    let mut variants = vec![path.to_owned()];
-    if let Some((_, suffix)) = path.split_once('.') {
-        variants.push(suffix.to_owned());
-        variants.push(format!("item.{suffix}"));
-    }
-    if let Some(tail) = store_list_source_tail_without_program(path) {
-        variants.push(tail);
-    }
-    variants
-}
-
-fn source_ref_variants_for_program(path: &str, program: &ParsedProgram) -> Vec<String> {
-    let mut variants = vec![path.to_owned()];
-    let Some((_, suffix)) = path.split_once('.') else {
-        return variants;
-    };
-    if source_suffix_is_unique(suffix, program) {
-        variants.push(suffix.to_owned());
-        variants.push(format!("item.{suffix}"));
-    }
-    if let Some(list_item_tail) = unique_list_item_source_tail(path, program) {
-        variants.push(list_item_tail);
-    }
-    variants
-}
-
-fn source_suffix_is_unique(suffix: &str, program: &ParsedProgram) -> bool {
-    let suffix = format!(".{suffix}");
-    program
-        .source_ports
-        .iter()
-        .filter(|source| source.path.ends_with(&suffix))
-        .take(2)
-        .count()
-        == 1
-}
-
-fn unique_list_item_source_tail(path: &str, program: &ParsedProgram) -> Option<String> {
-    let tail = store_list_source_tail(path, program)?;
-    let tail_suffix = format!(".{tail}");
-    let unique = program
-        .source_ports
-        .iter()
-        .filter(|source| source.path.ends_with(&tail_suffix))
-        .take(2)
-        .count()
-        == 1;
-    unique.then_some(tail)
-}
-
-fn store_list_source_tail(path: &str, program: &ParsedProgram) -> Option<String> {
-    let parts = dotted_path_parts(path);
-    let ["store", list, tail @ ..] = parts.as_slice() else {
-        return None;
-    };
-    if tail.is_empty()
-        || !program
-            .list_memories
-            .iter()
-            .any(|memory| memory.name == *list)
-    {
-        return None;
-    }
-    Some(tail.join("."))
-}
-
-fn store_list_source_tail_without_program(path: &str) -> Option<String> {
-    let parts = dotted_path_parts(path);
-    let ["store", _list, tail @ ..] = parts.as_slice() else {
-        return None;
-    };
-    (!tail.is_empty()).then(|| tail.join("."))
-}
-
-fn typed_field_defs(program: &ParsedProgram) -> Vec<FieldDef> {
-    let mut fields = Vec::new();
-    let items = program.ast.semantic_parser_items().collect::<Vec<_>>();
-    let function_bodies = field_function_body_index(&program.ast.statements);
-    gather_field_defs_from_statements(
-        &program.ast.statements,
-        &mut Vec::new(),
-        program,
-        &items,
-        &function_bodies,
-        &mut Vec::new(),
-        &mut fields,
-    );
-    fields
-}
-
-fn field_function_body_index(statements: &[AstStatement]) -> BTreeMap<&str, &[AstStatement]> {
-    let mut functions = BTreeMap::new();
-    collect_field_function_body_index(statements, &mut functions);
-    functions
-}
-
-fn collect_field_function_body_index<'a>(
-    statements: &'a [AstStatement],
-    functions: &mut BTreeMap<&'a str, &'a [AstStatement]>,
-) {
-    for statement in statements {
-        if let AstStatementKind::Function { name, .. } = &statement.kind {
-            functions.insert(name.as_str(), statement.children.as_slice());
-        }
-        collect_field_function_body_index(&statement.children, functions);
-    }
-}
-
-fn gather_field_defs_from_statements(
-    statements: &[AstStatement],
-    scope: &mut Vec<String>,
-    program: &ParsedProgram,
-    items: &[&AstItem],
-    function_bodies: &BTreeMap<&str, &[AstStatement]>,
-    function_stack: &mut Vec<String>,
-    fields: &mut Vec<FieldDef>,
-) {
-    for statement in statements {
-        gather_field_defs_from_called_functions(
-            statement,
-            scope,
-            program,
-            items,
-            function_bodies,
-            function_stack,
-            fields,
-        );
-        match &statement.kind {
-            AstStatementKind::Function { name, .. } => {
-                let function_row_scopes = function_row_scopes(name, program)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                for row_scope in function_row_scopes {
-                    scope.push(row_scope);
-                    function_stack.push(name.clone());
-                    if function_body_defines_record_fields(
-                        &statement.children,
-                        &program.ast.expressions,
-                        &program.ast.lines,
-                    ) {
-                        gather_field_defs_from_statements(
-                            &statement.children,
-                            scope,
-                            program,
-                            items,
-                            function_bodies,
-                            function_stack,
-                            fields,
-                        );
-                    } else {
-                        gather_field_defs_from_called_functions_in_statements(
-                            &statement.children,
-                            scope,
-                            program,
-                            items,
-                            function_bodies,
-                            function_stack,
-                            fields,
-                        );
-                    }
-                    function_stack.pop();
-                    scope.pop();
-                }
-            }
-            AstStatementKind::Field { name } => {
-                if should_record_field_statement(name, scope, program) {
-                    push_field_def(statement, name, scope, program, items, fields);
-                }
-                if !statement.children.is_empty() {
-                    scope.push(name.clone());
-                    gather_field_defs_from_statements(
-                        &statement.children,
-                        scope,
-                        program,
-                        items,
-                        function_bodies,
-                        function_stack,
-                        fields,
-                    );
-                    scope.pop();
-                }
-            }
-            AstStatementKind::Hold {
-                field: Some(name), ..
-            } => {
-                if should_record_field_statement(name, scope, program) {
-                    push_field_def(statement, name, scope, program, items, fields);
-                }
-                gather_field_defs_from_statements(
-                    &statement.children,
-                    scope,
-                    program,
-                    items,
-                    function_bodies,
-                    function_stack,
-                    fields,
-                );
-            }
-            AstStatementKind::List {
-                field: Some(name), ..
-            } => {
-                if should_record_field_statement(name, scope, program) {
-                    push_field_def(statement, name, scope, program, items, fields);
-                }
-            }
-            AstStatementKind::Expression
-                if statement.expr.is_some_and(|expr_id| {
-                    program.ast.expressions.get(expr_id).is_some_and(|expr| {
-                        matches!(
-                            expr.kind,
-                            AstExprKind::Call { .. } | AstExprKind::Pipe { .. }
-                        )
-                    })
-                }) =>
-            {
-                // Multiline call children are arguments owned by this expression,
-                // not independently addressable semantic fields.
-            }
-            AstStatementKind::Block
-            | AstStatementKind::Spread
-            | AstStatementKind::Expression
-            | AstStatementKind::Hold { .. }
-            | AstStatementKind::List { field: None, .. }
-            | AstStatementKind::Source { .. } => {
-                gather_field_defs_from_statements(
-                    &statement.children,
-                    scope,
-                    program,
-                    items,
-                    function_bodies,
-                    function_stack,
-                    fields,
-                );
-            }
-        }
-    }
-}
-
-fn gather_field_defs_from_called_functions(
-    statement: &AstStatement,
-    scope: &mut Vec<String>,
-    program: &ParsedProgram,
-    items: &[&AstItem],
-    function_bodies: &BTreeMap<&str, &[AstStatement]>,
-    function_stack: &mut Vec<String>,
-    fields: &mut Vec<FieldDef>,
-) {
-    if !scope.iter().any(|name| {
-        program
-            .row_scope_functions
-            .iter()
-            .any(|scope| scope.row_scope == *name)
-    }) {
-        return;
-    }
-    let Some(expr_id) = statement.expr else {
-        return;
-    };
-    let mut calls = Vec::new();
-    collect_field_called_functions(expr_id, &program.ast.expressions, &mut calls);
-    for function in calls {
-        gather_field_defs_from_helper_function(
-            &function,
-            scope,
-            program,
-            items,
-            function_bodies,
-            function_stack,
-            fields,
-        );
-    }
-}
-
-fn gather_field_defs_from_helper_function(
-    function: &str,
-    scope: &mut Vec<String>,
-    program: &ParsedProgram,
-    items: &[&AstItem],
-    function_bodies: &BTreeMap<&str, &[AstStatement]>,
-    function_stack: &mut Vec<String>,
-    fields: &mut Vec<FieldDef>,
-) {
-    if function_stack.iter().any(|entry| entry == function) {
-        return;
-    }
-    if function_has_row_scope(function, program) {
-        return;
-    }
-    let Some(children) = function_bodies.get(function) else {
-        return;
-    };
-    function_stack.push(function.to_owned());
-    if function_body_defines_record_fields(children, &program.ast.expressions, &program.ast.lines) {
-        gather_field_defs_from_statements(
-            children,
-            scope,
-            program,
-            items,
-            function_bodies,
-            function_stack,
-            fields,
-        );
-    } else {
-        gather_field_defs_from_called_functions_in_statements(
-            children,
-            scope,
-            program,
-            items,
-            function_bodies,
-            function_stack,
-            fields,
-        );
-    }
-    function_stack.pop();
-}
-
-fn gather_field_defs_from_called_functions_in_statements(
-    statements: &[AstStatement],
-    scope: &mut Vec<String>,
-    program: &ParsedProgram,
-    items: &[&AstItem],
-    function_bodies: &BTreeMap<&str, &[AstStatement]>,
-    function_stack: &mut Vec<String>,
-    fields: &mut Vec<FieldDef>,
-) {
-    for statement in statements {
-        if let Some(expr_id) = statement.expr {
-            let mut calls = Vec::new();
-            collect_field_called_functions(expr_id, &program.ast.expressions, &mut calls);
-            for function in calls {
-                gather_field_defs_from_helper_function(
-                    &function,
-                    scope,
-                    program,
-                    items,
-                    function_bodies,
-                    function_stack,
-                    fields,
-                );
-            }
-        }
-        gather_field_defs_from_called_functions_in_statements(
-            &statement.children,
-            scope,
-            program,
-            items,
-            function_bodies,
-            function_stack,
-            fields,
-        );
-    }
-}
-
-fn function_body_defines_record_fields(
-    statements: &[AstStatement],
-    expressions: &[AstExpr],
-    lines: &[boon_parser::ParserLine],
-) -> bool {
-    statements.iter().any(|statement| {
-        if statement
-            .expr
-            .and_then(|expr_id| expressions.get(expr_id))
-            .is_some_and(expr_is_render_constructor)
-        {
-            return false;
-        }
-        if statement_is_record_field(statement) {
-            return true;
-        }
-        if statement_is_record_constructor_block(statement, lines)
-            && statement.children.iter().any(statement_is_record_field)
-        {
-            return true;
-        }
-        if matches!(statement.kind, AstStatementKind::Expression)
-            && statement.children.iter().any(statement_is_record_field)
-        {
-            return true;
-        }
-        statement
-            .expr
-            .and_then(|expr_id| expressions.get(expr_id))
-            .is_some_and(|expr| {
-                matches!(
-                    expr.kind,
-                    AstExprKind::Object(_)
-                        | AstExprKind::Record(_)
-                        | AstExprKind::TaggedObject { .. }
-                )
-            })
-    })
-}
-
-fn expr_is_render_constructor(expr: &AstExpr) -> bool {
-    match &expr.kind {
-        AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } => {
-            boon_typecheck::is_registered_render_constructor(function)
-        }
-        _ => false,
-    }
-}
-
-fn statement_is_record_constructor_block(
-    statement: &AstStatement,
-    lines: &[boon_parser::ParserLine],
-) -> bool {
-    matches!(statement.kind, AstStatementKind::Block)
-        && lines
-            .iter()
-            .find(|line| line.line == statement.line)
-            .is_some_and(|line| line.symbols.iter().any(|symbol| symbol == "["))
-}
-
-fn statement_is_record_field(statement: &AstStatement) -> bool {
-    matches!(
-        statement.kind,
-        AstStatementKind::Spread
-            | AstStatementKind::Field { .. }
-            | AstStatementKind::Source { .. }
-            | AstStatementKind::Hold { field: Some(_), .. }
-            | AstStatementKind::List { field: Some(_), .. }
-    )
-}
-
-fn collect_field_called_functions(
-    expr_id: usize,
-    expressions: &[AstExpr],
-    calls: &mut Vec<String>,
-) {
-    let Some(expr) = expressions.get(expr_id) else {
-        return;
-    };
-    match &expr.kind {
-        AstExprKind::Call { function, args, .. } => {
-            calls.push(function.clone());
-            for arg in args {
-                collect_field_called_functions(arg.value, expressions, calls);
-            }
-        }
-        AstExprKind::Pipe {
-            input, op, args, ..
-        } => {
-            if !op.starts_with("Field/") {
-                collect_field_called_functions(*input, expressions, calls);
-            }
-            calls.push(op.clone());
-            for arg in args {
-                collect_field_called_functions(arg.value, expressions, calls);
-            }
-        }
-        AstExprKind::Hold { initial, .. }
-        | AstExprKind::When { input: initial, .. }
-        | AstExprKind::Draining { input: initial } => {
-            collect_field_called_functions(*initial, expressions, calls);
-        }
-        AstExprKind::Then { input, output } => {
-            collect_field_called_functions(*input, expressions, calls);
-            if let Some(output) = output {
-                collect_field_called_functions(*output, expressions, calls);
-            }
-        }
-        AstExprKind::Infix { left, right, .. } => {
-            collect_field_called_functions(*left, expressions, calls);
-            collect_field_called_functions(*right, expressions, calls);
-        }
-        AstExprKind::MatchArm { output, .. } => {
-            if let Some(output) = output {
-                collect_field_called_functions(*output, expressions, calls);
-            }
-        }
-        AstExprKind::Block { bindings, result } => {
-            for binding in bindings {
-                collect_field_called_functions(binding.value, expressions, calls);
-            }
-            if let Some(result) = result {
-                collect_field_called_functions(*result, expressions, calls);
-            }
-        }
-        AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
-            for field in fields {
-                collect_field_called_functions(field.value, expressions, calls);
-            }
-        }
-        AstExprKind::TaggedObject { fields, .. } => {
-            for field in fields {
-                collect_field_called_functions(field.value, expressions, calls);
-            }
-        }
-        AstExprKind::ListLiteral { items, .. } => {
-            for item in items {
-                collect_field_called_functions(*item, expressions, calls);
-            }
-        }
-        AstExprKind::BytesLiteral { items, .. } => {
-            for item in items {
-                collect_field_called_functions(*item, expressions, calls);
-            }
-        }
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::Drain { .. }
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::Source
-        | AstExprKind::Latest
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => {}
-    }
-}
-
-fn push_field_def(
-    statement: &AstStatement,
-    name: &str,
-    scope: &[String],
-    program: &ParsedProgram,
-    items: &[&AstItem],
-    fields: &mut Vec<FieldDef>,
-) {
-    let parent_path = scope.join(".");
-    let path = if parent_path.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{parent_path}.{name}")
-    };
-    if fields.iter().any(|field| field.path == path) {
-        return;
-    }
-    fields.push(FieldDef {
-        path,
-        local_name: name.to_owned(),
-        parent_path,
-        statement: statement.clone(),
-        ast_items: collect_statement_ast_items(statement, items),
-        ast_exprs: collect_statement_ast_exprs(statement, program),
-    });
-}
-
-fn collect_statement_ast_exprs(statement: &AstStatement, program: &ParsedProgram) -> Vec<AstExpr> {
-    let mut expr_ids = Vec::new();
-    collect_statement_expr_ids(statement, program, &mut Vec::new(), &mut expr_ids);
-    let mut lines = Vec::new();
-    collect_statement_lines(statement, &mut lines);
-    for expr in &program.ast.expressions {
-        if lines.contains(&expr.line) && !expr_ids.contains(&expr.id) {
-            collect_expr_tree(expr.id, program, &mut Vec::new(), &mut expr_ids);
-        }
-    }
-    expr_ids
-        .into_iter()
-        .filter_map(|id| program.ast.expressions.get(id).cloned())
-        .collect()
-}
-
-fn collect_statement_expr_ids(
-    statement: &AstStatement,
-    program: &ParsedProgram,
-    seen: &mut Vec<usize>,
-    exprs: &mut Vec<usize>,
-) {
-    if let Some(expr) = statement.expr {
-        collect_expr_tree(expr, program, seen, exprs);
-    }
-    for child in &statement.children {
-        collect_statement_expr_ids(child, program, seen, exprs);
-    }
-}
-
-fn collect_expr_tree(
-    id: usize,
-    program: &ParsedProgram,
-    seen: &mut Vec<usize>,
-    exprs: &mut Vec<usize>,
-) {
-    if seen.contains(&id) {
-        return;
-    }
-    seen.push(id);
-    exprs.push(id);
-    let Some(expr) = program.ast.expressions.get(id) else {
-        return;
-    };
-    match &expr.kind {
-        AstExprKind::Call { args, .. } => {
-            for arg in args {
-                collect_expr_tree(arg.value, program, seen, exprs);
-            }
-        }
-        AstExprKind::Pipe { input, args, .. } => {
-            collect_expr_tree(*input, program, seen, exprs);
-            for arg in args {
-                collect_expr_tree(arg.value, program, seen, exprs);
-            }
-        }
-        AstExprKind::Hold { initial, .. }
-        | AstExprKind::When { input: initial, .. }
-        | AstExprKind::Draining { input: initial } => {
-            collect_expr_tree(*initial, program, seen, exprs);
-        }
-        AstExprKind::Then { input, output } => {
-            collect_expr_tree(*input, program, seen, exprs);
-            if let Some(output) = output {
-                collect_expr_tree(*output, program, seen, exprs);
-            }
-        }
-        AstExprKind::Infix { left, right, .. } => {
-            collect_expr_tree(*left, program, seen, exprs);
-            collect_expr_tree(*right, program, seen, exprs);
-        }
-        AstExprKind::MatchArm { output, .. } => {
-            if let Some(output) = output {
-                collect_expr_tree(*output, program, seen, exprs);
-            }
-        }
-        AstExprKind::Block { bindings, result } => {
-            for binding in bindings {
-                collect_expr_tree(binding.value, program, seen, exprs);
-            }
-            if let Some(result) = result {
-                collect_expr_tree(*result, program, seen, exprs);
-            }
-        }
-        AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
-            for field in fields {
-                collect_expr_tree(field.value, program, seen, exprs);
-            }
-        }
-        AstExprKind::TaggedObject { fields, .. } => {
-            for field in fields {
-                collect_expr_tree(field.value, program, seen, exprs);
-            }
-        }
-        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => {
-            for item in items {
-                collect_expr_tree(*item, program, seen, exprs);
-            }
-        }
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::Drain { .. }
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::Source
-        | AstExprKind::Latest
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => {}
-    }
-}
-
-fn should_record_field_statement(
-    local_name: &str,
-    scope: &[String],
-    program: &ParsedProgram,
-) -> bool {
-    let candidate_path = if scope.is_empty() {
-        local_name.to_owned()
-    } else {
-        format!("{}.{}", scope.join("."), local_name)
-    };
-    let top_level_data_scope = scope.first().is_some_and(|root| {
-        !matches!(root.as_str(), "store" | "document" | "scene" | "host_ports")
-    });
-    local_name != "sources"
-        && local_name != "host_ports"
-        && !scope.iter().any(|name| name == "sources")
-        && !scope.iter().any(|name| name == "host_ports")
-        && scope.first().is_none_or(|name| name != "effects")
-        && (program
-            .state_cells
-            .iter()
-            .any(|cell| cell.path == candidate_path)
-            || top_level_data_scope
-            || scope.iter().any(|name| {
-                name == "store"
-                    || program
-                        .row_scope_functions
-                        .iter()
-                        .any(|scope| scope.row_scope == *name)
-            }))
-}
-
-fn collect_statement_ast_items(statement: &AstStatement, items: &[&AstItem]) -> Vec<AstItem> {
-    let mut lines = Vec::new();
-    collect_statement_lines(statement, &mut lines);
-    items
-        .iter()
-        .filter(|item| lines.iter().any(|line| line == &item.line))
-        .map(|item| (*item).clone())
-        .collect()
-}
-
-fn collect_statement_lines(statement: &AstStatement, lines: &mut Vec<usize>) {
-    lines.push(statement.line);
-    for child in &statement.children {
-        collect_statement_lines(child, lines);
-    }
-}
-
-fn collect_field_ast_items(items: &[&AstItem], start: usize, indent: usize) -> Vec<AstItem> {
-    let mut body = Vec::new();
-    for item in &items[start..] {
-        let current_indent = item.indent;
-        if current_indent <= indent && !body.is_empty() && item.line != items[start].line {
-            break;
-        }
-        body.push((*item).clone());
-    }
-    body
-}
-
-fn function_row_scopes<'a>(
-    name: &str,
-    program: &'a ParsedProgram,
-) -> impl Iterator<Item = &'a str> {
-    program
-        .row_scope_functions
-        .iter()
-        .filter(move |scope| {
-            scope.function == name
-                || scope
-                    .function
-                    .strip_prefix("__source_row_scope_")
-                    .is_some_and(|source_function| source_function == name)
-        })
-        .map(|scope| scope.row_scope.as_str())
-}
-
-fn function_has_row_scope(name: &str, program: &ParsedProgram) -> bool {
-    program.row_scope_functions.iter().any(|scope| {
-        scope.function == name
-            || scope
-                .function
-                .strip_prefix("__source_row_scope_")
-                .is_some_and(|source_function| source_function == name)
-    })
-}
-
-fn push_unique(output: &mut Vec<String>, value: String) {
-    if !output.contains(&value) {
-        output.push(value);
     }
 }
 
@@ -17727,22 +15649,6 @@ fn hidden_key_type(name: &str) -> String {
     }
     output.push_str("Key");
     output
-}
-
-fn sanitize_node_name(text: &str) -> String {
-    text.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('_')
-        .chars()
-        .take(48)
-        .collect()
 }
 
 #[cfg(test)]
@@ -17794,16 +15700,19 @@ defaults:
             "a literal initializer is storage, not a recomputed list view"
         );
         let binding = ir
-            .storage
+            .scope_index
             .bindings
             .iter()
             .find(|binding| binding.diagnostic_path == "defaults")
             .expect("literal list storage binding");
-        let StorageBindingKind::Value {
+        let ErasedBindingTarget::Value {
             field: None,
-            list: Some(list),
-            row_scope: Some(row_scope),
-        } = binding.kind
+            row:
+                Some(ErasedRowBinding {
+                    list,
+                    scope: row_scope,
+                }),
+        } = binding.target
         else {
             panic!("literal list must own exact keyed storage: {binding:?}");
         };
@@ -17812,6 +15721,205 @@ defaults:
             ir.lists[list.as_usize()].initializer,
             ListInitializer::RecordLiteral { .. }
         ));
+    }
+
+    #[test]
+    fn contextual_map_reuses_constructor_authority_and_preserves_row_identity() {
+        let parsed = boon_parser::parse_source(
+            "typed-literal-map.bn",
+            r#"
+mapped:
+    LIST {
+        [value: 1]
+        [value: 2]
+    }
+    |> List/map(item, new: [value: item.value + 1])
+"#,
+        )
+        .unwrap();
+        let ir = lower(&parsed).expect("typed literal map must lower");
+        let (list, _) = storage_for(&ir, "mapped");
+        assert!(matches!(
+            ir.lists[list.as_usize()].initializer,
+            ListInitializer::RecordLiteral { ref rows } if rows.len() == 2
+        ));
+        let materialization = ir
+            .materializations
+            .iter()
+            .find(|materialization| materialization.target_list_id == Some(list))
+            .expect("mapped output materialization");
+        assert_eq!(materialization.source_list_id, Some(list));
+        assert_eq!(
+            materialization.source_scope_id,
+            materialization.target_scope_id
+        );
+        let local = ir
+            .scope_index
+            .locals
+            .iter()
+            .find(|local| {
+                local.owner == materialization.owner && local.local == materialization.row_local
+            })
+            .expect("mapped local");
+        assert_eq!(
+            local.row,
+            Some(ErasedRowBinding {
+                list,
+                scope: materialization.target_scope_id.expect("target scope"),
+            })
+        );
+    }
+
+    #[test]
+    fn scalar_list_literals_remain_values_without_keyed_row_storage() {
+        let parsed = boon_parser::parse_source(
+            "typed-scalar-list.bn",
+            r#"
+selected: TEXT { alpha }
+selected_ids: LIST { selected }
+"#,
+        )
+        .unwrap();
+        let ir = lower(&parsed).expect("scalar list must lower as an ordinary value");
+        let binding = ir
+            .scope_index
+            .bindings
+            .iter()
+            .find(|binding| binding.diagnostic_path == "selected_ids")
+            .expect("scalar list binding");
+        assert!(matches!(
+            binding.target,
+            ErasedBindingTarget::Value {
+                field: Some(_),
+                row: None,
+            }
+        ));
+        assert!(ir.lists.iter().all(|list| list.name != "selected_ids"));
+        assert!(ir.derived_values.iter().any(|value| {
+            value.path == "selected_ids"
+                && value.materialized_list_id.is_none()
+                && value.kind == DerivedValueKind::Pure
+        }));
+    }
+
+    #[test]
+    fn function_local_record_lists_are_values_not_global_storage() {
+        let parsed = boon_parser::parse_source(
+            "function-local-record-list.bn",
+            r#"
+store: component()
+
+FUNCTION component() {
+    [
+        title: TEXT { component }
+        rows: LIST {
+            [name: TEXT { one }]
+            [name: TEXT { two }]
+        }
+    ]
+}
+"#,
+        )
+        .unwrap();
+        let ir = lower(&parsed).expect("function-local lists must lower through call ownership");
+        assert!(
+            ir.lists.is_empty(),
+            "function-template record lists must not allocate global ListId storage: {:?}",
+            ir.lists
+        );
+        assert!(ir.executable.statements.iter().any(|statement| {
+            matches!(
+                &statement.kind,
+                ExecutableStatementKind::Field { path, .. } if path == "store"
+            )
+        }));
+    }
+
+    #[test]
+    fn list_constructor_authority_is_explicit_before_backend_lowering() {
+        let parsed = boon_parser::parse_source(
+            "typed-list-authority.bn",
+            r#"
+store: [
+    add: SOURCE
+    candidate:
+        add |> THEN {
+            entries
+            |> List/any(item, if: item.id == add.text)
+            |> WHEN {
+                True => SKIP
+                False => [
+                    id: add.text
+                ]
+            }
+        }
+    entries:
+        LIST {}
+        |> List/append(item: candidate)
+        |> List/map(item, new: entry_view(entry: item))
+]
+
+FUNCTION entry_view(entry) {
+    [
+        id: entry.id
+    ]
+}
+"#,
+        )
+        .unwrap();
+        let ir = lower(&parsed).expect("list authority must lower structurally");
+        let list = ir
+            .lists
+            .iter()
+            .find(|list| list.name == "store.entries")
+            .expect("entries list");
+        let fields = ir
+            .scope_index
+            .fields
+            .iter()
+            .filter(|field| field.row.map(|row| row.list) == Some(list.id))
+            .collect::<Vec<_>>();
+        let authority = fields
+            .iter()
+            .copied()
+            .find(|field| field.name == "id" && field.role == ErasedFieldRole::ListAuthority)
+            .unwrap_or_else(|| panic!("constructor authority field among {fields:#?}"));
+        let value = fields
+            .iter()
+            .copied()
+            .find(|field| field.name == "id" && field.role == ErasedFieldRole::Value)
+            .expect("mapped value field");
+        assert_ne!(authority.id, value.id);
+        assert!(authority.declaration.is_none());
+        assert!(authority.producer.is_none());
+        assert!(authority.diagnostic_path.starts_with("@authority/"));
+        assert!(
+            ir.semantic_index
+                .fields
+                .iter()
+                .all(|field| field.id != authority.id),
+            "authority storage is not a user-visible semantic field"
+        );
+
+        let any = ir
+            .materializations
+            .iter()
+            .find(|materialization| materialization.operation == ContextualOperationKind::Any)
+            .expect("List/any materialization");
+        let local = ir
+            .scope_index
+            .locals
+            .iter()
+            .find(|local| local.owner == any.owner && local.local == any.row_local)
+            .expect("List/any local");
+        assert_eq!(
+            local
+                .members
+                .iter()
+                .find(|member| member.path == ["id"])
+                .map(|member| member.target),
+            Some(ErasedLocalMemberTarget::Field(authority.id))
+        );
     }
 
     #[test]
@@ -17833,17 +15941,19 @@ mapped:
         let ir = lower(&parsed).expect("top-level computed list must lower");
         let (list, row_scope) = storage_for(&ir, "mapped");
         let binding = ir
-            .storage
+            .scope_index
             .bindings
             .iter()
             .find(|binding| binding.diagnostic_path == "mapped")
             .expect("computed list storage binding");
         assert!(matches!(
-            binding.kind,
-            StorageBindingKind::Value {
+            binding.target,
+            ErasedBindingTarget::Value {
                 field: None,
-                list: Some(binding_list),
-                row_scope: Some(binding_scope),
+                row: Some(ErasedRowBinding {
+                    list: binding_list,
+                    scope: binding_scope,
+                }),
             } if binding_list == list && binding_scope == row_scope
         ));
     }

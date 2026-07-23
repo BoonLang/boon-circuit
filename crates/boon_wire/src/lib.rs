@@ -24,9 +24,9 @@ mod client_session_frame;
 mod session_control;
 
 pub use client_session_frame::{
-    CLIENT_SESSION_PROTOCOL_VERSION, ClientSessionFrame, ClientSessionFrameError,
-    ClientSessionFrameField, ClientSessionFrameLimits, decode_client_session_frame,
-    encode_client_session_frame,
+    CLIENT_SESSION_PROTOCOL_VERSION, ClientSessionDataOperation, ClientSessionFrame,
+    ClientSessionFrameError, ClientSessionFrameField, ClientSessionFrameLimits,
+    decode_client_session_frame, encode_client_session_frame,
 };
 pub use session_control::{
     ClientCommit, ClientHello, ClientRevoke, RESUME_LOOKUP_KEY_BYTES, RESUME_TOKEN_BYTES,

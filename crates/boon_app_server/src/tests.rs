@@ -18,7 +18,7 @@ fn server_descriptor(namespace: &str) -> ArtifactDescriptor {
         path: "artifacts/server.boon".to_owned(),
         revision: 1,
         content_artifact_id: digest(),
-        content_media_type: "application/vnd.boon.machine-plan+cbor;version=1".to_owned(),
+        content_media_type: "application/vnd.boon.machine-plan+cbor;version=2".to_owned(),
         bytes_sha256: digest(),
         bytes_len: 16,
         source_bundle_sha256: digest(),

@@ -2,11 +2,14 @@ use super::window;
 use crate::WebHostResult;
 use crate::client_effect_host::{
     BrowserClientEffectCommand, BrowserClientEffectHostCore, BrowserClientEffectKind,
-    DEFAULT_BROWSER_ACTIVE_EFFECT_LIMIT,
 };
-use boon_app_package::CapabilityProfileDescriptor;
+use boon_app_package::{BrowserPackageAssetDescriptor, CapabilityProfileDescriptor};
 use boon_plan::EffectContract;
 use boon_runtime::{RuntimeTurn, TransientEffectCallId, TransientEffectInvocation, Value};
+use boon_web_effect_host::{
+    BrowserFileEffectHost, BrowserFileEffectLimits, BrowserFileEffectNotification,
+    BrowserFileEffectOperation,
+};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -16,6 +19,9 @@ const MAX_BROWSER_RANDOM_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct BrowserClientEffectCompletion {
     pub call_id: TransientEffectCallId,
+    pub kind: BrowserClientEffectKind,
+    pub result_sequence: Option<u64>,
+    pub terminal: bool,
     pub outcome: Value,
 }
 
@@ -27,23 +33,27 @@ struct ActiveBrowserTimer {
 /// Browser platform adapter for the generic Client effect contract.
 pub(crate) struct BrowserClientEffectHost {
     core: BrowserClientEffectHostCore,
+    files: BrowserFileEffectHost,
     ready: Rc<RefCell<VecDeque<BrowserClientEffectCompletion>>>,
     timers: BTreeMap<TransientEffectCallId, ActiveBrowserTimer>,
     wake: Rc<dyn Fn()>,
 }
 
 impl BrowserClientEffectHost {
-    pub(crate) fn new(
+    pub(crate) async fn open(
+        package_id: &str,
         profile: &CapabilityProfileDescriptor,
         contracts: &[EffectContract],
+        package_assets: &[BrowserPackageAssetDescriptor],
         wake: Rc<dyn Fn()>,
     ) -> WebHostResult<Self> {
+        let file_limits = BrowserFileEffectLimits::default();
+        let mut files =
+            BrowserFileEffectHost::open(package_id, Rc::clone(&wake), file_limits).await?;
+        files.register_package_assets(package_assets)?;
         Ok(Self {
-            core: BrowserClientEffectHostCore::new(
-                profile,
-                contracts,
-                DEFAULT_BROWSER_ACTIVE_EFFECT_LIMIT,
-            )?,
+            core: BrowserClientEffectHostCore::new(profile, contracts, file_limits.max_active)?,
+            files,
             ready: Rc::new(RefCell::new(VecDeque::new())),
             timers: BTreeMap::new(),
             wake,
@@ -52,16 +62,42 @@ impl BrowserClientEffectHost {
 
     pub(crate) fn route_turns(&mut self, turns: &[RuntimeTurn]) -> WebHostResult<()> {
         let commands = self.core.route_turns(turns)?;
-        for command in commands {
-            match command {
-                BrowserClientEffectCommand::Submit { kind, invocation } => {
-                    self.submit(kind, invocation)?;
-                }
-                BrowserClientEffectCommand::Cancel { kind, call_id } => {
-                    self.cancel(kind, call_id);
-                }
-            }
+        for command in &commands {
+            let BrowserClientEffectCommand::Cancel { kind, call_id } = command else {
+                continue;
+            };
+            self.cancel(*kind, *call_id);
         }
+        for command in &commands {
+            let BrowserClientEffectCommand::Submit { kind, invocation } = command else {
+                continue;
+            };
+            self.submit(*kind, invocation.clone())?;
+        }
+        for command in &commands {
+            let BrowserClientEffectCommand::GrantCredits { kind, grant } = command else {
+                continue;
+            };
+            self.grant_credits(*kind, *grant)?;
+        }
+        Ok(())
+    }
+
+    fn grant_credits(
+        &mut self,
+        kind: BrowserClientEffectKind,
+        grant: boon_runtime::TransientEffectCreditGrant,
+    ) -> WebHostResult<()> {
+        if file_operation(kind).is_none() {
+            return Err(crate::WebHostError::InvalidInput {
+                field: "browser stream credit".to_owned(),
+                reason: format!(
+                    "non-stream browser effect {:?} received credit for call {}",
+                    kind, grant.call_id
+                ),
+            });
+        }
+        self.files.grant_credits(grant)?;
         Ok(())
     }
 
@@ -69,10 +105,19 @@ impl BrowserClientEffectHost {
         &mut self,
     ) -> WebHostResult<Option<BrowserClientEffectCompletion>> {
         loop {
-            let Some(completion) = self.ready.borrow_mut().pop_front() else {
+            let completion = self
+                .ready
+                .borrow_mut()
+                .pop_front()
+                .or_else(|| self.files.dequeue_notification().map(file_completion));
+            let Some(completion) = completion else {
                 return Ok(None);
             };
-            if self.core.accept_completion(completion.call_id).is_err() {
+            if self
+                .core
+                .accept_result(completion.call_id, completion.kind, completion.terminal)
+                .is_err()
+            {
                 continue;
             }
             if let Some(timer) = self.timers.remove(&completion.call_id) {
@@ -100,14 +145,24 @@ impl BrowserClientEffectHost {
         match kind {
             BrowserClientEffectKind::WallClock => {
                 let outcome = wall_clock_outcome(&invocation.intent);
-                self.queue(invocation.call_id, outcome);
+                self.queue(invocation.call_id, kind, outcome);
             }
             BrowserClientEffectKind::SecureRandom => {
                 let outcome = random_outcome(&invocation.intent);
-                self.queue(invocation.call_id, outcome);
+                self.queue(invocation.call_id, kind, outcome);
             }
             BrowserClientEffectKind::Deadline => {
                 self.submit_deadline(invocation)?;
+            }
+            BrowserClientEffectKind::FileReadBytes
+            | BrowserClientEffectKind::FileWriteBytes
+            | BrowserClientEffectKind::FileReadStream
+            | BrowserClientEffectKind::ContentImport
+            | BrowserClientEffectKind::ContentSave => {
+                self.files.submit(
+                    file_operation(kind).expect("File/Content kind has a platform operation"),
+                    invocation,
+                )?;
             }
         }
         Ok(())
@@ -119,6 +174,7 @@ impl BrowserClientEffectHost {
             Ok(_) => {
                 self.queue(
                     invocation.call_id,
+                    BrowserClientEffectKind::Deadline,
                     failure(
                         "delay_out_of_range",
                         "browser timer delay exceeds the platform timeout range",
@@ -127,7 +183,11 @@ impl BrowserClientEffectHost {
                 return Ok(());
             }
             Err(outcome) => {
-                self.queue(invocation.call_id, outcome);
+                self.queue(
+                    invocation.call_id,
+                    BrowserClientEffectKind::Deadline,
+                    outcome,
+                );
                 return Ok(());
             }
         };
@@ -137,6 +197,9 @@ impl BrowserClientEffectHost {
         let callback = Closure::wrap(Box::new(move || {
             ready.borrow_mut().push_back(BrowserClientEffectCompletion {
                 call_id,
+                kind: BrowserClientEffectKind::Deadline,
+                result_sequence: None,
+                terminal: true,
                 outcome: tagged(
                     "TimerFired",
                     BTreeMap::from([(
@@ -164,10 +227,16 @@ impl BrowserClientEffectHost {
         Ok(())
     }
 
-    fn queue(&self, call_id: TransientEffectCallId, outcome: Value) {
+    fn queue(&self, call_id: TransientEffectCallId, kind: BrowserClientEffectKind, outcome: Value) {
         self.ready
             .borrow_mut()
-            .push_back(BrowserClientEffectCompletion { call_id, outcome });
+            .push_back(BrowserClientEffectCompletion {
+                call_id,
+                kind,
+                result_sequence: None,
+                terminal: true,
+                outcome,
+            });
     }
 
     fn cancel(&mut self, kind: BrowserClientEffectKind, call_id: TransientEffectCallId) {
@@ -180,12 +249,45 @@ impl BrowserClientEffectHost {
         {
             window.clear_timeout_with_handle(timer.timeout_id);
         }
+        if file_operation(kind).is_some() {
+            self.files.cancel(call_id);
+        }
     }
 }
 
 impl Drop for BrowserClientEffectHost {
     fn drop(&mut self) {
         self.cancel_all();
+    }
+}
+
+fn file_operation(kind: BrowserClientEffectKind) -> Option<BrowserFileEffectOperation> {
+    match kind {
+        BrowserClientEffectKind::FileReadBytes => Some(BrowserFileEffectOperation::ReadBytes),
+        BrowserClientEffectKind::FileWriteBytes => Some(BrowserFileEffectOperation::WriteBytes),
+        BrowserClientEffectKind::FileReadStream => Some(BrowserFileEffectOperation::ReadStream),
+        BrowserClientEffectKind::ContentImport => Some(BrowserFileEffectOperation::ContentImport),
+        BrowserClientEffectKind::ContentSave => Some(BrowserFileEffectOperation::ContentSave),
+        BrowserClientEffectKind::WallClock
+        | BrowserClientEffectKind::SecureRandom
+        | BrowserClientEffectKind::Deadline => None,
+    }
+}
+
+fn file_completion(notification: BrowserFileEffectNotification) -> BrowserClientEffectCompletion {
+    let kind = match notification.operation {
+        BrowserFileEffectOperation::ReadBytes => BrowserClientEffectKind::FileReadBytes,
+        BrowserFileEffectOperation::WriteBytes => BrowserClientEffectKind::FileWriteBytes,
+        BrowserFileEffectOperation::ReadStream => BrowserClientEffectKind::FileReadStream,
+        BrowserFileEffectOperation::ContentImport => BrowserClientEffectKind::ContentImport,
+        BrowserFileEffectOperation::ContentSave => BrowserClientEffectKind::ContentSave,
+    };
+    BrowserClientEffectCompletion {
+        call_id: notification.call_id,
+        kind,
+        result_sequence: notification.result_sequence,
+        terminal: notification.terminal,
+        outcome: notification.outcome,
     }
 }
 

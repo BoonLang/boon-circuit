@@ -326,30 +326,30 @@ FUNCTION font(font) {
 FUNCTION text(of) {
     of |> WHEN {
         Hero => [
-            font: font(of: Hero)
+            font: font(font: Hero)
             depth: 0
             move: [further: 0]
         ]
 
         BodySecondary => [
-            font: font(of: BodySecondary)
+            font: font(font: BodySecondary)
             depth: 0
             move: [further: 0]
         ]
 
         ButtonIcon[checked] => [
-            font: font(of: ButtonIcon[checked: checked])
+            font: font(font: ButtonIcon[checked: checked])
             depth: 0
         ]
 
         Small => [
-            font: font(of: Small)
+            font: font(font: Small)
             depth: 0
             move: [further: 0]
         ]
 
         SmallLink[hovered] => [
-            font: font(of: SmallLink[hovered: hovered])
+            font: font(font: SmallLink[hovered: hovered])
             depth: 0
             move: [further: 0]
         ]

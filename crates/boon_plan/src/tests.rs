@@ -15,17 +15,18 @@ fn empty_plan() -> MachinePlan {
         target_profile: TargetProfile::SoftwareDefault,
         program_role: ProgramRole::Client,
         distributed_endpoint: None,
+        producer_function_instances: Vec::new(),
         application,
         persistence,
         effects: Vec::new(),
         outputs: Vec::new(),
         host_ports: Vec::new(),
-        query_collections: Vec::new(),
-        query_indexes: Vec::new(),
+        list_indexes: Vec::new(),
         demand: DemandPlan {
             root_derived_outputs: RootOutputDemand::Selected(Vec::new()),
         },
         document: None,
+        row_expressions: PlanRowExpressionArena::new(),
         constants: Vec::new(),
         source_routes: Vec::new(),
         storage_layout: StorageLayout {
@@ -39,8 +40,8 @@ fn empty_plan() -> MachinePlan {
             unresolved_dependency_edges: 0,
         },
         commit_plan: CommitPlan {
-            update_branch_count: 0,
-            unresolved_update_branch_count: 0,
+            state_update_count: 0,
+            unresolved_state_update_count: 0,
         },
         delta_plan: DeltaPlan { deltas: Vec::new() },
         capability_summary: CapabilitySummary {
@@ -74,11 +75,439 @@ fn empty_plan() -> MachinePlan {
     }
 }
 
+fn encoded_serde_string(value: &impl Serialize, expected: &str) {
+    let mut encoded = vec![6];
+    encoded.extend_from_slice(&(expected.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(expected.as_bytes());
+    assert_eq!(super::binary::encode(value).unwrap(), encoded);
+}
+
+fn row_call_arg(name: &str, value: PlanRowExpressionId) -> PlanRowCallArg {
+    PlanRowCallArg {
+        name: name.to_owned(),
+        value,
+    }
+}
+
+fn row_call_args(names: &[&str], value: PlanRowExpressionId) -> Vec<PlanRowCallArg> {
+    names.iter().map(|name| row_call_arg(name, value)).collect()
+}
+
+fn intern_empty_row_call(arena: &mut PlanRowExpressionArena) -> PlanRowExpressionId {
+    arena
+        .interner()
+        .intern(PlanRowExpressionNode::BuiltinCall {
+            function: PlanRowBuiltin::TextEmpty,
+            input: None,
+            args: Vec::new(),
+        })
+        .unwrap()
+}
+
+#[test]
+fn plan_row_expression_arena_interns_shared_nodes_in_linear_storage() {
+    let mut arena = PlanRowExpressionArena::new();
+    let (source, trimmed, root) = {
+        let mut builder = arena.builder();
+        let source = builder.value(ValueRef::State(StateId(7))).unwrap();
+        let trimmed = builder
+            .intern(PlanRowExpressionNode::TextTrim { input: source })
+            .unwrap();
+        assert_eq!(
+            builder
+                .intern(PlanRowExpressionNode::TextTrim { input: source })
+                .unwrap(),
+            trimmed
+        );
+        let root = builder
+            .intern(PlanRowExpressionNode::TextConcat {
+                parts: vec![trimmed, trimmed],
+            })
+            .unwrap();
+        (source, trimmed, root)
+    };
+
+    assert_eq!(arena.len(), 3);
+    assert_eq!(
+        arena.walk_postorder(root).unwrap(),
+        vec![source, trimmed, root]
+    );
+    assert_eq!(
+        arena.node(root).unwrap(),
+        &PlanRowExpressionNode::TextConcat {
+            parts: vec![trimmed, trimmed],
+        }
+    );
+}
+
+#[test]
+fn plan_row_expression_arena_rejects_invalid_and_forward_ids() {
+    let arena = PlanRowExpressionArena::new();
+    assert!(
+        arena
+            .walk_postorder(PlanRowExpressionId(9))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid for arena length 0")
+    );
+
+    let forward = PlanRowExpressionArena::from_nodes(vec![
+        PlanRowExpressionNode::TextTrim {
+            input: PlanRowExpressionId(1),
+        },
+        PlanRowExpressionNode::Field {
+            input: ValueRef::State(StateId(0)),
+        },
+    ])
+    .unwrap_err();
+    assert!(
+        forward
+            .to_string()
+            .contains("children must exist and precede parents")
+    );
+
+    let mut arena = PlanRowExpressionArena::new();
+    arena
+        .push(PlanRowExpressionNode::Field {
+            input: ValueRef::State(StateId(0)),
+        })
+        .unwrap();
+    assert!(
+        arena
+            .push(PlanRowExpressionNode::TextTrim {
+                input: PlanRowExpressionId(2),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("invalid future id 2")
+    );
+}
+
+#[test]
+fn plan_row_expression_arena_serde_and_plan_hash_are_deterministic() {
+    let build = || {
+        let mut arena = PlanRowExpressionArena::new();
+        let source = arena.builder().value(ValueRef::State(StateId(3))).unwrap();
+        let root = arena
+            .builder()
+            .intern(PlanRowExpressionNode::TextLength { input: source })
+            .unwrap();
+        (arena, root)
+    };
+    let (first, first_root) = build();
+    let (second, second_root) = build();
+
+    assert_eq!(first_root, second_root);
+    assert_eq!(
+        super::binary::encode(&first).unwrap(),
+        super::binary::encode(&second).unwrap()
+    );
+
+    let mut first_plan = empty_plan();
+    first_plan.row_expressions = first;
+    let mut second_plan = empty_plan();
+    second_plan.row_expressions = second;
+    assert_eq!(
+        plan_sha256(&first_plan).unwrap(),
+        plan_sha256(&second_plan).unwrap()
+    );
+
+    let mut changed = first_plan.clone();
+    changed
+        .row_expressions
+        .intern(PlanRowExpressionNode::TextIsEmpty { input: first_root })
+        .unwrap();
+    assert_ne!(
+        plan_sha256(&first_plan).unwrap(),
+        plan_sha256(&changed).unwrap()
+    );
+}
+
+#[test]
+fn plan_row_builtin_inventory_uses_stable_string_serde() {
+    let expected_new_builtins = [
+        ("Text/join_lines", PlanRowBuiltin::TextJoinLines),
+        ("Text/to_uppercase", PlanRowBuiltin::TextToUppercase),
+        ("Text/time_range_label", PlanRowBuiltin::TextTimeRangeLabel),
+        ("Number/bit_width", PlanRowBuiltin::NumberBitWidth),
+        ("Number/to_ascii_text", PlanRowBuiltin::NumberToAsciiText),
+    ];
+    let mut names = BTreeSet::new();
+    for builtin in PlanRowBuiltin::ALL {
+        let name = builtin.function_name();
+        assert!(names.insert(name), "duplicate builtin name `{name}`");
+        assert_eq!(PlanRowBuiltin::from_function_name(name), Some(*builtin));
+        encoded_serde_string(builtin, name);
+        let deserializer = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name);
+        let decoded = <PlanRowBuiltin as serde::Deserialize>::deserialize(deserializer).unwrap();
+        assert_eq!(decoded, *builtin);
+    }
+    for (name, builtin) in expected_new_builtins {
+        assert_eq!(PlanRowBuiltin::from_function_name(name), Some(builtin));
+    }
+    for excluded in [
+        "List/page",
+        "Url/encode",
+        "Text/trim",
+        "Text/substring",
+        "Text/to_bytes",
+        "Bytes/to_text",
+    ] {
+        assert_eq!(PlanRowBuiltin::from_function_name(excluded), None);
+    }
+}
+
+#[test]
+fn plan_infix_op_inventory_uses_stable_operator_strings() {
+    let expected = [
+        ("+", PlanInfixOp::Add),
+        ("-", PlanInfixOp::Subtract),
+        ("*", PlanInfixOp::Multiply),
+        ("/", PlanInfixOp::Divide),
+        ("%", PlanInfixOp::Remainder),
+        ("==", PlanInfixOp::Equal),
+        ("!=", PlanInfixOp::NotEqual),
+        ("<", PlanInfixOp::Less),
+        ("<=", PlanInfixOp::LessOrEqual),
+        (">", PlanInfixOp::Greater),
+        (">=", PlanInfixOp::GreaterOrEqual),
+    ];
+    assert_eq!(PlanInfixOp::ALL.len(), expected.len());
+    for (symbol, operator) in expected {
+        assert_eq!(PlanInfixOp::from_symbol(symbol), Some(operator));
+        assert_eq!(operator.as_str(), symbol);
+        encoded_serde_string(&operator, symbol);
+        let deserializer =
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(symbol);
+        let decoded = <PlanInfixOp as serde::Deserialize>::deserialize(deserializer).unwrap();
+        assert_eq!(decoded, operator);
+        assert_eq!(
+            operator.is_comparison(),
+            matches!(
+                operator,
+                PlanInfixOp::Equal
+                    | PlanInfixOp::NotEqual
+                    | PlanInfixOp::Less
+                    | PlanInfixOp::LessOrEqual
+                    | PlanInfixOp::Greater
+                    | PlanInfixOp::GreaterOrEqual
+            )
+        );
+    }
+    assert_eq!(PlanInfixOp::from_symbol("&&"), None);
+}
+
+#[test]
+fn plan_row_builtin_signatures_are_complete_and_queryable() {
+    for builtin in PlanRowBuiltin::ALL {
+        let signature = builtin.signature();
+        let mut names = BTreeSet::new();
+        let mut receiver_count = 0;
+        for parameter in signature.parameters {
+            assert!(
+                names.insert(parameter.name),
+                "{} repeats parameter `{}`",
+                builtin,
+                parameter.name
+            );
+            assert_eq!(builtin.parameter(parameter.name), Some(parameter));
+            assert_ne!(parameter.is_required(), parameter.is_optional());
+            receiver_count += usize::from(parameter.is_receiver());
+        }
+        assert!(receiver_count <= 1, "{} has multiple receivers", builtin);
+        assert_eq!(builtin.receiver_parameter(), signature.receiver_parameter());
+        assert!(
+            builtin.fixed_result_type().is_some()
+                || matches!(
+                    builtin,
+                    PlanRowBuiltin::ListGet | PlanRowBuiltin::ListLatest | PlanRowBuiltin::ListTake
+                ),
+            "{} lacks fixed result metadata",
+            builtin
+        );
+    }
+
+    let receiver = PlanRowBuiltin::TextTimeRangeLabel
+        .receiver_parameter()
+        .unwrap();
+    assert_eq!(receiver.name, "input");
+    assert!(receiver.required);
+    assert!(
+        PlanRowBuiltin::NumberToAsciiText
+            .parameter("width")
+            .unwrap()
+            .is_optional()
+    );
+    assert_eq!(
+        PlanRowBuiltin::TextJoinLines.fixed_result_type(),
+        Some(PlanValueType::Text)
+    );
+    assert_eq!(
+        PlanRowBuiltin::NumberBitWidth.fixed_result_type(),
+        Some(PlanValueType::Number)
+    );
+}
+
+#[test]
+fn plan_row_builtin_call_validation_enforces_canonical_shape() {
+    let mut arena = PlanRowExpressionArena::new();
+    let input = intern_empty_row_call(&mut arena);
+    PlanRowBuiltin::TextContains
+        .validate_call(Some(input), &row_call_args(&["needle"], input))
+        .unwrap();
+    PlanRowBuiltin::TextJoin
+        .validate_call(Some(input), &row_call_args(&["separator", "empty"], input))
+        .unwrap();
+    PlanRowBuiltin::NumberInterpolate
+        .validate_call(
+            None,
+            &row_call_args(
+                &["start", "end", "numerator", "denominator", "fallback"],
+                input,
+            ),
+        )
+        .unwrap();
+
+    let missing_input = PlanRowBuiltin::TextContains
+        .validate_call(None, &row_call_args(&["needle"], input))
+        .unwrap_err();
+    assert!(missing_input.to_string().contains("required input `input`"));
+
+    let named_receiver = PlanRowBuiltin::TextContains
+        .validate_call(None, &row_call_args(&["input", "needle"], input))
+        .unwrap_err();
+    assert!(
+        named_receiver
+            .to_string()
+            .contains("must be stored as input")
+    );
+
+    let duplicate_receiver = PlanRowBuiltin::TextContains
+        .validate_call(Some(input), &row_call_args(&["input", "needle"], input))
+        .unwrap_err();
+    assert!(
+        duplicate_receiver
+            .to_string()
+            .contains("duplicates its input")
+    );
+
+    let duplicate = PlanRowBuiltin::TextContains
+        .validate_call(Some(input), &row_call_args(&["needle", "needle"], input))
+        .unwrap_err();
+    assert!(
+        duplicate
+            .to_string()
+            .contains("duplicate argument `needle`")
+    );
+
+    let unknown = PlanRowBuiltin::TextContains
+        .validate_call(Some(input), &row_call_args(&["needle", "extra"], input))
+        .unwrap_err();
+    assert!(unknown.to_string().contains("unknown argument `extra`"));
+
+    let unexpected_input = PlanRowBuiltin::TextEmpty
+        .validate_call(Some(input), &[])
+        .unwrap_err();
+    assert!(
+        unexpected_input
+            .to_string()
+            .contains("does not accept an input")
+    );
+}
+
+#[test]
+fn plan_verifier_rejects_malformed_row_builtin_calls() {
+    let mut plan = empty_plan();
+    let input = intern_empty_row_call(&mut plan.row_expressions);
+    let expression = plan
+        .row_expression_builder()
+        .intern(PlanRowExpressionNode::BuiltinCall {
+            function: PlanRowBuiltin::TextContains,
+            input: Some(input),
+            args: row_call_args(&["needle", "needle"], input),
+        })
+        .unwrap();
+    plan.storage_layout.scalar_slots.push(ScalarStorageSlot {
+        id: PlanStorageId(0),
+        state_id: StateId(0),
+        owner: PlanOwner::root(),
+        value_type: PlanValueType::Bool,
+        scope_id: None,
+        indexed: false,
+        indexed_field_id: None,
+        initializer: ScalarInitializerPlan::Expression { expression },
+    });
+
+    let error = validate_plan_row_builtin_calls(&plan).unwrap_err();
+    assert!(error.to_string().contains("duplicate argument `needle`"));
+    let verification = verify_plan(&plan).unwrap();
+    let check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "row-builtin-calls-match-signatures")
+        .unwrap();
+    assert!(!check.pass);
+    assert!(check.detail.contains("duplicate argument `needle`"));
+}
+
+fn empty_indexed_list_plan(profile: TargetProfile, capacity: Option<usize>) -> MachinePlan {
+    let mut plan = empty_plan();
+    plan.target_profile = profile;
+    plan.storage_layout.list_slots.push(ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: None,
+        row_fields: Vec::new(),
+        capacity,
+        hidden_key_type: "u64".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Empty,
+        range: None,
+        initial_rows: Vec::new(),
+    });
+    plan
+}
+
+#[test]
+fn typed_index_resource_validation_rejects_inventory_and_capacity_over_profile() {
+    let mut inventory = empty_indexed_list_plan(TargetProfile::SoftwareBounded, None);
+    inventory.list_indexes = (0..65)
+        .map(|index| PlanListIndex {
+            id: PlanListIndexId(index),
+            source_list: ListId(0),
+            keys: Vec::new(),
+        })
+        .collect();
+    assert!(
+        validate_typed_list_index_resources(&inventory)
+            .unwrap_err()
+            .to_string()
+            .contains("at most 64 typed indexes")
+    );
+
+    let mut capacity = empty_indexed_list_plan(TargetProfile::SoftwareBounded, Some(100_001));
+    capacity.list_indexes.push(PlanListIndex {
+        id: PlanListIndexId(0),
+        source_list: ListId(0),
+        keys: Vec::new(),
+    });
+    assert!(
+        validate_typed_list_index_resources(&capacity)
+            .unwrap_err()
+            .to_string()
+            .contains("may retain 100001 entries")
+    );
+}
+
 fn distributed_declaration(semantic_path: &str) -> DistributedDeclarationId {
     DistributedDeclarationId::from_semantic_path("DistributedFixture", semantic_path).unwrap()
 }
 
-fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
+fn distributed_graph_fixture() -> (
+    ApplicationIdentity,
+    DistributedGraphPlan,
+    PlanRowExpressionArena,
+) {
     let application = ApplicationIdentity::compiler_default();
     let graph =
         DistributedGraphIdentityPlan::new(&application, distributed_declaration("graph"), 1)
@@ -103,22 +532,7 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
     )
     .unwrap();
     let function_declaration = distributed_declaration("server.function.double");
-    let function_export_id = ExportId::from_identity(
-        graph.graph_id,
-        server_endpoint_id,
-        DistributedExportKind::PureFunction,
-        function_declaration,
-    )
-    .unwrap();
-    let function_argument_id =
-        DistributedArgumentId::from_parameter_name(function_export_id, "value").unwrap();
-    let function_argument = || PlanRowExpression::Field {
-        input: ValueRef::DistributedFunctionArgument {
-            export_id: function_export_id,
-            argument_id: function_argument_id,
-        },
-    };
-    let server_function = DistributedPureFunctionExportPlan::new(
+    let server_function = DistributedFunctionExportPlan::new(
         graph.graph_id,
         server_endpoint_id,
         function_declaration,
@@ -126,11 +540,6 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         ProgramRole::Server,
         vec![("value".to_owned(), DataTypePlan::Number)],
         DataTypePlan::Number,
-        PlanRowExpression::NumberInfix {
-            op: "+".to_owned(),
-            left: Box::new(function_argument()),
-            right: Box::new(function_argument()),
-        },
     )
     .unwrap();
     let server = DistributedEndpointContractPlan::new(
@@ -164,22 +573,7 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
     )
     .unwrap();
     let session_function_declaration = distributed_declaration("session.function.double");
-    let session_function_export_id = ExportId::from_identity(
-        graph.graph_id,
-        session_endpoint_id,
-        DistributedExportKind::PureFunction,
-        session_function_declaration,
-    )
-    .unwrap();
-    let session_function_argument_id =
-        DistributedArgumentId::from_parameter_name(session_function_export_id, "value").unwrap();
-    let session_function_argument = || PlanRowExpression::Field {
-        input: ValueRef::DistributedFunctionArgument {
-            export_id: session_function_export_id,
-            argument_id: session_function_argument_id,
-        },
-    };
-    let session_function = DistributedPureFunctionExportPlan::new(
+    let session_function = DistributedFunctionExportPlan::new(
         graph.graph_id,
         session_endpoint_id,
         session_function_declaration,
@@ -187,11 +581,6 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         ProgramRole::Session,
         vec![("value".to_owned(), DataTypePlan::Number)],
         DataTypePlan::Number,
-        PlanRowExpression::NumberInfix {
-            op: "+".to_owned(),
-            left: Box::new(session_function_argument()),
-            right: Box::new(session_function_argument()),
-        },
     )
     .unwrap();
     let session_value = DistributedValueExportPlan::new(
@@ -235,17 +624,24 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
         &session_value,
     )
     .unwrap();
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let client_argument = row_expressions
+        .builder()
+        .value(ValueRef::DistributedImport(client_import.import_id))
+        .unwrap();
     let client_call = RemoteCallSitePlan::new(
         graph.graph_id,
         client_endpoint_id,
         distributed_declaration("client.call.double"),
         1,
         ProgramRole::Client,
+        PlanOwner::root(),
         &session_function,
-        vec![(
-            "value".to_owned(),
-            ValueRef::DistributedImport(client_import.import_id),
-        )],
+        vec![("value".to_owned(), client_argument)],
+        Vec::new(),
+        DistributedCallMode::Current,
+        None,
+        Vec::new(),
     )
     .unwrap();
     let client = DistributedEndpointContractPlan::new(
@@ -264,7 +660,231 @@ fn distributed_graph_fixture() -> (ApplicationIdentity, DistributedGraphPlan) {
 
     let graph =
         DistributedGraphPlan::new(&application, graph, vec![server, client, session]).unwrap();
-    (application, graph)
+    (application, graph, row_expressions)
+}
+
+fn session_producer_plan(graph: &DistributedGraphPlan) -> MachinePlan {
+    let endpoint = graph.endpoint_plan(ProgramRole::Session).unwrap();
+    let edge = endpoint
+        .wire_schema
+        .call_edges
+        .iter()
+        .find(|edge| edge.callee_role == ProgramRole::Session)
+        .unwrap();
+    let function = endpoint
+        .endpoint
+        .function_exports
+        .iter()
+        .find(|function| function.export_id == edge.function_export_id)
+        .unwrap();
+    let result_import =
+        ImportId::from_producer_argument(edge.call_site_id, function.parameters[0].argument_id)
+            .unwrap();
+    let instance = ProducerFunctionInstancePlan::new(
+        edge.call_site_id,
+        function,
+        PlanOwner {
+            static_owner: PlanStaticOwnerId(0),
+            ancestors: Vec::new(),
+        },
+        DistributedCallMode::Current,
+        None,
+        ProducerFunctionOwnershipPlan::new(
+            vec![PlanStaticOwnerId(0)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        ValueRef::DistributedImport(result_import),
+    )
+    .unwrap();
+
+    let mut plan = empty_plan();
+    plan.program_role = ProgramRole::Session;
+    plan.distributed_endpoint = Some(endpoint);
+    plan.producer_function_instances = vec![instance];
+    plan
+}
+
+fn session_producer_plan_with_owned_resources(graph: &DistributedGraphPlan) -> MachinePlan {
+    let mut plan = session_producer_plan(graph);
+    let instance_owner = PlanStaticOwnerId(0);
+    let resource_owner = PlanStaticOwnerId(1);
+    let source_id = SourceId(0);
+    let state_id = StateId(0);
+    let field_id = FieldId(0);
+    let list_id = ListId(0);
+    let index_id = PlanListIndexId(0);
+    let effect_id = EffectId::from_host_operation("Test/producer_owned").unwrap();
+    let invocation_id =
+        EffectInvocationId::from_result_owner(effect_id, "producer.result").unwrap();
+    let argument_import = plan.producer_function_instances[0].arguments[0].import_id;
+    let argument_expression = plan
+        .row_expression_builder()
+        .value(ValueRef::DistributedImport(argument_import))
+        .unwrap();
+    let resource_plan_owner = PlanOwner {
+        static_owner: resource_owner,
+        ancestors: Vec::new(),
+    };
+
+    plan.source_routes.push(SourceRoute {
+        id: PlanSourceRouteId(0),
+        source_id,
+        owner: resource_plan_owner.clone(),
+        path: "producer.source".to_owned(),
+        scoped: false,
+        scope_id: None,
+        interval_ms: None,
+        payload_schema: SourcePayloadSchema {
+            fields: Vec::new(),
+            typed_fields: Vec::new(),
+        },
+    });
+    plan.storage_layout.scalar_slots.push(ScalarStorageSlot {
+        id: PlanStorageId(0),
+        state_id,
+        owner: resource_plan_owner.clone(),
+        value_type: PlanValueType::Number,
+        scope_id: None,
+        indexed: false,
+        indexed_field_id: None,
+        initializer: ScalarInitializerPlan::Expression {
+            expression: argument_expression,
+        },
+    });
+    plan.storage_layout.list_slots.push(ListStorageSlot {
+        id: PlanStorageId(1),
+        list_id,
+        scope_id: None,
+        row_fields: Vec::new(),
+        capacity: None,
+        hidden_key_type: "u64".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Empty,
+        range: None,
+        initial_rows: Vec::new(),
+    });
+    plan.list_indexes.push(PlanListIndex {
+        id: index_id,
+        source_list: list_id,
+        keys: Vec::new(),
+    });
+    plan.regions.push(OperationRegion {
+        id: PlanRegionId(0),
+        kind: RegionKind::DerivedEvaluation,
+        ops: vec![PlanOp {
+            id: PlanOpId(0),
+            kind: PlanOpKind::DerivedValue {
+                derived_kind: PlanDerivedKind::Pure,
+                startup_recompute: true,
+                expression: None,
+            },
+            inputs: vec![ValueRef::DistributedImport(argument_import)],
+            output: Some(ValueRef::Field(field_id)),
+            indexed: false,
+            unresolved_executable_ref_count: 0,
+        }],
+    });
+    plan.regions.push(OperationRegion {
+        id: PlanRegionId(1),
+        kind: RegionKind::StateUpdates,
+        ops: vec![PlanOp {
+            id: PlanOpId(1),
+            kind: PlanOpKind::StateUpdate {
+                trigger: ValueRef::DistributedImport(argument_import),
+                value: None,
+                effect: Some(EffectInvocationPlan {
+                    invocation_id,
+                    effect_id,
+                    owner: resource_plan_owner,
+                    gate: argument_expression,
+                    intent_fields: Vec::new(),
+                    idempotency_key: EffectIdempotencyKeyPlan::InvocationTurnIntentSha256,
+                    result: EffectResultRoute::Target {
+                        target: ValueRef::State(state_id),
+                        policy: EffectResultPolicy::ReturnValue,
+                    },
+                    barrier: EffectBarrier::None,
+                }),
+            },
+            inputs: vec![ValueRef::DistributedImport(argument_import)],
+            output: Some(ValueRef::State(state_id)),
+            indexed: false,
+            unresolved_executable_ref_count: 0,
+        }],
+    });
+    plan.producer_function_instances[0].ownership = ProducerFunctionOwnershipPlan::new(
+        vec![resource_owner, instance_owner, resource_owner],
+        vec![source_id],
+        vec![state_id],
+        vec![field_id],
+        vec![list_id],
+        vec![index_id],
+        vec![invocation_id],
+    );
+    plan.producer_function_instances[0].result = ValueRef::Field(field_id);
+    plan
+}
+
+fn add_second_session_producer_instance(
+    plan: &mut MachinePlan,
+    ownership: ProducerFunctionOwnershipPlan,
+) {
+    let endpoint = plan.distributed_endpoint.as_ref().unwrap();
+    let function = endpoint.endpoint.function_exports[0].clone();
+    let call_site_id = RemoteCallSiteId::from_identity(
+        endpoint.graph.graph_id,
+        endpoint.endpoint.endpoint_id,
+        distributed_declaration("session.call.second_producer"),
+    )
+    .unwrap();
+    let mut edge = endpoint
+        .wire_schema
+        .call_edges
+        .iter()
+        .find(|edge| edge.callee_role == ProgramRole::Session)
+        .unwrap()
+        .clone();
+    edge.call_site_id = call_site_id;
+    let result_import =
+        ImportId::from_producer_argument(call_site_id, function.parameters[0].argument_id).unwrap();
+    let instance = ProducerFunctionInstancePlan::new(
+        call_site_id,
+        &function,
+        PlanOwner {
+            static_owner: PlanStaticOwnerId(2),
+            ancestors: Vec::new(),
+        },
+        DistributedCallMode::Current,
+        None,
+        ownership,
+        ValueRef::DistributedImport(result_import),
+    )
+    .unwrap();
+
+    let endpoint = plan.distributed_endpoint.as_mut().unwrap();
+    endpoint.wire_schema.call_edges.push(edge);
+    endpoint
+        .wire_schema
+        .call_edges
+        .sort_by_key(|edge| edge.call_site_id);
+    plan.producer_function_instances.push(instance);
+    plan.producer_function_instances
+        .sort_by_key(|instance| instance.call_site_id);
+}
+
+fn producer_function_check(plan: &MachinePlan) -> (bool, String) {
+    let verification = verify_plan(plan).unwrap();
+    let check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "producer-function-instances-canonical-and-resolved")
+        .unwrap();
+    (check.pass, check.detail.clone())
 }
 
 fn distributed_graph_with_event(
@@ -311,7 +931,7 @@ fn distributed_graph_with_event(
 
 #[test]
 fn distributed_graph_links_three_roles_and_each_machine_passes_the_distributed_check() {
-    let (application, graph) = distributed_graph_fixture();
+    let (application, graph, row_expressions) = distributed_graph_fixture();
 
     assert!(graph.validate(&application).is_ok());
     assert_eq!(
@@ -335,6 +955,7 @@ fn distributed_graph_links_three_roles_and_each_machine_passes_the_distributed_c
         let mut plan = empty_plan();
         plan.program_role = role;
         plan.distributed_endpoint = graph.endpoint_plan(role);
+        plan.row_expressions = row_expressions.clone();
 
         let verification = verify_plan(&plan).unwrap();
         let distributed_check = verification
@@ -377,23 +998,395 @@ fn distributed_graph_links_three_roles_and_each_machine_passes_the_distributed_c
             .unwrap();
         assert_eq!(caller.outbound_call_route(edge.call_site_id), Some(edge));
         assert_eq!(callee.inbound_call_route(edge.call_site_id), Some(edge));
+        assert!(callee.endpoint.function_exports.iter().any(|function| {
+            function.export_id == edge.function_export_id
+                && function.parameters == edge.parameters
+                && function.result_type == edge.result_type
+        }));
+    }
+}
+
+#[test]
+fn producer_function_ownership_constructor_canonicalizes_every_id_set() {
+    let low_effect = EffectInvocationId([1; 32]);
+    let high_effect = EffectInvocationId([2; 32]);
+    let ownership = ProducerFunctionOwnershipPlan::new(
+        vec![
+            PlanStaticOwnerId(2),
+            PlanStaticOwnerId(1),
+            PlanStaticOwnerId(2),
+        ],
+        vec![SourceId(2), SourceId(1), SourceId(2)],
+        vec![StateId(2), StateId(1), StateId(2)],
+        vec![FieldId(2), FieldId(1), FieldId(2)],
+        vec![ListId(2), ListId(1), ListId(2)],
+        vec![PlanListIndexId(2), PlanListIndexId(1), PlanListIndexId(2)],
+        vec![high_effect, low_effect, high_effect],
+    );
+
+    assert_eq!(
+        ownership.static_owners,
+        vec![PlanStaticOwnerId(1), PlanStaticOwnerId(2)]
+    );
+    assert_eq!(ownership.sources, vec![SourceId(1), SourceId(2)]);
+    assert_eq!(ownership.states, vec![StateId(1), StateId(2)]);
+    assert_eq!(ownership.fields, vec![FieldId(1), FieldId(2)]);
+    assert_eq!(ownership.lists, vec![ListId(1), ListId(2)]);
+    assert_eq!(
+        ownership.indexes,
+        vec![PlanListIndexId(1), PlanListIndexId(2)]
+    );
+    assert_eq!(ownership.effects, vec![low_effect, high_effect]);
+}
+
+#[test]
+fn producer_function_instance_uses_signature_only_exports_and_canonical_argument_imports() {
+    let (_, graph, _) = distributed_graph_fixture();
+    let plan = session_producer_plan(&graph);
+    let instance = &plan.producer_function_instances[0];
+    let argument = &instance.arguments[0];
+
+    assert_eq!(
+        argument.import_id,
+        ImportId::from_producer_argument(instance.call_site_id, argument.argument_id).unwrap()
+    );
+    assert_eq!(argument.data_type, DataTypePlan::Number);
+    assert_eq!(instance.result_type, DataTypePlan::Number);
+
+    let verification = verify_plan(&plan).unwrap();
+    let check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "producer-function-instances-canonical-and-resolved")
+        .unwrap();
+    assert!(check.pass, "{}", check.detail);
+}
+
+#[test]
+fn producer_function_ownership_resolves_real_plan_resources_and_results() {
+    let (_, graph, _) = distributed_graph_fixture();
+    let plan = session_producer_plan_with_owned_resources(&graph);
+    let (pass, detail) = producer_function_check(&plan);
+    assert!(pass, "{detail}");
+
+    let mut missing_field_result = plan.clone();
+    missing_field_result.producer_function_instances[0]
+        .ownership
+        .fields
+        .clear();
+    let (pass, detail) = producer_function_check(&missing_field_result);
+    assert!(!pass);
+    assert!(detail.contains("field result"), "{detail}");
+
+    let mut list_result = plan;
+    let list_type = DataTypePlan::List {
+        item: Box::new(DataTypePlan::Number),
+    };
+    let instance = &mut list_result.producer_function_instances[0];
+    instance.result = ValueRef::List(ListId(0));
+    instance.result_type = list_type.clone();
+    let endpoint = list_result.distributed_endpoint.as_mut().unwrap();
+    endpoint.endpoint.function_exports[0].result_type = list_type.clone();
+    endpoint
+        .wire_schema
+        .call_edges
+        .iter_mut()
+        .find(|edge| edge.callee_role == ProgramRole::Session)
+        .unwrap()
+        .result_type = list_type;
+    let (pass, detail) = producer_function_check(&list_result);
+    assert!(pass, "{detail}");
+
+    list_result.producer_function_instances[0]
+        .ownership
+        .lists
+        .clear();
+    let (pass, detail) = producer_function_check(&list_result);
+    assert!(!pass);
+    assert!(detail.contains("list result"), "{detail}");
+}
+
+#[test]
+fn producer_function_ownership_rejects_noncanonical_and_missing_ids() {
+    let (_, graph, _) = distributed_graph_fixture();
+    let plan = session_producer_plan_with_owned_resources(&graph);
+
+    let mut noncanonical = plan.clone();
+    noncanonical.producer_function_instances[0].ownership.states = vec![StateId(0), StateId(0)];
+    let (pass, detail) = producer_function_check(&noncanonical);
+    assert!(!pass);
+    assert!(
+        detail.contains("unique and canonically ordered"),
+        "{detail}"
+    );
+
+    let mut wrong_first_owner = plan.clone();
+    wrong_first_owner.producer_function_instances[0]
+        .ownership
+        .static_owners = vec![PlanStaticOwnerId(1)];
+    let (pass, detail) = producer_function_check(&wrong_first_owner);
+    assert!(!pass);
+    assert!(
+        detail.contains("begin with the instance static owner"),
+        "{detail}"
+    );
+
+    let mut root_owner = plan.clone();
+    root_owner.producer_function_instances[0]
+        .ownership
+        .static_owners
+        .push(PlanStaticOwnerId::ROOT);
+    let (pass, detail) = producer_function_check(&root_owner);
+    assert!(!pass);
+    assert!(detail.contains("ROOT static owner"), "{detail}");
+
+    let assert_missing = |plan: &MachinePlan, expected: &str| {
+        let (pass, detail) = producer_function_check(plan);
+        assert!(!pass);
         assert!(
-            callee
-                .endpoint
-                .pure_function_exports
-                .iter()
-                .any(|function| {
-                    function.export_id == edge.function_export_id
-                        && function.parameters == edge.parameters
-                        && function.result_type == edge.result_type
-                })
+            detail.contains(expected),
+            "expected `{expected}` in `{detail}`"
+        );
+    };
+
+    let mut missing_owner = plan.clone();
+    missing_owner.producer_function_instances[0]
+        .ownership
+        .static_owners
+        .push(PlanStaticOwnerId(3));
+    assert_missing(&missing_owner, "missing static owner 3");
+
+    let mut missing_source = plan.clone();
+    missing_source.producer_function_instances[0]
+        .ownership
+        .sources
+        .push(SourceId(1));
+    assert_missing(&missing_source, "missing source 1");
+
+    let mut missing_state = plan.clone();
+    missing_state.producer_function_instances[0]
+        .ownership
+        .states
+        .push(StateId(1));
+    assert_missing(&missing_state, "missing state 1");
+
+    let mut missing_field = plan.clone();
+    missing_field.producer_function_instances[0]
+        .ownership
+        .fields
+        .push(FieldId(1));
+    assert_missing(&missing_field, "missing field 1");
+
+    let mut missing_list = plan.clone();
+    missing_list.producer_function_instances[0]
+        .ownership
+        .lists
+        .push(ListId(1));
+    assert_missing(&missing_list, "missing list 1");
+
+    let mut missing_index = plan.clone();
+    missing_index.producer_function_instances[0]
+        .ownership
+        .indexes
+        .push(PlanListIndexId(1));
+    assert_missing(&missing_index, "missing list index 1");
+
+    let mut missing_effect = plan;
+    missing_effect.producer_function_instances[0]
+        .ownership
+        .effects
+        .push(EffectInvocationId([255; 32]));
+    missing_effect.producer_function_instances[0]
+        .ownership
+        .effects
+        .sort();
+    assert_missing(&missing_effect, "missing effect invocation");
+}
+
+#[test]
+fn producer_function_ownership_is_disjoint_across_distinct_instances() {
+    let (_, graph, _) = distributed_graph_fixture();
+    for category in [
+        "static owner",
+        "source",
+        "state",
+        "field",
+        "list",
+        "list index",
+        "effect invocation",
+    ] {
+        let mut plan = session_producer_plan_with_owned_resources(&graph);
+        let mut second_ownership = ProducerFunctionOwnershipPlan::new(
+            vec![PlanStaticOwnerId(2)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        match category {
+            "static owner" => {
+                plan.producer_function_instances[0]
+                    .ownership
+                    .static_owners
+                    .push(PlanStaticOwnerId(2));
+            }
+            "source" => second_ownership.sources.push(SourceId(0)),
+            "state" => second_ownership.states.push(StateId(0)),
+            "field" => second_ownership.fields.push(FieldId(0)),
+            "list" => second_ownership.lists.push(ListId(0)),
+            "list index" => second_ownership.indexes.push(PlanListIndexId(0)),
+            "effect invocation" => {
+                second_ownership
+                    .effects
+                    .push(plan.producer_function_instances[0].ownership.effects[0]);
+            }
+            _ => unreachable!(),
+        }
+        add_second_session_producer_instance(&mut plan, second_ownership);
+
+        let (pass, detail) = producer_function_check(&plan);
+        assert!(!pass);
+        assert!(
+            detail.contains(&format!("overlap on {category}")),
+            "{category}: {detail}"
         );
     }
 }
 
 #[test]
-fn distributed_wire_hash_excludes_bodies_value_refs_and_source_ids() {
-    let (application, graph) = distributed_graph_fixture();
+fn producer_function_instance_validation_rejects_noncanonical_ownership_and_arguments() {
+    let (_, graph, _) = distributed_graph_fixture();
+    let endpoint = graph.endpoint_plan(ProgramRole::Session).unwrap();
+    let edge = endpoint
+        .wire_schema
+        .call_edges
+        .iter()
+        .find(|edge| edge.callee_role == ProgramRole::Session)
+        .unwrap();
+    let function = endpoint
+        .endpoint
+        .function_exports
+        .iter()
+        .find(|function| function.export_id == edge.function_export_id)
+        .unwrap();
+
+    assert!(
+        ProducerFunctionInstancePlan::new(
+            edge.call_site_id,
+            function,
+            PlanOwner::root(),
+            DistributedCallMode::Current,
+            None,
+            ProducerFunctionOwnershipPlan::new(
+                vec![PlanStaticOwnerId::ROOT],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            ValueRef::Constant(PlanConstantId(0)),
+        )
+        .is_err()
+    );
+    assert!(
+        ImportId::from_producer_argument(
+            RemoteCallSiteId([0; 32]),
+            function.parameters[0].argument_id,
+        )
+        .is_err()
+    );
+    assert!(
+        DistributedFunctionExportPlan::new(
+            endpoint.graph.graph_id,
+            endpoint.endpoint.endpoint_id,
+            distributed_declaration("session.function.open_result"),
+            1,
+            ProgramRole::Session,
+            Vec::new(),
+            DataTypePlan::Record {
+                fields: Vec::new(),
+                open: true,
+            },
+        )
+        .is_err()
+    );
+
+    let mut missing_instance = empty_plan();
+    missing_instance.program_role = ProgramRole::Session;
+    missing_instance.distributed_endpoint = Some(endpoint);
+    let verification = verify_plan(&missing_instance).unwrap();
+    let check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "producer-function-instances-canonical-and-resolved")
+        .unwrap();
+    assert!(!check.pass);
+    assert!(check.detail.contains("exactly cover"));
+
+    let mut missing_argument = session_producer_plan(&graph);
+    missing_argument.producer_function_instances[0]
+        .arguments
+        .clear();
+    let verification = verify_plan(&missing_argument).unwrap();
+    let check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "producer-function-instances-canonical-and-resolved")
+        .unwrap();
+    assert!(!check.pass);
+    assert!(check.detail.contains("exactly match"));
+
+    let mut wrong_import = session_producer_plan(&graph);
+    wrong_import.producer_function_instances[0].arguments[0].import_id = ImportId([7; 32]);
+    let (pass, detail) = producer_function_check(&wrong_import);
+    assert!(!pass);
+    assert!(
+        detail.contains("exactly match its function signature"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn producer_function_instance_validation_rejects_duplicate_calls_and_static_type_mismatch() {
+    let (_, graph, _) = distributed_graph_fixture();
+    let mut duplicate = session_producer_plan(&graph);
+    duplicate
+        .producer_function_instances
+        .push(duplicate.producer_function_instances[0].clone());
+    let verification = verify_plan(&duplicate).unwrap();
+    let check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "producer-function-instances-canonical-and-resolved")
+        .unwrap();
+    assert!(!check.pass);
+    assert!(check.detail.contains("unique canonically ordered"));
+
+    let mut wrong_type = session_producer_plan(&graph);
+    wrong_type.constants.push(PlanConstant {
+        id: PlanConstantId(0),
+        value: PlanConstantValue::Text {
+            value: "not a number".to_owned(),
+        },
+    });
+    wrong_type.producer_function_instances[0].result = ValueRef::Constant(PlanConstantId(0));
+    let verification = verify_plan(&wrong_type).unwrap();
+    let check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "producer-function-instances-canonical-and-resolved")
+        .unwrap();
+    assert!(!check.pass);
+    assert!(check.detail.contains("incompatible"));
+}
+
+#[test]
+fn distributed_wire_hash_excludes_local_value_refs_and_source_ids() {
+    let (application, graph, _) = distributed_graph_fixture();
     let mut changed_endpoints = graph.endpoints.clone();
     let server = changed_endpoints
         .iter_mut()
@@ -405,18 +1398,6 @@ fn distributed_wire_hash_excludes_bodies_value_refs_and_source_ids() {
         .find(|endpoint| endpoint.role == ProgramRole::Session)
         .unwrap();
     session.value_exports[0].value = ValueRef::State(StateId(73));
-    let function = &mut session.pure_function_exports[0];
-    let argument = || PlanRowExpression::Field {
-        input: ValueRef::DistributedFunctionArgument {
-            export_id: function.export_id,
-            argument_id: function.parameters[0].argument_id,
-        },
-    };
-    function.body = PlanRowExpression::NumberInfix {
-        op: "*".to_owned(),
-        left: Box::new(argument()),
-        right: Box::new(argument()),
-    };
     let changed =
         DistributedGraphPlan::new(&application, graph.graph.clone(), changed_endpoints).unwrap();
     assert_eq!(graph.wire_schema, changed.wire_schema);
@@ -456,7 +1437,7 @@ fn distributed_wire_hash_excludes_bodies_value_refs_and_source_ids() {
 
 #[test]
 fn distributed_wire_hash_changes_with_edge_and_boundary_type() {
-    let (application, graph) = distributed_graph_fixture();
+    let (application, graph, _) = distributed_graph_fixture();
     let with_event = distributed_graph_with_event(
         &application,
         &graph,
@@ -486,7 +1467,7 @@ fn distributed_wire_hash_changes_with_edge_and_boundary_type() {
 
 #[test]
 fn distributed_graph_rejects_direction_type_and_source_revision_mismatches() {
-    let (application, graph) = distributed_graph_fixture();
+    let (application, graph, _) = distributed_graph_fixture();
 
     let mut wrong_direction = graph.clone();
     wrong_direction.endpoints[0].value_imports[0].producer_role = ProgramRole::Client;
@@ -521,10 +1502,11 @@ fn distributed_graph_rejects_direction_type_and_source_revision_mismatches() {
 
 #[test]
 fn distributed_endpoint_verifier_rejects_a_machine_role_mismatch() {
-    let (_, graph) = distributed_graph_fixture();
+    let (_, graph, row_expressions) = distributed_graph_fixture();
     let mut plan = empty_plan();
     plan.program_role = ProgramRole::Server;
     plan.distributed_endpoint = graph.endpoint_plan(ProgramRole::Client);
+    plan.row_expressions = row_expressions;
 
     let verification = verify_plan(&plan).unwrap();
     let distributed_check = verification
@@ -539,12 +1521,13 @@ fn distributed_endpoint_verifier_rejects_a_machine_role_mismatch() {
 
 #[test]
 fn distributed_endpoint_verifier_rejects_an_unlinked_wire_hash() {
-    let (_, graph) = distributed_graph_fixture();
+    let (_, graph, row_expressions) = distributed_graph_fixture();
     let mut endpoint = graph.endpoint_plan(ProgramRole::Client).unwrap();
     endpoint.wire_schema_hash[0] ^= 0xff;
     let mut plan = empty_plan();
     plan.program_role = ProgramRole::Client;
     plan.distributed_endpoint = Some(endpoint);
+    plan.row_expressions = row_expressions;
 
     let verification = verify_plan(&plan).unwrap();
     let distributed_check = verification
@@ -559,14 +1542,17 @@ fn distributed_endpoint_verifier_rejects_an_unlinked_wire_hash() {
 
 #[test]
 fn distributed_endpoint_verifier_rejects_an_unresolved_call_argument_constant() {
-    let (_, graph) = distributed_graph_fixture();
+    let (_, graph, mut row_expressions) = distributed_graph_fixture();
     let mut endpoint = graph.endpoint_plan(ProgramRole::Client).unwrap();
-    endpoint.endpoint.remote_call_sites[0].arguments[0].value = PlanRowExpression::Constant {
-        constant_id: PlanConstantId(999),
-    };
+    let unresolved_constant = row_expressions
+        .interner()
+        .constant(PlanConstantId(999))
+        .unwrap();
+    endpoint.endpoint.remote_call_sites[0].arguments[0].value = unresolved_constant;
     let mut plan = empty_plan();
     plan.program_role = ProgramRole::Client;
     plan.distributed_endpoint = Some(endpoint);
+    plan.row_expressions = row_expressions;
 
     let verification = verify_plan(&plan).unwrap();
     let distributed_check = verification
@@ -578,20 +1564,38 @@ fn distributed_endpoint_verifier_rejects_an_unresolved_call_argument_constant() 
     assert!(
         distributed_check
             .detail
-            .contains("bounded pure expressions")
+            .contains("unsupported bounded expression"),
+        "unexpected distributed verifier detail: {}",
+        distributed_check.detail
     );
 }
 
 #[test]
-fn distributed_graph_rejects_a_remote_call_result_cycle() {
-    let (application, mut graph) = distributed_graph_fixture();
+fn distributed_endpoint_verifier_rejects_a_remote_call_result_cycle() {
+    let (_, mut graph, mut row_expressions) = distributed_graph_fixture();
     let client = &mut graph.endpoints[0];
-    let call_result = client.remote_call_sites[0].result_import_id;
-    client.remote_call_sites[0].arguments[0].value =
-        ValueRef::DistributedImport(call_result).into();
+    let call_result = client.remote_call_sites[0]
+        .result
+        .current_import_id()
+        .unwrap();
+    let cycle = row_expressions
+        .builder()
+        .value(ValueRef::DistributedImport(call_result))
+        .unwrap();
+    client.remote_call_sites[0].arguments[0].value = cycle;
 
-    let error = graph.validate(&application).unwrap_err();
-    assert!(error.to_string().contains("call-result cycles"));
+    let mut plan = empty_plan();
+    plan.program_role = ProgramRole::Client;
+    plan.distributed_endpoint = graph.endpoint_plan(ProgramRole::Client);
+    plan.row_expressions = row_expressions;
+    let verification = verify_plan(&plan).unwrap();
+    let distributed_check = verification
+        .checks
+        .iter()
+        .find(|check| check.id == "distributed-endpoint-canonical-and-resolved")
+        .unwrap();
+    assert!(!distributed_check.pass);
+    assert!(distributed_check.detail.contains("call-result cycles"));
 }
 
 #[test]
@@ -1127,6 +2131,68 @@ fn verifier_rejects_unresolved_outputs_and_unsafe_effects() {
 }
 
 #[test]
+fn event_row_requires_the_exact_source_owner_list() {
+    let mut plan = empty_plan();
+    let list_slot = |id: usize, scope: usize| ListStorageSlot {
+        id: PlanStorageId(id),
+        list_id: ListId(id),
+        scope_id: Some(ScopeId(scope)),
+        row_fields: Vec::new(),
+        capacity: None,
+        hidden_key_type: "u64".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Empty,
+        range: None,
+        initial_rows: Vec::new(),
+    };
+    plan.storage_layout.list_slots = vec![list_slot(0, 0), list_slot(1, 1)];
+    plan.source_routes.push(SourceRoute {
+        id: PlanSourceRouteId(0),
+        source_id: SourceId(0),
+        owner: PlanOwner {
+            static_owner: PlanStaticOwnerId(1),
+            ancestors: vec![PlanOwnerAncestor {
+                static_owner: PlanStaticOwnerId(0),
+                scope: ScopeId(0),
+                list: ListId(0),
+            }],
+        },
+        path: "rows.controls.select".to_owned(),
+        scoped: true,
+        scope_id: Some(ScopeId(0)),
+        interval_ms: None,
+        payload_schema: SourcePayloadSchema {
+            fields: Vec::new(),
+            typed_fields: Vec::new(),
+        },
+    });
+
+    let matching_event = plan
+        .row_expression_builder()
+        .intern(PlanRowExpressionNode::EventRow {
+            source: SourceId(0),
+            list_id: ListId(0),
+        })
+        .unwrap();
+    let wrong_list_event = plan
+        .row_expression_builder()
+        .intern(PlanRowExpressionNode::EventRow {
+            source: SourceId(0),
+            list_id: ListId(1),
+        })
+        .unwrap();
+
+    assert!(row_expression_list_fields_resolve_inner(
+        &plan,
+        matching_event,
+    ));
+    assert!(!row_expression_list_fields_resolve_inner(
+        &plan,
+        wrong_list_event,
+    ));
+}
+
+#[test]
 fn verifier_detects_schema_hash_corruption() {
     let mut plan = empty_plan();
     plan.persistence.schema_hash[0] ^= 0xff;
@@ -1303,4 +2369,13 @@ fn indexed_field_rename_within_one_list_memory_is_not_a_cycle() {
         .0[0] ^= 0xff;
     let error = MigrationRecipePlan::new(vec![corrupt_owner]).unwrap_err();
     assert!(error.to_string().contains("list-owner identity"), "{error}");
+}
+
+#[test]
+fn distributed_call_instance_identity_is_opaque_in_diagnostics() {
+    let identity = DistributedCallInstanceId([0xa5; 32]);
+
+    assert_eq!(format!("{identity:?}"), "DistributedCallInstanceId(..)");
+    assert_eq!(identity.to_string(), "DistributedCallInstanceId(..)");
+    assert!(!format!("{identity:?}").contains("a5"));
 }

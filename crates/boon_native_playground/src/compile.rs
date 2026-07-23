@@ -22,6 +22,7 @@ use crate::protocol::{MigrationBundle, PreviewIntent, PreviewSource, SourceUnit,
 
 #[derive(Clone)]
 pub struct CompileRequest {
+    pub job_id: u64,
     pub intent: PreviewIntent,
     pub request_id: Option<u64>,
     pub revision: u64,
@@ -37,6 +38,7 @@ pub enum CompiledExecutable {
 }
 
 pub struct CompiledPreview {
+    pub job_id: u64,
     pub intent: PreviewIntent,
     pub request_id: Option<u64>,
     pub revision: u64,
@@ -47,6 +49,7 @@ pub struct CompiledPreview {
 }
 
 pub struct CompileOutcome {
+    pub job_id: u64,
     pub revision: u64,
     pub result: Result<CompiledPreview, String>,
 }
@@ -295,10 +298,15 @@ fn compile_loop(
             }
             state.pending.take().expect("pending compile request")
         };
+        let job_id = request.job_id;
         let revision = request.revision;
         let result = compile(request);
         if output
-            .unbounded_send(CompileOutcome { revision, result })
+            .unbounded_send(CompileOutcome {
+                job_id,
+                revision,
+                result,
+            })
             .is_err()
         {
             return;
@@ -364,6 +372,7 @@ fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
         }
     };
     Ok(CompiledPreview {
+        job_id: request.job_id,
         intent: request.intent,
         request_id: request.request_id,
         revision: request.revision,
@@ -521,14 +530,18 @@ mod tests {
 
     #[test]
     fn mailbox_is_depth_one_and_latest_wins() {
-        let (worker, _results) = CompileWorker::start();
-        for revision in 1..=4 {
+        let worker = CompileWorker {
+            state: Arc::new((Mutex::new(State::default()), Condvar::new())),
+            thread: None,
+        };
+        for job_id in 1..=4 {
             worker.replace(CompileRequest {
+                job_id,
                 intent: PreviewIntent::Replace,
                 request_id: None,
-                revision,
+                revision: 7,
                 source: PreviewSource::BuiltInSingleRole {
-                    application: application(&format!("mailbox-{revision}")),
+                    application: application(&format!("mailbox-{job_id}")),
                     units: Vec::new(),
                 },
                 test_steps: Vec::new(),
@@ -536,7 +549,12 @@ mod tests {
                 migration_stage: None,
             });
         }
-        assert!(worker.replaced_count() >= 1);
+        assert_eq!(worker.replaced_count(), 3);
+        {
+            let state = worker.state.0.lock().unwrap();
+            assert_eq!(state.pending.as_ref().unwrap().job_id, 4);
+            assert_eq!(state.pending.as_ref().unwrap().revision, 7);
+        }
     }
 
     #[test]
@@ -684,6 +702,7 @@ mod tests {
             },
         ];
         let compiled = compile(CompileRequest {
+            job_id: 7,
             intent: PreviewIntent::Replace,
             request_id: None,
             revision: 7,
@@ -710,6 +729,7 @@ mod tests {
     fn compile_installs_the_host_application_identity_in_the_machine_plan() {
         let application = application("compile-propagation");
         let compiled = compile(CompileRequest {
+            job_id: 1,
             intent: PreviewIntent::Replace,
             request_id: None,
             revision: 1,

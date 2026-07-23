@@ -11,11 +11,12 @@ use boon_effect_schema::{
 use boon_host_runtime::{FileEffectAdapter, HostServiceEffectAdapter};
 use boon_http_runtime::OutboundHttpEffectAdapter;
 use boon_plan::{EffectId, ProgramRole};
+use boon_runtime::ExactCallHostCore;
 use boon_runtime::{
     ProgramArtifact, TransientEffectCallId, TransientEffectCreditGrant, TransientEffectInvocation,
 };
 use boon_server_runtime::{
-    ExactCallHostCore, TransientEffectHost, TransientEffectHostDelivery, TransientEffectHostError,
+    TransientEffectHost, TransientEffectHostDelivery, TransientEffectHostError,
     TransientEffectHostEvent,
 };
 use boon_wellen_host::WaveformEffectWorker;
@@ -745,7 +746,7 @@ mod tests {
             path: format!("artifacts/{}.boon", role.as_str()),
             revision: 1,
             content_artifact_id: "11".repeat(32),
-            content_media_type: "application/vnd.boon.machine-plan+cbor;version=1".to_owned(),
+            content_media_type: "application/vnd.boon.machine-plan+cbor;version=2".to_owned(),
             bytes_sha256: "11".repeat(32),
             bytes_len: 1,
             source_bundle_sha256: "11".repeat(32),

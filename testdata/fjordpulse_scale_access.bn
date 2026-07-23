@@ -1,0 +1,148 @@
+FUNCTION station_city(number) {
+    number >= 58400 |> WHILE {
+        True => TEXT { Bergen }
+        False => TEXT { Other }
+    }
+}
+
+FUNCTION station_tokens(number) {
+    number == 58499 |> WHILE {
+        True => LIST { TEXT { rail }, TEXT { oslo } }
+        False =>
+            number == 58498 |> WHILE {
+                True => LIST { TEXT { bus } }
+                False => LIST { TEXT { other } }
+            }
+    }
+}
+
+FUNCTION station_cells(number) {
+    number >= 58400 |> WHILE {
+        True => LIST { TEXT { bergen-core } }
+        False => LIST { TEXT { elsewhere } }
+    }
+}
+
+FUNCTION station(number) {
+    [
+        id: number
+        city: station_city(number: number)
+        name:
+            TEXT { station }
+            |> Text/concat(with: number, separator: "-")
+        tokens: station_tokens(number: number)
+        spatial_cells: station_cells(number: number)
+        latitude: number
+        longitude: 100000 - number
+    ]
+}
+
+store: [
+    page_after_input: SOURCE
+    page_after:
+        Start |> HOLD page_after {
+            page_after_input.value |> THEN { page_after_input.value }
+        }
+    stations:
+        List/range(from: 0, to: 58499)
+        |> List/map(item, new: station(number: item))
+    exact:
+        stations
+        |> List/filter(item, if: item.id == 58499)
+        |> List/take(count: 10)
+    compound_exact:
+        stations
+        |> List/filter(item, if:
+            Bool/and(
+                left: item.city == TEXT { Bergen }
+                right: item.id == 58499
+            )
+        )
+        |> List/take(count: 10)
+    prefix:
+        stations
+        |> List/filter(item, if:
+            item.name |> Text/starts_with(prefix: TEXT { station-584 })
+        )
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/take(count: 20)
+    compound_prefix:
+        stations
+        |> List/filter(item, if: item.city == TEXT { Bergen })
+        |> List/filter(item, if:
+            item.name |> Text/starts_with(prefix: TEXT { station-584 })
+        )
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/take(count: 20)
+    range:
+        stations
+        |> List/filter(item, if:
+            Bool/and(
+                left: item.id >= 58440
+                right: item.id < 58460
+            )
+        )
+        |> List/sort_by(item, key: item.id, direction: Ascending)
+        |> List/take(count: 20)
+    union:
+        stations
+        |> List/filter(item, if:
+            Bool/or(
+                left: item.id == 1
+                right: item.id == 58499
+            )
+        )
+        |> List/sort_by(item, key: item.id, direction: Ascending)
+        |> List/take(count: 10)
+    token_union:
+        stations
+        |> List/filter(item, if:
+            Bool/or(
+                left:
+                    item.tokens
+                    |> List/any(item, if: item == TEXT { rail })
+                right:
+                    item.tokens
+                    |> List/any(item, if: item == TEXT { bus })
+            )
+        )
+        |> List/sort_by(item, key: item.id, direction: Descending)
+        |> List/take(count: 10)
+    token_intersection:
+        stations
+        |> List/filter(item, if:
+            Bool/and(
+                left:
+                    item.tokens
+                    |> List/any(item, if: item == TEXT { rail })
+                right:
+                    item.tokens
+                    |> List/any(item, if: item == TEXT { oslo })
+            )
+        )
+        |> List/sort_by(item, key: item.id, direction: Ascending)
+        |> List/take(count: 10)
+    spatial:
+        stations
+        |> List/filter(item, if:
+            item.spatial_cells
+            |> List/any(item, if: item == TEXT { bergen-core })
+        )
+        |> List/filter(item, if:
+            Bool/and(
+                left: item.latitude >= 58490
+                right: item.latitude <= 58499
+            )
+        )
+        |> List/sort_by(item, key: item.id, direction: Ascending)
+        |> List/take(count: 20)
+    page:
+        stations
+        |> List/filter(item, if:
+            item.name |> Text/starts_with(prefix: TEXT { station-58 })
+        )
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/page(size: 20, after: page_after)
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))

@@ -7,7 +7,8 @@ use boon_host_runtime::{
 };
 use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, FiniteReal};
 use boon_runtime::{
-    ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectInvocation, Value,
+    ContentRefError, ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectInvocation,
+    Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -480,8 +481,8 @@ impl WaveformEffectAdapter {
 
     fn try_open(&mut self, intent: &Value) -> Result<Value, WaveformFailure> {
         let fields = exact_record(intent, &["content"], "Wellen/open intent")?;
-        let content =
-            ContentRef::from_value(required(fields, "content")?).map_err(content_failure)?;
+        let content = ContentRef::from_value(required(fields, "content")?)
+            .map_err(content_reference_failure)?;
         self.ensure_content_loaded(&content)?;
         let waveform = self
             .waveforms
@@ -1055,7 +1056,8 @@ fn decode_artifact(value: &Value) -> Result<Artifact, WaveformFailure> {
         "waveform artifact",
     )?;
     Ok(Artifact {
-        content: ContentRef::from_value(required(fields, "content")?).map_err(content_failure)?,
+        content: ContentRef::from_value(required(fields, "content")?)
+            .map_err(content_reference_failure)?,
         format: bounded_waveform_text(text_field(fields, "format")?, "artifact format")?,
         schema_version: bounded_waveform_text(
             text_field(fields, "schema_version")?,
@@ -1072,7 +1074,10 @@ fn artifact_value(artifact: &Artifact) -> Result<Value, WaveformFailure> {
     Ok(Value::Record(BTreeMap::from([
         (
             "content".to_owned(),
-            artifact.content.value().map_err(content_failure)?,
+            artifact
+                .content
+                .value()
+                .map_err(content_reference_failure)?,
         ),
         ("format".to_owned(), Value::Text(artifact.format.clone())),
         (
@@ -1338,6 +1343,10 @@ fn content_failure(error: ContentStoreError) -> WaveformFailure {
         ContentStoreErrorKind::Io => "content_io",
     };
     WaveformFailure::new(code, error.diagnostic())
+}
+
+fn content_reference_failure(error: ContentRefError) -> WaveformFailure {
+    WaveformFailure::new("invalid_content_ref", error.diagnostic())
 }
 
 fn wellen_failure(error: wellen::WellenError) -> WaveformFailure {

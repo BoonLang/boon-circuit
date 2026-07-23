@@ -52,9 +52,11 @@ Current checkpoint to preserve and verify rather than redo:
 - commit a12c9e1 contains a large partial CheckedProgram/OUT/typed-collection
   lowering checkpoint, but the OUT plan's ErasedProgram-only backend cutover,
   deletion audits, and clear end condition are not complete;
-- the typed-list replacement is specified but not implemented: reflective
-  query syntax, QueryCollectionState, boon_query, and boon_query_redb remain in
-  the current tree and must be replaced, not wrapped;
+- the current worktree has deleted the reflective query collection,
+  QueryCollectionState, boon_query, and boon_query_redb, and replaces them with
+  compiler-derived typed access over boon_list_access. Preserve that cutover;
+  finish its currentness, cross-target, restore, budget, deletion, and Clear End
+  Condition evidence instead of rebuilding either execution world;
 - native reports predating the OUT and source migrations are stale evidence and
   must not be refreshed until the architecture and source stabilize;
 - Cells previously met its interaction budgets, but the new generic collection
@@ -120,6 +122,21 @@ Phase 1: implement the OUT compiler and runtime cutover completely
   elaborate/unify OutNet, expand contextual functions, erase transparent
   wrappers/OUT/PASS, and produce the authoritative ErasedProgram before
   executable IDs and hashes.
+- Preserve the ErasedProgram expression DAG through MachinePlan instead of
+  unfolding it into recursively owned `PlanRowExpression` trees. Store one
+  canonical, compact, postorder expression arena with dense typed IDs; intern
+  structurally equal nodes without merging owner-sensitive contexts; make
+  serialization, hashing, typed-list fingerprints, compiler diagnostics, and
+  document runtime-expression references consume that arena. Delete recursive
+  expression ownership, deep-cloning compiler memos, mutable tree rewrites,
+  and ID-to-tree compatibility expansion.
+- Execute machine expressions and currentness through an explicit bounded work
+  stack rather than the Rust call stack. Preserve left-to-right and
+  short-circuit semantics, exact work charging, contextual binding cleanup,
+  ordered-index guards, page work-limit catches, cycle errors, and rollback to
+  Dirty after failed evaluation. Default-stack tests for deep acyclic
+  expressions and dependency chains must pass; increasing thread stack size is
+  not completion evidence.
 - Make machine, document, distributed, persistence, native host, and verifier
   backends consume only ErasedProgram. Delete ListMapBinding, parser row-scope
   heuristics, template rediscovery, backend positional binders, contextual

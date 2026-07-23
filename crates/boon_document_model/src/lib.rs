@@ -32,6 +32,149 @@ string_ids!(
     MapTileSourceId,
 );
 
+macro_rules! route_usize_ids {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+            #[serde(transparent)]
+            pub struct $name(pub usize);
+
+            impl $name {
+                pub const fn as_usize(self) -> usize {
+                    self.0
+                }
+            }
+        )+
+    };
+}
+
+route_usize_ids!(ListId, PlanStaticOwnerId, SourceId);
+
+impl PlanStaticOwnerId {
+    /// The structural owner for executable work outside every repeated scope.
+    pub const ROOT: Self = Self(usize::MAX);
+
+    pub const fn is_root(self) -> bool {
+        self.0 == Self::ROOT.0
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct OwnerInstanceRow {
+    pub list: ListId,
+    pub key: u64,
+    pub generation: u64,
+}
+
+impl Debug for OwnerInstanceRow {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnerInstanceRow(..)")
+    }
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct OwnerInstanceId {
+    pub static_owner: PlanStaticOwnerId,
+    pub ancestors: Vec<OwnerInstanceRow>,
+}
+
+impl Debug for OwnerInstanceId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnerInstanceId(..)")
+    }
+}
+
+impl OwnerInstanceId {
+    pub fn new(
+        static_owner: PlanStaticOwnerId,
+        ancestors: impl IntoIterator<Item = OwnerInstanceRow>,
+    ) -> Result<Self, &'static str> {
+        let ancestors = ancestors.into_iter().collect::<Vec<_>>();
+        let owner = Self {
+            static_owner,
+            ancestors,
+        };
+        owner.validate()?;
+        Ok(owner)
+    }
+
+    pub fn root() -> Self {
+        Self {
+            static_owner: PlanStaticOwnerId::ROOT,
+            ancestors: Vec::new(),
+        }
+    }
+
+    pub fn leaf(&self) -> Option<OwnerInstanceRow> {
+        self.ancestors.last().copied()
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.static_owner.is_root() && !self.ancestors.is_empty() {
+            return Err("root owner instance cannot have ancestor rows");
+        }
+        if self
+            .ancestors
+            .iter()
+            .any(|ancestor| ancestor.generation == 0)
+        {
+            return Err("owner instance row generations must be positive");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SourceRouteToken {
+    pub program_revision: u64,
+    pub owner: OwnerInstanceId,
+    pub source: SourceId,
+    /// Zero denotes a non-row route; a row route repeats its leaf generation.
+    pub row_generation: u64,
+    pub binding_epoch: u64,
+}
+
+impl Debug for SourceRouteToken {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SourceRouteToken(..)")
+    }
+}
+
+impl SourceRouteToken {
+    pub fn new(
+        program_revision: u64,
+        owner: OwnerInstanceId,
+        source: SourceId,
+        binding_epoch: u64,
+    ) -> Result<Self, &'static str> {
+        let row_generation = owner.leaf().map_or(0, |row| row.generation);
+        let route = Self {
+            program_revision,
+            owner,
+            source,
+            row_generation,
+            binding_epoch,
+        };
+        route.validate()?;
+        Ok(route)
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.program_revision == 0 {
+            return Err("source route program revision must be positive");
+        }
+        if self.binding_epoch == 0 {
+            return Err("source route binding epoch must be positive");
+        }
+        self.owner.validate()?;
+        let expected_generation = self.owner.leaf().map_or(0, |row| row.generation);
+        if self.row_generation != expected_generation {
+            return Err("source route row generation does not match its owner");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: f32,
@@ -428,6 +571,8 @@ pub struct SourceBinding {
     pub id: SourceBindingId,
     pub source_path: String,
     pub intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<SourceRouteToken>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

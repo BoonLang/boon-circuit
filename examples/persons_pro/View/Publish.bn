@@ -32,8 +32,8 @@ FUNCTION compiler() {
             source: PASSED.store.publish_candidate_source
             support_sources: Profile/support_sources()
             revision: PASSED.store.publish_request_sequence
-            capability_profile: PublicClient
             artifact_retention: Archive
+            capability_profile: PublicClient
             session_key: TEXT { persons-public-candidate }
             mount: False
         )

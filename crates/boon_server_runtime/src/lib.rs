@@ -11,7 +11,6 @@
 #![forbid(unsafe_code)]
 
 mod distributed_sessions;
-mod exact_call_host;
 mod in_process;
 
 pub use distributed_sessions::{
@@ -22,7 +21,6 @@ pub use distributed_sessions::{
     DistributedSessionRegistryIdentity, DistributedSessionRegistryPoll, PoisonedDistributedSession,
     PreparedDistributedSessionDeliveries,
 };
-pub use exact_call_host::ExactCallHostCore;
 pub use in_process::{
     DEFAULT_IN_PROCESS_POLL_STEPS, InProcessDistributedRuntime, InProcessDistributedRuntimeConfig,
     InProcessDistributedRuntimeError, InProcessFrameProgress, InProcessFrameTransferProgress,
@@ -44,17 +42,19 @@ use boon_plan::{
 use boon_runtime::{
     DistributedImportUpdate, DistributedProgramBundle, DistributedRuntimeError,
     DistributedServerMachine, DistributedServerRuntime, DistributedServerUpdate,
-    PersistentDispatchError, PersistentProgramSession, PersistentRuntimeStartupDisposition,
-    PreparedDistributedServerTransaction, PreparedDistributedServerUpdate, ProgramArtifact,
-    ProgramCapabilityProfile, ProgramSession, ProgramSessionDispatch, RuntimeTurn, SessionContext,
+    EffectHostCoreError, PersistentDispatchError, PersistentDistributedCommitOutcome,
+    PersistentProgramSession, PersistentRuntimeStartupDisposition,
+    PreparedDistributedServerTransaction, ProgramArtifact, ProgramCapabilityProfile,
+    ProgramSession, ProgramSessionDispatch, RuntimeTurn, SessionContext, SessionOrigin,
     SessionPrincipal, SourceEvent, SourcePayload, TransientEffectCallId, TransientEffectInvocation,
     Value,
 };
 use boon_server_host::{
     CallCancellation, CancellationReason, DistributedSessionAction,
     DistributedSessionConnectionId as HostDistributedSessionConnectionId, DistributedSessionEvent,
-    Header, HttpRequest, HttpResponse, PeerAddress, ServerProgram, WebSocketAction, WebSocketClose,
-    WebSocketEvent, WebSocketFrame, WebSocketOpen, WebSocketTransportError,
+    DistributedSessionOpen, Header, HttpRequest, HttpResponse, PeerAddress, ServerProgram,
+    WebSocketAction, WebSocketClose, WebSocketEvent, WebSocketFrame, WebSocketOpen,
+    WebSocketTransportError,
 };
 use boon_wire::{SessionControlFrame, decode_session_control_frame};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -78,6 +78,24 @@ const ACTION_FIELD_FRAME: u16 = 1 << 2;
 const ACTION_FIELD_ROOM: u16 = 1 << 3;
 const ACTION_FIELD_INCLUDE_CURRENT: u16 = 1 << 4;
 const ACTION_FIELD_CLOSE: u16 = 1 << 5;
+
+/// Host-owned authentication boundary for a distributed Session connection.
+///
+/// The resolver receives bounded transport metadata and returns only the safe
+/// principal projection made visible through `SessionInfo/principal()`. Raw
+/// credentials remain in the host and are never inserted into Boon state.
+pub trait DistributedSessionAuthenticator: Send {
+    fn authenticate(&mut self, open: &DistributedSessionOpen) -> Option<SessionPrincipal>;
+}
+
+#[derive(Default)]
+pub struct AnonymousDistributedSessionAuthenticator;
+
+impl DistributedSessionAuthenticator for AnonymousDistributedSessionAuthenticator {
+    fn authenticate(&mut self, _open: &DistributedSessionOpen) -> Option<SessionPrincipal> {
+        Some(SessionPrincipal::Anonymous)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransientEffectLimits {
@@ -154,6 +172,12 @@ impl Display for TransientEffectHostError {
 }
 
 impl Error for TransientEffectHostError {}
+
+impl From<EffectHostCoreError> for TransientEffectHostError {
+    fn from(error: EffectHostCoreError) -> Self {
+        Self::new(error)
+    }
+}
 
 #[async_trait]
 pub trait TransientEffectHost: Send + 'static {
@@ -416,7 +440,7 @@ enum ServerRuntimeSession {
     Persistent {
         session: Box<PersistentProgramSession>,
         distributed_durability: ServerTurnDurability,
-        distributed_acknowledgements: Vec<CommitAck>,
+        distributed_commit_outcomes: Vec<PersistentDistributedCommitOutcome>,
     },
 }
 
@@ -598,13 +622,13 @@ impl ServerRuntimeSession {
         }
     }
 
-    fn take_distributed_acknowledgements(&mut self) -> Vec<CommitAck> {
+    fn take_distributed_commit_outcomes(&mut self) -> Vec<PersistentDistributedCommitOutcome> {
         match self {
             Self::Ephemeral(_) => Vec::new(),
             Self::Persistent {
-                distributed_acknowledgements,
+                distributed_commit_outcomes,
                 ..
-            } => std::mem::take(distributed_acknowledgements),
+            } => std::mem::take(distributed_commit_outcomes),
         }
     }
 }
@@ -649,52 +673,14 @@ impl DistributedServerMachine for ServerRuntimeSession {
             Self::Ephemeral(session) => session.commit_prepared_evaluation(turn, evaluation),
             Self::Persistent {
                 session,
-                distributed_acknowledgements,
+                distributed_commit_outcomes,
                 ..
             } => {
-                let (turn, acknowledgement) = session
-                    .commit_prepared_distributed_server_evaluation(turn, evaluation, Vec::new())
+                let committed = session
+                    .commit_prepared_distributed_server_evaluation(turn, evaluation)
                     .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))?;
-                if let Some(acknowledgement) = acknowledgement {
-                    distributed_acknowledgements.push(acknowledgement);
-                }
-                Ok(turn)
-            }
-        }
-    }
-
-    fn commit_prepared_evaluation_with_protocol_state(
-        &mut self,
-        turn: RuntimeTurn,
-        evaluation: Self::EvaluationMachine,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
-        match self {
-            Self::Ephemeral(session) => {
-                if !protocol_state_changes.is_empty() {
-                    return Err(DistributedRuntimeError::Runtime(
-                        "ephemeral Server authority cannot persist protocol recovery state"
-                            .to_owned(),
-                    ));
-                }
-                session.commit_prepared_evaluation(turn, evaluation)
-            }
-            Self::Persistent {
-                session,
-                distributed_acknowledgements,
-                ..
-            } => {
-                let (turn, acknowledgement) = session
-                    .commit_prepared_distributed_server_evaluation(
-                        turn,
-                        evaluation,
-                        protocol_state_changes,
-                    )
-                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))?;
-                if let Some(acknowledgement) = acknowledgement {
-                    distributed_acknowledgements.push(acknowledgement);
-                }
-                Ok(turn)
+                distributed_commit_outcomes.push(committed.outcome);
+                Ok(committed.turn)
             }
         }
     }
@@ -718,6 +704,17 @@ impl DistributedServerMachine for ServerRuntimeSession {
         match self {
             Self::Ephemeral(session) => session.event_for_source(source, payload),
             Self::Persistent { session, .. } => session.event_for_source(source, payload),
+        }
+    }
+
+    fn event_for_route(
+        &self,
+        route: boon_plan::SourceRouteToken,
+        payload: SourcePayload,
+    ) -> Result<SourceEvent, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.event_for_route(route, payload),
+            Self::Persistent { session, .. } => session.event_for_route(route, payload),
         }
     }
 
@@ -767,24 +764,125 @@ impl DistributedServerMachine for ServerRuntimeSession {
         }
     }
 
-    fn call_arguments(
+    fn current_call_instances(
         &mut self,
-        call: &boon_plan::RemoteCallSitePlan,
-    ) -> Result<BTreeMap<boon_plan::DistributedArgumentId, Value>, DistributedRuntimeError> {
+        call_site_id: boon_plan::RemoteCallSiteId,
+    ) -> Result<Vec<boon_runtime::DistributedCurrentCallInstance>, DistributedRuntimeError> {
         match self {
-            Self::Ephemeral(session) => session.call_arguments(call),
-            Self::Persistent { session, .. } => session.call_arguments(call),
+            Self::Ephemeral(session) => {
+                DistributedServerMachine::current_call_instances(&mut **session, call_site_id)
+            }
+            Self::Persistent { session, .. } => {
+                DistributedServerMachine::current_call_instances(&mut **session, call_site_id)
+            }
         }
     }
 
-    fn evaluate_function(
+    fn producer_call_result_current(
         &mut self,
-        export_id: boon_plan::ExportId,
-        arguments: BTreeMap<boon_plan::DistributedArgumentId, Value>,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
     ) -> Result<Value, DistributedRuntimeError> {
         match self {
-            Self::Ephemeral(session) => session.evaluate_function(export_id, arguments),
-            Self::Persistent { session, .. } => session.evaluate_function(export_id, arguments),
+            Self::Ephemeral(session) => DistributedServerMachine::producer_call_result_current(
+                &mut **session,
+                call_site_id,
+                call_instance_id,
+            ),
+            Self::Persistent { session, .. } => {
+                DistributedServerMachine::producer_call_result_current(
+                    &mut **session,
+                    call_site_id,
+                    call_instance_id,
+                )
+            }
+        }
+    }
+
+    fn evaluate_function_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        export_id: boon_plan::ExportId,
+        demand_revision: u64,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, Value>,
+    ) -> Result<(Value, Option<RuntimeTurn>), DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => DistributedServerMachine::evaluate_function_instance(
+                &mut **session,
+                call_site_id,
+                call_instance_id,
+                export_id,
+                demand_revision,
+                arguments,
+            ),
+            Self::Persistent {
+                session,
+                distributed_durability,
+                ..
+            } => session
+                .prepare_distributed_function_instance(
+                    call_site_id,
+                    call_instance_id,
+                    export_id,
+                    demand_revision,
+                    arguments,
+                    *distributed_durability == ServerTurnDurability::Immediate,
+                )
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn update_current_call_result_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+        content_revision: u64,
+        value: Value,
+    ) -> Result<Option<RuntimeTurn>, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => {
+                DistributedServerMachine::update_current_call_result_instance(
+                    &mut **session,
+                    call_site_id,
+                    call_instance_id,
+                    content_revision,
+                    value,
+                )
+            }
+            Self::Persistent { session, .. } => session
+                .prepare_distributed_call_result_instance(
+                    call_site_id,
+                    call_instance_id,
+                    content_revision,
+                    value,
+                )
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
+        }
+    }
+
+    fn drop_producer_call_instance(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+        call_instance_id: boon_plan::DistributedCallInstanceId,
+    ) -> Result<Option<RuntimeTurn>, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => DistributedServerMachine::drop_producer_call_instance(
+                &mut **session,
+                call_site_id,
+                call_instance_id,
+            ),
+            Self::Persistent {
+                session,
+                distributed_durability,
+                ..
+            } => session
+                .prepare_drop_producer_call_instance(
+                    call_site_id,
+                    call_instance_id,
+                    *distributed_durability == ServerTurnDurability::Immediate,
+                )
+                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
         }
     }
 
@@ -938,67 +1036,16 @@ impl DistributedServerMachine for ServerRuntimeSession {
             Self::Ephemeral(session) => session.commit_prepared_turn(turn),
             Self::Persistent {
                 session,
-                distributed_acknowledgements,
+                distributed_commit_outcomes,
                 ..
             } => {
-                let (turn, acknowledgement) = session
+                let committed = session
                     .commit_prepared_distributed_turn(turn)
                     .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))?;
-                if let Some(acknowledgement) = acknowledgement {
-                    distributed_acknowledgements.push(acknowledgement);
-                }
-                Ok(turn)
+                distributed_commit_outcomes.push(committed.outcome);
+                Ok(committed.turn)
             }
         }
-    }
-
-    fn commit_prepared_turn_with_protocol_state(
-        &mut self,
-        turn: RuntimeTurn,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
-        match self {
-            Self::Ephemeral(session) => {
-                if !protocol_state_changes.is_empty() {
-                    return Err(DistributedRuntimeError::Runtime(
-                        "ephemeral Server authority cannot persist protocol recovery state"
-                            .to_owned(),
-                    ));
-                }
-                session.commit_prepared_turn(turn)
-            }
-            Self::Persistent {
-                session,
-                distributed_acknowledgements,
-                ..
-            } => {
-                let (turn, acknowledgement) = session
-                    .commit_prepared_distributed_turn_with_protocol_state(
-                        turn,
-                        protocol_state_changes,
-                    )
-                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))?;
-                if let Some(acknowledgement) = acknowledgement {
-                    distributed_acknowledgements.push(acknowledgement);
-                }
-                Ok(turn)
-            }
-        }
-    }
-
-    fn prepare_protocol_checkpoint(&mut self) -> Result<RuntimeTurn, DistributedRuntimeError> {
-        match self {
-            Self::Ephemeral(_) => Err(DistributedRuntimeError::Runtime(
-                "ephemeral Server authority cannot persist protocol recovery state".to_owned(),
-            )),
-            Self::Persistent { session, .. } => session
-                .prepare_protocol_checkpoint()
-                .map_err(|error| DistributedRuntimeError::Runtime(error.to_string())),
-        }
-    }
-
-    fn supports_protocol_state(&self) -> bool {
-        matches!(self, Self::Persistent { .. })
     }
 
     fn rollback_prepared_turn(&mut self) -> Result<(), DistributedRuntimeError> {
@@ -1021,6 +1068,30 @@ impl DistributedServerMachine for ServerRuntimeSession {
         match self {
             Self::Ephemeral(session) => session.set_transient_effect_scope(scope),
             Self::Persistent { session, .. } => session.set_transient_effect_scope(scope),
+        }
+    }
+
+    fn set_machine_origin(&mut self, origin: SessionOrigin) -> Result<(), DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.set_machine_origin(origin),
+            Self::Persistent { session, .. } => session.set_machine_origin(origin),
+        }
+    }
+
+    fn reset_machine_origin(&mut self) -> Result<(), DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.reset_machine_origin(),
+            Self::Persistent { session, .. } => session.reset_machine_origin(),
+        }
+    }
+
+    fn drop_producer_origin(
+        &mut self,
+        origin: SessionOrigin,
+    ) -> Result<Vec<TransientEffectCallId>, DistributedRuntimeError> {
+        match self {
+            Self::Ephemeral(session) => session.drop_producer_origin(origin),
+            Self::Persistent { session, .. } => session.drop_producer_origin(origin),
         }
     }
 
@@ -1151,12 +1222,11 @@ enum DistributedTransportSend {
 struct DistributedTransportConnection {
     phase: DistributedTransportPhase,
     pending_send: Option<DistributedTransportSend>,
+    principal: SessionPrincipal,
 }
 
 pub struct BoonServerProgram {
     authority: ServerAuthority,
-    restored_protocol_state: boon_persistence::ProtocolStateSnapshot,
-    restored_authority_turn_sequence: u64,
     distributed_sessions: Option<DistributedSessionRegistry>,
     distributed_clock_origin: Option<Instant>,
     distributed_wall_clock_origin: Option<Duration>,
@@ -1171,6 +1241,7 @@ pub struct BoonServerProgram {
     active_transient_effects: BTreeMap<TransientEffectCallId, ActiveTransientEffect>,
     transient_effect_budgets: BTreeMap<TransientRuntimeOwner, TransientEffectBudget>,
     pending_distributed_actions: VecDeque<DistributedSessionAction>,
+    distributed_session_authenticator: Box<dyn DistributedSessionAuthenticator>,
 }
 
 impl BoonServerProgram {
@@ -1186,8 +1257,6 @@ impl BoonServerProgram {
                 routing: None,
                 persistence: None,
             },
-            restored_protocol_state: boon_persistence::ProtocolStateSnapshot::default(),
-            restored_authority_turn_sequence: 0,
             distributed_sessions: None,
             distributed_clock_origin: None,
             distributed_wall_clock_origin: None,
@@ -1201,6 +1270,7 @@ impl BoonServerProgram {
             active_transient_effects: BTreeMap::new(),
             transient_effect_budgets: BTreeMap::new(),
             pending_distributed_actions: VecDeque::new(),
+            distributed_session_authenticator: Box::new(AnonymousDistributedSessionAuthenticator),
         })
     }
 
@@ -1243,7 +1313,7 @@ impl BoonServerProgram {
         let session = ServerRuntimeSession::Persistent {
             session: Box::new(session),
             distributed_durability: config.durability.distributed,
-            distributed_acknowledgements: Vec::new(),
+            distributed_commit_outcomes: Vec::new(),
         };
         let persistence = session
             .persistence_status()
@@ -1257,8 +1327,6 @@ impl BoonServerProgram {
         }
 
         let startup_disposition = startup.disposition.clone();
-        let restored_protocol_state = startup.protocol_state.clone();
-        let restored_authority_turn_sequence = startup.restore_image.through_turn_sequence;
         let restore_epoch = startup.restore_image.epoch;
         let lifecycle = ServerLifecycleHandle {
             status: Arc::new(Mutex::new(PersistentServerStatus {
@@ -1292,8 +1360,6 @@ impl BoonServerProgram {
                         shutdown_complete: false,
                     }),
                 },
-                restored_protocol_state,
-                restored_authority_turn_sequence,
                 distributed_sessions: None,
                 distributed_clock_origin: None,
                 distributed_wall_clock_origin: None,
@@ -1307,6 +1373,9 @@ impl BoonServerProgram {
                 active_transient_effects: BTreeMap::new(),
                 transient_effect_budgets: BTreeMap::new(),
                 pending_distributed_actions: VecDeque::new(),
+                distributed_session_authenticator: Box::new(
+                    AnonymousDistributedSessionAuthenticator,
+                ),
             },
             server_startup,
         ))
@@ -1373,59 +1442,24 @@ impl BoonServerProgram {
                 "system clock is before the Unix epoch",
             )
         })?;
-        let (mut sessions, router_recovery) = DistributedSessionRegistry::start_with_recovery(
-            bundle,
-            config,
-            &self.restored_protocol_state,
-            self.restored_authority_turn_sequence,
-            wall_clock_origin,
-        )
-        .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
-        let mut server = match router_recovery.as_deref() {
-            Some(payload) => DistributedServerRuntime::start_with_recovery(artifact, payload),
-            None => DistributedServerRuntime::start(artifact),
-        }
-        .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
-        sessions
-            .validate_router_recovery(&server)
+        let sessions = DistributedSessionRegistry::start(bundle, config)
             .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
-        if router_recovery.is_some() {
-            let prepared = sessions
-                .prepare_recovery_checkpoint(
-                    server
-                        .recovery_payload()
-                        .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error))?,
-                )
-                .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error))?;
-            {
-                let mut authority = server.bind(&mut self.authority.machine);
-                authority
-                    .commit_protocol_checkpoint(|turn_sequence| {
-                        prepared
-                            .changes(turn_sequence)
-                            .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-                    })
-                    .map_err(|error| AdapterError::new(AdapterErrorKind::Persistence, error))?;
-            }
-            sessions.commit_recovery_checkpoint(prepared);
-            let acknowledgements = self.authority.machine.take_distributed_acknowledgements();
-            if acknowledgements.len() != 1 {
-                return Err(AdapterError::new(
-                    AdapterErrorKind::Persistence,
-                    "restored distributed recovery checkpoint did not produce one durable acknowledgement",
-                ));
-            }
-            self.record_persistent_accept(acknowledgements.first())?;
-        }
+        let server = DistributedServerRuntime::start(artifact)
+            .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
         self.authority.routing = Some(server);
         self.distributed_sessions = Some(sessions);
         self.distributed_clock_origin = Some(clock_origin);
         self.distributed_wall_clock_origin = Some(wall_clock_origin);
-        self.restored_protocol_state = boon_persistence::ProtocolStateSnapshot::default();
-        self.restored_authority_turn_sequence = 0;
         self.distributed_transport_connections.clear();
         self.required_transient_effects = required_transient_effects;
         Ok(())
+    }
+
+    pub fn set_distributed_session_authenticator(
+        &mut self,
+        authenticator: Box<dyn DistributedSessionAuthenticator>,
+    ) {
+        self.distributed_session_authenticator = authenticator;
     }
 
     pub fn distributed_identity(&self) -> Option<DistributedSessionRegistryIdentity> {
@@ -1446,17 +1480,11 @@ impl BoonServerProgram {
         principal: SessionPrincipal,
         client_frame: &[u8],
     ) -> Result<DistributedSessionHandshakeStart, DistributedSessionRegistryError> {
-        let server = self
-            .authority
-            .routing
-            .as_mut()
-            .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
         let sessions = self
             .distributed_sessions
             .as_mut()
             .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
-        let mut authority = server.bind(&mut self.authority.machine);
-        sessions.begin_handshake(&mut authority, now, principal, client_frame)
+        sessions.begin_handshake(now, principal, client_frame)
     }
 
     pub fn commit_distributed_handshake(
@@ -1465,40 +1493,6 @@ impl BoonServerProgram {
         connection_id: DistributedSessionConnectionId,
         client_frame: &[u8],
     ) -> Result<Vec<u8>, DistributedSessionRegistryError> {
-        if self.authority.machine.supports_protocol_state() {
-            let mut sessions = self
-                .distributed_sessions
-                .as_ref()
-                .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
-                .fork_settled()?;
-            let mut server = self
-                .authority
-                .routing
-                .as_ref()
-                .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
-                .clone();
-            let turn = self.authority.machine.prepare_protocol_checkpoint()?;
-            let mut evaluation = match self.authority.machine.fork_prepared_evaluation(Some(&turn))
-            {
-                Ok(evaluation) => evaluation,
-                Err(error) => {
-                    let _ = self.authority.machine.rollback_prepared_turn();
-                    return Err(error.into());
-                }
-            };
-            let ready = match {
-                let mut authority = server.bind(&mut evaluation);
-                sessions.commit_handshake(&mut authority, now, connection_id, client_frame)
-            } {
-                Ok(ready) => ready,
-                Err(error) => {
-                    let _ = self.authority.machine.rollback_prepared_turn();
-                    return Err(error);
-                }
-            };
-            self.commit_distributed_recovery_candidate(sessions, server, evaluation, turn)?;
-            return Ok(ready);
-        }
         let server = self
             .authority
             .routing
@@ -1510,61 +1504,6 @@ impl BoonServerProgram {
             .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
         let mut authority = server.bind(&mut self.authority.machine);
         sessions.commit_handshake(&mut authority, now, connection_id, client_frame)
-    }
-
-    fn commit_distributed_recovery_candidate(
-        &mut self,
-        mut sessions: DistributedSessionRegistry,
-        server: DistributedServerRuntime,
-        evaluation: ProgramSession,
-        turn: RuntimeTurn,
-    ) -> Result<(), DistributedSessionRegistryError> {
-        let prepared = match server
-            .recovery_payload()
-            .map_err(DistributedSessionRegistryError::from)
-            .and_then(|payload| sessions.prepare_recovery_checkpoint(payload))
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = self.authority.machine.rollback_prepared_turn();
-                return Err(error);
-            }
-        };
-        let changes = match prepared.changes(turn.sequence) {
-            Ok(changes) => changes,
-            Err(error) => {
-                let _ = self.authority.machine.rollback_prepared_turn();
-                return Err(error);
-            }
-        };
-        if let Err(error) = self
-            .authority
-            .machine
-            .commit_prepared_evaluation_with_protocol_state(turn, evaluation, changes)
-        {
-            let _ = self.authority.machine.rollback_prepared_turn();
-            return Err(error.into());
-        }
-        sessions.commit_recovery_checkpoint(prepared);
-        self.authority.routing = Some(server);
-        self.distributed_sessions = Some(sessions);
-
-        let acknowledgements = self.authority.machine.take_distributed_acknowledgements();
-        if acknowledgements.len() != 1 {
-            return Err(DistributedSessionRegistryError::Runtime(
-                DistributedRuntimeError::Runtime(
-                    "distributed recovery transaction did not produce one durable acknowledgement"
-                        .to_owned(),
-                ),
-            ));
-        }
-        self.record_persistent_accept(acknowledgements.first())
-            .map_err(|error| {
-                DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
-                    error.to_string(),
-                ))
-            })?;
-        Ok(())
     }
 
     pub fn disconnect_distributed_session(
@@ -1613,40 +1552,63 @@ impl BoonServerProgram {
         &mut self,
         result: Result<T, DistributedSessionRegistryError>,
     ) -> Result<T, DistributedSessionRegistryError> {
-        let durable_admissions = self
+        let (session_turns, server_turns) = self
             .distributed_sessions
             .as_mut()
             .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?
-            .take_direct_lifecycle_durable_admissions()?;
-        let acknowledgements = self.authority.machine.take_distributed_acknowledgements();
-        let acknowledgement_result = if acknowledgements.len() > durable_admissions {
+            .take_direct_lifecycle_turns();
+        let mut routing_failures = 0usize;
+        let mut first_routing_failure = None;
+        for (origin, turn) in session_turns {
+            if let Err(error) = self.route_transient_runtime_turn(
+                &turn,
+                TransientRuntimeOwner::DistributedSession(origin),
+            ) {
+                routing_failures += 1;
+                first_routing_failure.get_or_insert_with(|| error.to_string());
+            }
+        }
+        for (origin, turn) in server_turns {
+            if let Err(error) = self.route_transient_runtime_turn(
+                &turn,
+                TransientRuntimeOwner::DistributedServer(origin),
+            ) {
+                routing_failures += 1;
+                first_routing_failure.get_or_insert_with(|| error.to_string());
+            }
+        }
+        let routing_result = first_routing_failure.map_or(Ok(()), |first| {
             Err(DistributedSessionRegistryError::Runtime(
-                DistributedRuntimeError::Runtime(
-                    "distributed lifecycle acknowledgements exceed durable admissions".to_owned(),
-                ),
+                DistributedRuntimeError::Runtime(format!(
+                    "distributed lifecycle failed to route {routing_failures} transient-effect turn(s); first failure: {first}"
+                )),
             ))
-        } else {
-            let mut acknowledgements = acknowledgements.iter();
-            (0..durable_admissions).try_for_each(|_| {
-                self.record_persistent_accept(acknowledgements.next())
-                    .map_err(|error| {
-                        DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
-                            error.to_string(),
-                        ))
-                    })
-            })
+        });
+        let acknowledgement_result = self
+            .record_distributed_commit_outcomes(None, "distributed lifecycle")
+            .map_err(|error| {
+                DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
+                    error.to_string(),
+                ))
+            });
+        let completion_result = match (routing_result, acknowledgement_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(routing), Err(acknowledgement)) => Err(DistributedSessionRegistryError::Runtime(
+                DistributedRuntimeError::Runtime(format!(
+                    "distributed lifecycle routing failed: {routing}; acknowledgement accounting failed: {acknowledgement}"
+                )),
+            )),
         };
-        match (result, acknowledgement_result) {
+        match (result, completion_result) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), Ok(())) => Err(error),
             (Ok(_), Err(error)) => Err(error),
-            (Err(operation), Err(acknowledgement)) => {
-                Err(DistributedSessionRegistryError::Runtime(
-                    DistributedRuntimeError::Runtime(format!(
-                        "distributed lifecycle failed: {operation}; acknowledgement accounting failed: {acknowledgement}"
-                    )),
-                ))
-            }
+            (Err(operation), Err(completion)) => Err(DistributedSessionRegistryError::Runtime(
+                DistributedRuntimeError::Runtime(format!(
+                    "distributed lifecycle failed: {operation}; completion failed: {completion}"
+                )),
+            )),
         }
     }
 
@@ -1699,36 +1661,12 @@ impl BoonServerProgram {
             let mut authority = server.bind(&mut self.authority.machine);
             sessions.poll(&mut authority, now, maximum_steps)?
         };
-        let mutation_count = poll
-            .server_turns
-            .iter()
-            .filter(|(_, turn)| turn.source_sequence.is_some())
-            .count();
-        let durable_admission_count = mutation_count
-            .checked_add(poll.durable_protocol_checkpoints)
-            .ok_or_else(|| {
+        self.record_distributed_commit_outcomes(None, "distributed poll")
+            .map_err(|error| {
                 DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
-                    "distributed durability acknowledgement count overflowed".to_owned(),
+                    error.to_string(),
                 ))
             })?;
-        let acknowledgements = self.authority.machine.take_distributed_acknowledgements();
-        if acknowledgements.len() > durable_admission_count {
-            return Err(DistributedSessionRegistryError::Runtime(
-                DistributedRuntimeError::Runtime(
-                    "distributed persistence acknowledgements exceed admitted Server turns"
-                        .to_owned(),
-                ),
-            ));
-        }
-        let mut acknowledgements = acknowledgements.into_iter();
-        for _ in 0..durable_admission_count {
-            self.record_persistent_accept(acknowledgements.next().as_ref())
-                .map_err(|error| {
-                    DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
-                        error.to_string(),
-                    ))
-                })?;
-        }
         Ok(poll)
     }
 
@@ -1954,7 +1892,7 @@ impl BoonServerProgram {
         event: DistributedSessionEvent,
     ) -> Vec<DistributedSessionAction> {
         match event {
-            DistributedSessionEvent::Open(_) => {
+            DistributedSessionEvent::Open(open) => {
                 if self
                     .distributed_transport_connections
                     .contains_key(&connection)
@@ -1964,11 +1902,25 @@ impl BoonServerProgram {
                         WebSocketClose::new(1002, "duplicate distributed Session connection"),
                     )];
                 }
+                let Some(principal) = self.distributed_session_authenticator.authenticate(&open)
+                else {
+                    return vec![DistributedSessionAction::close(
+                        connection,
+                        WebSocketClose::new(1008, "distributed Session authentication failed"),
+                    )];
+                };
+                if principal.validate().is_err() {
+                    return vec![DistributedSessionAction::close(
+                        connection,
+                        WebSocketClose::new(1008, "distributed Session authentication failed"),
+                    )];
+                }
                 self.distributed_transport_connections.insert(
                     connection,
                     DistributedTransportConnection {
                         phase: DistributedTransportPhase::AwaitingHello,
                         pending_send: None,
+                        principal,
                     },
                 );
                 Vec::new()
@@ -1999,10 +1951,10 @@ impl BoonServerProgram {
                         )];
                     }
                 };
-                let Some(phase) = self
+                let Some((phase, principal)) = self
                     .distributed_transport_connections
                     .get(&connection)
-                    .map(|state| state.phase)
+                    .map(|state| (state.phase, state.principal.clone()))
                 else {
                     return vec![DistributedSessionAction::close(
                         connection,
@@ -2011,11 +1963,7 @@ impl BoonServerProgram {
                 };
                 match phase {
                     DistributedTransportPhase::AwaitingHello => {
-                        match self.begin_distributed_handshake(
-                            now,
-                            SessionPrincipal::Anonymous,
-                            &bytes,
-                        ) {
+                        match self.begin_distributed_handshake(now, principal, &bytes) {
                             Ok(DistributedSessionHandshakeStart::Offer(offer)) => {
                                 let (registry_connection, server_frame) = offer.into_parts();
                                 self.distributed_transport_connections
@@ -2239,123 +2187,6 @@ impl BoonServerProgram {
         }
     }
 
-    fn commit_prepared_distributed_update(
-        &mut self,
-        prepared: PreparedDistributedServerUpdate,
-    ) -> Result<DistributedServerUpdate, AdapterError> {
-        let prepares_machine_turn = prepared.prepares_machine_turn();
-        let prepared_deliveries = match self
-            .distributed_sessions
-            .as_ref()
-            .ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorKind::Runtime,
-                    "distributed Server routing has no Session registry",
-                )
-            })?
-            .prepare_deliveries(prepared.deliveries())
-        {
-            Ok(prepared_deliveries) => prepared_deliveries,
-            Err(error) => {
-                let rollback = self
-                    .authority
-                    .routing
-                    .as_mut()
-                    .expect("distributed preparation requires routing")
-                    .bind(&mut self.authority.machine)
-                    .rollback_prepared_update(prepared);
-                return match rollback {
-                    Ok(()) => Err(distributed_registry_adapter_error(error)),
-                    Err(rollback) => Err(AdapterError::new(
-                        AdapterErrorKind::Runtime,
-                        format_args!(
-                            "distributed delivery reservation failed: {error}; rollback failed: {rollback}"
-                        ),
-                    )),
-                };
-            }
-        };
-        let prepared_recovery = if self.authority.machine.supports_protocol_state() {
-            let router_payload = match prepared.candidate_recovery_payload() {
-                Ok(payload) => payload,
-                Err(error) => {
-                    self.authority
-                        .routing
-                        .as_mut()
-                        .expect("distributed preparation requires routing")
-                        .bind(&mut self.authority.machine)
-                        .rollback_prepared_update(prepared)
-                        .map_err(distributed_runtime_adapter_error)?;
-                    return Err(distributed_runtime_adapter_error(error));
-                }
-            };
-            match self
-                .distributed_sessions
-                .as_ref()
-                .expect("distributed preparation requires a Session registry")
-                .prepare_recovery_checkpoint_with_deliveries(router_payload, &prepared_deliveries)
-            {
-                Ok(checkpoint) => Some(checkpoint),
-                Err(error) => {
-                    self.authority
-                        .routing
-                        .as_mut()
-                        .expect("distributed preparation requires routing")
-                        .bind(&mut self.authority.machine)
-                        .rollback_prepared_update(prepared)
-                        .map_err(distributed_runtime_adapter_error)?;
-                    return Err(distributed_registry_adapter_error(error));
-                }
-            }
-        } else {
-            None
-        };
-        let update = {
-            let mut authority = self
-                .authority
-                .routing
-                .as_mut()
-                .expect("distributed preparation requires routing")
-                .bind(&mut self.authority.machine);
-            match prepared_recovery.as_ref() {
-                Some(recovery) => authority.commit_prepared_update_with_protocol_state(
-                    prepared,
-                    |turn_sequence| {
-                        recovery
-                            .changes(turn_sequence)
-                            .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-                    },
-                ),
-                None => authority.commit_prepared_update(prepared),
-            }
-            .map_err(distributed_runtime_adapter_error)?
-        };
-        self.distributed_sessions
-            .as_mut()
-            .expect("distributed preparation requires a Session registry")
-            .commit_deliveries(prepared_deliveries);
-        if let Some(recovery) = prepared_recovery {
-            self.distributed_sessions
-                .as_mut()
-                .expect("distributed preparation requires a Session registry")
-                .commit_recovery_checkpoint(recovery);
-        }
-
-        let mut acknowledgements = self.authority.machine.take_distributed_acknowledgements();
-        let durable_admission =
-            prepares_machine_turn || self.authority.machine.supports_protocol_state();
-        if acknowledgements.len() > usize::from(durable_admission) {
-            return Err(AdapterError::new(
-                AdapterErrorKind::Persistence,
-                "distributed persistence acknowledgements exceeded the committed machine turn",
-            ));
-        }
-        if durable_admission {
-            self.record_persistent_accept(acknowledgements.pop().as_ref())?;
-        }
-        Ok(update)
-    }
-
     fn commit_prepared_distributed_transaction(
         &mut self,
         prepared: PreparedDistributedServerTransaction<ProgramSession>,
@@ -2392,41 +2223,6 @@ impl BoonServerProgram {
                 };
             }
         };
-        let prepared_recovery = if self.authority.machine.supports_protocol_state() {
-            let router_payload = match prepared.candidate_recovery_payload() {
-                Ok(payload) => payload,
-                Err(error) => {
-                    self.authority
-                        .routing
-                        .as_mut()
-                        .expect("distributed transaction requires routing")
-                        .bind(&mut self.authority.machine)
-                        .rollback_prepared_transaction(prepared)
-                        .map_err(distributed_runtime_adapter_error)?;
-                    return Err(distributed_runtime_adapter_error(error));
-                }
-            };
-            match self
-                .distributed_sessions
-                .as_ref()
-                .expect("distributed transaction requires a Session registry")
-                .prepare_recovery_checkpoint_with_deliveries(router_payload, &prepared_deliveries)
-            {
-                Ok(checkpoint) => Some(checkpoint),
-                Err(error) => {
-                    self.authority
-                        .routing
-                        .as_mut()
-                        .expect("distributed transaction requires routing")
-                        .bind(&mut self.authority.machine)
-                        .rollback_prepared_transaction(prepared)
-                        .map_err(distributed_runtime_adapter_error)?;
-                    return Err(distributed_registry_adapter_error(error));
-                }
-            }
-        } else {
-            None
-        };
         let update = {
             let mut authority = self
                 .authority
@@ -2434,42 +2230,18 @@ impl BoonServerProgram {
                 .as_mut()
                 .expect("distributed transaction requires routing")
                 .bind(&mut self.authority.machine);
-            match prepared_recovery.as_ref() {
-                Some(recovery) => authority.commit_prepared_transaction_with_protocol_state(
-                    prepared,
-                    |turn_sequence| {
-                        recovery
-                            .changes(turn_sequence)
-                            .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-                    },
-                ),
-                None => authority.commit_prepared_transaction(prepared),
-            }
-            .map_err(distributed_runtime_adapter_error)?
+            authority
+                .commit_prepared_transaction(prepared)
+                .map_err(distributed_runtime_adapter_error)?
         };
         self.distributed_sessions
             .as_mut()
             .expect("distributed transaction requires a Session registry")
             .commit_deliveries(prepared_deliveries);
-        if let Some(recovery) = prepared_recovery {
-            self.distributed_sessions
-                .as_mut()
-                .expect("distributed transaction requires a Session registry")
-                .commit_recovery_checkpoint(recovery);
-        }
-
-        let mut acknowledgements = self.authority.machine.take_distributed_acknowledgements();
-        let durable_admission =
-            prepares_machine_turn || self.authority.machine.supports_protocol_state();
-        if acknowledgements.len() > usize::from(durable_admission) {
-            return Err(AdapterError::new(
-                AdapterErrorKind::Persistence,
-                "distributed persistence acknowledgements exceeded the committed machine turn",
-            ));
-        }
-        if durable_admission {
-            self.record_persistent_accept(acknowledgements.pop().as_ref())?;
-        }
+        self.record_distributed_commit_outcomes(
+            Some(usize::from(prepares_machine_turn)),
+            "distributed transaction",
+        )?;
         Ok(update)
     }
 
@@ -2479,9 +2251,9 @@ impl BoonServerProgram {
         };
         let prepared = routing
             .bind(&mut self.authority.machine)
-            .prepare_global_read_update()
+            .prepare_global_read_transaction()
             .map_err(distributed_runtime_adapter_error)?;
-        self.commit_prepared_distributed_update(prepared)?;
+        self.commit_prepared_distributed_transaction(prepared)?;
         Ok(())
     }
 
@@ -3050,21 +2822,14 @@ impl BoonServerProgram {
         call_id: TransientEffectCallId,
         outcome: Value,
     ) -> Result<bool, AdapterError> {
-        let routing = self.authority.routing.as_mut().ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::Runtime,
-                "distributed Session effect completion has no Server router",
-            )
-        })?;
         let sessions = self.distributed_sessions.as_mut().ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::Runtime,
                 "distributed Session effect completion has no Session registry",
             )
         })?;
-        let mut authority = routing.bind(&mut self.authority.machine);
         sessions
-            .complete_session_transient_effect(&mut authority, origin, call_id, outcome)
+            .complete_session_transient_effect(origin, call_id, outcome)
             .map_err(distributed_registry_adapter_error)
     }
 
@@ -3075,27 +2840,14 @@ impl BoonServerProgram {
         result_sequence: u64,
         outcome: Value,
     ) -> Result<bool, AdapterError> {
-        let routing = self.authority.routing.as_mut().ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::Runtime,
-                "distributed Session stream completion has no Server router",
-            )
-        })?;
         let sessions = self.distributed_sessions.as_mut().ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::Runtime,
                 "distributed Session stream completion has no Session registry",
             )
         })?;
-        let mut authority = routing.bind(&mut self.authority.machine);
         sessions
-            .deliver_session_transient_effect_result(
-                &mut authority,
-                origin,
-                call_id,
-                result_sequence,
-                outcome,
-            )
+            .deliver_session_transient_effect_result(origin, call_id, result_sequence, outcome)
             .map_err(distributed_registry_adapter_error)
     }
 
@@ -3104,21 +2856,14 @@ impl BoonServerProgram {
         origin: boon_runtime::SessionOrigin,
         call_id: TransientEffectCallId,
     ) -> Result<(), AdapterError> {
-        let routing = self.authority.routing.as_mut().ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::Runtime,
-                "distributed Session effect cancellation has no Server router",
-            )
-        })?;
         let sessions = self.distributed_sessions.as_mut().ok_or_else(|| {
             AdapterError::new(
                 AdapterErrorKind::Runtime,
                 "distributed Session effect cancellation has no Session registry",
             )
         })?;
-        let mut authority = routing.bind(&mut self.authority.machine);
         sessions
-            .cancel_session_transient_effect(&mut authority, origin, call_id)
+            .cancel_session_transient_effect(origin, call_id)
             .map_err(distributed_registry_adapter_error)
     }
 
@@ -3222,6 +2967,42 @@ impl BoonServerProgram {
             }
         }
         self.take_pending_distributed_actions()
+    }
+
+    fn record_distributed_commit_outcomes(
+        &mut self,
+        expected_machine_commits: Option<usize>,
+        context: &str,
+    ) -> Result<(), AdapterError> {
+        let outcomes = self.authority.machine.take_distributed_commit_outcomes();
+        if let Some(machine_commits) = expected_machine_commits {
+            let expected = if self.authority.persistence.is_some() {
+                machine_commits
+            } else {
+                0
+            };
+            if outcomes.len() != expected {
+                return Err(AdapterError::new(
+                    AdapterErrorKind::Persistence,
+                    format_args!(
+                        "{context} committed {machine_commits} authority-machine turns but recorded {} persistent outcomes; expected {expected}",
+                        outcomes.len()
+                    ),
+                ));
+            }
+        }
+        for outcome in outcomes {
+            match outcome {
+                PersistentDistributedCommitOutcome::ExecutionOnly => {}
+                PersistentDistributedCommitOutcome::BufferedAccepted => {
+                    self.record_persistent_accept(None)?;
+                }
+                PersistentDistributedCommitOutcome::ImmediateAcknowledged(acknowledgement) => {
+                    self.record_persistent_accept(Some(&acknowledgement))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn record_persistent_accept(
@@ -5322,6 +5103,38 @@ store: [
 ]
 "#;
 
+    const CLIENT_CURRENT_CALL: &str = r#"
+store: [
+    increment: SOURCE
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+    session_value: Session/store.session_value
+]
+
+scene: Scene/Element/text(
+    element: [events: [press: store.increment]]
+    style: [width: Fill]
+    text: TEXT { Current call }
+)
+"#;
+
+    const SESSION_CURRENT_CALL: &str = r#"
+store: [
+    client_count: Client/store.count
+    session_value: Server/double(value: 21)
+]
+"#;
+
+    const SERVER_CURRENT_CALL: &str = r#"
+store: [ready: True]
+
+FUNCTION double(value) {
+    value * 2
+}
+"#;
+
     #[derive(Default)]
     struct RandomHostState {
         submitted: Vec<TransientEffectCallId>,
@@ -5528,7 +5341,78 @@ store: [
     }
 
     #[tokio::test]
-    async fn distributed_effect_completions_are_durably_acknowledged_per_owner() {
+    async fn disconnect_routes_exact_effect_cancellations_to_the_production_host() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT),
+            request(ProgramRole::Session, SESSION_WITH_EFFECT),
+            request(ProgramRole::Server, SERVER),
+        ])
+        .unwrap();
+        let mut program = BoonServerProgram::new_distributed(
+            &bundle,
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let host_state = Arc::new(Mutex::new(RandomHostState::default()));
+        program
+            .attach_transient_effect_host(
+                Box::new(ScriptedRandomHost::new(Arc::clone(&host_state))),
+                TransientEffectLimits::default(),
+            )
+            .unwrap();
+        let (connection, session_id, generation, applied_client_through) =
+            connect_and_limit_delivery_queue(&mut program);
+        program
+            .distributed_sessions
+            .as_mut()
+            .unwrap()
+            .set_session_queue_limits_for_test(DistributedQueueLimits::default());
+
+        let mut client = DistributedClientRuntime::start(
+            bundle.artifact(ProgramRole::Client).unwrap(),
+            DistributedQueueLimits::default(),
+        )
+        .unwrap();
+        client
+            .bind(session_id, generation, applied_client_through)
+            .unwrap();
+        client.mark_current().unwrap();
+        client
+            .dispatch("store.increment", SourcePayload::default())
+            .unwrap();
+        let frame = client.next_session_frame().unwrap().unwrap();
+        program
+            .admit_distributed_client_frame(connection, &frame)
+            .unwrap();
+        assert!(client.acknowledge_session_frame());
+        assert!(
+            program
+                .poll_distributed_transport(Duration::ZERO)
+                .is_empty()
+        );
+        assert_eq!(program.active_transient_effects.len(), 2);
+
+        program
+            .disconnect_distributed_session(Duration::ZERO, connection)
+            .unwrap();
+
+        assert!(program.active_transient_effects.is_empty());
+        assert!(program.transient_effect_budgets.is_empty());
+        assert!(!program.has_pending_internal_work());
+        assert!(program.on_internal_work().await.is_empty());
+        let host_state = host_state.lock().unwrap();
+        assert_eq!(host_state.submitted.len(), 2);
+        assert_eq!(host_state.cancelled.len(), 2);
+        assert!(
+            host_state
+                .submitted
+                .iter()
+                .all(|call_id| host_state.cancelled.contains(call_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_server_owned_distributed_effect_completion_is_durably_acknowledged() {
         let bundle = compile_distributed_program_bundle(&[
             request(ProgramRole::Client, CLIENT),
             request(ProgramRole::Session, SESSION_WITH_EFFECT),
@@ -5585,8 +5469,11 @@ store: [
         let after = startup.lifecycle.status();
         let accepted = after.accepted_turns - before.accepted_turns;
         let acknowledged = after.durably_acknowledged_turns - before.durably_acknowledged_turns;
-        assert!(accepted >= 2);
-        assert_eq!(acknowledged, accepted);
+        assert_eq!(
+            accepted, 1,
+            "the resumable Session island is process-local; only the Server-owned completion is durable"
+        );
+        assert_eq!(acknowledged, 1);
         assert!(program.active_transient_effects.is_empty());
         program.shutdown_persistent().unwrap();
     }
@@ -5724,6 +5611,42 @@ store: [
             after_release.durably_acknowledged_turns + 1
         );
         assert_eq!(global_count(&mut program), Value::integer(2).unwrap());
+        program.shutdown_persistent().unwrap();
+    }
+
+    #[test]
+    fn persistent_current_call_publishes_without_a_durable_admission() {
+        let bundle = compile_distributed_program_bundle(&[
+            request(ProgramRole::Client, CLIENT_CURRENT_CALL),
+            request(ProgramRole::Session, SESSION_CURRENT_CALL),
+            request(ProgramRole::Server, SERVER_CURRENT_CALL),
+        ])
+        .unwrap();
+        let (mut program, startup) = BoonServerProgram::with_distributed_persistence(
+            &bundle,
+            InMemoryDriver::default(),
+            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let baseline = startup.lifecycle.status();
+        let (connection, _, _, _) = connect_and_limit_delivery_queue(&mut program);
+
+        assert_eq!(
+            program
+                .distributed_sessions
+                .as_mut()
+                .unwrap()
+                .session_root_value_current(connection, "store.session_value")
+                .unwrap(),
+            Value::integer(42).unwrap()
+        );
+        let current = startup.lifecycle.status();
+        assert_eq!(current.accepted_turns, baseline.accepted_turns);
+        assert_eq!(
+            current.durably_acknowledged_turns,
+            baseline.durably_acknowledged_turns
+        );
         program.shutdown_persistent().unwrap();
     }
 

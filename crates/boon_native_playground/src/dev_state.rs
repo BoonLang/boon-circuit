@@ -54,6 +54,8 @@ pub enum DevAction {
     SelectExample(String),
     SelectFile(usize),
     SelectMigrationStage(String),
+    NavigateDefinition,
+    NavigateReference,
     Clipboard(ClipboardAction),
     Close,
 }
@@ -333,18 +335,18 @@ impl DevState {
                         focused != self.editor_focused || rename_focused != self.rename_focused;
                     self.editor_focused = focused;
                     self.rename_focused = rename_focused && self.rename.is_some();
+                    let action = if self.rename.is_some()
+                        && !self.rename_focused
+                        && !matches!(target.as_deref(), Some(DEV_RENAME_SAVE | DEV_RENAME_CANCEL))
+                    {
+                        DevAction::CommitRename
+                    } else if focused && self.control {
+                        DevAction::NavigateDefinition
+                    } else {
+                        DevAction::None
+                    };
                     result(
-                        if self.rename.is_some()
-                            && !self.rename_focused
-                            && !matches!(
-                                target.as_deref(),
-                                Some(DEV_RENAME_SAVE | DEV_RENAME_CANCEL)
-                            )
-                        {
-                            DevAction::CommitRename
-                        } else {
-                            DevAction::None
-                        },
+                        action,
                         if changed || focused {
                             DevChange::Interaction
                         } else {
@@ -436,6 +438,18 @@ impl DevState {
         }
         if !self.editor_focused {
             return result(DevAction::None, DevChange::None);
+        }
+        if let LogicalKey::Named(name) = key
+            && crate::runtime_view::normalize_key(name) == "f12"
+        {
+            return result(
+                if self.shift {
+                    DevAction::NavigateReference
+                } else {
+                    DevAction::NavigateDefinition
+                },
+                DevChange::None,
+            );
         }
         if self.control {
             let action = match key_text(key).as_deref() {
@@ -653,5 +667,54 @@ fn action_for_target(target: Option<&str>) -> DevAction {
             DevAction::SelectMigrationStage(target[DEV_MIGRATION_STAGE_PREFIX.len()..].to_owned())
         }
         _ => DevAction::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use boon_host::{KeyEvent, PointerEvent, SurfaceId};
+
+    use super::*;
+
+    fn keyboard(name: &str, pressed: bool) -> HostEvent {
+        HostEvent::Keyboard(KeyEvent {
+            surface: SurfaceId("dev".to_owned()),
+            physical_key: None,
+            logical_key: LogicalKey::Named(name.to_owned()),
+            pressed,
+        })
+    }
+
+    #[test]
+    fn f12_and_shift_f12_request_semantic_navigation_without_editing() {
+        let mut state = DevState::new("value: 1\nresult: value\n".to_owned());
+        state.set_caret(Position { line: 1, column: 9 }, false);
+        let revision = state.buffer().revision();
+
+        let definition = state.handle_event(&keyboard("F12", true), |_, _| None);
+        assert_eq!(definition.action, DevAction::NavigateDefinition);
+        assert_eq!(definition.change, DevChange::None);
+
+        state.handle_event(&keyboard("Shift", true), |_, _| None);
+        let reference = state.handle_event(&keyboard("F12", true), |_, _| None);
+        assert_eq!(reference.action, DevAction::NavigateReference);
+        assert_eq!(state.buffer().revision(), revision);
+    }
+
+    #[test]
+    fn control_click_uses_the_same_definition_action() {
+        let mut state = DevState::new("value: 1\nresult: value\n".to_owned());
+        state.set_caret(Position { line: 1, column: 9 }, false);
+        state.handle_event(&keyboard("Control", true), |_, _| None);
+        let click = HostEvent::Pointer(PointerEvent {
+            surface: SurfaceId("dev".to_owned()),
+            x: 100.0,
+            y: 100.0,
+            phase: PointerPhase::Down,
+            button: Some(PointerButton::Primary),
+        });
+        let result = state.handle_event(&click, |_, _| Some(DEV_EDITOR.to_owned()));
+        assert_eq!(result.action, DevAction::NavigateDefinition);
+        assert_eq!(result.change, DevChange::Interaction);
     }
 }

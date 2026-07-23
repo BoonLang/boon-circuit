@@ -3,24 +3,27 @@
 use crate::{WebHostError, WebHostResult};
 use boon_app_package::CapabilityProfileDescriptor;
 use boon_effect_schema::{
-    SECURE_RANDOM_BYTES_OPERATION, TIMER_DEADLINE_OPERATION, WALL_CLOCK_READ_OPERATION,
+    CONTENT_IMPORT_OPERATION, CONTENT_SAVE_OPERATION, FILE_READ_BYTES_OPERATION,
+    FILE_READ_STREAM_OPERATION, FILE_WRITE_BYTES_OPERATION, SECURE_RANDOM_BYTES_OPERATION,
+    TIMER_DEADLINE_OPERATION, WALL_CLOCK_READ_OPERATION,
 };
-use boon_plan::{
-    EffectBarrier, EffectContract, EffectDeliveryCardinality, EffectId, EffectReplay,
-    EffectResultPolicy, ProgramRole,
-};
+use boon_plan::{EffectContract, ProgramRole, builtin_effect_contract};
 use boon_runtime::{
-    RuntimeTurn, TransientEffectCallId, TransientEffectCreditGrant, TransientEffectInvocation,
+    ExactCallHostCore, RuntimeTurn, TransientEffectCallId, TransientEffectCreditGrant,
+    TransientEffectInvocation,
 };
 use std::collections::{BTreeMap, BTreeSet};
-
-pub(crate) const DEFAULT_BROWSER_ACTIVE_EFFECT_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BrowserClientEffectKind {
     WallClock,
     SecureRandom,
     Deadline,
+    FileReadBytes,
+    FileWriteBytes,
+    FileReadStream,
+    ContentImport,
+    ContentSave,
 }
 
 impl BrowserClientEffectKind {
@@ -29,8 +32,33 @@ impl BrowserClientEffectKind {
             WALL_CLOCK_READ_OPERATION => Some((Self::WallClock, "host.clock")),
             SECURE_RANDOM_BYTES_OPERATION => Some((Self::SecureRandom, "host.secure-random")),
             TIMER_DEADLINE_OPERATION => Some((Self::Deadline, "host.timers")),
+            FILE_READ_BYTES_OPERATION => Some((Self::FileReadBytes, "host.file-read")),
+            FILE_WRITE_BYTES_OPERATION => Some((Self::FileWriteBytes, "host.file-write")),
+            FILE_READ_STREAM_OPERATION => Some((Self::FileReadStream, "host.file-read")),
+            CONTENT_IMPORT_OPERATION => Some((Self::ContentImport, "host.content-import")),
+            CONTENT_SAVE_OPERATION => Some((Self::ContentSave, "host.content-save")),
             _ => None,
         }
+    }
+
+    pub(crate) fn operation(self) -> &'static str {
+        match self {
+            Self::WallClock => WALL_CLOCK_READ_OPERATION,
+            Self::SecureRandom => SECURE_RANDOM_BYTES_OPERATION,
+            Self::Deadline => TIMER_DEADLINE_OPERATION,
+            Self::FileReadBytes => FILE_READ_BYTES_OPERATION,
+            Self::FileWriteBytes => FILE_WRITE_BYTES_OPERATION,
+            Self::FileReadStream => FILE_READ_STREAM_OPERATION,
+            Self::ContentImport => CONTENT_IMPORT_OPERATION,
+            Self::ContentSave => CONTENT_SAVE_OPERATION,
+        }
+    }
+
+    fn is_stream(self) -> bool {
+        matches!(
+            self,
+            Self::FileReadStream | Self::ContentImport | Self::ContentSave
+        )
     }
 }
 
@@ -44,17 +72,19 @@ pub(crate) enum BrowserClientEffectCommand {
         kind: BrowserClientEffectKind,
         call_id: TransientEffectCallId,
     },
+    GrantCredits {
+        kind: BrowserClientEffectKind,
+        grant: TransientEffectCreditGrant,
+    },
 }
 
 /// Exact-call ownership and capability policy for browser-owned Client effects.
 ///
 /// Platform adapters execute the returned commands, but only this core may
 /// admit, cancel, or complete a runtime call ID.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct BrowserClientEffectHostCore {
-    authorized: BTreeMap<EffectId, BrowserClientEffectKind>,
-    owners: BTreeMap<TransientEffectCallId, BrowserClientEffectKind>,
-    max_active: usize,
+    calls: ExactCallHostCore<BrowserClientEffectKind>,
 }
 
 impl BrowserClientEffectHostCore {
@@ -87,18 +117,10 @@ impl BrowserClientEffectHostCore {
                     feature: format!("Client host effect `{}`", contract.host_operation),
                     reason: "the browser host has no generic platform adapter".to_owned(),
                 })?;
-            let canonical_id =
-                EffectId::from_host_operation(&contract.host_operation).map_err(invalid_policy)?;
-            if contract.effect_id != canonical_id
-                || !matches!(
-                    contract.replay,
-                    EffectReplay::ReadOnly | EffectReplay::ProcessScoped
-                )
-                || contract.barrier != EffectBarrier::None
-                || contract.result_policy != EffectResultPolicy::ReturnValue
-                || contract.delivery != EffectDeliveryCardinality::Single
-                || contract.schema.is_none()
-            {
+            let canonical = builtin_effect_contract(&contract.host_operation)
+                .map_err(invalid_policy)?
+                .ok_or_else(|| invalid_policy("browser effect has no canonical contract"))?;
+            if contract != &canonical {
                 return Err(invalid_policy(format!(
                     "Client host effect `{}` differs from its canonical transient contract",
                     contract.host_operation
@@ -121,23 +143,18 @@ impl BrowserClientEffectHostCore {
             }
         }
 
-        Ok(Self {
-            authorized,
-            owners: BTreeMap::new(),
-            max_active,
-        })
+        let calls = ExactCallHostCore::new(authorized, max_active).map_err(invalid_policy)?;
+        Ok(Self { calls })
     }
 
     pub(crate) fn route_turns(
         &mut self,
         turns: &[RuntimeTurn],
     ) -> WebHostResult<Vec<BrowserClientEffectCommand>> {
-        let mut candidate = self.owners.clone();
+        let mut candidate = self.calls.clone();
         let mut commands = Vec::new();
         for turn in turns {
             Self::route_batch_into(
-                &self.authorized,
-                self.max_active,
                 &mut candidate,
                 &turn.cancelled_transient_effects,
                 &turn.transient_effect_credit_grants,
@@ -145,98 +162,101 @@ impl BrowserClientEffectHostCore {
                 &mut commands,
             )?;
         }
-        self.owners = candidate;
+        self.calls = candidate;
+        Ok(commands)
+    }
+
+    #[cfg(test)]
+    fn route_batch(
+        &mut self,
+        cancelled: &[TransientEffectCallId],
+        credits: &[TransientEffectCreditGrant],
+        invocations: &[TransientEffectInvocation],
+    ) -> WebHostResult<Vec<BrowserClientEffectCommand>> {
+        let mut candidate = self.calls.clone();
+        let mut commands = Vec::new();
+        Self::route_batch_into(
+            &mut candidate,
+            cancelled,
+            credits,
+            invocations,
+            &mut commands,
+        )?;
+        self.calls = candidate;
         Ok(commands)
     }
 
     fn route_batch_into(
-        authorized: &BTreeMap<EffectId, BrowserClientEffectKind>,
-        max_active: usize,
-        owners: &mut BTreeMap<TransientEffectCallId, BrowserClientEffectKind>,
+        calls: &mut ExactCallHostCore<BrowserClientEffectKind>,
         cancelled: &[TransientEffectCallId],
         credits: &[TransientEffectCreditGrant],
         invocations: &[TransientEffectInvocation],
         commands: &mut Vec<BrowserClientEffectCommand>,
     ) -> WebHostResult<()> {
-        for call_id in cancelled {
-            if let Some(kind) = owners.remove(call_id) {
-                commands.push(BrowserClientEffectCommand::Cancel {
-                    kind,
-                    call_id: *call_id,
-                });
-            }
+        for (kind, call_id) in calls.cancel_calls(cancelled) {
+            commands.push(BrowserClientEffectCommand::Cancel { kind, call_id });
         }
-        if let Some(grant) = credits.first() {
-            return Err(invalid_policy(format!(
-                "single-result browser effect call {} received stream credit",
-                grant.call_id
-            )));
+        for (kind, grant) in calls.credit_lanes(credits).map_err(invalid_policy)? {
+            if !kind.is_stream() {
+                return Err(invalid_policy(format!(
+                    "single-result browser effect call {} received stream credit",
+                    grant.call_id
+                )));
+            }
+            commands.push(BrowserClientEffectCommand::GrantCredits { kind, grant });
         }
 
-        let mut batch = BTreeSet::new();
         for invocation in invocations {
-            if owners.contains_key(&invocation.call_id) || !batch.insert(invocation.call_id) {
+            let kind = calls.authorized_lane(invocation.effect_id).ok_or_else(|| {
+                invalid_policy(format!(
+                    "browser host is not authorized for effect {}",
+                    invocation.effect_id
+                ))
+            })?;
+            let expected = builtin_effect_contract(kind.operation())
+                .map_err(invalid_policy)?
+                .expect("browser effect kinds have canonical contracts")
+                .delivery;
+            if invocation.delivery != expected {
                 return Err(invalid_policy(format!(
-                    "browser effect host received duplicate active call {}",
+                    "browser effect call {} differs from its canonical delivery",
                     invocation.call_id
                 )));
             }
-            if invocation.delivery != EffectDeliveryCardinality::Single {
-                return Err(invalid_policy(format!(
-                    "browser effect call {} requested unsupported stream delivery",
-                    invocation.call_id
-                )));
-            }
-            let kind = authorized
-                .get(&invocation.effect_id)
-                .copied()
-                .ok_or_else(|| WebHostError::CapabilityDenied {
-                    capability: invocation.effect_id.to_string(),
-                    reason: "effect was not authorized during browser startup".to_owned(),
-                })?;
-            if owners.len() >= max_active {
-                return Err(WebHostError::QueueOverflow {
-                    queue: "browser active effects".to_owned(),
-                    capacity: max_active,
-                });
-            }
-            owners.insert(invocation.call_id, kind);
-            commands.push(BrowserClientEffectCommand::Submit {
-                kind,
-                invocation: invocation.clone(),
-            });
+        }
+        let admitted = calls.admit(invocations.to_vec()).map_err(invalid_policy)?;
+        for (kind, invocation) in admitted {
+            commands.push(BrowserClientEffectCommand::Submit { kind, invocation });
         }
         Ok(())
     }
 
-    pub(crate) fn accept_completion(
+    pub(crate) fn accept_result(
         &mut self,
         call_id: TransientEffectCallId,
-    ) -> WebHostResult<BrowserClientEffectKind> {
-        self.owners
-            .remove(&call_id)
-            .ok_or_else(|| WebHostError::InvalidInput {
-                field: "browser effect completion".to_owned(),
-                reason: format!("call {call_id} is stale or belongs to another host"),
+        kind: BrowserClientEffectKind,
+        terminal: bool,
+    ) -> WebHostResult<()> {
+        self.calls
+            .accept_result(call_id, kind, terminal)
+            .map_err(|error| WebHostError::InvalidInput {
+                field: "browser effect result".to_owned(),
+                reason: error.to_string(),
             })
     }
 
     pub(crate) fn cancel_all(&mut self) -> Vec<BrowserClientEffectCommand> {
-        let commands = self
-            .owners
-            .iter()
-            .map(|(call_id, kind)| BrowserClientEffectCommand::Cancel {
-                kind: *kind,
-                call_id: *call_id,
-            })
-            .collect();
-        self.owners.clear();
-        commands
+        let calls = self.calls.active_call_ids();
+        self.calls
+            .cancel_calls(&calls)
+            .into_iter()
+            .map(|(kind, call_id)| BrowserClientEffectCommand::Cancel { kind, call_id })
+            .collect()
     }
 
     #[cfg(test)]
     pub(crate) fn pending_count(&self) -> usize {
-        self.owners.len()
+        self.calls.active_count()
     }
 }
 
@@ -250,7 +270,10 @@ fn invalid_policy(reason: impl ToString) -> WebHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_plan::{EffectInvocationId, builtin_effect_contract};
+    use boon_plan::{
+        EffectDeliveryCardinality, EffectId, EffectInvocationId, OwnerInstanceId,
+        builtin_effect_contract,
+    };
     use boon_runtime::{
         ApplicationIdentity, ClientSessionQueueLimits, DistributedClientRuntime,
         ProgramCapabilityProfile, ProgramCompileRequest, RuntimeSourceUnit, SourcePayload, Value,
@@ -273,11 +296,7 @@ mod tests {
     }
 
     fn call_id(sequence: u64) -> TransientEffectCallId {
-        serde_json::from_value(serde_json::json!({
-            "launch_epoch": 7,
-            "sequence": sequence,
-        }))
-        .unwrap()
+        TransientEffectCallId::from_host_parts(7, sequence)
     }
 
     fn invocation(operation: &str, sequence: u64) -> TransientEffectInvocation {
@@ -287,8 +306,9 @@ mod tests {
             invocation_id: EffectInvocationId::from_result_owner(effect_id, "store.result")
                 .unwrap(),
             effect_id,
-            trigger_source_sequence: sequence,
+            trigger_sequence: sequence,
             authority_turn_sequence: sequence,
+            owner: OwnerInstanceId::root(),
             target: None,
             intent: Value::Record(BTreeMap::from([(
                 "byte_count".to_owned(),
@@ -333,54 +353,26 @@ mod tests {
                 .unwrap();
         let first = invocation(SECURE_RANDOM_BYTES_OPERATION, 1);
         let second = invocation(SECURE_RANDOM_BYTES_OPERATION, 2);
-        let mut owners = host.owners.clone();
-        let mut commands = Vec::new();
-        BrowserClientEffectHostCore::route_batch_into(
-            &host.authorized,
-            host.max_active,
-            &mut owners,
-            &[],
-            &[],
-            std::slice::from_ref(&first),
-            &mut commands,
-        )
-        .unwrap();
-        host.owners = owners;
+        let commands = host
+            .route_batch(&[], &[], std::slice::from_ref(&first))
+            .unwrap();
         assert_eq!(host.pending_count(), 1);
         assert!(matches!(
             commands.as_slice(),
             [BrowserClientEffectCommand::Submit { invocation, .. }]
                 if invocation.call_id == first.call_id
         ));
-        assert_eq!(
-            host.accept_completion(first.call_id).unwrap(),
-            BrowserClientEffectKind::SecureRandom
+        host.accept_result(first.call_id, BrowserClientEffectKind::SecureRandom, true)
+            .unwrap();
+        assert!(
+            host.accept_result(first.call_id, BrowserClientEffectKind::SecureRandom, true)
+                .is_err()
         );
-        assert!(host.accept_completion(first.call_id).is_err());
 
-        let mut owners = host.owners.clone();
-        let mut commands = Vec::new();
-        BrowserClientEffectHostCore::route_batch_into(
-            &host.authorized,
-            host.max_active,
-            &mut owners,
-            &[],
-            &[],
-            std::slice::from_ref(&second),
-            &mut commands,
-        )
-        .unwrap();
-        BrowserClientEffectHostCore::route_batch_into(
-            &host.authorized,
-            host.max_active,
-            &mut owners,
-            &[second.call_id],
-            &[],
-            &[],
-            &mut commands,
-        )
-        .unwrap();
-        host.owners = owners;
+        let mut commands = host
+            .route_batch(&[], &[], std::slice::from_ref(&second))
+            .unwrap();
+        commands.extend(host.route_batch(&[second.call_id], &[], &[]).unwrap());
         assert_eq!(host.pending_count(), 0);
         assert!(matches!(
             commands.last(),
@@ -388,22 +380,74 @@ mod tests {
                 if *call_id == second.call_id
         ));
 
-        let mut owners = host.owners.clone();
-        let error = BrowserClientEffectHostCore::route_batch_into(
-            &host.authorized,
-            host.max_active,
-            &mut owners,
-            &[],
-            &[TransientEffectCreditGrant {
-                call_id: second.call_id,
-                credits: 1,
-            }],
-            &[],
-            &mut Vec::new(),
-        )
-        .unwrap_err();
+        let error = host
+            .route_batch(
+                &[],
+                &[TransientEffectCreditGrant {
+                    call_id: second.call_id,
+                    credits: 1,
+                }],
+                &[],
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("stream credit"));
         assert!(host.cancel_all().is_empty());
+    }
+
+    #[test]
+    fn file_stream_ownership_survives_results_and_routes_bounded_credits() {
+        let contract = builtin_effect_contract(FILE_READ_STREAM_OPERATION)
+            .unwrap()
+            .unwrap();
+        let mut host = BrowserClientEffectHostCore::new(
+            &profile(&["host.file-read"]),
+            std::slice::from_ref(&contract),
+            1,
+        )
+        .unwrap();
+        let mut stream = invocation(FILE_READ_STREAM_OPERATION, 1);
+        stream.delivery = contract.delivery;
+        let commands = host
+            .route_batch(&[], &[], std::slice::from_ref(&stream))
+            .unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [BrowserClientEffectCommand::Submit {
+                kind: BrowserClientEffectKind::FileReadStream,
+                invocation,
+            }] if invocation.call_id == stream.call_id
+        ));
+
+        host.accept_result(
+            stream.call_id,
+            BrowserClientEffectKind::FileReadStream,
+            false,
+        )
+        .unwrap();
+        assert_eq!(host.pending_count(), 1);
+        let grant = TransientEffectCreditGrant {
+            call_id: stream.call_id,
+            credits: 1,
+        };
+        let commands = host.route_batch(&[], &[grant], &[]).unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [BrowserClientEffectCommand::GrantCredits {
+                kind: BrowserClientEffectKind::FileReadStream,
+                grant: routed,
+            }] if *routed == grant
+        ));
+        assert!(
+            host.accept_result(stream.call_id, BrowserClientEffectKind::ContentImport, true)
+                .is_err()
+        );
+        host.accept_result(
+            stream.call_id,
+            BrowserClientEffectKind::FileReadStream,
+            true,
+        )
+        .unwrap();
+        assert_eq!(host.pending_count(), 0);
     }
 
     #[test]
@@ -482,7 +526,12 @@ scene: Scene/Element/text(
                 if routed.call_id == invocation.call_id
         ));
 
-        host.accept_completion(invocation.call_id).unwrap();
+        host.accept_result(
+            invocation.call_id,
+            BrowserClientEffectKind::SecureRandom,
+            true,
+        )
+        .unwrap();
         runtime
             .complete_transient_effect(
                 invocation.call_id,

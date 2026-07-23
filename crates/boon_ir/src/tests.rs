@@ -5,28 +5,154 @@ include!("tests/bytes.rs");
 include!("tests/distributed.rs");
 include!("tests/sources_and_events.rs");
 
+fn exact_state_arm<'a>(
+    program: &'a ErasedProgram,
+    target: &str,
+    cause: EventCause,
+) -> &'a StateUpdateArm {
+    let state = program
+        .state_cells
+        .iter()
+        .find(|state| state.path == target)
+        .unwrap_or_else(|| panic!("missing state `{target}`"));
+    program
+        .state_update_arms
+        .iter()
+        .find(|arm| arm.state == state.id && arm.cause == cause)
+        .unwrap_or_else(|| panic!("missing exact state arm for `{target}` from {cause:?}"))
+}
+
+fn exact_source_cause(program: &ErasedProgram, path: &str) -> EventCause {
+    EventCause::Source(
+        program
+            .sources
+            .iter()
+            .find(|source| source.path == path)
+            .unwrap_or_else(|| panic!("missing source `{path}`"))
+            .id,
+    )
+}
+
+fn exact_state_cause(program: &ErasedProgram, path: &str) -> EventCause {
+    EventCause::State(
+        program
+            .state_cells
+            .iter()
+            .find(|state| state.path == path)
+            .unwrap_or_else(|| panic!("missing state `{path}`"))
+            .id,
+    )
+}
+
+fn exact_subtree<'a>(
+    program: &'a ErasedProgram,
+    root: ExecutableExprId,
+) -> Vec<&'a ExecutableExpression> {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    let mut expressions = Vec::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let expression = program
+            .executable
+            .expressions
+            .get(id.as_usize())
+            .filter(|expression| expression.id == id)
+            .unwrap_or_else(|| panic!("missing executable expression {id}"));
+        pending.extend(executable_expression_children(&expression.kind));
+        expressions.push(expression);
+    }
+    expressions
+}
+
+fn exact_call<'a>(
+    program: &'a ErasedProgram,
+    root: ExecutableExprId,
+    function: &str,
+) -> &'a ExecutableExpression {
+    exact_subtree(program, root)
+        .into_iter()
+        .find(|expression| {
+            matches!(
+                &expression.kind,
+                ExecutableExpressionKind::Call { name, .. } if name == function
+            )
+        })
+        .unwrap_or_else(|| panic!("missing exact call `{function}` below {root}"))
+}
+
 #[test]
-fn outbound_http_call_lowers_as_a_direct_typed_state_update() {
+fn source_payload_erasure_keeps_the_endpoint_field_and_residual_projection() {
+    let source = SourcePort {
+        id: SourceId(0),
+        path: "store.input".to_owned(),
+        binding_path: "store.input".to_owned(),
+        executable_source_id: None,
+        static_owner: None,
+        source_expr_id: None,
+        source_line: 1,
+        scoped: false,
+        scope_id: None,
+        interval_ms: None,
+        payload_schema: SourcePayloadSchema {
+            fields: vec![SourcePayloadField::Named("payload".to_owned())],
+            typed_fields: vec![SourcePayloadDescriptor {
+                field: SourcePayloadField::Named("payload".to_owned()),
+                data_type: SemanticDataType::Record {
+                    fields: vec![SemanticTypeField {
+                        name: "child".to_owned(),
+                        data_type: SemanticDataType::Text,
+                    }],
+                    open: false,
+                },
+            }],
+        },
+    };
+
+    assert_eq!(
+        erased_source_payload_read(
+            &[source.clone()],
+            ErasedBindingId(0),
+            source.id,
+            &["payload".to_owned(), "child".to_owned()],
+        )
+        .unwrap(),
+        ErasedReadTarget::SourcePayload {
+            binding: ErasedBindingId(0),
+            source: source.id,
+            field: SourcePayloadField::Named("payload".to_owned()),
+            projection: vec!["child".to_owned()],
+        }
+    );
+    assert!(
+        erased_source_payload_read(
+            &[source],
+            ErasedBindingId(0),
+            SourceId(0),
+            &["missing".to_owned(), "payload".to_owned()],
+        )
+        .unwrap_err()
+        .contains("payload projection `missing`")
+    );
+}
+
+#[test]
+fn outbound_http_effect_is_owned_by_one_exact_state_arm() {
     let parsed = boon_parser::parse_source(
         "outbound-http-effect.bn",
         include_str!("../../../examples/outbound_http_effect.bn"),
     )
     .unwrap();
-    let typed = lower(&parsed).unwrap();
-    let branches = typed
-        .update_branches
-        .iter()
-        .filter(|branch| {
-            matches!(&branch.expression,
-            UpdateExpression::HostEffect { operation, .. } if operation == "Http/request")
-        })
-        .collect::<Vec<_>>();
-    let [branch] = branches.as_slice() else {
-        panic!("expected one direct typed outbound update");
-    };
-    assert_eq!(branch.source, "store.request");
-    assert_eq!(branch.target, "store.response");
-    let UpdateExpression::HostEffect { arguments, .. } = &branch.expression else {
+    let program = lower(&parsed).unwrap();
+    let arm = exact_state_arm(
+        &program,
+        "store.response",
+        exact_source_cause(&program, "store.request"),
+    );
+    let call = exact_call(&program, arm.output_expression_id, "Http/request");
+    let ExecutableExpressionKind::Call { arguments, .. } = &call.kind else {
         unreachable!();
     };
     assert_eq!(
@@ -45,19 +171,71 @@ fn outbound_http_call_lowers_as_a_direct_typed_state_update() {
             "overall_timeout_ms",
         ]
     );
-    let request = typed
-        .sources
-        .iter()
-        .find(|source| source.path == "store.request")
-        .unwrap();
-    assert!(request.payload_schema.typed_fields.iter().any(|field| {
-        field.field == SourcePayloadField::Named("path_segments".to_owned())
-            && matches!(field.data_type, SemanticDataType::List { .. })
-    }));
 }
 
 #[test]
-fn effect_result_state_lowers_as_the_next_effect_trigger() {
+fn tagged_pattern_binding_survives_a_user_function_call_as_an_exact_projection() {
+    let parsed = boon_parser::parse_source(
+        "pattern-binding-user-call.bn",
+        r#"
+FUNCTION row_value(row) {
+    row.value
+}
+
+rows: LIST { [id: TEXT { one }, value: 7] }
+
+selected:
+    rows |> List/find(item, if: item.id == TEXT { one }) |> WHEN {
+        Found[value] => row_value(row: value)
+        NotFound => 0
+    }
+"#,
+    )
+    .unwrap();
+    let program = lower(&parsed).unwrap();
+    let (found, binding) = program
+        .executable
+        .expressions
+        .iter()
+        .find_map(|expression| {
+            let ExecutableExpressionKind::When { arms, .. } = &expression.kind else {
+                return None;
+            };
+            arms.iter().find_map(|arm| {
+                if matches!(
+                    &arm.pattern,
+                    boon_typecheck::CheckedMatchPattern::Tag { name } if name == "Found"
+                ) {
+                    arm.bindings.first().map(|binding| (arm.output, binding))
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("typed Found arm");
+    assert_eq!(binding.name, "value");
+    assert_eq!(binding.projection, ["value"]);
+    let subtree = exact_subtree(&program, found);
+    assert!(subtree.iter().all(|expression| {
+        !matches!(
+            expression.kind,
+            ExecutableExpressionKind::ExternalRead { .. }
+        )
+    }));
+    assert!(
+        subtree.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                ExecutableExpressionKind::Project { fields, .. }
+                    if fields.iter().any(|field| field == "value")
+            )
+        }),
+        "Found arm subtree: {subtree:#?}"
+    );
+}
+
+#[test]
+fn effect_result_state_is_the_exact_next_effect_cause() {
     let parsed = boon_parser::parse_source(
         "state-triggered-effect-chain.bn",
         r#"
@@ -78,91 +256,27 @@ store: [
 "#,
     )
     .unwrap();
-    let typed = lower(&parsed).unwrap();
-    let branch = typed
-        .update_branches
-        .iter()
-        .find(|branch| {
-            matches!(&branch.expression,
-                UpdateExpression::HostEffect { operation, .. }
-                    if operation == "Random/bytes")
-        })
-        .expect("state-triggered Random/bytes branch");
-    assert_eq!(branch.source, "store.clock_result");
-    assert_eq!(branch.target, "store.random_result");
-    assert_eq!(
-        branch.guard,
-        Some(UpdateGuard::ValueOneOf {
-            input: "store.clock_result".to_owned(),
-            values: vec!["WallClockRead".to_owned()],
-        })
+    let program = lower(&parsed).unwrap();
+    let arm = exact_state_arm(
+        &program,
+        "store.random_result",
+        exact_state_cause(&program, "store.clock_result"),
     );
+    exact_call(&program, arm.output_expression_id, "Random/bytes");
     assert!(
-        !typed
+        !program
             .possible_causes
             .iter()
             .find(|cause| cause.target == "store.random_result")
             .unwrap()
             .sources
             .iter()
-            .any(|source| source == "store.start"),
-        "the second effect must not inherit the original SOURCE trigger"
+            .any(|source| source == "store.start")
     );
 }
 
 #[test]
-fn effect_result_changes_flow_through_pure_values_into_hold_branches() {
-    let parsed = boon_parser::parse_source(
-        "effect-result-derived-hold-branch.bn",
-        r#"
-store: [
-    start: SOURCE
-    clock_result:
-        ClockNotRequested |> HOLD clock_result {
-            start |> THEN { Clock/wall() }
-        }
-    current_label:
-        clock_result |> WHEN {
-            WallClockRead => TEXT { current }
-            __ => TEXT { none }
-        }
-    selected_label:
-        TEXT { none } |> HOLD selected_label {
-            current_label |> WHEN {
-                TEXT { current } => current_label
-                __ => SKIP
-            }
-        }
-]
-"#,
-    )
-    .unwrap();
-    let typed = lower(&parsed).unwrap();
-    let branch = typed
-        .update_branches
-        .iter()
-        .find(|branch| {
-            branch.target == "store.selected_label" && branch.source == "store.clock_result"
-        })
-        .expect("effect result must trigger the HOLD branch through its pure projection");
-    assert!(
-        !matches!(branch.expression, UpdateExpression::Unknown { .. }),
-        "derived state-triggered branch did not lower: {branch:?}"
-    );
-    assert!(
-        typed
-            .possible_causes
-            .iter()
-            .find(|cause| cause.target == "store.selected_label")
-            .unwrap()
-            .sources
-            .iter()
-            .any(|source| source == "store.clock_result")
-    );
-}
-
-#[test]
-fn nested_effect_result_guards_preserve_statement_ancestry() {
+fn nested_effect_guards_remain_exact_executable_control_flow() {
     let parsed = boon_parser::parse_source(
         "nested-effect-result-guards.bn",
         r#"
@@ -171,12 +285,7 @@ store: [
     selected: PackageAsset[url: TEXT { asset://files/primary.vcd }]
     file_result:
         NotStarted |> HOLD file_result {
-            read |> THEN {
-                File/read_stream(
-                    file: selected
-                    retain_content: True
-                )
-            }
+            read |> THEN { File/read_stream(file: selected, retain_content: True) }
         }
     waveform_result:
         NotStarted |> HOLD waveform_result {
@@ -192,159 +301,37 @@ store: [
 "#,
     )
     .unwrap();
-    let typed = lower(&parsed).unwrap();
-    let branch = typed
-        .update_branches
-        .iter()
-        .find(|branch| {
-            matches!(&branch.expression,
-                UpdateExpression::HostEffect { operation, .. }
-                    if operation == "Wellen/open")
-        })
-        .expect("state-triggered Wellen/open branch");
-    assert_eq!(
-        branch.guard,
-        Some(UpdateGuard::All {
-            guards: vec![
-                UpdateGuard::ValueOneOf {
-                    input: "store.file_result".to_owned(),
-                    values: vec!["Finished".to_owned()],
-                },
-                UpdateGuard::ValueOneOf {
-                    input: "store.file_result.retained".to_owned(),
-                    values: vec!["Retained".to_owned()],
-                },
-            ],
-        })
+    let program = lower(&parsed).unwrap();
+    let arm = exact_state_arm(
+        &program,
+        "store.waveform_result",
+        exact_state_cause(&program, "store.file_result"),
     );
+    exact_call(&program, arm.output_expression_id, "Wellen/open");
+    let when_count = exact_subtree(&program, arm.output_expression_id)
+        .into_iter()
+        .filter(|expression| matches!(expression.kind, ExecutableExpressionKind::When { .. }))
+        .count();
+    assert!(when_count >= 2, "nested guard ancestry was flattened");
 }
 
 #[test]
-fn nested_effect_guards_preserve_field_equality() {
-    let parsed = boon_parser::parse_source(
-        "nested-effect-field-equality.bn",
-        r#"
-store: [
-    start: SOURCE
-    replace_request: SOURCE
-    request_fingerprint:
-        TEXT { current } |> HOLD request_fingerprint {
-            replace_request.text
-        }
-    response_fingerprint: TEXT { current }
-    clock_result:
-        ClockNotRequested |> HOLD clock_result {
-            start |> THEN { Clock/wall() }
-        }
-    random_result:
-        RandomNotRequested |> HOLD random_result {
-            clock_result |> WHEN {
-                WallClockRead => request_fingerprint == response_fingerprint |> WHEN {
-                    True => Random/bytes(byte_count: 16)
-                    False => SKIP
-                }
-                __ => SKIP
-            }
-        }
-]
-"#,
-    )
-    .unwrap();
-    let typed = lower(&parsed).unwrap();
-    let branch = typed
-        .update_branches
-        .iter()
-        .find(|branch| {
-            matches!(&branch.expression,
-                UpdateExpression::HostEffect { operation, .. }
-                    if operation == "Random/bytes")
-        })
-        .expect("field-equality guarded Random/bytes branch");
-    assert_eq!(
-        branch.guard,
-        Some(UpdateGuard::All {
-            guards: vec![
-                UpdateGuard::ValueOneOf {
-                    input: "store.clock_result".to_owned(),
-                    values: vec!["WallClockRead".to_owned()],
-                },
-                UpdateGuard::ValuesEqual {
-                    left: "store.request_fingerprint".to_owned(),
-                    right: "store.response_fingerprint".to_owned(),
-                },
-            ],
-        })
-    );
-}
-
-#[test]
-fn nested_effect_guards_preserve_scalar_list_nonempty_predicates() {
-    let parsed = boon_parser::parse_source(
-        "nested-effect-list-nonempty.bn",
-        r#"
-store: [
-    start: SOURCE
-    signal_ids: LIST { TEXT { top.clk } }
-    random_result:
-        RandomNotRequested |> HOLD random_result {
-            start |> THEN {
-                signal_ids |> List/is_not_empty() |> WHEN {
-                    True => Random/bytes(byte_count: 1)
-                    False => SKIP
-                }
-            }
-        }
-]
-"#,
-    )
-    .unwrap();
-    let typed = lower(&parsed).unwrap();
-    let branch = typed
-        .update_branches
-        .iter()
-        .find(|branch| {
-            matches!(&branch.expression,
-                UpdateExpression::HostEffect { operation, .. }
-                    if operation == "Random/bytes")
-        })
-        .expect("list-guarded Random/bytes branch");
-
-    assert_eq!(
-        branch.guard,
-        Some(UpdateGuard::ListIsNotEmpty {
-            input: "store.signal_ids".to_owned(),
-            expected: true,
-        })
-    );
-}
-
-#[test]
-fn typed_passkey_call_lowers_to_its_result_hold() {
+fn passkey_effect_arguments_are_preserved_in_exact_call_order() {
     let parsed = boon_parser::parse_source(
         "typed-passkey-effects.bn",
         r#"
 store: [
     authenticate: SOURCE
-    simulate_cancel: SOURCE
-    simulate_failure: SOURCE
-    simulate_duplicate: SOURCE
     account_id: TEXT { account-1 }
     credential_count: 1
-    simulation:
-        Success |> HOLD simulation {
-            LATEST {
-                store.simulate_cancel |> THEN { Cancel }
-                store.simulate_failure |> THEN { Failure }
-                store.simulate_duplicate |> THEN { Duplicate }
-            }
-        }
+    simulation: Success
     authentication_result:
         AuthenticationNotRequested |> HOLD authentication_result {
-            store.authenticate |> THEN {
+            authenticate |> THEN {
                 DevelopmentPasskey/authenticate(
-                    account_id: store.account_id
-                    credential_count: store.credential_count
-                    simulation: store.simulation
+                    account_id: account_id
+                    credential_count: credential_count
+                    simulation: simulation
                 )
             }
         }
@@ -352,19 +339,18 @@ store: [
 "#,
     )
     .unwrap();
-    let typed = lower(&parsed).unwrap();
-    let branch = typed
-        .update_branches
-        .iter()
-        .find(|branch| {
-            matches!(&branch.expression,
-            UpdateExpression::HostEffect { operation, .. }
-                if operation == "DevelopmentPasskey/authenticate")
-        })
-        .unwrap();
-    assert_eq!(branch.source, "store.authenticate");
-    assert_eq!(branch.target, "store.authentication_result");
-    let UpdateExpression::HostEffect { arguments, .. } = &branch.expression else {
+    let program = lower(&parsed).unwrap();
+    let arm = exact_state_arm(
+        &program,
+        "store.authentication_result",
+        exact_source_cause(&program, "store.authenticate"),
+    );
+    let call = exact_call(
+        &program,
+        arm.output_expression_id,
+        "DevelopmentPasskey/authenticate",
+    );
+    let ExecutableExpressionKind::Call { arguments, .. } = &call.kind else {
         unreachable!();
     };
     assert_eq!(

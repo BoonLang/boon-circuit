@@ -1,4 +1,6 @@
-use boon_data::{Bytes, NumberTextFormat, format_number_text};
+use boon_data::{
+    Bytes, NumberTextFormat, format_number_ascii_text, format_number_text, number_bit_width,
+};
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
     DocumentPatch, EmbeddedProgramDescriptor, EmbeddedProgramSourceUnit, MapCamera, MapCoordinate,
@@ -10,12 +12,16 @@ use boon_document_model::{
 };
 use boon_plan::{
     DocumentArgumentRole, DocumentBuiltin, DocumentConstantId, DocumentConstantValue,
-    DocumentConstructor, DocumentExprId, DocumentExprOp, DocumentFunctionId,
-    DocumentMaterialization, DocumentMaterializationId, DocumentMaterializationSource,
-    DocumentNameId, DocumentPattern, DocumentRead, DocumentScalarOp, DocumentTemplateId, FieldId,
-    FiniteReal, ImportId, ListId, MachinePlan, ScopeId, SourceId,
+    DocumentConstructor, DocumentElementContextId, DocumentExprId, DocumentExprOp,
+    DocumentFunctionId, DocumentMaterialization, DocumentMaterializationId,
+    DocumentMaterializationSource, DocumentNameId, DocumentPattern, DocumentRead,
+    DocumentRowIdentity, DocumentRuntimeLocalBinding, DocumentScalarOp, DocumentTemplateId,
+    FieldId, FiniteReal, ImportId, ListId, MachinePlan, PlanRowExpressionId, ScopeId, SourceId,
+    ValueRef,
 };
-use boon_plan_executor::{Delta, MachineInstance, RowId, Value, ValueTarget};
+use boon_plan_executor::{
+    Delta, ExpressionLocalBinding, MachineInstance, RowId, Value, ValueTarget,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
@@ -28,6 +34,73 @@ const DEFAULT_OVERSCAN_ITEMS: u64 = 4;
 enum DocumentDependency {
     Value(ValueTarget),
     DistributedImport(ImportId),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ScopedMaterializationOwner {
+    materialization: DocumentMaterializationId,
+    parent_instance: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScopedMaterializationPartition {
+    generation: u64,
+    logical_len: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScopedMaterializationIdentities {
+    next_generation: u64,
+    partitions: BTreeMap<ScopedMaterializationOwner, ScopedMaterializationPartition>,
+}
+
+impl ScopedMaterializationIdentities {
+    fn reconcile(
+        &mut self,
+        owner: ScopedMaterializationOwner,
+        logical_len: usize,
+    ) -> Result<u64, DocumentError> {
+        let partition = self.partitions.entry(owner).or_default();
+        if partition.generation == 0 || logical_len < partition.logical_len {
+            self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
+                DocumentError::Evaluation(
+                    "scoped document materialization generation overflow".to_owned(),
+                )
+            })?;
+            partition.generation = self.next_generation;
+        }
+        partition.logical_len = logical_len;
+        Ok(partition.generation)
+    }
+
+    fn retain_active(&mut self, active: &BTreeSet<ScopedMaterializationOwner>) {
+        self.partitions.retain(|owner, _| active.contains(owner));
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DocumentItemIdentity {
+    Stored(RowId),
+    Scoped {
+        scope: ScopeId,
+        key: u64,
+        generation: u64,
+    },
+}
+
+impl DocumentItemIdentity {
+    fn instance_fragment(&self) -> String {
+        match self {
+            Self::Stored(row) => {
+                format!("row-{}-{}-{}", row.list.0, row.key, row.generation)
+            }
+            Self::Scoped {
+                scope,
+                key,
+                generation,
+            } => format!("scope-{}-{key}-{generation}", scope.0),
+        }
+    }
 }
 
 type RetainedScalarEvaluation = (
@@ -77,8 +150,8 @@ pub(crate) struct DocumentRuntime {
     field_names: BTreeMap<FieldId, Vec<String>>,
     field_state_aliases: BTreeMap<FieldId, boon_plan::StateId>,
     field_owners: BTreeMap<FieldId, ListId>,
+    list_scopes: BTreeMap<ListId, ScopeId>,
     row_sources: BTreeMap<ListId, Vec<(String, SourceId)>>,
-    global_targets: BTreeMap<String, ValueTarget>,
     windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand>,
     last_nonempty_windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand>,
     empty_source_windows: BTreeSet<DocumentMaterializationId>,
@@ -86,11 +159,13 @@ pub(crate) struct DocumentRuntime {
     dependencies: BTreeSet<DocumentDependency>,
     structural_dependencies: BTreeSet<DocumentDependency>,
     structural_lists: BTreeSet<ListId>,
+    structural_list_fields: BTreeSet<(ListId, FieldId)>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
     scalar_dependents: BTreeMap<DocumentDependency, BTreeSet<RetainedBindingKey>>,
     scalar_guarded_dependents: BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
     scalar_guard_values: BTreeMap<(ValueTarget, Value), BTreeSet<RetainedBindingKey>>,
     target_values: BTreeMap<DocumentDependency, Value>,
+    scoped_materialization_identities: ScopedMaterializationIdentities,
     full_evaluation_count: u64,
     retained_scalar_evaluation_count: u64,
     stats: DocumentMaterializationStats,
@@ -172,11 +247,16 @@ impl DocumentRuntime {
             .list_slots
             .iter()
             .flat_map(|slot| {
-                slot.row_field_ids
+                slot.row_fields
                     .iter()
-                    .copied()
-                    .map(|field| (field, slot.list_id))
+                    .map(|field| (field.field_id, slot.list_id))
             })
+            .collect();
+        let list_scopes = machine
+            .storage_layout
+            .list_slots
+            .iter()
+            .filter_map(|slot| slot.scope_id.map(|scope| (slot.list_id, scope)))
             .collect();
         let row_sources = machine
             .source_routes
@@ -198,7 +278,6 @@ impl DocumentRuntime {
                     sources
                 },
             );
-        let global_targets = global_target_index(&machine);
         let windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand> = plan
             .materializations
             .iter()
@@ -224,8 +303,8 @@ impl DocumentRuntime {
             field_names,
             field_state_aliases,
             field_owners,
+            list_scopes,
             row_sources,
-            global_targets,
             windows,
             last_nonempty_windows,
             empty_source_windows: BTreeSet::new(),
@@ -233,11 +312,13 @@ impl DocumentRuntime {
             dependencies: BTreeSet::new(),
             structural_dependencies: BTreeSet::new(),
             structural_lists: BTreeSet::new(),
+            structural_list_fields: BTreeSet::new(),
             retained_nodes: BTreeMap::new(),
             scalar_dependents: BTreeMap::new(),
             scalar_guarded_dependents: BTreeMap::new(),
             scalar_guard_values: BTreeMap::new(),
             target_values: BTreeMap::new(),
+            scoped_materialization_identities: ScopedMaterializationIdentities::default(),
             full_evaluation_count: 0,
             retained_scalar_evaluation_count: 0,
             stats: DocumentMaterializationStats::default(),
@@ -256,6 +337,50 @@ impl DocumentRuntime {
         self.machine_plan
             .document_plan()
             .expect("document runtime requires a document plan")
+    }
+
+    fn source_route_token(
+        &self,
+        session: &MachineInstance,
+        source: SourceId,
+        env: &EvalEnv,
+    ) -> Result<boon_plan::SourceRouteToken, DocumentError> {
+        if let Some(row) = env.active_row {
+            return session
+                .source_route_token_for_descendant_row(source, row)
+                .map_err(|error| DocumentError::Evaluation(error.to_string()));
+        }
+        let route = self
+            .machine_plan
+            .source_routes
+            .iter()
+            .find(|route| route.source_id == source)
+            .ok_or_else(|| {
+                DocumentError::InvalidPlan(format!("source {} has no route", source.0))
+            })?;
+        let ancestors = route
+            .owner
+            .ancestors
+            .iter()
+            .map(|ancestor| {
+                let row = env.rows.get(&ancestor.scope).copied().ok_or_else(|| {
+                    DocumentError::Evaluation(format!(
+                        "source {} owner scope {} is not active",
+                        source.0, ancestor.scope.0
+                    ))
+                })?;
+                if row.list != ancestor.list {
+                    return Err(DocumentError::InvalidPlan(format!(
+                        "source {} owner scope {} resolved list {}, expected {}",
+                        source.0, ancestor.scope.0, row.list.0, ancestor.list.0
+                    )));
+                }
+                Ok(row)
+            })
+            .collect::<Result<Vec<_>, DocumentError>>()?;
+        session
+            .source_route_token(source, &ancestors)
+            .map_err(|error| DocumentError::Evaluation(error.to_string()))
     }
 
     pub(crate) fn stats(&self) -> DocumentMaterializationStats {
@@ -473,9 +598,15 @@ impl DocumentRuntime {
 
     fn turn_affects_structure(&self, deltas: &[Delta]) -> bool {
         deltas.iter().any(|delta| match delta {
-            Delta::SetValue { target, .. } => self
-                .structural_dependencies
-                .contains(&DocumentDependency::Value(*target)),
+            Delta::SetValue { target, .. } => {
+                self.structural_dependencies
+                    .contains(&DocumentDependency::Value(*target))
+                    || matches!(
+                        target,
+                        ValueTarget::RowField { row, field }
+                            if self.structural_list_fields.contains(&(row.list, *field))
+                    )
+            }
             Delta::SetDistributedImport { import_id, .. } => self
                 .structural_dependencies
                 .contains(&DocumentDependency::DistributedImport(*import_id)),
@@ -508,8 +639,16 @@ impl DocumentRuntime {
                 &mut self.structural_lists,
                 evaluated.structural_lists,
             ),
+            structural_list_fields: std::mem::replace(
+                &mut self.structural_list_fields,
+                evaluated.structural_list_fields,
+            ),
             retained_nodes: std::mem::replace(&mut self.retained_nodes, evaluated.retained_nodes),
             target_values: std::mem::replace(&mut self.target_values, evaluated.target_values),
+            scoped_materialization_identities: std::mem::replace(
+                &mut self.scoped_materialization_identities,
+                evaluated.scoped_materialization_identities,
+            ),
             stats: std::mem::replace(&mut self.stats, evaluated.stats),
         };
         (
@@ -705,7 +844,7 @@ impl DocumentRuntime {
             let retained = staged_retained_nodes.get(&id).ok_or_else(|| {
                 DocumentError::InvalidPlan(format!("retained node {} was not staged", id.0))
             })?;
-            let next = self.rebuild_retained_node(&previous, retained)?;
+            let next = self.rebuild_retained_node(session, &previous, retained)?;
             patches.extend(diff_node(&previous, &next));
             staged_frame_nodes.push((id, next));
         }
@@ -840,14 +979,12 @@ impl DocumentRuntime {
 
     fn rebuild_retained_node(
         &self,
+        session: &MachineInstance,
         previous: &DocumentNode,
         retained: &RetainedNode,
     ) -> Result<DocumentNode, DocumentError> {
         let mut node = DocumentNode::new(previous.id.0.clone(), retained.kind.clone());
         node.parent = retained.parent.clone();
-        if let Some(row) = retained.row {
-            insert_row_identity(&mut node, row);
-        }
         if retained.kind == DocumentNodeKind::MapViewport {
             node.map_viewport = Some(Box::new(evaluate_map_viewport_descriptor(
                 retained
@@ -859,11 +996,12 @@ impl DocumentRuntime {
         for argument in &retained.arguments {
             apply_argument(
                 self,
+                session,
                 &mut node,
                 argument.name,
                 argument.role,
                 argument.value.clone(),
-                retained.row,
+                &retained.environment,
             )?;
         }
         if node.kind == DocumentNodeKind::Button {
@@ -891,8 +1029,10 @@ struct EvaluatedDocument {
     dependencies: BTreeSet<DocumentDependency>,
     structural_dependencies: BTreeSet<DocumentDependency>,
     structural_lists: BTreeSet<ListId>,
+    structural_list_fields: BTreeSet<(ListId, FieldId)>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
     target_values: BTreeMap<DocumentDependency, Value>,
+    scoped_materialization_identities: ScopedMaterializationIdentities,
     stats: DocumentMaterializationStats,
 }
 
@@ -924,32 +1064,35 @@ enum EvalValue {
     },
     Tagged(String, BTreeMap<String, EvalValue>),
     List(Vec<EvalValue>),
+    RuntimeList {
+        list: ListId,
+        logical_len: u64,
+    },
     Row {
         id: Option<RowId>,
         fields: BTreeMap<FieldId, Value>,
     },
     Source(SourceId),
     Nodes(Vec<FrameNodeId>),
-    Global,
 }
 
 #[derive(Clone, Debug, Default)]
 struct EvalEnv {
     parameters: Arc<BTreeMap<boon_plan::DocumentParameterId, EvalValue>>,
     locals: Arc<BTreeMap<boon_plan::DocumentLocalId, EvalValue>>,
-    passed: Option<EvalValue>,
     matched: BTreeMap<usize, EvalValue>,
     rows: Arc<BTreeMap<ScopeId, RowId>>,
     active_row: Option<RowId>,
     parent: Option<FrameNodeId>,
     instance: Arc<Vec<String>>,
+    element_context: Option<DocumentElementContextId>,
 }
 
 #[derive(Clone, Debug)]
 struct RetainedNode {
     kind: DocumentNodeKind,
     parent: Option<FrameNodeId>,
-    row: Option<RowId>,
+    environment: EvalEnv,
     arguments: Vec<RetainedArgument>,
 }
 
@@ -1011,8 +1154,11 @@ struct Evaluator<'a> {
     structural_dependencies: BTreeSet<DocumentDependency>,
     dependency_capture: Option<BTreeSet<DocumentDependency>>,
     structural_lists: BTreeSet<ListId>,
+    structural_list_fields: BTreeSet<(ListId, FieldId)>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
-    materialized_rows: BTreeSet<RowId>,
+    materialized_items: BTreeSet<DocumentItemIdentity>,
+    scoped_materialization_identities: ScopedMaterializationIdentities,
+    active_scoped_materialization_owners: BTreeSet<ScopedMaterializationOwner>,
     call_depth: usize,
 }
 
@@ -1029,8 +1175,11 @@ impl<'a> Evaluator<'a> {
             structural_dependencies: BTreeSet::new(),
             dependency_capture: None,
             structural_lists: BTreeSet::new(),
+            structural_list_fields: BTreeSet::new(),
             retained_nodes: BTreeMap::new(),
-            materialized_rows: BTreeSet::new(),
+            materialized_items: BTreeSet::new(),
+            scoped_materialization_identities: runtime.scoped_materialization_identities.clone(),
+            active_scoped_materialization_owners: BTreeSet::new(),
             call_depth: 0,
         }
     }
@@ -1038,7 +1187,6 @@ impl<'a> Evaluator<'a> {
     fn evaluate(mut self) -> Result<EvaluatedDocument, DocumentError> {
         let root = self.frame.root.clone();
         let mut env = EvalEnv {
-            passed: Some(EvalValue::Global),
             parent: Some(root.clone()),
             instance: Arc::new(vec![format!(
                 "root-{}",
@@ -1056,9 +1204,11 @@ impl<'a> Evaluator<'a> {
                 .style
                 .insert("height".to_owned(), StyleValue::Text("Fill".to_owned()));
         }
+        self.scoped_materialization_identities
+            .retain_active(&self.active_scoped_materialization_owners);
         let stats = DocumentMaterializationStats {
             logical_rows: self.session.logical_row_count(),
-            materialized_rows: self.materialized_rows.len(),
+            materialized_rows: self.materialized_items.len(),
             materialized_nodes: self.frame.nodes.len().saturating_sub(1),
             ..DocumentMaterializationStats::default()
         };
@@ -1067,8 +1217,10 @@ impl<'a> Evaluator<'a> {
             dependencies: self.dependencies,
             structural_dependencies: self.structural_dependencies,
             structural_lists: self.structural_lists,
+            structural_list_fields: self.structural_list_fields,
             retained_nodes: self.retained_nodes,
             target_values: self.projection_cache,
+            scoped_materialization_identities: self.scoped_materialization_identities,
             stats,
         })
     }
@@ -1192,27 +1344,6 @@ impl<'a> Evaluator<'a> {
                 env.locals = old;
                 value
             }
-            DocumentExprOp::FunctionCall {
-                function,
-                arguments,
-                passed,
-            } => {
-                let mut parameters = BTreeMap::new();
-                for argument in arguments {
-                    parameters.insert(argument.parameter, self.eval(argument.value, env)?);
-                }
-                let passed = (*passed)
-                    .map(|value| self.eval(value, env))
-                    .transpose()?
-                    .or_else(|| env.passed.clone());
-                self.call_function(
-                    *function,
-                    parameters,
-                    passed,
-                    env,
-                    format!("call-{}", expression.0),
-                )
-            }
             DocumentExprOp::Builtin {
                 builtin,
                 input,
@@ -1222,14 +1353,11 @@ impl<'a> Evaluator<'a> {
                 let mut values = Vec::new();
                 for argument in arguments {
                     values.push((
-                        argument
-                            .name
-                            .map(|name| self.name(name).map(str::to_owned))
-                            .transpose()?,
+                        self.name(argument.name)?.to_owned(),
                         self.eval(argument.value, env)?,
                     ));
                 }
-                Ok(eval_builtin(*builtin, input, values))
+                self.eval_builtin_call(*builtin, input, values)
             }
             DocumentExprOp::Scalar {
                 operation,
@@ -1245,14 +1373,10 @@ impl<'a> Evaluator<'a> {
                 for arm in arms {
                     if self.pattern_matches(&input, arm.pattern.clone())? {
                         let selector = self.runtime.plan().expressions[expression.0].compiler_id;
-                        let previous = env.matched.insert(selector, input.clone());
-                        let output = self.eval(arm.output, env);
-                        if let Some(previous) = previous {
-                            env.matched.insert(selector, previous);
-                        } else {
-                            env.matched.remove(&selector);
-                        }
-                        return output;
+                        let mut arm_env = env.clone();
+                        arm_env.matched.insert(selector, input.clone());
+                        self.install_pattern_rows(&input, &arm.bindings, &mut arm_env)?;
+                        return self.eval(arm.output, &mut arm_env);
                     }
                 }
                 Ok(EvalValue::Null)
@@ -1279,13 +1403,193 @@ impl<'a> Evaluator<'a> {
             DocumentExprOp::Constructor {
                 template,
                 constructor,
+                element_context,
                 arguments,
-            } => self.constructor(*template, *constructor, arguments.clone(), env),
+            } => self.constructor(
+                *template,
+                *constructor,
+                *element_context,
+                arguments.clone(),
+                env,
+            ),
             DocumentExprOp::Materialize { materialization } => {
                 self.materialize(*materialization, env)
             }
+            DocumentExprOp::RuntimeExpression {
+                expression,
+                bindings,
+            } => self.runtime_expression(*expression, bindings, env),
             DocumentExprOp::NoElement => Ok(EvalValue::Nodes(Vec::new())),
         }
+    }
+
+    fn eval_builtin_call(
+        &mut self,
+        builtin: DocumentBuiltin,
+        input: Option<EvalValue>,
+        arguments: Vec<(String, EvalValue)>,
+    ) -> Result<EvalValue, DocumentError> {
+        let runtime_list = input
+            .as_ref()
+            .into_iter()
+            .chain(arguments.iter().map(|(_, value)| value))
+            .find_map(|value| match value {
+                EvalValue::RuntimeList { list, logical_len } => Some((*list, *logical_len)),
+                _ => None,
+            });
+        let Some((list, logical_len)) = runtime_list else {
+            return Ok(eval_builtin(builtin, input, arguments));
+        };
+        match builtin {
+            DocumentBuiltin::ListCount | DocumentBuiltin::ListLength => {
+                Ok(EvalValue::Number(logical_len as f64))
+            }
+            DocumentBuiltin::ListIsNotEmpty => Ok(EvalValue::Bool(logical_len != 0)),
+            DocumentBuiltin::ListGet => {
+                let index = named_number(&arguments, "index").unwrap_or(0.0);
+                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                    return Ok(EvalValue::Null);
+                }
+                self.runtime_list_row(list, logical_len, index as u64)
+            }
+            DocumentBuiltin::ListLatest => {
+                if logical_len == 0 {
+                    Ok(EvalValue::Null)
+                } else {
+                    self.runtime_list_row(list, logical_len, logical_len - 1)
+                }
+            }
+            _ => Err(DocumentError::InvalidPlan(format!(
+                "document builtin {builtin:?} received logical list {} without a bounded typed lowering",
+                list.0
+            ))),
+        }
+    }
+
+    fn runtime_list_row(
+        &mut self,
+        list: ListId,
+        logical_len: u64,
+        index: u64,
+    ) -> Result<EvalValue, DocumentError> {
+        if index >= logical_len {
+            return Ok(EvalValue::Null);
+        }
+        let end = index.checked_add(1).ok_or_else(|| {
+            DocumentError::Evaluation("document list index overflowed".to_owned())
+        })?;
+        let (current_logical_len, mut rows) = self
+            .session
+            .list_row_snapshots_window_current(list, index..end)
+            .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
+        if current_logical_len != logical_len {
+            return Err(DocumentError::Evaluation(
+                "document logical list changed during one bounded read".to_owned(),
+            ));
+        }
+        let Some(row) = rows.pop() else {
+            return Ok(EvalValue::Null);
+        };
+        Ok(EvalValue::Row {
+            id: Some(row.id),
+            fields: row.fields,
+        })
+    }
+
+    fn runtime_expression(
+        &mut self,
+        expression: PlanRowExpressionId,
+        bindings: &[DocumentRuntimeLocalBinding],
+        env: &EvalEnv,
+    ) -> Result<EvalValue, DocumentError> {
+        let machine_plan = Arc::clone(&self.runtime.machine_plan);
+        machine_plan
+            .row_expressions
+            .visit_inputs(expression, &mut |input| match input {
+                ValueRef::State(state)
+                | ValueRef::StateProjection {
+                    state_id: state, ..
+                } => {
+                    let target = self.runtime_state_target(state, env);
+                    self.record_dependency(DocumentDependency::Value(target));
+                }
+                ValueRef::Field(field) => {
+                    let target = self.runtime_field_target(field, env);
+                    self.record_dependency(DocumentDependency::Value(target));
+                }
+                ValueRef::List(list) => {
+                    self.structural_lists.insert(list);
+                }
+                ValueRef::DistributedImport(import) => {
+                    self.record_dependency(DocumentDependency::DistributedImport(import));
+                }
+                ValueRef::Source(_) | ValueRef::SourcePayload { .. } | ValueRef::Constant(_) => {}
+            })
+            .map_err(|error| DocumentError::InvalidPlan(error.to_string()))?;
+        machine_plan
+            .row_expressions
+            .visit_list_fields(expression, &mut |list, field| {
+                self.structural_list_fields.insert((list, field));
+            })
+            .map_err(|error| DocumentError::InvalidPlan(error.to_string()))?;
+
+        let bindings = bindings
+            .iter()
+            .map(|binding| {
+                let value = env.parameters.get(&binding.parameter).ok_or_else(|| {
+                    DocumentError::InvalidPlan(format!(
+                        "runtime expression local {}:{} references inactive parameter {}",
+                        binding.owner.0, binding.local.0, binding.parameter.0
+                    ))
+                })?;
+                let value = guard_value(value).ok_or_else(|| {
+                    DocumentError::Evaluation(format!(
+                        "runtime expression local {}:{} cannot cross the retained-value boundary",
+                        binding.owner.0, binding.local.0
+                    ))
+                })?;
+                Ok(ExpressionLocalBinding {
+                    owner: binding.owner,
+                    local: binding.local,
+                    value,
+                })
+            })
+            .collect::<Result<Vec<_>, DocumentError>>()?;
+        self.session
+            .evaluate_plan_expression_current(expression, env.active_row, &bindings)
+            .map(machine_value_to_eval)
+            .map_err(|error| DocumentError::Evaluation(error.to_string()))
+    }
+
+    fn runtime_field_target(&self, field: FieldId, env: &EvalEnv) -> ValueTarget {
+        if let Some(row) = env.active_row
+            && self.runtime.field_owners.get(&field) == Some(&row.list)
+        {
+            return ValueTarget::RowField { row, field };
+        }
+        self.runtime
+            .field_state_aliases
+            .get(&field)
+            .copied()
+            .map(|state| self.runtime_state_target(state, env))
+            .unwrap_or(ValueTarget::Field(field))
+    }
+
+    fn runtime_state_target(&self, state: boon_plan::StateId, env: &EvalEnv) -> ValueTarget {
+        if let Some(row) = env.active_row
+            && let Some(slot) = self
+                .runtime
+                .machine_plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == state && slot.indexed)
+            && slot.owner.ancestors.last().map(|owner| owner.list) == Some(row.list)
+            && let Some(field) = slot.indexed_field_id
+        {
+            return ValueTarget::RowField { row, field };
+        }
+        ValueTarget::State(state)
     }
 
     fn constant(&self, id: DocumentConstantId) -> Result<EvalValue, DocumentError> {
@@ -1342,18 +1646,11 @@ impl<'a> Evaluator<'a> {
             DocumentRead::DistributedImport { import } => self.read_distributed_import(import),
             DocumentRead::List { list } => {
                 self.structural_lists.insert(list);
-                let rows = self
+                let logical_len = self
                     .session
-                    .list_row_snapshots_current(list)
+                    .list_logical_len_current(list)
                     .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
-                Ok(EvalValue::List(
-                    rows.into_iter()
-                        .map(|row| EvalValue::Row {
-                            id: Some(row.id),
-                            fields: row.fields,
-                        })
-                        .collect(),
-                ))
+                Ok(EvalValue::RuntimeList { list, logical_len })
             }
             DocumentRead::Source { source } => Ok(EvalValue::Source(source)),
             DocumentRead::Parameter {
@@ -1370,13 +1667,6 @@ impl<'a> Evaluator<'a> {
                 env.locals.get(&local).cloned().unwrap_or(EvalValue::Null),
                 &projection,
             )),
-            DocumentRead::Passed { projection } => {
-                if matches!(env.passed, Some(EvalValue::Global) | None) {
-                    self.resolve_global_projection(&projection)
-                } else {
-                    Ok(self.project(env.passed.clone().unwrap_or(EvalValue::Null), &projection))
-                }
-            }
             DocumentRead::Matched {
                 selector,
                 projection,
@@ -1415,10 +1705,19 @@ impl<'a> Evaluator<'a> {
                     Ok(self.project(snapshot, &projection))
                 }
             }
-            DocumentRead::ElementState { projection } => {
+            DocumentRead::ElementState {
+                context,
+                projection,
+            } => {
+                if env.element_context != Some(context) {
+                    return Err(DocumentError::Evaluation(format!(
+                        "element state context {:?} is not active",
+                        context
+                    )));
+                }
                 let state = EvalValue::Record(BTreeMap::from([
                     ("focused".to_owned(), EvalValue::Bool(false)),
-                    ("hover".to_owned(), EvalValue::Bool(false)),
+                    ("hovered".to_owned(), EvalValue::Bool(false)),
                     ("pressed".to_owned(), EvalValue::Bool(false)),
                     ("selected".to_owned(), EvalValue::Bool(false)),
                 ]));
@@ -1532,10 +1831,7 @@ impl<'a> Evaluator<'a> {
                 Ok(ScalarTargetUse::Independent)
             }
             DocumentExprOp::Read { read } => {
-                if self.direct_read_target(read, env) == Some(target)
-                    || (matches!(read, DocumentRead::Passed { .. })
-                        && matches!(env.passed, None | Some(EvalValue::Global)))
-                {
+                if self.direct_read_target(read, env) == Some(target) {
                     Ok(ScalarTargetUse::Unguarded)
                 } else {
                     Ok(ScalarTargetUse::Independent)
@@ -1577,7 +1873,6 @@ impl<'a> Evaluator<'a> {
                 expressions.push(*result);
                 self.merge_scalar_target_uses(&expressions, env, target, next)
             }
-            DocumentExprOp::FunctionCall { .. } => Ok(ScalarTargetUse::Unguarded),
             DocumentExprOp::Builtin {
                 input, arguments, ..
             } => {
@@ -1631,9 +1926,9 @@ impl<'a> Evaluator<'a> {
                 expressions.extend(*output);
                 self.merge_scalar_target_uses(&expressions, env, target, next)
             }
-            DocumentExprOp::Constructor { .. } | DocumentExprOp::Materialize { .. } => {
-                Ok(ScalarTargetUse::Unguarded)
-            }
+            DocumentExprOp::Constructor { .. }
+            | DocumentExprOp::Materialize { .. }
+            | DocumentExprOp::RuntimeExpression { .. } => Ok(ScalarTargetUse::Unguarded),
         }
     }
 
@@ -1702,7 +1997,6 @@ impl<'a> Evaluator<'a> {
             | DocumentRead::Source { .. }
             | DocumentRead::Parameter { .. }
             | DocumentRead::Local { .. }
-            | DocumentRead::Passed { .. }
             | DocumentRead::Matched { .. }
             | DocumentRead::Row { field: None, .. }
             | DocumentRead::ElementState { .. } => None,
@@ -1734,9 +2028,6 @@ impl<'a> Evaluator<'a> {
                 | DocumentRead::Local { .. }
                 | DocumentRead::Matched { .. }
                 | DocumentRead::ElementState { .. } => true,
-                DocumentRead::Passed { .. } => {
-                    !matches!(env.passed, None | Some(EvalValue::Global))
-                }
                 DocumentRead::State { .. }
                 | DocumentRead::Field { .. }
                 | DocumentRead::DistributedImport { .. }
@@ -1793,42 +2084,14 @@ impl<'a> Evaluator<'a> {
                         .iter()
                         .all(|output| self.guard_key_expression(*output, env, next))
             }
-            DocumentExprOp::FunctionCall { .. }
-            | DocumentExprOp::Constructor { .. }
-            | DocumentExprOp::Materialize { .. } => false,
+            DocumentExprOp::Constructor { .. }
+            | DocumentExprOp::Materialize { .. }
+            | DocumentExprOp::RuntimeExpression { .. } => false,
         }
     }
 
     fn value(&self, value: Value) -> EvalValue {
-        match value {
-            Value::Null => EvalValue::Null,
-            Value::Bool(value) => EvalValue::Bool(value),
-            Value::Number(value) => EvalValue::Number(value.get()),
-            Value::Text(value) => EvalValue::Text(value),
-            Value::Bytes(value) => EvalValue::Bytes(value),
-            Value::List(values) => {
-                EvalValue::List(values.into_iter().map(|value| self.value(value)).collect())
-            }
-            Value::Record(values) => EvalValue::Record(
-                values
-                    .into_iter()
-                    .map(|(name, value)| (name, self.value(value)))
-                    .collect(),
-            ),
-            Value::MappedRow { id, fields } => EvalValue::MappedRow {
-                id,
-                fields: fields
-                    .into_iter()
-                    .map(|(name, value)| (name, self.value(value)))
-                    .collect(),
-            },
-            Value::Row { id, fields } => EvalValue::Row {
-                id: Some(id),
-                fields,
-            },
-            Value::Error { code } => EvalValue::Text(code),
-            Value::HostBound { visible, .. } => self.value(*visible),
-        }
+        machine_value_to_eval(value)
     }
 
     fn project(&mut self, mut value: EvalValue, path: &[DocumentNameId]) -> EvalValue {
@@ -1901,15 +2164,6 @@ impl<'a> Evaluator<'a> {
                         })
                         .unwrap_or(EvalValue::Null)
                 }
-                EvalValue::Global => {
-                    return self
-                        .resolve_global_names(
-                            path.iter()
-                                .filter_map(|name| self.name(*name).ok())
-                                .collect::<Vec<_>>(),
-                        )
-                        .unwrap_or(EvalValue::Null);
-                }
                 _ => EvalValue::Null,
             };
         }
@@ -1944,69 +2198,10 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn resolve_global_projection(
-        &mut self,
-        projection: &[DocumentNameId],
-    ) -> Result<EvalValue, DocumentError> {
-        let names = projection
-            .iter()
-            .map(|name| self.name(*name))
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(value) = self.resolve_global_names(names.clone()) {
-            return Ok(value);
-        }
-        let path = names.join(".");
-        if let Some(target) = self.runtime.global_targets.get(&path).copied() {
-            return self.read_target(target);
-        }
-        self.global_record(&path)
-    }
-
-    fn resolve_global_names(&self, names: Vec<&str>) -> Option<EvalValue> {
-        let path = names.join(".");
-        self.runtime
-            .routes
-            .iter()
-            .find_map(|(source, route)| (route == &path).then_some(EvalValue::Source(*source)))
-    }
-
-    fn global_record(&mut self, path: &str) -> Result<EvalValue, DocumentError> {
-        let normalized = path.strip_suffix(".events").unwrap_or(path);
-        let mut fields = BTreeMap::new();
-        let source_prefix = format!("{normalized}.");
-        for (source, route) in &self.runtime.routes {
-            if let Some(rest) = route.strip_prefix(&source_prefix) {
-                insert_path(&mut fields, rest, EvalValue::Source(*source));
-            }
-        }
-        let target_prefix = format!("{path}.");
-        let targets = self
-            .runtime
-            .global_targets
-            .iter()
-            .filter_map(|(candidate, target)| {
-                candidate
-                    .strip_prefix(&target_prefix)
-                    .map(|rest| (rest.to_owned(), *target))
-            })
-            .collect::<Vec<_>>();
-        for (rest, target) in targets {
-            if let Ok(value) = self.read_target(target) {
-                insert_path(&mut fields, &rest, value);
-            }
-        }
-        if fields.is_empty() {
-            Ok(EvalValue::Null)
-        } else {
-            Ok(EvalValue::Record(fields))
-        }
-    }
-
     fn call_function(
         &mut self,
         function: DocumentFunctionId,
         parameters: BTreeMap<boon_plan::DocumentParameterId, EvalValue>,
-        passed: Option<EvalValue>,
         caller: &EvalEnv,
         instance: String,
     ) -> Result<EvalValue, DocumentError> {
@@ -2023,7 +2218,6 @@ impl<'a> Evaluator<'a> {
         let mut env = caller.clone();
         env.parameters = Arc::new(parameters);
         env.locals = Arc::new(BTreeMap::new());
-        env.passed = passed;
         Arc::make_mut(&mut env.instance).push(instance);
         self.eval(function.body, &mut env)
     }
@@ -2047,6 +2241,38 @@ impl<'a> Evaluator<'a> {
         })
     }
 
+    fn install_pattern_rows(
+        &mut self,
+        input: &EvalValue,
+        bindings: &[boon_plan::DocumentSelectBinding],
+        env: &mut EvalEnv,
+    ) -> Result<(), DocumentError> {
+        let mut rows = BTreeMap::new();
+        for binding in bindings {
+            let value = self.project(input.clone(), &binding.projection);
+            let row = match value {
+                EvalValue::Row { id: Some(row), .. } | EvalValue::MappedRow { id: row, .. } => row,
+                _ => continue,
+            };
+            let Some(scope) = self.runtime.list_scopes.get(&row.list).copied() else {
+                return Err(DocumentError::InvalidPlan(format!(
+                    "pattern-bound row from list {} has no canonical document scope",
+                    row.list.0
+                )));
+            };
+            if let Some(previous) = rows.insert(scope, row)
+                && previous != row
+            {
+                return Err(DocumentError::Evaluation(format!(
+                    "pattern bindings resolve multiple rows for document scope {}",
+                    scope.0
+                )));
+            }
+        }
+        Arc::make_mut(&mut env.rows).extend(rows);
+        Ok(())
+    }
+
     fn materialize(
         &mut self,
         id: DocumentMaterializationId,
@@ -2062,11 +2288,42 @@ impl<'a> Evaluator<'a> {
             .ok_or_else(|| {
                 DocumentError::InvalidPlan(format!("materialization {} is missing", id.0))
             })?;
-        let source = self.materialization_source(&materialization, env)?;
-        let items = match source {
-            EvalValue::List(items) => items,
-            EvalValue::Null => Vec::new(),
-            value => vec![value],
+        enum MaterializationSourceRows {
+            DirectList(ListId),
+            Values(Vec<EvalValue>),
+        }
+        let (source, logical_item_count) = match materialization.source.clone() {
+            DocumentMaterializationSource::List { list } => {
+                self.structural_lists.insert(list);
+                let logical_item_count = self
+                    .session
+                    .list_logical_len_current(list)
+                    .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
+                (
+                    MaterializationSourceRows::DirectList(list),
+                    logical_item_count,
+                )
+            }
+            _ => {
+                let source = self.materialization_source(&materialization, env)?;
+                match source {
+                    EvalValue::RuntimeList { list, logical_len } => {
+                        self.structural_lists.insert(list);
+                        (MaterializationSourceRows::DirectList(list), logical_len)
+                    }
+                    EvalValue::List(items) => {
+                        let logical_item_count = u64::try_from(items.len()).map_err(|_| {
+                            DocumentError::Evaluation(
+                                "document materialization length does not fit the logical key space"
+                                    .to_owned(),
+                            )
+                        })?;
+                        (MaterializationSourceRows::Values(items), logical_item_count)
+                    }
+                    EvalValue::Null => (MaterializationSourceRows::Values(Vec::new()), 0),
+                    value => (MaterializationSourceRows::Values(vec![value]), 1),
+                }
+            }
         };
         let demand =
             self.runtime
@@ -2078,7 +2335,7 @@ impl<'a> Evaluator<'a> {
                     visible: 0..DEFAULT_VISIBLE_ITEMS,
                     overscan: 0..DEFAULT_VISIBLE_ITEMS.saturating_add(DEFAULT_OVERSCAN_ITEMS),
                 });
-        let demand = if !items.is_empty() && self.runtime.empty_source_windows.contains(&id) {
+        let demand = if logical_item_count != 0 && self.runtime.empty_source_windows.contains(&id) {
             self.runtime
                 .last_nonempty_windows
                 .get(&id)
@@ -2086,6 +2343,45 @@ impl<'a> Evaluator<'a> {
                 .unwrap_or(demand)
         } else {
             demand
+        };
+        let logical_item_count_usize = usize::try_from(logical_item_count).map_err(|_| {
+            DocumentError::Evaluation(
+                "document materialization length does not fit this target".to_owned(),
+            )
+        })?;
+        let range = clamp_range(demand.overscan.clone(), logical_item_count_usize);
+        let items: Vec<(u64, EvalValue)> = match source {
+            MaterializationSourceRows::DirectList(list) => {
+                let (current_logical_item_count, rows) = self
+                    .session
+                    .list_row_snapshots_window_current(list, range.clone())
+                    .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
+                if current_logical_item_count != logical_item_count {
+                    return Err(DocumentError::Evaluation(
+                        "document materialization source changed during one currentness read"
+                            .to_owned(),
+                    ));
+                }
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(offset, row)| {
+                        (
+                            range.start.saturating_add(offset as u64),
+                            EvalValue::Row {
+                                id: Some(row.id),
+                                fields: row.fields,
+                            },
+                        )
+                    })
+                    .collect()
+            }
+            MaterializationSourceRows::Values(items) => items
+                .into_iter()
+                .enumerate()
+                .skip(range.start as usize)
+                .take(range.end.saturating_sub(range.start) as usize)
+                .map(|(index, item)| (index as u64, item))
+                .collect(),
         };
         if let Some(parent) = env.parent.as_ref()
             && let Some(node) = self.frame.nodes.get_mut(parent)
@@ -2098,12 +2394,11 @@ impl<'a> Evaluator<'a> {
             node.materialized.push(MaterializedRange {
                 materialization: Some(id.0),
                 axis,
-                visible: clamp_range(demand.visible.clone(), items.len()),
-                overscan: clamp_range(demand.overscan.clone(), items.len()),
-                logical_item_count: items.len() as u64,
+                visible: clamp_range(demand.visible.clone(), logical_item_count_usize),
+                overscan: range,
+                logical_item_count,
             });
         }
-        let range = clamp_range(demand.overscan, items.len());
         let static_arguments = materialization
             .template_arguments
             .iter()
@@ -2112,40 +2407,83 @@ impl<'a> Evaluator<'a> {
                     .map(|value| (argument.parameter, value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let mut nodes = Vec::new();
-        for (index, item) in items
-            .into_iter()
-            .enumerate()
-            .skip(range.start as usize)
-            .take(range.end.saturating_sub(range.start) as usize)
-        {
-            let row = self.materialization_row(&materialization, &item, index);
-            if let Some(row) = row {
-                self.materialized_rows.insert(row);
+        let scoped_generation = match materialization.row_identity {
+            DocumentRowIdentity::ListHiddenKeyAndGeneration { .. } => None,
+            DocumentRowIdentity::ScopedHiddenKeyAndGeneration { .. } => {
+                let owner = ScopedMaterializationOwner {
+                    materialization: id,
+                    parent_instance: env.instance.as_ref().clone(),
+                };
+                self.active_scoped_materialization_owners
+                    .insert(owner.clone());
+                Some(
+                    self.scoped_materialization_identities
+                        .reconcile(owner, logical_item_count_usize)?,
+                )
             }
+        };
+        let mut nodes = Vec::new();
+        for (logical_index, item) in items {
+            let row = self.materialization_row(&item);
+            let identity = match materialization.row_identity {
+                DocumentRowIdentity::ListHiddenKeyAndGeneration { list } => {
+                    let row = row.ok_or_else(|| {
+                        DocumentError::Evaluation(format!(
+                            "document materialization {} item has no hidden row key and generation",
+                            id.0
+                        ))
+                    })?;
+                    if row.list != list {
+                        return Err(DocumentError::InvalidPlan(format!(
+                            "document materialization {} expected ListId {}, received ListId {}",
+                            id.0, list.0, row.list.0
+                        )));
+                    }
+                    DocumentItemIdentity::Stored(row)
+                }
+                DocumentRowIdentity::ScopedHiddenKeyAndGeneration { scope } => match row {
+                    Some(row) => DocumentItemIdentity::Stored(row),
+                    None => {
+                        let generation = scoped_generation.ok_or_else(|| {
+                            DocumentError::InvalidPlan(format!(
+                                "document materialization {} has no scoped generation for item {}",
+                                id.0, logical_index
+                            ))
+                        })?;
+                        DocumentItemIdentity::Scoped {
+                            scope,
+                            key: logical_index.saturating_add(1),
+                            generation,
+                        }
+                    }
+                },
+            };
+            self.materialized_items.insert(identity.clone());
             let mut parameters = static_arguments.clone();
             parameters.insert(materialization.item_parameter, item);
             let mut row_env = env.clone();
             if let Some(row) = row {
-                Arc::make_mut(&mut row_env.rows).insert(materialization.item_scope, row);
+                let rows = Arc::make_mut(&mut row_env.rows);
+                let structural_rows = self
+                    .session
+                    .structural_owner_rows(row)
+                    .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
+                for structural_row in structural_rows {
+                    if let Some(scope) = self.runtime.list_scopes.get(&structural_row.list).copied()
+                    {
+                        rows.insert(scope, structural_row);
+                    }
+                }
+                rows.insert(materialization.item_scope, row);
                 row_env.active_row = Some(row);
             }
-            let identity = row
-                .map(|row| format!("{}-{}-{}", row.list.0, row.key, row.generation))
-                .unwrap_or_else(|| format!("synthetic-{index}"));
             let value = self.call_function(
                 materialization.template_function,
                 parameters,
-                env.passed.clone(),
                 &row_env,
-                format!("materialize-{}-{identity}", id.0),
+                format!("materialize-{}-{}", id.0, identity.instance_fragment()),
             )?;
             let created = value.node_ids();
-            if let Some(row) = row {
-                for node in &created {
-                    self.apply_row_identity(node, row);
-                }
-            }
             nodes.extend(created);
         }
         Ok(EvalValue::Nodes(nodes))
@@ -2157,21 +2495,9 @@ impl<'a> Evaluator<'a> {
         env: &mut EvalEnv,
     ) -> Result<EvalValue, DocumentError> {
         match materialization.source.clone() {
-            DocumentMaterializationSource::List { list } => {
-                self.structural_lists.insert(list);
-                let rows = self
-                    .session
-                    .list_row_snapshots(list)
-                    .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
-                Ok(EvalValue::List(
-                    rows.into_iter()
-                        .map(|row| EvalValue::Row {
-                            id: Some(row.id),
-                            fields: row.fields,
-                        })
-                        .collect(),
-                ))
-            }
+            DocumentMaterializationSource::List { .. } => Err(DocumentError::InvalidPlan(
+                "direct list materialization bypassed its bounded window path".to_owned(),
+            )),
             DocumentMaterializationSource::Field { field } => {
                 if let Some(row) = env.active_row
                     && self.runtime.field_owners.get(&field) == Some(&row.list)
@@ -2218,23 +2544,12 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn materialization_row(
-        &self,
-        materialization: &DocumentMaterialization,
-        item: &EvalValue,
-        index: usize,
-    ) -> Option<RowId> {
+    fn materialization_row(&self, item: &EvalValue) -> Option<RowId> {
         match item {
             EvalValue::Row { id: Some(row), .. } | EvalValue::MappedRow { id: row, .. } => {
-                return Some(*row);
+                Some(*row)
             }
-            _ => {}
-        }
-        match materialization.row_identity {
-            boon_plan::DocumentRowIdentity::ListHiddenKeyAndGeneration { list } => {
-                self.session.list_row_at(list, index)
-            }
-            boon_plan::DocumentRowIdentity::ScopedHiddenKeyAndGeneration { .. } => None,
+            _ => None,
         }
     }
 
@@ -2242,6 +2557,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         template: DocumentTemplateId,
         constructor: DocumentConstructor,
+        element_context: Option<DocumentElementContextId>,
         arguments: Vec<boon_plan::DocumentConstructorArgument>,
         env: &mut EvalEnv,
     ) -> Result<EvalValue, DocumentError> {
@@ -2267,6 +2583,8 @@ impl<'a> Evaluator<'a> {
             .ok_or_else(|| {
                 DocumentError::InvalidPlan(format!("template {} is missing", template.0))
             })?;
+        let mut element_env = env.clone();
+        element_env.element_context = element_context;
         let mut evaluated = Vec::new();
         let mut delayed = Vec::new();
         for argument in arguments {
@@ -2277,13 +2595,13 @@ impl<'a> Evaluator<'a> {
                 delayed.push(argument);
             } else {
                 let class = self.runtime.plan().expressions[argument.value.0].value_class;
-                let environment = env.clone();
+                let environment = element_env.clone();
                 let retain_scalar = class == boon_plan::DocumentValueClass::DynamicScalar
                     && retained_argument_role(argument.role)
                     && self.name(argument.name)? != "direction";
                 let (value, binding) = if retain_scalar {
                     let (value, dependencies, guards) =
-                        self.eval_retained_scalar(argument.value, env)?;
+                        self.eval_retained_scalar(argument.value, &mut element_env)?;
                     if retained_value_affects_structure(argument.role, &value) {
                         self.structural_dependencies
                             .extend(dependencies.iter().copied());
@@ -2300,7 +2618,7 @@ impl<'a> Evaluator<'a> {
                         )
                     }
                 } else {
-                    (self.eval(argument.value, env)?, None)
+                    (self.eval(argument.value, &mut element_env)?, None)
                 };
                 evaluated.push(EvaluatedArgument {
                     name: argument.name,
@@ -2318,9 +2636,6 @@ impl<'a> Evaluator<'a> {
         let id = self.instance_node_id(template_node, env, row);
         let mut node = DocumentNode::new(id.0.clone(), kind);
         node.parent = env.parent.clone();
-        if let Some(row) = row {
-            insert_row_identity(&mut node, row);
-        }
         if node.kind == DocumentNodeKind::MapViewport {
             node.map_viewport = Some(Box::new(evaluate_map_viewport_descriptor(
                 evaluated
@@ -2335,7 +2650,7 @@ impl<'a> Evaluator<'a> {
                 argument.name,
                 argument.role,
                 argument.value.clone(),
-                row,
+                &element_env,
             )?;
             retained_arguments.push(RetainedArgument {
                 name: argument.name,
@@ -2358,7 +2673,7 @@ impl<'a> Evaluator<'a> {
             node.style.insert("link".to_owned(), StyleValue::Bool(true));
         }
         self.add_node(node);
-        let mut child_env = env.clone();
+        let mut child_env = element_env.clone();
         child_env.parent = Some(id.clone());
         Arc::make_mut(&mut child_env.instance).push(format!("node-{template_node}"));
         for argument in delayed {
@@ -2402,7 +2717,7 @@ impl<'a> Evaluator<'a> {
                 }
                 DocumentArgumentRole::EventBindings => {
                     if let Some(node) = self.frame.nodes.get_mut(&id) {
-                        attach_sources(node, &self.runtime.routes, &value, row);
+                        attach_sources(self.runtime, self.session, node, &value, &child_env)?;
                     }
                     retained_arguments.push(RetainedArgument {
                         name: argument.name,
@@ -2425,7 +2740,7 @@ impl<'a> Evaluator<'a> {
                     .map(|node| node.kind.clone())
                     .unwrap_or(DocumentNodeKind::Stack),
                 parent: env.parent.clone(),
-                row,
+                environment: element_env,
                 arguments: retained_arguments,
             },
         );
@@ -2454,9 +2769,9 @@ impl<'a> Evaluator<'a> {
         name: DocumentNameId,
         role: DocumentArgumentRole,
         value: EvalValue,
-        row: Option<RowId>,
+        env: &EvalEnv,
     ) -> Result<(), DocumentError> {
-        apply_argument(self.runtime, node, name, role, value, row)
+        apply_argument(self.runtime, self.session, node, name, role, value, env)
     }
 
     fn add_node(&mut self, mut node: DocumentNode) {
@@ -2529,12 +2844,6 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn apply_row_identity(&mut self, id: &FrameNodeId, row: RowId) {
-        if let Some(node) = self.frame.nodes.get_mut(id) {
-            insert_row_identity(node, row);
-        }
-    }
-
     fn configure_scroll_ranges(&mut self, id: &FrameNodeId) {
         let Some(node) = self.frame.nodes.get_mut(id) else {
             return;
@@ -2578,11 +2887,12 @@ impl<'a> Evaluator<'a> {
 
 fn apply_argument(
     runtime: &DocumentRuntime,
+    session: &MachineInstance,
     node: &mut DocumentNode,
     name: DocumentNameId,
     role: DocumentArgumentRole,
     value: EvalValue,
-    row: Option<RowId>,
+    env: &EvalEnv,
 ) -> Result<(), DocumentError> {
     let name = runtime
         .plan()
@@ -2599,7 +2909,7 @@ fn apply_argument(
         DocumentArgumentRole::StaticText | DocumentArgumentRole::DynamicText => {
             apply_text_argument(node, name, value)
         }
-        DocumentArgumentRole::EventBindings => attach_sources(node, &runtime.routes, &value, row),
+        DocumentArgumentRole::EventBindings => attach_sources(runtime, session, node, &value, env)?,
         DocumentArgumentRole::Value => apply_value_argument(node, name, value),
         DocumentArgumentRole::Child
         | DocumentArgumentRole::Children
@@ -2649,7 +2959,7 @@ fn retained_value_affects_structure(role: DocumentArgumentRole, value: &EvalValu
 impl EvalValue {
     fn text(&self) -> String {
         match self {
-            Self::Null | Self::Global => String::new(),
+            Self::Null => String::new(),
             Self::Bool(value) => if *value { "True" } else { "False" }.to_owned(),
             Self::Number(value) => format_number(*value),
             Self::Text(value) | Self::Enum(value) => value.clone(),
@@ -2664,6 +2974,7 @@ impl EvalValue {
                 .unwrap_or_else(|| format_record(None, fields)),
             Self::Tagged(tag, fields) => format_record(Some(tag), fields),
             Self::List(values) => values.iter().map(Self::text).collect::<Vec<_>>().join(""),
+            Self::RuntimeList { .. } => String::new(),
             Self::Row { .. } => String::new(),
             Self::Source(_) => String::new(),
             Self::Nodes(_) => String::new(),
@@ -2679,9 +2990,10 @@ impl EvalValue {
             Self::Record(value) | Self::Tagged(_, value) => !value.is_empty(),
             Self::MappedRow { fields, .. } => !fields.is_empty(),
             Self::List(value) => !value.is_empty(),
+            Self::RuntimeList { logical_len, .. } => *logical_len != 0,
             Self::Nodes(value) => !value.is_empty(),
             Self::Row { .. } => true,
-            Self::Null | Self::Source(_) | Self::Global => false,
+            Self::Null | Self::Source(_) => false,
         }
     }
 
@@ -2714,10 +3026,10 @@ fn inline_content_text(value: &EvalValue) -> Option<String> {
         | EvalValue::MappedRow { .. }
         | EvalValue::Tagged(_, _)
         | EvalValue::List(_)
+        | EvalValue::RuntimeList { .. }
         | EvalValue::Row { .. }
         | EvalValue::Source(_)
-        | EvalValue::Nodes(_)
-        | EvalValue::Global => None,
+        | EvalValue::Nodes(_) => None,
     }
 }
 
@@ -2773,11 +3085,63 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
             id: *id,
             fields: fields.clone(),
         }),
-        EvalValue::Tagged(_, _)
+        EvalValue::Tagged(tag, fields) => {
+            let mut record = fields
+                .iter()
+                .map(|(name, value)| Some((name.clone(), guard_value(value)?)))
+                .collect::<Option<BTreeMap<_, _>>>()?;
+            if record
+                .insert("$tag".to_owned(), Value::Text(tag.clone()))
+                .is_some()
+            {
+                return None;
+            }
+            Some(Value::Record(record))
+        }
+        EvalValue::RuntimeList { .. }
         | EvalValue::Row { id: None, .. }
         | EvalValue::Source(_)
-        | EvalValue::Nodes(_)
-        | EvalValue::Global => None,
+        | EvalValue::Nodes(_) => None,
+    }
+}
+
+fn machine_value_to_eval(value: Value) -> EvalValue {
+    match value {
+        Value::Null => EvalValue::Null,
+        Value::Bool(value) => EvalValue::Bool(value),
+        Value::Number(value) => EvalValue::Number(value.get()),
+        Value::Text(value) => EvalValue::Text(value),
+        Value::Bytes(value) => EvalValue::Bytes(value),
+        Value::List(values) => {
+            EvalValue::List(values.into_iter().map(machine_value_to_eval).collect())
+        }
+        Value::Record(values) => {
+            let mut fields = values
+                .into_iter()
+                .map(|(name, value)| (name, machine_value_to_eval(value)))
+                .collect::<BTreeMap<_, _>>();
+            match fields.remove("$tag") {
+                Some(EvalValue::Text(tag)) => EvalValue::Tagged(tag, fields),
+                Some(value) => {
+                    fields.insert("$tag".to_owned(), value);
+                    EvalValue::Record(fields)
+                }
+                None => EvalValue::Record(fields),
+            }
+        }
+        Value::MappedRow { id, fields } => EvalValue::MappedRow {
+            id,
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name, machine_value_to_eval(value)))
+                .collect(),
+        },
+        Value::Row { id, fields } => EvalValue::Row {
+            id: Some(id),
+            fields,
+        },
+        Value::Error { code } => EvalValue::Text(code),
+        Value::HostBound { visible, .. } => machine_value_to_eval(*visible),
     }
 }
 
@@ -2797,19 +3161,6 @@ fn spread_list(list: &mut Vec<EvalValue>, value: EvalValue) {
             list.extend(nodes.into_iter().map(|node| EvalValue::Nodes(vec![node])))
         }
         value => list.push(value),
-    }
-}
-
-fn insert_path(record: &mut BTreeMap<String, EvalValue>, path: &str, value: EvalValue) {
-    let Some((head, tail)) = path.split_once('.') else {
-        record.insert(path.to_owned(), value);
-        return;
-    };
-    let entry = record
-        .entry(head.to_owned())
-        .or_insert_with(|| EvalValue::Record(BTreeMap::new()));
-    if let EvalValue::Record(fields) = entry {
-        insert_path(fields, tail, value);
     }
 }
 
@@ -2889,7 +3240,7 @@ fn compare_binary(
 fn eval_builtin(
     builtin: DocumentBuiltin,
     input: Option<EvalValue>,
-    arguments: Vec<(Option<String>, EvalValue)>,
+    arguments: Vec<(String, EvalValue)>,
 ) -> EvalValue {
     let has_input = input.is_some();
     let mut values = input
@@ -2926,9 +3277,20 @@ fn eval_builtin(
                 .text()
                 .starts_with(&values.next().unwrap_or(EvalValue::Null).text()),
         ),
-        DocumentBuiltin::BytesToText | DocumentBuiltin::NumberToAsciiText => {
-            EvalValue::Text(first.text())
-        }
+        DocumentBuiltin::BytesToText => EvalValue::Text(first.text()),
+        DocumentBuiltin::NumberToAsciiText => EvalValue::Text(
+            first
+                .number()
+                .and_then(|value| FiniteReal::new(value).ok())
+                .map(|value| {
+                    format_number_ascii_text(
+                        value,
+                        named_number(&arguments, "width")
+                            .and_then(|width| FiniteReal::new(width).ok()),
+                    )
+                })
+                .unwrap_or_else(|| "?".to_owned()),
+        ),
         DocumentBuiltin::ErrorNew => EvalValue::Tagged(
             "Error".to_owned(),
             BTreeMap::from([("text".to_owned(), first)]),
@@ -2939,10 +3301,6 @@ fn eval_builtin(
             }
             value => EvalValue::Text(value.text()),
         },
-        DocumentBuiltin::ListAny => EvalValue::Bool(match first {
-            EvalValue::List(values) => values.into_iter().any(|value| value.truthy()),
-            value => value.truthy(),
-        }),
         DocumentBuiltin::ListAppend => {
             let mut list = match first {
                 EvalValue::List(values) => values,
@@ -2994,22 +3352,19 @@ fn eval_builtin(
                     .collect(),
             )
         }
-        DocumentBuiltin::ListRemove
-        | DocumentBuiltin::ListRetain
-        | DocumentBuiltin::ListSortBy
-        | DocumentBuiltin::ListMap => first,
-        DocumentBuiltin::ListFind => match first {
-            EvalValue::List(mut values) => values.drain(..).next().unwrap_or(EvalValue::Null),
-            value => value,
-        },
+        DocumentBuiltin::ListSortBy => first,
         DocumentBuiltin::ListSum => EvalValue::Number(match first {
             EvalValue::List(values) => values.iter().filter_map(EvalValue::number).sum(),
             value => value.number().unwrap_or(0.0),
         }),
-        DocumentBuiltin::NumberBitWidth => {
-            let value = first.number().unwrap_or(0.0).abs() as u64;
-            EvalValue::Number((u64::BITS - value.leading_zeros()) as f64)
-        }
+        DocumentBuiltin::NumberBitWidth => EvalValue::Number(
+            first
+                .number()
+                .and_then(|value| FiniteReal::new(value).ok())
+                .and_then(|value| number_bit_width(value).ok())
+                .map(FiniteReal::get)
+                .unwrap_or(0.0),
+        ),
         DocumentBuiltin::NumberCeil => EvalValue::Number(first.number().unwrap_or(0.0).ceil()),
         DocumentBuiltin::NumberFloor => EvalValue::Number(first.number().unwrap_or(0.0).floor()),
         DocumentBuiltin::NumberInterpolate => first,
@@ -3074,7 +3429,7 @@ fn eval_builtin(
                 arguments
                     .iter()
                     .skip(usize::from(!has_input))
-                    .filter(|(name, _)| name.as_deref() != Some("separator"))
+                    .filter(|(name, _)| name != "separator")
                     .map(|(_, value)| value.text()),
             );
             EvalValue::Text(parts.join(&separator))
@@ -3113,7 +3468,15 @@ fn eval_builtin(
         }),
         DocumentBuiltin::TextLength => EvalValue::Number(first.text().chars().count() as f64),
         DocumentBuiltin::TextSpace => EvalValue::Text(" ".to_owned()),
-        DocumentBuiltin::TextTimeRangeLabel => EvalValue::Text(first.text()),
+        DocumentBuiltin::TextTimeRangeLabel => {
+            let end = named_value(&arguments, "end")
+                .map(EvalValue::text)
+                .unwrap_or_default();
+            let unit = named_value(&arguments, "unit")
+                .map(EvalValue::text)
+                .unwrap_or_default();
+            EvalValue::Text(format!("{} {unit} - {end} {unit}", first.text()))
+        }
         DocumentBuiltin::TextToBytes => EvalValue::Bytes(first.text().into_bytes().into()),
         DocumentBuiltin::TextToLowercase => EvalValue::Text(first.text().to_lowercase()),
         DocumentBuiltin::TextToNumber => {
@@ -3124,12 +3487,7 @@ fn eval_builtin(
         DocumentBuiltin::LightAmbient
         | DocumentBuiltin::LightDirectional
         | DocumentBuiltin::LightSpot
-        | DocumentBuiltin::Svg => EvalValue::Record(
-            arguments
-                .into_iter()
-                .filter_map(|(name, value)| name.map(|name| (name, value)))
-                .collect(),
-        ),
+        | DocumentBuiltin::Svg => EvalValue::Record(arguments.into_iter().collect()),
         DocumentBuiltin::RouterGoTo | DocumentBuiltin::RouterRoute => first,
         DocumentBuiltin::DirectoryEntries
         | DocumentBuiltin::FileWriteText
@@ -3140,16 +3498,13 @@ fn eval_builtin(
     }
 }
 
-fn named_value<'a>(
-    arguments: &'a [(Option<String>, EvalValue)],
-    name: &str,
-) -> Option<&'a EvalValue> {
+fn named_value<'a>(arguments: &'a [(String, EvalValue)], name: &str) -> Option<&'a EvalValue> {
     arguments
         .iter()
-        .find_map(|(candidate, value)| (candidate.as_deref() == Some(name)).then_some(value))
+        .find_map(|(candidate, value)| (candidate == name).then_some(value))
 }
 
-fn named_number(arguments: &[(Option<String>, EvalValue)], name: &str) -> Option<f64> {
+fn named_number(arguments: &[(String, EvalValue)], name: &str) -> Option<f64> {
     named_value(arguments, name).and_then(EvalValue::number)
 }
 
@@ -4064,11 +4419,12 @@ fn record_value<'a>(value: &'a EvalValue, name: &str) -> Option<&'a EvalValue> {
 }
 
 fn attach_sources(
+    runtime: &DocumentRuntime,
+    session: &MachineInstance,
     node: &mut DocumentNode,
-    routes: &BTreeMap<SourceId, String>,
     value: &EvalValue,
-    row: Option<RowId>,
-) {
+    env: &EvalEnv,
+) -> Result<(), DocumentError> {
     let mut sources = Vec::new();
     collect_sources(value, None, true, &mut sources);
     sources.sort_unstable_by(|left, right| {
@@ -4076,25 +4432,25 @@ fn attach_sources(
     });
     sources.dedup();
     for (ordinal, (source, intent)) in sources.into_iter().enumerate() {
-        let Some(path) = routes.get(&source) else {
-            continue;
-        };
+        let path = runtime.routes.get(&source).ok_or_else(|| {
+            DocumentError::InvalidPlan(format!("source {} has no route path", source.0))
+        })?;
+        let route = runtime.source_route_token(session, source, env)?;
         let route_intent = path.rsplit('.').next().unwrap_or("source");
         let intent = intent
             .or_else(|| host_source_intent(route_intent).then(|| route_intent.to_owned()))
             .unwrap_or_else(|| "source".to_owned());
-        let row_suffix = row
-            .map(|row| format!(":{}:{}:{}", row.list.0, row.key, row.generation))
-            .unwrap_or_default();
         node.source_bindings.push(SourceBinding {
             id: SourceBindingId(format!(
-                "source:{}:{}:{}{}",
-                node.id.0, source.0, ordinal, row_suffix
+                "source:{}:{}:{}:{}",
+                node.id.0, source.0, ordinal, route.binding_epoch
             )),
             source_path: path.clone(),
             intent,
+            route: Some(route),
         });
     }
+    Ok(())
 }
 
 fn collect_sources(
@@ -4192,17 +4548,6 @@ fn host_source_intent(value: &str) -> bool {
     )
 }
 
-fn insert_row_identity(node: &mut DocumentNode, row: RowId) {
-    node.style
-        .insert("row_key".to_owned(), StyleValue::Number(row.key as f64));
-    node.style.insert(
-        "row_generation".to_owned(),
-        StyleValue::Number(row.generation as f64),
-    );
-    node.style
-        .insert("row_list".to_owned(), StyleValue::Number(row.list.0 as f64));
-}
-
 fn style_bool(style: &StyleMap, name: &str) -> bool {
     match style.get(name) {
         Some(StyleValue::Bool(value)) => *value,
@@ -4265,42 +4610,6 @@ fn field_state_alias_index(plan: &MachinePlan) -> BTreeMap<FieldId, boon_plan::S
                 .map(|state| (field, state))
         })
         .collect()
-}
-
-fn global_target_index(plan: &MachinePlan) -> BTreeMap<String, ValueTarget> {
-    let mut result = BTreeMap::new();
-    for entry in &plan.debug_map.state_slots {
-        if let Some(id) = entry
-            .id
-            .rsplit(':')
-            .next()
-            .and_then(|value| value.parse().ok())
-            .map(boon_plan::StateId)
-        {
-            result.insert(entry.label.clone(), ValueTarget::State(id));
-        }
-    }
-    let indexed = plan
-        .storage_layout
-        .list_slots
-        .iter()
-        .flat_map(|slot| slot.row_field_ids.iter().copied())
-        .collect::<BTreeSet<_>>();
-    for entry in &plan.debug_map.fields {
-        let Some(id) = entry
-            .id
-            .rsplit(':')
-            .next()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(FieldId)
-        else {
-            continue;
-        };
-        if !indexed.contains(&id) {
-            result.insert(entry.label.clone(), ValueTarget::Field(id));
-        }
-    }
-    result
 }
 
 fn frame_node_id(plan_id: u64, instance: Option<&str>) -> FrameNodeId {
@@ -4597,6 +4906,42 @@ fn diff_style(previous: &StyleMap, next: &StyleMap) -> StylePatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_tagged_values_keep_their_tag_and_payload_in_documents() {
+        let value = Value::Record(BTreeMap::from([
+            ("$tag".to_owned(), Value::Text("Found".to_owned())),
+            ("value".to_owned(), Value::Text("current".to_owned())),
+        ]));
+        let expected = EvalValue::Tagged(
+            "Found".to_owned(),
+            BTreeMap::from([("value".to_owned(), EvalValue::Text("current".to_owned()))]),
+        );
+
+        assert_eq!(machine_value_to_eval(value.clone()), expected);
+        assert_eq!(guard_value(&expected), Some(value));
+    }
+
+    #[test]
+    fn scoped_materialization_identity_metadata_is_constant_space_and_rotates_on_shrink() {
+        let owner = ScopedMaterializationOwner {
+            materialization: DocumentMaterializationId(7),
+            parent_instance: vec!["root".to_owned()],
+        };
+        let mut identities = ScopedMaterializationIdentities::default();
+
+        let initial = identities.reconcile(owner.clone(), 1_000_000).unwrap();
+        let grown = identities.reconcile(owner.clone(), 2_000_000).unwrap();
+        assert_eq!(initial, grown);
+        assert_eq!(identities.partitions.len(), 1);
+        assert_eq!(identities.partitions[&owner].logical_len, 2_000_000);
+
+        let shrunk = identities.reconcile(owner.clone(), 10).unwrap();
+        assert_ne!(shrunk, initial);
+        let regrown = identities.reconcile(owner.clone(), 1_000_000).unwrap();
+        assert_eq!(regrown, shrunk);
+        assert_eq!(identities.partitions.len(), 1);
+    }
 
     fn map_descriptor(generation: u64, longitude: f64) -> MapViewportDescriptor {
         MapViewportDescriptor {
@@ -4959,18 +5304,43 @@ mod tests {
                 DocumentBuiltin::TextConcat,
                 Some(EvalValue::Number(3.0)),
                 vec![
-                    (
-                        Some("with".to_owned()),
-                        EvalValue::Text("items left".to_owned())
-                    ),
-                    (
-                        Some("separator".to_owned()),
-                        EvalValue::Text(" ".to_owned())
-                    ),
+                    ("with".to_owned(), EvalValue::Text("items left".to_owned())),
+                    ("separator".to_owned(), EvalValue::Text(" ".to_owned())),
                 ],
             ),
             EvalValue::Text("3 items left".to_owned())
         );
+    }
+
+    #[test]
+    fn time_range_label_formats_both_endpoints_with_the_unit() {
+        assert_eq!(
+            eval_builtin(
+                DocumentBuiltin::TextTimeRangeLabel,
+                Some(EvalValue::Number(0.0)),
+                vec![
+                    ("end".to_owned(), EvalValue::Number(240.0)),
+                    ("unit".to_owned(), EvalValue::Text("ns".to_owned())),
+                ],
+            ),
+            EvalValue::Text("0 ns - 240 ns".to_owned())
+        );
+    }
+
+    #[test]
+    fn number_to_ascii_text_respects_signal_bit_width() {
+        let ascii = |value, width| {
+            eval_builtin(
+                DocumentBuiltin::NumberToAsciiText,
+                Some(EvalValue::Number(value)),
+                vec![("width".to_owned(), EvalValue::Number(width))],
+            )
+        };
+        assert_eq!(ascii(0x48 as f64, 8.0), EvalValue::Text("H".to_owned()));
+        assert_eq!(ascii(0x4845 as f64, 16.0), EvalValue::Text("HE".to_owned()));
+        assert_eq!(ascii(0.0, 7.0), EvalValue::Text("-".to_owned()));
+        assert_eq!(ascii(0.0, 8.0), EvalValue::Text("?".to_owned()));
+        assert_eq!(ascii(1.0, 8.0), EvalValue::Text("?".to_owned()));
     }
 
     #[test]

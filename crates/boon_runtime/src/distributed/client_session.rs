@@ -2,9 +2,11 @@ use super::DistributedRuntimeError;
 use super::link::ClientSessionLink;
 use super::message::{DistributedMessage, DistributedMessagePayload};
 use boon_data::Value as DataValue;
-use boon_plan::{DistributedWireSchemaPlan, ExportId, ProgramRole, RemoteCallSiteId};
-use boon_wire::ClientSessionFrame;
-use serde::{Deserialize, Serialize};
+use boon_plan::{
+    DistributedCallInstanceId, DistributedCallMode, DistributedWireSchemaPlan, ExportId,
+    ProgramRole, RemoteCallSiteId,
+};
+use boon_wire::{ClientSessionDataOperation, ClientSessionFrame};
 use std::collections::{BTreeMap, VecDeque};
 
 pub use super::message::DistributedQueueLimits as ClientSessionQueueLimits;
@@ -14,17 +16,6 @@ struct QueuedClientSessionMessage {
     operation_sequence: u64,
     message: DistributedMessage,
     sent_generation: Option<u64>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct RecoveredClientSessionMessage {
-    operation_sequence: u64,
-    message: DistributedMessage,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct OutboundClientSessionQueueRecovery {
-    messages: Vec<RecoveredClientSessionMessage>,
 }
 
 #[derive(Clone)]
@@ -181,85 +172,6 @@ impl OutboundClientSessionQueue {
     pub(super) fn clear(&mut self) {
         self.messages.clear();
     }
-
-    pub(super) fn recovery_image(&self) -> OutboundClientSessionQueueRecovery {
-        OutboundClientSessionQueueRecovery {
-            messages: self
-                .messages
-                .iter()
-                .map(|queued| RecoveredClientSessionMessage {
-                    operation_sequence: queued.operation_sequence,
-                    message: queued.message.clone(),
-                })
-                .collect(),
-        }
-    }
-
-    pub(super) fn from_recovery(
-        recovery: OutboundClientSessionQueueRecovery,
-        limits: ClientSessionQueueLimits,
-        link: &ClientSessionLink,
-        schema: &DistributedWireSchemaPlan,
-    ) -> Result<Self, DistributedRuntimeError> {
-        if recovery.messages.len() > limits.max_messages {
-            return Err(DistributedRuntimeError::QueueFull {
-                limit: limits.max_messages,
-            });
-        }
-        let first_expected = link
-            .peer_acknowledged_through()
-            .checked_add(1)
-            .ok_or(DistributedRuntimeError::TransportSequenceMismatch)?;
-        let last_allocated = link.last_send_operation_sequence();
-        if recovery.messages.is_empty() {
-            if link.peer_acknowledged_through() != last_allocated {
-                return Err(DistributedRuntimeError::TransportSequenceMismatch);
-            }
-        } else {
-            for (index, recovered) in recovery.messages.iter().enumerate() {
-                let expected = first_expected
-                    .checked_add(index as u64)
-                    .ok_or(DistributedRuntimeError::TransportSequenceMismatch)?;
-                if recovered.operation_sequence != expected {
-                    return Err(DistributedRuntimeError::TransportSequenceMismatch);
-                }
-            }
-            if recovery
-                .messages
-                .last()
-                .is_none_or(|message| message.operation_sequence != last_allocated)
-            {
-                return Err(DistributedRuntimeError::TransportSequenceMismatch);
-            }
-        }
-        let messages = recovery
-            .messages
-            .into_iter()
-            .map(|recovered| QueuedClientSessionMessage {
-                operation_sequence: recovered.operation_sequence,
-                message: recovered.message,
-                // Writer admission is not remote receipt. Every unacknowledged
-                // logical operation is sendable after process recovery.
-                sent_generation: None,
-            })
-            .collect::<VecDeque<_>>();
-        let encoded_bytes = messages.iter().try_fold(0usize, |total, queued| {
-            total
-                .checked_add(
-                    encode_message(link, schema, queued.operation_sequence, &queued.message)
-                        .map(|bytes| bytes.len())?,
-                )
-                .ok_or(DistributedRuntimeError::QueueBytesFull {
-                    limit: limits.max_bytes,
-                })
-        });
-        if encoded_bytes? > limits.max_bytes {
-            return Err(DistributedRuntimeError::QueueBytesFull {
-                limit: limits.max_bytes,
-            });
-        }
-        Ok(Self { messages, limits })
-    }
 }
 
 pub(super) enum DecodedClientSessionFrame {
@@ -283,67 +195,155 @@ fn encode_message(
     message: &DistributedMessage,
 ) -> Result<Vec<u8>, DistributedRuntimeError> {
     validate_adjacent_roles(message.producer, message.consumer)?;
-    let (semantic_revision, payload) = match &message.payload {
-        DistributedMessagePayload::Current {
-            export_id,
-            revision,
-            value,
-        } => {
-            require_value_edge(schema, *export_id, message.producer, message.consumer)?;
-            (*revision, value.clone())
-        }
-        DistributedMessagePayload::Event {
-            export_id,
-            sequence,
-            value,
-        } => {
-            require_event_edge(schema, *export_id, message.producer, message.consumer)?;
-            (*sequence, value.clone())
-        }
-        DistributedMessagePayload::CallRequest {
-            call_site_id,
-            function_export_id,
-            revision,
-            arguments,
-        } => {
-            let edge = schema
-                .call_edges
-                .iter()
-                .find(|edge| {
-                    edge.call_site_id == *call_site_id
-                        && edge.caller_role == message.producer
-                        && edge.callee_role == message.consumer
-                        && edge.function_export_id == *function_export_id
-                })
-                .ok_or(DistributedRuntimeError::UnknownTransportEdge)?;
-            let values = edge
-                .parameters
-                .iter()
-                .map(|parameter| {
-                    arguments
-                        .get(&parameter.argument_id)
-                        .cloned()
-                        .ok_or(DistributedRuntimeError::InvalidTransportFrame)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if values.len() != arguments.len() {
-                return Err(DistributedRuntimeError::InvalidTransportFrame);
+    let (operation, call_instance_id, semantic_revision, result_revision, payload) =
+        match &message.payload {
+            DistributedMessagePayload::Current {
+                export_id,
+                revision,
+                value,
+            } => {
+                require_value_edge(schema, *export_id, message.producer, message.consumer)?;
+                (
+                    ClientSessionDataOperation::Current,
+                    None,
+                    *revision,
+                    None,
+                    value.clone(),
+                )
             }
-            (*revision, DataValue::List(values))
-        }
-        DistributedMessagePayload::CallResult {
-            call_site_id,
-            revision,
-            value,
-        } => {
-            require_call_result_edge(schema, *call_site_id, message.producer, message.consumer)?;
-            (*revision, value.clone())
-        }
-    };
+            DistributedMessagePayload::Event {
+                export_id,
+                sequence,
+                value,
+            } => {
+                require_event_edge(schema, *export_id, message.producer, message.consumer)?;
+                (
+                    ClientSessionDataOperation::Event,
+                    None,
+                    *sequence,
+                    None,
+                    value.clone(),
+                )
+            }
+            DistributedMessagePayload::CurrentCallRequest {
+                call_site_id,
+                call_instance_id,
+                function_export_id,
+                demand_revision,
+                arguments,
+            } => {
+                let values = encode_call_arguments(
+                    schema,
+                    *call_site_id,
+                    *function_export_id,
+                    message.producer,
+                    message.consumer,
+                    DistributedCallMode::Current,
+                    arguments,
+                )?;
+                (
+                    ClientSessionDataOperation::CurrentCallRequest,
+                    Some(call_instance_id.0),
+                    *demand_revision,
+                    None,
+                    values,
+                )
+            }
+            DistributedMessagePayload::CurrentCallResult {
+                call_site_id,
+                call_instance_id,
+                demand_revision,
+                result_revision,
+                value,
+            } => {
+                require_call_result_edge(
+                    schema,
+                    *call_site_id,
+                    message.producer,
+                    message.consumer,
+                    DistributedCallMode::Current,
+                )?;
+                (
+                    ClientSessionDataOperation::CurrentCallResult,
+                    Some(call_instance_id.0),
+                    *demand_revision,
+                    Some(*result_revision),
+                    value.clone(),
+                )
+            }
+            DistributedMessagePayload::CurrentCallDetach {
+                call_site_id,
+                call_instance_id,
+                demand_revision,
+            } => {
+                require_call_result_edge(
+                    schema,
+                    *call_site_id,
+                    message.consumer,
+                    message.producer,
+                    DistributedCallMode::Current,
+                )?;
+                (
+                    ClientSessionDataOperation::CurrentCallDetach,
+                    Some(call_instance_id.0),
+                    *demand_revision,
+                    None,
+                    DataValue::Null,
+                )
+            }
+            DistributedMessagePayload::InvocationRequest {
+                call_site_id,
+                call_instance_id,
+                function_export_id,
+                sequence,
+                arguments,
+            } => {
+                let values = encode_call_arguments(
+                    schema,
+                    *call_site_id,
+                    *function_export_id,
+                    message.producer,
+                    message.consumer,
+                    DistributedCallMode::Invocation,
+                    arguments,
+                )?;
+                (
+                    ClientSessionDataOperation::InvocationRequest,
+                    Some(call_instance_id.0),
+                    *sequence,
+                    None,
+                    values,
+                )
+            }
+            DistributedMessagePayload::InvocationResult {
+                call_site_id,
+                call_instance_id,
+                sequence,
+                value,
+            } => {
+                require_call_result_edge(
+                    schema,
+                    *call_site_id,
+                    message.producer,
+                    message.consumer,
+                    DistributedCallMode::Invocation,
+                )?;
+                (
+                    ClientSessionDataOperation::InvocationResult,
+                    Some(call_instance_id.0),
+                    *sequence,
+                    None,
+                    value.clone(),
+                )
+            }
+        };
     link.encode_data(
         operation_sequence,
         message.edge_bytes(),
+        operation,
+        call_instance_id,
         semantic_revision,
+        result_revision,
         payload,
     )
 }
@@ -361,7 +361,10 @@ pub(super) fn decode_frame(
             operation_sequence,
             ack_through,
             edge_id,
+            operation,
+            call_instance_id,
             semantic_revision,
+            result_revision,
             payload,
             ..
         } => Ok(DecodedClientSessionFrame::Data {
@@ -372,7 +375,10 @@ pub(super) fn decode_frame(
                 producer,
                 consumer,
                 edge_id,
+                operation,
+                call_instance_id,
                 semantic_revision,
+                result_revision,
                 payload,
             )?,
         }),
@@ -390,14 +396,19 @@ fn classify_data(
     producer: ProgramRole,
     consumer: ProgramRole,
     edge_id: [u8; 32],
+    operation: ClientSessionDataOperation,
+    call_instance_id: Option<[u8; 32]>,
     semantic_revision: u64,
+    result_revision: Option<u64>,
     payload: DataValue,
 ) -> Result<DistributedMessage, DistributedRuntimeError> {
-    if let Some(edge) = schema.event_edges.iter().find(|edge| {
-        edge.export_id.0 == edge_id
-            && edge.producer_role == producer
-            && edge.consumer_role == consumer
-    }) {
+    if operation == ClientSessionDataOperation::Event
+        && let Some(edge) = schema.event_edges.iter().find(|edge| {
+            edge.export_id.0 == edge_id
+                && edge.producer_role == producer
+                && edge.consumer_role == consumer
+        })
+    {
         return Ok(DistributedMessage {
             producer,
             consumer,
@@ -408,11 +419,13 @@ fn classify_data(
             },
         });
     }
-    if let Some(edge) = schema.value_edges.iter().find(|edge| {
-        edge.export_id.0 == edge_id
-            && edge.producer_role == producer
-            && edge.consumer_role == consumer
-    }) {
+    if operation == ClientSessionDataOperation::Current
+        && let Some(edge) = schema.value_edges.iter().find(|edge| {
+            edge.export_id.0 == edge_id
+                && edge.producer_role == producer
+                && edge.consumer_role == consumer
+        })
+    {
         return Ok(DistributedMessage {
             producer,
             consumer,
@@ -424,11 +437,33 @@ fn classify_data(
         });
     }
     let call_site_id = RemoteCallSiteId(edge_id);
-    if let Some(edge) = schema.call_edges.iter().find(|edge| {
+    let call_instance_id = call_instance_id
+        .map(DistributedCallInstanceId)
+        .ok_or(DistributedRuntimeError::InvalidTransportFrame)?;
+    if matches!(
+        operation,
+        ClientSessionDataOperation::CurrentCallRequest
+            | ClientSessionDataOperation::CurrentCallDetach
+            | ClientSessionDataOperation::InvocationRequest
+    ) && let Some(edge) = schema.call_edges.iter().find(|edge| {
         edge.call_site_id == call_site_id
             && edge.caller_role == producer
             && edge.callee_role == consumer
     }) {
+        if operation == ClientSessionDataOperation::CurrentCallDetach {
+            if edge.mode != DistributedCallMode::Current || payload != DataValue::Null {
+                return Err(DistributedRuntimeError::InvalidTransportFrame);
+            }
+            return Ok(DistributedMessage {
+                producer,
+                consumer,
+                payload: DistributedMessagePayload::CurrentCallDetach {
+                    call_site_id,
+                    call_instance_id,
+                    demand_revision: semantic_revision,
+                },
+            });
+        }
         let DataValue::List(values) = &payload else {
             return Err(DistributedRuntimeError::InvalidTransportFrame);
         };
@@ -441,30 +476,67 @@ fn classify_data(
             .zip(values.iter().cloned())
             .map(|(parameter, value)| (parameter.argument_id, value))
             .collect::<BTreeMap<_, _>>();
+        let payload = match (operation, edge.mode) {
+            (ClientSessionDataOperation::CurrentCallRequest, DistributedCallMode::Current) => {
+                DistributedMessagePayload::CurrentCallRequest {
+                    call_site_id,
+                    call_instance_id,
+                    function_export_id: edge.function_export_id,
+                    demand_revision: semantic_revision,
+                    arguments,
+                }
+            }
+            (ClientSessionDataOperation::InvocationRequest, DistributedCallMode::Invocation) => {
+                DistributedMessagePayload::InvocationRequest {
+                    call_site_id,
+                    call_instance_id,
+                    function_export_id: edge.function_export_id,
+                    sequence: semantic_revision,
+                    arguments,
+                }
+            }
+            _ => return Err(DistributedRuntimeError::InvalidTransportFrame),
+        };
         return Ok(DistributedMessage {
             producer,
             consumer,
-            payload: DistributedMessagePayload::CallRequest {
-                call_site_id,
-                function_export_id: edge.function_export_id,
-                revision: semantic_revision,
-                arguments,
-            },
+            payload,
         });
     }
-    if schema.call_edges.iter().any(|edge| {
+    if matches!(
+        operation,
+        ClientSessionDataOperation::CurrentCallResult
+            | ClientSessionDataOperation::InvocationResult
+    ) && let Some(edge) = schema.call_edges.iter().find(|edge| {
         edge.call_site_id == call_site_id
             && edge.callee_role == producer
             && edge.caller_role == consumer
     }) {
+        let payload = match (operation, edge.mode) {
+            (ClientSessionDataOperation::CurrentCallResult, DistributedCallMode::Current) => {
+                DistributedMessagePayload::CurrentCallResult {
+                    call_site_id,
+                    call_instance_id,
+                    demand_revision: semantic_revision,
+                    result_revision: result_revision
+                        .ok_or(DistributedRuntimeError::InvalidTransportFrame)?,
+                    value: payload,
+                }
+            }
+            (ClientSessionDataOperation::InvocationResult, DistributedCallMode::Invocation) => {
+                DistributedMessagePayload::InvocationResult {
+                    call_site_id,
+                    call_instance_id,
+                    sequence: semantic_revision,
+                    value: payload,
+                }
+            }
+            _ => return Err(DistributedRuntimeError::InvalidTransportFrame),
+        };
         return Ok(DistributedMessage {
             producer,
             consumer,
-            payload: DistributedMessagePayload::CallResult {
-                call_site_id,
-                revision: semantic_revision,
-                value: payload,
-            },
+            payload,
         });
     }
     Err(DistributedRuntimeError::UnknownTransportEdge)
@@ -511,6 +583,7 @@ fn require_call_result_edge(
     call_site_id: RemoteCallSiteId,
     producer: ProgramRole,
     consumer: ProgramRole,
+    mode: DistributedCallMode,
 ) -> Result<(), DistributedRuntimeError> {
     schema
         .call_edges
@@ -519,9 +592,46 @@ fn require_call_result_edge(
             edge.call_site_id == call_site_id
                 && edge.callee_role == producer
                 && edge.caller_role == consumer
+                && edge.mode == mode
         })
         .then_some(())
         .ok_or(DistributedRuntimeError::UnknownTransportEdge)
+}
+
+fn encode_call_arguments(
+    schema: &DistributedWireSchemaPlan,
+    call_site_id: RemoteCallSiteId,
+    function_export_id: ExportId,
+    producer: ProgramRole,
+    consumer: ProgramRole,
+    mode: DistributedCallMode,
+    arguments: &BTreeMap<boon_plan::DistributedArgumentId, DataValue>,
+) -> Result<DataValue, DistributedRuntimeError> {
+    let edge = schema
+        .call_edges
+        .iter()
+        .find(|edge| {
+            edge.call_site_id == call_site_id
+                && edge.caller_role == producer
+                && edge.callee_role == consumer
+                && edge.function_export_id == function_export_id
+                && edge.mode == mode
+        })
+        .ok_or(DistributedRuntimeError::UnknownTransportEdge)?;
+    let values = edge
+        .parameters
+        .iter()
+        .map(|parameter| {
+            arguments
+                .get(&parameter.argument_id)
+                .cloned()
+                .ok_or(DistributedRuntimeError::InvalidTransportFrame)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() != arguments.len() {
+        return Err(DistributedRuntimeError::InvalidTransportFrame);
+    }
+    Ok(DataValue::List(values))
 }
 
 fn validate_adjacent_roles(
@@ -604,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn rebind_preserves_operation_sequence_and_replays_unacknowledged_data() {
+    fn generation_cutover_drops_old_data_and_rebases_from_the_peer_watermark() {
         let (_, schema, message, mut link) = fixture();
         let mut queue =
             OutboundClientSessionQueue::new(ClientSessionQueueLimits::default()).unwrap();
@@ -613,14 +723,11 @@ mod tests {
         assert!(queue.mark_sent(first.operation_sequence, 1));
         assert!(queue.encode_next(&link, &schema).unwrap().is_none());
 
-        link = link.rebind(link.session_id(), 2);
-        let replay = queue.encode_next(&link, &schema).unwrap().unwrap();
-        assert_eq!(replay.operation_sequence, 1);
-        assert!(queue.mark_sent(replay.operation_sequence, 2));
+        queue.clear();
+        link = link.rebind(2, 5).unwrap();
+        assert!(queue.encode_next(&link, &schema).unwrap().is_none());
         queue.push(&mut link, &schema, [message]).unwrap();
-        link.accept_peer_ack(1).unwrap();
-        queue.acknowledge_through(1);
         let second = queue.encode_next(&link, &schema).unwrap().unwrap();
-        assert_eq!(second.operation_sequence, 2);
+        assert_eq!(second.operation_sequence, 6);
     }
 }

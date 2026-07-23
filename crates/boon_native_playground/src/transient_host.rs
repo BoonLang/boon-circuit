@@ -7,10 +7,9 @@ use boon_http_client::{ClientConfig, HttpClient};
 use boon_http_runtime::OutboundHttpEffectAdapter;
 use boon_plan::EffectId;
 use boon_runtime::{
-    RuntimeTurn, TransientEffectCallId, TransientEffectCreditGrant, TransientEffectInvocation,
-    Value,
+    ExactCallHostCore, RuntimeTurn, TransientEffectCallId, TransientEffectCreditGrant,
+    TransientEffectInvocation, Value,
 };
-use boon_server_runtime::ExactCallHostCore;
 use boon_wellen_host::{WaveformEffectCompletion, WaveformEffectLimits, WaveformEffectWorker};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;

@@ -15,6 +15,7 @@ mod passkey_simulator;
 mod preview;
 mod proof;
 mod protocol;
+mod readiness;
 mod runtime_view;
 mod transient_host;
 mod ui;

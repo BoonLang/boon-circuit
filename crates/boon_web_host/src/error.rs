@@ -66,3 +66,23 @@ impl Display for WebHostError {
 }
 
 impl Error for WebHostError {}
+
+#[cfg(target_arch = "wasm32")]
+impl From<boon_web_effect_host::WebHostError> for WebHostError {
+    fn from(error: boon_web_effect_host::WebHostError) -> Self {
+        match error {
+            boon_web_effect_host::WebHostError::LimitExceeded { resource, limit } => {
+                Self::LimitExceeded { resource, limit }
+            }
+            boon_web_effect_host::WebHostError::InvalidInput { field, reason } => {
+                Self::InvalidInput { field, reason }
+            }
+            boon_web_effect_host::WebHostError::QueueOverflow { queue, capacity } => {
+                Self::QueueOverflow { queue, capacity }
+            }
+            boon_web_effect_host::WebHostError::Platform { operation, message } => {
+                Self::Platform { operation, message }
+            }
+        }
+    }
+}

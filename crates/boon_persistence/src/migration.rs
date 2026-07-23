@@ -491,6 +491,33 @@ fn apply_recipe(
         }
     }
 
+    let list_move_map = resolved_list_moves(&list_moves)?;
+    if let Some((item_id, _)) = candidate.outbox.iter().find(|(_, item)| {
+        item.owner.ancestors.iter().any(|row| {
+            list_move_map
+                .get(&row.list_memory_id)
+                .is_some_and(|destination| *destination != row.list_memory_id)
+        }) || item.target_row.is_some_and(|row| {
+            list_move_map
+                .get(&row.list_memory_id)
+                .is_some_and(|destination| *destination != row.list_memory_id)
+        })
+    }) {
+        return Err(MigrationError::IncompatibleOutbox {
+            item_id: *item_id,
+            detail: "list migration cannot change ownership referenced by durable outbox work"
+                .to_owned(),
+        });
+    }
+    for list in candidate.lists.values_mut() {
+        for row in &mut list.rows {
+            rewrite_durable_owner_memories(&mut row.owner, &list_move_map);
+            if let Some(origin) = &mut row.materialization_origin {
+                rewrite_durable_owner_memories(origin, &list_move_map);
+            }
+        }
+    }
+
     let destination_scalars = scalar_destinations.keys().copied().collect::<BTreeSet<_>>();
     for source in consumed_scalars {
         if !destination_scalars.contains(&source) {
@@ -525,6 +552,50 @@ fn apply_recipe(
         }
     }
     Ok(transformed_rows)
+}
+
+fn rewrite_durable_owner_memories(
+    owner: &mut crate::DurableOwner,
+    moves: &BTreeMap<MemoryId, MemoryId>,
+) {
+    for row in &mut owner.ancestors {
+        if let Some(destination) = moves.get(&row.list_memory_id) {
+            row.list_memory_id = *destination;
+        }
+    }
+}
+
+fn resolved_list_moves(
+    moves: &[(MemoryId, MemoryId)],
+) -> Result<BTreeMap<MemoryId, MemoryId>, MigrationError> {
+    let mut direct = BTreeMap::new();
+    for (source, destination) in moves {
+        if let Some(previous) = direct.insert(*source, *destination)
+            && previous != *destination
+        {
+            return Err(MigrationError::InvalidTransfer(format!(
+                "list memory {source} has multiple migration destinations"
+            )));
+        }
+    }
+    let mut resolved = BTreeMap::new();
+    for source in direct.keys().copied() {
+        let mut current = source;
+        let mut seen = BTreeSet::new();
+        while let Some(next) = direct.get(&current).copied() {
+            if next == current {
+                break;
+            }
+            if !seen.insert(current) {
+                return Err(MigrationError::InvalidTransfer(format!(
+                    "list migration contains a memory cycle at {current}"
+                )));
+            }
+            current = next;
+        }
+        resolved.insert(source, current);
+    }
+    Ok(resolved)
 }
 
 fn scalar_inputs(
@@ -709,6 +780,9 @@ fn ensure_target_row<'a>(
     list.rows.push(StoredRow {
         key: source.key,
         generation: source.generation,
+        source_order_token: 0,
+        owner: source.owner.clone(),
+        materialization_origin: source.materialization_origin.clone(),
         fields: BTreeMap::new(),
         touched_fields: BTreeSet::new(),
     });
@@ -752,6 +826,14 @@ fn evaluate_expression(
             .cloned()
             .ok_or_else(|| MigrationError::Evaluation("lambda parameter is missing".to_owned())),
         MigrationExpressionPlan::Text { value } => Ok(StoredValue::Text(value.clone())),
+        MigrationExpressionPlan::TextConcat { parts } => {
+            let mut text = String::new();
+            for part in parts {
+                let value = evaluate_expression(part, inputs, parameters)?;
+                text.push_str(&migration_value_text(&value)?);
+            }
+            Ok(StoredValue::Text(text))
+        }
         MigrationExpressionPlan::Number { value } => Ok(StoredValue::Number(*value)),
         MigrationExpressionPlan::Bool { value } => Ok(StoredValue::Bool(*value)),
         MigrationExpressionPlan::Variant { tag } => Ok(StoredValue::Variant {
@@ -792,7 +874,7 @@ fn evaluate_expression(
                         body: body.as_ref().clone(),
                     },
                 };
-                evaluated.push((argument.name.as_deref(), value));
+                evaluated.push((argument.name.as_str(), value));
             }
             evaluate_call(function, input, &evaluated, inputs)
         }
@@ -838,18 +920,68 @@ fn evaluate_expression(
         }
         MigrationExpressionPlan::Match { input, arms } => {
             let value = evaluate_expression(input, inputs, parameters)?;
-            let tag = stored_tag(&value);
             let arm = arms
                 .iter()
-                .find(|arm| {
-                    arm.pattern
-                        .iter()
-                        .any(|pattern| pattern == "_" || pattern == tag)
-                })
+                .find(|arm| stored_value_matches_pattern(&value, &arm.pattern))
                 .ok_or_else(|| {
+                    let tag = stored_tag(&value);
                     MigrationError::Evaluation(format!("no migration match arm accepts `{tag}`"))
                 })?;
             evaluate_expression(&arm.output, inputs, parameters)
+        }
+    }
+}
+
+fn migration_value_text(value: &StoredValue) -> Result<String, MigrationError> {
+    match value {
+        StoredValue::Null => Ok(String::new()),
+        StoredValue::Bool(value) => Ok(if *value { "True" } else { "False" }.to_owned()),
+        StoredValue::Number(value) => Ok(value.to_string()),
+        StoredValue::Text(value) => Ok(value.clone()),
+        StoredValue::Bytes(value) => String::from_utf8(value.to_vec()).map_err(|error| {
+            MigrationError::Evaluation(format!(
+                "text interpolation contains invalid UTF-8: {error}"
+            ))
+        }),
+        StoredValue::Variant { tag, fields } => fields
+            .get("text")
+            .map(migration_value_text)
+            .transpose()
+            .map(|value| value.unwrap_or_else(|| tag.clone())),
+        StoredValue::Error { code, .. } => Ok(code.clone()),
+        StoredValue::Record(fields) => fields
+            .get("text")
+            .map(migration_value_text)
+            .transpose()?
+            .ok_or_else(|| {
+                MigrationError::Evaluation(
+                    "record without a text field cannot be interpolated".to_owned(),
+                )
+            }),
+        StoredValue::List(_) => Err(MigrationError::Evaluation(
+            "list cannot be interpolated into text".to_owned(),
+        )),
+    }
+}
+
+fn stored_value_matches_pattern(
+    value: &StoredValue,
+    pattern: &boon_plan::PlanRowSelectPattern,
+) -> bool {
+    match pattern {
+        boon_plan::PlanRowSelectPattern::Wildcard => true,
+        boon_plan::PlanRowSelectPattern::Bool { value: expected } => {
+            value == &StoredValue::Bool(*expected)
+        }
+        boon_plan::PlanRowSelectPattern::Number { value: expected } => {
+            value == &StoredValue::Number(*expected)
+        }
+        boon_plan::PlanRowSelectPattern::Text { value: expected } => {
+            matches!(value, StoredValue::Text(value) if value == expected)
+                || matches!(value, StoredValue::Variant { tag, .. } | StoredValue::Error { code: tag, .. } if tag == expected)
+        }
+        boon_plan::PlanRowSelectPattern::NaN => {
+            matches!(value, StoredValue::Text(value) if value == "NaN")
         }
     }
 }
@@ -885,43 +1017,26 @@ fn stored_number_result(value: f64) -> Result<StoredValue, MigrationError> {
 fn evaluate_call(
     function: &str,
     input: Option<StoredValue>,
-    arguments: &[(Option<&str>, EvaluatedArgument)],
+    arguments: &[(&str, EvaluatedArgument)],
     inputs: &BTreeMap<MigrationInputId, StoredValue>,
 ) -> Result<StoredValue, MigrationError> {
-    let first_value = || {
-        arguments.iter().find_map(|(_, argument)| match argument {
-            EvaluatedArgument::Value(value) => Some(value.clone()),
-            EvaluatedArgument::Lambda { .. } => None,
+    let named_value = |name: &str| {
+        arguments.iter().find_map(|(candidate, argument)| {
+            (*candidate == name).then(|| match argument {
+                EvaluatedArgument::Value(value) => Some(value.clone()),
+                EvaluatedArgument::Lambda { .. } => None,
+            })?
         })
     };
     match function {
-        "Bool/not" => match input.or_else(first_value) {
+        "Bool/not" => match input.or_else(|| named_value("value")) {
             Some(StoredValue::Bool(value)) => Ok(StoredValue::Bool(!value)),
             _ => Err(MigrationError::Evaluation(
                 "Bool/not requires one boolean".to_owned(),
             )),
         },
         "Number/to_text" => {
-            let named_value = |name: &str| {
-                arguments.iter().find_map(|(candidate, argument)| {
-                    (*candidate == Some(name)).then(|| match argument {
-                        EvaluatedArgument::Value(value) => Some(value.clone()),
-                        EvaluatedArgument::Lambda { .. } => None,
-                    })?
-                })
-            };
-            let positional_value = || {
-                arguments.iter().find_map(|(name, argument)| {
-                    name.is_none().then(|| match argument {
-                        EvaluatedArgument::Value(value) => Some(value.clone()),
-                        EvaluatedArgument::Lambda { .. } => None,
-                    })?
-                })
-            };
-            let Some(StoredValue::Number(value)) = input
-                .or_else(|| named_value("value"))
-                .or_else(positional_value)
-            else {
+            let Some(StoredValue::Number(value)) = input.or_else(|| named_value("value")) else {
                 return Err(MigrationError::Evaluation(
                     "Number/to_text requires one number".to_owned(),
                 ));
@@ -966,7 +1081,7 @@ fn evaluate_call(
             .map_err(|error| MigrationError::Evaluation(error.to_string()))?;
             Ok(StoredValue::Text(text))
         }
-        "Text/to_number" => match input.or_else(first_value) {
+        "Text/to_number" => match input.or_else(|| named_value("input")) {
             Some(StoredValue::Text(value)) => value
                 .parse::<FiniteReal>()
                 .map(StoredValue::Number)
@@ -987,13 +1102,13 @@ fn evaluate_call(
             }
             Ok(StoredValue::Text(parts.concat()))
         }
-        "Text/is_empty" => match input.or_else(first_value) {
+        "Text/is_empty" => match input.or_else(|| named_value("input")) {
             Some(StoredValue::Text(value)) => Ok(StoredValue::Bool(value.is_empty())),
             _ => Err(MigrationError::Evaluation(
                 "Text/is_empty requires one text value".to_owned(),
             )),
         },
-        "List/count" | "List/length" => match input.or_else(first_value) {
+        "List/count" | "List/length" => match input.or_else(|| named_value("list")) {
             Some(StoredValue::List(values)) => {
                 stored_integer(i64::try_from(values.len()).map_err(|_| {
                     MigrationError::Evaluation("list length exceeds number range".to_owned())
@@ -1004,9 +1119,10 @@ fn evaluate_call(
             )),
         },
         "List/map" => {
-            let StoredValue::List(values) = input.or_else(first_value).ok_or_else(|| {
-                MigrationError::Evaluation("List/map requires a list input".to_owned())
-            })?
+            let StoredValue::List(values) =
+                input.or_else(|| named_value("list")).ok_or_else(|| {
+                    MigrationError::Evaluation("List/map requires a list input".to_owned())
+                })?
             else {
                 return Err(MigrationError::Evaluation(
                     "List/map requires a list input".to_owned(),
@@ -1014,12 +1130,15 @@ fn evaluate_call(
             };
             let (parameter_count, body) = arguments
                 .iter()
-                .find_map(|(_, argument)| match argument {
-                    EvaluatedArgument::Lambda {
-                        parameter_count,
-                        body,
-                    } => Some((*parameter_count, body)),
-                    EvaluatedArgument::Value(_) => None,
+                .find_map(|(name, argument)| match (*name, argument) {
+                    (
+                        "new",
+                        EvaluatedArgument::Lambda {
+                            parameter_count,
+                            body,
+                        },
+                    ) => Some((*parameter_count, body)),
+                    _ => None,
                 })
                 .ok_or_else(|| {
                     MigrationError::Evaluation("List/map requires a lambda".to_owned())
@@ -1172,10 +1291,11 @@ fn digest_hex(digest: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DurableOutboxItem, DurableOwner, DurableRowId};
     use boon_plan::{
-        ApplicationPlan, DataTypeFieldPlan, InitialProvenance, ListMemoryPlan, MemoryKind,
-        MemoryLeafPlan, MemoryOwnerPath, MemoryPlan, MigrationDestinationPlan,
-        MigrationLeafRefPlan, MigrationListRowFieldPlan, PlanStorageId,
+        ApplicationPlan, DataTypeFieldPlan, EffectId, EffectInvocationId, InitialProvenance,
+        ListMemoryPlan, MemoryKind, MemoryLeafPlan, MemoryOwnerPath, MemoryPlan,
+        MigrationDestinationPlan, MigrationLeafRefPlan, MigrationListRowFieldPlan, PlanStorageId,
     };
 
     fn number(value: i64) -> StoredValue {
@@ -1357,7 +1477,12 @@ mod tests {
             canonical_module: "app".to_owned(),
             named_owner_path: "store".to_owned(),
         };
-        let source = list_memory(0, "store.todos", &["title", "$input$title"], owner.clone());
+        let source = list_memory(
+            0,
+            "store.todos",
+            &["title", "@authority:title"],
+            owner.clone(),
+        );
         let target = list_memory(0, "store.tasks", &["title"], owner);
         let source_plan = PersistencePlan::new(
             &application,
@@ -1384,7 +1509,7 @@ mod tests {
                 .unwrap();
         let source_constructor = MigrationLeafRefPlan::new(
             source.memory_id,
-            "store.todos.$input$title",
+            "store.todos.@authority:title",
             DataTypePlan::Text,
         )
         .unwrap();
@@ -1439,11 +1564,22 @@ mod tests {
             source.memory_id,
             StoredList {
                 touched: true,
+                revision: 0,
                 next_key: 42,
+                next_order_token: 3_u128 << 64,
                 rows: vec![
                     StoredRow {
                         key: 9,
                         generation: 3,
+                        source_order_token: 1_u128 << 64,
+                        owner: crate::DurableOwner {
+                            ancestors: vec![crate::DurableRowId {
+                                list_memory_id: source.memory_id,
+                                row_key: 9,
+                                row_generation: 3,
+                            }],
+                        },
+                        materialization_origin: None,
                         fields: BTreeMap::from([
                             (source_title.leaf_id, StoredValue::Text("first".to_owned())),
                             (
@@ -1459,6 +1595,15 @@ mod tests {
                     StoredRow {
                         key: 4,
                         generation: 8,
+                        source_order_token: 2_u128 << 64,
+                        owner: crate::DurableOwner {
+                            ancestors: vec![crate::DurableRowId {
+                                list_memory_id: source.memory_id,
+                                row_key: 4,
+                                row_generation: 8,
+                            }],
+                        },
+                        materialization_origin: None,
                         fields: BTreeMap::new(),
                         touched_fields: BTreeSet::new(),
                     },
@@ -1489,5 +1634,32 @@ mod tests {
         assert!(migrated.rows[1].fields.is_empty());
         assert!(migrated.rows[1].touched_fields.is_empty());
         assert!(!staged.candidate.lists.contains_key(&source.memory_id));
+
+        let row = DurableRowId {
+            list_memory_id: source.memory_id,
+            row_key: 9,
+            row_generation: 3,
+        };
+        let effect_id = EffectId::from_host_operation("Test/send").unwrap();
+        let invocation_id =
+            EffectInvocationId::from_result_owner(effect_id, "store.result").unwrap();
+        let pending = DurableOutboxItem::pending(
+            invocation_id,
+            effect_id,
+            number(9),
+            StoredValue::Record(BTreeMap::new()),
+            DurableOwner {
+                ancestors: vec![row],
+            },
+            Some(row),
+            1,
+        );
+        let pending_id = pending.item_id;
+        stored.outbox.insert(pending_id, pending);
+
+        assert!(matches!(
+            stage_migration_plan(&stored, &application.identity, &target_plan),
+            Err(MigrationError::IncompatibleOutbox { item_id, .. }) if item_id == pending_id
+        ));
     }
 }

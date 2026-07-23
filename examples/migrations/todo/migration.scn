@@ -10,15 +10,15 @@ action = { kind = "start", stage = "v1", namespace = "todo-incremental" }
 
 [[step]]
 id = "edit-incremental-first-title"
-action = { kind = "dispatch", public_source = "todo.sources.rename_button.press", target = { list = "store.todos", key = 1, generation = 1 } }
+action = { kind = "dispatch", public_source = "store.todos.sources.rename_button.events.press", target = { list = "store.todos", key = 1, generation = 1 } }
 
 [[step]]
 id = "touch-incremental-first-completed"
-action = { kind = "dispatch", public_source = "todo.sources.toggle_button.press", target = { list = "store.todos", key = 1, generation = 1 } }
+action = { kind = "dispatch", public_source = "store.todos.sources.toggle_button.events.press", target = { list = "store.todos", key = 1, generation = 1 } }
 
 [[step]]
 id = "touch-incremental-obsolete-help"
-action = { kind = "dispatch", public_source = "store.sources.help_button.press" }
+action = { kind = "dispatch", public_source = "store.sources.help_button.events.press" }
 
 [[step]]
 id = "checkpoint-incremental-v1"
@@ -291,15 +291,15 @@ action = { kind = "start", stage = "v1", namespace = "todo-skipped" }
 
 [[step]]
 id = "edit-skipped-first-title"
-action = { kind = "dispatch", public_source = "todo.sources.rename_button.press", target = { list = "store.todos", key = 1, generation = 1 } }
+action = { kind = "dispatch", public_source = "store.todos.sources.rename_button.events.press", target = { list = "store.todos", key = 1, generation = 1 } }
 
 [[step]]
 id = "touch-skipped-first-completed"
-action = { kind = "dispatch", public_source = "todo.sources.toggle_button.press", target = { list = "store.todos", key = 1, generation = 1 } }
+action = { kind = "dispatch", public_source = "store.todos.sources.toggle_button.events.press", target = { list = "store.todos", key = 1, generation = 1 } }
 
 [[step]]
 id = "touch-skipped-obsolete-help"
-action = { kind = "dispatch", public_source = "store.sources.help_button.press" }
+action = { kind = "dispatch", public_source = "store.sources.help_button.events.press" }
 
 [[step]]
 id = "checkpoint-skipped-v1"

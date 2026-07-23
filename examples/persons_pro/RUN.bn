@@ -129,7 +129,7 @@ store: [
     workspace_id:
         Text/empty() |> HOLD workspace_id {
             host.lifecycle.started |> THEN {
-                Text/is_empty(workspace_id) |> WHEN {
+                workspace_id |> Text/is_empty() |> WHEN {
                     True => host.lifecycle.started.instance_id
                     False => workspace_id
                 }
@@ -151,7 +151,7 @@ store: [
             host.lifecycle.started |> THEN {
                 workspace_grant_state == AccountOwned |> WHEN {
                     True => Text/empty()
-                    False => Text/is_empty(workspace_grant_id) |> WHEN {
+                    False => workspace_grant_id |> Text/is_empty() |> WHEN {
                         True => host.lifecycle.started.grant_id
                         False => workspace_grant_id
                     }
@@ -168,9 +168,7 @@ store: [
 
     draft_revision:
         1 |> HOLD draft_revision {
-            LATEST {
-                elements.source_editor.event.change |> THEN { draft_revision + 1 }
-            }
+            elements.source_editor.event.change |> THEN { draft_revision + 1 }
         }
 
     draft_compile_state:
@@ -288,7 +286,7 @@ store: [
         }
 
     account_state:
-        Text/is_empty(account_id) |> WHEN {
+        account_id |> Text/is_empty() |> WHEN {
             True => Anonymous
             False => signed_out |> WHEN {
                 True => SignedOut
@@ -424,10 +422,8 @@ store: [
         }
 
     published_revision_to_append:
-        LATEST {
-            elements.publish_candidate_program.compiled
-                |> THEN { elements.publish_candidate_program.compiled.source_digest }
-        }
+        elements.publish_candidate_program.compiled
+            |> THEN { elements.publish_candidate_program.compiled.source_digest }
 
     published_revisions:
         LIST {}

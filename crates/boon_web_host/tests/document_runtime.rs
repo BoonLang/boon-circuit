@@ -175,6 +175,7 @@ fn runtime_turn(sequence: u64, document_patches: Vec<DocumentPatch>) -> RuntimeT
         authority_deltas: Vec::new(),
         durable_changes: Vec::new(),
         outbox_changes: Vec::new(),
+        distributed_invocations: Vec::new(),
         transient_effects: Vec::new(),
         cancelled_transient_effects: Vec::new(),
         transient_effect_credit_grants: Vec::new(),

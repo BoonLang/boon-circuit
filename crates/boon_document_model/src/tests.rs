@@ -114,6 +114,26 @@ fn sensitive_text_input_artifacts_are_fixed_redactions() {
 }
 
 #[test]
+fn runtime_route_identity_is_opaque_in_diagnostics() {
+    let row = OwnerInstanceRow {
+        list: ListId(0x41),
+        key: 0x4242,
+        generation: 0x4343,
+    };
+    let owner = OwnerInstanceId::new(PlanStaticOwnerId(0x44), [row]).unwrap();
+    let route = SourceRouteToken::new(0x45, owner.clone(), SourceId(0x46), 0x47).unwrap();
+
+    assert_eq!(format!("{row:?}"), "OwnerInstanceRow(..)");
+    assert_eq!(format!("{owner:?}"), "OwnerInstanceId(..)");
+    assert_eq!(format!("{route:?}"), "SourceRouteToken(..)");
+
+    let diagnostic = format!("{row:?}\n{owner:?}\n{route:?}");
+    for hidden in ["4242", "4343", "0x44", "0x45", "0x46", "0x47"] {
+        assert!(!diagnostic.contains(hidden), "leaked `{hidden}`");
+    }
+}
+
+#[test]
 fn older_document_nodes_default_typed_focus_metadata_to_absent() {
     let node = DocumentNode::new("input", DocumentNodeKind::TextInput);
     let serialized = toml::to_string(&node).unwrap();

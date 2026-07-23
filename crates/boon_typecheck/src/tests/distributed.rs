@@ -11,21 +11,18 @@ fn distributed_function(args: &[(&str, Type)], result: Type) -> ExternalFunction
             .iter()
             .map(|(name, ty)| ExternalFunctionArgument {
                 name: (*name).to_owned(),
-                ty: ty.clone(),
+                flow_type: distributed_continuous(ty.clone()),
             })
             .collect(),
         result: distributed_continuous(result),
-        pure: true,
+        effect: CheckedEffectSummary::default(),
     }
 }
 
 #[test]
 fn session_info_intrinsics_enforce_role_visibility_and_closed_types() {
-    let status = boon_parser::parse_source(
-        "session-status.bn",
-        "status: SessionInfo/status()\n",
-    )
-    .unwrap();
+    let status =
+        boon_parser::parse_source("session-status.bn", "status: SessionInfo/status()\n").unwrap();
     for role in [
         ProgramRole::Client,
         ProgramRole::Session,
@@ -47,7 +44,10 @@ fn session_info_intrinsics_enforce_role_visibility_and_closed_types() {
     assert!(!session.has_errors(), "{:#?}", session.diagnostics);
     for role in [ProgramRole::Client] {
         let report = check_with_external_types(&principal, &ExternalTypeEnvironment::empty(role));
-        assert!(report.has_errors(), "{role:?} unexpectedly accepted principal");
+        assert!(
+            report.has_errors(),
+            "{role:?} unexpectedly accepted principal"
+        );
     }
     let server = check_with_external_types(
         &principal,
@@ -139,7 +139,11 @@ FUNCTION decorate(item) {
         distributed_function(&[("value", Type::Number)], Type::Number),
     );
     let (output, _) = check_runtime_program_profiled_with_external_types(&parsed, &environment);
-    assert!(!output.report.has_errors(), "{:#?}", output.report.diagnostics);
+    assert!(
+        !output.report.has_errors(),
+        "{:#?}",
+        output.report.diagnostics
+    );
     assert_eq!(
         output
             .report
@@ -159,6 +163,221 @@ FUNCTION decorate(item) {
             .map(|expression| &expression.flow_type),
         Some(&distributed_continuous(Type::Number))
     );
+}
+
+#[test]
+fn checked_program_retains_final_lowering_metadata_and_external_environment() {
+    let parsed = boon_parser::parse_project(
+        "Client/RUN.bn",
+        [
+            (
+                "Client/RUN.bn".to_owned(),
+                r#"
+store: [
+    submitted: SOURCE
+    submitted_text:
+        TEXT { idle } |> HOLD submitted_text {
+            submitted.text
+        }
+    remote_title: Presentation/identity(value: Session/store.title)
+]
+outputs: [
+    submitted_text: store.submitted_text
+    remote_title: store.remote_title
+]
+"#
+                .to_owned(),
+            ),
+            (
+                "Client/Presentation.bn".to_owned(),
+                r#"
+FUNCTION identity(value) {
+    value
+}
+"#
+                .to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Client);
+    environment.values.insert(
+        "Session/store.title".to_owned(),
+        distributed_continuous(Type::Text),
+    );
+
+    let (output, _) = check_runtime_program_profiled_with_external_types(&parsed, &environment);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let checked = output.program.expect("runtime program is checked");
+    let metadata = &checked.lowering_metadata;
+
+    assert_eq!(checked.external_types, environment);
+    assert_eq!(
+        metadata.source_units,
+        vec![
+            CheckedSourceUnitMetadata {
+                path: "Client/RUN.bn".to_owned(),
+                module: None,
+                start_line: 1,
+                line_count: parsed.files[0].source.lines().count().max(1),
+            },
+            CheckedSourceUnitMetadata {
+                path: "Client/Presentation.bn".to_owned(),
+                module: Some("Presentation".to_owned()),
+                start_line: parsed.files[1].start_line,
+                line_count: parsed.files[1].source.lines().count().max(1),
+            },
+        ]
+    );
+    assert_eq!(
+        metadata.original_source_expression_count,
+        parsed.expressions.len()
+    );
+    assert_eq!(
+        metadata.source_payload_shape_table,
+        output.report.source_payload_shape_table
+    );
+    assert!(metadata
+        .source_payload_shape_table
+        .iter()
+        .any(|entry| entry.source_path == "store.submitted"
+            && entry.fields.iter().any(|field| field.name == "text")));
+    assert_eq!(metadata.host_port_table, output.report.host_port_table);
+    assert_eq!(metadata.output_root_types, output.report.output_root_types);
+    assert_eq!(metadata.expr_type_table, output.report.expr_type_table);
+    assert_eq!(
+        metadata.function_type_table,
+        output.report.function_type_table
+    );
+    assert_eq!(
+        metadata.named_value_type_table,
+        output.report.named_value_type_table
+    );
+    assert_eq!(metadata.render_slot_table, output.report.render_slot_table);
+    assert_eq!(
+        metadata.checked_expression_count,
+        output.report.checked_expression_count
+    );
+    assert_eq!(
+        metadata.dynamic_fallback_count,
+        output.report.dynamic_fallback_count
+    );
+    assert_eq!(metadata.diagnostics, output.report.diagnostics);
+    assert!(metadata
+        .output_root_types
+        .iter()
+        .any(|output| output.name == "remote_title" && output.ty == Type::Text));
+}
+
+#[test]
+fn checked_builtin_call_result_does_not_oscillate_with_an_event_argument() {
+    let parsed = boon_parser::parse_source(
+        "distributed-client-render-call.bn",
+        r#"
+store: [
+    read_clock: SOURCE
+]
+
+scene: Scene/Element/text(
+    element: [events: [press: store.read_clock]]
+    style: [width: Fill]
+    text: Session/store.server_seconds
+)
+"#,
+    )
+    .unwrap();
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Client);
+    environment.values.insert(
+        "Session/store.server_seconds".to_owned(),
+        FlowType {
+            mode: FlowMode::PresentOrAbsent,
+            ty: Type::Number,
+        },
+    );
+
+    let (output, _) = check_runtime_program_profiled_with_external_types(&parsed, &environment);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    assert!(output.program.is_some());
+}
+
+#[test]
+fn distributed_boundary_requirements_seed_generic_user_schemes() {
+    let parsed = boon_parser::parse_source(
+        "distributed-identity-boundary.bn",
+        r#"
+FUNCTION identity(value) {
+    value
+}
+"#,
+    )
+    .unwrap();
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Session);
+    environment.local_function_requirements.insert(
+        "identity".to_owned(),
+        BTreeMap::from([("value".to_owned(), Type::Number)]),
+    );
+
+    let output = check_program_with_external_types(&parsed, &environment);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let checked = output.program.expect("identity boundary is checked");
+    let identity = checked
+        .callables
+        .iter()
+        .find(|callable| callable.name == "identity")
+        .expect("identity signature");
+    assert_eq!(identity.parameters[0].flow_type.ty, Type::Number);
+    assert_eq!(identity.result.ty, Type::Number);
+}
+
+#[test]
+fn provisional_distributed_check_preserves_external_reads_and_named_calls() {
+    let parsed = boon_parser::parse_source(
+        "distributed-provisional.bn",
+        "count: Session/store.count\nnext: Session/add(value: count)\n",
+    )
+    .unwrap();
+    let (output, _) = check_runtime_program_profiled_with_external_types(
+        &parsed,
+        &ExternalTypeEnvironment::provisional(ProgramRole::Client),
+    );
+    assert!(
+        output
+            .report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| { !diagnostic.message.starts_with("unknown qualified external") }),
+        "{:#?}",
+        output.report.diagnostics
+    );
+    let checked = output.program.expect("provisional checked program");
+    assert!(checked.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            CheckedExpressionKind::ExternalRead { canonical_path }
+                if canonical_path == "Session/store.count"
+        )
+    }));
+    let call = checked
+        .calls
+        .iter()
+        .find(|call| call.function == "Session/add")
+        .expect("provisional external call");
+    assert!(matches!(
+        call.entries.as_slice(),
+        [CheckedCallEntry::Input { name, .. }] if name == "value"
+    ));
 }
 
 #[test]
@@ -200,21 +419,20 @@ fn distributed_role_direction_and_same_role_qualification_fail_closed() {
         );
     }
 
-    let parsed = boon_parser::parse_source(
-        "invalid-call-direction.bn",
-        "value: Client/add(value: 1)\n",
-    )
-    .unwrap();
+    let parsed =
+        boon_parser::parse_source("invalid-call-direction.bn", "value: Client/add(value: 1)\n")
+            .unwrap();
     let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Server);
     environment.functions.insert(
         "Client/add".to_owned(),
         distributed_function(&[("value", Type::Number)], Type::Number),
     );
     let report = check_with_external_types(&parsed, &environment);
-    assert!(report
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.message.contains("Server cannot depend on Client")));
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("Server cannot depend on Client")
+    }));
 }
 
 #[test]
@@ -247,22 +465,39 @@ fn distributed_values_reject_role_outputs_and_non_store_roots() {
 #[test]
 fn distributed_adjacent_roles_can_read_in_both_directions() {
     for (consumer, producer, path) in [
-        (ProgramRole::Client, ProgramRole::Session, "Session/store.value"),
-        (ProgramRole::Session, ProgramRole::Client, "Client/store.value"),
-        (ProgramRole::Session, ProgramRole::Server, "Server/store.value"),
-        (ProgramRole::Server, ProgramRole::Session, "Session/store.value"),
+        (
+            ProgramRole::Client,
+            ProgramRole::Session,
+            "Session/store.value",
+        ),
+        (
+            ProgramRole::Session,
+            ProgramRole::Client,
+            "Client/store.value",
+        ),
+        (
+            ProgramRole::Session,
+            ProgramRole::Server,
+            "Server/store.value",
+        ),
+        (
+            ProgramRole::Server,
+            ProgramRole::Session,
+            "Session/store.value",
+        ),
     ] {
-        let parsed = boon_parser::parse_source(
-            "adjacent-role.bn",
-            &format!("value: {path}\n"),
-        )
-        .unwrap();
+        let parsed =
+            boon_parser::parse_source("adjacent-role.bn", &format!("value: {path}\n")).unwrap();
         let mut environment = ExternalTypeEnvironment::empty(consumer);
         environment
             .values
             .insert(path.to_owned(), distributed_continuous(Type::Number));
         let report = check_with_external_types(&parsed, &environment);
-        assert!(!report.has_errors(), "{consumer:?} <- {producer:?}: {:#?}", report.diagnostics);
+        assert!(
+            !report.has_errors(),
+            "{consumer:?} <- {producer:?}: {:#?}",
+            report.diagnostics
+        );
     }
 }
 
@@ -308,11 +543,9 @@ fn distributed_unknown_symbols_and_wrong_arguments_are_errors() {
         );
     }
 
-    let positional = boon_parser::parse_source(
-        "invalid-external-positional.bn",
-        "value: Server/add(1)\n",
-    )
-    .unwrap_err();
+    let positional =
+        boon_parser::parse_source("invalid-external-positional.bn", "value: Server/add(1)\n")
+            .unwrap_err();
     assert!(
         positional
             .message
@@ -366,7 +599,10 @@ fn distributed_external_interfaces_accept_closed_event_and_list_values() {
         ExternalFunctionType {
             args: Vec::new(),
             result: distributed_continuous(Type::Number),
-            pure: false,
+            effect: CheckedEffectSummary {
+                invokes_host: true,
+                ..CheckedEffectSummary::default()
+            },
         },
     );
     environment.functions.insert(
@@ -377,7 +613,7 @@ fn distributed_external_interfaces_accept_closed_event_and_list_values() {
                 mode: FlowMode::TickPresent,
                 ty: Type::Number,
             },
-            pure: true,
+            effect: CheckedEffectSummary::default(),
         },
     );
     environment.functions.insert(
@@ -393,8 +629,6 @@ fn distributed_external_interfaces_accept_closed_event_and_list_values() {
         "external value `Server/store.absent` cannot be always absent",
         "external value `Server/store.open` must have a closed value type",
         "external value `Server/store.unknown` must have a closed value type",
-        "external function `Server/impure` must be pure",
-        "external function `Server/noncontinuous` must have a continuous result",
     ] {
         assert!(
             report
@@ -408,7 +642,7 @@ fn distributed_external_interfaces_accept_closed_event_and_list_values() {
 }
 
 #[test]
-fn distributed_calls_reject_noncontinuous_source_arguments() {
+fn distributed_calls_preserve_event_argument_flow() {
     let parsed = boon_parser::parse_source(
         "source-argument.bn",
         "trigger: SOURCE\nvalue: Server/add(value: trigger)\n",
@@ -419,12 +653,19 @@ fn distributed_calls_reject_noncontinuous_source_arguments() {
         "Server/add".to_owned(),
         distributed_function(&[("value", exact_empty_object_type())], Type::Number),
     );
-    let report = check_with_external_types(&parsed, &environment);
-    assert!(report.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .contains("external function `Server/add` argument `value` must be continuous")
-    }));
+    let output = check_program_with_external_types(&parsed, &environment);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("event-valued external call is checked");
+    let call = program
+        .calls
+        .iter()
+        .find(|call| call.function == "Server/add")
+        .expect("distributed call");
+    assert_eq!(call.result.mode, FlowMode::PresentOrAbsent);
 }
 
 #[test]
@@ -479,11 +720,13 @@ FUNCTION add(value) {
     );
     assert!(!entries.contains_key("count"));
     assert!(!entries.keys().any(|path| path.contains("local")));
-    assert!(report
-        .named_value_type_table
-        .entries
-        .windows(2)
-        .all(|entries| entries[0].path < entries[1].path));
+    assert!(
+        report
+            .named_value_type_table
+            .entries
+            .windows(2)
+            .all(|entries| entries[0].path < entries[1].path)
+    );
     let function = report
         .function_type_table
         .entries
@@ -491,6 +734,6 @@ FUNCTION add(value) {
         .find(|function| function.name == "add")
         .expect("runtime-profiled function interface");
     assert_eq!(function.args, ["value"]);
-    assert_eq!(function.arg_types, [Type::Number]);
+    assert_eq!(function.arg_flows, [distributed_continuous(Type::Number)]);
     assert_eq!(function.result, distributed_continuous(Type::Number));
 }

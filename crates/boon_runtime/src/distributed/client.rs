@@ -1,13 +1,16 @@
 use super::client_session::{
     ClientSessionQueueLimits, DecodedClientSessionFrame, OutboundClientSessionQueue, decode_frame,
 };
-use super::endpoint::{EndpointRuntime, PreparedEndpointUpdate};
+use super::endpoint::{
+    EndpointBuildPoll, EndpointBuildTask, EndpointRuntime, PreparedEndpointUpdate,
+};
 use super::link::{ClientSessionLink, ReceiveOperation, SentControl};
 use super::{DistributedRuntimeError, runtime_error};
 use crate::program::ProgramArtifact;
+use crate::program::program_limits;
 use crate::{
-    DocumentFrame, MachineTemplate, RowId, RuntimeTurn, SessionConnectionStatus, SessionContext,
-    SessionOptions, SessionPrincipal, SourcePayload, Value,
+    DocumentFrame, MachineBuildProgress, RowId, RuntimeTurn, SessionConnectionStatus,
+    SessionContext, SessionOptions, SessionPrincipal, SourcePayload, SourceRouteToken, Value,
 };
 use boon_plan::{DistributedGraphIdentityPlan, DistributedWireSchemaPlan, ProgramRole};
 use boon_wire::SessionId;
@@ -24,6 +27,45 @@ pub struct DistributedClientRuntime {
     outbound: OutboundClientSessionQueue,
     leased_session_frame: Option<LeasedSessionFrame>,
     owned_transient_effects: BTreeSet<crate::TransientEffectCallId>,
+}
+
+pub enum DistributedClientStartupPoll {
+    Pending(MachineBuildProgress),
+    Ready(DistributedClientRuntime),
+}
+
+pub struct DistributedClientStartupTask {
+    endpoint: EndpointBuildTask,
+    graph: DistributedGraphIdentityPlan,
+    wire_schema: DistributedWireSchemaPlan,
+    wire_schema_hash: [u8; 32],
+    outbound: OutboundClientSessionQueue,
+}
+
+impl DistributedClientStartupTask {
+    pub fn poll(
+        &mut self,
+        max_steps: usize,
+    ) -> Result<DistributedClientStartupPoll, DistributedRuntimeError> {
+        match self.endpoint.poll(max_steps)? {
+            EndpointBuildPoll::Pending(progress) => {
+                Ok(DistributedClientStartupPoll::Pending(progress))
+            }
+            EndpointBuildPoll::Ready(endpoint) => Ok(DistributedClientStartupPoll::Ready(
+                DistributedClientRuntime {
+                    endpoint,
+                    graph: self.graph.clone(),
+                    wire_schema: self.wire_schema.clone(),
+                    wire_schema_hash: self.wire_schema_hash,
+                    link: None,
+                    connected: false,
+                    outbound: self.outbound.clone(),
+                    leased_session_frame: None,
+                    owned_transient_effects: BTreeSet::new(),
+                },
+            )),
+        }
+    }
 }
 
 struct LeasedSessionFrame {
@@ -51,6 +93,19 @@ impl DistributedClientRuntime {
         artifact: &ProgramArtifact,
         queue_limits: ClientSessionQueueLimits,
     ) -> Result<Self, DistributedRuntimeError> {
+        let mut task = Self::begin_start(artifact, queue_limits)?;
+        loop {
+            match task.poll(usize::MAX)? {
+                DistributedClientStartupPoll::Pending(_) => {}
+                DistributedClientStartupPoll::Ready(runtime) => return Ok(runtime),
+            }
+        }
+    }
+
+    pub fn begin_start(
+        artifact: &ProgramArtifact,
+        queue_limits: ClientSessionQueueLimits,
+    ) -> Result<DistributedClientStartupTask, DistributedRuntimeError> {
         if artifact.role() != ProgramRole::Client {
             return Err(runtime_error(
                 "DistributedClientRuntime requires a Client artifact",
@@ -61,10 +116,9 @@ impl DistributedClientRuntime {
             .distributed_endpoint
             .as_ref()
             .ok_or_else(|| runtime_error("Client artifact has no distributed endpoint"))?;
-        let template =
-            MachineTemplate::new_shared(artifact.plan().clone()).map_err(runtime_error)?;
-        let endpoint = EndpointRuntime::start(
-            &template,
+        let limits = program_limits(artifact.capability_profile());
+        let endpoint = EndpointRuntime::begin_start(
+            artifact.machine_template(),
             linked.endpoint.clone(),
             linked.wire_schema.clone(),
             SessionOptions {
@@ -72,19 +126,17 @@ impl DistributedClientRuntime {
                     status: SessionConnectionStatus::Connecting,
                     principal: SessionPrincipal::Anonymous,
                 },
+                program_revision: artifact.revision(),
+                max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
                 ..SessionOptions::default()
             },
         )?;
-        Ok(Self {
+        Ok(DistributedClientStartupTask {
             endpoint,
             graph: linked.graph.clone(),
             wire_schema: linked.wire_schema.clone(),
             wire_schema_hash: linked.wire_schema_hash,
-            link: None,
-            connected: false,
             outbound: OutboundClientSessionQueue::new(queue_limits)?,
-            leased_session_frame: None,
-            owned_transient_effects: BTreeSet::new(),
         })
     }
 
@@ -98,32 +150,39 @@ impl DistributedClientRuntime {
             return Err(DistributedRuntimeError::StaleTransportGeneration);
         }
         let mut candidate_outbound = self.outbound.clone();
-        let mut candidate_link = match self.link.as_ref() {
-            Some(link) if link.session_id() == session_id => link.rebind(session_id, generation),
+        candidate_outbound.clear();
+        let candidate_link = match self.link.as_ref() {
+            Some(link) if link.session_id() == session_id => {
+                link.rebind(generation, applied_client_through)?
+            }
             Some(_) => {
-                candidate_outbound.clear();
-                ClientSessionLink::new(
+                let mut link = ClientSessionLink::new(
                     self.graph.graph_id.0,
                     self.wire_schema_hash,
                     self.graph.revision,
                     session_id,
                     generation,
-                )
+                );
+                link.rebase_send_after_handshake(applied_client_through)?;
+                link
             }
-            None => ClientSessionLink::new(
-                self.graph.graph_id.0,
-                self.wire_schema_hash,
-                self.graph.revision,
-                session_id,
-                generation,
-            ),
+            None => {
+                let mut link = ClientSessionLink::new(
+                    self.graph.graph_id.0,
+                    self.wire_schema_hash,
+                    self.graph.revision,
+                    session_id,
+                    generation,
+                );
+                link.rebase_send_after_handshake(applied_client_through)?;
+                link
+            }
         };
-        let acknowledged = candidate_link.accept_peer_ack(applied_client_through)?;
-        candidate_outbound.acknowledge_through(acknowledged);
         let candidate_link = Some(candidate_link);
-        let prepared = self.endpoint.prepare_context_update(
+        let prepared = self.endpoint.prepare_context_rebind(
             SessionConnectionStatus::Connecting,
             SessionPrincipal::Anonymous,
+            ProgramRole::Session,
             &[ProgramRole::Session],
         )?;
         let update =
@@ -164,13 +223,15 @@ impl DistributedClientRuntime {
             turns.extend(cancelled.turns);
             self.owned_transient_effects.clear();
         }
+        let mut candidate_outbound = self.outbound.clone();
+        candidate_outbound.clear();
         let prepared = self.endpoint.prepare_context_update(
             SessionConnectionStatus::Stale,
             SessionPrincipal::Anonymous,
             &[],
         )?;
         let update =
-            self.route_prepared_with_transport(prepared, self.link.clone(), self.outbound.clone())?;
+            self.route_prepared_with_transport(prepared, self.link.clone(), candidate_outbound)?;
         turns.extend(update.turns);
         self.connected = false;
         self.leased_session_frame = None;
@@ -182,23 +243,36 @@ impl DistributedClientRuntime {
         path: &str,
         payload: SourcePayload,
     ) -> Result<DistributedClientUpdate, DistributedRuntimeError> {
-        self.dispatch_scoped(path, None, payload)
+        if !self.connected {
+            return Err(DistributedRuntimeError::SessionDisconnected);
+        }
+        let prepared = self.endpoint.prepare_event_for_path(path, payload)?;
+        let prepared = self
+            .endpoint
+            .dispatch_prepared(prepared, &[ProgramRole::Session])?;
+        self.route_prepared(prepared)
     }
 
-    pub fn dispatch_scoped(
+    pub fn dispatch_route(
         &mut self,
-        path: &str,
-        row: Option<RowId>,
+        route: SourceRouteToken,
         payload: SourcePayload,
     ) -> Result<DistributedClientUpdate, DistributedRuntimeError> {
         if !self.connected {
             return Err(DistributedRuntimeError::SessionDisconnected);
         }
-        let prepared = self.endpoint.prepare_event_for_path(path, row, payload)?;
+        let prepared = self.endpoint.prepare_event_for_route(route, payload)?;
         let prepared = self
             .endpoint
             .dispatch_prepared(prepared, &[ProgramRole::Session])?;
         self.route_prepared(prepared)
+    }
+
+    pub fn source_route_token_for_path(
+        &self,
+        path: &str,
+    ) -> Result<SourceRouteToken, DistributedRuntimeError> {
+        self.endpoint.root_route_for_path(path)
     }
 
     pub fn accept_session_frame(
@@ -227,14 +301,15 @@ impl DistributedClientRuntime {
                 ack_through,
                 message,
             } => {
+                let fingerprint = message.semantic_fingerprint()?;
                 let acknowledged = candidate_link.accept_peer_ack(ack_through)?;
                 candidate_outbound.acknowledge_through(acknowledged);
-                match candidate_link.classify_receive(operation_sequence) {
+                match candidate_link.classify_receive(operation_sequence, fingerprint)? {
                     ReceiveOperation::Next => {
                         let prepared = self
                             .endpoint
                             .prepare_accept(message, &[ProgramRole::Session])?;
-                        candidate_link.accept_receive(operation_sequence)?;
+                        candidate_link.accept_receive(operation_sequence, fingerprint)?;
                         self.route_prepared_with_transport(
                             prepared,
                             Some(candidate_link),
@@ -242,7 +317,7 @@ impl DistributedClientRuntime {
                         )
                     }
                     ReceiveOperation::Duplicate => {
-                        candidate_link.accept_receive(operation_sequence)?;
+                        candidate_link.accept_receive(operation_sequence, fingerprint)?;
                         self.link = Some(candidate_link);
                         self.outbound = candidate_outbound;
                         Ok(DistributedClientUpdate::default())
@@ -459,20 +534,6 @@ impl DistributedClientRuntime {
     ) -> Result<RowId, DistributedRuntimeError> {
         self.endpoint
             .row_target_for_source_path(path, key, generation)
-    }
-
-    pub fn row_target_for_source_text(
-        &self,
-        path: &str,
-        text: &str,
-        occurrence: usize,
-    ) -> Result<Option<RowId>, DistributedRuntimeError> {
-        self.endpoint
-            .row_target_for_source_text(path, text, occurrence)
-    }
-
-    pub fn source_row_lookup_field(&self, path: &str) -> Option<&str> {
-        self.endpoint.source_row_lookup_field(path)
     }
 
     pub fn source_is_row_scoped(&self, path: &str) -> Option<bool> {

@@ -15,7 +15,7 @@ expect_root_nonempty = ["real_hierarchy_status", "real_signal_status", "real_cur
 [[step]]
 id = "select-temperature-analog"
 user_action = { kind = "click", target = "variable row", target_text = "simple_tb.s.temperature" }
-expected_source_event = { source = "signal_row.signal_elements.select_signal", address = "simple_tb.s.temperature", target_text = "simple_tb.s.temperature" }
+expected_source_event = { source = "store.signal_catalog.signal_elements.select_signal", address = "simple_tb.s.temperature", target_text = "simple_tb.s.temperature" }
 expect_root_text = { "active_signal" = "simple_tb.s.temperature", "real_signal_page_offset" = "0" }
 expect_root_nonempty = ["active_waveform_segment_labels", "real_cursor_status"]
 
@@ -78,20 +78,20 @@ expect_root_nonempty = ["real_signal_page_request_fingerprint"]
 [[step]]
 id = "select-compare-file"
 user_action = { kind = "click", target = "file row", target_text = "wave_27.fst" }
-expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "wave_27.fst", target_text = "wave_27.fst" }
+expected_source_event = { source = "store.file_tree_rows.file_row_elements.select_file", address = "wave_27.fst", target_text = "wave_27.fst" }
 expect_root_text = { "active_file" = "wave_27.fst", "real_bridge_format" = "FST", "compare_file" = "simple.vcd", "comparison_visible" = "True", "comparison_signal_name" = "simple_tb.s.A", "file_compare_status" = "comparing simple.vcd to wave_27.fst" }
 expect_root_nonempty = ["compare_request_page", "compare_result_label", "comparison_current_value"]
 
 [[step]]
 id = "select-primary-file"
 user_action = { kind = "click", target = "file row", target_text = "simple.vcd" }
-expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "simple.vcd", target_text = "simple.vcd" }
+expected_source_event = { source = "store.file_tree_rows.file_row_elements.select_file", address = "simple.vcd", target_text = "simple.vcd" }
 expect_root_text = { "active_file" = "simple.vcd", "real_bridge_format" = "VCD", "compare_file" = "none", "comparison_visible" = "False", "file_compare_status" = "single file: simple.vcd" }
 
 [[step]]
 id = "select-ghw-file"
 user_action = { kind = "click", target = "file row", target_text = "simple_test.ghw" }
-expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "simple_test.ghw", target_text = "simple_test.ghw" }
+expected_source_event = { source = "store.file_tree_rows.file_row_elements.select_file", address = "simple_test.ghw", target_text = "simple_test.ghw" }
 expect_root_text = { "active_file" = "simple_test.ghw", "real_bridge_format" = "GHW", "compare_file" = "none", "comparison_visible" = "False" }
 expect_root_nonempty = ["active_signal", "real_hierarchy_status", "real_signal_status"]
 

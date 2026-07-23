@@ -26,13 +26,15 @@ pub use codec::{
     decode_checkpoint_batch, decode_restore_image, encode_application_transfer,
     encode_checkpoint_batch, encode_restore_image,
 };
+
+pub const MAX_DURABLE_OWNER_DEPTH: usize = 64;
 pub use migration::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::RedbDriver;
 #[cfg(target_arch = "wasm32")]
 pub use web::{
-    BrowserFailureKind, BrowserPersistenceGrant, BrowserStorageStatus, RexieDriver,
-    browser_failure_kind,
+    BrowserFailureKind, BrowserPersistenceEnqueueError, BrowserPersistenceGrant,
+    BrowserPersistenceOperation, BrowserStorageStatus, RexieDriver, browser_failure_kind,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use worker::*;
@@ -47,6 +49,9 @@ pub struct StoredScalar {
 pub struct StoredRow {
     pub key: u64,
     pub generation: u64,
+    pub source_order_token: u128,
+    pub owner: DurableOwner,
+    pub materialization_origin: Option<DurableOwner>,
     pub fields: BTreeMap<MemoryLeafId, StoredValue>,
     pub touched_fields: BTreeSet<MemoryLeafId>,
 }
@@ -54,7 +59,9 @@ pub struct StoredRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredList {
     pub touched: bool,
+    pub revision: u64,
     pub next_key: u64,
+    pub next_order_token: u128,
     pub rows: Vec<StoredRow>,
 }
 
@@ -67,13 +74,15 @@ impl OutboxItemId {
         invocation_id: EffectInvocationId,
         effect_id: EffectId,
         idempotency_key: &StoredValue,
-        target_row: Option<DurableEffectRow>,
+        owner: &DurableOwner,
+        target_row: Option<DurableRowId>,
     ) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(b"boon.outbox.item.v3");
+        hasher.update(b"boon.outbox.item.v4");
         hasher.update(invocation_id.as_bytes());
         hasher.update(effect_id.as_bytes());
         hash_stored_value(&mut hasher, idempotency_key);
+        hash_durable_owner(&mut hasher, owner);
         match target_row {
             Some(row) => {
                 hasher.update([1]);
@@ -98,11 +107,25 @@ pub fn canonical_intent_key(intent: &StoredValue) -> StoredValue {
     StoredValue::Bytes(hasher.finalize().to_vec().into())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DurableEffectRow {
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DurableRowId {
     pub list_memory_id: MemoryId,
     pub row_key: u64,
     pub row_generation: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DurableOwner {
+    pub ancestors: Vec<DurableRowId>,
+}
+
+fn hash_durable_owner(hasher: &mut Sha256, owner: &DurableOwner) {
+    hasher.update((owner.ancestors.len() as u64).to_be_bytes());
+    for row in &owner.ancestors {
+        hasher.update(row.list_memory_id.as_bytes());
+        hasher.update(row.row_key.to_be_bytes());
+        hasher.update(row.row_generation.to_be_bytes());
+    }
 }
 
 impl fmt::Display for OutboxItemId {
@@ -139,7 +162,8 @@ pub struct DurableOutboxItem {
     pub item_id: OutboxItemId,
     pub invocation_id: EffectInvocationId,
     pub effect_id: EffectId,
-    pub target_row: Option<DurableEffectRow>,
+    pub owner: DurableOwner,
+    pub target_row: Option<DurableRowId>,
     pub idempotency_key: StoredValue,
     pub intent: StoredValue,
     pub state: DurableOutboxState,
@@ -154,7 +178,8 @@ impl DurableOutboxItem {
         effect_id: EffectId,
         idempotency_key: StoredValue,
         intent: StoredValue,
-        target_row: Option<DurableEffectRow>,
+        owner: DurableOwner,
+        target_row: Option<DurableRowId>,
         turn_sequence: u64,
     ) -> Self {
         Self {
@@ -162,10 +187,12 @@ impl DurableOutboxItem {
                 invocation_id,
                 effect_id,
                 &idempotency_key,
+                &owner,
                 target_row,
             ),
             invocation_id,
             effect_id,
+            owner,
             target_row,
             idempotency_key,
             intent,
@@ -260,22 +287,29 @@ pub enum DurableChange {
     },
     SetRowField {
         memory_id: MemoryId,
+        list_revision: u64,
         row_key: u64,
         row_generation: u64,
+        owner: DurableOwner,
+        materialization_origin: Option<DurableOwner>,
         field_id: MemoryLeafId,
         value: StoredValue,
     },
     InsertRow {
         memory_id: MemoryId,
+        list_revision: u64,
         index: u64,
         row: StoredRow,
         next_key: u64,
+        next_order_token: u128,
     },
     RemoveRow {
         memory_id: MemoryId,
+        list_revision: u64,
         row_key: u64,
         row_generation: u64,
         next_key: u64,
+        next_order_token: u128,
     },
     DeleteList {
         memory_id: MemoryId,
@@ -293,124 +327,8 @@ pub struct CheckpointBatch {
     pub changes: Vec<DurableChange>,
     pub outbox_changes: Vec<DurableOutboxChange>,
     #[serde(default)]
-    pub protocol_state_changes: Vec<DurableProtocolStateChange>,
-    #[serde(default)]
     pub content_artifact_changes: Vec<DurableContentArtifactChange>,
     pub checksum: [u8; 32],
-}
-
-pub const MAX_PROTOCOL_STATE_RECORDS: usize = 4_096;
-pub const MAX_PROTOCOL_STATE_RECORD_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_PROTOCOL_STATE_BYTES: usize = 64 * 1024 * 1024;
-
-/// Host-private key for protocol recovery state committed with application authority.
-///
-/// Keys and payloads are deliberately absent from the public persistence inspector and
-/// application export. Hosts derive keys from their own private identity domains.
-#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[repr(transparent)]
-pub struct ProtocolStateKey(pub [u8; 32]);
-
-impl ProtocolStateKey {
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for ProtocolStateKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ProtocolStateKey(..)")
-    }
-}
-
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProtocolStateRecord {
-    pub revision: u64,
-    pub payload: Bytes,
-}
-
-impl fmt::Debug for ProtocolStateRecord {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ProtocolStateRecord")
-            .field("revision", &self.revision)
-            .field("payload_bytes", &self.payload.len())
-            .finish()
-    }
-}
-
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum DurableProtocolStateChange {
-    Put {
-        key: ProtocolStateKey,
-        expected_revision: Option<u64>,
-        next_revision: u64,
-        payload: Bytes,
-        turn_sequence: u64,
-    },
-    Delete {
-        key: ProtocolStateKey,
-        expected_revision: u64,
-        turn_sequence: u64,
-    },
-}
-
-impl DurableProtocolStateChange {
-    pub const fn turn_sequence(&self) -> u64 {
-        match self {
-            Self::Put { turn_sequence, .. } | Self::Delete { turn_sequence, .. } => *turn_sequence,
-        }
-    }
-}
-
-impl fmt::Debug for DurableProtocolStateChange {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Put {
-                expected_revision,
-                next_revision,
-                payload,
-                turn_sequence,
-                ..
-            } => formatter
-                .debug_struct("PutProtocolState")
-                .field("expected_revision", expected_revision)
-                .field("next_revision", next_revision)
-                .field("payload_bytes", &payload.len())
-                .field("turn_sequence", turn_sequence)
-                .finish(),
-            Self::Delete {
-                expected_revision,
-                turn_sequence,
-                ..
-            } => formatter
-                .debug_struct("DeleteProtocolState")
-                .field("expected_revision", expected_revision)
-                .field("turn_sequence", turn_sequence)
-                .finish(),
-        }
-    }
-}
-
-#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProtocolStateSnapshot {
-    pub records: BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
-}
-
-impl fmt::Debug for ProtocolStateSnapshot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let bytes = self
-            .records
-            .values()
-            .map(|record| record.payload.len())
-            .sum::<usize>();
-        formatter
-            .debug_struct("ProtocolStateSnapshot")
-            .field("record_count", &self.records.len())
-            .field("payload_bytes", &bytes)
-            .finish()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -471,8 +389,8 @@ impl ActivationBatch {
         if candidate.through_turn_sequence < current.through_turn_sequence {
             return Err(StoreError::NonContiguousTurn);
         }
-        for list in candidate.lists.values() {
-            validate_list(list)?;
+        for (memory_id, list) in &candidate.lists {
+            validate_list(*memory_id, list)?;
         }
         validate_content_artifact_manifest(&candidate.content_artifact_manifest)?;
         if candidate
@@ -555,11 +473,6 @@ pub struct BarrierRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InspectRequest {
-    pub application: ApplicationIdentity,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LoadProtocolStateRequest {
     pub application: ApplicationIdentity,
 }
 
@@ -754,7 +667,6 @@ pub struct ShutdownRequest;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PersistenceCommand {
     Load(RestoreRequest),
-    LoadProtocolState(LoadProtocolStateRequest),
     Initialize(RestoreImage),
     Commit(CheckpointBatch),
     Activate(ActivationBatch),
@@ -868,7 +780,6 @@ pub struct ShutdownAck;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PersistenceResult {
     Loaded(Result<Option<RestoreImage>, StoreError>),
-    ProtocolStateLoaded(Result<ProtocolStateSnapshot, StoreError>),
     Initialized(Result<CommitAck, StoreError>),
     Committed(Result<CommitAck, StoreError>),
     Activated(Result<ActivationAck, StoreError>),
@@ -894,7 +805,6 @@ pub enum StoreError {
     InvalidChecksum,
     InvalidAuthority(String),
     InvalidOutboxTransition(String),
-    InvalidProtocolState(String),
     InvalidContentArtifact(String),
     Backend(String),
 }
@@ -913,9 +823,6 @@ impl fmt::Display for StoreError {
             Self::InvalidOutboxTransition(detail) => {
                 write!(formatter, "invalid outbox transition: {detail}")
             }
-            Self::InvalidProtocolState(detail) => {
-                write!(formatter, "invalid protocol state: {detail}")
-            }
             Self::InvalidContentArtifact(detail) => {
                 write!(formatter, "invalid content artifact: {detail}")
             }
@@ -933,7 +840,6 @@ pub trait PersistenceDriver {
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryDriver {
     applications: BTreeMap<ApplicationIdentity, RestoreImage>,
-    protocol_state: BTreeMap<ApplicationIdentity, ProtocolStateSnapshot>,
     artifacts: BTreeMap<(ApplicationIdentity, ContentArtifactId), ContentArtifact>,
     closed: bool,
     fail_next_activation: bool,
@@ -941,9 +847,7 @@ pub struct InMemoryDriver {
 
 impl InMemoryDriver {
     pub fn seed(&mut self, image: RestoreImage) {
-        let application = image.application.clone();
-        self.applications.insert(application.clone(), image);
-        self.protocol_state.entry(application).or_default();
+        self.applications.insert(image.application.clone(), image);
     }
 
     pub fn fail_next_activation(&mut self) {
@@ -952,13 +856,6 @@ impl InMemoryDriver {
 
     pub fn image(&self, application: &ApplicationIdentity) -> Option<&RestoreImage> {
         self.applications.get(application)
-    }
-
-    pub fn protocol_state(
-        &self,
-        application: &ApplicationIdentity,
-    ) -> Option<&ProtocolStateSnapshot> {
-        self.protocol_state.get(application)
     }
 
     fn application_artifacts(
@@ -1016,9 +913,7 @@ impl InMemoryDriver {
             epoch: image.epoch,
             through_turn_sequence: image.through_turn_sequence,
         };
-        let application = image.application.clone();
-        self.applications.insert(application.clone(), image);
-        self.protocol_state.entry(application).or_default();
+        self.applications.insert(image.application.clone(), image);
         Ok(ack)
     }
 
@@ -1029,19 +924,8 @@ impl InMemoryDriver {
             .cloned()
             .ok_or(StoreError::MissingApplication)?;
         let ack = apply_checkpoint_to_image(&mut candidate, &batch)?;
-        let mut protocol_state = self
-            .protocol_state
-            .get(&batch.application)
-            .cloned()
-            .unwrap_or_default();
-        apply_durable_protocol_state_changes(
-            &mut protocol_state.records,
-            &batch.protocol_state_changes,
-        )?;
         let artifacts = self.application_artifacts(&batch.application);
         validate_content_artifact_storage(&candidate.content_artifact_manifest, &artifacts)?;
-        self.protocol_state
-            .insert(batch.application.clone(), protocol_state);
         self.applications.insert(batch.application, candidate);
         Ok(ack)
     }
@@ -1099,7 +983,6 @@ impl InMemoryDriver {
         let (reset, ack) = apply_reset_to_image(current, &batch)?;
         self.artifacts
             .retain(|(application, _), _| application != &batch.application);
-        self.protocol_state.remove(&batch.application);
         self.applications.insert(batch.application, reset);
         Ok(ack)
     }
@@ -1182,19 +1065,6 @@ impl PersistenceDriver for InMemoryDriver {
         }
         match command {
             PersistenceCommand::Load(request) => PersistenceResult::Loaded(self.load(request)),
-            PersistenceCommand::LoadProtocolState(request) => {
-                let result = self
-                    .applications
-                    .contains_key(&request.application)
-                    .then(|| {
-                        self.protocol_state
-                            .get(&request.application)
-                            .cloned()
-                            .unwrap_or_default()
-                    })
-                    .ok_or(StoreError::MissingApplication);
-                PersistenceResult::ProtocolStateLoaded(result)
-            }
             PersistenceCommand::Initialize(image) => {
                 PersistenceResult::Initialized(self.initialize(image))
             }
@@ -1274,7 +1144,7 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 image.scalars.remove(memory_id);
             }
             DurableChange::SetList { memory_id, value } => {
-                validate_list(value)?;
+                validate_list(*memory_id, value)?;
                 if image.scalars.contains_key(memory_id) {
                     return Err(StoreError::InvalidAuthority(format!(
                         "memory {memory_id} is already a scalar"
@@ -1284,8 +1154,11 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
             }
             DurableChange::SetRowField {
                 memory_id,
+                list_revision,
                 row_key,
                 row_generation,
+                owner,
+                materialization_origin,
                 field_id,
                 value,
             } => {
@@ -1296,15 +1169,28 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 }
                 let list = image.lists.entry(*memory_id).or_insert_with(|| StoredList {
                     touched: false,
+                    revision: *list_revision,
                     next_key: 0,
+                    next_order_token: 0,
                     rows: Vec::new(),
                 });
+                advance_list_revision(*memory_id, list, *list_revision)?;
                 let row = match list
                     .rows
                     .iter_mut()
                     .find(|row| row.key == *row_key && row.generation == *row_generation)
                 {
-                    Some(row) => row,
+                    Some(row)
+                        if row.owner == *owner
+                            && row.materialization_origin == *materialization_origin =>
+                    {
+                        row
+                    }
+                    Some(_) => {
+                        return Err(StoreError::InvalidAuthority(format!(
+                            "list {memory_id} row {row_key}:{row_generation} changed structural owner"
+                        )));
+                    }
                     None if list.touched => {
                         return Err(StoreError::InvalidAuthority(format!(
                             "list {memory_id} has no row {row_key}:{row_generation}"
@@ -1314,6 +1200,9 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                         list.rows.push(StoredRow {
                             key: *row_key,
                             generation: *row_generation,
+                            source_order_token: 0,
+                            owner: owner.clone(),
+                            materialization_origin: materialization_origin.clone(),
                             fields: BTreeMap::new(),
                             touched_fields: BTreeSet::new(),
                         });
@@ -1322,12 +1211,15 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 };
                 row.fields.insert(*field_id, value.clone());
                 row.touched_fields.insert(*field_id);
+                validate_row_owner(*memory_id, row)?;
             }
             DurableChange::InsertRow {
                 memory_id,
+                list_revision,
                 index,
                 row,
                 next_key,
+                next_order_token,
             } => {
                 let list = image.lists.get_mut(memory_id).ok_or_else(|| {
                     StoreError::InvalidAuthority(format!(
@@ -1359,14 +1251,18 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                     )));
                 }
                 list.rows.insert(index, row.clone());
+                advance_list_revision(*memory_id, list, *list_revision)?;
                 list.next_key = *next_key;
-                validate_list(list)?;
+                list.next_order_token = *next_order_token;
+                validate_list(*memory_id, list)?;
             }
             DurableChange::RemoveRow {
                 memory_id,
+                list_revision,
                 row_key,
                 row_generation,
                 next_key,
+                next_order_token,
             } => {
                 let list = image.lists.get_mut(memory_id).ok_or_else(|| {
                     StoreError::InvalidAuthority(format!(
@@ -1388,8 +1284,10 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                         ))
                     })?;
                 list.rows.remove(index);
+                advance_list_revision(*memory_id, list, *list_revision)?;
                 list.next_key = *next_key;
-                validate_list(list)?;
+                list.next_order_token = *next_order_token;
+                validate_list(*memory_id, list)?;
             }
             DurableChange::DeleteList { memory_id } => {
                 image.lists.remove(memory_id);
@@ -1509,114 +1407,6 @@ pub fn apply_durable_outbox_changes(
     Ok(())
 }
 
-/// Applies opaque host-protocol recovery records with optimistic revisions.
-///
-/// The persistence layer validates boundedness and compare-and-swap ordering but
-/// never interprets payload bytes. Protocol owners are responsible for their own
-/// versioned payload schema.
-pub fn apply_durable_protocol_state_changes(
-    records: &mut BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
-    changes: &[DurableProtocolStateChange],
-) -> Result<(), StoreError> {
-    let mut candidate = records.clone();
-    for change in changes {
-        match change {
-            DurableProtocolStateChange::Put {
-                key,
-                expected_revision,
-                next_revision,
-                payload,
-                ..
-            } => {
-                if payload.len() > MAX_PROTOCOL_STATE_RECORD_BYTES {
-                    return Err(StoreError::InvalidProtocolState(format!(
-                        "protocol record has {} bytes, limit is {MAX_PROTOCOL_STATE_RECORD_BYTES}",
-                        payload.len()
-                    )));
-                }
-                let current = candidate.get(key);
-                match (expected_revision, current) {
-                    (None, None) if *next_revision == 1 => {}
-                    (Some(expected), Some(current))
-                        if current.revision == *expected
-                            && expected.checked_add(1) == Some(*next_revision) => {}
-                    (_, Some(current))
-                        if current.revision == *next_revision && current.payload == *payload =>
-                    {
-                        continue;
-                    }
-                    _ => {
-                        return Err(StoreError::InvalidProtocolState(
-                            "protocol record revision compare-and-swap failed".to_owned(),
-                        ));
-                    }
-                }
-                candidate.insert(
-                    *key,
-                    ProtocolStateRecord {
-                        revision: *next_revision,
-                        payload: payload.clone(),
-                    },
-                );
-            }
-            DurableProtocolStateChange::Delete {
-                key,
-                expected_revision,
-                ..
-            } => {
-                let Some(current) = candidate.get(key) else {
-                    return Err(StoreError::InvalidProtocolState(
-                        "cannot delete a missing protocol record".to_owned(),
-                    ));
-                };
-                if current.revision != *expected_revision {
-                    return Err(StoreError::InvalidProtocolState(
-                        "protocol record delete revision does not match".to_owned(),
-                    ));
-                }
-                candidate.remove(key);
-            }
-        }
-    }
-    validate_protocol_state(&candidate)?;
-    *records = candidate;
-    Ok(())
-}
-
-pub fn validate_protocol_state(
-    records: &BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
-) -> Result<(), StoreError> {
-    if records.len() > MAX_PROTOCOL_STATE_RECORDS {
-        return Err(StoreError::InvalidProtocolState(format!(
-            "protocol state has {} records, limit is {MAX_PROTOCOL_STATE_RECORDS}",
-            records.len()
-        )));
-    }
-    let mut bytes = 0usize;
-    for record in records.values() {
-        if record.revision == 0 {
-            return Err(StoreError::InvalidProtocolState(
-                "protocol record revision must be positive".to_owned(),
-            ));
-        }
-        if record.payload.len() > MAX_PROTOCOL_STATE_RECORD_BYTES {
-            return Err(StoreError::InvalidProtocolState(format!(
-                "protocol record has {} bytes, limit is {MAX_PROTOCOL_STATE_RECORD_BYTES}",
-                record.payload.len()
-            )));
-        }
-        bytes = bytes.checked_add(record.payload.len()).ok_or_else(|| {
-            StoreError::InvalidProtocolState("protocol state byte count overflow".to_owned())
-        })?;
-    }
-    if bytes > MAX_PROTOCOL_STATE_BYTES {
-        return Err(StoreError::InvalidProtocolState(format!(
-            "protocol state has {bytes} bytes, limit is {MAX_PROTOCOL_STATE_BYTES}"
-        )));
-    }
-    Ok(())
-}
-
 fn transition_outbox_item(
     outbox: &mut BTreeMap<OutboxItemId, DurableOutboxItem>,
     item_id: OutboxItemId,
@@ -1681,11 +1471,20 @@ fn validate_outbox(outbox: &BTreeMap<OutboxItemId, DurableOutboxItem>) -> Result
 }
 
 fn validate_outbox_item(item: &DurableOutboxItem) -> Result<(), StoreError> {
+    validate_durable_owner(&item.owner, true).map_err(StoreError::InvalidOutboxTransition)?;
+    if let Some(target) = item.target_row
+        && target.row_generation == 0
+    {
+        return Err(StoreError::InvalidOutboxTransition(
+            "outbox target row has zero generation".to_owned(),
+        ));
+    }
     if item.item_id
         != OutboxItemId::from_invocation(
             item.invocation_id,
             item.effect_id,
             &item.idempotency_key,
+            &item.owner,
             item.target_row,
         )
     {
@@ -2128,9 +1927,25 @@ fn apply_activation_to_image(
     Ok((candidate, ack))
 }
 
-fn validate_list(list: &StoredList) -> Result<(), StoreError> {
+fn advance_list_revision(
+    memory_id: MemoryId,
+    list: &mut StoredList,
+    next_revision: u64,
+) -> Result<(), StoreError> {
+    if next_revision < list.revision {
+        return Err(StoreError::InvalidAuthority(format!(
+            "list {memory_id} revision moved backwards from {} to {next_revision}",
+            list.revision
+        )));
+    }
+    list.revision = next_revision;
+    Ok(())
+}
+
+fn validate_list(memory_id: MemoryId, list: &StoredList) -> Result<(), StoreError> {
     let mut rows = BTreeSet::new();
     let mut minimum_next = 1u64;
+    let mut previous_order_token = 0_u128;
     for row in &list.rows {
         if !rows.insert((row.key, row.generation)) {
             return Err(StoreError::InvalidAuthority(format!(
@@ -2138,6 +1953,7 @@ fn validate_list(list: &StoredList) -> Result<(), StoreError> {
                 row.key, row.generation
             )));
         }
+        validate_row_owner(memory_id, row)?;
         if !row
             .touched_fields
             .is_subset(&row.fields.keys().copied().collect())
@@ -2152,18 +1968,28 @@ fn validate_list(list: &StoredList) -> Result<(), StoreError> {
                 || row
                     .fields
                     .keys()
-                    .any(|field| !row.touched_fields.contains(field)))
+                    .any(|field| !row.touched_fields.contains(field))
+                || row.source_order_token != 0)
         {
             return Err(StoreError::InvalidAuthority(format!(
                 "sparse row {}:{} contains non-override fields",
                 row.key, row.generation
             )));
         }
+        if list.touched {
+            if row.source_order_token == 0 || row.source_order_token <= previous_order_token {
+                return Err(StoreError::InvalidAuthority(format!(
+                    "list {memory_id} row {}:{} has a non-increasing source-order token",
+                    row.key, row.generation
+                )));
+            }
+            previous_order_token = row.source_order_token;
+        }
         minimum_next = minimum_next.max(row.key.saturating_add(1));
     }
-    if !list.touched && list.next_key != 0 {
+    if !list.touched && (list.next_key != 0 || list.next_order_token != 0) {
         return Err(StoreError::InvalidAuthority(
-            "sparse row overrides must not replace list allocator state".to_owned(),
+            "sparse row overrides must not replace list allocator or ordering state".to_owned(),
         ));
     }
     if list.touched && list.next_key < minimum_next {
@@ -2171,6 +1997,63 @@ fn validate_list(list: &StoredList) -> Result<(), StoreError> {
             "next key {} is below {}",
             list.next_key, minimum_next
         )));
+    }
+    if list.touched && list.next_order_token <= previous_order_token {
+        return Err(StoreError::InvalidAuthority(format!(
+            "list {memory_id} next source-order token does not follow its rows"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_row_owner(memory_id: MemoryId, row: &StoredRow) -> Result<(), StoreError> {
+    if row.generation == 0 {
+        return Err(StoreError::InvalidAuthority(format!(
+            "row {} has zero generation",
+            row.key
+        )));
+    }
+    validate_durable_owner(&row.owner, false).map_err(StoreError::InvalidAuthority)?;
+    if let Some(origin) = &row.materialization_origin {
+        validate_durable_owner(origin, true).map_err(StoreError::InvalidAuthority)?;
+    }
+    let Some(leaf) = row.owner.ancestors.last() else {
+        return Err(StoreError::InvalidAuthority(format!(
+            "row {}:{} has no structural owner",
+            row.key, row.generation
+        )));
+    };
+    if leaf.list_memory_id != memory_id
+        || leaf.row_key != row.key
+        || leaf.row_generation != row.generation
+    {
+        return Err(StoreError::InvalidAuthority(format!(
+            "row {}:{} structural owner has a different leaf",
+            row.key, row.generation
+        )));
+    }
+    Ok(())
+}
+
+fn validate_durable_owner(owner: &DurableOwner, allow_empty: bool) -> Result<(), String> {
+    if owner.ancestors.is_empty() && !allow_empty {
+        return Err("durable row owner is empty".to_owned());
+    }
+    if owner.ancestors.len() > MAX_DURABLE_OWNER_DEPTH {
+        return Err(format!(
+            "durable owner depth {} exceeds {}",
+            owner.ancestors.len(),
+            MAX_DURABLE_OWNER_DEPTH
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for row in &owner.ancestors {
+        if row.row_generation == 0 {
+            return Err("durable owner contains a zero row generation".to_owned());
+        }
+        if !seen.insert(*row) {
+            return Err("durable owner repeats a row identity".to_owned());
+        }
     }
     Ok(())
 }
@@ -2193,15 +2076,6 @@ fn validate_checkpoint(batch: &CheckpointBatch) -> Result<(), StoreError> {
             )));
         }
     }
-    for change in &batch.protocol_state_changes {
-        let turn = change.turn_sequence();
-        if turn < batch.first_turn_sequence || turn > batch.last_turn_sequence {
-            return Err(StoreError::InvalidProtocolState(format!(
-                "protocol-state transition turn {turn} is outside checkpoint range {}..={}",
-                batch.first_turn_sequence, batch.last_turn_sequence
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -2211,8 +2085,8 @@ fn validate_initial_image(image: &RestoreImage) -> Result<(), StoreError> {
             "initial restore image must start at epoch and turn zero".to_owned(),
         ));
     }
-    for list in image.lists.values() {
-        validate_list(list)?;
+    for (memory_id, list) in &image.lists {
+        validate_list(*memory_id, list)?;
     }
     validate_outbox(&image.outbox)?;
     validate_content_artifact_manifest(&image.content_artifact_manifest)?;
@@ -2283,8 +2157,8 @@ fn validate_activation(batch: &ActivationBatch) -> Result<(), StoreError> {
 }
 
 pub fn validate_application_transfer(transfer: &ApplicationTransfer) -> Result<(), StoreError> {
-    for list in transfer.restore_image.lists.values() {
-        validate_list(list)?;
+    for (memory_id, list) in &transfer.restore_image.lists {
+        validate_list(*memory_id, list)?;
     }
     validate_outbox(&transfer.restore_image.outbox)?;
     validate_content_artifact_manifest(&transfer.restore_image.content_artifact_manifest)?;
@@ -2376,7 +2250,6 @@ fn checkpoint_checksum(batch: &CheckpointBatch) -> [u8; 32] {
     hasher.update(batch.last_turn_sequence.to_be_bytes());
     hash_changes(&mut hasher, &batch.changes);
     hash_outbox_changes(&mut hasher, &batch.outbox_changes);
-    hash_protocol_state_changes(&mut hasher, &batch.protocol_state_changes);
     hash_content_artifact_changes(&mut hasher, &batch.content_artifact_changes);
     hasher.finalize().into()
 }
@@ -2497,7 +2370,9 @@ fn hash_changes(hasher: &mut Sha256, changes: &[DurableChange]) {
                 hasher.update([2]);
                 hasher.update(memory_id.as_bytes());
                 hasher.update([u8::from(value.touched)]);
+                hasher.update(value.revision.to_be_bytes());
                 hasher.update(value.next_key.to_be_bytes());
+                hasher.update(value.next_order_token.to_be_bytes());
                 hasher.update((value.rows.len() as u64).to_be_bytes());
                 for row in &value.rows {
                     hash_stored_row(hasher, row);
@@ -2505,41 +2380,61 @@ fn hash_changes(hasher: &mut Sha256, changes: &[DurableChange]) {
             }
             DurableChange::SetRowField {
                 memory_id,
+                list_revision,
                 row_key,
                 row_generation,
+                owner,
+                materialization_origin,
                 field_id,
                 value,
             } => {
                 hasher.update([3]);
                 hasher.update(memory_id.as_bytes());
+                hasher.update(list_revision.to_be_bytes());
                 hasher.update(row_key.to_be_bytes());
                 hasher.update(row_generation.to_be_bytes());
+                hash_durable_owner(hasher, owner);
+                match materialization_origin {
+                    Some(origin) => {
+                        hasher.update([1]);
+                        hash_durable_owner(hasher, origin);
+                    }
+                    None => hasher.update([0]),
+                }
                 hasher.update(field_id.as_bytes());
                 hash_stored_value(hasher, value);
             }
             DurableChange::InsertRow {
                 memory_id,
+                list_revision,
                 index,
                 row,
                 next_key,
+                next_order_token,
             } => {
                 hasher.update([4]);
                 hasher.update(memory_id.as_bytes());
+                hasher.update(list_revision.to_be_bytes());
                 hasher.update(index.to_be_bytes());
                 hash_stored_row(hasher, row);
                 hasher.update(next_key.to_be_bytes());
+                hasher.update(next_order_token.to_be_bytes());
             }
             DurableChange::RemoveRow {
                 memory_id,
+                list_revision,
                 row_key,
                 row_generation,
                 next_key,
+                next_order_token,
             } => {
                 hasher.update([5]);
                 hasher.update(memory_id.as_bytes());
+                hasher.update(list_revision.to_be_bytes());
                 hasher.update(row_key.to_be_bytes());
                 hasher.update(row_generation.to_be_bytes());
                 hasher.update(next_key.to_be_bytes());
+                hasher.update(next_order_token.to_be_bytes());
             }
             DurableChange::DeleteList { memory_id } => {
                 hasher.update([6]);
@@ -2614,45 +2509,6 @@ fn hash_outbox_changes(hasher: &mut Sha256, changes: &[DurableOutboxChange]) {
     }
 }
 
-fn hash_protocol_state_changes(hasher: &mut Sha256, changes: &[DurableProtocolStateChange]) {
-    hasher.update((changes.len() as u64).to_be_bytes());
-    for change in changes {
-        match change {
-            DurableProtocolStateChange::Put {
-                key,
-                expected_revision,
-                next_revision,
-                payload,
-                turn_sequence,
-            } => {
-                hasher.update([0]);
-                hasher.update(key.as_bytes());
-                match expected_revision {
-                    Some(revision) => {
-                        hasher.update([1]);
-                        hasher.update(revision.to_be_bytes());
-                    }
-                    None => hasher.update([0]),
-                }
-                hasher.update(next_revision.to_be_bytes());
-                hasher.update(turn_sequence.to_be_bytes());
-                hasher.update((payload.len() as u64).to_be_bytes());
-                hasher.update(payload);
-            }
-            DurableProtocolStateChange::Delete {
-                key,
-                expected_revision,
-                turn_sequence,
-            } => {
-                hasher.update([1]);
-                hasher.update(key.as_bytes());
-                hasher.update(expected_revision.to_be_bytes());
-                hasher.update(turn_sequence.to_be_bytes());
-            }
-        }
-    }
-}
-
 fn hash_outbox_transition_header(
     hasher: &mut Sha256,
     item_id: OutboxItemId,
@@ -2672,6 +2528,7 @@ fn hash_outbox_item(hasher: &mut Sha256, item: &DurableOutboxItem) {
     hasher.update(item.item_id.as_bytes());
     hasher.update(item.invocation_id.as_bytes());
     hasher.update(item.effect_id.as_bytes());
+    hash_durable_owner(hasher, &item.owner);
     match item.target_row {
         Some(row) => {
             hasher.update([1]);
@@ -2707,6 +2564,15 @@ fn hash_outbox_item(hasher: &mut Sha256, item: &DurableOutboxItem) {
 fn hash_stored_row(hasher: &mut Sha256, row: &StoredRow) {
     hasher.update(row.key.to_be_bytes());
     hasher.update(row.generation.to_be_bytes());
+    hasher.update(row.source_order_token.to_be_bytes());
+    hash_durable_owner(hasher, &row.owner);
+    match &row.materialization_origin {
+        Some(origin) => {
+            hasher.update([1]);
+            hash_durable_owner(hasher, origin);
+        }
+        None => hasher.update([0]),
+    }
     hasher.update((row.fields.len() as u64).to_be_bytes());
     for (field, field_value) in &row.fields {
         hasher.update(field.as_bytes());
@@ -2856,9 +2722,6 @@ pub(crate) fn inspector_snapshot_with_artifacts(
 fn error_result(command: PersistenceCommand, error: StoreError) -> PersistenceResult {
     match command {
         PersistenceCommand::Load(_) => PersistenceResult::Loaded(Err(error)),
-        PersistenceCommand::LoadProtocolState(_) => {
-            PersistenceResult::ProtocolStateLoaded(Err(error))
-        }
         PersistenceCommand::Initialize(_) => PersistenceResult::Initialized(Err(error)),
         PersistenceCommand::Commit(_) => PersistenceResult::Committed(Err(error)),
         PersistenceCommand::Activate(_) => PersistenceResult::Activated(Err(error)),
@@ -2920,6 +2783,93 @@ mod tests {
         let mut driver = InMemoryDriver::default();
         driver.seed(RestoreImage::empty(application(), 1, [1; 32]));
         driver
+    }
+
+    #[test]
+    fn structural_row_owners_are_bounded_exact_and_checksum_significant() {
+        let rows = list_memory("rows");
+        let parent = list_memory("parents");
+        let field = MemoryLeafId::from_memory_path(rows, "value").unwrap();
+        let leaf = DurableRowId {
+            list_memory_id: rows,
+            row_key: 2,
+            row_generation: 1,
+        };
+        let owner = DurableOwner {
+            ancestors: vec![
+                DurableRowId {
+                    list_memory_id: parent,
+                    row_key: 7,
+                    row_generation: 3,
+                },
+                leaf,
+            ],
+        };
+        let valid = StoredList {
+            touched: true,
+            revision: 0,
+            next_key: 3,
+            next_order_token: 2_u128 << 64,
+            rows: vec![StoredRow {
+                key: 2,
+                generation: 1,
+                source_order_token: 1_u128 << 64,
+                owner: owner.clone(),
+                materialization_origin: Some(DurableOwner::default()),
+                fields: BTreeMap::from([(field, number(1))]),
+                touched_fields: BTreeSet::from([field]),
+            }],
+        };
+        validate_list(rows, &valid).unwrap();
+
+        let mut invalid = valid.clone();
+        invalid.rows[0].owner.ancestors.clear();
+        assert!(validate_list(rows, &invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.rows[0].owner.ancestors[1].row_generation = 0;
+        assert!(validate_list(rows, &invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.rows[0].owner.ancestors[1].row_key = 99;
+        assert!(validate_list(rows, &invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.rows[0].owner.ancestors = vec![leaf, leaf];
+        assert!(validate_list(rows, &invalid).is_err());
+
+        let change = |parent_key| DurableChange::SetRowField {
+            memory_id: rows,
+            list_revision: 1,
+            row_key: 2,
+            row_generation: 1,
+            owner: DurableOwner {
+                ancestors: vec![
+                    DurableRowId {
+                        list_memory_id: parent,
+                        row_key: parent_key,
+                        row_generation: 1,
+                    },
+                    leaf,
+                ],
+            },
+            materialization_origin: None,
+            field_id: field,
+            value: number(1),
+        };
+        let batch = |change| {
+            CheckpointBatch {
+                application: application(),
+                schema_hash: [1; 32],
+                base_epoch: 0,
+                next_epoch: 1,
+                first_turn_sequence: 1,
+                last_turn_sequence: 1,
+                changes: vec![change],
+                outbox_changes: Vec::new(),
+                content_artifact_changes: Vec::new(),
+                checksum: [0; 32],
+            }
+            .seal()
+        };
+        assert_ne!(batch(change(1)).checksum, batch(change(2)).checksum);
     }
 
     #[test]
@@ -3037,7 +2987,6 @@ mod tests {
             last_turn_sequence: turn_sequence,
             changes: authority_changes,
             outbox_changes: Vec::new(),
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: changes,
             checksum: [0; 32],
         }
@@ -3373,6 +3322,7 @@ mod tests {
             effect(),
             number(key),
             StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(key * 10))])),
+            DurableOwner::default(),
             None,
             turn_sequence,
         )
@@ -3382,7 +3332,7 @@ mod tests {
     fn indexed_effect_rows_keep_distinct_local_completion_obligations() {
         let intent = StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(10))]));
         let key = canonical_intent_key(&intent);
-        let row = |row_key| DurableEffectRow {
+        let row = |row_key| DurableRowId {
             list_memory_id: memory("todos"),
             row_key,
             row_generation: 1,
@@ -3392,11 +3342,23 @@ mod tests {
             effect(),
             key.clone(),
             intent.clone(),
+            DurableOwner {
+                ancestors: vec![row(1)],
+            },
             Some(row(1)),
             1,
         );
-        let second =
-            DurableOutboxItem::pending(invocation(), effect(), key, intent, Some(row(2)), 1);
+        let second = DurableOutboxItem::pending(
+            invocation(),
+            effect(),
+            key,
+            intent,
+            DurableOwner {
+                ancestors: vec![row(2)],
+            },
+            Some(row(2)),
+            1,
+        );
 
         assert_ne!(first.item_id, second.item_id);
         assert_eq!(first.idempotency_key, second.idempotency_key);
@@ -3420,7 +3382,6 @@ mod tests {
                 },
             }],
             outbox_changes: Vec::new(),
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3450,21 +3411,38 @@ mod tests {
             changes: vec![
                 DurableChange::SetRowField {
                     memory_id: list,
+                    list_revision: 1,
                     row_key: 2,
                     row_generation: 1,
+                    owner: DurableOwner {
+                        ancestors: vec![DurableRowId {
+                            list_memory_id: list,
+                            row_key: 2,
+                            row_generation: 1,
+                        }],
+                    },
+                    materialization_origin: None,
                     field_id: field,
                     value: StoredValue::Text("=A1".to_owned()),
                 },
                 DurableChange::SetRowField {
                     memory_id: list,
+                    list_revision: 1,
                     row_key: 2,
                     row_generation: 1,
+                    owner: DurableOwner {
+                        ancestors: vec![DurableRowId {
+                            list_memory_id: list,
+                            row_key: 2,
+                            row_generation: 1,
+                        }],
+                    },
+                    materialization_origin: None,
                     field_id: field,
                     value: StoredValue::Text("=A1+1".to_owned()),
                 },
             ],
             outbox_changes: Vec::new(),
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3649,7 +3627,6 @@ mod tests {
             last_turn_sequence: 1,
             changes: Vec::new(),
             outbox_changes,
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3683,7 +3660,6 @@ mod tests {
             last_turn_sequence: 2,
             changes: Vec::new(),
             outbox_changes: vec![dispatch.clone(), dispatch],
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3719,7 +3695,6 @@ mod tests {
                 attempt: 1,
                 turn_sequence: 3,
             }],
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3766,7 +3741,6 @@ mod tests {
                 },
             }],
             outbox_changes: completions,
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3844,48 +3818,5 @@ mod tests {
             driver.execute(PersistenceCommand::ResetApplication(batch)),
             PersistenceResult::ApplicationReset(Err(StoreError::StaleEpoch))
         ));
-    }
-
-    #[test]
-    fn private_protocol_state_is_revisioned_bounded_and_not_in_the_restore_image() {
-        let key = ProtocolStateKey([7; 32]);
-        let mut records = BTreeMap::new();
-        apply_durable_protocol_state_changes(
-            &mut records,
-            &[DurableProtocolStateChange::Put {
-                key,
-                expected_revision: None,
-                next_revision: 1,
-                payload: Bytes::from_static(b"session-checkpoint-v1"),
-                turn_sequence: 1,
-            }],
-        )
-        .unwrap();
-        assert_eq!(records[&key].revision, 1);
-
-        let stale = DurableProtocolStateChange::Put {
-            key,
-            expected_revision: Some(0),
-            next_revision: 1,
-            payload: Bytes::from_static(b"stale"),
-            turn_sequence: 2,
-        };
-        assert!(matches!(
-            apply_durable_protocol_state_changes(&mut records, &[stale]),
-            Err(StoreError::InvalidProtocolState(_))
-        ));
-        assert_eq!(records[&key].payload.as_ref(), b"session-checkpoint-v1");
-
-        apply_durable_protocol_state_changes(
-            &mut records,
-            &[DurableProtocolStateChange::Delete {
-                key,
-                expected_revision: 1,
-                turn_sequence: 2,
-            }],
-        )
-        .unwrap();
-        assert!(records.is_empty());
-        assert!(!format!("{:?}", ProtocolStateSnapshot { records }).contains("session-checkpoint"));
     }
 }

@@ -1,9 +1,10 @@
 #![cfg(feature = "build")]
 
 use boon_app_package::{
-    AppManifest, BUNDLE_MANIFEST_FILE, BrowserAppConfig, BuildRequest, BundleManifest,
-    LoadedAppBundle, MAX_CAPABILITY_GRANTS_PER_PROFILE, MAX_CAPABILITY_PROFILES, NamespaceProfile,
-    RunMode, build_app_package,
+    AppManifest, BUNDLE_MANIFEST_FILE, BrowserAppConfig, BrowserPackageAssetDescriptor,
+    BuildRequest, BundleFileKind, BundleManifest, LoadedAppBundle, MAX_BROWSER_APP_CONFIG_BYTES,
+    MAX_BROWSER_PACKAGE_ASSETS, MAX_CAPABILITY_GRANTS_PER_PROFILE, MAX_CAPABILITY_PROFILES,
+    MAX_PACKAGE_FILE_BYTES, NamespaceProfile, RunMode, build_app_package,
 };
 use boon_plan::ProgramRole;
 use boon_runtime::ProgramCapabilityProfile;
@@ -67,6 +68,25 @@ fn encode_browser_config_unchecked(config: &BrowserAppConfig) -> Vec<u8> {
     let mut bytes = Vec::new();
     ciborium::into_writer(config, &mut bytes).unwrap();
     bytes
+}
+
+fn assert_browser_config_rejected(config: &BrowserAppConfig, expected_message: &str) {
+    let error = BrowserAppConfig::decode(&encode_browser_config_unchecked(config)).unwrap_err();
+    assert!(
+        error.to_string().contains(expected_message),
+        "unexpected browser config error: {error}"
+    );
+}
+
+fn browser_asset_with_target(
+    template: &BrowserPackageAssetDescriptor,
+    package_id: &str,
+    target: String,
+) -> BrowserPackageAssetDescriptor {
+    let mut asset = template.clone();
+    asset.url = format!("asset://{package_id}/{target}");
+    asset.fetch_path = format!("/{target}");
+    asset
 }
 
 #[test]
@@ -282,6 +302,42 @@ fn unrelated_triple_builds_and_loads_with_exact_roles_profiles_and_identity() {
         "public-webgpu-v1"
     );
     assert_eq!(browser_config.client_capability_profile, *client_profile);
+    let bundle_asset = loaded
+        .manifest()
+        .files
+        .iter()
+        .find(|file| file.kind == BundleFileKind::Asset)
+        .unwrap();
+    let [browser_asset] = browser_config.package_assets.as_slice() else {
+        panic!("the declared public asset must be present in browser bootstrap metadata");
+    };
+    assert!(bundle_asset.public);
+    assert_eq!(
+        browser_asset.url,
+        "asset://dev.boon.fixture.triple-notes/assets/mark.svg"
+    );
+    assert_eq!(browser_asset.fetch_path, "/assets/mark.svg");
+    assert_eq!(browser_asset.bytes_sha256, bundle_asset.bytes_sha256);
+    assert_eq!(browser_asset.bytes_len, bundle_asset.bytes_len);
+    assert_eq!(browser_asset.media_type, "image/svg+xml");
+    let asset_bytes = fs::read(output.join("assets/mark.svg")).unwrap();
+    browser_asset.verify_bytes(&asset_bytes).unwrap();
+    let mut tampered_asset_bytes = asset_bytes.clone();
+    tampered_asset_bytes[0] ^= 1;
+    assert!(
+        browser_asset
+            .verify_bytes(&tampered_asset_bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("digest differs")
+    );
+    assert!(
+        browser_asset
+            .verify_bytes(&asset_bytes[..asset_bytes.len() - 1])
+            .unwrap_err()
+            .to_string()
+            .contains("size differs")
+    );
     for private_role in [ProgramRole::Session, ProgramRole::Server] {
         let private_profile = loaded
             .manifest()
@@ -446,4 +502,117 @@ fn browser_bootstrap_rejects_tampered_and_trailing_input() {
     let mut omitted_profile = Vec::new();
     ciborium::into_writer(&value, &mut omitted_profile).unwrap();
     assert!(BrowserAppConfig::decode(&omitted_profile).is_err());
+
+    let mut value: ciborium::Value = ciborium::from_reader(config_bytes.as_slice()).unwrap();
+    let ciborium::Value::Map(fields) = &mut value else {
+        panic!("browser config must encode as a CBOR map");
+    };
+    fields
+        .retain(|(key, _)| !matches!(key, ciborium::Value::Text(name) if name == "package_assets"));
+    let mut omitted_assets = Vec::new();
+    ciborium::into_writer(&value, &mut omitted_assets).unwrap();
+    assert!(BrowserAppConfig::decode(&omitted_assets).is_err());
+}
+
+#[test]
+fn browser_package_asset_metadata_rejects_tampering_duplicates_and_noncanonical_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = build_fixture(&temp, "bundle");
+    let config_bytes = fs::read(output.join("boon-app.cbor")).unwrap();
+    let config = BrowserAppConfig::decode(&config_bytes).unwrap();
+    let asset = config.package_assets[0].clone();
+    let bundle = read_bundle_manifest(&output);
+    let declared_asset = bundle
+        .files
+        .iter()
+        .find(|file| file.kind == BundleFileKind::Asset)
+        .unwrap();
+    let mut private_asset = declared_asset.clone();
+    private_asset.public = false;
+    assert!(
+        BrowserPackageAssetDescriptor::from_bundle_file(&config.package_id, &private_asset)
+            .unwrap_err()
+            .to_string()
+            .contains("public Asset")
+    );
+    let mut wrong_kind = declared_asset.clone();
+    wrong_kind.kind = BundleFileKind::Fixture;
+    assert!(
+        BrowserPackageAssetDescriptor::from_bundle_file(&config.package_id, &wrong_kind)
+            .unwrap_err()
+            .to_string()
+            .contains("public Asset")
+    );
+
+    let mut wrong_owner = config.clone();
+    wrong_owner.package_assets[0].url = "asset://dev.boon.other/assets/mark.svg".to_owned();
+    assert_browser_config_rejected(&wrong_owner, "belongs to another package");
+
+    let mut noncanonical_path = config.clone();
+    noncanonical_path.package_assets[0].fetch_path = "/assets/../mark.svg".to_owned();
+    noncanonical_path.package_assets[0].url = format!(
+        "asset://{}{}",
+        noncanonical_path.package_id, noncanonical_path.package_assets[0].fetch_path
+    );
+    assert_browser_config_rejected(&noncanonical_path, "non-canonical component");
+
+    let mut escaped_path = config.clone();
+    escaped_path.package_assets[0].fetch_path = "/assets/mark%2Esvg".to_owned();
+    escaped_path.package_assets[0].url = format!(
+        "asset://{}{}",
+        escaped_path.package_id, escaped_path.package_assets[0].fetch_path
+    );
+    assert_browser_config_rejected(&escaped_path, "canonical same-origin path");
+
+    let mut bad_digest = config.clone();
+    bad_digest.package_assets[0].bytes_sha256 = "A".repeat(64);
+    assert_browser_config_rejected(&bad_digest, "lowercase SHA-256 digest");
+
+    let mut oversized = config.clone();
+    oversized.package_assets[0].bytes_len = MAX_PACKAGE_FILE_BYTES + 1;
+    assert_browser_config_rejected(&oversized, "asset size exceeds");
+
+    let mut wrong_media = config.clone();
+    wrong_media.package_assets[0].media_type = "application/octet-stream".to_owned();
+    assert_browser_config_rejected(&wrong_media, "deterministic target type");
+
+    let mut duplicate = config.clone();
+    duplicate.package_assets.push(asset.clone());
+    assert_browser_config_rejected(&duplicate, "strictly sorted and unique");
+
+    let mut out_of_order = config.clone();
+    out_of_order.package_assets.push(browser_asset_with_target(
+        &asset,
+        &config.package_id,
+        "assets/z-mark.svg".to_owned(),
+    ));
+    out_of_order.package_assets.reverse();
+    assert_browser_config_rejected(&out_of_order, "strictly sorted and unique");
+
+    let mut too_many = config;
+    too_many.package_assets = vec![asset; MAX_BROWSER_PACKAGE_ASSETS + 1];
+    let error = too_many.validate().unwrap_err();
+    assert!(error.to_string().contains("asset count exceeds"));
+}
+
+#[test]
+fn browser_package_asset_metadata_obeys_the_total_config_byte_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = build_fixture(&temp, "bundle");
+    let config_bytes = fs::read(output.join("boon-app.cbor")).unwrap();
+    let mut config = BrowserAppConfig::decode(&config_bytes).unwrap();
+    let template = config.package_assets[0].clone();
+    let long_stem = "a".repeat(300);
+    config.package_assets = (0..MAX_BROWSER_PACKAGE_ASSETS)
+        .map(|index| {
+            browser_asset_with_target(
+                &template,
+                &config.package_id,
+                format!("assets/{index:04}-{long_stem}.svg"),
+            )
+        })
+        .collect();
+    assert!(encode_browser_config_unchecked(&config).len() > MAX_BROWSER_APP_CONFIG_BYTES);
+    let error = config.encode().unwrap_err();
+    assert!(error.to_string().contains("browser app config size"));
 }

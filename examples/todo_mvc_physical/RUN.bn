@@ -77,11 +77,11 @@ store: [
         |> List/retain(item, if: item.completed)
         |> List/count()
     has_todos:
-        active_count == 0 |> Bool/and(with: completed_count == 0) |> Bool/not()
+        active_count == 0 |> Bool/and(right: completed_count == 0) |> Bool/not()
     has_completed:
         completed_count > 0
     all_completed:
-        active_count == 0 |> Bool/and(with: completed_count > 0)
+        active_count == 0 |> Bool/and(right: completed_count > 0)
     visible_todos:
         todos
         |> List/retain(item, if: selected_filter |> WHEN {
@@ -611,6 +611,7 @@ FUNCTION toggle_all_checkbox(events) {
                 material: [color: TEXT { #00000000 }]
             ]
             label: Scene/Element/text(
+                element: []
                 style: [
                     ...Theme/text(of: ButtonIcon[checked: checked])
                     width: Fill
@@ -685,8 +686,8 @@ FUNCTION todo_checkbox(events, todo) {
                 ...Theme/checkbox_material()
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
-            target: todo.title
             checked: todo.completed
+            target: todo.title
         )
     }
 }
@@ -703,6 +704,7 @@ FUNCTION todo_title_element(events, todo) {
             padding: [left: 0, right: 60]
         ]
         label: Scene/Element/text(
+            element: []
             style: todo_title_text(completed: todo.completed)
             text: todo.title
         )
@@ -724,6 +726,7 @@ FUNCTION remove_todo_button(events) {
             material: delete_button_material(hovered: element.hovered)
         ]
         label: Scene/Element/text(
+            element: []
             style: delete_button_text()
             text: TEXT { × }
         )
@@ -830,6 +833,7 @@ FUNCTION filter_button(events, filter) {
                 material: filter_button_material(selected: selected)
             ]
             label: Scene/Element/text(
+                element: []
                 style: filter_button_text(selected: selected)
                 text: filter |> WHEN {
                     All => TEXT { All }
@@ -862,7 +866,8 @@ FUNCTION remove_completed_button(events) {
             spring_range: Theme/spring_range(of: Button)
             material: Theme/material(of: Interactive[hovered: element.hovered])
         ]
-            label: Scene/Element/text(
+        label: Scene/Element/text(
+            element: []
             style: [
                 ...clear_button_text(hovered: element.hovered)
                 width: Fill
@@ -975,7 +980,6 @@ FUNCTION footer_link(label, to) {
         ]
         label: label
         to: to
-        new_tab: []
     )
 }
 
@@ -1052,6 +1056,7 @@ FUNCTION theme_name_button(events, theme_name) {
                 material: theme_switcher_button_material(selected: selected, hovered: element.hovered)
             ]
             label: Scene/Element/text(
+                element: []
                 style: [
                     ...theme_switcher_button_text(selected: selected)
                     width: theme_name |> WHEN {
@@ -1095,6 +1100,7 @@ FUNCTION mode_toggle_button(events) {
             material: Theme/material(of: Interactive[hovered: element.hovered])
         ]
         label: Scene/Element/text(
+            element: []
             style: [
                 ...theme_switcher_button_text(selected: False)
                 width: 80

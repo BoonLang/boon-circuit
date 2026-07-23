@@ -27,6 +27,7 @@ wgpu.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+boon_web_effect_host.workspace = true
 idb = { version = "0.6.5", default-features = false, features = ["builder"] }
 js-sys = "0.3.98"
 wasm-bindgen = "0.2.121"
@@ -52,6 +53,10 @@ web-sys = { version = "0.3.98", features = [
     "Event",
     "EventTarget",
     "FocusEvent",
+    "File",
+    "FileSystemFileHandle",
+    "FileSystemHandle",
+    "FileSystemWritableFileStream",
     "Headers",
     "History",
     "HtmlCanvasElement",
@@ -87,6 +92,7 @@ web-sys = { version = "0.3.98", features = [
     "WebSocket",
     "WheelEvent",
     "Window",
+    "WritableStream",
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

@@ -59,13 +59,13 @@ store: [
         |> List/append(item: title_to_add |> THEN {
             [title: title_to_add, completed: False]
         })
+        |> List/map(item, new: new_todo(todo: item, store: store))
         |> List/remove(item, when:
             LATEST {
                 item.sources.remove_todo_button.events.press |> THEN { True }
                 sources.clear_completed_button.events.press |> THEN { item.completed }
             }
         )
-        |> List/map(item, new: new_todo(todo: item, store: store))
 
     visible_todos:
         todos
@@ -88,13 +88,13 @@ store: [
         |> List/count()
 
     has_todos:
-        active_count == 0 |> Bool/and(with: completed_count == 0) |> Bool/not()
+        active_count == 0 |> Bool/and(right: completed_count == 0) |> Bool/not()
 
     has_completed:
         completed_count > 0
 
     all_completed:
-        active_count == 0 |> Bool/and(with: completed_count > 0)
+        active_count == 0 |> Bool/and(right: completed_count > 0)
 
     new_todo_focused:
         True |> HOLD state {

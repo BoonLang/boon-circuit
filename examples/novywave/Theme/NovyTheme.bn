@@ -3,7 +3,7 @@
 FUNCTION material(mode, of) {
     of |> WHEN {
         AppBackground => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #111827 }
                 Light => TEXT { #f4f7fb }
             }
@@ -11,24 +11,24 @@ FUNCTION material(mode, of) {
         ]
 
         PanelSurface => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #162033 }
                 Light => TEXT { #f8fafc }
             }
             gloss: 0.035
             metal: 0.0
-            transparency: PASSED.mode |> WHEN {
+            transparency: mode |> WHEN {
                 Dark => 0.06
                 Light => 0.10
             }
             frosted_blur: 10
             frosted_saturate: 1.06
             glass_highlight: 0.08
-            glass_highlight_color: PASSED.mode |> WHEN {
+            glass_highlight_color: mode |> WHEN {
                 Dark => TEXT { #dce8ff12 }
                 Light => TEXT { #ffffff66 }
             }
-            border: PASSED.mode |> WHEN {
+            border: mode |> WHEN {
                 Dark => TEXT { #304057 }
                 Light => TEXT { #c9d7ea }
             }
@@ -40,22 +40,22 @@ FUNCTION material(mode, of) {
         ]
 
         PanelInset => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #0b1220 }
                 Light => TEXT { #ffffff }
             }
             gloss: 0.025
-            transparency: PASSED.mode |> WHEN {
+            transparency: mode |> WHEN {
                 Dark => 0.04
                 Light => 0.06
             }
             frosted_blur: 6
             glass_highlight: 0.07
-            glass_highlight_color: PASSED.mode |> WHEN {
+            glass_highlight_color: mode |> WHEN {
                 Dark => TEXT { #dce8ff12 }
                 Light => TEXT { #ffffff66 }
             }
-            border: PASSED.mode |> WHEN {
+            border: mode |> WHEN {
                 Dark => TEXT { #25344f }
                 Light => TEXT { #d7dde8 }
             }
@@ -63,49 +63,49 @@ FUNCTION material(mode, of) {
         ]
 
         DialogBackdrop => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #020817 }
                 Light => TEXT { #e2e8f0 }
             }
             gloss: 0.02
-            transparency: PASSED.mode |> WHEN {
+            transparency: mode |> WHEN {
                 Dark => 0.08
                 Light => 0.10
             }
             frosted_blur: 12
             frosted_saturate: 1.08
-            glass_highlight: PASSED.mode |> WHEN {
+            glass_highlight: mode |> WHEN {
                 Dark => 0.10
                 Light => 0.18
             }
-            glass_highlight_color: PASSED.mode |> WHEN {
+            glass_highlight_color: mode |> WHEN {
                 Dark => TEXT { #dce8ff18 }
                 Light => TEXT { #ffffff86 }
             }
         ]
 
         Dialog => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #07111f }
                 Light => TEXT { #ffffff }
             }
             gloss: 0.06
             metal: 0.0
-            transparency: PASSED.mode |> WHEN {
+            transparency: mode |> WHEN {
                 Dark => 0.01
                 Light => 0.02
             }
             frosted_blur: 4
             frosted_saturate: 1.02
-            glass_highlight: PASSED.mode |> WHEN {
+            glass_highlight: mode |> WHEN {
                 Dark => 0.16
                 Light => 0.24
             }
-            glass_highlight_color: PASSED.mode |> WHEN {
+            glass_highlight_color: mode |> WHEN {
                 Dark => TEXT { #dce8ff24 }
                 Light => TEXT { #ffffffb0 }
             }
-            border: PASSED.mode |> WHEN {
+            border: mode |> WHEN {
                 Dark => TEXT { #365a83 }
                 Light => TEXT { #b7c9dd }
             }
@@ -117,111 +117,111 @@ FUNCTION material(mode, of) {
         ]
 
         TimelineGlass => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #020817d8 }
                 Light => TEXT { #f8fbffb8 }
             }
             refraction: 1.1
             gloss: 0.035
-            transparency: PASSED.mode |> WHEN {
+            transparency: mode |> WHEN {
                 Dark => 0.16
                 Light => 0.18
             }
             frosted_blur: 8
             frosted_saturate: 1.08
             glass_highlight: 0.18
-            glass_highlight_color: PASSED.mode |> WHEN {
+            glass_highlight_color: mode |> WHEN {
                 Dark => TEXT { #dce8ff18 }
                 Light => TEXT { #ffffff70 }
             }
         ]
 
         WaveformGlass => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #020817e6 }
                 Light => TEXT { #050b18f5 }
             }
             refraction: 1.1
-            gloss: PASSED.mode |> WHEN {
+            gloss: mode |> WHEN {
                 Dark => 0.035
                 Light => 0.03
             }
-            transparency: PASSED.mode |> WHEN {
+            transparency: mode |> WHEN {
                 Dark => 0.14
                 Light => 0.03
             }
-            frosted_blur: PASSED.mode |> WHEN {
+            frosted_blur: mode |> WHEN {
                 Dark => 6
                 Light => 3
             }
-            frosted_saturate: PASSED.mode |> WHEN {
+            frosted_saturate: mode |> WHEN {
                 Dark => 1.06
                 Light => 1.04
             }
-            glass_highlight: PASSED.mode |> WHEN {
+            glass_highlight: mode |> WHEN {
                 Dark => 0.14
                 Light => 0.08
             }
-            glass_highlight_color: PASSED.mode |> WHEN {
+            glass_highlight_color: mode |> WHEN {
                 Dark => TEXT { #dce8ff14 }
                 Light => TEXT { #c8e6ff14 }
             }
         ]
 
         TraceHigh => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #3b82f6 }
                 Light => TEXT { #2563eb }
             }
-            glow: PASSED.mode |> WHEN {
+            glow: mode |> WHEN {
                 Dark => [color: TEXT { #3b82f633 }, intensity: 0.04]
                 Light => [color: TEXT { #2563eb24 }, intensity: 0.02]
             }
         ]
 
         TraceLow => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #020817 }
                 Light => TEXT { #020817 }
             }
         ]
 
         TraceUnknown => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #60a5fa }
                 Light => TEXT { #3b82f6 }
             }
-            glow: PASSED.mode |> WHEN {
+            glow: mode |> WHEN {
                 Dark => [color: TEXT { #60a5fa4d }, intensity: 0.09]
                 Light => [color: TEXT { #3b82f62e }, intensity: 0.04]
             }
         ]
 
         TraceEdge => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #60a5fa }
                 Light => TEXT { #2563eb }
             }
             gloss: 0.04
-            glow: PASSED.mode |> WHEN {
+            glow: mode |> WHEN {
                 Dark => [color: TEXT { #60a5fa3d }, intensity: 0.06]
                 Light => [color: TEXT { #2563eb24 }, intensity: 0.03]
             }
         ]
 
         AnalogTrace => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #6bbdff }
                 Light => TEXT { #1267aa }
             }
-            glow: PASSED.mode |> WHEN {
+            glow: mode |> WHEN {
                 Dark => [color: TEXT { #6bbdff4d }, intensity: 0.10]
                 Light => [color: TEXT { #1267aa3d }, intensity: 0.05]
             }
         ]
 
         CursorGlow => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #ffef8a }
                 Light => TEXT { #9a7600 }
             }
@@ -230,7 +230,7 @@ FUNCTION material(mode, of) {
         ]
 
         MarkerChip => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #6147d9 }
                 Light => TEXT { #e7ddff }
             }
@@ -240,28 +240,28 @@ FUNCTION material(mode, of) {
         ]
 
         SelectedRow => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #1b3457 }
                 Light => TEXT { #e3efff }
             }
-            border: PASSED.mode |> WHEN {
+            border: mode |> WHEN {
                 Dark => TEXT { #4f8cc8 }
                 Light => TEXT { #4f8cc8 }
             }
             border_width: 1
-            glow: PASSED.mode |> WHEN {
+            glow: mode |> WHEN {
                 Dark => [color: TEXT { #60a5fa33 }, intensity: 0.06]
                 Light => [color: TEXT { #2474bb24 }, intensity: 0.03]
             }
         ]
 
         HoverControl => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #1a2b44 }
                 Light => TEXT { #e9f3ff }
             }
             gloss: 0.08
-            border: PASSED.mode |> WHEN {
+            border: mode |> WHEN {
                 Dark => TEXT { #49617f }
                 Light => TEXT { #bad0e8 }
             }
@@ -269,13 +269,13 @@ FUNCTION material(mode, of) {
         ]
 
         PressedControl => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #28466d }
                 Light => TEXT { #cce4ff }
             }
             gloss: 0.12
             glow: [color: TEXT { #65b8ff44 }, intensity: 0.10]
-            border: PASSED.mode |> WHEN {
+            border: mode |> WHEN {
                 Dark => TEXT { #65b8ff }
                 Light => TEXT { #2474bb }
             }
@@ -283,13 +283,13 @@ FUNCTION material(mode, of) {
         ]
 
         FocusedControl => [
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #11243b }
                 Light => TEXT { #e9f3ff }
             }
             gloss: 0.05
             glow: [color: TEXT { #65b8ff33 }, intensity: 0.06]
-            border: PASSED.mode |> WHEN {
+            border: mode |> WHEN {
                 Dark => TEXT { #65b8ff }
                 Light => TEXT { #2474bb }
             }
@@ -308,7 +308,7 @@ FUNCTION font(mode, of) {
             family: TEXT { Inter, Arial, SansSerif }
             size: 32
             weight: Bold
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #eef7ff }
                 Light => TEXT { #102033 }
             }
@@ -317,7 +317,7 @@ FUNCTION font(mode, of) {
             family: TEXT { Inter, Arial, SansSerif }
             size: 15
             weight: Bold
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #dceaff }
                 Light => TEXT { #182a3d }
             }
@@ -326,7 +326,7 @@ FUNCTION font(mode, of) {
             family: TEXT { Inter, Arial, SansSerif }
             size: 12
             weight: Regular
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #d2def0 }
                 Light => TEXT { #25384c }
             }
@@ -335,7 +335,7 @@ FUNCTION font(mode, of) {
             family: TEXT { Inter, Arial, SansSerif }
             size: 11
             weight: Regular
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #90a4bf }
                 Light => TEXT { #60748b }
             }
@@ -344,7 +344,7 @@ FUNCTION font(mode, of) {
             family: TEXT { JetBrains Mono, Menlo, Monospace }
             size: 11
             weight: Regular
-            color: PASSED.mode |> WHEN {
+            color: mode |> WHEN {
                 Dark => TEXT { #dbeafe }
                 Light => TEXT { #172033 }
             }

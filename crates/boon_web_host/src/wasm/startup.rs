@@ -1,15 +1,15 @@
 use super::{
     BrowserClientEffectHost, BrowserDistributedSessionSocket, BrowserFetchAdapter,
     BrowserInputBindings, CanvasFrameDisposition, SemanticDomEvent, SemanticDomProjector,
-    WebGpuCanvasHost, request_animation_frame, window,
+    WebGpuCanvasHost, js_error, request_animation_frame, window,
 };
 use crate::sensitive_input::BrowserSensitiveInputVault;
 use crate::{
-    BrowserAppStartup, BrowserDocumentHostConfig, BrowserDocumentHostCore, BrowserDocumentRuntime,
-    BrowserFetchCapabilities, BrowserFetchCapability, BrowserFetchRequest, BrowserHostEvent,
-    BrowserLifecycleEvent, BrowserWebSocketCapabilities, BrowserWebSocketCapability,
-    BrowserWebSocketRequest, DistributedSessionSocketLimits, FetchMethod, WebGpuFrameIdentity,
-    WebHostError, WebHostResult, decode_browser_app_config,
+    BrowserAppStartup, BrowserAppStartupPoll, BrowserDocumentHostConfig, BrowserDocumentHostCore,
+    BrowserDocumentRuntime, BrowserFetchCapabilities, BrowserFetchCapability, BrowserFetchRequest,
+    BrowserHostEvent, BrowserLifecycleEvent, BrowserWebSocketCapabilities,
+    BrowserWebSocketCapability, BrowserWebSocketRequest, DistributedSessionSocketLimits,
+    FetchMethod, WebGpuFrameIdentity, WebHostError, WebHostResult, decode_browser_app_config,
 };
 use boon_app_package::{BrowserAppConfig, MAX_BROWSER_APP_CONFIG_BYTES};
 use boon_document::SemanticWebInputEvent;
@@ -17,12 +17,12 @@ use boon_host::{SemanticId, SensitiveInputHandle, SurfaceId, Viewport, WindowId}
 use boon_native_gpu::GlyphonRenderTextColumnMeasurer;
 use boon_runtime::DistributedClientUpdate;
 use boon_wire::DISTRIBUTED_SESSION_TRANSPORT_PATH;
-use js_sys::Uint8Array;
+use js_sys::{Promise, Uint8Array};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::HtmlCanvasElement;
 
 const BOOTSTRAP_FETCH_CAPABILITY: &str = "boon-browser-bootstrap";
@@ -35,6 +35,7 @@ const BROWSER_WINDOW_ID: &str = "boon-browser-window";
 const MAX_BROWSER_INPUT_TEXT_BYTES: usize = 64 * 1024;
 const MAX_PENDING_SEMANTIC_EVENTS: usize = 1_024;
 const MAX_EFFECT_COMPLETIONS_PER_PUMP: usize = 1_024;
+const BROWSER_MACHINE_BUILD_STEPS_PER_SLICE: usize = 256;
 
 enum BrowserWasmStartupState {
     Idle,
@@ -113,7 +114,13 @@ async fn start_boon_app_inner(config_bytes: Uint8Array) -> WebHostResult<ActiveB
     let config = decode_browser_app_config(&config_bytes.to_vec())?;
     let canvas = browser_canvas(&config)?;
     let artifact_bytes = fetch_client_artifact(&config).await?;
-    let startup = BrowserAppStartup::from_artifact_bytes(config, artifact_bytes)?;
+    let mut startup = BrowserAppStartup::begin_from_artifact_bytes(config, artifact_bytes)?;
+    let startup = loop {
+        match startup.poll(BROWSER_MACHINE_BUILD_STEPS_PER_SLICE)? {
+            BrowserAppStartupPoll::Pending(_) => yield_browser_task().await?,
+            BrowserAppStartupPoll::Ready(startup) => break startup,
+        }
+    };
     let (config, identity, runtime, effect_contracts) = startup.into_distributed_parts();
     let authoritative_frame =
         runtime
@@ -187,11 +194,14 @@ async fn start_boon_app_inner(config_bytes: Uint8Array) -> WebHostResult<ActiveB
         protocols: Vec::new(),
     };
     let event_wake: Rc<dyn Fn()> = Rc::new(schedule_browser_network_pump);
-    let effects = BrowserClientEffectHost::new(
+    let effects = BrowserClientEffectHost::open(
+        &config.package_id,
         &config.client_capability_profile,
         &effect_contracts,
+        &config.package_assets,
         Rc::clone(&event_wake),
-    )?;
+    )
+    .await?;
     let session = BrowserDistributedSessionSocket::connect_with_event_wake(
         capabilities,
         request,
@@ -230,7 +240,54 @@ async fn start_boon_app_inner(config_bytes: Uint8Array) -> WebHostResult<ActiveB
     })
 }
 
+async fn yield_browser_task() -> WebHostResult<()> {
+    let browser = window()?;
+    let promise = Promise::new(&mut |resolve, reject| {
+        let callback = Closure::once_into_js(move || {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        });
+        if let Err(error) = browser
+            .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
+        {
+            let _ = reject.call1(&JsValue::UNDEFINED, &error);
+        }
+    });
+    JsFuture::from(promise)
+        .await
+        .map(|_| ())
+        .map_err(|error| js_error("yield browser startup task", error))
+}
+
 impl ActiveBrowserApp {
+    fn cancel_transient_effects(&mut self) {
+        self.effects.cancel_all();
+        let _ = self.session.cancel_all_transient_effects();
+    }
+
+    fn cancel_for_page_exit(&mut self, persisted: bool) {
+        self.cancel_transient_effects();
+        if !persisted {
+            let _ = self.session.close();
+        }
+    }
+
+    fn enter_terminal_error(&mut self, error: impl ToString) {
+        if self.terminal_error.is_some() {
+            return;
+        }
+        self.terminal_error = Some(error.to_string());
+        self.cancel_transient_effects();
+        let _ = self.session.close();
+        self.semantic_events.clear();
+        self.host_pump_scheduled = false;
+        self.network_pump_scheduled = false;
+        if let Some(timer_id) = self.reconnect_timer_id.take()
+            && let Ok(window) = window()
+        {
+            window.clear_timeout_with_handle(timer_id);
+        }
+    }
+
     fn consume_runtime_updates(
         &mut self,
         updates: impl IntoIterator<Item = DistributedClientUpdate>,
@@ -284,12 +341,27 @@ impl ActiveBrowserApp {
                     capacity: MAX_EFFECT_COMPLETIONS_PER_PUMP,
                 });
             }
-            let update = self
-                .session
-                .complete_transient_effect(completion.call_id, completion.outcome)
-                .map_err(|error| {
-                    WebHostError::platform("complete browser Client effect", error.to_string())
-                })?;
+            let update = match completion.result_sequence {
+                Some(result_sequence) => self
+                    .session
+                    .deliver_transient_effect_result(
+                        completion.call_id,
+                        result_sequence,
+                        completion.outcome,
+                    )
+                    .map_err(|error| {
+                        WebHostError::platform(
+                            "deliver browser Client stream result",
+                            error.to_string(),
+                        )
+                    })?,
+                None => self
+                    .session
+                    .complete_transient_effect(completion.call_id, completion.outcome)
+                    .map_err(|error| {
+                        WebHostError::platform("complete browser Client effect", error.to_string())
+                    })?,
+            };
             pending.push_back(update);
         }
         Ok(request_animation_frame)
@@ -413,6 +485,19 @@ impl ActiveBrowserApp {
     }
 }
 
+impl Drop for ActiveBrowserApp {
+    fn drop(&mut self) {
+        self.effects.cancel_all();
+        let _ = self.session.cancel_all_transient_effects();
+        let _ = self.session.close();
+        if let Some(timer_id) = self.reconnect_timer_id.take()
+            && let Ok(window) = window()
+        {
+            window.clear_timeout_with_handle(timer_id);
+        }
+    }
+}
+
 fn enqueue_browser_host_event(event: BrowserHostEvent) {
     let should_spawn = STARTUP_STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -422,8 +507,17 @@ fn enqueue_browser_host_event(event: BrowserHostEvent) {
         if active.terminal_error.is_some() {
             return false;
         }
+        match &event {
+            BrowserHostEvent::Lifecycle {
+                event: BrowserLifecycleEvent::PageHide { persisted },
+            } => active.cancel_for_page_exit(*persisted),
+            BrowserHostEvent::Lifecycle {
+                event: BrowserLifecycleEvent::BeforeUnload,
+            } => active.cancel_for_page_exit(false),
+            _ => {}
+        }
         if let Err(error) = active.host.accept_event(event, browser_now_ms()) {
-            active.terminal_error = Some(error.to_string());
+            active.enter_terminal_error(error);
             return false;
         }
         if active.host_pump_scheduled {
@@ -449,13 +543,10 @@ fn enqueue_browser_semantic_event(event: SemanticDomEvent) {
             return false;
         }
         if active.semantic_events.len() >= MAX_PENDING_SEMANTIC_EVENTS {
-            active.terminal_error = Some(
-                WebHostError::QueueOverflow {
-                    queue: "browser semantic events".to_owned(),
-                    capacity: MAX_PENDING_SEMANTIC_EVENTS,
-                }
-                .to_string(),
-            );
+            active.enter_terminal_error(WebHostError::QueueOverflow {
+                queue: "browser semantic events".to_owned(),
+                capacity: MAX_PENDING_SEMANTIC_EVENTS,
+            });
             return false;
         }
         let event = match event {
@@ -463,7 +554,7 @@ fn enqueue_browser_semantic_event(event: SemanticDomEvent) {
                 let handle = match active.sensitive_inputs.replace(semantic_id.clone(), text) {
                     Ok(handle) => handle,
                     Err(error) => {
-                        active.terminal_error = Some(error.to_string());
+                        active.enter_terminal_error(error);
                         return false;
                     }
                 };
@@ -505,7 +596,7 @@ fn pump_browser_host_once() {
             match active.process_host_event(event) {
                 Ok(request) => request_frame |= request,
                 Err(error) => {
-                    active.terminal_error = Some(error.to_string());
+                    active.enter_terminal_error(error);
                     return false;
                 }
             }
@@ -514,7 +605,7 @@ fn pump_browser_host_once() {
             match active.process_semantic_event(event) {
                 Ok(request) => request_frame |= request,
                 Err(error) => {
-                    active.terminal_error = Some(error.to_string());
+                    active.enter_terminal_error(error);
                     return false;
                 }
             }
@@ -563,8 +654,7 @@ fn pump_browser_network_once() {
                 let request_frame = match active.consume_runtime_updates(poll.runtime_updates) {
                     Ok(request_frame) => request_frame,
                     Err(error) => {
-                        let _ = active.session.close();
-                        active.terminal_error = Some(error.to_string());
+                        active.enter_terminal_error(error);
                         return (false, false);
                     }
                 };
@@ -577,8 +667,7 @@ fn pump_browser_network_once() {
                 (reconnect, request_frame)
             }
             Err(error) => {
-                let _ = active.session.close();
-                active.terminal_error = Some(error.to_string());
+                active.enter_terminal_error(error);
                 (false, false)
             }
         }
@@ -603,7 +692,7 @@ fn schedule_browser_animation_frame() {
         if let Err(error) =
             request_animation_frame(active.animation_callback.as_ref().unchecked_ref())
         {
-            active.terminal_error = Some(error.to_string());
+            active.enter_terminal_error(error);
         }
     });
 }
@@ -622,7 +711,7 @@ fn run_browser_animation_frame(timestamp_ms: f64) {
             return false;
         }
         if let Err(error) = active.canvas.resize_to_display_size() {
-            active.terminal_error = Some(error.to_string());
+            active.enter_terminal_error(error);
             return false;
         }
         let stats = active.document.stats();
@@ -648,7 +737,7 @@ fn run_browser_animation_frame(timestamp_ms: f64) {
                 }
                 CanvasFrameDisposition::SurfaceLost => {
                     if let Err(error) = active.canvas.recover_lost_surface() {
-                        active.terminal_error = Some(error.to_string());
+                        active.enter_terminal_error(error);
                         return false;
                     }
                     true
@@ -660,12 +749,12 @@ fn run_browser_animation_frame(timestamp_ms: f64) {
                         .canvas
                         .device_lost_reason()
                         .unwrap_or_else(|| "browser WebGPU device was lost".to_owned());
-                    active.terminal_error = Some(reason);
+                    active.enter_terminal_error(reason);
                     return false;
                 }
             },
             Err(error) => {
-                active.terminal_error = Some(error.to_string());
+                active.enter_terminal_error(error);
                 return false;
             }
         };
@@ -725,7 +814,7 @@ fn schedule_browser_reconnect(delay_ms: u32) {
             .reconnect_deadline_ms
             .get_or_insert(now + RECONNECT_WINDOW_MS);
         if now >= deadline {
-            active.terminal_error = Some("distributed Session reconnect window expired".to_owned());
+            active.enter_terminal_error("distributed Session reconnect window expired");
             return;
         }
         match window().and_then(|window| {
@@ -737,7 +826,7 @@ fn schedule_browser_reconnect(delay_ms: u32) {
                 .map_err(|error| super::js_error("schedule distributed Session reconnect", error))
         }) {
             Ok(timer_id) => active.reconnect_timer_id = Some(timer_id),
-            Err(error) => active.terminal_error = Some(error.to_string()),
+            Err(error) => active.enter_terminal_error(error),
         }
     });
 }
@@ -758,7 +847,7 @@ fn attempt_browser_reconnect() {
             .reconnect_deadline_ms
             .is_some_and(|deadline| js_sys::Date::now() >= deadline)
         {
-            active.terminal_error = Some("distributed Session reconnect window expired".to_owned());
+            active.enter_terminal_error("distributed Session reconnect window expired");
             return None;
         }
         match active.session.reconnect() {

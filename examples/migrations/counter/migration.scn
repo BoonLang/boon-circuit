@@ -15,7 +15,7 @@ action = { kind = "start", stage = "v1", namespace = "counter-touched" }
 
 [[step]]
 id = "increment-v1"
-action = { kind = "dispatch", public_source = "store.sources.increment_button.press" }
+action = { kind = "dispatch", public_source = "store.sources.increment_button.events.press" }
   [[step.assert]]
   kind = "current_value"
   path = "store.count"
@@ -68,7 +68,7 @@ action = { kind = "clear_fault" }
 
 [[step]]
 id = "touch-equal-default-v1"
-action = { kind = "dispatch", public_source = "store.sources.reset_button.press" }
+action = { kind = "dispatch", public_source = "store.sources.reset_button.events.press" }
   [[step.assert]]
   kind = "current_value"
   path = "store.count"

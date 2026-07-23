@@ -14,7 +14,7 @@ use crate::frame::{
     NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, host_event_digest,
     input_kind, pointer_button_pressed,
 };
-use crate::language::{LanguageSnapshot, LanguageWorker};
+use crate::language::{LanguageSnapshot, LanguageWorker, SemanticItem};
 use crate::observer::{InputAccepted, ObserverClient, ObserverEvent, ObserverRole};
 use crate::protocol::{
     ApplicationIdentity, AuthoritySelection, CanonicalStateArtifact, CatalogItem, Connection,
@@ -661,6 +661,26 @@ fn handle_action(
             language.submit(model.revision, index, model.active.units.clone());
         }
         DevAction::SelectFile(_) => {}
+        navigation @ (DevAction::NavigateDefinition | DevAction::NavigateReference) => {
+            let definition = navigation == DevAction::NavigateDefinition;
+            let destination = semantic_navigation_target(model, state, definition);
+            if let Some(destination) = destination {
+                let file_changed = apply_semantic_navigation(model, state, &destination);
+                if file_changed {
+                    model.language = None;
+                    language.submit(
+                        model.revision,
+                        model.active_file,
+                        model.active.units.clone(),
+                    );
+                }
+                state.set_status(destination.label);
+            } else if definition {
+                state.set_status("No source definition at caret");
+            } else {
+                state.set_status("No references at caret");
+            }
+        }
         DevAction::SelectMigrationStage(stage_id) => {
             if model.migration.as_ref().is_some_and(|migration| {
                 model
@@ -1296,23 +1316,65 @@ fn inspector(model: &DevModel, state: &DevState) -> InspectorOwned {
         .buffer()
         .byte_for_position(state.inspection_position());
     let source = state.source();
-    let symbol = symbol_at(&source, byte);
-    let hint = model
-        .language
-        .as_ref()
-        .filter(|snapshot| snapshot.revision == model.revision)
-        .and_then(|snapshot| snapshot.hint_at(byte));
+    let language = model.language.as_ref().filter(|snapshot| {
+        snapshot.revision == model.revision && snapshot.file_index == model.active_file
+    });
+    let semantic = language.and_then(|snapshot| snapshot.semantic_at(byte));
+    let hint = language.and_then(|snapshot| snapshot.hint_at(byte));
+    let detail = match (semantic, hint) {
+        (Some(semantic), Some(hint)) => format!(
+            "{}\n{}\n{}\n{}",
+            semantic.label, semantic.detail, hint.category, hint.detail_label
+        ),
+        (Some(semantic), None) => format!("{}\n{}", semantic.label, semantic.detail),
+        (None, Some(hint)) => format!("{}\n{}", hint.category, hint.detail_label),
+        (None, None) => String::new(),
+    };
     InspectorOwned {
-        symbol,
+        symbol: semantic.map_or_else(|| symbol_at(&source, byte), |item| item.name.clone()),
         static_type: hint.map_or_else(
             || "No type at caret".to_owned(),
             |hint| hint.compact_label.clone(),
         ),
-        detail: hint.map_or_else(String::new, |hint| {
-            format!("{}\n{}", hint.category, hint.detail_label)
-        }),
+        detail,
         current_value: model.runtime_value.clone(),
     }
+}
+
+fn semantic_navigation_target(
+    model: &DevModel,
+    state: &DevState,
+    definition: bool,
+) -> Option<SemanticItem> {
+    let snapshot = model.language.as_ref().filter(|snapshot| {
+        snapshot.revision == model.revision && snapshot.file_index == model.active_file
+    })?;
+    let byte = state.buffer().byte_for_position(state.buffer().caret());
+    if definition {
+        snapshot.definition_at(byte)
+    } else {
+        snapshot.next_reference_at(byte)
+    }
+    .cloned()
+}
+
+fn apply_semantic_navigation(
+    model: &mut DevModel,
+    state: &mut DevState,
+    destination: &SemanticItem,
+) -> bool {
+    if destination.location.file_index >= model.active.units.len() {
+        return false;
+    }
+    model.sync_editor(state);
+    let file_changed = model.active_file != destination.location.file_index;
+    if file_changed {
+        model.active_file = destination.location.file_index;
+        state.replace_source(model.source());
+    }
+    let position = state.buffer().position_for_byte(destination.location.start);
+    state.set_caret(position, false);
+    file_changed
 }
 
 fn symbol_at(source: &str, byte: usize) -> String {
@@ -1728,4 +1790,120 @@ fn perf_line(stats: &PreviewStats) -> String {
         stats.dropped_snapshots,
         stats.sample_age_millis,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::language::{LanguageSnapshot, LineDecorations, SemanticKind, SourceLocation};
+
+    use super::*;
+
+    #[test]
+    fn semantic_navigation_changes_file_caret_and_scroll_deterministically() {
+        let destination_source = (0..30)
+            .map(|index| format!("line_{index}: {index}\n"))
+            .collect::<String>()
+            + "target: 42\n";
+        let target_start = destination_source.find("target").expect("target byte");
+        let mut model = DevModel::waiting();
+        model.active.units = vec![
+            SourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: "result: Library.target\n".to_owned(),
+            },
+            SourceUnit {
+                path: "Library.bn".to_owned(),
+                source: destination_source,
+            },
+        ];
+        model.active_file = 0;
+        let mut state = DevState::new(model.source());
+        let destination = SemanticItem {
+            target: boon_typecheck::DeclId(17),
+            kind: SemanticKind::Declaration,
+            location: SourceLocation {
+                file_index: 1,
+                path: "Library.bn".to_owned(),
+                line: 30,
+                start: target_start,
+                end: target_start + "target".len(),
+            },
+            name: "Library.target".to_owned(),
+            label: "declaration Library.target".to_owned(),
+            detail: "Declares Library.target".to_owned(),
+            out_related: false,
+        };
+
+        assert!(apply_semantic_navigation(
+            &mut model,
+            &mut state,
+            &destination
+        ));
+        assert_eq!(model.active_file, 1);
+        assert_eq!(
+            state.buffer().caret(),
+            Position {
+                line: 30,
+                column: 0
+            }
+        );
+        assert!(state.editor_scroll() > 0.0);
+
+        let first_scroll = state.editor_scroll();
+        assert!(!apply_semantic_navigation(
+            &mut model,
+            &mut state,
+            &destination
+        ));
+        assert_eq!(
+            state.buffer().caret(),
+            Position {
+                line: 30,
+                column: 0
+            }
+        );
+        assert_eq!(state.editor_scroll(), first_scroll);
+    }
+
+    #[test]
+    fn inspector_prefers_checked_semantic_hover_information() {
+        let source = "value: 1\nresult: value\n";
+        let reference_start = source.rfind("value").expect("reference byte");
+        let mut model = DevModel::waiting();
+        model.active.units = vec![SourceUnit {
+            path: "RUN.bn".to_owned(),
+            source: source.to_owned(),
+        }];
+        model.language = Some(LanguageSnapshot {
+            revision: model.revision,
+            file_index: 0,
+            path: "RUN.bn".to_owned(),
+            lines: vec![LineDecorations::default(); 2],
+            inspector_hints: Vec::new(),
+            semantics: vec![SemanticItem {
+                target: boon_typecheck::DeclId(3),
+                kind: SemanticKind::Reference,
+                location: SourceLocation {
+                    file_index: 0,
+                    path: "RUN.bn".to_owned(),
+                    line: 1,
+                    start: reference_start,
+                    end: reference_start + "value".len(),
+                },
+                name: "value".to_owned(),
+                label: "Reference value".to_owned(),
+                detail: "Reads value value\nDefined at RUN.bn:1".to_owned(),
+                out_related: false,
+            }],
+            diagnostics: Vec::new(),
+            inline_out_hints: false,
+        });
+        let mut state = DevState::new(source.to_owned());
+        state.set_inspector_position(Some(Position { line: 1, column: 9 }));
+
+        let inspected = inspector(&model, &state);
+        assert_eq!(inspected.symbol, "value");
+        assert!(inspected.detail.contains("Reference value"));
+        assert!(inspected.detail.contains("Defined at RUN.bn:1"));
+    }
 }

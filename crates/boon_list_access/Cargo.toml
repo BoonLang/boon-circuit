@@ -1,0 +1,12 @@
+[package]
+name = "boon_list_access"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic typed ordered access over canonical Boon row identities"
+
+[dependencies]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

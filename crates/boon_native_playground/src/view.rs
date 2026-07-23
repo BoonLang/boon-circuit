@@ -5,6 +5,7 @@ use boon_document::{
     RenderVisualPrimitiveKind, RetainedDocument, RetainedDocumentUpdate,
 };
 use boon_host::Viewport;
+use boon_plan::{OwnerInstanceId, SourceRouteToken};
 
 pub(crate) const OPERATOR_CURSOR_LIGHT: [u8; 4] = [255, 255, 255, 255];
 pub(crate) const OPERATOR_CURSOR_DARK: [u8; 4] = [24, 28, 36, 255];
@@ -21,8 +22,7 @@ pub struct HitTarget {
     pub node: String,
     pub source_path: Option<String>,
     pub source_intent: Option<String>,
-    pub row_key: Option<u64>,
-    pub row_generation: Option<u64>,
+    pub source_route: Option<SourceRouteToken>,
     pub scroll_root: Option<String>,
     pub center_x: f32,
     pub center_y: f32,
@@ -218,8 +218,7 @@ impl RetainedView {
                     node: root.clone(),
                     source_path: None,
                     source_intent: None,
-                    row_key: None,
-                    row_generation: None,
+                    source_route: None,
                     scroll_root: Some(root),
                     center_x: x,
                     center_y: y,
@@ -315,39 +314,27 @@ impl RetainedView {
                         .iter()
                         .find(|route| route.source_path == source_path)
                 })?;
-            let node = self.retained.frame().nodes.get(&entry.node);
+            let token = route.token.as_ref()?;
             if let Some((key, generation)) = target_row {
-                if entry.row_key.is_some() {
-                    if entry.row_key != Some(key) || entry.row_generation.unwrap_or(1) != generation
-                    {
-                        return None;
-                    }
-                } else {
-                    if let Some(expected) = target_text
-                        && !entry_matches_row_text(self.retained.frame(), entry, expected)
-                    {
-                        return None;
-                    }
-                    if let Some(expected) = address
-                        && node_semantic_identity(node) != Some(expected)
-                    {
-                        return None;
-                    }
+                let leaf = token.owner.leaf()?;
+                if leaf.key != key || leaf.generation != generation {
+                    return None;
                 }
-            } else if let Some(expected) = target_text
-                && !entry_matches_row_text(self.retained.frame(), entry, expected)
-            {
-                return None;
-            }
-            if target_row.is_none()
-                && let Some(expected) = address
-                && node_semantic_identity(node) != Some(expected)
+            } else if let Some(expected) = target_text.or(address)
+                && !entry_matches_owner_text(
+                    self.retained.frame(),
+                    self.retained.hits(),
+                    &token.owner,
+                    entry,
+                    expected,
+                )
             {
                 return None;
             }
             let mut target = self.visible_hit_target(entry)?;
             target.source_path = Some(route.source_path.clone());
             target.source_intent = Some(route.intent.clone());
+            target.source_route = Some(token.clone());
             Some(target)
         })
     }
@@ -388,17 +375,6 @@ impl RetainedView {
     }
 }
 
-fn node_semantic_identity(node: Option<&boon_document::DocumentNode>) -> Option<&str> {
-    node.and_then(|node| {
-        ["address", "key", "target"].iter().find_map(|key| {
-            node.style.get(*key).and_then(|value| match value {
-                boon_document::StyleValue::Text(value) => Some(value.as_str()),
-                _ => None,
-            })
-        })
-    })
-}
-
 fn action_source_intent(action: Option<&str>) -> Option<&str> {
     match action? {
         "blur" => Some("blur"),
@@ -411,8 +387,10 @@ fn action_source_intent(action: Option<&str>) -> Option<&str> {
     }
 }
 
-fn entry_matches_row_text(
+fn entry_matches_owner_text(
     frame: &DocumentFrame,
+    hits: &boon_document::HitSideTable,
+    owner: &OwnerInstanceId,
     entry: &boon_document::HitSideTableEntry,
     expected: &str,
 ) -> bool {
@@ -422,15 +400,16 @@ fn entry_matches_row_text(
     if subtree_matches_semantic_text(frame, node, expected) {
         return true;
     }
-    let (Some(row_key), Some(row_list)) = (entry.row_key, style_identity(node, "row_list")) else {
-        return false;
-    };
-    let row_generation = entry.row_generation.unwrap_or(1);
-    frame.nodes.values().any(|candidate| {
-        style_identity(candidate, "row_key") == Some(row_key)
-            && style_identity(candidate, "row_list") == Some(row_list)
-            && style_identity(candidate, "row_generation").unwrap_or(1) == row_generation
-            && node_matches_semantic_text(candidate, expected)
+    hits.entries.iter().any(|candidate| {
+        candidate
+            .source_routes
+            .iter()
+            .filter_map(|route| route.token.as_ref())
+            .any(|token| &token.owner == owner)
+            && frame
+                .nodes
+                .get(&candidate.node)
+                .is_some_and(|node| subtree_matches_semantic_text(frame, node, expected))
     })
 }
 
@@ -466,23 +445,12 @@ fn node_matches_semantic_text(node: &boon_document::DocumentNode, expected: &str
         })
 }
 
-fn style_identity(node: &boon_document::DocumentNode, name: &str) -> Option<u64> {
-    match node.style.get(name) {
-        Some(boon_document::StyleValue::Number(value)) if value.is_finite() && *value >= 0.0 => {
-            Some(*value as u64)
-        }
-        Some(boon_document::StyleValue::Text(value)) => value.parse().ok(),
-        _ => None,
-    }
-}
-
 fn hit_target(entry: &boon_document::HitSideTableEntry) -> HitTarget {
     HitTarget {
         node: entry.node.0.clone(),
         source_path: entry.source_path.clone(),
         source_intent: entry.source_intent.clone(),
-        row_key: entry.row_key,
-        row_generation: entry.row_generation,
+        source_route: entry.source_route.clone(),
         scroll_root: entry.scroll_root.as_ref().map(|root| root.0.clone()),
         center_x: entry.bounds.x + entry.bounds.width * 0.5,
         center_y: entry.bounds.y + entry.bounds.height * 0.5,

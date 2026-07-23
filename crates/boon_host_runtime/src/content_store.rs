@@ -1,5 +1,4 @@
-use boon_plan::FiniteReal;
-use boon_runtime::Value;
+use boon_runtime::{CONTENT_DIGEST_BYTES, ContentRef, ContentRefError};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -8,8 +7,6 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-const CONTENT_DIGEST_BYTES: usize = 32;
-const MAX_CONTENT_MEDIA_BYTES: usize = 256;
 const TEMP_TOKEN_BYTES: usize = 16;
 const TEMP_TOKEN_ATTEMPTS: usize = 16;
 
@@ -69,123 +66,9 @@ impl fmt::Display for ContentStoreError {
 
 impl std::error::Error for ContentStoreError {}
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ContentRef {
-    digest: [u8; CONTENT_DIGEST_BYTES],
-    size: u64,
-    media: Arc<str>,
-}
-
-impl ContentRef {
-    pub fn new(
-        digest: [u8; CONTENT_DIGEST_BYTES],
-        size: u64,
-        media: impl Into<Arc<str>>,
-    ) -> Result<Self, ContentStoreError> {
-        let media = media.into();
-        validate_media(&media)?;
-        Ok(Self {
-            digest,
-            size,
-            media,
-        })
-    }
-
-    pub const fn digest(&self) -> [u8; CONTENT_DIGEST_BYTES] {
-        self.digest
-    }
-
-    pub const fn size(&self) -> u64 {
-        self.size
-    }
-
-    pub fn media(&self) -> &str {
-        &self.media
-    }
-
-    pub fn value(&self) -> Result<Value, ContentStoreError> {
-        let size = i64::try_from(self.size).map_err(|_| {
-            ContentStoreError::new(
-                ContentStoreErrorKind::InvalidReference,
-                "content size exceeds the Boon Number range",
-            )
-        })?;
-        let size = FiniteReal::from_i64_exact(size).map_err(|_| {
-            ContentStoreError::new(
-                ContentStoreErrorKind::InvalidReference,
-                "content size is not exactly representable as a Boon Number",
-            )
-        })?;
-        Ok(Value::Record(BTreeMap::from([
-            (
-                "digest".to_owned(),
-                Value::Bytes(self.digest.to_vec().into()),
-            ),
-            ("size".to_owned(), Value::Number(size)),
-            ("media".to_owned(), Value::Text(self.media.to_string())),
-        ])))
-    }
-
-    pub fn from_value(value: &Value) -> Result<Self, ContentStoreError> {
-        let Value::Record(fields) = value else {
-            return Err(ContentStoreError::new(
-                ContentStoreErrorKind::InvalidReference,
-                "content reference must be a record",
-            ));
-        };
-        if fields.len() != 3
-            || !fields.contains_key("digest")
-            || !fields.contains_key("size")
-            || !fields.contains_key("media")
-        {
-            return Err(ContentStoreError::new(
-                ContentStoreErrorKind::InvalidReference,
-                "content reference fields differ from the typed contract",
-            ));
-        }
-        let digest = match fields.get("digest") {
-            Some(Value::Bytes(digest)) => <[u8; CONTENT_DIGEST_BYTES]>::try_from(digest.as_ref())
-                .map_err(|_| {
-                ContentStoreError::new(
-                    ContentStoreErrorKind::InvalidReference,
-                    "content digest must contain exactly 32 bytes",
-                )
-            })?,
-            _ => {
-                return Err(ContentStoreError::new(
-                    ContentStoreErrorKind::InvalidReference,
-                    "content digest must be Bytes",
-                ));
-            }
-        };
-        let size = match fields.get("size") {
-            Some(Value::Number(size)) => size
-                .to_i64_exact()
-                .ok()
-                .and_then(|size| u64::try_from(size).ok())
-                .ok_or_else(|| {
-                    ContentStoreError::new(
-                        ContentStoreErrorKind::InvalidReference,
-                        "content size must be a non-negative exact whole Number",
-                    )
-                })?,
-            _ => {
-                return Err(ContentStoreError::new(
-                    ContentStoreErrorKind::InvalidReference,
-                    "content size must be Number",
-                ));
-            }
-        };
-        let media = match fields.get("media") {
-            Some(Value::Text(media)) => Arc::<str>::from(media.as_str()),
-            _ => {
-                return Err(ContentStoreError::new(
-                    ContentStoreErrorKind::InvalidReference,
-                    "content media must be Text",
-                ));
-            }
-        };
-        Self::new(digest, size, media)
+impl From<ContentRefError> for ContentStoreError {
+    fn from(error: ContentRefError) -> Self {
+        Self::new(ContentStoreErrorKind::InvalidReference, error)
     }
 }
 
@@ -296,9 +179,9 @@ impl ContentStore {
     pub fn contains(&self, content: &ContentRef) -> bool {
         self.lock()
             .entries
-            .get(&content.digest)
+            .get(&content.digest())
             .is_some_and(|entry| {
-                entry.size == content.size && entry.integrity != ContentIntegrity::Corrupt
+                entry.size == content.size() && entry.integrity != ContentIntegrity::Corrupt
             })
     }
 
@@ -373,13 +256,13 @@ impl ContentStore {
         let (path, verify) = {
             let mut state = self.lock();
             let use_sequence = next_use_sequence(&mut state);
-            let entry = state.entries.get_mut(&content.digest).ok_or_else(|| {
+            let entry = state.entries.get_mut(&content.digest()).ok_or_else(|| {
                 ContentStoreError::new(
                     ContentStoreErrorKind::Missing,
                     "content is absent from the bounded host store",
                 )
             })?;
-            if entry.size != content.size {
+            if entry.size != content.size() {
                 return Err(ContentStoreError::new(
                     ContentStoreErrorKind::InvalidReference,
                     "content digest and size disagree with the host store",
@@ -424,18 +307,18 @@ impl ContentStore {
 
     pub fn remove(&self, content: &ContentRef) -> Result<bool, ContentStoreError> {
         let mut state = self.lock();
-        let Some(entry) = state.entries.get(&content.digest) else {
+        let Some(entry) = state.entries.get(&content.digest()) else {
             return Ok(false);
         };
-        if entry.size != content.size
+        if entry.size != content.size()
             || entry.pin_count > 0
-            || state.durable_roots.contains(&content.digest)
+            || state.durable_roots.contains(&content.digest())
         {
             return Ok(false);
         }
         fs::remove_file(&entry.path).map_err(|error| io_error("remove content", error))?;
         let size = entry.size;
-        state.entries.remove(&content.digest);
+        state.entries.remove(&content.digest());
         state.stored_bytes = state.stored_bytes.saturating_sub(size);
         sync_directory(&state.root)?;
         Ok(true)
@@ -450,8 +333,8 @@ impl ContentStore {
         let mut stale_path = None;
         let mut state = self.lock();
         release_pending_locked(&mut state, expected_bytes);
-        if let Some(existing) = state.entries.get(&content.digest) {
-            if existing.size != content.size {
+        if let Some(existing) = state.entries.get(&content.digest()) {
+            if existing.size != content.size() {
                 return Err(ContentStoreError::new(
                     ContentStoreErrorKind::InvalidReference,
                     "equal content digests have conflicting sizes",
@@ -462,7 +345,7 @@ impl ContentStore {
                 let use_sequence = next_use_sequence(&mut state);
                 state
                     .entries
-                    .get_mut(&content.digest)
+                    .get_mut(&content.digest())
                     .expect("existing content was checked")
                     .last_used = use_sequence;
             } else {
@@ -472,22 +355,22 @@ impl ContentStore {
                 let use_sequence = next_use_sequence(&mut state);
                 let existing = state
                     .entries
-                    .get_mut(&content.digest)
+                    .get_mut(&content.digest())
                     .expect("existing content was checked");
                 existing.integrity = ContentIntegrity::Verified;
                 existing.last_used = use_sequence;
             }
         } else {
-            make_room(&mut state, content.size, true)?;
-            let final_path = state.root.join(hex_digest(content.digest));
+            make_room(&mut state, content.size(), true)?;
+            let final_path = state.root.join(hex_digest(content.digest()));
             publish_temp_file(temp_path, &final_path)?;
             sync_directory(&state.root)?;
             let use_sequence = next_use_sequence(&mut state);
             state.entries.insert(
-                content.digest,
+                content.digest(),
                 ContentEntry {
                     path: final_path,
-                    size: content.size,
+                    size: content.size(),
                     pin_count: 0,
                     last_used: use_sequence,
                     integrity: ContentIntegrity::Verified,
@@ -495,7 +378,7 @@ impl ContentStore {
             );
             state.stored_bytes = state
                 .stored_bytes
-                .checked_add(content.size)
+                .checked_add(content.size())
                 .expect("content capacity check prevents byte overflow");
         }
         drop(state);
@@ -512,8 +395,8 @@ impl ContentStore {
 
     fn release_lease(&self, content: &ContentRef) {
         let mut state = self.lock();
-        if let Some(entry) = state.entries.get_mut(&content.digest)
-            && entry.size == content.size
+        if let Some(entry) = state.entries.get_mut(&content.digest())
+            && entry.size == content.size()
         {
             entry.pin_count = entry.pin_count.saturating_sub(1);
         }
@@ -521,8 +404,8 @@ impl ContentStore {
 
     fn mark_verified(&self, content: &ContentRef) {
         let mut state = self.lock();
-        if let Some(entry) = state.entries.get_mut(&content.digest)
-            && entry.size == content.size
+        if let Some(entry) = state.entries.get_mut(&content.digest())
+            && entry.size == content.size()
             && entry.integrity == ContentIntegrity::Unverified
         {
             entry.integrity = ContentIntegrity::Verified;
@@ -531,8 +414,8 @@ impl ContentStore {
 
     fn release_failed_verification(&self, content: &ContentRef, corrupt: bool) {
         let mut state = self.lock();
-        if let Some(entry) = state.entries.get_mut(&content.digest)
-            && entry.size == content.size
+        if let Some(entry) = state.entries.get_mut(&content.digest())
+            && entry.size == content.size()
         {
             entry.pin_count = entry.pin_count.saturating_sub(1);
             if corrupt {
@@ -590,14 +473,14 @@ impl ContentWriter {
     }
 
     pub fn finish(mut self, content: ContentRef) -> Result<ContentRef, ContentStoreError> {
-        if self.written_bytes != self.expected_bytes || content.size != self.written_bytes {
+        if self.written_bytes != self.expected_bytes || content.size() != self.written_bytes {
             return Err(ContentStoreError::new(
                 ContentStoreErrorKind::InvalidReference,
                 "content materialization length differs from its descriptor",
             ));
         }
         let actual_digest = <[u8; CONTENT_DIGEST_BYTES]>::from(self.digest.clone().finalize());
-        if actual_digest != content.digest {
+        if actual_digest != content.digest() {
             return Err(ContentStoreError::new(
                 ContentStoreErrorKind::InvalidReference,
                 "content materialization digest differs from its descriptor",
@@ -731,13 +614,13 @@ fn validate_durable_roots(
 ) -> Result<BTreeSet<[u8; CONTENT_DIGEST_BYTES]>, ContentStoreError> {
     let mut validated = BTreeSet::new();
     for content in roots {
-        let entry = entries.get(&content.digest).ok_or_else(|| {
+        let entry = entries.get(&content.digest()).ok_or_else(|| {
             ContentStoreError::new(
                 ContentStoreErrorKind::Missing,
                 "durable state references content absent from the host store",
             )
         })?;
-        if entry.size != content.size {
+        if entry.size != content.size() {
             return Err(ContentStoreError::new(
                 ContentStoreErrorKind::InvalidReference,
                 "durable content digest and size disagree with the host store",
@@ -749,7 +632,7 @@ fn validate_durable_roots(
                 "durable state references content that failed integrity verification",
             ));
         }
-        validated.insert(content.digest);
+        validated.insert(content.digest());
     }
     Ok(validated)
 }
@@ -920,7 +803,7 @@ fn verify_file(path: &Path, content: &ContentRef) -> Result<(), ContentStoreErro
         digest.update(&buffer[..read]);
     }
     let digest = <[u8; CONTENT_DIGEST_BYTES]>::from(digest.finalize());
-    if size != content.size || digest != content.digest {
+    if size != content.size() || digest != content.digest() {
         return Err(ContentStoreError::new(
             ContentStoreErrorKind::Corrupt,
             "recovered content differs from its digest or size descriptor",
@@ -946,20 +829,6 @@ fn hex_digit(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         _ => None,
     }
-}
-
-fn validate_media(media: &str) -> Result<(), ContentStoreError> {
-    if media.is_empty()
-        || media.len() > MAX_CONTENT_MEDIA_BYTES
-        || media.trim() != media
-        || media.bytes().any(|byte| byte.is_ascii_control())
-    {
-        return Err(ContentStoreError::new(
-            ContentStoreErrorKind::InvalidReference,
-            "content media is empty, untrimmed, contains control bytes, or exceeds its bound",
-        ));
-    }
-    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), ContentStoreError> {

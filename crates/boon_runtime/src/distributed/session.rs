@@ -1,9 +1,6 @@
-use super::client_session::{
-    DecodedClientSessionFrame, OutboundClientSessionQueue, OutboundClientSessionQueueRecovery,
-    decode_frame,
-};
-use super::endpoint::{EndpointRecoveryImage, EndpointRuntime, PreparedEndpointUpdate};
-use super::link::{ClientSessionLink, ClientSessionLinkRecovery, ReceiveOperation, SentControl};
+use super::client_session::{DecodedClientSessionFrame, OutboundClientSessionQueue, decode_frame};
+use super::endpoint::{EndpointRuntime, PreparedEndpointUpdate};
+use super::link::{ClientSessionLink, ReceiveOperation, SentControl};
 use super::message::{DistributedMessage, DistributedQueueLimits, TypedMessageQueue};
 use super::{DistributedRuntimeError, runtime_error};
 use crate::program::ProgramArtifact;
@@ -13,13 +10,10 @@ use crate::{
 };
 use boon_plan::{DistributedGraphIdentityPlan, DistributedWireSchemaPlan, ProgramRole};
 use boon_wire::{ClientSessionFrameLimits, SessionId};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
 
 const SESSION_SERVER_TARGET: &[ProgramRole] = &[ProgramRole::Server];
 const SESSION_CONNECTED_TARGETS: &[ProgramRole] = &[ProgramRole::Client, ProgramRole::Server];
-const SESSION_RECOVERY_FORMAT_VERSION: u16 = 4;
-const MAX_SESSION_RECOVERY_BYTES: usize = boon_persistence::MAX_PROTOCOL_STATE_RECORD_BYTES;
 
 pub struct DistributedSessionRuntime {
     endpoint: EndpointRuntime,
@@ -50,19 +44,6 @@ enum LeasedClientFrameAction {
         ack_through: u64,
     },
     Control(SentControl),
-}
-
-#[derive(Serialize, Deserialize)]
-struct SessionRecoveryImage {
-    format_version: u16,
-    graph_id: [u8; 32],
-    graph_revision: u64,
-    wire_schema_hash: [u8; 32],
-    endpoint: EndpointRecoveryImage,
-    link: ClientSessionLinkRecovery,
-    principal: SessionPrincipal,
-    outbound_client: OutboundClientSessionQueueRecovery,
-    outbound_server: Vec<DistributedMessage>,
 }
 
 #[derive(Clone)]
@@ -143,103 +124,9 @@ impl DistributedSessionTemplate {
             owned_transient_effects: BTreeSet::new(),
         })
     }
-
-    pub fn restore(
-        &self,
-        payload: &[u8],
-        queue_limits: DistributedQueueLimits,
-    ) -> Result<DistributedSessionRuntime, DistributedRuntimeError> {
-        if payload.is_empty() || payload.len() > MAX_SESSION_RECOVERY_BYTES {
-            return Err(DistributedRuntimeError::InvalidTransportFrame);
-        }
-        let recovery: SessionRecoveryImage = ciborium::de::from_reader(payload)
-            .map_err(|_| DistributedRuntimeError::InvalidTransportFrame)?;
-        if recovery.format_version != SESSION_RECOVERY_FORMAT_VERSION {
-            return Err(DistributedRuntimeError::ProtocolMismatch);
-        }
-        let mut canonical = Vec::new();
-        ciborium::ser::into_writer(&recovery, &mut canonical)
-            .map_err(|_| DistributedRuntimeError::InvalidTransportFrame)?;
-        if canonical != payload {
-            return Err(DistributedRuntimeError::InvalidTransportFrame);
-        }
-        if recovery.graph_id != self.graph.graph_id.0
-            || recovery.graph_revision != self.graph.revision
-            || recovery.wire_schema_hash != self.wire_schema_hash
-        {
-            return Err(DistributedRuntimeError::ProtocolMismatch);
-        }
-        if recovery.endpoint.principal() != Some(&recovery.principal) {
-            return Err(DistributedRuntimeError::InvalidTransportFrame);
-        }
-        let link = ClientSessionLink::from_recovery(
-            recovery.link,
-            self.graph.graph_id.0,
-            self.wire_schema_hash,
-            self.graph.revision,
-        )?;
-        let outbound_client = OutboundClientSessionQueue::from_recovery(
-            recovery.outbound_client,
-            queue_limits,
-            &link,
-            &self.wire_schema,
-        )?;
-        let outbound_server =
-            TypedMessageQueue::from_recovery(recovery.outbound_server, queue_limits)?;
-        let endpoint = EndpointRuntime::start_with_recovery(
-            &self.machine,
-            self.contract.clone(),
-            self.wire_schema.clone(),
-            SessionOptions {
-                session_context: SessionContext::Available {
-                    status: SessionConnectionStatus::Stale,
-                    principal: recovery.principal.clone(),
-                },
-                ..SessionOptions::default()
-            },
-            recovery.endpoint,
-        )?;
-        Ok(DistributedSessionRuntime {
-            endpoint,
-            wire_schema: self.wire_schema.clone(),
-            link,
-            connected: false,
-            principal: recovery.principal,
-            inbound_client_frames: VecDeque::new(),
-            inbound_client_bytes: 0,
-            inbound_limits: queue_limits,
-            outbound_client,
-            leased_client_frame: None,
-            outbound_server,
-            owned_transient_effects: BTreeSet::new(),
-        })
-    }
 }
 
 impl DistributedSessionRuntime {
-    pub fn recovery_payload(&self) -> Result<Vec<u8>, DistributedRuntimeError> {
-        let recovery = SessionRecoveryImage {
-            format_version: SESSION_RECOVERY_FORMAT_VERSION,
-            graph_id: self.link.graph_hash(),
-            graph_revision: self.link.graph_revision(),
-            wire_schema_hash: self.link.schema_hash(),
-            endpoint: self.endpoint.recovery_image()?,
-            link: self.link.recovery_image(),
-            principal: self.principal.clone(),
-            outbound_client: self.outbound_client.recovery_image(),
-            outbound_server: self.outbound_server.recovery_messages(),
-        };
-        let mut payload = Vec::new();
-        ciborium::ser::into_writer(&recovery, &mut payload)
-            .map_err(|_| runtime_error("failed to encode Session recovery checkpoint"))?;
-        if payload.len() > MAX_SESSION_RECOVERY_BYTES {
-            return Err(DistributedRuntimeError::QueueBytesFull {
-                limit: MAX_SESSION_RECOVERY_BYTES,
-            });
-        }
-        Ok(payload)
-    }
-
     pub fn fork_settled(&self) -> Result<Self, DistributedRuntimeError> {
         Ok(Self {
             endpoint: self.endpoint.fork_settled()?,
@@ -280,15 +167,18 @@ impl DistributedSessionRuntime {
         if generation == 0 {
             return Err(DistributedRuntimeError::StaleTransportGeneration);
         }
-        let mut candidate_link = self.link.rebind(self.link.session_id(), generation);
+        let candidate_link = self.link.rebind(generation, applied_server_through)?;
         let mut candidate_client = self.outbound_client.clone();
-        let acknowledged = candidate_link.accept_peer_ack(applied_server_through)?;
-        candidate_client.acknowledge_through(acknowledged);
-        let prepared = self.endpoint.prepare_context_update(
+        candidate_client.clear();
+        let prepared = self.endpoint.prepare_context_rebind(
             SessionConnectionStatus::Connecting,
             self.principal.clone(),
+            ProgramRole::Client,
             SESSION_CONNECTED_TARGETS,
         )?;
+        self.inbound_client_frames.clear();
+        self.inbound_client_bytes = 0;
+        self.leased_client_frame = None;
         let update = self.route_prepared_with_transport(
             prepared,
             true,
@@ -296,14 +186,13 @@ impl DistributedSessionRuntime {
             candidate_client,
             self.outbound_server.clone(),
         )?;
-        self.inbound_client_frames.clear();
-        self.inbound_client_bytes = 0;
-        self.leased_client_frame = None;
         Ok(update)
     }
 
     pub fn mark_stale(&mut self) -> Result<DistributedSessionUpdate, DistributedRuntimeError> {
         let candidate_client = self.outbound_client.clone();
+        let mut candidate_server = self.outbound_server.clone();
+        candidate_server.retain_session_resume_snapshots();
         let prepared = self.endpoint.prepare_context_update(
             SessionConnectionStatus::Stale,
             self.principal.clone(),
@@ -314,7 +203,7 @@ impl DistributedSessionRuntime {
             false,
             self.link.clone(),
             candidate_client,
-            self.outbound_server.clone(),
+            candidate_server,
         )?;
         self.inbound_client_frames.clear();
         self.inbound_client_bytes = 0;
@@ -384,14 +273,15 @@ impl DistributedSessionRuntime {
                 ack_through,
                 message,
             } => {
+                let fingerprint = message.semantic_fingerprint()?;
                 let acknowledged = candidate_link.accept_peer_ack(ack_through)?;
                 candidate_client.acknowledge_through(acknowledged);
-                match candidate_link.classify_receive(operation_sequence) {
+                match candidate_link.classify_receive(operation_sequence, fingerprint)? {
                     ReceiveOperation::Next => {
                         let prepared = self
                             .endpoint
                             .prepare_accept(message, SESSION_CONNECTED_TARGETS)?;
-                        candidate_link.accept_receive(operation_sequence)?;
+                        candidate_link.accept_receive(operation_sequence, fingerprint)?;
                         self.route_prepared_with_transport(
                             prepared,
                             self.connected,
@@ -401,7 +291,7 @@ impl DistributedSessionRuntime {
                         )?
                     }
                     ReceiveOperation::Duplicate => {
-                        candidate_link.accept_receive(operation_sequence)?;
+                        candidate_link.accept_receive(operation_sequence, fingerprint)?;
                         self.link = candidate_link;
                         self.outbound_client = candidate_client;
                         DistributedSessionUpdate::default()
@@ -507,10 +397,6 @@ impl DistributedSessionRuntime {
             }
         }
         true
-    }
-
-    pub fn drain_server_messages(&mut self, maximum: usize) -> Vec<DistributedMessage> {
-        self.outbound_server.drain(maximum)
     }
 
     pub fn next_server_message(&self) -> Option<DistributedMessage> {

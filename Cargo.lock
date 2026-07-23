@@ -59,6 +59,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aead"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
+dependencies = [
+ "crypto-common",
+ "generic-array",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -678,7 +688,6 @@ dependencies = [
  "boon_ir",
  "boon_parser",
  "boon_plan",
- "boon_query",
  "boon_typecheck",
  "serde",
  "sha2",
@@ -726,6 +735,9 @@ dependencies = [
 [[package]]
 name = "boon_effect_schema"
 version = "0.1.0"
+dependencies = [
+ "boon_parser",
+]
 
 [[package]]
 name = "boon_example_manifest"
@@ -801,6 +813,13 @@ dependencies = [
  "boon_typecheck",
  "serde",
  "web-time",
+]
+
+[[package]]
+name = "boon_list_access"
+version = "0.1.0"
+dependencies = [
+ "wasm-bindgen-test",
 ]
 
 [[package]]
@@ -910,7 +929,6 @@ dependencies = [
  "boon_data",
  "boon_document_model",
  "boon_effect_schema",
- "boon_query",
  "serde",
  "sha2",
  "wasm-bindgen-test",
@@ -922,33 +940,16 @@ version = "0.1.0"
 dependencies = [
  "boon_compiler",
  "boon_data",
+ "boon_effect_schema",
+ "boon_ir",
+ "boon_list_access",
  "boon_persistence",
  "boon_plan",
- "boon_query",
- "serde",
-]
-
-[[package]]
-name = "boon_query"
-version = "0.1.0"
-dependencies = [
- "boon_data",
- "ciborium",
+ "chacha20poly1305",
+ "getrandom 0.3.4",
  "serde",
  "sha2",
-]
-
-[[package]]
-name = "boon_query_redb"
-version = "0.1.0"
-dependencies = [
- "boon_data",
- "boon_query",
- "ciborium",
- "redb",
- "serde",
- "sha2",
- "tempfile",
+ "wasm-bindgen-test",
 ]
 
 [[package]]
@@ -966,9 +967,12 @@ dependencies = [
  "boon_wire",
  "ciborium",
  "futures",
+ "gloo-timers",
  "js-sys",
+ "redb",
  "serde",
  "sha2",
+ "tempfile",
  "toml",
  "wasm-bindgen-test",
  "web-time",
@@ -995,6 +999,7 @@ name = "boon_server_runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "boon_data",
  "boon_effect_schema",
  "boon_host_runtime",
  "boon_persistence",
@@ -1026,6 +1031,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_web_effect_host"
+version = "0.1.0"
+dependencies = [
+ "boon_app_package",
+ "boon_effect_schema",
+ "boon_plan",
+ "boon_runtime",
+ "getrandom 0.3.4",
+ "idb",
+ "js-sys",
+ "sha2",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+]
+
+[[package]]
 name = "boon_web_host"
 version = "0.1.0"
 dependencies = [
@@ -1036,6 +1059,7 @@ dependencies = [
  "boon_native_gpu",
  "boon_plan",
  "boon_runtime",
+ "boon_web_effect_host",
  "boon_wire",
  "getrandom 0.3.4",
  "idb",
@@ -1167,6 +1191,17 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "chacha20"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
@@ -1174,6 +1209,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20 0.9.1",
+ "cipher",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -1211,6 +1259,17 @@ checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
 dependencies = [
  "ciborium-io",
  "half",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -2613,6 +2672,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "io-uring"
 version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3251,6 +3319,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
+name = "opaque-debug"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
 name = "open"
 version = "5.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3414,6 +3488,17 @@ dependencies = [
  "pin-project-lite",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "poly1305"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
 ]
 
 [[package]]
@@ -3633,7 +3718,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20",
+ "chacha20 0.10.1",
  "getrandom 0.4.2",
  "rand_core 0.10.1",
 ]
@@ -4913,6 +4998,16 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "universal-hash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
+dependencies = [
+ "crypto-common",
+ "subtle",
+]
 
 [[package]]
 name = "untrusted"

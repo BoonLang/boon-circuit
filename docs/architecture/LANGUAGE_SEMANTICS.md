@@ -22,6 +22,10 @@ literals do not create different value kinds. NaN and infinities are rejected,
 and negative zero is normalized to positive zero for equality, ordering,
 hashing, persistence, and protocol identity.
 
+The measured hidden-integer specialization was rejected because it doubled
+scalar storage and regressed all measured workloads. See
+[`NUMBER_SPECIALIZATION_EXPERIMENT.md`](NUMBER_SPECIALIZATION_EXPERIMENT.md).
+
 Arithmetic operators produce `Number`. In particular, `/` is real division:
 `1 / 2` is `0.5`. Division or remainder by zero and arithmetic that would
 produce a non-finite result produce a typed error instead of a non-finite

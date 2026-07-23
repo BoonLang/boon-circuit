@@ -12,13 +12,16 @@ mod message;
 mod server;
 mod session;
 
-pub use client::{DistributedClientRuntime, DistributedClientUpdate};
+pub use client::{
+    DistributedClientRuntime, DistributedClientStartupPoll, DistributedClientStartupTask,
+    DistributedClientUpdate,
+};
 pub use client_session::ClientSessionQueueLimits;
 pub use message::{DistributedMessage, DistributedMessagePayload, DistributedQueueLimits};
 pub use server::{
     DistributedServerAuthority, DistributedServerMachine, DistributedServerRuntime,
-    DistributedServerUpdate, PreparedDistributedServerTransaction, PreparedDistributedServerUpdate,
-    ServerDelivery, ServerDeliveryTarget, SessionOrigin,
+    DistributedServerUpdate, PreparedDistributedServerTransaction, ServerDelivery,
+    ServerDeliveryTarget, SessionOrigin,
 };
 pub use session::{
     DistributedSessionRuntime, DistributedSessionTemplate, DistributedSessionUpdate,
@@ -105,12 +108,10 @@ pub(super) fn exported_event_data(
     let Some(field) = export.payload_field.as_ref() else {
         return Ok(boon_data::Value::Null);
     };
-    export_runtime_value(source_payload_value(source, field).ok_or_else(|| {
-        runtime_error(format!(
-            "distributed event export {} is missing its payload",
-            export.export_id
-        ))
-    })?)
+    export_runtime_value(
+        source_payload_value(source, field)
+            .ok_or_else(|| runtime_error("distributed event export is missing its payload"))?,
+    )
 }
 
 pub(super) fn export_runtime_value(

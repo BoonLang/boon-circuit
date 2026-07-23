@@ -7,10 +7,16 @@ rust-version.workspace = true
 
 [dependencies]
 boon_data.workspace = true
+boon_effect_schema.workspace = true
+boon_list_access.workspace = true
 boon_plan.workspace = true
 boon_persistence.workspace = true
-boon_query.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
 serde.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 boon_compiler.workspace = true
+boon_ir.workspace = true
+wasm-bindgen-test = "0.3"

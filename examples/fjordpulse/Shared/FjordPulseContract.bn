@@ -2,70 +2,108 @@
 -- intent from the pinned oracle without claiming that a live transport exists.
 
 FUNCTION health(version, request_count, readiness) {
-    [
-        status: TEXT { ok }
-        service: TEXT { fjordpulse-boon }
-        mode: TEXT { deterministic }
-        version: version
-        readiness: readiness
-        request_count: request_count
-    ]
+    BLOCK {
+        health_version: version
+        health_request_count: request_count
+        health_readiness: readiness
+        [
+            status: TEXT { ok }
+            service: TEXT { fjordpulse-boon }
+            mode: TEXT { deterministic }
+            version: health_version
+            readiness: health_readiness
+            request_count: health_request_count
+        ]
+    }
 }
 
 FUNCTION success(data, data_state, source_state, updated_at) {
-    [
-        ok: True
-        data: data
-        data_state: data_state
-        source_state: source_state
-        updated_at: updated_at
-    ]
+    BLOCK {
+        success_data: data
+        success_data_state: data_state
+        success_source_state: source_state
+        success_updated_at: updated_at
+        [
+            ok: True
+            data: success_data
+            data_state: success_data_state
+            source_state: success_source_state
+            updated_at: success_updated_at
+        ]
+    }
 }
 
 FUNCTION error(code, message, retryable) {
-    [
-        ok: False
-        error: [
-            code: code
-            message: message
-            retryable: retryable
+    BLOCK {
+        error_code: code
+        error_message: message
+        error_retryable: retryable
+        [
+            ok: False
+            error: [
+                code: error_code
+                message: error_message
+                retryable: error_retryable
+            ]
         ]
-    ]
+    }
 }
 
 FUNCTION coordinate(latitude, longitude) {
-    [latitude: latitude, longitude: longitude]
+    BLOCK {
+        coordinate_latitude: latitude
+        coordinate_longitude: longitude
+        [latitude: coordinate_latitude, longitude: coordinate_longitude]
+    }
 }
 
 FUNCTION station(id, name, latitude, longitude, kind, modes) {
-    [
-        id: id
-        name: name
-        coordinate: coordinate(latitude: latitude, longitude: longitude)
-        kind: kind
-        modes: modes
-    ]
+    BLOCK {
+        station_id: id
+        station_name: name
+        station_kind: kind
+        station_modes: modes
+        [
+            id: station_id
+            name: station_name
+            coordinate: coordinate(latitude: latitude, longitude: longitude)
+            kind: station_kind
+            modes: station_modes
+        ]
+    }
 }
 
 FUNCTION departure(expected_time, line, destination, platform, status) {
-    [
-        expected_time: expected_time
-        line: line
-        destination: destination
-        platform: platform
-        status: status
-    ]
+    BLOCK {
+        departure_expected_time: expected_time
+        departure_line: line
+        departure_destination: destination
+        departure_platform: platform
+        departure_status: status
+        [
+            expected_time: departure_expected_time
+            line: departure_line
+            destination: departure_destination
+            platform: departure_platform
+            status: departure_status
+        ]
+    }
 }
 
 FUNCTION vehicle(id, line, mode, passenger_state, freshness, latitude, longitude) {
-    [
-        id: id
-        line: line
-        transport_mode: mode
-        passenger_service_state: passenger_state
-        freshness: freshness
-        coordinate: coordinate(latitude: latitude, longitude: longitude)
-    ]
+    BLOCK {
+        vehicle_id: id
+        vehicle_line: line
+        vehicle_freshness: freshness
+        [
+            id: vehicle_id
+            line: vehicle_line
+            transport_mode: mode
+            passenger_service_state: passenger_state
+            freshness: vehicle_freshness
+            coordinate: coordinate(latitude: latitude, longitude: longitude)
+        ]
+    }
 }
 
 FUNCTION map_config() {
@@ -78,15 +116,18 @@ FUNCTION map_config() {
 }
 
 FUNCTION admin_status(request_count) {
-    [
-        mode: TEXT { deterministic }
-        overall: TEXT { operational }
-        boon_server: TEXT { ready }
-        persistence: TEXT { redb-ready }
-        realtime: TEXT { fixture-session }
-        request_count: request_count
-        checked_at: TEXT { 2026-07-16T10:00:00+02:00 }
-    ]
+    BLOCK {
+        status_request_count: request_count
+        [
+            mode: TEXT { deterministic }
+            overall: TEXT { operational }
+            boon_server: TEXT { ready }
+            persistence: TEXT { redb-ready }
+            realtime: TEXT { fixture-session }
+            request_count: status_request_count
+            checked_at: TEXT { 2026-07-16T10:00:00+02:00 }
+        ]
+    }
 }
 
 FUNCTION admin_infrastructure() {
@@ -132,11 +173,15 @@ FUNCTION http_status(path) {
 }
 
 FUNCTION http_body(path, method, request_count) {
-    [
-        ok: http_status(path: path) == 200
-        route: path
-        method: method
-        request_count: request_count
-        mode: TEXT { deterministic }
-    ]
+    BLOCK {
+        request_method: method
+        body_request_count: request_count
+        [
+            ok: http_status(path: path) == 200
+            route: path
+            method: request_method
+            request_count: body_request_count
+            mode: TEXT { deterministic }
+        ]
+    }
 }

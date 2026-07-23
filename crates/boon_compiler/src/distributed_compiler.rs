@@ -1,19 +1,22 @@
 use super::{
-    CompileProfile, CompiledMachinePlanFromSource, CompilerResult, CompilerSourceUnit,
-    compiler_statement_ast_exprs, elapsed_ms, machine_plan_backend, parse_source_units,
+    CompileProfile, CompiledMachinePlanFromSource, CompilerResult, CompilerSourceUnit, elapsed_ms,
+    machine_plan_backend, parse_source_units,
 };
-use boon_ir::{DistributedPureCall, ErasedProgram, verify_hidden_identity, verify_static_schedule};
+use boon_ir::{DistributedCall, ErasedProgram, verify_hidden_identity, verify_static_schedule};
 use boon_plan::{
-    ApplicationIdentity, DataTypeFieldPlan, DataTypePlan, DataVariantPlan, DistributedArgumentId,
-    DistributedDeclarationId, DistributedEndpointContractPlan, DistributedEndpointId,
-    DistributedEndpointPlan, DistributedEventExportPlan, DistributedEventImportPlan,
-    DistributedGraphIdentityPlan, DistributedGraphPlan, DistributedPureFunctionExportPlan,
-    DistributedValueExportPlan, DistributedValueImportPlan, ExportId, ImportId,
-    MigrationPredecessorBinding, PlanError, PlanSourceRouteId, ProgramRole, RemoteCallSitePlan,
-    SourceId, SourcePayloadDescriptor, SourcePayloadField, SourcePayloadSchema, SourceRoute,
-    TargetProfile, ValueRef, verify_plan,
+    ApplicationIdentity, DataTypeFieldPlan, DataTypePlan, DataVariantPlan, DistributedCallMode,
+    DistributedCallResultPlan, DistributedCallRowBindingPlan, DistributedDeclarationId,
+    DistributedEndpointContractPlan, DistributedEndpointId, DistributedEndpointPlan,
+    DistributedEventExportPlan, DistributedEventImportPlan, DistributedFunctionExportPlan,
+    DistributedGraphIdentityPlan, DistributedGraphPlan, DistributedInvocationArmPlan,
+    DistributedValueExportPlan, DistributedValueImportPlan, ExportId, FieldId, ImportId, ListId,
+    MigrationPredecessorBinding, PlanError, PlanLocalId, PlanOwner, PlanSourceRouteId,
+    PlanStaticOwnerId, ProducerFunctionInstancePlan, ProgramRole, RemoteCallSiteId,
+    RemoteCallSitePlan, SourceId, SourcePayloadDescriptor, SourcePayloadField, SourcePayloadSchema,
+    SourceRoute, TargetProfile, ValueRef, verify_plan,
 };
 use boon_typecheck::{
+    CheckedCallEntry, CheckedCallableKind, CheckedParameterKind, CheckedProgram,
     ExternalFunctionArgument, ExternalFunctionType, ExternalTypeEnvironment, FlowMode, FlowType,
     FunctionTypeEntry, ObjectShape, Type, TypeCheckReport, Variant,
 };
@@ -54,8 +57,9 @@ impl CompiledDistributedMachinePlans {
 
 struct LoweredRole {
     request: DistributedCompilerProgram,
-    parsed: boon_parser::ParsedProgram,
+    checked: CheckedProgram,
     ir: ErasedProgram,
+    source_unit_count: usize,
     parse_ms: f64,
     lower_ms: f64,
     verify_ms: f64,
@@ -64,7 +68,12 @@ struct LoweredRole {
 struct ParsedRole {
     request: DistributedCompilerProgram,
     parsed: boon_parser::ParsedProgram,
+    checked: CheckedProgram,
     parse_ms: f64,
+}
+
+struct SolvedBundleInterfaces {
+    checked: BTreeMap<ProgramRole, CheckedProgram>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,8 +136,7 @@ fn distributed_flow_for_value_ref(value: &ValueRef) -> DistributedReferenceFlow 
         | ValueRef::Field(_)
         | ValueRef::List(_)
         | ValueRef::Constant(_)
-        | ValueRef::DistributedImport(_)
-        | ValueRef::DistributedFunctionArgument { .. } => DistributedReferenceFlow::Current,
+        | ValueRef::DistributedImport(_) => DistributedReferenceFlow::Current,
     }
 }
 
@@ -147,10 +155,13 @@ struct FunctionLink {
 struct CallLink {
     consumer_role: ProgramRole,
     owner_path: String,
+    owner: PlanOwner,
     stable_identity: DistributedDeclarationId,
-    call: DistributedPureCall,
+    call_site_id: RemoteCallSiteId,
+    call: DistributedCall,
     function_export_id: ExportId,
-    result_import_id: ImportId,
+    result: DistributedCallResultPlan,
+    mode: DistributedCallMode,
 }
 
 pub fn compile_distributed_runtime_source_programs(
@@ -171,7 +182,7 @@ pub fn compile_distributed_runtime_source_programs(
         .map(|program| (program.request.role, program))
         .collect::<BTreeMap<_, _>>();
     let references = collect_bundle_references(&parsed)?;
-    let environments = solve_bundle_interfaces(&parsed, &references)?;
+    let mut solved = solve_bundle_interfaces(&parsed, &references)?;
     let mut lowered = BTreeMap::<ProgramRole, LoweredRole>::new();
     for role in [
         ProgramRole::Client,
@@ -180,7 +191,10 @@ pub fn compile_distributed_runtime_source_programs(
     ] {
         let program = lower_parsed_role(
             parsed.get(&role).expect("validated parsed role"),
-            environments.get(&role).expect("solved role interface"),
+            solved
+                .checked
+                .remove(&role)
+                .expect("solved checked role authority"),
         )?;
         lowered.insert(role, program);
     }
@@ -239,19 +253,34 @@ fn validate_bundle_requests(programs: &[DistributedCompilerProgram]) -> Result<(
 fn parse_role(request: &DistributedCompilerProgram) -> CompilerResult<ParsedRole> {
     let parse_started = Instant::now();
     let parsed = parse_source_units(&request.source_label, &request.units)?;
+    let (checked, _) = boon_typecheck::check_runtime_program_profiled_with_external_types(
+        &parsed,
+        &ExternalTypeEnvironment::provisional(request.role),
+    );
+    let checked = checked.program.ok_or_else(|| {
+        let diagnostics = checked
+            .report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        PlanError::new(format!(
+            "{} distributed interface cannot be checked: {diagnostics}",
+            request.role.namespace()
+        ))
+    })?;
     Ok(ParsedRole {
         request: request.clone(),
         parsed,
+        checked,
         parse_ms: elapsed_ms(parse_started),
     })
 }
 
-fn lower_parsed_role(
-    program: &ParsedRole,
-    external: &ExternalTypeEnvironment,
-) -> CompilerResult<LoweredRole> {
+fn lower_parsed_role(program: &ParsedRole, checked: CheckedProgram) -> CompilerResult<LoweredRole> {
     let lower_started = Instant::now();
-    let ir = boon_ir::lower_runtime_with_external_types(&program.parsed, external)?;
+    let ir = boon_ir::lower_checked(checked.clone(), &[])?;
     let lower_ms = elapsed_ms(lower_started);
     let verify_started = Instant::now();
     verify_hidden_identity(&ir)?;
@@ -259,21 +288,38 @@ fn lower_parsed_role(
     let verify_ms = elapsed_ms(verify_started);
     Ok(LoweredRole {
         request: program.request.clone(),
-        parsed: program.parsed.clone(),
+        checked,
         ir,
+        source_unit_count: program.parsed.files.len(),
         parse_ms: program.parse_ms,
         lower_ms,
         verify_ms,
     })
 }
 
+fn relower_role_with_producer_functions(
+    program: &mut LoweredRole,
+    requests: &[boon_ir::ProducerFunctionLoweringRequest],
+) -> CompilerResult<()> {
+    let lower_started = Instant::now();
+    let ir = boon_ir::lower_checked(program.checked.clone(), requests)?;
+    let lower_ms = elapsed_ms(lower_started);
+    let verify_started = Instant::now();
+    verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
+    let verify_ms = elapsed_ms(verify_started);
+    program.ir = ir;
+    program.lower_ms = lower_ms;
+    program.verify_ms = verify_ms;
+    Ok(())
+}
+
 fn program_role_for_namespace(namespace: &str) -> Option<ProgramRole> {
-    match namespace {
-        "Client" => Some(ProgramRole::Client),
-        "Session" => Some(ProgramRole::Session),
-        "Server" => Some(ProgramRole::Server),
-        _ => None,
-    }
+    Some(match boon_parser::program_role_root(namespace)? {
+        boon_parser::ProgramRoleRoot::Client => ProgramRole::Client,
+        boon_parser::ProgramRoleRoot::Session => ProgramRole::Session,
+        boon_parser::ProgramRoleRoot::Server => ProgramRole::Server,
+    })
 }
 
 fn collect_bundle_references(
@@ -283,86 +329,70 @@ fn collect_bundle_references(
     let mut seen_values = BTreeSet::new();
 
     for (consumer_role, program) in programs {
-        for expression in &program.parsed.expressions {
-            match &expression.kind {
-                boon_parser::AstExprKind::Path(parts) => {
-                    let Some(producer_role) = parts
-                        .first()
-                        .and_then(|namespace| program_role_for_namespace(namespace))
-                    else {
-                        continue;
-                    };
-                    validate_distributed_reference_roles(*consumer_role, producer_role)?;
-                    if parts.len() < 2 {
-                        return Err(PlanError::new(format!(
-                            "qualified role value `{}` must name a value after the role root",
-                            producer_role.namespace()
-                        )));
-                    }
-                    let canonical_path = boon_parser::canonical_value_path(parts);
-                    if parts.len() < 3 || parts[1] != "store" {
-                        return Err(PlanError::new(format!(
-                            "qualified external value `{canonical_path}` must use `{}/store.<value>`; role outputs are host boundaries, not distributed application state",
-                            producer_role.namespace()
-                        )));
-                    }
-                    if seen_values.insert((*consumer_role, canonical_path.clone())) {
-                        references.values.push(BundleValueReference {
-                            consumer_role: *consumer_role,
-                            producer_role,
-                            canonical_path,
-                            local_path: parts[1..].join("."),
-                        });
-                    }
-                }
-                boon_parser::AstExprKind::Call {
-                    function,
-                    args,
-                    pass: _,
-                }
-                | boon_parser::AstExprKind::Pipe {
-                    input: _,
-                    op: function,
-                    args,
-                    pass: _,
-                    ..
-                } => {
-                    let Some((namespace, local_function)) = function.split_once('/') else {
-                        continue;
-                    };
-                    let Some(producer_role) = program_role_for_namespace(namespace) else {
-                        continue;
-                    };
-                    validate_distributed_reference_roles(*consumer_role, producer_role)?;
-                    if local_function.is_empty() {
-                        return Err(PlanError::new(format!(
-                            "qualified role function `{function}` must name a function after the role root"
-                        )));
-                    }
-                    let mut arguments = Vec::with_capacity(args.len());
-                    for argument in args {
-                        if argument.is_bare_binding() {
-                            return Err(PlanError::new(format!(
-                                "distributed function `{function}` requires named arguments"
-                            )));
-                        }
-                        let name = argument.named_name().ok_or_else(|| {
-                            PlanError::new(format!(
-                                "distributed function `{function}` has an invalid call entry"
-                            ))
-                        })?;
-                        arguments.push((name.to_owned(), argument.value));
-                    }
-                    references.calls.push(BundleCallReference {
-                        consumer_role: *consumer_role,
-                        producer_role,
-                        canonical_function: function.clone(),
-                        local_function: local_function.to_owned(),
-                        arguments,
-                    });
-                }
-                _ => {}
+        for expression in &program.checked.expressions {
+            let boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path } =
+                &expression.kind
+            else {
+                continue;
+            };
+            let Some((namespace, local_path)) = canonical_path.split_once('/') else {
+                continue;
+            };
+            let Some(producer_role) = program_role_for_namespace(namespace) else {
+                continue;
+            };
+            validate_distributed_reference_roles(*consumer_role, producer_role)?;
+            if !local_path.starts_with("store.") {
+                return Err(PlanError::new(format!(
+                    "qualified external value `{canonical_path}` must use `{}/store.<value>`; role outputs are host boundaries, not distributed application state",
+                    producer_role.namespace()
+                )));
             }
+            if seen_values.insert((*consumer_role, canonical_path.clone())) {
+                references.values.push(BundleValueReference {
+                    consumer_role: *consumer_role,
+                    producer_role,
+                    canonical_path: canonical_path.clone(),
+                    local_path: local_path.to_owned(),
+                });
+            }
+        }
+        for call in &program.checked.calls {
+            let Some((namespace, local_function)) = call.function.split_once('/') else {
+                continue;
+            };
+            let Some(producer_role) = program_role_for_namespace(namespace) else {
+                continue;
+            };
+            validate_distributed_reference_roles(*consumer_role, producer_role)?;
+            if local_function.is_empty() {
+                return Err(PlanError::new(format!(
+                    "qualified role function `{}` must name a function after the role root",
+                    call.function
+                )));
+            }
+            let arguments = call
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    CheckedCallEntry::Input { name, value, .. } => {
+                        Ok((name.clone(), value.0 as usize))
+                    }
+                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => {
+                        Err(PlanError::new(format!(
+                            "distributed function `{}` cannot expose OUT across a runtime island",
+                            call.function
+                        )))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            references.calls.push(BundleCallReference {
+                consumer_role: *consumer_role,
+                producer_role,
+                canonical_function: call.function.clone(),
+                local_function: local_function.to_owned(),
+                arguments,
+            });
         }
     }
 
@@ -408,7 +438,7 @@ fn validate_distributed_reference_roles(
 fn solve_bundle_interfaces(
     programs: &BTreeMap<ProgramRole, ParsedRole>,
     references: &BundleReferences,
-) -> Result<BTreeMap<ProgramRole, ExternalTypeEnvironment>, PlanError> {
+) -> Result<SolvedBundleInterfaces, PlanError> {
     let mut value_types = references
         .values
         .iter()
@@ -431,22 +461,26 @@ fn solve_bundle_interfaces(
         let producer = programs
             .get(&reference.producer_role)
             .expect("validated producer role");
-        let args = declared_function_arguments(&producer.parsed, &reference.local_function)?;
+        let declared = declared_function_signature(&producer.checked, &reference.local_function)?;
         function_types.insert(
             key,
             ExternalFunctionType {
-                args: args
-                    .into_iter()
-                    .map(|name| ExternalFunctionArgument {
-                        name,
-                        ty: Type::Unknown,
+                args: declared
+                    .parameters
+                    .iter()
+                    .map(|parameter| ExternalFunctionArgument {
+                        name: parameter.name.clone(),
+                        flow_type: FlowType {
+                            mode: parameter.flow_type.mode,
+                            ty: Type::Unknown,
+                        },
                     })
                     .collect(),
                 result: FlowType {
-                    mode: FlowMode::Continuous,
+                    mode: declared.result.mode,
                     ty: Type::Unknown,
                 },
-                pure: true,
+                effect: declared.effect,
             },
         );
     }
@@ -459,6 +493,7 @@ fn solve_bundle_interfaces(
             .map(|function| function.args.len() + 1)
             .sum::<usize>();
     let max_passes = interface_slot_count.saturating_mul(2).max(2) + 1;
+    let mut settled_checks = None;
 
     for _ in 0..max_passes {
         let environments = build_bundle_environments(
@@ -468,21 +503,22 @@ fn solve_bundle_interfaces(
             &local_requirements,
             true,
         );
-        let reports = programs
+        let checks = programs
             .iter()
             .map(|(role, program)| {
-                let (report, _) = boon_typecheck::check_runtime_profiled_with_external_types(
-                    &program.parsed,
-                    environments.get(role).expect("provisional environment"),
-                );
-                (*role, report)
+                let (output, _) =
+                    boon_typecheck::check_runtime_program_profiled_with_external_types(
+                        &program.parsed,
+                        environments.get(role).expect("provisional environment"),
+                    );
+                (*role, output)
             })
             .collect::<BTreeMap<_, _>>();
         let mut progress = false;
 
         for ((producer_role, local_path), flow_type) in &mut value_types {
             let Some(candidate) = named_value_type(
-                reports.get(producer_role).expect("producer report"),
+                &checks.get(producer_role).expect("producer report").report,
                 local_path,
             ) else {
                 continue;
@@ -511,35 +547,33 @@ fn solve_bundle_interfaces(
 
         for ((producer_role, local_function), signature) in &mut function_types {
             let Some(candidate) = checked_function_type(
-                reports.get(producer_role).expect("producer report"),
+                &checks.get(producer_role).expect("producer report").report,
                 local_function,
             )?
             else {
                 continue;
             };
-            if candidate.result.mode != FlowMode::Continuous {
-                return Err(PlanError::new(format!(
-                    "distributed function `{}/{local_function}` must return a continuous value",
-                    producer_role.namespace()
-                )));
-            }
             if candidate.args
                 != signature
                     .args
                     .iter()
                     .map(|arg| arg.name.clone())
                     .collect::<Vec<_>>()
-                || candidate.args.len() != candidate.arg_types.len()
+                || candidate.args.len() != candidate.arg_flows.len()
             {
                 return Err(PlanError::new(format!(
                     "distributed function `{}/{local_function}` has an inconsistent checked signature",
                     producer_role.namespace()
                 )));
             }
-            for (argument, candidate_type) in signature.args.iter_mut().zip(&candidate.arg_types) {
+            for (argument, candidate_flow) in signature.args.iter_mut().zip(&candidate.arg_flows) {
+                if argument.flow_type.mode != candidate_flow.mode {
+                    argument.flow_type.mode = candidate_flow.mode;
+                    progress = true;
+                }
                 progress |= merge_interface_type(
-                    &mut argument.ty,
-                    candidate_type,
+                    &mut argument.flow_type.ty,
+                    &candidate_flow.ty,
                     &format!(
                         "distributed function `{}/{local_function}` argument `{}`",
                         producer_role.namespace(),
@@ -555,10 +589,21 @@ fn solve_bundle_interfaces(
                     producer_role.namespace()
                 ),
             )?;
+            if signature.result.mode != candidate.result.mode {
+                signature.result.mode = candidate.result.mode;
+                progress = true;
+            }
+            if signature.effect != candidate.effect {
+                signature.effect = candidate.effect;
+                progress = true;
+            }
         }
 
         for call in &references.calls {
-            let report = reports.get(&call.consumer_role).expect("consumer report");
+            let report = &checks
+                .get(&call.consumer_role)
+                .expect("consumer report")
+                .report;
             let signature = function_types
                 .get(&(call.producer_role, call.local_function.clone()))
                 .expect("collected function signature");
@@ -595,6 +640,7 @@ fn solve_bundle_interfaces(
         }
 
         if !progress {
+            settled_checks = Some(checks);
             break;
         }
     }
@@ -615,13 +661,64 @@ fn solve_bundle_interfaces(
         )));
     }
 
-    Ok(build_bundle_environments(
+    let environments = build_bundle_environments(
         references,
         &value_types,
         &function_types,
         &local_requirements,
         false,
-    ))
+    );
+    settled_checks.ok_or_else(|| {
+        PlanError::new("distributed interface solver exceeded its bounded fixed-point passes")
+    })?;
+    let checked = seal_solved_bundle_checks(programs, &environments)?;
+    Ok(SolvedBundleInterfaces { checked })
+}
+
+fn seal_solved_bundle_checks(
+    programs: &BTreeMap<ProgramRole, ParsedRole>,
+    environments: &BTreeMap<ProgramRole, ExternalTypeEnvironment>,
+) -> Result<BTreeMap<ProgramRole, CheckedProgram>, PlanError> {
+    programs
+        .iter()
+        .map(|(role, program)| {
+            let (output, _) = boon_typecheck::check_runtime_program_profiled_with_external_types(
+                &program.parsed,
+                environments
+                    .get(role)
+                    .expect("settled environment exists for every role"),
+            );
+            if output.report.has_errors() {
+                let diagnostics = output
+                    .report
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error
+                    })
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(PlanError::new(format!(
+                    "{} distributed program failed its settled typecheck: {diagnostics}",
+                    role.namespace()
+                )));
+            }
+            let checked = output.program.ok_or_else(|| {
+                PlanError::new(format!(
+                    "{} settled typecheck produced no CheckedProgram",
+                    role.namespace()
+                ))
+            })?;
+            debug_assert_eq!(
+                &checked.external_types,
+                environments
+                    .get(role)
+                    .expect("settled environment exists for every role")
+            );
+            Ok((*role, checked))
+        })
+        .collect()
 }
 
 fn build_bundle_environments(
@@ -683,37 +780,34 @@ fn build_bundle_environments(
     environments
 }
 
-fn declared_function_arguments(
-    program: &boon_parser::ParsedProgram,
+fn declared_function_signature<'a>(
+    program: &'a CheckedProgram,
     local_function: &str,
-) -> Result<Vec<String>, PlanError> {
-    fn collect(
-        statements: &[boon_parser::AstStatement],
-        local_function: &str,
-        matches: &mut Vec<Vec<String>>,
-    ) {
-        for statement in statements {
-            if let boon_parser::AstStatementKind::Function { name, parameters } = &statement.kind
-                && (name == local_function
+) -> Result<&'a boon_typecheck::CheckedCallableSignature, PlanError> {
+    let matches = program
+        .callables
+        .iter()
+        .filter(|callable| {
+            callable.kind == CheckedCallableKind::User
+                && (callable.name == local_function
                     || local_function
                         .rsplit_once('/')
-                        .is_some_and(|(_, suffix)| suffix == name))
-            {
-                matches.push(
-                    parameters
-                        .iter()
-                        .map(|parameter| parameter.name.clone())
-                        .collect(),
-                );
-            }
-            collect(&statement.children, local_function, matches);
-        }
-    }
-
-    let mut matches = Vec::new();
-    collect(&program.ast.statements, local_function, &mut matches);
+                        .is_some_and(|(_, suffix)| suffix == callable.name))
+        })
+        .collect::<Vec<_>>();
     match matches.as_slice() {
-        [arguments] => Ok(arguments.clone()),
+        [callable] => {
+            if callable
+                .parameters
+                .iter()
+                .any(|parameter| parameter.kind != CheckedParameterKind::Value)
+            {
+                return Err(PlanError::new(format!(
+                    "distributed function `{local_function}` may contain only ordinary value parameters"
+                )));
+            }
+            Ok(*callable)
+        }
         [] => Err(PlanError::new(format!(
             "distributed function `{local_function}` is not declared by its producer role"
         ))),
@@ -850,7 +944,7 @@ fn unresolved_bundle_interfaces(
     }
     for ((role, function), signature) in function_types {
         for argument in &signature.args {
-            if type_to_data_plan(&argument.ty).is_none() {
+            if type_to_data_plan(&argument.flow_type.ty).is_none() {
                 unresolved.push(format!(
                     "{}/{function} argument {}",
                     role.namespace(),
@@ -973,24 +1067,42 @@ fn link_lowered_roles(
     lowered: BTreeMap<ProgramRole, LoweredRole>,
     target_profile: TargetProfile,
 ) -> CompilerResult<CompiledDistributedMachinePlans> {
-    validate_distributed_immediate_cycles(&lowered)?;
-    let client = lowered
+    link_lowered_roles_round(lowered, target_profile, 0)
+}
+
+fn link_lowered_roles_round(
+    mut lowered: BTreeMap<ProgramRole, LoweredRole>,
+    target_profile: TargetProfile,
+    producer_round: usize,
+) -> CompilerResult<CompiledDistributedMachinePlans> {
+    let producer_round_limit = lowered
+        .values()
+        .map(|program| program.checked.expressions.len())
+        .sum::<usize>()
+        .saturating_add(1);
+    if producer_round > producer_round_limit {
+        return Err(PlanError::new(
+            "distributed producer-function expansion did not reach a finite call graph",
+        )
+        .into());
+    }
+    let application = lowered
         .get(&ProgramRole::Client)
-        .expect("validated client role");
+        .expect("validated client role")
+        .request
+        .application
+        .clone();
     let graph_revision = lowered
         .values()
         .map(|program| program.request.revision)
         .max()
         .unwrap_or(1);
     let graph_stable_identity = DistributedDeclarationId::from_semantic_path(
-        &client.request.application.package_id,
+        &application.package_id,
         "Client+Session+Server",
     )?;
-    let graph_identity = DistributedGraphIdentityPlan::new(
-        &client.request.application,
-        graph_stable_identity,
-        graph_revision,
-    )?;
+    let graph_identity =
+        DistributedGraphIdentityPlan::new(&application, graph_stable_identity, graph_revision)?;
     let endpoints = [
         ProgramRole::Client,
         ProgramRole::Session,
@@ -999,7 +1111,7 @@ fn link_lowered_roles(
     .into_iter()
     .map(|role| {
         let stable_identity = DistributedDeclarationId::from_semantic_path(
-            &client.request.application.package_id,
+            &application.package_id,
             role_namespace(role),
         )?;
         let endpoint_id =
@@ -1031,6 +1143,10 @@ fn link_lowered_roles(
     let mut function_links = BTreeMap::<(ProgramRole, String), FunctionLink>::new();
     let mut call_links = Vec::new();
     let mut call_occurrences = BTreeMap::<(ProgramRole, String, String), usize>::new();
+    let mut next_synthetic_source_ids = lowered
+        .iter()
+        .map(|(role, program)| (*role, program.ir.sources.len()))
+        .collect::<BTreeMap<_, _>>();
 
     for (consumer_role, consumer) in &lowered {
         for reference in &consumer.ir.distributed_references.value_references {
@@ -1182,7 +1298,7 @@ fn link_lowered_roles(
                     None => ValueRef::Source(link.event_source_id.expect("event link source")),
                 },
             };
-            bind_executable_expression_ref(
+            bind_checked_expression_refs(
                 &mut context.expression_refs,
                 &consumer.ir,
                 reference.expr_id.as_usize(),
@@ -1215,6 +1331,7 @@ fn link_lowered_roles(
                 context.synthetic_source_routes.push(SourceRoute {
                     id: PlanSourceRouteId(usize::MAX),
                     source_id,
+                    owner: PlanOwner::root(),
                     path: boon_ir::distributed_event_source_path(&link.canonical_path),
                     scoped: false,
                     scope_id: None,
@@ -1222,14 +1339,12 @@ fn link_lowered_roles(
                     payload_schema: SourcePayloadSchema {
                         fields,
                         typed_fields,
-                        row_lookup_field: None,
-                        row_lookup_field_id: None,
                     },
                 });
             }
         }
 
-        for call in &consumer.ir.distributed_references.pure_calls {
+        for (call_reference, call) in consumer.ir.distributed_references.calls.iter().enumerate() {
             let producer_role = call.producer_role;
             let local_function =
                 strip_role_function_prefix(&call.canonical_function, producer_role)?;
@@ -1255,7 +1370,7 @@ fn link_lowered_roles(
                         .get(&producer_role)
                         .expect("producer endpoint")
                         .endpoint_id,
-                    boon_plan::DistributedExportKind::PureFunction,
+                    boon_plan::DistributedExportKind::Function,
                     stable_identity,
                 )?;
                 let function = FunctionLink {
@@ -1270,7 +1385,40 @@ fn link_lowered_roles(
                 function_links.insert(function_key, function.clone());
                 function
             };
-            let owner_path = distributed_root_owner(&consumer.ir, call.expr_id.as_usize())?;
+            if call.effect != function.signature.effect {
+                return Err(PlanError::new(format!(
+                    "distributed call `{}` effect summary differs from its producer signature",
+                    call.canonical_function
+                ))
+                .into());
+            }
+            let mode = if call.invocation_arms.is_empty()
+                && call.result.mode == FlowMode::Continuous
+                && call
+                    .arguments
+                    .iter()
+                    .all(|argument| argument.flow_type.mode == FlowMode::Continuous)
+                && !call.effect.emits_source
+                && !call.effect.invokes_host
+            {
+                DistributedCallMode::Current
+            } else {
+                DistributedCallMode::Invocation
+            };
+            if mode == DistributedCallMode::Invocation && call.invocation_arms.is_empty() {
+                return Err(PlanError::new(format!(
+                    "distributed call `{}` requires invocation semantics but has no exact trigger arm",
+                    call.canonical_function
+                ))
+                .into());
+            }
+            let owner_path =
+                erased_external_call_owner_path(&consumer.ir, call_reference, call.owner)?;
+            let owner = machine_plan_backend::plan_owner_for_static_owner(
+                &consumer.ir,
+                call.owner,
+                &format!("distributed call `{}`", call.canonical_function),
+            )?;
             let occurrence_key = (
                 *consumer_role,
                 owner_path.clone(),
@@ -1294,25 +1442,242 @@ fn link_lowered_roles(
                     .endpoint_id,
                 stable_identity,
             )?;
-            let result_import_id = ImportId::from_remote_call_result(call_site_id)?;
+            let result = match mode {
+                DistributedCallMode::Current => DistributedCallResultPlan::Current {
+                    import_id: ImportId::from_remote_call_result(call_site_id)?,
+                },
+                DistributedCallMode::Invocation => {
+                    let next_source_id = next_synthetic_source_ids
+                        .get_mut(consumer_role)
+                        .expect("consumer source allocator");
+                    let source_id = SourceId(*next_source_id);
+                    *next_source_id = next_source_id.checked_add(1).ok_or_else(|| {
+                        PlanError::new("distributed invocation result source IDs exhausted")
+                    })?;
+                    let payload_field = SourcePayloadField::Named("result".to_owned());
+                    let owner = owner.clone();
+                    let scope_id = owner.ancestors.last().map(|ancestor| ancestor.scope);
+                    let context = contexts.get_mut(consumer_role).expect("consumer context");
+                    context.synthetic_source_routes.push(SourceRoute {
+                        id: PlanSourceRouteId(usize::MAX),
+                        source_id,
+                        owner,
+                        path: format!("@distributed/result/{call_site_id}"),
+                        scoped: scope_id.is_some(),
+                        scope_id,
+                        interval_ms: None,
+                        payload_schema: SourcePayloadSchema {
+                            fields: vec![payload_field.clone()],
+                            typed_fields: vec![SourcePayloadDescriptor {
+                                field: payload_field.clone(),
+                                data_type: function.result_type.clone(),
+                            }],
+                        },
+                    });
+                    context.invocation_result_sources.insert(source_id);
+                    DistributedCallResultPlan::Invocation {
+                        source_id,
+                        payload_field,
+                    }
+                }
+            };
             bind_executable_expression_ref(
                 &mut contexts
                     .get_mut(consumer_role)
                     .expect("consumer context")
                     .expression_refs,
-                &consumer.ir,
-                call.expr_id.as_usize(),
-                ValueRef::DistributedImport(result_import_id),
+                call.expression,
+                result.value_ref(),
             )?;
             call_links.push(CallLink {
                 consumer_role: *consumer_role,
                 owner_path,
+                owner,
                 stable_identity,
+                call_site_id,
                 call: call.clone(),
                 function_export_id: function.export_id,
-                result_import_id,
+                result,
+                mode,
             });
         }
+    }
+
+    let mut function_exports = BTreeMap::<ExportId, DistributedFunctionExportPlan>::new();
+    for function in function_links.values() {
+        let parameters = function
+            .signature
+            .args
+            .iter()
+            .cloned()
+            .zip(function.signature.arg_flows.iter())
+            .map(|(name, flow)| {
+                type_to_data_plan(&flow.ty)
+                    .map(|data_type| (name, data_type))
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "distributed function `{}` argument is not a closed boundary type",
+                            function.canonical_function
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let export = DistributedFunctionExportPlan::new(
+            graph_identity.graph_id,
+            endpoints
+                .get(&function.producer_role)
+                .expect("producer endpoint")
+                .endpoint_id,
+            function.stable_identity,
+            lowered
+                .get(&function.producer_role)
+                .expect("producer")
+                .request
+                .revision,
+            function.producer_role,
+            parameters,
+            function.result_type.clone(),
+        )?;
+        if export.export_id != function.export_id {
+            return Err(
+                PlanError::new("distributed function export ID changed during linking").into(),
+            );
+        }
+        function_exports.insert(export.export_id, export);
+    }
+
+    let mut requested_producers =
+        BTreeMap::<ProgramRole, BTreeSet<boon_ir::ProducerFunctionLoweringRequest>>::new();
+    for link in &call_links {
+        let function_link = function_links
+            .values()
+            .find(|candidate| candidate.export_id == link.function_export_id)
+            .expect("linked function definition");
+        requested_producers
+            .entry(function_link.producer_role)
+            .or_default()
+            .insert(boon_ir::ProducerFunctionLoweringRequest {
+                identity: link.call_site_id.0,
+                local_function: function_link.local_function.clone(),
+                mode: match link.mode {
+                    DistributedCallMode::Current => boon_ir::ProducerFunctionMode::Current,
+                    DistributedCallMode::Invocation => boon_ir::ProducerFunctionMode::Invocation,
+                },
+            });
+    }
+    let mut relower_roles = Vec::new();
+    for role in [
+        ProgramRole::Client,
+        ProgramRole::Session,
+        ProgramRole::Server,
+    ] {
+        let expected = requested_producers.get(&role).cloned().unwrap_or_default();
+        let actual = lowered
+            .get(&role)
+            .expect("lowered producer role")
+            .ir
+            .producer_function_instances
+            .iter()
+            .map(|instance| boon_ir::ProducerFunctionLoweringRequest {
+                identity: instance.identity,
+                local_function: instance.function_name.clone(),
+                mode: instance.mode,
+            })
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            relower_roles.push((role, expected.into_iter().collect::<Vec<_>>()));
+        }
+    }
+    if !relower_roles.is_empty() {
+        for (role, requests) in relower_roles {
+            relower_role_with_producer_functions(
+                lowered.get_mut(&role).expect("lowered producer role"),
+                &requests,
+            )?;
+        }
+        return link_lowered_roles_round(lowered, target_profile, producer_round.saturating_add(1));
+    }
+
+    for link in &call_links {
+        let function = function_exports
+            .get(&link.function_export_id)
+            .expect("linked function export");
+        let function_link = function_links
+            .values()
+            .find(|candidate| candidate.export_id == link.function_export_id)
+            .expect("linked function definition");
+        let producer = lowered
+            .get(&function.producer_role)
+            .expect("compiled function producer");
+        let instance = producer
+            .ir
+            .producer_function_instances
+            .iter()
+            .find(|instance| {
+                instance.identity == link.call_site_id.0
+                    && instance.function_name == function_link.local_function
+            })
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "producer function `{}` has no exact pre-lowered graph instance",
+                    link.call.canonical_function
+                ))
+            })?;
+        let instance_plan = ProducerFunctionInstancePlan::new(
+            link.call_site_id,
+            function,
+            machine_plan_backend::plan_owner_for_static_owner(
+                &producer.ir,
+                Some(instance.owner),
+                &format!("producer function `{}`", link.call.canonical_function),
+            )?,
+            link.mode,
+            instance.invocation_source.map(|source| SourceId(source.0)),
+            machine_plan_backend::producer_function_ownership_seed(&producer.ir, instance.owner)?,
+            ValueRef::Field(FieldId(instance.result_field.0)),
+        )?;
+        if instance.arguments.len() != instance_plan.arguments.len() {
+            return Err(PlanError::new(format!(
+                    "producer function `{}` executable parameter count differs from its boundary signature",
+                    link.call.canonical_function
+                ))
+            .into());
+        }
+        let context = contexts
+            .get_mut(&function.producer_role)
+            .expect("producer context");
+        for argument in &instance.arguments {
+            let planned = instance_plan
+                .arguments
+                .iter()
+                .find(|planned| planned.name == argument.name)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "producer function `{}` has no boundary argument `{}`",
+                        link.call.canonical_function, argument.name
+                    ))
+                })?;
+            if argument.input_expressions.is_empty() {
+                return Err(PlanError::new(format!(
+                    "producer function `{}` argument `{}` has no executable input occurrence",
+                    link.call.canonical_function, argument.name
+                ))
+                .into());
+            }
+            for expression in &argument.input_expressions {
+                bind_executable_expression_ref(
+                    &mut context.expression_refs,
+                    *expression,
+                    ValueRef::DistributedImport(planned.import_id),
+                )?;
+            }
+        }
+        context.producer_function_instances.push(instance_plan);
+    }
+    for context in contexts.values_mut() {
+        context
+            .producer_function_instances
+            .sort_by_key(|instance| instance.call_site_id);
     }
 
     let mut compiled = BTreeMap::new();
@@ -1336,11 +1701,10 @@ fn link_lowered_roles(
         compiled.insert(
             role,
             CompiledMachinePlanFromSource {
-                parsed: program.parsed.clone(),
                 ir: program.ir.clone(),
                 plan,
                 profile: CompileProfile {
-                    source_unit_count: program.parsed.files.len(),
+                    source_unit_count: program.source_unit_count,
                     expression_count: program.ir.expression_count,
                     graph_node_count: program.ir.graph_node_count,
                     parse_ms: program.parse_ms,
@@ -1352,14 +1716,13 @@ fn link_lowered_roles(
             },
         );
     }
-
     let mut value_exports = BTreeMap::<ExportId, DistributedValueExportPlan>::new();
     let mut event_exports = BTreeMap::<ExportId, DistributedEventExportPlan>::new();
     let origin_scoped_server_values = origin_scoped_server_values(
         compiled.get(&ProgramRole::Server).expect("compiled Server"),
         value_links.values(),
         &call_links,
-    );
+    )?;
     for link in value_links.values() {
         if match link.flow {
             DistributedReferenceFlow::Current => value_exports.contains_key(&link.export_id),
@@ -1455,69 +1818,6 @@ fn link_lowered_roles(
                 event_exports.insert(export.export_id, export);
             }
         }
-    }
-
-    let mut function_exports = BTreeMap::<ExportId, DistributedPureFunctionExportPlan>::new();
-    for function in function_links.values() {
-        let parameters = function
-            .signature
-            .args
-            .iter()
-            .cloned()
-            .zip(function.signature.arg_types.iter())
-            .map(|(name, ty)| {
-                type_to_data_plan(ty)
-                    .map(|data_type| (name, data_type))
-                    .ok_or_else(|| {
-                        PlanError::new(format!(
-                            "distributed function `{}` argument is not a closed boundary type",
-                            function.canonical_function
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let parameter_ids = parameters
-            .iter()
-            .map(|(name, _)| {
-                Ok((
-                    name.clone(),
-                    DistributedArgumentId::from_parameter_name(function.export_id, name)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, PlanError>>()?;
-        let producer = compiled
-            .get_mut(&function.producer_role)
-            .expect("compiled function producer");
-        let body = machine_plan_backend::lower_distributed_pure_function_body(
-            &producer.ir,
-            &function.local_function,
-            function.export_id,
-            &parameter_ids,
-            &mut producer.plan.constants,
-        )?;
-        let export = DistributedPureFunctionExportPlan::new(
-            graph_identity.graph_id,
-            endpoints
-                .get(&function.producer_role)
-                .expect("producer endpoint")
-                .endpoint_id,
-            function.stable_identity,
-            lowered
-                .get(&function.producer_role)
-                .expect("producer")
-                .request
-                .revision,
-            function.producer_role,
-            parameters,
-            function.result_type.clone(),
-            body,
-        )?;
-        if export.export_id != function.export_id {
-            return Err(
-                PlanError::new("distributed function export ID changed during linking").into(),
-            );
-        }
-        function_exports.insert(export.export_id, export);
     }
 
     let mut value_imports = BTreeMap::<ProgramRole, Vec<DistributedValueImportPlan>>::new();
@@ -1623,13 +1923,41 @@ fn link_lowered_roles(
                     machine_plan_backend::lower_distributed_root_expression(
                         &consumer.ir,
                         &link.owner_path,
-                        argument.expr_id.as_usize(),
+                        argument.value,
+                        &mut consumer.plan.row_expressions,
                         &mut consumer.plan.constants,
                         &context,
                     )?,
                 ))
             })
             .collect::<Result<Vec<_>, PlanError>>()?;
+        let invocation_arms = link
+            .call
+            .invocation_arms
+            .iter()
+            .map(|arm| {
+                let trigger = match arm.cause {
+                    boon_ir::EventCause::Source(source) => ValueRef::Source(SourceId(source.0)),
+                    boon_ir::EventCause::State(state) => {
+                        ValueRef::State(boon_plan::StateId(state.0))
+                    }
+                };
+                Ok(DistributedInvocationArmPlan {
+                    gate: machine_plan_backend::lower_distributed_invocation_gate(
+                        &consumer.ir,
+                        &link.owner_path,
+                        arm.output_expression_id,
+                        link.call.expression,
+                        &trigger,
+                        &mut consumer.plan.row_expressions,
+                        &mut consumer.plan.constants,
+                        &context,
+                    )?,
+                    trigger,
+                })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let row_bindings = distributed_call_row_bindings(&consumer.ir, link.call.owner)?;
         let call = RemoteCallSitePlan::new(
             graph_identity.graph_id,
             endpoints
@@ -1643,13 +1971,16 @@ fn link_lowered_roles(
                 .request
                 .revision,
             link.consumer_role,
+            link.owner.clone(),
             function,
             arguments,
+            row_bindings,
+            link.mode,
+            link.result.invocation_source().map(|(source, _)| source),
+            invocation_arms,
         )?;
-        if call.result_import_id != link.result_import_id {
-            return Err(
-                PlanError::new("remote call result import ID changed during linking").into(),
-            );
+        if call.result != link.result {
+            return Err(PlanError::new("remote call result lane changed during linking").into());
         }
         remote_calls
             .entry(link.consumer_role)
@@ -1690,11 +2021,7 @@ fn link_lowered_roles(
         )?;
         endpoint_contracts.push(contract);
     }
-    let graph = DistributedGraphPlan::new(
-        &client.request.application,
-        graph_identity,
-        endpoint_contracts,
-    )?;
+    let graph = DistributedGraphPlan::new(&application, graph_identity, endpoint_contracts)?;
 
     for (role, program) in &mut compiled {
         program.plan.distributed_endpoint = Some(DistributedEndpointPlan::new(
@@ -1702,7 +2029,13 @@ fn link_lowered_roles(
             &graph,
             *role,
         )?);
+        machine_plan_backend::finalize_machine_plan_row_expressions(&mut program.plan)?;
         program.plan.capability_summary.constant_count = program.plan.constants.len();
+    }
+
+    validate_distributed_immediate_cycles(&compiled, &call_links)?;
+
+    for (role, program) in &compiled {
         let verification = verify_plan(&program.plan)?;
         if verification.status != "pass" {
             let failed = verification
@@ -1733,7 +2066,7 @@ fn link_lowered_roles(
     })
 }
 
-fn bind_executable_expression_ref(
+fn bind_checked_expression_refs(
     refs: &mut BTreeMap<boon_ir::ExecutableExprId, ValueRef>,
     program: &ErasedProgram,
     checked_expr_id: usize,
@@ -1766,11 +2099,27 @@ fn bind_executable_expression_ref(
     Ok(())
 }
 
+fn bind_executable_expression_ref(
+    refs: &mut BTreeMap<boon_ir::ExecutableExprId, ValueRef>,
+    expression: boon_ir::ExecutableExprId,
+    value: ValueRef,
+) -> Result<(), PlanError> {
+    if let Some(previous) = refs.insert(expression, value.clone())
+        && previous != value
+    {
+        return Err(PlanError::new(format!(
+            "distributed executable expression {} resolves to conflicting values",
+            expression.0
+        )));
+    }
+    Ok(())
+}
+
 fn origin_scoped_server_values<'a>(
     server: &CompiledMachinePlanFromSource,
     value_links: impl Iterator<Item = &'a ValueLink>,
     call_links: &[CallLink],
-) -> BTreeSet<ValueRef> {
+) -> Result<BTreeSet<ValueRef>, PlanError> {
     let mut scoped = value_links
         .filter(|link| {
             link.flow == DistributedReferenceFlow::Current
@@ -1782,7 +2131,7 @@ fn origin_scoped_server_values<'a>(
             call_links
                 .iter()
                 .filter(|link| link.consumer_role == ProgramRole::Server)
-                .map(|link| ValueRef::DistributedImport(link.result_import_id)),
+                .map(|link| link.result.value_ref()),
         )
         .collect::<BTreeSet<_>>();
     for op in server.plan.regions.iter().flat_map(|region| &region.ops) {
@@ -1794,7 +2143,9 @@ fn origin_scoped_server_values<'a>(
             continue;
         };
         let mut has_session_info = false;
-        expression.visit_intrinsics(&mut |_| has_session_info = true);
+        expression.visit_intrinsics(&server.plan.row_expressions, &mut |_| {
+            has_session_info = true
+        })?;
         if has_session_info {
             if let Some(output) = &op.output {
                 scoped.insert(output.clone());
@@ -1818,54 +2169,230 @@ fn origin_scoped_server_values<'a>(
             }
         }
         if !changed {
-            return scoped;
+            return Ok(scoped);
         }
     }
 }
 
 fn validate_distributed_immediate_cycles(
-    lowered: &BTreeMap<ProgramRole, LoweredRole>,
+    compiled: &BTreeMap<ProgramRole, CompiledMachinePlanFromSource>,
+    call_links: &[CallLink],
 ) -> Result<(), PlanError> {
-    type Node = (ProgramRole, String);
+    type Node = (ProgramRole, ValueRef);
+
+    let mut labels = BTreeMap::<Node, String>::new();
+    for (role, program) in compiled {
+        for (path, (_, value)) in machine_plan_backend::distributed_exportable_values(&program.ir) {
+            labels
+                .entry((*role, value))
+                .or_insert_with(|| format!("{}/{path}", role.namespace()));
+        }
+    }
 
     let mut edges = BTreeMap::<Node, BTreeSet<Node>>::new();
-    for (role, program) in lowered {
-        for dependency in &program.ir.immediate_dependencies {
-            edges
-                .entry((*role, dependency.dependent.clone()))
-                .or_default()
-                .insert((*role, dependency.dependency.clone()));
-        }
-        for reference in &program.ir.distributed_references.value_references {
-            if reference.flow_mode != FlowMode::Continuous {
+    for (role, program) in compiled {
+        for op in program.plan.regions.iter().flat_map(|region| &region.ops) {
+            if !matches!(
+                op.kind,
+                boon_plan::PlanOpKind::DerivedValue { .. }
+                    | boon_plan::PlanOpKind::ListProjection { .. }
+                    | boon_plan::PlanOpKind::DependencyEdge
+            ) {
                 continue;
             }
-            if program.ir.state_cells.iter().any(|state| {
-                state
-                    .expression_ids
-                    .iter()
-                    .any(|expr_id| expr_id.as_usize() == reference.expr_id.as_usize())
-            }) {
+            let Some(output) = &op.output else {
                 continue;
-            }
-            let owner = match distributed_root_owner(&program.ir, reference.expr_id.as_usize()) {
-                Ok(owner) => owner,
-                Err(_)
-                    if distributed_expression_is_retained_output(
-                        &program.ir,
-                        reference.expr_id.as_usize(),
-                    ) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
             };
+            for input in &op.inputs {
+                edges
+                    .entry((*role, output.clone()))
+                    .or_default()
+                    .insert((*role, input.clone()));
+            }
+        }
+        for (reference_index, reference) in program
+            .ir
+            .distributed_references
+            .value_references
+            .iter()
+            .enumerate()
+        {
             let producer_path =
                 strip_role_value_prefix(&reference.canonical_path, reference.producer_role)?;
+            let reads = program
+                .ir
+                .scope_index
+                .reads
+                .iter()
+                .filter(|read| {
+                    matches!(
+                        read.target,
+                        boon_ir::ErasedReadTarget::ExternalValue { reference }
+                            if reference == reference_index
+                    )
+                })
+                .map(|read| read.id)
+                .collect::<BTreeSet<_>>();
+            for use_site in program
+                .ir
+                .scope_index
+                .dependencies
+                .iter()
+                .filter(|use_site| {
+                    matches!(
+                        use_site.target,
+                        boon_ir::ErasedDependencyTarget::ExternalRead { read }
+                            if reads.contains(&read)
+                    )
+                })
+                .filter(|use_site| {
+                    matches!(use_site.timing, boon_ir::ErasedDependencyTiming::Immediate)
+                })
+            {
+                let dependent = program
+                    .ir
+                    .scope_index
+                    .bindings
+                    .get(use_site.dependent.as_usize())
+                    .filter(|binding| binding.id == use_site.dependent)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "distributed dependency references missing erased binding {}",
+                            use_site.dependent
+                        ))
+                    })?;
+                let dependent = distributed_cycle_binding_value(dependent)?;
+                let producer = compiled
+                    .get(&reference.producer_role)
+                    .and_then(|program| {
+                        machine_plan_backend::distributed_exportable_values(&program.ir)
+                            .get(&producer_path)
+                            .map(|(_, value)| value.clone())
+                    })
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "distributed cycle dependency `{}/{producer_path}` has no exact producer value",
+                            reference.producer_role.namespace()
+                        ))
+                    })?;
+                edges
+                    .entry((*role, dependent))
+                    .or_default()
+                    .insert((reference.producer_role, producer));
+            }
+        }
+    }
+
+    for (caller_role, caller) in compiled {
+        let endpoint = caller.plan.distributed_endpoint.as_ref().ok_or_else(|| {
+            PlanError::new(format!(
+                "{} machine has no distributed endpoint during cycle validation",
+                caller_role.namespace()
+            ))
+        })?;
+        for call in endpoint
+            .endpoint
+            .remote_call_sites
+            .iter()
+            .filter(|call| call.mode == DistributedCallMode::Current)
+        {
+            let call_link = call_links
+                .iter()
+                .find(|link| {
+                    link.consumer_role == *caller_role && link.call_site_id == call.call_site_id
+                })
+                .ok_or_else(|| {
+                    PlanError::new("current distributed call has no canonical call metadata")
+                })?;
+            let result_import = call.result.current_import_id().ok_or_else(|| {
+                PlanError::new(format!(
+                    "current distributed function `{}` has no current result import",
+                    call_link.call.canonical_function
+                ))
+            })?;
+            let producer = compiled.get(&call.callee_role).ok_or_else(|| {
+                PlanError::new(format!(
+                    "current distributed function `{}` targets missing {} machine",
+                    call_link.call.canonical_function,
+                    call.callee_role.namespace()
+                ))
+            })?;
+            let instance = producer
+                .plan
+                .producer_function_instances
+                .iter()
+                .find(|instance| instance.call_site_id == call.call_site_id)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "current distributed function `{}` has no exact producer instance",
+                        call_link.call.canonical_function
+                    ))
+                })?;
+            if instance.mode != DistributedCallMode::Current
+                || instance.function_export_id != call.function_export_id
+            {
+                return Err(PlanError::new(format!(
+                    "current distributed function `{}` differs from its producer instance",
+                    call_link.call.canonical_function
+                )));
+            }
+
+            let result_node = (*caller_role, ValueRef::DistributedImport(result_import));
+            let producer_result = (call.callee_role, instance.result.clone());
+            labels.entry(result_node.clone()).or_insert_with(|| {
+                let declaration = call_link
+                    .owner_path
+                    .split_once('@')
+                    .map_or(call_link.owner_path.as_str(), |(path, _)| path);
+                format!(
+                    "{}/{declaration} call {}",
+                    caller_role.namespace(),
+                    call_link.call.canonical_function
+                )
+            });
+            labels
+                .entry(producer_result.clone())
+                .or_insert_with(|| format!("{} result", call_link.call.canonical_function));
             edges
-                .entry((*role, owner))
+                .entry(result_node)
                 .or_default()
-                .insert((reference.producer_role, producer_path));
+                .insert(producer_result);
+
+            for argument in &call.arguments {
+                let producer_argument = instance
+                    .arguments
+                    .iter()
+                    .find(|candidate| candidate.argument_id == argument.argument_id)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "current distributed function `{}` argument `{}` has no producer import",
+                            call_link.call.canonical_function, argument.name
+                        ))
+                    })?;
+                let argument_node = (
+                    call.callee_role,
+                    ValueRef::DistributedImport(producer_argument.import_id),
+                );
+                labels.entry(argument_node.clone()).or_insert_with(|| {
+                    format!(
+                        "{} argument `{}`",
+                        call_link.call.canonical_function, argument.name
+                    )
+                });
+                let mut dependencies = BTreeSet::new();
+                caller
+                    .plan
+                    .row_expressions
+                    .visit_inputs(argument.value, &mut |input| {
+                        dependencies.insert(input);
+                    })?;
+                for dependency in dependencies {
+                    edges
+                        .entry(argument_node.clone())
+                        .or_default()
+                        .insert((*caller_role, dependency));
+                }
+            }
         }
     }
 
@@ -1879,7 +2406,12 @@ fn validate_distributed_immediate_cycles(
         if let Some(cycle) = distributed_cycle_from(&node, &edges, &mut states, &mut stack) {
             let detail = cycle
                 .iter()
-                .map(|(role, path)| format!("{}/{path}", role.namespace()))
+                .map(|node @ (role, _)| {
+                    labels
+                        .get(node)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{} internal value", role.namespace()))
+                })
                 .collect::<Vec<_>>()
                 .join(" -> ");
             return Err(PlanError::new(format!(
@@ -1890,23 +2422,12 @@ fn validate_distributed_immediate_cycles(
     Ok(())
 }
 
-fn distributed_expression_is_retained_output(program: &ErasedProgram, expr_id: usize) -> bool {
-    program.output_values.iter().any(|output| {
-        matches!(
-            output.contract,
-            boon_ir::SemanticOutputContractKind::RetainedVisual { .. }
-        ) && compiler_statement_ast_exprs(&output.statement, &program.expressions)
-            .iter()
-            .any(|expression| expression.id == expr_id)
-    })
-}
-
 fn distributed_cycle_from(
-    node: &(ProgramRole, String),
-    edges: &BTreeMap<(ProgramRole, String), BTreeSet<(ProgramRole, String)>>,
-    states: &mut BTreeMap<(ProgramRole, String), u8>,
-    stack: &mut Vec<(ProgramRole, String)>,
-) -> Option<Vec<(ProgramRole, String)>> {
+    node: &(ProgramRole, ValueRef),
+    edges: &BTreeMap<(ProgramRole, ValueRef), BTreeSet<(ProgramRole, ValueRef)>>,
+    states: &mut BTreeMap<(ProgramRole, ValueRef), u8>,
+    stack: &mut Vec<(ProgramRole, ValueRef)>,
+) -> Option<Vec<(ProgramRole, ValueRef)>> {
     states.insert(node.clone(), 1);
     stack.push(node.clone());
     for dependency in edges.get(node).into_iter().flatten() {
@@ -1933,46 +2454,164 @@ fn distributed_cycle_from(
     None
 }
 
-fn distributed_root_owner(program: &ErasedProgram, expr_id: usize) -> Result<String, PlanError> {
-    let mut candidates = program
-        .derived_values
-        .iter()
-        .filter(|derived| !derived.indexed && derived.scope_id.is_none())
-        .filter(|derived| {
-            compiler_statement_ast_exprs(&derived.statement, &program.expressions)
-                .iter()
-                .any(|expression| expression.id == expr_id)
-        })
-        .map(|derived| {
-            (
-                derived
-                    .statement
-                    .end
-                    .saturating_sub(derived.statement.start),
-                derived.path.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    match candidates.as_slice() {
-        [(_, owner), ..]
-            if candidates
-                .get(1)
-                .is_none_or(|candidate| candidate.0 > candidates[0].0) =>
-        {
-            Ok(owner.clone())
+fn distributed_cycle_binding_value(
+    binding: &boon_ir::ErasedBinding,
+) -> Result<ValueRef, PlanError> {
+    match binding.target {
+        boon_ir::ErasedBindingTarget::Value { row: Some(row), .. } => {
+            Ok(ValueRef::List(boon_plan::ListId(row.list.as_usize())))
         }
-        [] => Err(PlanError::new(format!(
-            "distributed expression {expr_id} ({:?}) is not owned by one non-indexed root value; calls inside reusable functions, documents, or list rows need scheduled call-site identity",
-            program
-                .expressions
-                .get(expr_id)
-                .map(|expression| &expression.kind)
-        ))),
-        _ => Err(PlanError::new(format!(
-            "remote call expression {expr_id} has ambiguous scheduled ownership"
+        boon_ir::ErasedBindingTarget::Value {
+            field: Some(field), ..
+        } => Ok(ValueRef::Field(boon_plan::FieldId(field.as_usize()))),
+        boon_ir::ErasedBindingTarget::Source { runtime, .. } => {
+            Ok(ValueRef::Source(SourceId(runtime.as_usize())))
+        }
+        boon_ir::ErasedBindingTarget::State { runtime, .. } => {
+            Ok(ValueRef::State(boon_plan::StateId(runtime.as_usize())))
+        }
+        boon_ir::ErasedBindingTarget::Value { .. } => Err(PlanError::new(format!(
+            "distributed cycle dependency binding {} has no exact machine storage",
+            binding.id
         ))),
     }
+}
+
+fn erased_external_call_owner_path(
+    program: &ErasedProgram,
+    reference: usize,
+    static_owner: Option<boon_ir::StaticOwnerId>,
+) -> Result<String, PlanError> {
+    let owners = program
+        .scope_index
+        .dependencies
+        .iter()
+        .filter_map(|use_site| {
+            matches!(
+                use_site.target,
+                boon_ir::ErasedDependencyTarget::ExternalCall {
+                    reference: candidate,
+                } if candidate == reference
+            )
+            .then_some(use_site.dependent)
+        })
+        .collect::<BTreeSet<_>>();
+    let owners = owners
+        .into_iter()
+        .map(|owner| {
+            program
+                .scope_index
+                .bindings
+                .get(owner.as_usize())
+                .filter(|binding| binding.id == owner)
+                .map(|binding| binding.diagnostic_path.clone())
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "external call dependency references missing erased binding {owner}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if owners.is_empty() {
+        return Err(PlanError::new(format!(
+            "distributed call reference {reference} has no exact erased owner"
+        )));
+    }
+    let binding_path = owners.join("&");
+    let Some(static_owner) = static_owner else {
+        return Ok(binding_path);
+    };
+
+    let mut ordinals = Vec::new();
+    let mut next = Some(static_owner);
+    let mut visited = BTreeSet::new();
+    let mut row_owned = false;
+    while let Some(owner) = next {
+        if !visited.insert(owner) {
+            return Err(PlanError::new(format!(
+                "distributed call reference {reference} has cyclic static ownership at {owner}"
+            )));
+        }
+        let definition = program
+            .scope_index
+            .owners
+            .iter()
+            .find(|definition| definition.id == owner)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "distributed call reference {reference} has missing static owner {owner}"
+                ))
+            })?;
+        row_owned |= definition.authority_row.is_some();
+        ordinals.push(definition.child_ordinal);
+        next = definition.parent;
+    }
+    ordinals.reverse();
+    let owner_kind = if row_owned { "row-owner" } else { "owner" };
+    let owner_path = ordinals
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    Ok(format!("{binding_path}@{owner_kind}:{owner_path}"))
+}
+
+fn distributed_call_row_bindings(
+    program: &ErasedProgram,
+    owner: Option<boon_ir::StaticOwnerId>,
+) -> Result<Vec<DistributedCallRowBindingPlan>, PlanError> {
+    let mut ancestry = Vec::new();
+    let mut next = owner;
+    let mut visited = BTreeSet::new();
+    while let Some(owner) = next {
+        if !visited.insert(owner) {
+            return Err(PlanError::new(format!(
+                "distributed call has cyclic static ownership at {owner}"
+            )));
+        }
+        let definition = program
+            .scope_index
+            .owners
+            .iter()
+            .find(|definition| definition.id == owner)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "distributed call references missing static owner {owner}"
+                ))
+            })?;
+        ancestry.push(owner);
+        next = definition.parent;
+    }
+    ancestry.reverse();
+
+    let mut bindings = Vec::new();
+    for owner in ancestry {
+        for local in program
+            .scope_index
+            .locals
+            .iter()
+            .filter(|local| local.owner == owner)
+        {
+            let Some(row) = local.row else {
+                continue;
+            };
+            bindings.push(DistributedCallRowBindingPlan {
+                owner: PlanStaticOwnerId(owner.as_usize()),
+                local: PlanLocalId(local.local.0 as usize),
+                list: ListId(row.list.0),
+            });
+        }
+    }
+    bindings.sort();
+    if bindings
+        .windows(2)
+        .any(|pair| pair[0].owner == pair[1].owner)
+    {
+        return Err(PlanError::new(
+            "distributed call owner chain contains multiple contextual rows for one owner",
+        ));
+    }
+    Ok(bindings)
 }
 
 fn find_function_signature<'a>(
@@ -2043,7 +2682,11 @@ fn type_to_data_plan(ty: &Type) -> Option<DataTypePlan> {
         Type::List(item) => Some(DataTypePlan::List {
             item: Box::new(type_to_data_plan(item)?),
         }),
-        Type::VariantSet(variants) if bool_variant_set(variants) => Some(DataTypePlan::Bool),
+        Type::VariantSet(variants)
+            if boon_typecheck::variants_use_boolean_runtime_representation(variants) =>
+        {
+            Some(DataTypePlan::Bool)
+        }
         Type::VariantSet(variants) => Some(DataTypePlan::Variant {
             variants: variants
                 .iter()
@@ -2083,15 +2726,4 @@ fn object_fields(shape: &ObjectShape) -> Option<Vec<DataTypeFieldPlan>> {
             })
         })
         .collect()
-}
-
-fn bool_variant_set(variants: &[Variant]) -> bool {
-    let tags = variants
-        .iter()
-        .filter_map(|variant| match variant {
-            Variant::Tag(tag) => Some(tag.as_str()),
-            Variant::Tagged { .. } => None,
-        })
-        .collect::<BTreeSet<_>>();
-    tags == BTreeSet::from(["False", "True"]) && variants.len() == 2
 }

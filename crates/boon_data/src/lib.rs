@@ -238,6 +238,72 @@ pub fn format_number_text(
     Ok(output)
 }
 
+/// Returns the number of significant bits in the absolute whole-number value.
+/// Fractional values are rejected instead of being silently truncated.
+pub fn number_bit_width(value: FiniteReal) -> Result<FiniteReal, FiniteRealError> {
+    let magnitude = value.to_i64_exact()?.unsigned_abs();
+    FiniteReal::from_i64_exact(i64::from(u64::BITS - magnitude.leading_zeros()))
+}
+
+/// Formats a whole-number bit pattern as bounded ASCII waveform text.
+/// Invalid values use `?`; widths below one byte use `-`.
+pub fn format_number_ascii_text(value: FiniteReal, width: Option<FiniteReal>) -> String {
+    let Ok(value) = value.to_i64_exact().and_then(|value| {
+        u64::try_from(value)
+            .map_err(|_| FiniteRealError::new("ASCII values must be non-negative whole Numbers"))
+    }) else {
+        return "?".to_owned();
+    };
+    if value > (1_u64 << 53) - 1 {
+        return "?".to_owned();
+    }
+
+    let inferred_width = (u64::BITS as usize - value.leading_zeros() as usize)
+        .max(1)
+        .div_ceil(8)
+        * 8;
+    let width = match width {
+        Some(width) => match width.to_usize_exact() {
+            Ok(width) => width,
+            Err(_) => return "?".to_owned(),
+        },
+        None => inferred_width,
+    };
+    if width < 8 {
+        return "-".to_owned();
+    }
+    if width > 64 {
+        return "?".to_owned();
+    }
+
+    let mut bytes = Vec::with_capacity(width / 8);
+    for group in 0..width / 8 {
+        let shift = width - (group + 1) * 8;
+        let byte = ((value >> shift) & 0xff) as u8;
+        bytes.push(
+            if byte == 0
+                || (byte.is_ascii() && (byte.is_ascii_graphic() || byte.is_ascii_whitespace()))
+            {
+                byte
+            } else {
+                b'?'
+            },
+        );
+    }
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    if bytes.is_empty() {
+        return "?".to_owned();
+    }
+    for byte in &mut bytes {
+        if *byte == 0 {
+            *byte = b'?';
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| "?".to_owned())
+}
+
 impl FromStr for FiniteReal {
     type Err = FiniteRealError;
 
@@ -438,6 +504,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn waveform_number_helpers_are_exact_and_bounded() {
+        assert_eq!(
+            number_bit_width(FiniteReal::ZERO).unwrap(),
+            FiniteReal::ZERO
+        );
+        assert_eq!(
+            number_bit_width(FiniteReal::new(255.0).unwrap()).unwrap(),
+            FiniteReal::new(8.0).unwrap()
+        );
+        assert!(number_bit_width(FiniteReal::new(1.5).unwrap()).is_err());
+
+        let ascii = |value: f64, width: Option<f64>| {
+            format_number_ascii_text(
+                FiniteReal::new(value).unwrap(),
+                width.map(|width| FiniteReal::new(width).unwrap()),
+            )
+        };
+        assert_eq!(ascii(0x48 as f64, Some(8.0)), "H");
+        assert_eq!(ascii(0x4845 as f64, Some(16.0)), "HE");
+        assert_eq!(ascii(0.0, Some(7.0)), "-");
+        assert_eq!(ascii(0.0, Some(8.0)), "?");
+        assert_eq!(ascii(1.0, Some(8.0)), "?");
+        assert_eq!(ascii(0x48 as f64, Some(65.0)), "?");
     }
 
     #[test]

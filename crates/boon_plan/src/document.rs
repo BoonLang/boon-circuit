@@ -1,4 +1,7 @@
-use crate::{FieldId, ImportId, ListId, MachinePlan, ScopeId, SourceId, StateId};
+use crate::{
+    FieldId, ImportId, ListId, MachinePlan, PlanLocalId, PlanRowExpressionId, PlanStaticOwnerId,
+    ScopeId, SourceId, StateId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -27,6 +30,12 @@ document_usize_ids!(
     DocumentConstantId,
     DocumentBindingId,
 );
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DocumentElementContextId {
+    pub call_instance: usize,
+    pub ordinal: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -143,11 +152,6 @@ pub enum DocumentExprOp {
         bindings: Vec<DocumentLocalBinding>,
         result: DocumentExprId,
     },
-    FunctionCall {
-        function: DocumentFunctionId,
-        arguments: Vec<DocumentCallArgument>,
-        passed: Option<DocumentExprId>,
-    },
     Builtin {
         builtin: DocumentBuiltin,
         input: Option<DocumentExprId>,
@@ -172,12 +176,26 @@ pub enum DocumentExprOp {
     Constructor {
         template: DocumentTemplateId,
         constructor: DocumentConstructor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        element_context: Option<DocumentElementContextId>,
         arguments: Vec<DocumentConstructorArgument>,
     },
     Materialize {
         materialization: DocumentMaterializationId,
     },
+    RuntimeExpression {
+        expression: PlanRowExpressionId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bindings: Vec<DocumentRuntimeLocalBinding>,
+    },
     NoElement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRuntimeLocalBinding {
+    pub owner: PlanStaticOwnerId,
+    pub local: PlanLocalId,
+    pub parameter: DocumentParameterId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -206,9 +224,6 @@ pub enum DocumentRead {
         local: DocumentLocalId,
         projection: Vec<DocumentNameId>,
     },
-    Passed {
-        projection: Vec<DocumentNameId>,
-    },
     Matched {
         selector: usize,
         projection: Vec<DocumentNameId>,
@@ -219,6 +234,7 @@ pub enum DocumentRead {
         projection: Vec<DocumentNameId>,
     },
     ElementState {
+        context: DocumentElementContextId,
         projection: Vec<DocumentNameId>,
     },
 }
@@ -276,19 +292,14 @@ pub enum DocumentBuiltin {
     LightAmbient,
     LightDirectional,
     LightSpot,
-    ListAny,
     ListAppend,
     ListChunk,
     ListCount,
-    ListFind,
     ListGet,
     ListIsNotEmpty,
     ListLatest,
     ListLength,
-    ListMap,
     ListRange,
-    ListRemove,
-    ListRetain,
     ListSortBy,
     ListSum,
     LogError,
@@ -364,14 +375,22 @@ pub struct DocumentCallArgument {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DocumentBuiltinArgument {
-    pub name: Option<DocumentNameId>,
+    pub name: DocumentNameId,
     pub value: DocumentExprId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DocumentSelectArm {
     pub pattern: DocumentPattern,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<DocumentSelectBinding>,
     pub output: DocumentExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentSelectBinding {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projection: Vec<DocumentNameId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -657,11 +676,37 @@ impl DocumentPlan {
                             .endpoint
                             .remote_call_sites
                             .iter()
-                            .map(|call| call.result_import_id),
+                            .filter_map(|call| call.result.current_import_id()),
                     )
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
+        let element_contexts = self
+            .expressions
+            .iter()
+            .filter_map(|expression| match expression.op {
+                DocumentExprOp::Constructor {
+                    element_context, ..
+                } => element_context,
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let element_context_count = self
+            .expressions
+            .iter()
+            .filter(|expression| {
+                matches!(
+                    expression.op,
+                    DocumentExprOp::Constructor {
+                        element_context: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        if element_contexts.len() != element_context_count {
+            return Err("document element-context ids are not unique".to_owned());
+        }
         for expression in &self.expressions {
             if matches!(
                 &expression.op,
@@ -693,13 +738,22 @@ impl DocumentPlan {
                     ));
                 }
             }
-            if let DocumentExprOp::FunctionCall { function, .. } = &expression.op
-                && !function_ids.contains(function)
-            {
-                return Err(format!(
-                    "document expression {} references missing function {}",
-                    expression.id.0, function.0
-                ));
+            if let DocumentExprOp::Builtin { arguments, .. } = &expression.op {
+                let mut names = BTreeSet::new();
+                for argument in arguments {
+                    if argument.name.0 >= self.names.len() {
+                        return Err(format!(
+                            "document expression {} references missing builtin argument name {}",
+                            expression.id.0, argument.name.0
+                        ));
+                    }
+                    if !names.insert(argument.name) {
+                        return Err(format!(
+                            "document expression {} contains duplicate builtin argument name {}",
+                            expression.id.0, argument.name.0
+                        ));
+                    }
+                }
             }
             if let DocumentExprOp::Read {
                 read: DocumentRead::DistributedImport { import },
@@ -709,6 +763,16 @@ impl DocumentPlan {
                 return Err(format!(
                     "document expression {} references missing distributed import {:?}",
                     expression.id.0, import
+                ));
+            }
+            if let DocumentExprOp::Read {
+                read: DocumentRead::ElementState { context, .. },
+            } = &expression.op
+                && !element_contexts.contains(context)
+            {
+                return Err(format!(
+                    "document expression {} references missing element context {:?}",
+                    expression.id.0, context
                 ));
             }
             if let DocumentExprOp::Constructor { template, .. } = &expression.op
@@ -721,10 +785,17 @@ impl DocumentPlan {
             }
             if let DocumentExprOp::Constructor {
                 constructor,
+                element_context,
                 arguments,
                 ..
             } = &expression.op
             {
+                if constructor.owns_element_context() != element_context.is_some() {
+                    return Err(format!(
+                        "document expression {} has an invalid element-context contract",
+                        expression.id.0
+                    ));
+                }
                 verify_map_viewport_constructor_contract(*constructor, arguments, &self.names)
                     .map_err(|detail| {
                         format!("document expression {} {detail}", expression.id.0)
@@ -737,6 +808,32 @@ impl DocumentPlan {
                     "document expression {} references missing materialization {}",
                     expression.id.0, materialization.0
                 ));
+            }
+            if let DocumentExprOp::RuntimeExpression {
+                expression: runtime_expression,
+                bindings,
+            } = &expression.op
+            {
+                let binding_keys = bindings
+                    .iter()
+                    .map(|binding| (binding.owner, binding.local))
+                    .collect::<BTreeSet<_>>();
+                let bindings_unique = binding_keys.len() == bindings.len();
+                let validation = crate::validate_runtime_row_expression(
+                    machine,
+                    *runtime_expression,
+                    binding_keys.iter().copied(),
+                );
+                let locals_resolve = validation.locals_resolve;
+                let list_fields_resolve = validation.list_fields_resolve;
+                let cpu_evaluable = validation.cpu_evaluable;
+                if !bindings_unique || !locals_resolve || !list_fields_resolve || !cpu_evaluable {
+                    let cpu_error = validation.detail.unwrap_or_else(|| "none".to_owned());
+                    return Err(format!(
+                        "document expression {} contains an invalid runtime expression or local binding: bindings_unique={bindings_unique}, locals_resolve={locals_resolve}, list_fields_resolve={list_fields_resolve}, cpu_evaluable={cpu_evaluable}, cpu_error={cpu_error}",
+                        expression.id.0,
+                    ));
+                }
             }
         }
         if self
@@ -764,6 +861,10 @@ impl DocumentPlan {
 }
 
 impl DocumentConstructor {
+    pub fn owns_element_context(self) -> bool {
+        !matches!(self, Self::DocumentNew | Self::SceneNew)
+    }
+
     pub fn is_map_viewport(self) -> bool {
         matches!(self, Self::ElementMap | Self::SceneElementMap)
     }
@@ -863,13 +964,6 @@ impl DocumentExprOp {
                 .map(|binding| binding.value)
                 .chain(std::iter::once(*result))
                 .collect(),
-            Self::FunctionCall {
-                arguments, passed, ..
-            } => arguments
-                .iter()
-                .map(|argument| argument.value)
-                .chain(passed.iter().copied())
-                .collect(),
             Self::Builtin {
                 input, arguments, ..
             } => input
@@ -890,7 +984,7 @@ impl DocumentExprOp {
             Self::Constructor { arguments, .. } => {
                 arguments.iter().map(|argument| argument.value).collect()
             }
-            Self::Materialize { .. } => Vec::new(),
+            Self::Materialize { .. } | Self::RuntimeExpression { .. } => Vec::new(),
         }
     }
 

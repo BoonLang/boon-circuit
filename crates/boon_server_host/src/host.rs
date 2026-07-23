@@ -1383,6 +1383,17 @@ async fn run_websocket(
                 }
                 let requested_close = close_receiver.borrow().clone();
                 if let Some(close) = requested_close {
+                    let mut flush_failed = false;
+                    while let Ok(queued) = write_receiver.try_recv() {
+                        queued_bytes.fetch_sub(queued.bytes, Ordering::AcqRel);
+                        if sink.send(frame_message(queued.frame)).await.is_err() {
+                            flush_failed = true;
+                            break;
+                        }
+                    }
+                    if flush_failed {
+                        break;
+                    }
                     let _ = sink.send(close_message(&close)).await;
                     observed_close = Some(close);
                     break;
@@ -1506,6 +1517,21 @@ async fn run_distributed_session_websocket(
                 }
                 let requested_close = close_receiver.borrow().clone();
                 if let Some(close) = requested_close {
+                    let mut flush_failed = false;
+                    while let Ok(queued) = write_receiver.try_recv() {
+                        queued_bytes.fetch_sub(queued.bytes, Ordering::AcqRel);
+                        let WebSocketFrame::Binary(bytes) = queued.frame else {
+                            flush_failed = true;
+                            break;
+                        };
+                        if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                            flush_failed = true;
+                            break;
+                        }
+                    }
+                    if flush_failed {
+                        break;
+                    }
                     let _ = sink.send(close_message(&close)).await;
                     observed_close = Some(close);
                     break;

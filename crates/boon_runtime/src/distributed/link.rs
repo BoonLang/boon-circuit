@@ -1,9 +1,11 @@
 use super::{DistributedRuntimeError, runtime_error};
 use boon_wire::{
-    ClientSessionFrame, ClientSessionFrameError, ClientSessionFrameLimits, SessionId,
-    decode_client_session_frame, encode_client_session_frame,
+    ClientSessionDataOperation, ClientSessionFrame, ClientSessionFrameError,
+    ClientSessionFrameLimits, SessionId, decode_client_session_frame, encode_client_session_frame,
 };
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+const RECEIVE_REPLAY_WINDOW: u64 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReceiveOperation {
@@ -22,17 +24,9 @@ pub(super) struct ClientSessionLink {
     next_send_operation_sequence: u64,
     peer_acknowledged_through: u64,
     applied_receive_through: u64,
+    receive_fingerprints: BTreeMap<u64, [u8; 32]>,
     ack_pending: bool,
     resync_expected_next: Option<u64>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct ClientSessionLinkRecovery {
-    session_id: [u8; 32],
-    generation: u64,
-    next_send_operation_sequence: u64,
-    peer_acknowledged_through: u64,
-    applied_receive_through: u64,
 }
 
 impl ClientSessionLink {
@@ -52,70 +46,41 @@ impl ClientSessionLink {
             next_send_operation_sequence: 1,
             peer_acknowledged_through: 0,
             applied_receive_through: 0,
+            receive_fingerprints: BTreeMap::new(),
             ack_pending: false,
             resync_expected_next: None,
         }
     }
 
-    pub(super) fn rebind(&self, session_id: SessionId, generation: u64) -> Self {
+    pub(super) fn rebind(
+        &self,
+        generation: u64,
+        peer_applied_through: u64,
+    ) -> Result<Self, DistributedRuntimeError> {
+        if generation <= self.generation {
+            return Err(DistributedRuntimeError::StaleTransportGeneration);
+        }
         let mut rebound = self.clone();
-        rebound.session_id = session_id;
         rebound.generation = generation;
+        rebound.rebase_send_after_handshake(peer_applied_through)?;
         rebound.ack_pending = rebound.applied_receive_through != 0;
         rebound.resync_expected_next = None;
-        rebound
+        Ok(rebound)
     }
 
-    pub(super) fn recovery_image(&self) -> ClientSessionLinkRecovery {
-        ClientSessionLinkRecovery {
-            session_id: self.session_id.into_bytes(),
-            generation: self.generation,
-            next_send_operation_sequence: self.next_send_operation_sequence,
-            peer_acknowledged_through: self.peer_acknowledged_through,
-            applied_receive_through: self.applied_receive_through,
-        }
-    }
-
-    pub(super) fn from_recovery(
-        recovery: ClientSessionLinkRecovery,
-        graph_hash: [u8; 32],
-        schema_hash: [u8; 32],
-        graph_revision: u64,
-    ) -> Result<Self, DistributedRuntimeError> {
-        if recovery.generation == 0
-            || recovery.next_send_operation_sequence == 0
-            || recovery.peer_acknowledged_through >= recovery.next_send_operation_sequence
-        {
-            return Err(DistributedRuntimeError::InvalidTransportFrame);
-        }
-        Ok(Self {
-            graph_hash,
-            schema_hash,
-            graph_revision,
-            session_id: SessionId::from_bytes(recovery.session_id),
-            generation: recovery.generation,
-            next_send_operation_sequence: recovery.next_send_operation_sequence,
-            peer_acknowledged_through: recovery.peer_acknowledged_through,
-            applied_receive_through: recovery.applied_receive_through,
-            ack_pending: false,
-            resync_expected_next: None,
-        })
+    pub(super) fn rebase_send_after_handshake(
+        &mut self,
+        peer_applied_through: u64,
+    ) -> Result<(), DistributedRuntimeError> {
+        self.next_send_operation_sequence = peer_applied_through
+            .checked_add(1)
+            .ok_or_else(|| runtime_error("client/session send operation sequence exhausted"))?;
+        self.peer_acknowledged_through = peer_applied_through;
+        Ok(())
     }
 
     pub(super) fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub(super) fn graph_hash(&self) -> [u8; 32] {
-        self.graph_hash
-    }
-
-    pub(super) fn schema_hash(&self) -> [u8; 32] {
-        self.schema_hash
-    }
-
-    pub(super) fn graph_revision(&self) -> u64 {
-        self.graph_revision
     }
 
     pub(super) fn session_id(&self) -> SessionId {
@@ -138,15 +103,14 @@ impl ClientSessionLink {
         self.applied_receive_through
     }
 
-    pub(super) fn peer_acknowledged_through(&self) -> u64 {
-        self.peer_acknowledged_through
-    }
-
     pub(super) fn encode_data(
         &self,
         operation_sequence: u64,
         edge_id: [u8; 32],
+        operation: ClientSessionDataOperation,
+        call_instance_id: Option<[u8; 32]>,
         semantic_revision: u64,
+        result_revision: Option<u64>,
         payload: boon_data::Value,
     ) -> Result<Vec<u8>, DistributedRuntimeError> {
         encode_client_session_frame(
@@ -159,7 +123,10 @@ impl ClientSessionLink {
                 operation_sequence,
                 ack_through: self.applied_receive_through,
                 edge_id,
+                operation,
+                call_instance_id,
                 semantic_revision,
+                result_revision,
                 payload,
             },
             ClientSessionFrameLimits::default(),
@@ -258,24 +225,39 @@ impl ClientSessionLink {
         Ok(())
     }
 
-    pub(super) fn classify_receive(&self, operation_sequence: u64) -> ReceiveOperation {
+    pub(super) fn classify_receive(
+        &self,
+        operation_sequence: u64,
+        fingerprint: [u8; 32],
+    ) -> Result<ReceiveOperation, DistributedRuntimeError> {
         let expected_next = self.applied_receive_through.saturating_add(1);
         if operation_sequence == expected_next {
-            ReceiveOperation::Next
+            Ok(ReceiveOperation::Next)
         } else if operation_sequence <= self.applied_receive_through {
-            ReceiveOperation::Duplicate
+            match self.receive_fingerprints.get(&operation_sequence) {
+                Some(accepted) if accepted == &fingerprint => Ok(ReceiveOperation::Duplicate),
+                Some(_) => Err(DistributedRuntimeError::InvalidTransportFrame),
+                None => Err(DistributedRuntimeError::TransportSequenceMismatch),
+            }
         } else {
-            ReceiveOperation::Gap { expected_next }
+            Ok(ReceiveOperation::Gap { expected_next })
         }
     }
 
     pub(super) fn accept_receive(
         &mut self,
         operation_sequence: u64,
+        fingerprint: [u8; 32],
     ) -> Result<(), DistributedRuntimeError> {
-        match self.classify_receive(operation_sequence) {
+        match self.classify_receive(operation_sequence, fingerprint)? {
             ReceiveOperation::Next => {
                 self.applied_receive_through = operation_sequence;
+                self.receive_fingerprints
+                    .insert(operation_sequence, fingerprint);
+                let retain_from =
+                    operation_sequence.saturating_sub(RECEIVE_REPLAY_WINDOW.saturating_sub(1));
+                self.receive_fingerprints
+                    .retain(|sequence, _| *sequence >= retain_from);
                 self.ack_pending = true;
                 self.resync_expected_next = None;
                 Ok(())
@@ -337,4 +319,55 @@ impl ClientSessionLink {
 pub(super) enum SentControl {
     Ack { ack_through: u64 },
     Resync { expected_next: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link() -> ClientSessionLink {
+        ClientSessionLink::new([1; 32], [2; 32], 1, SessionId::from_bytes([3; 32]), 1)
+    }
+
+    #[test]
+    fn duplicate_receive_requires_the_same_semantic_fingerprint() {
+        let mut link = link();
+        link.accept_receive(1, [7; 32]).unwrap();
+        assert_eq!(
+            link.classify_receive(1, [7; 32]).unwrap(),
+            ReceiveOperation::Duplicate
+        );
+        assert!(matches!(
+            link.classify_receive(1, [8; 32]),
+            Err(DistributedRuntimeError::InvalidTransportFrame)
+        ));
+    }
+
+    #[test]
+    fn stale_duplicates_outside_the_bounded_replay_window_fail() {
+        let mut link = link();
+        for sequence in 1..=RECEIVE_REPLAY_WINDOW + 1 {
+            link.accept_receive(sequence, [sequence as u8; 32]).unwrap();
+        }
+        assert!(matches!(
+            link.classify_receive(1, [1; 32]),
+            Err(DistributedRuntimeError::TransportSequenceMismatch)
+        ));
+    }
+
+    #[test]
+    fn rebind_requires_a_new_generation_and_uses_the_peer_receive_watermark() {
+        let mut link = link();
+        link.accept_receive(1, [9; 32]).unwrap();
+        assert!(matches!(
+            link.rebind(1, 0),
+            Err(DistributedRuntimeError::StaleTransportGeneration)
+        ));
+        let mut rebound = link.rebind(2, 7).unwrap();
+        assert_eq!(
+            rebound.classify_receive(1, [9; 32]).unwrap(),
+            ReceiveOperation::Duplicate
+        );
+        assert_eq!(rebound.allocate_operation_sequence().unwrap(), 8);
+    }
 }

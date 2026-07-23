@@ -11,6 +11,32 @@ pub enum StandardRootKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramRoleRoot {
+    Client,
+    Session,
+    Server,
+}
+
+impl ProgramRoleRoot {
+    pub const ALL: [Self; 3] = [Self::Client, Self::Session, Self::Server];
+
+    pub const fn namespace(self) -> &'static str {
+        match self {
+            Self::Client => "Client",
+            Self::Session => "Session",
+            Self::Server => "Server",
+        }
+    }
+
+    const fn standard_root(self) -> StandardRoot {
+        StandardRoot {
+            name: self.namespace(),
+            kind: StandardRootKind::ProgramRole,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StandardRoot {
     pub name: &'static str,
     pub kind: StandardRootKind,
@@ -20,21 +46,18 @@ pub struct StandardRoot {
 /// library. Application modules and root declarations may not shadow them.
 pub const STANDARD_ROOTS: &[StandardRoot] = &[
     StandardRoot {
-        name: "Browser",
+        name: "Bool",
         kind: StandardRootKind::Library,
     },
     StandardRoot {
-        name: "Bool",
+        name: "Browser",
         kind: StandardRootKind::Library,
     },
     StandardRoot {
         name: "Bytes",
         kind: StandardRootKind::Library,
     },
-    StandardRoot {
-        name: "Client",
-        kind: StandardRootKind::ProgramRole,
-    },
+    ProgramRoleRoot::Client.standard_root(),
     StandardRoot {
         name: "Clock",
         kind: StandardRootKind::Library,
@@ -45,6 +68,10 @@ pub const STANDARD_ROOTS: &[StandardRoot] = &[
     },
     StandardRoot {
         name: "Crypto",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "DevelopmentPasskey",
         kind: StandardRootKind::Library,
     },
     StandardRoot {
@@ -61,6 +88,10 @@ pub const STANDARD_ROOTS: &[StandardRoot] = &[
     },
     StandardRoot {
         name: "Error",
+        kind: StandardRootKind::Library,
+    },
+    StandardRoot {
+        name: "Field",
         kind: StandardRootKind::Library,
     },
     StandardRoot {
@@ -107,14 +138,8 @@ pub const STANDARD_ROOTS: &[StandardRoot] = &[
         name: "Secret",
         kind: StandardRootKind::Library,
     },
-    StandardRoot {
-        name: "Server",
-        kind: StandardRootKind::ProgramRole,
-    },
-    StandardRoot {
-        name: "Session",
-        kind: StandardRootKind::ProgramRole,
-    },
+    ProgramRoleRoot::Server.standard_root(),
+    ProgramRoleRoot::Session.standard_root(),
     StandardRoot {
         name: "SessionInfo",
         kind: StandardRootKind::Runtime,
@@ -151,8 +176,14 @@ pub fn standard_root_kind(name: &str) -> Option<StandardRootKind> {
         .find_map(|root| (root.name == name).then_some(root.kind))
 }
 
+pub fn program_role_root(name: &str) -> Option<ProgramRoleRoot> {
+    ProgramRoleRoot::ALL
+        .into_iter()
+        .find(|role| role.namespace() == name)
+}
+
 pub fn is_program_role_root(name: &str) -> bool {
-    standard_root_kind(name) == Some(StandardRootKind::ProgramRole)
+    program_role_root(name).is_some()
 }
 
 pub fn is_reserved_standard_root(name: &str) -> bool {
@@ -348,6 +379,26 @@ pub struct AstExpr {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AstTextSegment {
+    Static { value: String },
+    Dynamic { value: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AstMatchPattern {
+    Wildcard,
+    Bool { value: bool },
+    Number { value: String },
+    Text { value: String },
+    NaN,
+    Tag { name: String },
+    Binding { name: String },
+    Unknown { tokens: Vec<String> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AstExprKind {
     Identifier(String),
     Path(Vec<String>),
@@ -356,6 +407,9 @@ pub enum AstExprKind {
     },
     StringLiteral(String),
     TextLiteral(String),
+    TextTemplate {
+        segments: Vec<AstTextSegment>,
+    },
     Number(String),
     ByteLiteral {
         radix: u8,
@@ -390,7 +444,10 @@ pub enum AstExprKind {
         initial: usize,
         name: String,
     },
-    Latest,
+    Latest {
+        #[serde(default)]
+        branches: Vec<usize>,
+    },
     When {
         input: usize,
         #[serde(default)]
@@ -407,6 +464,7 @@ pub enum AstExprKind {
     },
     MatchArm {
         pattern: Vec<String>,
+        semantic_pattern: AstMatchPattern,
         output: Option<usize>,
     },
     Block {
@@ -496,6 +554,7 @@ pub struct AstPassContext {
     pub value: usize,
     pub start: usize,
     pub end: usize,
+    pub final_clause: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1160,6 +1219,7 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let mut expressions = Vec::new();
     let mut statements = ast_statement_tree(&items, &mut expressions, source);
     link_multiline_expression_structure(&mut statements, &mut expressions);
+    validate_pipeline_inputs(path, source, &expressions)?;
     Ok(AstProgram {
         tokens,
         lines,
@@ -1173,11 +1233,171 @@ fn link_multiline_expression_structure(
     statements: &mut [AstStatement],
     expressions: &mut Vec<AstExpr>,
 ) {
+    link_multiline_expression_structure_with_input(statements, expressions, None);
+}
+
+fn link_multiline_expression_structure_with_input(
+    statements: &mut [AstStatement],
+    expressions: &mut Vec<AstExpr>,
+    mut previous: Option<usize>,
+) {
     for statement in statements.iter_mut() {
-        link_multiline_expression_structure(&mut statement.children, expressions);
+        if let Some(target) = statement_pipeline_continuation_target(statement, expressions)
+            && let Some(input) = previous
+            && let Some(expression) = expressions.get_mut(target)
+        {
+            expression.linked_input = Some(input);
+            if let AstExprKind::Infix { left, .. } = &mut expression.kind {
+                *left = input;
+            }
+        }
+        let child_input = statement_child_pipeline_input(statement, expressions);
+        link_multiline_expression_structure_with_input(
+            &mut statement.children,
+            expressions,
+            child_input,
+        );
+        if let Some(output) = leading_pipeline_continuation_result(&statement.children, expressions)
+        {
+            replace_statement_inline_output(statement, expressions, output);
+        }
         materialize_statement_structure(statement, expressions);
+        let value = statement_value_expression(statement, expressions);
+        if let Some(value) = value {
+            previous = Some(value);
+        }
     }
-    link_multiline_pipeline_inputs(statements, expressions);
+}
+
+fn statement_pipeline_continuation_target(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    pipeline_placeholder_target(statement.expr?, expressions)
+}
+
+fn pipeline_placeholder_target(expr_id: usize, expressions: &[AstExpr]) -> Option<usize> {
+    let expression = expressions.get(expr_id)?;
+    if expression.linked_input.is_some()
+        && matches!(expression.kind, AstExprKind::Infix { .. })
+    {
+        return Some(expr_id);
+    }
+    let input = match &expression.kind {
+        AstExprKind::Pipe { input, .. }
+        | AstExprKind::Then { input, .. }
+        | AstExprKind::When { input, .. }
+        | AstExprKind::Draining { input }
+        | AstExprKind::Hold { initial: input, .. } => *input,
+        AstExprKind::Infix { left, .. } => *left,
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => return pipeline_placeholder_target(*output, expressions),
+        _ => return None,
+    };
+    if expressions
+        .get(input)
+        .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
+    {
+        Some(expr_id)
+    } else {
+        pipeline_placeholder_target(input, expressions)
+    }
+}
+
+fn statement_child_pipeline_input(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    let owner = statement_structure_owner(statement.expr?, expressions);
+    match &expressions.get(owner)?.kind {
+        AstExprKind::MatchArm { output, .. } | AstExprKind::Then { output, .. } => *output,
+        AstExprKind::Block { .. }
+        | AstExprKind::Record(_)
+        | AstExprKind::ListLiteral { .. }
+        | AstExprKind::BytesLiteral { .. }
+        | AstExprKind::Hold { .. }
+        | AstExprKind::Latest { .. }
+        | AstExprKind::When { .. } => None,
+        AstExprKind::Pipe { op, .. } if op == "WHILE" => None,
+        _ => Some(owner),
+    }
+}
+
+fn leading_pipeline_continuation_result(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    let mut result = None;
+    for statement in statements {
+        if statement_pipeline_continuation_target(statement, expressions).is_none() {
+            break;
+        }
+        result = statement_value_expression(statement, expressions);
+    }
+    result
+}
+
+fn replace_statement_inline_output(
+    statement: &AstStatement,
+    expressions: &mut [AstExpr],
+    output: usize,
+) {
+    let Some(expr_id) = statement.expr else {
+        return;
+    };
+    let owner = statement_structure_owner(expr_id, expressions);
+    let Some(expression) = expressions.get_mut(owner) else {
+        return;
+    };
+    match &mut expression.kind {
+        AstExprKind::MatchArm {
+            output: arm_output, ..
+        }
+        | AstExprKind::Then {
+            output: arm_output, ..
+        } if arm_output.is_some() => *arm_output = Some(output),
+        _ => {}
+    }
+}
+
+fn validate_pipeline_inputs(
+    path: &str,
+    source: &str,
+    expressions: &[AstExpr],
+) -> Result<(), ParseError> {
+    for expression in expressions {
+        let input = match &expression.kind {
+            AstExprKind::Pipe { input, .. }
+            | AstExprKind::Then { input, .. }
+            | AstExprKind::When { input, .. }
+            | AstExprKind::Draining { input }
+            | AstExprKind::Hold { initial: input, .. }
+            | AstExprKind::Infix { left: input, .. } => *input,
+            _ => continue,
+        };
+        if expressions
+            .get(input)
+            .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
+            && expression.linked_input.is_none()
+        {
+            let line_start = source
+                .get(..expression.start)
+                .and_then(|prefix| prefix.rfind('\n'))
+                .map_or(0, |newline| newline + 1);
+            let column = source
+                .get(line_start..expression.start)
+                .map_or(1, |prefix| prefix.chars().count() + 1);
+            return Err(error(
+                path,
+                expression.line,
+                column,
+                "pipeline continuation has no preceding value in its lexical sequence",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn materialize_statement_structure(statement: &mut AstStatement, expressions: &mut Vec<AstExpr>) {
@@ -1240,6 +1460,11 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
                 *arms = child_arms;
             }
         }
+        AstExprKind::Latest { branches } => {
+            if branches.is_empty() {
+                *branches = child_values;
+            }
+        }
         AstExprKind::Pipe { op, arms, .. } if op == "WHILE" => {
             if arms.is_empty() {
                 *arms = child_arms;
@@ -1296,27 +1521,11 @@ fn expression_owns_statement_children(expr_id: usize, expressions: &[AstExpr]) -
                 | AstExprKind::ListLiteral { .. }
                 | AstExprKind::BytesLiteral { .. }
                 | AstExprKind::Hold { .. }
-                | AstExprKind::Latest
+                | AstExprKind::Latest { .. }
                 | AstExprKind::When { .. }
                 | AstExprKind::Then { .. }
         ) || matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "WHILE")
     })
-}
-
-fn link_multiline_pipeline_inputs(statements: &[AstStatement], expressions: &mut [AstExpr]) {
-    let mut previous = None;
-    for statement in statements {
-        let value = statement_value_expression(statement, expressions);
-        if statement_is_pipeline_continuation(statement, expressions)
-            && let (Some(expr_id), Some(input)) = (statement.expr, previous)
-            && let Some(expression) = expressions.get_mut(expr_id)
-        {
-            expression.linked_input = Some(input);
-        }
-        if let Some(value) = value {
-            previous = Some(value);
-        }
-    }
 }
 
 fn statement_sequence_values(statements: &[AstStatement], expressions: &[AstExpr]) -> Vec<usize> {
@@ -1346,7 +1555,7 @@ fn statement_value_expression(statement: &AstStatement, expressions: &[AstExpr])
                     | AstExprKind::ListLiteral { .. }
                     | AstExprKind::BytesLiteral { .. }
                     | AstExprKind::Hold { .. }
-                    | AstExprKind::Latest
+                    | AstExprKind::Latest { .. }
                     | AstExprKind::When { .. }
                     | AstExprKind::Then { .. }
                     | AstExprKind::MatchArm { .. }
@@ -2023,8 +2232,10 @@ fn ast_expr_kind(
         };
     }
     if let Some(arrow) = find_top_level_token(tokens, "=>") {
+        let pattern = &tokens[..arrow];
         return AstExprKind::MatchArm {
-            pattern: tokens[..arrow].to_vec(),
+            pattern: pattern.to_vec(),
+            semantic_pattern: ast_match_pattern(pattern, item, source),
             output: (!tokens[arrow + 1..].is_empty())
                 .then(|| parse_ast_expr(&tokens[arrow + 1..], item, expressions, source)),
         };
@@ -2032,8 +2243,13 @@ fn ast_expr_kind(
     if let Some(value) = string_literal_value(tokens) {
         return AstExprKind::StringLiteral(value);
     }
-    if let Some(text) = text_literal_value(tokens, item, source) {
-        return AstExprKind::TextLiteral(text);
+    if let Some(text) = parsed_text_literal(tokens, item, source) {
+        if let Some(segments) =
+            ast_text_template_segments(&text.value, text.value_start, item, expressions, source)
+        {
+            return AstExprKind::TextTemplate { segments };
+        }
+        return AstExprKind::TextLiteral(text.value);
     }
     if tokens == ["Text/empty", "(", ")"] {
         return AstExprKind::TextLiteral(String::new());
@@ -2053,7 +2269,9 @@ fn ast_expr_kind(
         return ast_pipe_expr_kind(tokens, pipe, item, expressions, source);
     }
     if tokens.first().map(String::as_str) == Some("LATEST") {
-        return AstExprKind::Latest;
+        return AstExprKind::Latest {
+            branches: ast_latest_branches(tokens, item, expressions, source),
+        };
     }
     if tokens.first().map(String::as_str) == Some("LIST") {
         return AstExprKind::ListLiteral {
@@ -2095,6 +2313,15 @@ fn ast_expr_kind(
             fields: ast_record_fields(&tokens[1..], item, expressions, source),
         };
     }
+    if let Some((op, right)) = split_leading_infix(tokens) {
+        let left = parse_ast_expr(&[], item, expressions, source);
+        let right = parse_ast_expr(right, item, expressions, source);
+        return AstExprKind::Infix {
+            left,
+            op: op.to_owned(),
+            right,
+        };
+    }
     if let Some((left, op, right)) = split_infix(tokens) {
         let left = parse_ast_expr(left, item, expressions, source);
         let right = parse_ast_expr(right, item, expressions, source);
@@ -2134,6 +2361,47 @@ fn ast_expr_kind(
         AstExprKind::Path(path_segments(tokens))
     } else {
         AstExprKind::Unknown(tokens.to_vec())
+    }
+}
+
+fn ast_match_pattern(tokens: &[String], item: &ParserItem, source: &str) -> AstMatchPattern {
+    if tokens == ["__"] {
+        return AstMatchPattern::Wildcard;
+    }
+    if tokens == ["True"] {
+        return AstMatchPattern::Bool { value: true };
+    }
+    if tokens == ["False"] {
+        return AstMatchPattern::Bool { value: false };
+    }
+    if tokens == ["NaN"] {
+        return AstMatchPattern::NaN;
+    }
+    if let Some(value) = ast_number_literal(tokens) {
+        return AstMatchPattern::Number { value };
+    }
+    if let Some(value) = string_literal_value(tokens) {
+        return AstMatchPattern::Text { value };
+    }
+    if let Some(value) = text_literal_value(tokens, item, source) {
+        return AstMatchPattern::Text { value };
+    }
+    if let Some(name) = tokens.first().filter(|_| tokens.len() == 1) {
+        if value_starts_uppercase_identifier(name) {
+            return AstMatchPattern::Tag { name: name.clone() };
+        }
+        if is_name(name) {
+            return AstMatchPattern::Binding { name: name.clone() };
+        }
+    }
+    if let Some(name) = tokens
+        .first()
+        .filter(|name| value_starts_uppercase_identifier(name))
+    {
+        return AstMatchPattern::Tag { name: name.clone() };
+    }
+    AstMatchPattern::Unknown {
+        tokens: tokens.to_vec(),
     }
 }
 
@@ -2419,14 +2687,20 @@ fn ast_call_parts(
 ) -> (Vec<AstCallArg>, Option<AstPassContext>) {
     let mut args = Vec::new();
     let mut pass = None;
-    for part in split_top_level(tokens, ",") {
+    let parts = split_top_level(tokens, ",");
+    for (index, part) in parts.iter().enumerate() {
         if part.first().map(String::as_str) == Some("PASS")
             && part.get(1).map(String::as_str) == Some(":")
         {
-            let (start, end) = span_for_tokens(&part, item).unwrap_or((item.start, item.end));
+            let (start, end) = span_for_tokens(part, item).unwrap_or((item.start, item.end));
             let value = parse_ast_expr(&part[2..], item, expressions, source);
             if pass.is_none() {
-                pass = Some(AstPassContext { value, start, end });
+                pass = Some(AstPassContext {
+                    value,
+                    start,
+                    end,
+                    final_clause: index + 1 == parts.len(),
+                });
             } else {
                 args.push(AstCallArg {
                     kind: AstCallArgKind::Named,
@@ -2436,7 +2710,7 @@ fn ast_call_parts(
                     end,
                 });
             }
-        } else if let Some(arg) = ast_call_arg(&part, item, expressions, source) {
+        } else if let Some(arg) = ast_call_arg(part, item, expressions, source) {
             args.push(arg);
         }
     }
@@ -2463,8 +2737,114 @@ fn push_inline_hold_latest_exprs(
     let Some(latest) = tokens.iter().position(|token| token == "LATEST") else {
         return;
     };
-    let _ = parse_ast_expr(&tokens[latest..=latest], item, expressions, source);
-    let _ = ast_operator_block_expr(&tokens[latest..], item, expressions, source);
+    let _ = parse_ast_expr(&tokens[latest..], item, expressions, source);
+}
+
+fn ast_latest_branches(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> Vec<usize> {
+    let Some(open) = tokens.iter().position(|token| token == "{") else {
+        return Vec::new();
+    };
+    let Some(close) = matching_close(tokens, open) else {
+        return Vec::new();
+    };
+    if close <= open + 1 {
+        return Vec::new();
+    }
+    let inner = &tokens[open + 1..close];
+    let Some(token_offset) = item
+        .symbols
+        .windows(tokens.len())
+        .position(|window| window == tokens)
+        .map(|offset| offset + open + 1)
+    else {
+        return Vec::new();
+    };
+    let first_offset = item.symbol_spans.get(token_offset).map(|span| span.0);
+    let base_indent = first_offset.map_or(0, |offset| source_line_indent(source, offset));
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_usize;
+    for index in 0..inner.len() {
+        let token = inner[index].as_str();
+        if depth == 0 && token == "," {
+            if start < index {
+                ranges.push(start..index);
+            }
+            start = index + 1;
+            continue;
+        }
+        if index > start
+            && depth == 0
+            && !latest_continuation_token(token)
+            && latest_token_starts_peer_line(
+                item,
+                source,
+                token_offset + index - 1,
+                token_offset + index,
+                base_indent,
+            )
+        {
+            ranges.push(start..index);
+            start = index;
+        }
+        match token {
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if start < inner.len() {
+        ranges.push(start..inner.len());
+    }
+    ranges
+        .into_iter()
+        .filter(|range| range.start < range.end)
+        .map(|range| parse_ast_expr(&inner[range], item, expressions, source))
+        .collect()
+}
+
+fn latest_token_starts_peer_line(
+    item: &ParserItem,
+    source: &str,
+    previous: usize,
+    current: usize,
+    base_indent: usize,
+) -> bool {
+    let Some(previous_end) = item.symbol_spans.get(previous).map(|span| span.1) else {
+        return false;
+    };
+    let Some(current_start) = item.symbol_spans.get(current).map(|span| span.0) else {
+        return false;
+    };
+    source
+        .get(previous_end..current_start)
+        .is_some_and(|gap| gap.contains('\n'))
+        && source_line_indent(source, current_start) <= base_indent
+}
+
+fn latest_continuation_token(token: &str) -> bool {
+    matches!(
+        token,
+        "|>" | "+" | "-" | "*" | "/" | "%" | "==" | "!=" | ">" | "<" | ">=" | "<="
+    )
+}
+
+fn source_line_indent(source: &str, offset: usize) -> usize {
+    let line_start = source
+        .get(..offset)
+        .and_then(|prefix| prefix.rfind('\n'))
+        .map_or(0, |newline| newline + 1);
+    source
+        .get(line_start..offset)
+        .unwrap_or_default()
+        .chars()
+        .take_while(|character| matches!(character, ' ' | '\t'))
+        .count()
 }
 
 fn parse_inline_match_arms(
@@ -2587,8 +2967,10 @@ fn split_infix(tokens: &[String]) -> Option<(&[String], &str, &[String])> {
         match token.as_str() {
             "[" | "{" | "(" => depth += 1,
             "]" | "}" | ")" => depth -= 1,
-            "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-" | "*" | "/" | "%"
-                if depth == 0 && index > 0 && index + 1 < tokens.len() =>
+            token if is_infix_operator(token)
+                && depth == 0
+                && index > 0
+                && index + 1 < tokens.len() =>
             {
                 return Some((&tokens[..index], token, &tokens[index + 1..]));
             }
@@ -2596,6 +2978,18 @@ fn split_infix(tokens: &[String]) -> Option<(&[String], &str, &[String])> {
         }
     }
     None
+}
+
+fn split_leading_infix(tokens: &[String]) -> Option<(&str, &[String])> {
+    let (operator, right) = tokens.split_first()?;
+    (!right.is_empty() && is_infix_operator(operator)).then_some((operator, right))
+}
+
+fn is_infix_operator(token: &str) -> bool {
+    matches!(
+        token,
+        "==" | ">" | "<" | ">=" | "<=" | "!=" | "+" | "-" | "*" | "/" | "%"
+    )
 }
 
 fn split_postfix_field_access(tokens: &[String]) -> Option<(&[String], String)> {
@@ -2691,7 +3085,20 @@ fn split_role_value_head(value: &str) -> Option<(&str, &str)> {
     (is_program_role_root(role) && is_name(first)).then_some((role, first))
 }
 
+struct ParsedTextLiteral {
+    value: String,
+    value_start: usize,
+}
+
 fn text_literal_value(tokens: &[String], item: &ParserItem, source: &str) -> Option<String> {
+    parsed_text_literal(tokens, item, source).map(|text| text.value)
+}
+
+fn parsed_text_literal(
+    tokens: &[String],
+    item: &ParserItem,
+    source: &str,
+) -> Option<ParsedTextLiteral> {
     if tokens.first().map(String::as_str) != Some("TEXT")
         || tokens.get(1).map(String::as_str) != Some("{")
     {
@@ -2707,12 +3114,26 @@ fn text_literal_value(tokens: &[String], item: &ParserItem, source: &str) -> Opt
     if let Some(text) = text_literal_source_value(tokens, item, source) {
         return Some(text);
     }
-    Some(join_text_literal_tokens(&tokens[2..close]))
+    Some(ParsedTextLiteral {
+        value: join_text_literal_tokens(&tokens[2..close]),
+        value_start: span_for_tokens(tokens, item)
+            .and_then(|(start, end)| source.get(start..end).map(|slice| (start, slice)))
+            .and_then(|(start, slice)| slice.find('{').map(|open| start + open + 1))
+            .unwrap_or(item.start),
+    })
 }
 
-fn text_literal_source_value(tokens: &[String], item: &ParserItem, source: &str) -> Option<String> {
+fn text_literal_source_value(
+    tokens: &[String],
+    item: &ParserItem,
+    source: &str,
+) -> Option<ParsedTextLiteral> {
     let (start, end) = span_for_tokens(tokens, item)?;
     let slice = source.get(start..end)?;
+    parsed_text_literal_source_slice(slice, start)
+}
+
+fn parsed_text_literal_source_slice(slice: &str, slice_start: usize) -> Option<ParsedTextLiteral> {
     let text_start = slice.find("TEXT")?;
     let open = text_start + slice[text_start..].find('{')?;
     let content_start = open + 1;
@@ -2723,11 +3144,13 @@ fn text_literal_source_value(tokens: &[String], item: &ParserItem, source: &str)
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(
-                        slice[content_start..content_start + offset]
-                            .trim()
-                            .to_owned(),
-                    );
+                    let raw = &slice[content_start..content_start + offset];
+                    let value = raw.trim();
+                    let leading = raw.len() - raw.trim_start().len();
+                    return Some(ParsedTextLiteral {
+                        value: value.to_owned(),
+                        value_start: slice_start + content_start + leading,
+                    });
                 }
             }
             _ => {}
@@ -2736,29 +3159,95 @@ fn text_literal_source_value(tokens: &[String], item: &ParserItem, source: &str)
     None
 }
 
-fn text_literal_source_value_from_start(start: usize, source: &str) -> Option<String> {
+fn text_literal_source_value_from_start(start: usize, source: &str) -> Option<ParsedTextLiteral> {
     let slice = source.get(start..)?;
-    let text_start = slice.find("TEXT")?;
-    let open = text_start + slice[text_start..].find('{')?;
-    let content_start = open + 1;
-    let mut depth = 1i32;
-    for (offset, ch) in slice[content_start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(
-                        slice[content_start..content_start + offset]
-                            .trim()
-                            .to_owned(),
-                    );
-                }
-            }
-            _ => {}
+    parsed_text_literal_source_slice(slice, start)
+}
+
+fn ast_text_template_segments(
+    text: &str,
+    text_start: usize,
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> Option<Vec<AstTextSegment>> {
+    let mut cursor = 0usize;
+    let mut segments = Vec::new();
+    while let Some(relative_open) = text[cursor..].find('{') {
+        let open = cursor + relative_open;
+        if open > cursor {
+            segments.push(AstTextSegment::Static {
+                value: text[cursor..open].to_owned(),
+            });
         }
+        let Some(relative_close) = text[open + 1..].find('}') else {
+            let raw = text[open + 1..].trim();
+            let leading = text[open + 1..].len() - text[open + 1..].trim_start().len();
+            let start = text_start + open + 1 + leading;
+            let value = push_ast_expr_at_source_span(
+                item,
+                expressions,
+                AstExprKind::Unknown(vec![raw.to_owned()]),
+                start,
+                start + raw.len(),
+                source,
+            );
+            segments.push(AstTextSegment::Dynamic { value });
+            cursor = text.len();
+            break;
+        };
+        let close = open + 1 + relative_close;
+        let inner = &text[open + 1..close];
+        let trimmed = inner.trim();
+        let raw = trimmed.trim_start_matches('$');
+        let parts = raw.split('.').collect::<Vec<_>>();
+        let kind = if parts.len() == 1 && parts[0].contains('/') {
+            let path = path_segments(&[parts[0].to_owned()]);
+            if path.is_empty() {
+                AstExprKind::Unknown(vec![raw.to_owned()])
+            } else {
+                AstExprKind::Path(path)
+            }
+        } else if parts.len() == 1 && is_name(parts[0]) {
+            AstExprKind::Identifier(parts[0].to_owned())
+        } else if !parts.is_empty() && parts.iter().all(|part| is_name(part)) {
+            AstExprKind::Path(parts.into_iter().map(str::to_owned).collect())
+        } else {
+            AstExprKind::Unknown(vec![raw.to_owned()])
+        };
+        let leading = inner.len() - inner.trim_start().len();
+        let dollar_prefix = trimmed.len() - raw.len();
+        let start = text_start + open + 1 + leading + dollar_prefix;
+        let value =
+            push_ast_expr_at_source_span(item, expressions, kind, start, start + raw.len(), source);
+        segments.push(AstTextSegment::Dynamic { value });
+        cursor = close + 1;
     }
-    None
+    if segments.is_empty() {
+        return None;
+    }
+    if cursor < text.len() {
+        segments.push(AstTextSegment::Static {
+            value: text[cursor..].to_owned(),
+        });
+    }
+    Some(segments)
+}
+
+fn push_ast_expr_at_source_span(
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    kind: AstExprKind,
+    start: usize,
+    end: usize,
+    source: &str,
+) -> usize {
+    let value = push_ast_expr(item, expressions, kind, start, end);
+    expressions[value].line = source
+        .get(..start)
+        .map(|prefix| prefix.bytes().filter(|byte| *byte == b'\n').count() + 1)
+        .unwrap_or(item.line);
+    value
 }
 
 fn string_literal_value(tokens: &[String]) -> Option<String> {
@@ -3170,7 +3659,7 @@ fn validate_call_entry_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseE
             }
         }
         if let Some(pass) = pass
-            && args.iter().any(|arg| arg.start > pass.start)
+            && !pass.final_clause
         {
             return Err(error(
                 path,
@@ -4605,6 +5094,14 @@ fn collect_expr_list_value_facts(
                 collect_expr_list_value_facts(*item, expressions, facts);
             }
         }
+        AstExprKind::TextTemplate { segments } => {
+            for value in segments.iter().filter_map(|segment| match segment {
+                AstTextSegment::Static { .. } => None,
+                AstTextSegment::Dynamic { value } => Some(*value),
+            }) {
+                collect_expr_list_value_facts(value, expressions, facts);
+            }
+        }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::Drain { .. }
@@ -4616,7 +5113,7 @@ fn collect_expr_list_value_facts(
         | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
         | AstExprKind::Source
-        | AstExprKind::Latest
+        | AstExprKind::Latest { .. }
         | AstExprKind::Delimiter
         | AstExprKind::Unknown(_) => {}
     }
@@ -4630,6 +5127,7 @@ fn expr_is_scalar_list_item(expr_id: usize, expressions: &[AstExpr]) -> bool {
                 | AstExprKind::Path(_)
                 | AstExprKind::StringLiteral(_)
                 | AstExprKind::TextLiteral(_)
+                | AstExprKind::TextTemplate { .. }
                 | AstExprKind::Number(_)
                 | AstExprKind::ByteLiteral { .. }
                 | AstExprKind::BytesLiteral { .. }
@@ -5035,6 +5533,14 @@ fn collect_called_functions(expr_id: usize, expressions: &[AstExpr], calls: &mut
                 collect_called_functions(*item, expressions, calls);
             }
         }
+        AstExprKind::TextTemplate { segments } => {
+            for value in segments.iter().filter_map(|segment| match segment {
+                AstTextSegment::Static { .. } => None,
+                AstTextSegment::Dynamic { value } => Some(*value),
+            }) {
+                collect_called_functions(value, expressions, calls);
+            }
+        }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::Drain { .. }
@@ -5046,7 +5552,7 @@ fn collect_called_functions(expr_id: usize, expressions: &[AstExpr], calls: &mut
         | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
         | AstExprKind::Source
-        | AstExprKind::Latest
+        | AstExprKind::Latest { .. }
         | AstExprKind::Delimiter
         | AstExprKind::Unknown(_) => {}
     }
@@ -5120,7 +5626,7 @@ fn expr_is_root_memory_statement_expr(
     expressions: &[AstExpr],
 ) -> bool {
     match &expr.kind {
-        AstExprKind::Latest => latest_statement_has_initial(statement, expressions),
+        AstExprKind::Latest { .. } => latest_statement_has_initial(statement, expressions),
         AstExprKind::Pipe { op, .. } => op == "Bool/toggle",
         _ => false,
     }
@@ -5132,7 +5638,7 @@ fn expr_is_stateful_statement_expr(
     expressions: &[AstExpr],
 ) -> bool {
     match &expr.kind {
-        AstExprKind::Latest => latest_statement_has_initial(statement, expressions),
+        AstExprKind::Latest { .. } => latest_statement_has_initial(statement, expressions),
         AstExprKind::Pipe { op, .. } => op == "Bool/toggle",
         _ => false,
     }
@@ -5165,15 +5671,7 @@ fn latest_statement_has_initial(statement: &AstStatement, expressions: &[AstExpr
 }
 
 fn statement_is_pipeline_continuation(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
-    statement
-        .expr
-        .and_then(|expr_id| expressions.get(expr_id))
-        .is_some_and(|expr| match &expr.kind {
-            AstExprKind::Pipe { input, .. } | AstExprKind::Draining { input } => expressions
-                .get(*input)
-                .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter)),
-            _ => false,
-        })
+    statement_pipeline_continuation_target(statement, expressions).is_some()
 }
 
 fn statement_is_transient_latest_branch(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
@@ -5191,7 +5689,7 @@ fn expr_contains_transient_latest_operator(expr_id: usize, expressions: &[AstExp
         return false;
     };
     match &expr.kind {
-        AstExprKind::Latest | AstExprKind::When { .. } | AstExprKind::Then { .. } => true,
+        AstExprKind::Latest { .. } | AstExprKind::When { .. } | AstExprKind::Then { .. } => true,
         AstExprKind::Pipe {
             input,
             op,
@@ -5246,6 +5744,12 @@ fn expr_contains_transient_latest_operator(expr_id: usize, expressions: &[AstExp
         AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => items
             .iter()
             .any(|item| expr_contains_transient_latest_operator(*item, expressions)),
+        AstExprKind::TextTemplate { segments } => segments.iter().any(|segment| match segment {
+            AstTextSegment::Static { .. } => false,
+            AstTextSegment::Dynamic { value } => {
+                expr_contains_transient_latest_operator(*value, expressions)
+            }
+        }),
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::Drain { .. }
@@ -5983,6 +6487,7 @@ while_value:
                 AstExprKind::MatchArm {
                     pattern,
                     output: Some(output),
+                    ..
                 } if pattern == &["Ready"] => Some(*output),
                 _ => None,
             });
@@ -6001,6 +6506,7 @@ while_value:
                 AstExprKind::MatchArm {
                     pattern,
                     output: Some(output),
+                    ..
                 } if pattern == &["fallback"] => Some(*output),
                 _ => None,
             })
@@ -6112,6 +6618,277 @@ rows: LIST {
     }
 
     #[test]
+    fn hanging_indented_pipeline_retains_exact_input_chain() {
+        let parsed = parse_ast(
+            "hanging-indented-pipeline.bn",
+            r#"
+value:
+    input
+        |> Number/abs()
+        |> Number/floor()
+"#,
+        )
+        .unwrap();
+
+        let input = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Identifier(name) if name == "input")
+            })
+            .expect("pipeline source");
+        let abs = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/abs")
+            })
+            .expect("first continuation");
+        let floor = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/floor")
+            })
+            .expect("second continuation");
+
+        assert_eq!(abs.linked_input, Some(input.id));
+        assert_eq!(floor.linked_input, Some(abs.id));
+    }
+
+    #[test]
+    fn one_line_continuation_links_the_innermost_placeholder_operator() {
+        let parsed = parse_ast(
+            "one-line-continuation.bn",
+            r#"
+value:
+    input
+    |> Number/abs() |> Number/floor()
+"#,
+        )
+        .unwrap();
+
+        let input = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Identifier(name) if name == "input")
+            })
+            .expect("pipeline source");
+        let abs = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/abs")
+            })
+            .expect("placeholder-bearing operator");
+        let floor = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/floor")
+            })
+            .expect("outer operator");
+
+        assert_eq!(abs.linked_input, Some(input.id));
+        assert_eq!(floor.linked_input, None);
+        assert!(matches!(
+            floor.kind,
+            AstExprKind::Pipe { input, .. } if input == abs.id
+        ));
+    }
+
+    #[test]
+    fn every_special_pipeline_continuation_receives_its_exact_input() {
+        let parsed = parse_ast(
+            "special-continuations.bn",
+            r#"
+when_value:
+    when_input
+    |> WHEN {
+        True => 1
+        False => 0
+    }
+
+then_value:
+    then_input
+    |> THEN { 1 }
+
+hold_value:
+    hold_input
+    |> HOLD held { LATEST {} }
+
+draining_value:
+    draining_input
+    |> DRAINING
+
+while_value:
+    while_input
+    |> WHILE {
+        True => 1
+        False => 0
+    }
+"#,
+        )
+        .unwrap();
+
+        let expected = [
+            ("when_input", "WHEN"),
+            ("then_input", "THEN"),
+            ("hold_input", "HOLD"),
+            ("draining_input", "DRAINING"),
+            ("while_input", "WHILE"),
+        ];
+        for (input_name, operator) in expected {
+            let expression = parsed
+                .expressions
+                .iter()
+                .find(|expression| match (&expression.kind, operator) {
+                    (AstExprKind::When { .. }, "WHEN")
+                    | (AstExprKind::Then { .. }, "THEN")
+                    | (AstExprKind::Hold { .. }, "HOLD")
+                    | (AstExprKind::Draining { .. }, "DRAINING") => true,
+                    (AstExprKind::Pipe { op, .. }, "WHILE") => op == "WHILE",
+                    _ => false,
+                })
+                .unwrap_or_else(|| panic!("{operator} continuation"));
+            let linked = expression
+                .linked_input
+                .unwrap_or_else(|| panic!("{operator} linked input"));
+            assert!(matches!(
+                &parsed.expressions[linked].kind,
+                AstExprKind::Identifier(name) if name == input_name
+            ));
+        }
+    }
+
+    #[test]
+    fn inline_match_arm_and_then_outputs_extend_to_the_final_continuation() {
+        let parsed = parse_ast(
+            "inline-output-continuations.bn",
+            r#"
+matched:
+    selector |> WHEN {
+        Ready => match_input
+            |> Number/abs()
+        __ => 0
+    }
+
+triggered:
+    trigger |> THEN { then_input }
+        |> Number/floor()
+"#,
+        )
+        .unwrap();
+
+        let abs = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/abs")
+            })
+            .expect("match-arm continuation");
+        let match_input = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Identifier(name) if name == "match_input")
+            })
+            .expect("match-arm input");
+        assert_eq!(abs.linked_input, Some(match_input.id));
+        assert!(parsed.expressions.iter().any(|expression| matches!(
+            expression.kind,
+            AstExprKind::MatchArm { output: Some(output), .. } if output == abs.id
+        )));
+
+        let floor = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/floor")
+            })
+            .expect("THEN output continuation");
+        let then_input = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Identifier(name) if name == "then_input")
+            })
+            .expect("THEN output input");
+        assert_eq!(floor.linked_input, Some(then_input.id));
+        assert!(parsed.expressions.iter().any(|expression| matches!(
+            expression.kind,
+            AstExprKind::Then { output: Some(output), .. } if output == floor.id
+        )));
+    }
+
+    #[test]
+    fn orphan_pipeline_continuation_is_rejected_by_the_parser() {
+        let error = parse_ast(
+            "orphan-continuation.bn",
+            r#"
+value: |> Number/abs()
+"#,
+        )
+        .expect_err("orphan continuation must fail");
+
+        assert!(
+            error
+                .message
+                .contains("pipeline continuation has no preceding value")
+        );
+    }
+
+    #[test]
+    fn every_cells_pipeline_placeholder_is_parser_linked() {
+        let files = [
+            ("cell.bn", include_str!("../../../examples/cells/cell.bn")),
+            (
+                "columns.bn",
+                include_str!("../../../examples/cells/columns.bn"),
+            ),
+            (
+                "defaults.bn",
+                include_str!("../../../examples/cells/defaults.bn"),
+            ),
+            (
+                "formula.bn",
+                include_str!("../../../examples/cells/formula.bn"),
+            ),
+            ("model.bn", include_str!("../../../examples/cells/model.bn")),
+            ("store.bn", include_str!("../../../examples/cells/store.bn")),
+            ("view.bn", include_str!("../../../examples/cells/view.bn")),
+        ];
+        let mut placeholder_count = 0usize;
+        for (path, source) in files {
+            let parsed = parse_ast(path, source).unwrap_or_else(|error| panic!("{path}: {error}"));
+            for expression in &parsed.expressions {
+                let input = match &expression.kind {
+                    AstExprKind::Pipe { input, .. }
+                    | AstExprKind::Then { input, .. }
+                    | AstExprKind::When { input, .. }
+                    | AstExprKind::Draining { input }
+                    | AstExprKind::Hold { initial: input, .. } => *input,
+                    _ => continue,
+                };
+                if parsed
+                    .expressions
+                    .get(input)
+                    .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
+                {
+                    placeholder_count += 1;
+                    assert!(
+                        expression.linked_input.is_some(),
+                        "{path}: expression {}",
+                        expression.id
+                    );
+                }
+            }
+        }
+        assert!(placeholder_count > 0);
+    }
+
+    #[test]
     fn grouped_infix_expression_preserves_the_inner_operation() {
         let parsed = parse_source(
             "grouped-infix.bn",
@@ -6137,6 +6914,40 @@ store: [
     }
 
     #[test]
+    fn comparison_pipeline_feeds_when_with_the_comparison_result() {
+        let parsed = parse_source(
+            "comparison-when.bn",
+            r#"
+store: [
+    left: [value: 1]
+    right: [value: 1]
+    result:
+        left
+        == right
+        |> WHEN {
+            True => TEXT { equal }
+            False => TEXT { different }
+        }
+]
+"#,
+        )
+        .unwrap();
+        let when = parsed
+            .expressions
+            .iter()
+            .find(|expr| matches!(expr.kind, AstExprKind::When { .. }))
+            .expect("WHEN expression");
+        let AstExprKind::When { input, .. } = when.kind else {
+            unreachable!();
+        };
+        let input = when.linked_input.unwrap_or(input);
+        assert!(matches!(
+            parsed.expressions[input].kind,
+            AstExprKind::Infix { ref op, .. } if op == "=="
+        ), "WHEN input: {:#?}", parsed.expressions[input]);
+    }
+
+    #[test]
     fn nested_grouped_expression_preserves_every_operation() {
         let parsed = parse_source(
             "nested-grouped-infix.bn",
@@ -6158,6 +6969,40 @@ store: [
         assert!(matches!(
             parsed.expressions[left].kind,
             AstExprKind::Infix { ref op, .. } if op == "+"
+        ));
+    }
+
+    #[test]
+    fn text_interpolation_creates_structured_children_with_exact_spans() {
+        let source = r#"
+store: [value: 7]
+label: TEXT {
+    prefix
+    {store.value}
+    suffix
+}
+"#;
+        let parsed = parse_source("text-interpolation-span.bn", source).unwrap();
+        let dynamic = parsed
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                AstExprKind::TextTemplate { segments } => {
+                    segments.iter().find_map(|segment| match segment {
+                        AstTextSegment::Static { .. } => None,
+                        AstTextSegment::Dynamic { value } => Some(*value),
+                    })
+                }
+                _ => None,
+            })
+            .expect("structured text interpolation child");
+        let dynamic = &parsed.expressions[dynamic];
+
+        assert_eq!(&source[dynamic.start..dynamic.end], "store.value");
+        assert_eq!(dynamic.line, 5);
+        assert!(matches!(
+            &dynamic.kind,
+            AstExprKind::Path(path) if path == &["store", "value"]
         ));
     }
 
@@ -6306,6 +7151,7 @@ store: [
             AstExprKind::MatchArm {
                 pattern,
                 output: Some(output),
+                ..
             } if pattern.iter().any(|part| part == "Ready") => Some(*output),
             _ => None,
         });
@@ -6455,6 +7301,17 @@ mapped:
             "value: render(value: 1, PASS: [theme: theme])",
         )
         .unwrap();
+        parse_source(
+            "valid-multiline-pass.bn",
+            "value:\n    render(\n        value: 1\n        PASS: [theme: theme]\n    )\n",
+        )
+        .unwrap();
+        let error = parse_source(
+            "invalid-multiline-pass.bn",
+            "value:\n    render(\n        PASS: [theme: theme]\n        value: 1\n    )\n",
+        )
+        .unwrap_err();
+        assert!(error.message.contains("final call clause"), "{error}");
     }
 
     #[test]
@@ -6468,5 +7325,91 @@ mapped:
         let error =
             parse_source("invalid-parameter.bn", "FUNCTION map(item: EACH) { item }").unwrap_err();
         assert!(error.message.contains("`name` or `name: OUT`"), "{error}");
+    }
+
+    #[test]
+    fn application_code_cannot_shadow_canonical_standard_roots() {
+        let field_error = parse_source("app.bn", "SessionInfo: 1\n").unwrap_err();
+        assert!(field_error.message.contains("reserved Boon standard root"));
+
+        let function_error =
+            parse_source("app.bn", "FUNCTION List/custom(value) { value }\n").unwrap_err();
+        assert!(
+            function_error
+                .message
+                .contains("reserved Boon standard namespace")
+        );
+
+        let projection_error =
+            parse_source("app.bn", "FUNCTION Field/custom(value) { value }\n").unwrap_err();
+        assert!(
+            projection_error
+                .message
+                .contains("reserved Boon standard namespace")
+        );
+
+        let module_error = parse_project(
+            "RUN.bn",
+            [
+                ("RUN.bn".to_owned(), "store: [ready: True]\n".to_owned()),
+                ("File.bn".to_owned(), "value: 1\n".to_owned()),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            module_error
+                .message
+                .contains("reserved Boon standard namespace")
+        );
+
+        for role in ["Client", "Session", "Server"] {
+            let source = format!("{role}: 1\n");
+            let error = parse_source("app.bn", source).unwrap_err();
+            assert!(error.message.contains("reserved Boon standard root"));
+        }
+    }
+
+    #[test]
+    fn canonical_standard_root_registry_is_sorted_unique_and_role_complete() {
+        for roots in STANDARD_ROOTS.windows(2) {
+            assert!(
+                roots[0].name < roots[1].name,
+                "standard root `{}` must sort before unique root `{}`",
+                roots[0].name,
+                roots[1].name
+            );
+        }
+        for role in ProgramRoleRoot::ALL {
+            assert_eq!(program_role_root(role.namespace()), Some(role));
+            assert_eq!(
+                standard_root_kind(role.namespace()),
+                Some(StandardRootKind::ProgramRole)
+            );
+        }
+        for root in STANDARD_ROOTS
+            .iter()
+            .filter(|root| root.kind == StandardRootKind::ProgramRole)
+        {
+            assert!(
+                program_role_root(root.name).is_some(),
+                "program-role root `{}` is missing from ProgramRoleRoot",
+                root.name
+            );
+        }
+    }
+
+    #[test]
+    fn obsolete_dotted_role_qualification_is_rejected_for_every_role_root() {
+        for role in ProgramRoleRoot::ALL {
+            let namespace = role.namespace();
+            let source = format!("value: {namespace}.foo\n");
+            let error = parse_source("obsolete-role-path.bn", source).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains(&format!("use `{namespace}/value.field`")),
+                "unexpected {namespace} diagnostic: {error}"
+            );
+        }
     }
 }

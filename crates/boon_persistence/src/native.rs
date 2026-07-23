@@ -1,8 +1,8 @@
 use super::codec::{
     BlobDigest, BlobRecord, EncodedComponent, decode_blob_record, decode_outbox_record,
-    decode_protocol_state_record, decode_row_component, decode_scalar_component,
-    encode_blob_record, encode_outbox_record, encode_protocol_state_record, encode_row_component,
-    encode_scalar_component, row_component_blob_references, scalar_component_blob_references,
+    decode_row_component, decode_scalar_component, encode_blob_record, encode_outbox_record,
+    encode_row_component, encode_scalar_component, row_component_blob_references,
+    scalar_component_blob_references,
 };
 use super::{
     ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, CheckpointBatch, CommitAck,
@@ -10,9 +10,8 @@ use super::{
     ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
     DurableChange, DurableOutboxItem, ExportApplicationRequest, LoadContentArtifactRequest,
     OutboxItemId, PersistenceCommand, PersistenceDriver, PersistenceInspectorSnapshot,
-    PersistenceResult, ProtocolStateKey, ProtocolStateRecord, ProtocolStateSnapshot,
-    PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch,
-    RestoreImage, ShutdownAck, StoreError, StoredList, StoredRow,
+    PersistenceResult, PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck,
+    ResetApplicationBatch, RestoreImage, ShutdownAck, StoreError, StoredList, StoredRow,
     apply_durable_content_artifact_changes, encode_restore_image, exact_content_artifact_closure,
     hash_application, inspector_snapshot_with_artifacts, validate_activation,
     validate_application_transfer, validate_checkpoint, validate_content_artifact,
@@ -37,12 +36,11 @@ const ROWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ROWS");
 const CHECKPOINTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("CHECKPOINTS");
 const MIGRATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("MIGRATIONS");
 const OUTBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("OUTBOX");
-const PROTOCOL_STATE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("PROTOCOL_STATE");
 const BLOBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("BLOBS");
 const ARTIFACTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ARTIFACTS");
 const ARTIFACT_OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ARTIFACT_OWNERS");
 
-const COMPONENT_FORMAT: u32 = 1;
+const COMPONENT_FORMAT: u32 = 3;
 const MAX_CHECKPOINT_RECORDS_PER_APPLICATION: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,11 +60,19 @@ struct RowRef {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ListRowRef {
+    row: RowRef,
+    source_order_token: u128,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ListRecord {
     touched: bool,
+    revision: u64,
     next_key: u64,
-    rows: Vec<RowRef>,
+    next_order_token: u128,
+    rows: Vec<ListRowRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -178,7 +184,7 @@ impl RedbDriver {
                 let record = decode_list_record(bytes, self.limits)?;
                 let mut rows = Vec::with_capacity(record.rows.len());
                 for row_ref in &record.rows {
-                    let row_key = row_storage_key(&app, memory, *row_ref);
+                    let row_key = row_storage_key(&app, memory, row_ref.row);
                     if !expected_rows.insert(row_key.to_vec()) {
                         return Err(corrupt("list repeats a row identity"));
                     }
@@ -193,17 +199,22 @@ impl RedbDriver {
                         &row_component_blob_references(&bytes, self.limits).map_err(codec)?,
                     )?;
                     let row = decode_row_component(&bytes, self.limits, &blobs).map_err(codec)?;
-                    if row.key != row_ref.key || row.generation != row_ref.generation {
+                    if row.key != row_ref.row.key
+                        || row.generation != row_ref.row.generation
+                        || row.source_order_token != row_ref.source_order_token
+                    {
                         return Err(corrupt("row payload identity does not match its key"));
                     }
                     rows.push(row);
                 }
                 let list = StoredList {
                     touched: record.touched,
+                    revision: record.revision,
                     next_key: record.next_key,
+                    next_order_token: record.next_order_token,
                     rows,
                 };
-                validate_list(&list)?;
+                validate_list(memory, &list)?;
                 if lists.insert(memory, list).is_some() {
                     return Err(corrupt("duplicate list memory key"));
                 }
@@ -273,21 +284,6 @@ impl RedbDriver {
             outbox,
             content_artifact_manifest,
         }))
-    }
-
-    fn load_protocol_state(
-        &self,
-        application: &ApplicationIdentity,
-    ) -> Result<ProtocolStateSnapshot, StoreError> {
-        let transaction = self.database()?.begin_read().map_err(backend)?;
-        let meta = transaction.open_table(META).map_err(backend)?;
-        if read_meta(&meta, application, self.limits)?.is_none() {
-            return Err(StoreError::MissingApplication);
-        }
-        drop(meta);
-        let app = application_key(application);
-        let table = transaction.open_table(PROTOCOL_STATE).map_err(backend)?;
-        load_protocol_state_table(&table, &app, self.limits)
     }
 
     fn initialize(&self, image: RestoreImage) -> Result<CommitAck, StoreError> {
@@ -410,22 +406,6 @@ impl RedbDriver {
                 replace_outbox(&mut outbox, &app, &current_outbox, &candidate_outbox)?;
             }
 
-            if !batch.protocol_state_changes.is_empty() {
-                let mut protocol_state = transaction.open_table(PROTOCOL_STATE).map_err(backend)?;
-                let current = load_protocol_state_table(&protocol_state, &app, self.limits)?;
-                let mut candidate = current.clone();
-                super::apply_durable_protocol_state_changes(
-                    &mut candidate.records,
-                    &batch.protocol_state_changes,
-                )?;
-                replace_protocol_state(
-                    &mut protocol_state,
-                    &app,
-                    &current.records,
-                    &candidate.records,
-                )?;
-            }
-
             if !batch.content_artifact_changes.is_empty() {
                 let mut artifact_owners =
                     transaction.open_table(ARTIFACT_OWNERS).map_err(backend)?;
@@ -539,10 +519,6 @@ impl RedbDriver {
                 &app,
             )?;
             delete_prefix(&mut transaction.open_table(OUTBOX).map_err(backend)?, &app)?;
-            delete_prefix(
-                &mut transaction.open_table(PROTOCOL_STATE).map_err(backend)?,
-                &app,
-            )?;
             delete_prefix(&mut transaction.open_table(BLOBS).map_err(backend)?, &app)?;
             delete_prefix(
                 &mut transaction.open_table(ARTIFACTS).map_err(backend)?,
@@ -1071,11 +1047,6 @@ impl PersistenceDriver for RedbDriver {
                 });
                 PersistenceResult::Loaded(result)
             }
-            PersistenceCommand::LoadProtocolState(request) => {
-                PersistenceResult::ProtocolStateLoaded(
-                    self.load_protocol_state(&request.application),
-                )
-            }
             PersistenceCommand::Initialize(image) => {
                 PersistenceResult::Initialized(self.initialize(image))
             }
@@ -1121,7 +1092,6 @@ fn create_tables(transaction: &WriteTransaction) -> Result<(), StoreError> {
     transaction.open_table(CHECKPOINTS).map_err(backend)?;
     transaction.open_table(MIGRATIONS).map_err(backend)?;
     transaction.open_table(OUTBOX).map_err(backend)?;
-    transaction.open_table(PROTOCOL_STATE).map_err(backend)?;
     transaction.open_table(BLOBS).map_err(backend)?;
     transaction.open_table(ARTIFACTS).map_err(backend)?;
     transaction.open_table(ARTIFACT_OWNERS).map_err(backend)?;
@@ -1162,66 +1132,6 @@ where
     }
     super::validate_outbox(&outbox)?;
     Ok(outbox)
-}
-
-fn load_protocol_state_table<T>(
-    table: &T,
-    app: &[u8; 32],
-    limits: DecodeLimits,
-) -> Result<ProtocolStateSnapshot, StoreError>
-where
-    T: ReadableTable<&'static [u8], &'static [u8]>,
-{
-    let mut records = BTreeMap::new();
-    let mut total_bytes = 0usize;
-    for entry in table.iter().map_err(backend)? {
-        let (key, value) = entry.map_err(backend)?;
-        let key = key.value();
-        if !key.starts_with(app) {
-            continue;
-        }
-        if key.len() != 64 {
-            return Err(corrupt("invalid protocol-state key"));
-        }
-        let mut digest = [0; 32];
-        digest.copy_from_slice(&key[32..]);
-        let bytes = value.value();
-        total_bytes = total_bytes
-            .checked_add(bytes.len())
-            .ok_or_else(|| corrupt("protocol-state byte count overflow"))?;
-        if total_bytes > limits.max_total_bytes {
-            return Err(corrupt("protocol-state records exceed decode limit"));
-        }
-        let record = decode_protocol_state_record(bytes, limits).map_err(codec)?;
-        if records.insert(ProtocolStateKey(digest), record).is_some() {
-            return Err(corrupt("duplicate protocol-state key"));
-        }
-    }
-    super::validate_protocol_state(&records)?;
-    Ok(ProtocolStateSnapshot { records })
-}
-
-fn replace_protocol_state(
-    table: &mut Table<'_, &[u8], &[u8]>,
-    app: &[u8; 32],
-    current: &BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
-    candidate: &BTreeMap<ProtocolStateKey, ProtocolStateRecord>,
-) -> Result<(), StoreError> {
-    for key in current.keys().filter(|key| !candidate.contains_key(key)) {
-        let storage_key = protocol_state_storage_key(app, *key);
-        table.remove(storage_key.as_slice()).map_err(backend)?;
-    }
-    for (key, record) in candidate {
-        if current.get(key) == Some(record) {
-            continue;
-        }
-        let storage_key = protocol_state_storage_key(app, *key);
-        let bytes = encode_protocol_state_record(record).map_err(codec)?;
-        table
-            .insert(storage_key.as_slice(), bytes.as_slice())
-            .map_err(backend)?;
-    }
-    Ok(())
 }
 
 fn replace_outbox(
@@ -1622,13 +1532,16 @@ fn apply_changes(
                         "memory {memory_id} is already a scalar"
                     )));
                 }
-                validate_list(value)?;
+                validate_list(*memory_id, value)?;
                 replace_list(lists, rows, app, *memory_id, value, limits, blobs)?;
             }
             DurableChange::SetRowField {
                 memory_id,
+                list_revision,
                 row_key,
                 row_generation,
+                owner,
+                materialization_origin,
                 field_id,
                 value,
             } => {
@@ -1639,16 +1552,34 @@ fn apply_changes(
                 }
                 let mut list = load_list(lists, app, *memory_id, limits)?.unwrap_or(ListRecord {
                     touched: false,
+                    revision: *list_revision,
                     next_key: 0,
+                    next_order_token: 0,
                     rows: Vec::new(),
                 });
-                let row_ref = RowRef {
-                    key: *row_key,
-                    generation: *row_generation,
-                };
-                let mut row = if list.rows.contains(&row_ref) {
-                    load_row(rows, app, *memory_id, row_ref, limits, blobs)?
-                        .ok_or_else(|| corrupt("list references a missing row"))?
+                advance_list_record_revision(*memory_id, &mut list, *list_revision)?;
+                let existing_row_ref = list
+                    .rows
+                    .iter()
+                    .find(|row| row.row.key == *row_key && row.row.generation == *row_generation)
+                    .copied();
+                let row_ref = existing_row_ref.unwrap_or(ListRowRef {
+                    row: RowRef {
+                        key: *row_key,
+                        generation: *row_generation,
+                    },
+                    source_order_token: 0,
+                });
+                let mut row = if existing_row_ref.is_some() {
+                    let row = load_row(rows, app, *memory_id, row_ref.row, limits, blobs)?
+                        .ok_or_else(|| corrupt("list references a missing row"))?;
+                    if row.owner != *owner || row.materialization_origin != *materialization_origin
+                    {
+                        return Err(StoreError::InvalidAuthority(format!(
+                            "list {memory_id} row {row_key}:{row_generation} changed structural owner"
+                        )));
+                    }
+                    row
                 } else if list.touched {
                     return Err(StoreError::InvalidAuthority(format!(
                         "list {memory_id} has no row {row_key}:{row_generation}"
@@ -1658,21 +1589,26 @@ fn apply_changes(
                     StoredRow {
                         key: *row_key,
                         generation: *row_generation,
+                        source_order_token: 0,
+                        owner: owner.clone(),
+                        materialization_origin: materialization_origin.clone(),
                         fields: BTreeMap::new(),
                         touched_fields: BTreeSet::new(),
                     }
                 };
                 row.fields.insert(*field_id, value.clone());
                 row.touched_fields.insert(*field_id);
-                validate_row(&row, !list.touched)?;
+                validate_row(*memory_id, &row, !list.touched)?;
                 save_row(rows, app, *memory_id, &row, limits, blobs)?;
                 save_list(lists, app, *memory_id, &list)?;
             }
             DurableChange::InsertRow {
                 memory_id,
+                list_revision,
                 index,
                 row,
                 next_key,
+                next_order_token,
             } => {
                 let mut list = load_list(lists, app, *memory_id, limits)?.ok_or_else(|| {
                     StoreError::InvalidAuthority(format!(
@@ -1684,11 +1620,16 @@ fn apply_changes(
                         "cannot insert into sparse override list {memory_id}"
                     )));
                 }
-                let row_ref = RowRef {
-                    key: row.key,
-                    generation: row.generation,
+                let row_ref = ListRowRef {
+                    row: RowRef {
+                        key: row.key,
+                        generation: row.generation,
+                    },
+                    source_order_token: row.source_order_token,
                 };
-                if list.rows.contains(&row_ref) {
+                if list.rows.iter().any(|candidate| {
+                    candidate.row.key == row.key && candidate.row.generation == row.generation
+                }) {
                     return Err(StoreError::InvalidAuthority(format!(
                         "list {memory_id} already has row {}:{}",
                         row.key, row.generation
@@ -1705,18 +1646,22 @@ fn apply_changes(
                         list.rows.len()
                     )));
                 }
-                validate_row(row, false)?;
+                validate_row(*memory_id, row, false)?;
                 list.rows.insert(index, row_ref);
+                advance_list_record_revision(*memory_id, &mut list, *list_revision)?;
                 list.next_key = *next_key;
+                list.next_order_token = *next_order_token;
                 validate_list_record(&list)?;
                 save_row(rows, app, *memory_id, row, limits, blobs)?;
                 save_list(lists, app, *memory_id, &list)?;
             }
             DurableChange::RemoveRow {
                 memory_id,
+                list_revision,
                 row_key,
                 row_generation,
                 next_key,
+                next_order_token,
             } => {
                 let mut list = load_list(lists, app, *memory_id, limits)?.ok_or_else(|| {
                     StoreError::InvalidAuthority(format!(
@@ -1728,23 +1673,23 @@ fn apply_changes(
                         "cannot remove from sparse override list {memory_id}"
                     )));
                 }
-                let row_ref = RowRef {
-                    key: *row_key,
-                    generation: *row_generation,
-                };
                 let index = list
                     .rows
                     .iter()
-                    .position(|row| *row == row_ref)
+                    .position(|row| {
+                        row.row.key == *row_key && row.row.generation == *row_generation
+                    })
                     .ok_or_else(|| {
                         StoreError::InvalidAuthority(format!(
                             "list {memory_id} has no row {row_key}:{row_generation}"
                         ))
                     })?;
-                list.rows.remove(index);
+                let row_ref = list.rows.remove(index);
+                advance_list_record_revision(*memory_id, &mut list, *list_revision)?;
                 list.next_key = *next_key;
+                list.next_order_token = *next_order_token;
                 validate_list_record(&list)?;
-                delete_row(rows, app, *memory_id, row_ref, limits, blobs)?;
+                delete_row(rows, app, *memory_id, row_ref.row, limits, blobs)?;
                 save_list(lists, app, *memory_id, &list)?;
             }
             DurableChange::DeleteList { memory_id } => {
@@ -1764,17 +1709,22 @@ fn replace_list(
     limits: DecodeLimits,
     blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
 ) -> Result<(), StoreError> {
-    validate_list(list)?;
+    validate_list(memory, list)?;
     delete_rows(rows, app, memory, limits, blobs)?;
     let record = ListRecord {
         touched: list.touched,
+        revision: list.revision,
         next_key: list.next_key,
+        next_order_token: list.next_order_token,
         rows: list
             .rows
             .iter()
-            .map(|row| RowRef {
-                key: row.key,
-                generation: row.generation,
+            .map(|row| ListRowRef {
+                row: RowRef {
+                    key: row.key,
+                    generation: row.generation,
+                },
+                source_order_token: row.source_order_token,
             })
             .collect(),
     };
@@ -1981,7 +1931,8 @@ fn delete_scalar(
     Ok(())
 }
 
-fn validate_row(row: &StoredRow, sparse: bool) -> Result<(), StoreError> {
+fn validate_row(memory: MemoryId, row: &StoredRow, sparse: bool) -> Result<(), StoreError> {
+    super::validate_row_owner(memory, row)?;
     if !row
         .touched_fields
         .iter()
@@ -2007,28 +1958,61 @@ fn validate_row(row: &StoredRow, sparse: bool) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn advance_list_record_revision(
+    memory_id: MemoryId,
+    list: &mut ListRecord,
+    next_revision: u64,
+) -> Result<(), StoreError> {
+    if next_revision < list.revision {
+        return Err(StoreError::InvalidAuthority(format!(
+            "list {memory_id} revision moved backwards from {} to {next_revision}",
+            list.revision
+        )));
+    }
+    list.revision = next_revision;
+    Ok(())
+}
+
 fn validate_list_record(list: &ListRecord) -> Result<(), StoreError> {
-    let unique = list.rows.iter().copied().collect::<BTreeSet<_>>();
+    let unique = list.rows.iter().map(|row| row.row).collect::<BTreeSet<_>>();
     if unique.len() != list.rows.len() {
         return Err(StoreError::InvalidAuthority(
             "list order repeats a row identity".to_owned(),
         ));
     }
-    if !list.touched && list.next_key != 0 {
+    if !list.touched
+        && (list.next_key != 0
+            || list.next_order_token != 0
+            || list.rows.iter().any(|row| row.source_order_token != 0))
+    {
         return Err(StoreError::InvalidAuthority(
-            "sparse row overrides must not replace list allocator state".to_owned(),
+            "sparse row overrides must not replace list allocator or ordering state".to_owned(),
         ));
     }
     if list.touched {
         let minimum_next = list
             .rows
             .iter()
-            .fold(1u64, |next, row| next.max(row.key.saturating_add(1)));
+            .fold(1u64, |next, row| next.max(row.row.key.saturating_add(1)));
         if list.next_key < minimum_next {
             return Err(StoreError::InvalidAuthority(format!(
                 "next key {} is below {}",
                 list.next_key, minimum_next
             )));
+        }
+        let mut previous = 0_u128;
+        for row in &list.rows {
+            if row.source_order_token == 0 || row.source_order_token <= previous {
+                return Err(StoreError::InvalidAuthority(
+                    "list order has non-increasing source-order tokens".to_owned(),
+                ));
+            }
+            previous = row.source_order_token;
+        }
+        if list.next_order_token <= previous {
+            return Err(StoreError::InvalidAuthority(
+                "next source-order token does not follow list rows".to_owned(),
+            ));
         }
     }
     Ok(())
@@ -2187,18 +2171,21 @@ fn encode_list_record(list: &ListRecord) -> Result<Vec<u8>, StoreError> {
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
     encoder
-        .array(4)
+        .array(6)
         .and_then(|encoder| encoder.u32(COMPONENT_FORMAT))
         .and_then(|encoder| encoder.bool(list.touched))
+        .and_then(|encoder| encoder.u64(list.revision))
         .and_then(|encoder| encoder.u64(list.next_key))
-        .and_then(|encoder| encoder.array(list.rows.len() as u64))
         .map_err(cbor_encode)?;
+    encode_u128(&mut encoder, list.next_order_token)?;
+    encoder.array(list.rows.len() as u64).map_err(cbor_encode)?;
     for row in &list.rows {
         encoder
-            .array(2)
-            .and_then(|encoder| encoder.u64(row.key))
-            .and_then(|encoder| encoder.u64(row.generation))
+            .array(3)
+            .and_then(|encoder| encoder.u64(row.row.key))
+            .and_then(|encoder| encoder.u64(row.row.generation))
             .map_err(cbor_encode)?;
+        encode_u128(&mut encoder, row.source_order_token)?;
     }
     Ok(bytes)
 }
@@ -2206,23 +2193,30 @@ fn encode_list_record(list: &ListRecord) -> Result<Vec<u8>, StoreError> {
 fn decode_list_record(bytes: &[u8], limits: DecodeLimits) -> Result<ListRecord, StoreError> {
     component_size(bytes, limits, "list metadata")?;
     let mut decoder = Decoder::new(bytes);
-    expect_array(&mut decoder, 4, "list metadata")?;
+    expect_array(&mut decoder, 6, "list metadata")?;
     expect_format(&mut decoder, "list metadata")?;
     let touched = decoder.bool().map_err(cbor_decode)?;
+    let revision = decoder.u64().map_err(cbor_decode)?;
     let next_key = decoder.u64().map_err(cbor_decode)?;
+    let next_order_token = decode_u128(&mut decoder)?;
     let count = collection_len(&mut decoder, limits, "list row order")?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
-        expect_array(&mut decoder, 2, "row identity")?;
-        rows.push(RowRef {
-            key: decoder.u64().map_err(cbor_decode)?,
-            generation: decoder.u64().map_err(cbor_decode)?,
+        expect_array(&mut decoder, 3, "row identity")?;
+        rows.push(ListRowRef {
+            row: RowRef {
+                key: decoder.u64().map_err(cbor_decode)?,
+                generation: decoder.u64().map_err(cbor_decode)?,
+            },
+            source_order_token: decode_u128(&mut decoder)?,
         });
     }
     reject_trailing(&decoder, bytes, "list metadata")?;
     let record = ListRecord {
         touched,
+        revision,
         next_key,
+        next_order_token,
         rows,
     };
     validate_list_record(&record)?;
@@ -2390,13 +2384,6 @@ fn outbox_storage_key(app: &[u8; 32], item_id: OutboxItemId) -> [u8; 64] {
     key
 }
 
-fn protocol_state_storage_key(app: &[u8; 32], key: ProtocolStateKey) -> [u8; 64] {
-    let mut storage_key = [0; 64];
-    storage_key[..32].copy_from_slice(app);
-    storage_key[32..].copy_from_slice(key.as_bytes());
-    storage_key
-}
-
 fn blob_storage_key(app: &[u8; 32], digest: BlobDigest) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(app);
@@ -2508,6 +2495,20 @@ fn decode_digest(decoder: &mut Decoder<'_>) -> Result<[u8; 32], StoreError> {
         .map_err(|_| corrupt("digest must contain exactly 32 bytes"))
 }
 
+fn encode_u128(encoder: &mut Encoder<&mut Vec<u8>>, value: u128) -> Result<(), StoreError> {
+    encoder.bytes(&value.to_be_bytes()).map_err(cbor_encode)?;
+    Ok(())
+}
+
+fn decode_u128(decoder: &mut Decoder<'_>) -> Result<u128, StoreError> {
+    let bytes: [u8; 16] = decoder
+        .bytes()
+        .map_err(cbor_decode)?
+        .try_into()
+        .map_err(|_| corrupt("u128 value must contain exactly 16 bytes"))?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
 fn reject_trailing(decoder: &Decoder<'_>, bytes: &[u8], label: &str) -> Result<(), StoreError> {
     if decoder.position() != bytes.len() {
         return Err(corrupt(format!("{label} has trailing bytes")));
@@ -2539,8 +2540,7 @@ fn corrupt(detail: impl Into<String>) -> StoreError {
 mod tests {
     use super::*;
     use crate::{
-        CompactRequest, DurableOutboxState, DurableProtocolStateChange, InspectRequest,
-        LoadProtocolStateRequest, PersistenceCommand, PersistenceResult, ProtocolStateKey,
+        CompactRequest, DurableOutboxState, InspectRequest, PersistenceCommand, PersistenceResult,
         RestoreRequest, ShutdownRequest, StoredScalar, StoredValue,
     };
     use boon_plan::{EffectId, MemoryKind, MemoryLeafId, MemoryOwnerPath};
@@ -2591,10 +2591,19 @@ mod tests {
         ));
     }
 
-    fn row(key: u64, text: &str, field: MemoryLeafId) -> StoredRow {
+    fn row(memory: MemoryId, key: u64, text: &str, field: MemoryLeafId) -> StoredRow {
         StoredRow {
             key,
             generation: 1,
+            source_order_token: (u128::from(key) + 1) << 64,
+            owner: crate::DurableOwner {
+                ancestors: vec![crate::DurableRowId {
+                    list_memory_id: memory,
+                    row_key: key,
+                    row_generation: 1,
+                }],
+            },
+            materialization_origin: None,
             fields: BTreeMap::from([(field, StoredValue::Text(text.to_owned()))]),
             touched_fields: BTreeSet::from([field]),
         }
@@ -2607,6 +2616,7 @@ mod tests {
             effect,
             StoredValue::Text("request-1".to_owned()),
             StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(12))])),
+            crate::DurableOwner::default(),
             None,
             turn_sequence,
         )
@@ -2629,7 +2639,6 @@ mod tests {
             last_turn_sequence: turn_sequence,
             changes,
             outbox_changes,
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -2668,7 +2677,6 @@ mod tests {
             last_turn_sequence: turn_sequence,
             changes: Vec::new(),
             outbox_changes: Vec::new(),
-            protocol_state_changes: Vec::new(),
             content_artifact_changes,
             checksum: [0; 32],
         }
@@ -2700,7 +2708,6 @@ mod tests {
                     "META".to_owned(),
                     "MIGRATIONS".to_owned(),
                     "OUTBOX".to_owned(),
-                    "PROTOCOL_STATE".to_owned(),
                     "ROWS".to_owned(),
                     "SLOTS".to_owned(),
                 ])
@@ -2931,29 +2938,50 @@ mod tests {
                 changes: vec![
                     DurableChange::SetRowField {
                         memory_id: cells,
+                        list_revision: 1,
                         row_key: 2,
                         row_generation: 1,
+                        owner: crate::DurableOwner {
+                            ancestors: vec![crate::DurableRowId {
+                                list_memory_id: cells,
+                                row_key: 2,
+                                row_generation: 1,
+                            }],
+                        },
+                        materialization_origin: None,
                         field_id: formula,
                         value: StoredValue::Text("=A1".to_owned()),
                     },
                     DurableChange::SetRowField {
                         memory_id: cells,
+                        list_revision: 1,
                         row_key: 2,
                         row_generation: 1,
+                        owner: crate::DurableOwner {
+                            ancestors: vec![crate::DurableRowId {
+                                list_memory_id: cells,
+                                row_key: 2,
+                                row_generation: 1,
+                            }],
+                        },
+                        materialization_origin: None,
                         field_id: formula,
                         value: StoredValue::Text("=A1+1".to_owned()),
                     },
                 ],
                 outbox_changes: Vec::new(),
-                protocol_state_changes: Vec::new(),
                 content_artifact_changes: Vec::new(),
                 checksum: [0; 32],
             }
             .seal();
-            assert!(matches!(
-                driver.execute(PersistenceCommand::Commit(batch)),
-                PersistenceResult::Committed(Ok(CommitAck { epoch: 1, .. }))
-            ));
+            let result = driver.execute(PersistenceCommand::Commit(batch));
+            assert!(
+                matches!(
+                    result,
+                    PersistenceResult::Committed(Ok(CommitAck { epoch: 1, .. }))
+                ),
+                "unexpected sparse commit result: {result:?}"
+            );
             driver.execute(PersistenceCommand::Shutdown(ShutdownRequest));
         }
         let mut driver = RedbDriver::open(&path).unwrap();
@@ -2975,15 +3003,18 @@ mod tests {
         let app = application();
         let todos = list("todos");
         let title = MemoryLeafId::from_memory_path(todos, "title").unwrap();
-        let first = row(0, "first", title);
-        let second = row(1, "second", title);
-        let third = row(2, "third", title);
+        let first = row(todos, 0, "first", title);
+        let second = row(todos, 1, "second", title);
+        let mut third = row(todos, 2, "third", title);
+        third.source_order_token = 1_u128 << 63;
         let mut image = RestoreImage::empty(app.clone(), 1, [2; 32]);
         image.lists.insert(
             todos,
             StoredList {
                 touched: true,
+                revision: 0,
                 next_key: 2,
+                next_order_token: 3_u128 << 64,
                 rows: vec![first.clone(), second.clone()],
             },
         );
@@ -3000,27 +3031,31 @@ mod tests {
                 changes: vec![
                     DurableChange::RemoveRow {
                         memory_id: todos,
+                        list_revision: 1,
                         row_key: first.key,
                         row_generation: first.generation,
                         next_key: 2,
+                        next_order_token: 3_u128 << 64,
                     },
                     DurableChange::InsertRow {
                         memory_id: todos,
+                        list_revision: 1,
                         index: 0,
                         row: third.clone(),
                         next_key: 3,
+                        next_order_token: 3_u128 << 64,
                     },
                 ],
                 outbox_changes: Vec::new(),
-                protocol_state_changes: Vec::new(),
                 content_artifact_changes: Vec::new(),
                 checksum: [0; 32],
             }
             .seal();
-            assert!(matches!(
-                driver.execute(PersistenceCommand::Commit(batch)),
-                PersistenceResult::Committed(Ok(_))
-            ));
+            let result = driver.execute(PersistenceCommand::Commit(batch));
+            assert!(
+                matches!(result, PersistenceResult::Committed(Ok(_))),
+                "unexpected structural commit result: {result:?}"
+            );
             driver.execute(PersistenceCommand::Shutdown(ShutdownRequest));
         }
         let mut driver = RedbDriver::open(&path).unwrap();
@@ -3065,13 +3100,14 @@ mod tests {
                 },
                 DurableChange::InsertRow {
                     memory_id: missing,
+                    list_revision: 1,
                     index: 0,
-                    row: row(0, "invalid", field),
+                    row: row(missing, 0, "invalid", field),
                     next_key: 1,
+                    next_order_token: 2_u128 << 64,
                 },
             ],
             outbox_changes: Vec::new(),
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3098,7 +3134,6 @@ mod tests {
                 },
             }],
             outbox_changes: Vec::new(),
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
@@ -3230,7 +3265,6 @@ mod tests {
                 last_turn_sequence: sequence,
                 changes: Vec::new(),
                 outbox_changes: Vec::new(),
-                protocol_state_changes: Vec::new(),
                 content_artifact_changes: Vec::new(),
                 checksum: [0; 32],
             }
@@ -3246,67 +3280,6 @@ mod tests {
             count_prefix(&table, &application_key(&app)).unwrap(),
             MAX_CHECKPOINT_RECORDS_PER_APPLICATION
         );
-    }
-
-    #[test]
-    fn protocol_state_commits_atomically_with_authority_and_survives_restart() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("state.redb");
-        let app = application();
-        let count = scalar("count");
-        let key = ProtocolStateKey([0x51; 32]);
-        {
-            let mut driver = RedbDriver::open(&path).unwrap();
-            initialize(&mut driver, RestoreImage::empty(app.clone(), 1, [0x52; 32]));
-            let batch = CheckpointBatch {
-                application: app.clone(),
-                schema_hash: [0x52; 32],
-                base_epoch: 0,
-                next_epoch: 1,
-                first_turn_sequence: 1,
-                last_turn_sequence: 1,
-                changes: vec![DurableChange::SetScalar {
-                    memory_id: count,
-                    value: StoredScalar {
-                        touched: true,
-                        value: number(1),
-                    },
-                }],
-                outbox_changes: Vec::new(),
-                protocol_state_changes: vec![DurableProtocolStateChange::Put {
-                    key,
-                    expected_revision: None,
-                    next_revision: 1,
-                    payload: crate::Bytes::from_static(b"opaque-session-v1"),
-                    turn_sequence: 1,
-                }],
-                content_artifact_changes: Vec::new(),
-                checksum: [0; 32],
-            }
-            .seal();
-            assert!(matches!(
-                driver.execute(PersistenceCommand::Commit(batch)),
-                PersistenceResult::Committed(Ok(_))
-            ));
-        }
-
-        let mut driver = RedbDriver::open(&path).unwrap();
-        assert_eq!(
-            load(&mut driver, app.clone()).scalars[&count].value,
-            number(1)
-        );
-        let snapshot = match driver.execute(PersistenceCommand::LoadProtocolState(
-            LoadProtocolStateRequest { application: app },
-        )) {
-            PersistenceResult::ProtocolStateLoaded(Ok(snapshot)) => snapshot,
-            result => panic!("unexpected protocol-state load result: {result:?}"),
-        };
-        assert_eq!(snapshot.records[&key].revision, 1);
-        assert_eq!(
-            snapshot.records[&key].payload.as_ref(),
-            b"opaque-session-v1"
-        );
-        assert!(!format!("{snapshot:?}").contains("opaque-session-v1"));
     }
 
     #[test]
@@ -3380,6 +3353,7 @@ mod tests {
                 item.invocation_id,
                 item.effect_id,
                 &item.idempotency_key,
+                &item.owner,
                 item.target_row,
             )
         );
@@ -3446,10 +3420,21 @@ mod tests {
             list_memory,
             StoredList {
                 touched: true,
+                revision: 0,
                 next_key: 1,
+                next_order_token: 2_u128 << 64,
                 rows: vec![StoredRow {
                     key: 0,
                     generation: 1,
+                    source_order_token: 1_u128 << 64,
+                    owner: crate::DurableOwner {
+                        ancestors: vec![crate::DurableRowId {
+                            list_memory_id: list_memory,
+                            row_key: 0,
+                            row_generation: 1,
+                        }],
+                    },
+                    materialization_origin: None,
                     fields: BTreeMap::from([(field, StoredValue::Bytes(payload.clone().into()))]),
                     touched_fields: BTreeSet::from([field]),
                 }],
@@ -3498,10 +3483,11 @@ mod tests {
             }],
             Vec::new(),
         );
-        assert!(matches!(
-            driver.execute(PersistenceCommand::Commit(delete)),
-            PersistenceResult::Committed(Ok(_))
-        ));
+        let result = driver.execute(PersistenceCommand::Commit(delete));
+        assert!(
+            matches!(result, PersistenceResult::Committed(Ok(_))),
+            "unexpected delete commit result: {result:?}"
+        );
         {
             let transaction = driver.database().unwrap().begin_read().unwrap();
             let table = transaction.open_table(BLOBS).unwrap();

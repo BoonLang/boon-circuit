@@ -3,10 +3,11 @@ use super::effects::{
     HostEffectWorker, HostEffectWorkerOperation, HostEffectWorkerOutcome,
 };
 use super::{
-    DistributedImportUpdate, DocumentPatch, LiveRuntime, ProgramArtifact, ProgramArtifactOwnership,
-    ProgramCompletion, ProgramDiagnostic, ProgramDocumentHost, ProgramHostCompletion,
-    ProgramHostRequest, ProgramHostUpdate, ProgramRejection, ProgramRequestId, ProgramSessionId,
-    RuntimeTurn, SessionContext, SourcePayload, TransientEffectCallId,
+    DistributedCurrentCallInstance, DistributedImportUpdate, DocumentPatch, LiveRuntime,
+    ProgramArtifact, ProgramArtifactOwnership, ProgramCompletion, ProgramDiagnostic,
+    ProgramDocumentHost, ProgramHostCompletion, ProgramHostRequest, ProgramHostUpdate,
+    ProgramRejection, ProgramRequestId, ProgramSessionId, RuntimeTurn, SessionContext,
+    SourcePayload, TransientEffectCallId,
 };
 use boon_persistence::{
     ActivationAck, ActivationBatch, AuthorityTurn, AuthorityTurnReservation, BarrierAck, CommitAck,
@@ -16,12 +17,16 @@ use boon_persistence::{
     ContentArtifactStoreTicket, DecodeLimits, DurableContentArtifactChange, DurableOutboxChange,
     DurableOutboxItem, DurableOutboxState, OutboxItemId, PersistenceControlError,
     PersistenceCoordinator, PersistenceDriver, PersistenceInspectorSnapshot,
-    PersistenceWorkerConfig, PersistenceWorkerStartError, PersistenceWorkerStatus,
-    PutContentArtifactAck, ResetApplicationAck, ResetApplicationBatch, RestoreImage, StoredValue,
-    TurnEnqueueError, TurnReservationError, apply_durable_outbox_changes,
-    decode_application_transfer, encode_application_transfer, stage_migration,
+    PersistenceResolvedStartError, PersistenceStartupResolution, PersistenceWorkerConfig,
+    PersistenceWorkerStartError, PersistenceWorkerStatus, PutContentArtifactAck,
+    ResetApplicationAck, ResetApplicationBatch, RestoreImage, StoredValue, TurnEnqueueError,
+    TurnReservationError, apply_durable_outbox_changes, decode_application_transfer,
+    encode_application_transfer, stage_migration,
 };
-use boon_plan::{DistributedArgumentId, ExportId, MachinePlan, MemoryKind, RemoteCallSiteId};
+use boon_plan::{
+    DistributedArgumentId, DistributedCallInstanceId, DistributedCallMode, ExportId, MachinePlan,
+    MemoryKind, RemoteCallSiteId,
+};
 use boon_plan_executor::{SessionOptions, SourceEvent, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -116,6 +121,12 @@ pub enum PersistentActivationError {
     Runtime(String),
     Migration(boon_persistence::MigrationError),
     MissingDurableState,
+    StalePreparedCandidate {
+        expected_epoch: u64,
+        expected_through_turn_sequence: u64,
+        current_epoch: u64,
+        current_through_turn_sequence: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,6 +209,15 @@ impl fmt::Display for PersistentActivationError {
             Self::MissingDurableState => {
                 formatter.write_str("persistence worker has no durable application state")
             }
+            Self::StalePreparedCandidate {
+                expected_epoch,
+                expected_through_turn_sequence,
+                current_epoch,
+                current_through_turn_sequence,
+            } => write!(
+                formatter,
+                "prepared candidate targeted durable epoch {expected_epoch} through turn {expected_through_turn_sequence}, but authority advanced to epoch {current_epoch} through turn {current_through_turn_sequence}"
+            ),
         }
     }
 }
@@ -227,6 +247,20 @@ pub struct PersistentRuntime {
 enum PreparedDistributedAdmission {
     Buffered(AuthorityTurnReservation),
     Immediate,
+    ExecutionOnly,
+}
+
+#[derive(Clone, Debug)]
+pub struct PersistentDistributedCommit {
+    pub turn: RuntimeTurn,
+    pub outcome: PersistentDistributedCommitOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersistentDistributedCommitOutcome {
+    ExecutionOnly,
+    BufferedAccepted,
+    ImmediateAcknowledged(CommitAck),
 }
 
 const MAX_PENDING_EFFECT_DURABILITY: usize = 8;
@@ -311,7 +345,6 @@ pub enum PersistentRuntimeStartupDisposition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistentRuntimeStartup {
     pub restore_image: RestoreImage,
-    pub protocol_state: boon_persistence::ProtocolStateSnapshot,
     pub disposition: PersistentRuntimeStartupDisposition,
 }
 
@@ -319,6 +352,54 @@ pub struct PersistentPlanActivation {
     pub mount: RuntimeTurn,
     pub acknowledgement: Option<ActivationAck>,
     pub migration: Option<boon_persistence::MigrationPreview>,
+}
+
+/// Immutable authority and plan input for building a replacement runtime away
+/// from the owner thread. Publication remains a separate, stale-checked step.
+pub struct PersistentPlanBuildRequest {
+    base: RestoreImage,
+    restore: RestoreImage,
+    plan: Arc<MachinePlan>,
+    options: SessionOptions,
+    activation: Option<ActivationBatch>,
+    migration: Option<boon_persistence::MigrationPreview>,
+}
+
+/// A fully built replacement that has not yet acquired persistent authority.
+/// It is safe to discard when a newer source or authority revision wins.
+pub struct PreparedPersistentPlanActivation {
+    base: RestoreImage,
+    candidate: LiveRuntime,
+    replacement_effect_work: EffectWorkIndex,
+    activation: Option<ActivationBatch>,
+    migration: Option<boon_persistence::MigrationPreview>,
+    rebuild_derived_us: u64,
+}
+
+impl PersistentPlanBuildRequest {
+    pub fn build(self) -> Result<PreparedPersistentPlanActivation, PersistentActivationError> {
+        let Self {
+            base,
+            restore,
+            plan,
+            options,
+            activation,
+            migration,
+        } = self;
+        let replacement_effect_work = EffectWorkIndex::from_items(restore.outbox.clone());
+        let rebuild_started = Instant::now();
+        let candidate =
+            LiveRuntime::from_shared_machine_plan_with_restore(plan, options, Some(restore))
+                .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
+        Ok(PreparedPersistentPlanActivation {
+            base,
+            candidate,
+            replacement_effect_work,
+            activation,
+            migration,
+            rebuild_derived_us: duration_us(rebuild_started.elapsed()),
+        })
+    }
 }
 
 pub struct PersistentPlanPreview {
@@ -616,72 +697,129 @@ impl PersistentRuntime {
     where
         D: PersistenceDriver + Send + 'static,
     {
-        let rebuild_started = Instant::now();
-        let default_runtime =
-            LiveRuntime::from_shared_machine_plan(Arc::clone(&plan), options.clone())
-                .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
-        let mut last_rebuild_derived_us = duration_us(rebuild_started.elapsed());
-        let initial_image = default_runtime
-            .durable_restore_image(0, BTreeSet::new())
-            .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
-        let (persistence, mut startup) =
-            PersistenceCoordinator::start(driver, initial_image, config)
-                .map_err(PersistentRuntimeStartError::Persistence)?;
+        enum ResolvedRuntimeStartup {
+            Ready {
+                runtime: LiveRuntime,
+                disposition: PersistentRuntimeStartupDisposition,
+                rebuild_derived_us: u64,
+            },
+            Migration {
+                runtime: LiveRuntime,
+                candidate: RestoreImage,
+                activation: ActivationBatch,
+                preview: boon_persistence::MigrationPreview,
+                rebuild_derived_us: u64,
+            },
+        }
 
-        let (runtime, disposition) = if startup.initialized {
-            (default_runtime, PersistentRuntimeStartupDisposition::Fresh)
-        } else if startup.restore_image.schema_version == plan.persistence.schema_version
-            && startup.restore_image.schema_hash == plan.persistence.schema_hash
-        {
-            let rebuild_started = Instant::now();
-            let runtime = LiveRuntime::from_shared_machine_plan_with_restore(
-                plan,
-                options,
-                Some(startup.restore_image.clone()),
-            )
-            .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
-            last_rebuild_derived_us = duration_us(rebuild_started.elapsed());
-            (runtime, PersistentRuntimeStartupDisposition::Restored)
-        } else {
-            let staged = match stage_migration(&startup.restore_image, &plan) {
-                Ok(staged) => staged,
-                Err(error) => {
-                    let _ = persistence.shutdown();
-                    return Err(PersistentRuntimeStartError::Migration(error));
+        let resolved = PersistenceCoordinator::start_resolved(
+            driver,
+            plan.application.identity.clone(),
+            config,
+            |loaded| -> Result<_, PersistentRuntimeStartError> {
+                let rebuild_started = Instant::now();
+                match loaded {
+                    None => {
+                        let runtime = LiveRuntime::from_shared_machine_plan(
+                            Arc::clone(&plan),
+                            options.clone(),
+                        )
+                        .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
+                        let initial_image = runtime
+                            .durable_restore_image(0, BTreeSet::new())
+                            .map_err(|error| {
+                                PersistentRuntimeStartError::Runtime(error.to_string())
+                            })?;
+                        Ok(PersistenceStartupResolution::Initialize {
+                            initial_image,
+                            value: ResolvedRuntimeStartup::Ready {
+                                runtime,
+                                disposition: PersistentRuntimeStartupDisposition::Fresh,
+                                rebuild_derived_us: duration_us(rebuild_started.elapsed()),
+                            },
+                        })
+                    }
+                    Some(stored)
+                        if stored.schema_version == plan.persistence.schema_version
+                            && stored.schema_hash == plan.persistence.schema_hash =>
+                    {
+                        let runtime = LiveRuntime::from_shared_machine_plan_with_restore(
+                            Arc::clone(&plan),
+                            options.clone(),
+                            Some(stored.clone()),
+                        )
+                        .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
+                        Ok(PersistenceStartupResolution::AdoptLoaded {
+                            restore_image: stored,
+                            value: ResolvedRuntimeStartup::Ready {
+                                runtime,
+                                disposition: PersistentRuntimeStartupDisposition::Restored,
+                                rebuild_derived_us: duration_us(rebuild_started.elapsed()),
+                            },
+                        })
+                    }
+                    Some(stored) => {
+                        let staged = stage_migration(&stored, &plan)
+                            .map_err(PersistentRuntimeStartError::Migration)?;
+                        let runtime = LiveRuntime::from_shared_machine_plan_with_restore(
+                            Arc::clone(&plan),
+                            options.clone(),
+                            Some(staged.candidate.clone()),
+                        )
+                        .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
+                        Ok(PersistenceStartupResolution::AdoptLoaded {
+                            restore_image: stored,
+                            value: ResolvedRuntimeStartup::Migration {
+                                runtime,
+                                candidate: staged.candidate,
+                                activation: staged.activation,
+                                preview: staged.preview,
+                                rebuild_derived_us: duration_us(rebuild_started.elapsed()),
+                            },
+                        })
+                    }
                 }
-            };
-            let rebuild_started = Instant::now();
-            let candidate = match LiveRuntime::from_shared_machine_plan_with_restore(
-                Arc::clone(&plan),
-                options,
-                Some(staged.candidate.clone()),
-            ) {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    let _ = persistence.shutdown();
-                    return Err(PersistentRuntimeStartError::Runtime(error.to_string()));
-                }
-            };
-            last_rebuild_derived_us = duration_us(rebuild_started.elapsed());
-            let acknowledgement = match persistence.activate(staged.activation) {
-                Ok(acknowledgement) => acknowledgement,
-                Err(error) => {
-                    let _ = persistence.shutdown();
-                    return Err(PersistentRuntimeStartError::Activation(error));
-                }
-            };
-            let preview = staged.preview;
-            startup.restore_image = staged.candidate;
-            startup.restore_image.epoch = acknowledgement.epoch;
-            (
-                candidate,
-                PersistentRuntimeStartupDisposition::Migrated(preview),
-            )
+            },
+        );
+        let (persistence, mut startup, resolved) = match resolved {
+            Ok(resolved) => resolved,
+            Err(PersistenceResolvedStartError::Persistence(error)) => {
+                return Err(PersistentRuntimeStartError::Persistence(error));
+            }
+            Err(PersistenceResolvedStartError::Resolver(error)) => return Err(error),
+        };
+        let (runtime, disposition, last_rebuild_derived_us) = match resolved {
+            ResolvedRuntimeStartup::Ready {
+                runtime,
+                disposition,
+                rebuild_derived_us,
+            } => (runtime, disposition, rebuild_derived_us),
+            ResolvedRuntimeStartup::Migration {
+                runtime,
+                mut candidate,
+                activation,
+                preview,
+                rebuild_derived_us,
+            } => {
+                let acknowledgement = match persistence.activate(activation) {
+                    Ok(acknowledgement) => acknowledgement,
+                    Err(error) => {
+                        let _ = persistence.shutdown();
+                        return Err(PersistentRuntimeStartError::Activation(error));
+                    }
+                };
+                candidate.epoch = acknowledgement.epoch;
+                startup.restore_image = candidate;
+                (
+                    runtime,
+                    PersistentRuntimeStartupDisposition::Migrated(preview),
+                    rebuild_derived_us,
+                )
+            }
         };
 
         let startup = PersistentRuntimeStartup {
             restore_image: startup.restore_image,
-            protocol_state: startup.protocol_state,
             disposition,
         };
         let effect_work = EffectWorkIndex::from_items(startup.restore_image.outbox.clone());
@@ -705,6 +843,10 @@ impl PersistentRuntime {
 
     pub fn runtime(&self) -> &LiveRuntime {
         &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut LiveRuntime {
+        &mut self.runtime
     }
 
     pub(crate) fn validate_distributed_server_evaluation(
@@ -868,27 +1010,51 @@ impl PersistentRuntime {
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
     }
 
-    pub fn evaluate_distributed_function(
+    pub fn distributed_call_instances_current(
         &mut self,
-        export_id: ExportId,
-        arguments: BTreeMap<DistributedArgumentId, Value>,
-    ) -> Result<Value, PersistentDispatchError> {
+        call_site_id: RemoteCallSiteId,
+    ) -> Result<Vec<DistributedCurrentCallInstance>, PersistentDispatchError> {
         self.runtime
-            .evaluate_distributed_function(export_id, arguments)
+            .distributed_call_instances_current(call_site_id)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
     }
 
-    pub fn distributed_call_arguments_current(
+    pub fn distributed_producer_call_result_current(
         &mut self,
         call_site_id: RemoteCallSiteId,
-    ) -> Result<BTreeMap<DistributedArgumentId, Value>, PersistentDispatchError> {
+        call_instance_id: DistributedCallInstanceId,
+    ) -> Result<Value, PersistentDispatchError> {
         self.runtime
-            .distributed_call_arguments_current(call_site_id)
+            .distributed_producer_call_result_current(call_site_id, call_instance_id)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
     }
 
     pub fn set_transient_effect_scope(&mut self, scope: u64) {
         self.runtime.set_transient_effect_scope(scope);
+    }
+
+    pub fn set_machine_origin(
+        &mut self,
+        origin: crate::MachineOrigin,
+    ) -> Result<(), PersistentDispatchError> {
+        self.runtime
+            .set_machine_origin(origin)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    pub fn reset_machine_origin(&mut self) -> Result<(), PersistentDispatchError> {
+        self.runtime
+            .reset_machine_origin()
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    pub fn drop_producer_origin(
+        &mut self,
+        origin: crate::MachineOrigin,
+    ) -> Result<Vec<TransientEffectCallId>, PersistentDispatchError> {
+        self.runtime
+            .drop_producer_origin(origin)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
     }
 
     pub fn cancel_transient_effects(
@@ -927,6 +1093,105 @@ impl PersistentRuntime {
         immediate: bool,
     ) -> Result<RuntimeTurn, PersistentDispatchError> {
         self.prepare_distributed_turn(immediate, |runtime| runtime.dispatch_unsettled(event))
+    }
+
+    pub(crate) fn prepare_distributed_function_instance(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        export_id: ExportId,
+        demand_revision: u64,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+        immediate: bool,
+    ) -> Result<(Value, Option<RuntimeTurn>), PersistentDispatchError> {
+        let mode = self
+            .runtime
+            .machine_plan()
+            .producer_function_instances
+            .iter()
+            .find(|instance| {
+                instance.call_site_id == call_site_id && instance.function_export_id == export_id
+            })
+            .map(|instance| instance.mode)
+            .ok_or_else(|| {
+                PersistentDispatchError::Runtime(
+                    "distributed producer call site is not declared by this runtime".to_owned(),
+                )
+            })?;
+        match mode {
+            DistributedCallMode::Current => self.begin_distributed_execution()?,
+            DistributedCallMode::Invocation => self.begin_distributed_admission(immediate)?,
+        }
+        match self
+            .runtime
+            .evaluate_distributed_function_instance_unsettled(
+                call_site_id,
+                call_instance_id,
+                export_id,
+                demand_revision,
+                arguments,
+            ) {
+            Ok((value, Some(turn))) => Ok((value, Some(turn))),
+            Ok((value, None)) => {
+                self.prepared_distributed_admission = None;
+                Ok((value, None))
+            }
+            Err(error) => {
+                self.prepared_distributed_admission = None;
+                Err(PersistentDispatchError::Runtime(error.to_string()))
+            }
+        }
+    }
+
+    pub(crate) fn prepare_distributed_call_result_instance(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        content_revision: u64,
+        value: Value,
+    ) -> Result<Option<RuntimeTurn>, PersistentDispatchError> {
+        self.begin_distributed_execution()?;
+        match self
+            .runtime
+            .update_distributed_call_result_instance_unsettled(
+                call_site_id,
+                call_instance_id,
+                content_revision,
+                value,
+            ) {
+            Ok(Some(turn)) => Ok(Some(turn)),
+            Ok(None) => {
+                self.prepared_distributed_admission = None;
+                Ok(None)
+            }
+            Err(error) => {
+                self.prepared_distributed_admission = None;
+                Err(PersistentDispatchError::Runtime(error.to_string()))
+            }
+        }
+    }
+
+    pub(crate) fn prepare_drop_producer_call_instance(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        immediate: bool,
+    ) -> Result<Option<RuntimeTurn>, PersistentDispatchError> {
+        self.begin_distributed_admission(immediate)?;
+        match self
+            .runtime
+            .drop_producer_call_instance_unsettled(call_site_id, call_instance_id)
+        {
+            Ok(Some(turn)) => Ok(Some(turn)),
+            Ok(None) => {
+                self.prepared_distributed_admission = None;
+                Ok(None)
+            }
+            Err(error) => {
+                self.prepared_distributed_admission = None;
+                Err(PersistentDispatchError::Runtime(error.to_string()))
+            }
+        }
     }
 
     pub(crate) fn prepare_distributed_effect_completion(
@@ -971,17 +1236,10 @@ impl PersistentRuntime {
         }
     }
 
-    pub(crate) fn prepare_distributed_protocol_checkpoint(
-        &mut self,
-    ) -> Result<RuntimeTurn, PersistentDispatchError> {
-        self.prepare_distributed_turn(true, LiveRuntime::protocol_checkpoint_unsettled)
-    }
-
     pub(crate) fn commit_prepared_distributed_turn(
         &mut self,
         turn: RuntimeTurn,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<(RuntimeTurn, Option<CommitAck>), PersistentDispatchError> {
+    ) -> Result<PersistentDistributedCommit, PersistentDispatchError> {
         let admission = self.prepared_distributed_admission.take().ok_or_else(|| {
             PersistentDispatchError::Runtime(
                 "distributed persistent turn was not prepared before commit".to_owned(),
@@ -989,11 +1247,24 @@ impl PersistentRuntime {
         })?;
         match admission {
             PreparedDistributedAdmission::Buffered(reservation) => self
-                .admit_buffered_turn_with_protocol_state(reservation, turn, protocol_state_changes)
-                .map(|turn| (turn, None)),
-            PreparedDistributedAdmission::Immediate => self
-                .commit_unsettled_immediate_with_protocol_state(turn, protocol_state_changes)
-                .map(|acknowledged| (acknowledged.turn, Some(acknowledged.acknowledgement))),
+                .admit_buffered_turn(reservation, turn)
+                .map(|turn| PersistentDistributedCommit {
+                    turn,
+                    outcome: PersistentDistributedCommitOutcome::BufferedAccepted,
+                }),
+            PreparedDistributedAdmission::Immediate => {
+                self.commit_unsettled_immediate(turn).map(|acknowledged| {
+                    PersistentDistributedCommit {
+                        turn: acknowledged.turn,
+                        outcome: PersistentDistributedCommitOutcome::ImmediateAcknowledged(
+                            acknowledged.acknowledgement,
+                        ),
+                    }
+                })
+            }
+            PreparedDistributedAdmission::ExecutionOnly => {
+                self.commit_prepared_distributed_execution(turn)
+            }
         }
     }
 
@@ -1044,6 +1315,47 @@ impl PersistentRuntime {
             )
         });
         Ok(())
+    }
+
+    fn begin_distributed_execution(&mut self) -> Result<(), PersistentDispatchError> {
+        if self.prepared_distributed_admission.is_some() {
+            return Err(PersistentDispatchError::Runtime(
+                "previous distributed persistent turn is still prepared".to_owned(),
+            ));
+        }
+        self.prepared_distributed_admission = Some(PreparedDistributedAdmission::ExecutionOnly);
+        Ok(())
+    }
+
+    fn commit_prepared_distributed_execution(
+        &mut self,
+        turn: RuntimeTurn,
+    ) -> Result<PersistentDistributedCommit, PersistentDispatchError> {
+        if turn.source_sequence.is_some()
+            || !turn.authority_deltas.is_empty()
+            || !turn.durable_changes.is_empty()
+            || !turn.outbox_changes.is_empty()
+            || !turn.transient_effects.is_empty()
+            || !turn.cancelled_transient_effects.is_empty()
+            || !turn.transient_effect_credit_grants.is_empty()
+            || !turn.distributed_invocations.is_empty()
+            || !turn.document_patches.is_empty()
+        {
+            let rollback = self
+                .runtime
+                .rollback_unsettled_turn()
+                .err()
+                .map(|error| format!("; rollback also failed: {error}"))
+                .unwrap_or_default();
+            return Err(PersistentDispatchError::Runtime(format!(
+                "distributed function execution produced authoritative or effect work{rollback}"
+            )));
+        }
+        self.runtime.settle_turn();
+        Ok(PersistentDistributedCommit {
+            turn,
+            outcome: PersistentDistributedCommitOutcome::ExecutionOnly,
+        })
     }
 
     pub fn dispatch(&mut self, event: SourceEvent) -> Result<RuntimeTurn, PersistentDispatchError> {
@@ -1098,16 +1410,7 @@ impl PersistentRuntime {
     fn admit_buffered_turn(
         &mut self,
         reservation: AuthorityTurnReservation,
-        turn: RuntimeTurn,
-    ) -> Result<RuntimeTurn, PersistentDispatchError> {
-        self.admit_buffered_turn_with_protocol_state(reservation, turn, Vec::new())
-    }
-
-    fn admit_buffered_turn_with_protocol_state(
-        &mut self,
-        reservation: AuthorityTurnReservation,
         mut turn: RuntimeTurn,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
     ) -> Result<RuntimeTurn, PersistentDispatchError> {
         let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
         if next_effect_work.is_some()
@@ -1128,8 +1431,7 @@ impl PersistentRuntime {
         }
         let persistence_started = Instant::now();
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
-            .with_outbox_changes(turn.outbox_changes.clone())
-            .with_protocol_state_changes(protocol_state_changes);
+            .with_outbox_changes(turn.outbox_changes.clone());
         if let Err(error) = reservation.enqueue(authority) {
             turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
             let rollback_error = self
@@ -1280,21 +1582,12 @@ impl PersistentRuntime {
 
     fn commit_unsettled_immediate(
         &mut self,
-        turn: RuntimeTurn,
-    ) -> Result<DurablyAcknowledgedTurn, PersistentDispatchError> {
-        self.commit_unsettled_immediate_with_protocol_state(turn, Vec::new())
-    }
-
-    fn commit_unsettled_immediate_with_protocol_state(
-        &mut self,
         mut turn: RuntimeTurn,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
     ) -> Result<DurablyAcknowledgedTurn, PersistentDispatchError> {
         let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
         let persistence_started = Instant::now();
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
-            .with_outbox_changes(turn.outbox_changes.clone())
-            .with_protocol_state_changes(protocol_state_changes);
+            .with_outbox_changes(turn.outbox_changes.clone());
         let acknowledgement = match self.persistence.commit_immediate(authority) {
             Ok(acknowledgement) => acknowledgement,
             Err(error) => {
@@ -2117,13 +2410,14 @@ impl PersistentRuntime {
         Ok(acknowledgement)
     }
 
-    /// Builds and settles a replacement plan against the acknowledged image,
-    /// commits any required migration, then swaps the only live runtime.
-    pub fn activate_machine_plan(
-        &mut self,
+    /// Captures an acknowledged authority image for an independently built
+    /// replacement. The returned request owns no persistence worker state and
+    /// may be moved to a background worker.
+    pub fn prepare_machine_plan_build(
+        &self,
         plan: Arc<MachinePlan>,
         options: SessionOptions,
-    ) -> Result<PersistentPlanActivation, PersistentActivationError> {
+    ) -> Result<PersistentPlanBuildRequest, PersistentActivationError> {
         self.persistence
             .barrier()
             .map_err(PersistentActivationError::Persistence)?;
@@ -2137,7 +2431,7 @@ impl PersistentRuntime {
             == plan.persistence.schema_version
             && current.schema_hash == plan.persistence.schema_hash
         {
-            (current, None, None)
+            (current.clone(), None, None)
         } else {
             let staged =
                 stage_migration(&current, &plan).map_err(PersistentActivationError::Migration)?;
@@ -2147,12 +2441,49 @@ impl PersistentRuntime {
                 Some(staged.preview),
             )
         };
-        let replacement_effect_work = EffectWorkIndex::from_items(restore.outbox.clone());
-        let rebuild_started = Instant::now();
-        let candidate =
-            LiveRuntime::from_shared_machine_plan_with_restore(plan, options, Some(restore))
-                .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
-        let rebuild_derived_us = duration_us(rebuild_started.elapsed());
+
+        Ok(PersistentPlanBuildRequest {
+            base: current,
+            restore,
+            plan,
+            options,
+            activation,
+            migration,
+        })
+    }
+
+    /// Commits a fully built candidate only while its captured durable image is
+    /// still authoritative. The active runtime is untouched on stale work or a
+    /// backend activation failure.
+    pub fn activate_prepared_machine_plan(
+        &mut self,
+        prepared: PreparedPersistentPlanActivation,
+    ) -> Result<PersistentPlanActivation, PersistentActivationError> {
+        self.persistence
+            .barrier()
+            .map_err(PersistentActivationError::Persistence)?;
+        let current = self
+            .persistence
+            .load()
+            .map_err(PersistentActivationError::Persistence)?
+            .ok_or(PersistentActivationError::MissingDurableState)?;
+        if current != prepared.base {
+            return Err(PersistentActivationError::StalePreparedCandidate {
+                expected_epoch: prepared.base.epoch,
+                expected_through_turn_sequence: prepared.base.through_turn_sequence,
+                current_epoch: current.epoch,
+                current_through_turn_sequence: current.through_turn_sequence,
+            });
+        }
+
+        let PreparedPersistentPlanActivation {
+            candidate,
+            replacement_effect_work,
+            activation,
+            migration,
+            rebuild_derived_us,
+            ..
+        } = prepared;
         let mount = candidate.mount();
         let acknowledgement = activation
             .map(|batch| self.persistence.activate(batch))
@@ -2171,6 +2502,17 @@ impl PersistentRuntime {
             acknowledgement,
             migration,
         })
+    }
+
+    /// Synchronous convenience boundary for non-interactive callers. Native
+    /// preview and browser hosts must use the split prepare/build/activate path.
+    pub fn activate_machine_plan(
+        &mut self,
+        plan: Arc<MachinePlan>,
+        options: SessionOptions,
+    ) -> Result<PersistentPlanActivation, PersistentActivationError> {
+        let prepared = self.prepare_machine_plan_build(plan, options)?.build()?;
+        self.activate_prepared_machine_plan(prepared)
     }
 
     /// Builds and settles a candidate against acknowledged durable authority
@@ -2801,8 +3143,13 @@ impl ProgramArtifactLanes {
                         .to_owned(),
                 ));
             }
+            let route = host.source_route_token(path).cloned().ok_or_else(|| {
+                PersistentDispatchError::Runtime(format!(
+                    "child lifecycle source `{path}` has no typed route"
+                ))
+            })?;
             let (turn, patches) = host
-                .dispatch(next_sequence, path, None, payload)
+                .dispatch(next_sequence, path, route, payload)
                 .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
             let dispatched_sequence = turn.source_sequence.ok_or_else(|| {
                 PersistentDispatchError::Runtime(format!(
@@ -2822,7 +3169,7 @@ impl ProgramArtifactLanes {
 
         let event = runtime
             .runtime()
-            .source_event(next_sequence, path, None, payload)
+            .source_event_for_path(next_sequence, path, &[], payload)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
         let (turn, ticket) = match content_changes {
             Some(changes) => {
@@ -3524,9 +3871,10 @@ mod tests {
     use super::*;
     use boon_persistence::{
         CheckpointBatch, ContentArtifactOwnerId, InMemoryDriver, PersistenceCommand,
-        PersistenceResult, ShutdownAck, StoreError,
+        PersistenceResult, RedbDriver, ShutdownAck, StoreError,
     };
     use boon_plan_executor::SourcePayload;
+    use redb::{ReadableTable, TableDefinition};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
@@ -3695,7 +4043,7 @@ mod tests {
     fn effect_source_event(runtime: &PersistentRuntime, sequence: u64) -> SourceEvent {
         runtime
             .runtime()
-            .source_event(sequence, "store.register", None, SourcePayload::default())
+            .source_event_for_path(sequence, "store.register", &[], SourcePayload::default())
             .unwrap()
     }
 
@@ -3779,10 +4127,10 @@ mod tests {
 
         let event = runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 1,
-                "store.sources.increment_button.press",
-                None,
+                "store.sources.increment_button.events.press",
+                &[],
                 SourcePayload::default(),
             )
             .unwrap();
@@ -3825,10 +4173,10 @@ mod tests {
 
         let event = runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 1,
-                "store.sources.increment_button.press",
-                None,
+                "store.sources.increment_button.events.press",
+                &[],
                 SourcePayload::default(),
             )
             .unwrap();
@@ -3838,6 +4186,171 @@ mod tests {
         assert_eq!(load_count.load(Ordering::Acquire), startup_loads);
 
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn corrupt_raw_redb_metadata_never_publishes_runtime_readiness() {
+        const META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("META");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corrupt-runtime-readiness.redb");
+        let identity = boon_plan::ApplicationIdentity::new(
+            "dev.boon.corrupt-runtime-readiness",
+            "test",
+            "redb",
+        );
+        let compiled = LiveRuntime::from_source_with_identity(
+            "corrupt-runtime-readiness.bn",
+            include_str!("../../../examples/counter.bn"),
+            identity,
+        )
+        .unwrap();
+        let plan = compiled.shared_machine_plan();
+        let driver = RedbDriver::open(&path).unwrap();
+        let (runtime, _) = PersistentRuntime::from_shared_machine_plan(
+            Arc::clone(&plan),
+            SessionOptions::default(),
+            driver,
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+        runtime.shutdown().unwrap();
+        drop(runtime);
+
+        let database = redb::Database::open(&path).unwrap();
+        let transaction = database.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(META).unwrap();
+            let key = table
+                .iter()
+                .unwrap()
+                .next()
+                .expect("initialized runtime metadata")
+                .unwrap()
+                .0
+                .value()
+                .to_vec();
+            table.insert(key.as_slice(), &[0xff, 0x00][..]).unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(database);
+
+        let driver = RedbDriver::open(&path).unwrap();
+        let error = match PersistentRuntime::from_shared_machine_plan(
+            plan,
+            SessionOptions::default(),
+            driver,
+            PersistenceWorkerConfig::default(),
+        ) {
+            Ok(_) => panic!("corrupt redb metadata published a ready runtime"),
+            Err(error) => error,
+        };
+        let detail = error.to_string();
+        assert!(
+            detail.contains("corrupt durable state") || detail.contains("durable CBOR"),
+            "unexpected corrupt-readiness error: {detail}"
+        );
+    }
+
+    #[test]
+    fn restored_startup_never_builds_the_superseded_default_index() {
+        let identity =
+            boon_plan::ApplicationIdentity::new("dev.boon.restore-before-index", "test", "local");
+        let oversized_default = "x".repeat(5_000);
+        let source = format!(
+            r#"
+store: [
+    replace: SOURCE
+    name:
+        TEXT {{ {oversized_default} }} |> HOLD name {{
+            replace.text |> THEN {{ replace.text }}
+        }}
+    rows: LIST {{ [name: name] }}
+    ordered:
+        rows
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/take(count: 1)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}))
+"#
+        );
+        let default_plan = Arc::new(
+            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+                "restore-before-index.bn",
+                &source,
+                boon_plan::TargetProfile::SoftwareDefault,
+                identity.clone(),
+                1,
+            )
+            .unwrap()
+            .plan,
+        );
+        let mut default_runtime = LiveRuntime::from_shared_machine_plan(
+            Arc::clone(&default_plan),
+            SessionOptions::default(),
+        )
+        .unwrap();
+        let event = default_runtime
+            .source_event_for_path(
+                1,
+                "store.replace",
+                &[],
+                SourcePayload {
+                    text: Some("short".to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        default_runtime.dispatch(event).unwrap();
+        let durable = default_runtime
+            .durable_restore_image(7, BTreeSet::new())
+            .unwrap();
+        assert!(
+            durable
+                .scalars
+                .values()
+                .any(|scalar| scalar.value == StoredValue::Text("short".to_owned())),
+            "short scalar authority was not captured: {durable:#?}"
+        );
+
+        let bounded_plan = Arc::new(
+            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+                "restore-before-index.bn",
+                &source,
+                boon_plan::TargetProfile::SoftwareBounded,
+                identity,
+                1,
+            )
+            .unwrap()
+            .plan,
+        );
+        assert_eq!(
+            default_plan.persistence.schema_hash,
+            bounded_plan.persistence.schema_hash
+        );
+        let storage = SharedPersistenceDriver::default();
+        storage
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .seed(durable);
+
+        let (mut restored, startup) = PersistentRuntime::from_shared_machine_plan(
+            bounded_plan,
+            SessionOptions::default(),
+            storage,
+            PersistenceWorkerConfig::default(),
+        )
+        .expect("restored authority must replace the invalid default before index readiness");
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Restored
+        );
+        assert_eq!(
+            restored.runtime.root_value_current("store.name").unwrap(),
+            Value::Text("short".to_owned())
+        );
+        restored.shutdown().unwrap();
     }
 
     #[test]
@@ -3858,10 +4371,10 @@ mod tests {
         .unwrap();
         let event = runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 1,
-                "store.sources.increment_button.press",
-                None,
+                "store.sources.increment_button.events.press",
+                &[],
                 SourcePayload::default(),
             )
             .unwrap();
@@ -3911,13 +4424,17 @@ mod tests {
             PersistenceWorkerConfig::default(),
         )
         .unwrap();
-        let event = |runtime: &PersistentRuntime, sequence, path: &str, text: Option<&str>| {
+        let event = |runtime: &mut PersistentRuntime, sequence, path: &str, text: Option<&str>| {
+            let target = runtime
+                .runtime_mut()
+                .row_target_for_source_path(path, 79, 1)
+                .expect("Cells source row A3");
             runtime
                 .runtime()
-                .source_event(
+                .source_event_for_path(
                     sequence,
                     path,
-                    None,
+                    &[target],
                     SourcePayload {
                         address: Some("A3".to_owned()),
                         text: text.map(str::to_owned),
@@ -3926,28 +4443,45 @@ mod tests {
                 )
                 .unwrap()
         };
-        runtime
-            .dispatch(event(&runtime, 1, "item.sources.editor.select", None))
-            .unwrap();
-        runtime
-            .dispatch(event(&runtime, 2, "item.sources.editor.change", Some("20")))
-            .unwrap();
-        runtime
-            .dispatch(event(&runtime, 3, "item.sources.editor.commit", Some("20")))
-            .unwrap();
+        let select = event(&mut runtime, 1, "cells.sources.editor.select", None);
+        runtime.dispatch(select).unwrap();
+        let change = event(&mut runtime, 2, "cells.sources.editor.change", Some("20"));
+        runtime.dispatch(change).unwrap();
+        let commit = event(&mut runtime, 3, "cells.sources.editor.commit", Some("20"));
+        runtime.dispatch(commit).unwrap();
         runtime.barrier().unwrap();
         let durable = runtime.load_durable_image().unwrap().unwrap();
         let stored_rows = durable
             .lists
-            .values()
-            .map(|list| {
-                assert!(!list.touched, "Cells edit stored full list structure");
+            .iter()
+            .map(|(memory, list)| {
+                let semantic_path = plan
+                    .persistence
+                    .lists
+                    .iter()
+                    .find(|candidate| candidate.memory_id == *memory)
+                    .map(|candidate| candidate.semantic_path.as_str())
+                    .unwrap_or("<unknown>");
+                assert!(
+                    !list.touched,
+                    "Cells edit stored full list structure for `{semantic_path}` {memory:?} ({} rows)",
+                    list.rows.len()
+                );
                 list.rows.len()
             })
             .sum::<usize>();
         assert_eq!(stored_rows, 1, "{durable:#?}");
         runtime.shutdown().unwrap();
 
+        let sheet_rows = plan
+            .debug_map
+            .list_slots
+            .iter()
+            .find(|entry| entry.label == "store.sheet_rows")
+            .and_then(|entry| entry.id.strip_prefix("list:"))
+            .and_then(|id| id.parse::<usize>().ok())
+            .map(boon_plan::ListId)
+            .expect("Cells sheet-row list");
         let (mut restored, startup) = PersistentRuntime::from_shared_machine_plan(
             plan,
             SessionOptions::default(),
@@ -3959,34 +4493,108 @@ mod tests {
             startup.disposition,
             PersistentRuntimeStartupDisposition::Restored
         );
+        let materialization = restored.runtime.document_materialization_stats();
         assert!(
-            restored
-                .runtime
-                .document_materialization_stats()
-                .logical_rows
-                >= 2_600
+            materialization.logical_rows >= 2_600,
+            "Cells logical grid was truncated: {materialization:?}"
+        );
+        let materialized_sheet_rows = restored
+            .runtime
+            .session
+            .list_row_snapshots(sheet_rows)
+            .unwrap()
+            .len();
+        assert!(
+            materialized_sheet_rows <= 32,
+            "Cells restored {materialized_sheet_rows} chunk rows instead of one retained window: {materialization:?}"
         );
         assert!(
+            materialization.materialized_rows <= 512,
+            "Cells restored more nested document items than the bounded visible row/cell windows: {materialization:?}"
+        );
+        assert_eq!(
             restored
                 .runtime
-                .document_frame()
-                .unwrap()
-                .nodes
-                .values()
-                .any(|node| {
-                    node.kind == boon_document_model::DocumentNodeKind::TextInput
-                        && node.text.as_ref().is_some_and(|text| text.text == "20")
-                })
+                .root_value_current("store.selected_address")
+                .unwrap(),
+            Value::Text("A3".to_owned())
         );
-        let Value::List(sample) = restored.inspect_value_current("cell.value", 1).unwrap() else {
-            panic!("cell.value inspection must remain demand-current");
+        let a3 = restored
+            .runtime
+            .row_target_for_source_path("cells.sources.editor.select", 79, 1)
+            .unwrap();
+        let formula_field = restored
+            .runtime
+            .session
+            .plan()
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.list_id == a3.list)
+            .unwrap()
+            .row_fields
+            .iter()
+            .find(|field| field.name == "formula_text" && field.role.is_value())
+            .unwrap()
+            .field_id;
+        let formula_text = restored
+            .runtime
+            .session
+            .project_current(&[boon_plan_executor::ValueTarget::RowField {
+                row: a3,
+                field: formula_field,
+            }])
+            .unwrap();
+        assert_eq!(
+            formula_text.get(&boon_plan_executor::ValueTarget::RowField {
+                row: a3,
+                field: formula_field,
+            }),
+            Some(&Value::Text("20".to_owned()))
+        );
+        let input_texts = restored
+            .runtime
+            .document_frame()
+            .unwrap()
+            .nodes
+            .values()
+            .filter(|node| node.kind == boon_document_model::DocumentNodeKind::TextInput)
+            .filter_map(|node| node.text.as_ref().map(|text| text.text.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            input_texts.iter().any(|text| text == "20"),
+            "restored formula bar inputs: {input_texts:?}"
+        );
+        let value_field = restored
+            .runtime
+            .session
+            .plan()
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.list_id == a3.list)
+            .unwrap()
+            .row_fields
+            .iter()
+            .find(|field| field.name == "value" && field.role.is_value())
+            .unwrap()
+            .field_id;
+        let value_target = boon_plan_executor::ValueTarget::RowField {
+            row: a3,
+            field: value_field,
         };
-        assert_eq!(sample.len(), 1);
+        let sample = restored
+            .runtime
+            .session
+            .project_current(&[value_target])
+            .unwrap();
+        assert_eq!(sample.len(), 1, "cell.value inspection must stay sparse");
+        assert!(sample.contains_key(&value_target));
         restored.shutdown().unwrap();
     }
 
     #[test]
-    fn novywave_restart_restores_authority_and_rebuilds_signal_views() {
+    fn novywave_restart_restores_authority_without_persisting_derived_waveform_rows() {
         let identity =
             boon_plan::ApplicationIdentity::new("dev.boon.persistent-novywave", "test", "local");
         let units = boon_compiler::compiler_source_units_for_path(std::path::Path::new(
@@ -4004,6 +4612,29 @@ mod tests {
             .unwrap()
             .plan,
         );
+        let formatter_memory =
+            plan.persistence
+                .lists
+                .iter()
+                .find(|memory| {
+                    memory.row_fields.iter().any(|field| {
+                        field.semantic_path == "store.selected_signal_defaults.formatter"
+                    })
+                })
+                .expect("selected signal defaults memory");
+        let formatter_field = formatter_memory
+            .row_fields
+            .iter()
+            .find(|field| field.semantic_path == "store.selected_signal_defaults.formatter")
+            .and_then(|field| field.runtime_field_id)
+            .expect("selected signal formatter runtime field");
+        let formatter_list = plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.id == formatter_memory.runtime_slot)
+            .map(|slot| slot.list_id)
+            .expect("selected signal defaults runtime list");
         let storage = SharedPersistenceDriver::default();
         let (mut runtime, _) = PersistentRuntime::from_shared_machine_plan(
             Arc::clone(&plan),
@@ -4014,10 +4645,10 @@ mod tests {
         .unwrap();
         let event = runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 1,
                 "store.elements.panels_toggle_arrangement",
-                None,
+                &[],
                 SourcePayload::default(),
             )
             .unwrap();
@@ -4054,12 +4685,16 @@ mod tests {
             Value::Text("Docked".to_owned())
         );
         let Value::List(formatters) = restored
-            .inspect_value_current("selected_signal.formatter", 32)
+            .runtime_mut()
+            .inspect_list_field_current(formatter_list, formatter_field, 32)
             .unwrap()
         else {
-            panic!("selected signal formatters must rebuild after restore");
+            panic!("selected signal formatter inspection must remain a typed list");
         };
-        assert_eq!(formatters.len(), 14);
+        assert!(
+            formatters.is_empty(),
+            "waveform rows must come from a real post-restart File/Wellen result, not persisted or bootstrap data"
+        );
         restored.shutdown().unwrap();
     }
 
@@ -4095,10 +4730,15 @@ mod tests {
                 .filter_map(|step| step.source_event.as_ref())
                 .take(2),
         ) {
-            let target = runtime.runtime().scenario_target(source).unwrap();
+            let target = runtime.runtime_mut().scenario_target(source).unwrap();
             let event = runtime
                 .runtime()
-                .source_event(sequence, &source.source, target, source.payload.clone())
+                .source_event_for_path(
+                    sequence,
+                    &source.source,
+                    target.as_slice(),
+                    source.payload.clone(),
+                )
                 .unwrap();
             runtime.dispatch(event).unwrap();
         }
@@ -4124,7 +4764,10 @@ mod tests {
             startup.disposition,
             PersistentRuntimeStartupDisposition::Restored
         );
-        let Value::List(rows) = restored.inspect_value_current("todo.title", 8).unwrap() else {
+        let Value::List(rows) = restored
+            .inspect_value_current("store.todos.title", 8)
+            .unwrap()
+        else {
             panic!("todo.title inspection must return row values");
         };
         let titles = rows
@@ -4170,10 +4813,10 @@ mod tests {
         let mut dispatch = |sequence, source: &str, text: Option<&str>| {
             let event = runtime
                 .runtime()
-                .source_event(
+                .source_event_for_path(
                     sequence,
                     source,
-                    None,
+                    &[],
                     SourcePayload {
                         text: text.map(str::to_owned),
                         ..SourcePayload::default()
@@ -4182,15 +4825,19 @@ mod tests {
                 .unwrap();
             runtime.dispatch(event).unwrap();
         };
-        dispatch(1, "store.sources.station_input.change", Some("station-42"));
+        dispatch(
+            1,
+            "store.sources.station_input.events.change",
+            Some("station-42"),
+        );
         dispatch(
             2,
-            "store.sources.snapshot.receive",
+            "store.sources.snapshot.events.receive",
             Some("temperature=12.4"),
         );
-        dispatch(3, "store.sources.connected.receive", None);
-        dispatch(4, "store.sources.locale_button.press", None);
-        dispatch(5, "store.sources.basemap_button.press", None);
+        dispatch(3, "store.sources.connected.events.receive", None);
+        dispatch(4, "store.sources.locale_button.events.press", None);
+        dispatch(5, "store.sources.basemap_button.events.press", None);
         runtime.barrier().unwrap();
         runtime.shutdown().unwrap();
 
@@ -4551,10 +5198,10 @@ mod tests {
         .unwrap();
         let event = runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 1,
-                "store.sources.increment_button.press",
-                None,
+                "store.sources.increment_button.events.press",
+                &[],
                 SourcePayload::default(),
             )
             .unwrap();
@@ -4639,6 +5286,80 @@ mod tests {
     }
 
     #[test]
+    fn prepared_plan_build_runs_off_thread_and_rejects_stale_authority() {
+        let source = include_str!("../../../examples/counter.bn");
+        let compiled = LiveRuntime::from_source_with_identity(
+            "persistent-prepared-build.bn",
+            source,
+            boon_plan::ApplicationIdentity::new(
+                "dev.boon.persistent-prepared-build",
+                "test",
+                "local",
+            ),
+        )
+        .unwrap();
+        let plan = compiled.shared_machine_plan();
+        let (mut runtime, _) = PersistentRuntime::from_shared_machine_plan(
+            Arc::clone(&plan),
+            SessionOptions::default(),
+            InMemoryDriver::default(),
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+
+        let request = runtime
+            .prepare_machine_plan_build(Arc::clone(&plan), SessionOptions::default())
+            .unwrap();
+        let prepared = std::thread::spawn(move || request.build().unwrap())
+            .join()
+            .unwrap();
+
+        let event = runtime
+            .runtime()
+            .source_event_for_path(
+                1,
+                "store.sources.increment_button.events.press",
+                &[],
+                SourcePayload::default(),
+            )
+            .unwrap();
+        runtime.dispatch(event).unwrap();
+        runtime.barrier().unwrap();
+        assert!(matches!(
+            runtime.activate_prepared_machine_plan(prepared),
+            Err(PersistentActivationError::StalePreparedCandidate {
+                expected_through_turn_sequence: 0,
+                current_through_turn_sequence: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            runtime
+                .runtime_mut()
+                .root_value_current("store.count")
+                .unwrap(),
+            number(1)
+        );
+
+        let request = runtime
+            .prepare_machine_plan_build(plan, SessionOptions::default())
+            .unwrap();
+        let prepared = std::thread::spawn(move || request.build().unwrap())
+            .join()
+            .unwrap();
+        let activation = runtime.activate_prepared_machine_plan(prepared).unwrap();
+        assert!(activation.acknowledgement.is_none());
+        assert_eq!(
+            runtime
+                .runtime_mut()
+                .root_value_current("store.count")
+                .unwrap(),
+            number(1)
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn start_over_uses_the_same_store_and_preserves_monotonic_progress() {
         let source = include_str!("../../../examples/counter.bn");
         let compiled = LiveRuntime::from_source_with_identity(
@@ -4660,10 +5381,10 @@ mod tests {
         .unwrap();
         let increment = runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 1,
-                "store.sources.increment_button.press",
-                None,
+                "store.sources.increment_button.events.press",
+                &[],
                 SourcePayload::default(),
             )
             .unwrap();
@@ -4694,10 +5415,10 @@ mod tests {
 
         let increment = runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 2,
-                "store.sources.increment_button.press",
-                None,
+                "store.sources.increment_button.events.press",
+                &[],
                 SourcePayload::default(),
             )
             .unwrap();
@@ -4781,10 +5502,10 @@ mod tests {
         let increment = |runtime: &PersistentRuntime, sequence| {
             runtime
                 .runtime()
-                .source_event(
+                .source_event_for_path(
                     sequence,
-                    "store.sources.increment_button.press",
-                    None,
+                    "store.sources.increment_button.events.press",
+                    &[],
                     SourcePayload::default(),
                 )
                 .unwrap()
@@ -4879,7 +5600,6 @@ mod tests {
             last_turn_sequence: 1,
             changes: Vec::new(),
             outbox_changes: Vec::new(),
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: vec![DurableContentArtifactChange::InsertImmutable {
                 owner_id,
                 artifact_id: content.id,
@@ -4900,10 +5620,10 @@ mod tests {
         .unwrap();
         let increment = source_runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 1,
-                "store.sources.increment_button.press",
-                None,
+                "store.sources.increment_button.events.press",
+                &[],
                 SourcePayload::default(),
             )
             .unwrap();
@@ -4971,9 +5691,7 @@ store: [
             pulse |> THEN { count + 1 }
         }
     transient:
-        LATEST {
-            pulse |> THEN { count + 10 }
-        }
+        pulse |> THEN { count + 10 }
     derived: count + 20
 ]
 "#,
@@ -5007,7 +5725,7 @@ store: [
         );
         let pulse = runtime
             .runtime()
-            .source_event(1, "store.pulse", None, SourcePayload::default())
+            .source_event_for_path(1, "store.pulse", &[], SourcePayload::default())
             .unwrap();
         runtime.dispatch(pulse).unwrap();
         runtime.barrier().unwrap();

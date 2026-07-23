@@ -5,7 +5,7 @@ use super::{
     PersistentServerStartup, PersistentServerStatus, ServerTurnClass,
 };
 use boon_persistence::PersistenceDriver;
-use boon_plan::{EffectDeliveryCardinality, ProgramRole};
+use boon_plan::{EffectDeliveryCardinality, ProgramRole, SourceRouteToken};
 use boon_runtime::{
     DistributedClientRuntime, DistributedProgramBundle, DistributedQueueLimits,
     DistributedRuntimeError, DocumentFrame, RowId, RuntimeTurn, SessionOrigin, SessionPrincipal,
@@ -121,7 +121,6 @@ pub struct InProcessPoll {
     pub transient_effect_credit_grants: Vec<InProcessTransientEffectCreditGrant>,
     pub serviced_session_steps: usize,
     pub backpressured_session_steps: usize,
-    pub durable_protocol_checkpoints: usize,
     pub expired_sessions: usize,
 }
 
@@ -436,13 +435,19 @@ impl InProcessDistributedRuntime {
         path: &str,
         payload: SourcePayload,
     ) -> Result<(), InProcessDistributedRuntimeError> {
-        self.dispatch_client_scoped(path, None, payload)
+        self.require_running()?;
+        let update = self
+            .client
+            .as_mut()
+            .expect("running in-process runtime owns its Client")
+            .dispatch(path, payload)?;
+        self.queue_turns(TransientEffectOwner::Client, update.turns);
+        Ok(())
     }
 
-    pub fn dispatch_client_scoped(
+    pub fn dispatch_client_route(
         &mut self,
-        path: &str,
-        row: Option<RowId>,
+        route: SourceRouteToken,
         payload: SourcePayload,
     ) -> Result<(), InProcessDistributedRuntimeError> {
         self.require_running()?;
@@ -450,9 +455,21 @@ impl InProcessDistributedRuntime {
             .client
             .as_mut()
             .expect("running in-process runtime owns its Client")
-            .dispatch_scoped(path, row, payload)?;
+            .dispatch_route(route, payload)?;
         self.queue_turns(TransientEffectOwner::Client, update.turns);
         Ok(())
+    }
+
+    pub fn client_source_route_token_for_path(
+        &self,
+        path: &str,
+    ) -> Result<SourceRouteToken, InProcessDistributedRuntimeError> {
+        self.require_running()?;
+        self.client
+            .as_ref()
+            .expect("running in-process runtime owns its Client")
+            .source_route_token_for_path(path)
+            .map_err(Into::into)
     }
 
     /// Performs at most `config.max_poll_steps` fixed-shape transport/runtime rounds.
@@ -485,12 +502,10 @@ impl InProcessDistributedRuntime {
             }
             output.serviced_session_steps += registry_poll.serviced_origins.len();
             output.backpressured_session_steps += registry_poll.backpressured_origins.len();
-            output.durable_protocol_checkpoints += registry_poll.durable_protocol_checkpoints;
             output.expired_sessions += registry_poll.expired_sessions;
             progressed |= !registry_poll.serviced_origins.is_empty()
                 || !registry_poll.session_turns.is_empty()
                 || !registry_poll.server_turns.is_empty()
-                || registry_poll.durable_protocol_checkpoints != 0
                 || registry_poll.expired_sessions != 0;
             for (origin, turn) in registry_poll.session_turns {
                 self.pending_turns.push_back(PendingTurn {
@@ -696,26 +711,6 @@ impl InProcessDistributedRuntime {
             .expect("running in-process runtime owns its Client")
             .row_target_for_source_path(path, key, generation)
             .map_err(Into::into)
-    }
-
-    pub fn client_row_target_for_source_text(
-        &self,
-        path: &str,
-        text: &str,
-        occurrence: usize,
-    ) -> Result<Option<RowId>, InProcessDistributedRuntimeError> {
-        self.require_running()?;
-        self.client
-            .as_ref()
-            .expect("running in-process runtime owns its Client")
-            .row_target_for_source_text(path, text, occurrence)
-            .map_err(Into::into)
-    }
-
-    pub fn client_source_row_lookup_field(&self, path: &str) -> Option<&str> {
-        self.client
-            .as_ref()
-            .and_then(|client| client.source_row_lookup_field(path))
     }
 
     pub fn client_source_is_row_scoped(&self, path: &str) -> Option<bool> {

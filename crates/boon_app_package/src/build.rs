@@ -1,8 +1,8 @@
 use crate::{
     AppManifest, ArtifactDescriptor, BUNDLE_FORMAT, BUNDLE_MANIFEST_FILE, BrowserAppConfig,
-    BundleFileDescriptor, BundleFileKind, BundleManifest, CapabilityProfileDescriptor,
-    MAX_PACKAGE_FILE_BYTES, NamespaceProfile, PackageError, PackageFileManifest, ProgramManifest,
-    RunMode, StaticCachePolicy, sha256_bytes,
+    BrowserPackageAssetDescriptor, BundleFileDescriptor, BundleFileKind, BundleManifest,
+    CapabilityProfileDescriptor, MAX_PACKAGE_FILE_BYTES, NamespaceProfile, PackageError,
+    PackageFileManifest, ProgramManifest, RunMode, StaticCachePolicy, sha256_bytes,
 };
 use boon_plan::{ApplicationIdentity, ProgramRole};
 use boon_runtime::{
@@ -219,15 +219,7 @@ fn build_into(
         .find(|profile| profile.role == ProgramRole::Client)
         .ok_or_else(|| PackageError::new("selected Client capability profile is absent"))?;
 
-    generate_browser_assets(
-        app,
-        browser_wasm,
-        output,
-        &client_descriptor,
-        client_capability_profile,
-        &mut files,
-        &mut targets,
-    )?;
+    let declared_asset_start = files.len();
     copy_declared_files(
         manifest_dir,
         workspace_root,
@@ -235,6 +227,20 @@ fn build_into(
         &app.assets,
         BundleFileKind::Asset,
         true,
+        &mut files,
+        &mut targets,
+    )?;
+    let browser_package_assets = files[declared_asset_start..]
+        .iter()
+        .map(|file| BrowserPackageAssetDescriptor::from_bundle_file(&app.package.id, file))
+        .collect::<Result<Vec<_>, _>>()?;
+    generate_browser_assets(
+        app,
+        browser_wasm,
+        output,
+        &client_descriptor,
+        client_capability_profile,
+        browser_package_assets,
         &mut files,
         &mut targets,
     )?;
@@ -488,6 +494,7 @@ fn generate_browser_assets(
     output: &Path,
     client: &ArtifactDescriptor,
     client_capability_profile: &CapabilityProfileDescriptor,
+    package_assets: Vec<BrowserPackageAssetDescriptor>,
     files: &mut Vec<BundleFileDescriptor>,
     targets: &mut BTreeSet<String>,
 ) -> Result<(), PackageError> {
@@ -523,6 +530,7 @@ fn generate_browser_assets(
         &app.browser.canvas_id,
         client,
         client_capability_profile,
+        package_assets,
     )?;
     let app_config_bytes = app_config.encode()?;
     write_generated_public_file(

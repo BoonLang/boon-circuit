@@ -784,16 +784,11 @@ fn add_value_inspector(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
         "value",
     );
     inspector_field(frame, "Details", state.inspector.detail, 116.0, "detail");
-    if let Some(language) = state.language
-        && !language.diagnostics.is_empty()
-    {
-        inspector_field(
-            frame,
-            "Diagnostics",
-            &language.diagnostics.join("\n"),
-            98.0,
-            "diagnostics",
-        );
+    if let Some(language) = state.language {
+        let diagnostics = language.diagnostics_text();
+        if !diagnostics.is_empty() {
+            inspector_field(frame, "Diagnostics", &diagnostics, 98.0, "diagnostics");
+        }
     }
 }
 
@@ -1434,6 +1429,7 @@ fn binding(id: &str, intent: &str) -> SourceBinding {
         id: SourceBindingId(format!("binding:{id}")),
         source_path: id.to_owned(),
         intent: intent.to_owned(),
+        route: None,
     }
 }
 

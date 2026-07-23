@@ -1,12 +1,11 @@
 use boon_example_manifest::{ExampleEntry, ExampleManifest};
 use boon_ir::{ErasedProgram, verify_hidden_identity, verify_static_schedule};
-use boon_parser::{AstExpr, AstExprKind, AstStatement, ParsedProgram, parse_project, parse_source};
+use boon_parser::{ParsedProgram, parse_project, parse_source};
 pub use boon_plan::{
     ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, ProgramRole,
     TargetProfile,
 };
 use serde::de::DeserializeOwned;
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
@@ -138,226 +137,9 @@ pub struct CompileProfile {
 
 #[derive(Clone, Debug)]
 pub struct CompiledMachinePlanFromSource {
-    pub parsed: ParsedProgram,
     pub ir: ErasedProgram,
     pub plan: MachinePlan,
     pub profile: CompileProfile,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum CompilerDerivedTextExpression {
-    EnterKeyPayloadTextTrimNonEmpty,
-    EnterKeyRootTextTrimNonEmpty { path: String },
-    SourceRootText { path: String },
-    Other,
-}
-
-fn compiler_statement_ast_exprs(statement: &AstStatement, expressions: &[AstExpr]) -> Vec<AstExpr> {
-    let mut ids = BTreeSet::new();
-    collect_statement_expr_ids(statement, expressions, &mut ids);
-    expressions
-        .iter()
-        .filter(|expr| {
-            ids.contains(&expr.id) || (expr.start >= statement.start && expr.end <= statement.end)
-        })
-        .cloned()
-        .collect()
-}
-
-fn collect_statement_expr_ids(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-    ids: &mut BTreeSet<usize>,
-) {
-    if let Some(expr) = statement.expr {
-        collect_expr_ids(expr, expressions, ids);
-    }
-    for child in &statement.children {
-        collect_statement_expr_ids(child, expressions, ids);
-    }
-}
-
-fn collect_expr_ids(id: usize, expressions: &[AstExpr], ids: &mut BTreeSet<usize>) {
-    if !ids.insert(id) {
-        return;
-    }
-    let Some(expr) = expressions.iter().find(|expr| expr.id == id) else {
-        return;
-    };
-    match &expr.kind {
-        AstExprKind::Call { args, .. } => {
-            for arg in args {
-                collect_expr_ids(arg.value, expressions, ids);
-            }
-        }
-        AstExprKind::Pipe { input, args, .. } => {
-            collect_expr_ids(*input, expressions, ids);
-            for arg in args {
-                collect_expr_ids(arg.value, expressions, ids);
-            }
-        }
-        AstExprKind::Draining { input } => {
-            collect_expr_ids(*input, expressions, ids);
-        }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial, .. } => {
-            collect_expr_ids(*initial, expressions, ids);
-        }
-        AstExprKind::Block { bindings, result } => {
-            for binding in bindings {
-                collect_expr_ids(binding.value, expressions, ids);
-            }
-            if let Some(result) = result {
-                collect_expr_ids(*result, expressions, ids);
-            }
-        }
-        AstExprKind::Then { input, output } => {
-            collect_expr_ids(*input, expressions, ids);
-            if let Some(output) = output {
-                collect_expr_ids(*output, expressions, ids);
-            }
-        }
-        AstExprKind::Infix { left, right, .. } => {
-            collect_expr_ids(*left, expressions, ids);
-            collect_expr_ids(*right, expressions, ids);
-        }
-        AstExprKind::MatchArm { output, .. } => {
-            if let Some(output) = output {
-                collect_expr_ids(*output, expressions, ids);
-            }
-        }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
-            for field in fields {
-                collect_expr_ids(field.value, expressions, ids);
-            }
-        }
-        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => {
-            for item in items {
-                collect_expr_ids(*item, expressions, ids);
-            }
-        }
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::Drain { .. }
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::Source
-        | AstExprKind::Latest
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => {}
-    }
-}
-
-fn compiler_source_event_transform_text_expression(
-    value: &boon_ir::DerivedValue,
-    source: &str,
-    expressions: &[AstExpr],
-    _functions: &[boon_ir::FunctionDefinition],
-) -> CompilerDerivedTextExpression {
-    let expressions = compiler_statement_ast_exprs(&value.statement, expressions);
-    if let Some(path) = text_trim_input_path(&expressions) {
-        if source_payload_suffix(&path, source).as_deref() == Some("text") {
-            return CompilerDerivedTextExpression::EnterKeyPayloadTextTrimNonEmpty;
-        }
-        return CompilerDerivedTextExpression::EnterKeyRootTextTrimNonEmpty {
-            path: canonical_sibling_path(&value.path, &path),
-        };
-    }
-    for expr in &expressions {
-        let AstExprKind::Then {
-            input,
-            output: Some(output),
-        } = expr.kind
-        else {
-            continue;
-        };
-        if !expr_tree_mentions_source(&expressions, input, source) {
-            continue;
-        }
-        if let Some(path) = expr_path(&expressions, output) {
-            return CompilerDerivedTextExpression::SourceRootText {
-                path: canonical_sibling_path(&value.path, &path),
-            };
-        }
-    }
-    CompilerDerivedTextExpression::Other
-}
-
-fn text_trim_input_path(expressions: &[AstExpr]) -> Option<String> {
-    expressions.iter().find_map(|expr| match &expr.kind {
-        AstExprKind::Pipe { input, op, .. } if op == "Text/trim" => expr_path(expressions, *input),
-        AstExprKind::Call { function, args, .. } if function == "Text/trim" => args
-            .iter()
-            .find(|arg| arg.is_bare_binding())
-            .and_then(|arg| expr_path(expressions, arg.value)),
-        _ => None,
-    })
-}
-
-fn expr_tree_mentions_source(expressions: &[AstExpr], id: usize, source: &str) -> bool {
-    let mut ids = BTreeSet::new();
-    collect_expr_ids(id, expressions, &mut ids);
-    expressions.iter().any(|expr| {
-        ids.contains(&expr.id)
-            && expr_path(expressions, expr.id)
-                .is_some_and(|path| source_suffix(&path, source).is_some())
-    })
-}
-
-fn expr_path(expressions: &[AstExpr], id: usize) -> Option<String> {
-    match &expressions.iter().find(|expr| expr.id == id)?.kind {
-        AstExprKind::Identifier(value) => Some(value.clone()),
-        AstExprKind::Path(parts) if !parts.is_empty() => {
-            Some(boon_parser::canonical_value_path(parts))
-        }
-        _ => None,
-    }
-}
-
-fn source_payload_suffix(path: &str, source: &str) -> Option<String> {
-    let suffix = source_suffix(path, source)?;
-    Some(match suffix {
-        "change.text" | "event.change.text" | "events.change.text" => "text".to_owned(),
-        "key_down.key" | "event.key_down.key" | "events.key_down.key" => "key".to_owned(),
-        other => other.rsplit('.').next().unwrap_or(other).to_owned(),
-    })
-}
-
-fn source_suffix<'a>(path: &'a str, source: &str) -> Option<&'a str> {
-    let mut variants = vec![source.to_owned()];
-    if let Some((_, suffix)) = source.split_once('.') {
-        variants.push(suffix.to_owned());
-        variants.push(format!("item.{suffix}"));
-    }
-    variants.into_iter().find_map(|variant| {
-        if path == variant {
-            return Some("");
-        }
-        path.strip_prefix(&variant)
-            .and_then(|suffix| suffix.strip_prefix('.'))
-            .or_else(|| {
-                let marker = format!(".{variant}.");
-                path.find(&marker)
-                    .map(|start| &path[start + marker.len()..])
-            })
-    })
-}
-
-fn canonical_sibling_path(owner: &str, path: &str) -> String {
-    if path.contains('.') {
-        path.to_owned()
-    } else {
-        owner
-            .rsplit_once('.')
-            .map(|(parent, _)| format!("{parent}.{path}"))
-            .unwrap_or_else(|| path.to_owned())
-    }
 }
 
 pub fn compile_typed_program(
@@ -866,22 +648,61 @@ fn compile_parsed_to_machine_plan(
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let lower_started = Instant::now();
-    let requires_recursive_migration_types = parsed.expressions.iter().any(|expression| {
-        matches!(
-            expression.kind,
-            AstExprKind::Drain { .. } | AstExprKind::Draining { .. }
-        )
-    });
     let external_types = boon_typecheck::ExternalTypeEnvironment::empty(program_role);
-    let ir = match lowering_mode {
-        LoweringMode::Full => boon_ir::lower_with_external_types(&parsed, &external_types),
-        LoweringMode::Runtime if requires_recursive_migration_types => {
-            boon_ir::lower_with_external_types(&parsed, &external_types)
+    let check_output = match lowering_mode {
+        LoweringMode::Full => {
+            boon_typecheck::check_program_profiled_with_external_types(&parsed, &external_types).0
         }
         LoweringMode::Runtime => {
-            boon_ir::lower_runtime_with_external_types(&parsed, &external_types)
+            boon_typecheck::check_runtime_program_profiled_with_external_types(
+                &parsed,
+                &external_types,
+            )
+            .0
         }
-    }?;
+    };
+    if check_output.report.has_errors() {
+        let diagnostics = check_output
+            .report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error)
+            .map(|diagnostic| {
+                let (path, line) = source_file_location(&parsed, diagnostic.line);
+                format!("{path}:{line}: {}", diagnostic.message)
+            })
+            .chain(
+                check_output
+                    .report
+                    .render_slot_table
+                    .slots
+                    .iter()
+                    .flat_map(|slot| {
+                        slot.diagnostics
+                            .iter()
+                            .filter(|diagnostic| {
+                                diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error
+                            })
+                            .map(|diagnostic| {
+                                format!(
+                                    "render slot `{}` at line {}: {}",
+                                    slot.slot_name, diagnostic.line, diagnostic.message
+                                )
+                            })
+                    }),
+            )
+            .collect::<Vec<_>>();
+        return Err(PlanError::new(format!(
+            "typecheck failed with {} error diagnostic(s): {}",
+            diagnostics.len(),
+            diagnostics.join("; ")
+        ))
+        .into());
+    }
+    let checked = check_output
+        .program
+        .ok_or_else(|| PlanError::new("typecheck produced no CheckedProgram for valid source"))?;
+    let ir = boon_ir::lower_checked(checked, &[])?;
     let lower_ms = elapsed_ms(lower_started);
     let verify_started = Instant::now();
     verify_hidden_identity(&ir)?;
@@ -907,12 +728,7 @@ fn compile_parsed_to_machine_plan(
         compile_ms,
         total_ms: elapsed_ms(total_started),
     };
-    Ok(CompiledMachinePlanFromSource {
-        parsed,
-        ir,
-        plan,
-        profile,
-    })
+    Ok(CompiledMachinePlanFromSource { ir, plan, profile })
 }
 
 fn parse_source_units(

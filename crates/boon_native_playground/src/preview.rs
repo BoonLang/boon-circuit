@@ -22,7 +22,7 @@ use boon_runtime::{
 };
 
 use crate::compile::{
-    CompileRequest, CompileWorker, CompiledExecutable, ProgramCompileReceipt, ProgramCompileWorker,
+    CompileRequest, CompileWorker, ProgramCompileReceipt, ProgramCompileWorker,
     compile_migration_stage, preview_project_key, project_key_for_stage,
 };
 use crate::frame::{
@@ -47,9 +47,13 @@ use crate::protocol::{
     PreviewIntent, PreviewSource, PreviewStats, ProofMode, Role, StateArtifactFormat,
     StateArtifactPreviewSummary, TestStep,
 };
+use crate::readiness::{
+    PreparedRuntimeActivation, RuntimeReadinessRequest, RuntimeReadinessWorker,
+};
 use crate::runtime_view::{
     ProgramCompletionObservation, RuntimeAsyncLaneKind, RuntimeAsyncLaneObservation,
-    RuntimeAsyncLaneOutcome, RuntimeSourceDispatch, RuntimeView, STATE_ROOT_ENV, digest_hex,
+    RuntimeAsyncLaneOutcome, RuntimePlanPublishError, RuntimeSourceDispatch, RuntimeView,
+    STATE_ROOT_ENV, digest_hex,
 };
 use crate::view::{HitTarget, RetainedView};
 
@@ -669,15 +673,17 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
     })?;
 
     let (compiler, mut compiled) = CompileWorker::start();
+    let (readiness, mut ready) = RuntimeReadinessWorker::start();
     let (program_compiler, mut program_compiled) = ProgramCompileWorker::start();
     let mut runtime = None::<RuntimeView>;
     let mut runtime_key = None::<String>;
-    let mut package_assets = Vec::<AssetBlob>::new();
+    let mut package_assets = Arc::new(Vec::<AssetBlob>::new());
     let mut state_mount_captured = false;
     let mut migration = None::<MigrationBundle>;
     let mut active_migration_stage = None::<String>;
     let mut previewed_migration_stage = None::<String>;
     let mut desired_revision = 0u64;
+    let mut desired_compile_job = 0u64;
     let mut source_revision = 0u64;
     let mut cursor = (24.0f32, 24.0f32);
     let mut switch_started = None::<(u64, Instant)>;
@@ -730,6 +736,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             Native(Result<HostEventEnvelope, boon_native_app_window::NativeHostError>),
             Ipc(Option<Result<Message, String>>),
             Compiled(Option<crate::compile::CompileOutcome>),
+            Ready(Option<crate::readiness::RuntimeReadinessOutcome>),
             ProgramCompiled(Option<crate::compile::ProgramCompileOutcome>),
             Proof(Option<Box<ProofResult>>),
             MapTile(Option<()>),
@@ -739,6 +746,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             let native = host.next_event().fuse();
             let command = incoming.next().fuse();
             let result = compiled.next().fuse();
+            let readiness_result = ready.next().fuse();
             let program_result = program_compiled.next().fuse();
             let proof_result = async {
                 match proof.as_mut() {
@@ -753,6 +761,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 native,
                 command,
                 result,
+                readiness_result,
                 program_result,
                 proof_result,
                 map_tile,
@@ -762,6 +771,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 value = native => Wake::Native(value),
                 value = command => Wake::Ipc(value),
                 value = result => Wake::Compiled(value),
+                value = readiness_result => Wake::Ready(value),
                 value = program_result => Wake::ProgramCompiled(value),
                 value = proof_result => Wake::Proof(value.map(Box::new)),
                 value = map_tile => Wake::MapTile(value),
@@ -1078,7 +1088,9 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         runtime.as_ref(),
                         source_revision,
                         FrameMode::Burst,
-                        compiler.replaced_count(),
+                        compiler
+                            .replaced_count()
+                            .saturating_add(readiness.replaced_count()),
                         &mut last_stats_sent,
                         false,
                     )?;
@@ -1131,7 +1143,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             .map(render_asset_source)
                             .collect::<Vec<_>>();
                         product.replace_asset_sources(sources)?;
-                        package_assets = assets;
+                        package_assets = Arc::new(assets);
                     }
                     Message::PreviewApply {
                         intent,
@@ -1228,6 +1240,10 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         migration = incoming_migration.clone();
                         active_migration_stage.clone_from(&migration_stage);
                         previewed_migration_stage = None;
+                        desired_compile_job = desired_compile_job
+                            .checked_add(1)
+                            .ok_or("preview compile job identity exhausted")?;
+                        let compile_job = desired_compile_job;
                         let key = preview_project_key(&source, migration_stage.as_deref());
                         if intent == PreviewIntent::Replace {
                             switch_started = Some((revision, accepted_at));
@@ -1276,13 +1292,16 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 runtime.as_ref(),
                                 source_revision,
                                 FrameMode::Idle,
-                                compiler.replaced_count(),
+                                compiler
+                                    .replaced_count()
+                                    .saturating_add(readiness.replaced_count()),
                                 &mut last_stats_sent,
                                 true,
                             )?;
                             continue;
                         }
                         compiler.replace(CompileRequest {
+                            job_id: compile_job,
                             intent,
                             request_id,
                             revision,
@@ -1403,7 +1422,9 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             runtime.as_ref(),
                             source_revision,
                             FrameMode::Idle,
-                            compiler.replaced_count(),
+                            compiler
+                                .replaced_count()
+                                .saturating_add(readiness.replaced_count()),
                             &mut last_stats_sent,
                             true,
                         )?;
@@ -1462,28 +1483,54 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             }
             Wake::Compiled(outcome) => {
                 let outcome = outcome.ok_or("preview compiler stopped")?;
-                if outcome.revision < desired_revision {
+                if outcome.job_id != desired_compile_job || outcome.revision < desired_revision {
+                    continue;
+                }
+                let request = match outcome.result {
+                    Ok(compiled_preview) => {
+                        let test = compiled_preview.intent == PreviewIntent::Test;
+                        let isolated_scenario =
+                            test && state_evidence.native_workflow_steps.is_empty();
+                        let deterministic_runtime =
+                            test || !state_evidence.scenario_steps.is_empty();
+                        RuntimeReadinessRequest::prepare(
+                            compiled_preview,
+                            runtime.as_ref(),
+                            deterministic_runtime,
+                            isolated_scenario,
+                            Arc::clone(&package_assets),
+                        )
+                    }
+                    Err(error) => RuntimeReadinessRequest::compile_failed(
+                        outcome.job_id,
+                        outcome.revision,
+                        error,
+                    ),
+                };
+                readiness.replace(request);
+            }
+            Wake::Ready(outcome) => {
+                let outcome = outcome.ok_or("preview readiness worker stopped")?;
+                if outcome.job_id != desired_compile_job || outcome.revision < desired_revision {
                     continue;
                 }
                 match outcome.result {
                     Ok(compiled_preview) => {
-                        let compile_us = duration_us(compiled_preview.elapsed);
+                        let compile_us = duration_us(compiled_preview.compile_elapsed);
                         let compile_elapsed_ms = compile_us as f64 / 1_000.0;
+                        let readiness_us = duration_us(compiled_preview.readiness_elapsed);
+                        let readiness_elapsed_ms = readiness_us as f64 / 1_000.0;
                         let test = compiled_preview.intent == PreviewIntent::Test;
                         let request_id = compiled_preview.request_id.unwrap_or(0);
                         let steps = compiled_preview.test_steps.clone();
                         let key = compiled_preview.source_key.clone();
                         let revision = compiled_preview.revision;
+                        let retry = compiled_preview.retry.clone();
                         let post_compile_started = Instant::now();
-                        let isolated_test = test && state_evidence.native_workflow_steps.is_empty();
-                        let deterministic_runtime =
-                            test || !state_evidence.scenario_steps.is_empty();
-                        let activation = activate_executable(
+                        let activation = publish_prepared_activation(
                             &mut runtime,
-                            compiled_preview.executable,
-                            deterministic_runtime,
-                            isolated_test,
-                            &package_assets,
+                            compiled_preview.expected_runtime_owner,
+                            compiled_preview.activation,
                         );
                         match activation {
                             Ok(activation) => {
@@ -1534,7 +1581,9 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                         source_revision,
                                         presented,
                                         compile_us,
-                                        duration_us(post_compile_started.elapsed()),
+                                        readiness_us.saturating_add(duration_us(
+                                            post_compile_started.elapsed(),
+                                        )),
                                     );
                                     if capture_mount {
                                         let request = capture_state_mounted(
@@ -1594,7 +1643,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                     revision: source_revision,
                                     ok: true,
                                     message: format!(
-                                        "typed runtime and retained document mounted in {compile_elapsed_ms:.2}ms"
+                                        "typed runtime and retained document mounted: compile {compile_elapsed_ms:.2}ms, readiness {readiness_elapsed_ms:.2}ms"
                                     ),
                                 })?;
                                 if let (Some(_), Some(active_stage), Some(runtime)) = (
@@ -1767,7 +1816,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                             proof_requested = false;
                                             proof_eligible_ordinal = 0;
                                         }
-                                        if let Some(runtime) = runtime.as_ref()
+                                        if let Some(runtime) = runtime.as_mut()
                                             && let Some(target) =
                                                 first_test_target(runtime, &view, &steps)
                                                     .or_else(|| view.first_visible_hit_target())
@@ -1818,16 +1867,46 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                     runtime.as_ref(),
                                     source_revision,
                                     FrameMode::Idle,
-                                    compiler.replaced_count(),
+                                    compiler
+                                        .replaced_count()
+                                        .saturating_add(readiness.replaced_count()),
                                     &mut last_stats_sent,
                                     true,
                                 )?;
                             }
                             Err(error) => {
+                                let mut retry_failure = None;
+                                if matches!(
+                                    &error,
+                                    PreparedActivationPublishError::AuthorityStale(_)
+                                ) && let Some(retry) = retry
+                                    && let Some(current) = runtime.as_ref()
+                                {
+                                    let attempt = retry.attempt().saturating_add(1);
+                                    match retry.recapture(current) {
+                                        Ok(request) => {
+                                            readiness.replace(request);
+                                            output.send(Message::PreviewStatus {
+                                                revision,
+                                                ok: true,
+                                                message: format!(
+                                                    "runtime authority changed during readiness; recaptured replacement attempt {attempt}"
+                                                ),
+                                            })?;
+                                            continue;
+                                        }
+                                        Err(retry_error) => retry_failure = Some(retry_error),
+                                    }
+                                }
+                                let mut error = error.to_string();
+                                if let Some(retry_failure) = retry_failure {
+                                    error.push_str("; ");
+                                    error.push_str(&retry_failure);
+                                }
                                 emit(
                                     &observer,
                                     ObserverEvent::SourceFailed {
-                                        revision: source_revision,
+                                        revision,
                                         stage: "runtime-mount".to_owned(),
                                         message: error.clone(),
                                     },
@@ -1844,7 +1923,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                     .await?;
                                 }
                                 output.send(Message::PreviewStatus {
-                                    revision: source_revision,
+                                    revision,
                                     ok: false,
                                     message: error,
                                 })?;
@@ -2090,7 +2169,9 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         runtime.as_ref(),
                         source_revision,
                         FrameMode::Burst,
-                        compiler.replaced_count(),
+                        compiler
+                            .replaced_count()
+                            .saturating_add(readiness.replaced_count()),
                         &mut last_stats_sent,
                         false,
                     )?;
@@ -2122,7 +2203,9 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             Some(&*runtime),
                             source_revision,
                             FrameMode::Burst,
-                            compiler.replaced_count(),
+                            compiler
+                                .replaced_count()
+                                .saturating_add(readiness.replaced_count()),
                             &mut last_stats_sent,
                             false,
                         )?;
@@ -2803,7 +2886,7 @@ fn emit_native_workflow_state_frame(
 fn emit_current_native_workflow_target(
     workflow: &mut NativeWorkflowState,
     observer: &Option<ObserverClient>,
-    runtime: &mut RuntimeView,
+    _runtime: &mut RuntimeView,
     view: &RetainedView,
     key: Option<&crate::observer::FrameEvidenceKey>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2818,12 +2901,7 @@ fn emit_current_native_workflow_target(
         .action_kind
         .clone()
         .ok_or("native workflow target cannot represent an assertion-only step")?;
-    let target_row = runtime.scenario_target_row(
-        &step.source_path,
-        step.target_text.as_deref(),
-        step.address.as_deref(),
-        step.target_occurrence,
-    )?;
+    let target_row = step.target_key.zip(step.target_generation);
     let Some(target) = view.target_for_scenario(
         &step.source_path,
         step.action_kind.as_deref(),
@@ -3496,57 +3574,57 @@ enum RuntimeActivation {
     Updated,
 }
 
-fn activate_executable(
-    runtime: &mut Option<RuntimeView>,
-    executable: CompiledExecutable,
-    deterministic_scenario: bool,
-    isolated_scenario: bool,
-    assets: &[AssetBlob],
-) -> Result<RuntimeActivation, String> {
-    match executable {
-        CompiledExecutable::BuiltInSingleRole(plan) => activate_compatible_single_role(
-            runtime,
-            plan,
-            deterministic_scenario,
-            isolated_scenario,
-            assets,
-        ),
-        CompiledExecutable::DistributedPackage(bundle) => {
-            RuntimeView::open_distributed_with_assets(
-                bundle,
-                deterministic_scenario || isolated_scenario,
-                assets,
-            )
-            .map(|runtime| RuntimeActivation::Opened(Box::new(runtime)))
+enum PreparedActivationPublishError {
+    OwnerStale(String),
+    AuthorityStale(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for PreparedActivationPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OwnerStale(message) | Self::AuthorityStale(message) | Self::Failed(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
 
-fn activate_compatible_single_role(
+fn publish_prepared_activation(
     runtime: &mut Option<RuntimeView>,
-    plan: Arc<boon_plan::MachinePlan>,
-    deterministic_scenario: bool,
-    isolated_scenario: bool,
-    assets: &[AssetBlob],
-) -> Result<RuntimeActivation, String> {
-    if !isolated_scenario
-        && let Some(runtime) = runtime.as_mut()
-        && runtime.application_identity() == &plan.application.identity
-    {
-        if !runtime.plan_schema_matches(&plan) {
-            return Err(
-                "same-identity schema change requires Migration Preview and Activate".to_owned(),
-            );
+    expected_runtime_owner: Option<crate::runtime_view::RuntimeOwnerStamp>,
+    activation: Result<PreparedRuntimeActivation, String>,
+) -> Result<RuntimeActivation, PreparedActivationPublishError> {
+    if let Some(expected) = expected_runtime_owner {
+        let current = runtime.as_ref().map(RuntimeView::owner_stamp);
+        if current != Some(expected) {
+            return Err(PreparedActivationPublishError::OwnerStale(format!(
+                "prepared replacement owner is stale: expected {expected:?}, current {current:?}"
+            )));
         }
-        runtime.activate_machine_plan(plan)?;
-        return Ok(RuntimeActivation::Updated);
     }
-    if isolated_scenario {
-        RuntimeView::open_for_scenario_with_assets(plan, assets)
-    } else {
-        RuntimeView::open_with_assets(plan, deterministic_scenario, assets)
+    match activation.map_err(PreparedActivationPublishError::Failed)? {
+        PreparedRuntimeActivation::Opened(runtime) => Ok(RuntimeActivation::Opened(runtime)),
+        PreparedRuntimeActivation::Replacement(prepared) => {
+            runtime
+                .as_mut()
+                .ok_or_else(|| {
+                    PreparedActivationPublishError::OwnerStale(
+                        "prepared replacement has no active runtime owner".to_owned(),
+                    )
+                })?
+                .publish_prepared_machine_plan(prepared)
+                .map_err(|error| match error {
+                    RuntimePlanPublishError::AuthorityStale(message) => {
+                        PreparedActivationPublishError::AuthorityStale(message)
+                    }
+                    RuntimePlanPublishError::Failed(message) => {
+                        PreparedActivationPublishError::Failed(message)
+                    }
+                })?;
+            Ok(RuntimeActivation::Updated)
+        }
     }
-    .map(|runtime| RuntimeActivation::Opened(Box::new(runtime)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4375,12 +4453,7 @@ async fn run_stale_program_evidence(
     }
 
     let baseline = runtime.export_state_artifact()?;
-    let target_row = runtime.scenario_target_row(
-        &edits[0].source_path,
-        edits[0].target_text.as_deref(),
-        edits[0].address.as_deref(),
-        edits[0].target_occurrence,
-    )?;
+    let target_row = edits[0].target_key.zip(edits[0].target_generation);
     let target = view
         .target_for_scenario(
             &edits[0].source_path,
@@ -4565,7 +4638,7 @@ fn queue_evidence_proofs(
 }
 
 fn first_test_target(
-    runtime: &RuntimeView,
+    _runtime: &mut RuntimeView,
     view: &RetainedView,
     steps: &[TestStep],
 ) -> Option<HitTarget> {
@@ -4573,15 +4646,7 @@ fn first_test_target(
         .iter()
         .filter(|step| !step.source_path.is_empty())
         .find_map(|step| {
-            let target_row = runtime
-                .scenario_target_row(
-                    &step.source_path,
-                    step.target_text.as_deref(),
-                    step.address.as_deref(),
-                    step.target_occurrence,
-                )
-                .ok()
-                .flatten();
+            let target_row = step.target_key.zip(step.target_generation);
             view.target_for_scenario(
                 &step.source_path,
                 step.action_kind.as_deref(),
@@ -4651,12 +4716,7 @@ async fn run_test(
             continue;
         }
         runtime.begin_scenario_step(&step.source_path);
-        let target_row = runtime.scenario_target_row(
-            &step.source_path,
-            step.target_text.as_deref(),
-            step.address.as_deref(),
-            step.target_occurrence,
-        )?;
+        let target_row = step.target_key.zip(step.target_generation);
         let target = view
             .target_for_scenario(
                 &step.source_path,
@@ -4973,12 +5033,7 @@ fn arm_product_profile_benchmark(
         );
     }
     let baseline = runtime.export_state_artifact()?;
-    let target_row = runtime.scenario_target_row(
-        &edits[0].source_path,
-        edits[0].target_text.as_deref(),
-        edits[0].address.as_deref(),
-        edits[0].target_occurrence,
-    )?;
+    let target_row = edits[0].target_key.zip(edits[0].target_generation);
     let target = view
         .target_for_scenario(
             &edits[0].source_path,
@@ -6054,4 +6109,54 @@ fn duration_us(duration: Duration) -> u64 {
 
 fn accounted_end_to_end_us(measured: u64, queue_wait: u64, worker: u64, apply: u64) -> u64 {
     measured.max(queue_wait.saturating_add(worker).saturating_add(apply))
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use boon_plan::TargetProfile;
+
+    fn plan() -> Arc<boon_plan::MachinePlan> {
+        Arc::new(
+            boon_compiler::compile_runtime_source_text_to_machine_plan_with_identity(
+                "readiness-owner.bn",
+                "scene: Scene/Element/text(element: [], style: [], text: TEXT { Ready })",
+                TargetProfile::SoftwareDefault,
+                boon_plan::ApplicationIdentity::new(
+                    "dev.boon.readiness-test",
+                    "owner-stamp",
+                    "test",
+                ),
+            )
+            .unwrap()
+            .plan,
+        )
+    }
+
+    #[test]
+    fn prepared_replacement_cannot_land_on_an_equal_authority_different_runtime_owner() {
+        let plan = plan();
+        let first = RuntimeView::open_for_scenario_with_assets(Arc::clone(&plan), &[]).unwrap();
+        let expected = first.owner_stamp();
+        let prepared = first
+            .prepare_machine_plan_build(Arc::clone(&plan))
+            .unwrap()
+            .build()
+            .unwrap();
+        let second = RuntimeView::open_for_scenario_with_assets(plan, &[]).unwrap();
+        let second_stamp = second.owner_stamp();
+        assert_ne!(expected, second_stamp);
+
+        let mut active = Some(second);
+        let result = publish_prepared_activation(
+            &mut active,
+            Some(expected),
+            Ok(PreparedRuntimeActivation::Replacement(prepared)),
+        );
+        assert!(matches!(
+            result,
+            Err(PreparedActivationPublishError::OwnerStale(_))
+        ));
+        assert_eq!(active.as_ref().unwrap().owner_stamp(), second_stamp);
+    }
 }

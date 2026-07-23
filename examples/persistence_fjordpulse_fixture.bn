@@ -16,12 +16,10 @@ store: [
     locale:
         TEXT { en-US }
         |> HOLD locale {
-            LATEST {
-                sources.locale_button.events.press |> THEN {
-                    locale |> WHEN {
-                        TEXT { en-US } => TEXT { nb-NO }
-                        TEXT { nb-NO } => TEXT { en-US }
-                    }
+            sources.locale_button.events.press |> THEN {
+                locale |> WHEN {
+                    TEXT { en-US } => TEXT { nb-NO }
+                    TEXT { nb-NO } => TEXT { en-US }
                 }
             }
         }
@@ -29,12 +27,10 @@ store: [
     basemap:
         Street
         |> HOLD basemap {
-            LATEST {
-                sources.basemap_button.events.press |> THEN {
-                    basemap |> WHEN {
-                        Street => Satellite
-                        Satellite => Street
-                    }
+            sources.basemap_button.events.press |> THEN {
+                basemap |> WHEN {
+                    Street => Satellite
+                    Satellite => Street
                 }
             }
         }
@@ -99,6 +95,7 @@ FUNCTION fjordpulse_fixture() {
             Element/text_input(
                 element: [events: store.sources.station_input.events]
                 style: [width: Fill, height: 38]
+                label: TEXT { Station }
                 text: store.selected_station
             )
             fixture_label(label: store.watch_descriptor)

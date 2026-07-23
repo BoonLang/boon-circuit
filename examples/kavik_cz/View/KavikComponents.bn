@@ -158,7 +158,6 @@ FUNCTION external_link(label, to) {
         ]
         label: label
         to: to
-        new_tab: []
     )
 }
 

@@ -13,12 +13,14 @@ use boon_wire::{
     SessionControlFrame, SessionControlFrameError, SessionId, SessionIdGenerationError,
     decode_session_control_frame, encode_session_control_frame,
 };
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::ops::Deref;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub const DEFAULT_SESSION_RESUME_WINDOW: Duration = Duration::from_secs(60);
@@ -26,9 +28,6 @@ pub const DEFAULT_SESSION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE_LANES_PER_SESSION: usize = 4;
 const MAX_SESSION_CLEANUP_ROUNDS: usize = 1024;
 const RESUME_DIGEST_DOMAIN: &[u8] = b"boon.session.resume-digest.v1\0";
-const RECOVERY_ROOT_KEY_DOMAIN: &[u8] = b"boon.distributed-recovery-root.v1\0";
-const RECOVERY_SESSION_KEY_DOMAIN: &[u8] = b"boon.distributed-session.v1\0";
-const RECOVERY_FORMAT_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DistributedSessionConnectionId(u64);
@@ -53,6 +52,7 @@ pub struct DistributedSessionRegistryConfig {
     pub max_global_queued_bytes: usize,
     pub session_queue_limits: DistributedQueueLimits,
     pub handshake_timeout: Duration,
+    pub resume_window: Duration,
 }
 
 impl Default for DistributedSessionRegistryConfig {
@@ -63,6 +63,7 @@ impl Default for DistributedSessionRegistryConfig {
             max_global_queued_bytes: 256 * 1024 * 1024,
             session_queue_limits: DistributedQueueLimits::default(),
             handshake_timeout: DEFAULT_SESSION_HANDSHAKE_TIMEOUT,
+            resume_window: DEFAULT_SESSION_RESUME_WINDOW,
         }
     }
 }
@@ -121,7 +122,6 @@ pub struct DistributedSessionRegistryPoll {
     pub poisoned_sessions: Vec<PoisonedDistributedSession>,
     pub session_turns: Vec<(SessionOrigin, RuntimeTurn)>,
     pub server_turns: Vec<(SessionOrigin, RuntimeTurn)>,
-    pub durable_protocol_checkpoints: usize,
     pub expired_sessions: usize,
 }
 
@@ -139,7 +139,6 @@ impl DistributedSessionRegistryPoll {
             poisoned_sessions: Vec::new(),
             session_turns: Vec::new(),
             server_turns: Vec::new(),
-            durable_protocol_checkpoints: 0,
             expired_sessions,
         }
     }
@@ -162,7 +161,6 @@ pub enum DistributedSessionRegistryError {
     TimeRegression,
     TimeOverflow,
     IdentityUnavailable,
-    InvalidRecoveryState(&'static str),
     TokenGeneration(ResumeTokenGenerationError),
     SessionIdGeneration(SessionIdGenerationError),
     CleanupFailures { count: usize, first: String },
@@ -183,7 +181,6 @@ impl Display for DistributedSessionRegistryError {
             Self::IdentityUnavailable => {
                 formatter.write_str("distributed Session identity is unavailable")
             }
-            Self::InvalidRecoveryState(message) => formatter.write_str(message),
             Self::TokenGeneration(error) => Display::fmt(error, formatter),
             Self::SessionIdGeneration(error) => Display::fmt(error, formatter),
             Self::CleanupFailures { count, first } => {
@@ -262,7 +259,7 @@ enum SessionSlotState {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionCleanupDisposition {
     Resume,
     Remove,
@@ -272,7 +269,7 @@ struct SessionSlot {
     origin: SessionOrigin,
     execution_scope: u64,
     principal: SessionPrincipal,
-    runtime: DistributedSessionRuntime,
+    runtime: SessionRuntimeSlab,
     transport_generation: u64,
     resume_digest: [u8; 32],
     state: SessionSlotState,
@@ -282,113 +279,55 @@ struct SessionSlot {
     next_lane: u8,
 }
 
-#[derive(Serialize, Deserialize)]
-enum RecoveredSessionState {
-    Connected,
-    Stale {
-        deadline_millis: u64,
-        cleanup: Option<SessionCleanupDisposition>,
-    },
+/// Copy-on-write state for one row of the compiled Session template.
+///
+/// Registry transactions clone the indexed slot table frequently. Sharing the
+/// settled runtime here keeps that clone proportional to slot metadata; only a
+/// row actually mutated by a candidate transaction forks its runtime state.
+struct SessionRuntimeSlab {
+    settled: Arc<DistributedSessionRuntime>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SessionRecoveryRecord {
-    format_version: u16,
-    graph_id: [u8; 32],
-    graph_revision: u64,
-    schema_hash: [u8; 32],
-    session_id: [u8; 32],
-    origin_slot: u32,
-    origin_generation: u64,
-    execution_scope: u64,
-    principal: SessionPrincipal,
-    transport_generation: u64,
-    resume_digest: [u8; 32],
-    state: RecoveredSessionState,
-    runtime_payload: Vec<u8>,
-    pending_server_messages: Vec<DistributedMessage>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RegistryRecoveryRecord {
-    format_version: u16,
-    graph_id: [u8; 32],
-    graph_revision: u64,
-    schema_hash: [u8; 32],
-    session_keys: Vec<[u8; 32]>,
-    slot_epochs: BTreeMap<u32, u64>,
-    next_execution_scope: u64,
-    authority_turn_sequence: u64,
-    router_payload: Vec<u8>,
-}
-
-struct PreparedProtocolPut {
-    key: boon_persistence::ProtocolStateKey,
-    expected_revision: Option<u64>,
-    next_revision: u64,
-    payload: boon_persistence::Bytes,
-}
-
-pub(crate) struct PreparedDistributedRecoveryCheckpoint {
-    root_key: boon_persistence::ProtocolStateKey,
-    puts: Vec<PreparedProtocolPut>,
-    deletes: Vec<(boon_persistence::ProtocolStateKey, u64)>,
-    next_revisions: BTreeMap<boon_persistence::ProtocolStateKey, u64>,
-}
-
-impl PreparedDistributedRecoveryCheckpoint {
-    pub(crate) fn changes(
-        &self,
-        turn_sequence: u64,
-    ) -> Result<Vec<boon_persistence::DurableProtocolStateChange>, DistributedSessionRegistryError>
-    {
-        if turn_sequence == 0 {
-            return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                "distributed recovery checkpoint turn must be positive",
-            ));
+impl SessionRuntimeSlab {
+    fn new(runtime: DistributedSessionRuntime) -> Self {
+        Self {
+            settled: Arc::new(runtime),
         }
-        let changes = self
-            .puts
-            .iter()
-            .map(|put| {
-                let payload = if put.key == self.root_key {
-                    let mut root: RegistryRecoveryRecord = decode_recovery_record(&put.payload)?;
-                    root.authority_turn_sequence = turn_sequence;
-                    encode_recovery_record(&root)?.into()
-                } else {
-                    put.payload.clone()
-                };
-                Ok(boon_persistence::DurableProtocolStateChange::Put {
-                    key: put.key,
-                    expected_revision: put.expected_revision,
-                    next_revision: put.next_revision,
-                    payload,
-                    turn_sequence,
-                })
-            })
-            .chain(self.deletes.iter().map(|(key, expected_revision)| {
-                Ok(boon_persistence::DurableProtocolStateChange::Delete {
-                    key: *key,
-                    expected_revision: *expected_revision,
-                    turn_sequence,
-                })
-            }))
-            .collect::<Result<Vec<_>, DistributedSessionRegistryError>>()?;
-        let total_bytes = changes.iter().try_fold(0usize, |total, change| {
-            let bytes = match change {
-                boon_persistence::DurableProtocolStateChange::Put { payload, .. } => payload.len(),
-                boon_persistence::DurableProtocolStateChange::Delete { .. } => 0,
-            };
-            total.checked_add(bytes)
-        });
-        if total_bytes.is_none_or(|bytes| bytes > boon_persistence::MAX_PROTOCOL_STATE_BYTES) {
-            return Err(DistributedSessionRegistryError::Runtime(
-                DistributedRuntimeError::QueueBytesFull {
-                    limit: boon_persistence::MAX_PROTOCOL_STATE_BYTES,
-                },
-            ));
+    }
+
+    fn get(&self) -> &DistributedSessionRuntime {
+        self.settled.as_ref()
+    }
+
+    fn get_mut(
+        &mut self,
+    ) -> Result<&mut DistributedSessionRuntime, DistributedSessionRegistryError> {
+        if Arc::get_mut(&mut self.settled).is_none() {
+            self.settled = Arc::new(self.settled.fork_settled()?);
         }
-        Ok(changes)
+        Ok(Arc::get_mut(&mut self.settled)
+            .expect("a freshly forked Session runtime slab has one owner"))
+    }
+
+    #[cfg(test)]
+    fn shares_settled_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.settled, &other.settled)
+    }
+}
+
+impl Clone for SessionRuntimeSlab {
+    fn clone(&self) -> Self {
+        Self {
+            settled: Arc::clone(&self.settled),
+        }
+    }
+}
+
+impl Deref for SessionRuntimeSlab {
+    type Target = DistributedSessionRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
     }
 }
 
@@ -403,7 +342,7 @@ impl SessionSlot {
             origin: self.origin,
             execution_scope: self.execution_scope,
             principal: self.principal.clone(),
-            runtime: self.runtime.fork_settled()?,
+            runtime: self.runtime.clone(),
             transport_generation: self.transport_generation,
             resume_digest: self.resume_digest,
             state: match self.state {
@@ -442,16 +381,22 @@ impl SessionSlot {
             .try_fold(self.pending_server_bytes, usize::checked_add)
     }
 
-    fn has_runnable_work(&self) -> bool {
+    fn has_runnable_work(&self, now: Duration) -> bool {
         matches!(
             self.state,
             SessionSlotState::Stale {
                 cleanup: Some(_),
                 ..
             }
+        ) || matches!(
+            self.state,
+            SessionSlotState::Stale {
+                deadline,
+                cleanup: None,
+            } if now >= deadline
         ) || !self.pending_server_messages.is_empty()
             || (self.connected_id().is_some() && !self.inbound_frame_sizes.is_empty())
-            || self.runtime.pending_server_messages() > 0
+            || self.runtime.get().pending_server_messages() > 0
     }
 }
 
@@ -473,14 +418,20 @@ pub struct DistributedSessionRegistry {
     global_reserved_queue_bytes: usize,
     pending_session_turns: VecDeque<(SessionOrigin, RuntimeTurn)>,
     pending_server_turns: VecDeque<(SessionOrigin, RuntimeTurn)>,
-    pending_durable_protocol_checkpoints: usize,
-    recovery_revisions: BTreeMap<boon_persistence::ProtocolStateKey, u64>,
+    #[cfg(test)]
+    inject_server_publication_queue_pressure: Arc<AtomicBool>,
 }
 
 impl DistributedSessionRegistry {
     #[cfg(test)]
     pub(crate) fn set_session_queue_limits_for_test(&mut self, limits: DistributedQueueLimits) {
         self.config.session_queue_limits = limits;
+    }
+
+    #[cfg(test)]
+    fn inject_server_publication_queue_pressure_for_test(&mut self) {
+        self.inject_server_publication_queue_pressure
+            .store(true, Ordering::SeqCst);
     }
 
     pub fn start(
@@ -521,196 +472,9 @@ impl DistributedSessionRegistry {
             global_reserved_queue_bytes: 0,
             pending_session_turns: VecDeque::new(),
             pending_server_turns: VecDeque::new(),
-            pending_durable_protocol_checkpoints: 0,
-            recovery_revisions: BTreeMap::new(),
+            #[cfg(test)]
+            inject_server_publication_queue_pressure: Arc::new(AtomicBool::new(false)),
         })
-    }
-
-    pub(crate) fn start_with_recovery(
-        bundle: &DistributedProgramBundle,
-        config: DistributedSessionRegistryConfig,
-        snapshot: &boon_persistence::ProtocolStateSnapshot,
-        authority_turn_sequence: u64,
-        now: Duration,
-    ) -> Result<(Self, Option<Vec<u8>>), DistributedSessionRegistryError> {
-        let mut registry = Self::start(bundle, config)?;
-        let root_key = recovery_root_key(registry.identity);
-        let Some(root_record) = snapshot.records.get(&root_key) else {
-            return Ok((registry, None));
-        };
-        registry.observe_now(now)?;
-        if root_record.revision == 0 {
-            return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                "distributed recovery root has an invalid revision",
-            ));
-        }
-        let root: RegistryRecoveryRecord = decode_recovery_record(&root_record.payload)?;
-        validate_recovery_identity(
-            registry.identity,
-            root.format_version,
-            root.graph_id,
-            root.graph_revision,
-            root.schema_hash,
-        )?;
-        if root.next_execution_scope == 0
-            || root.next_execution_scope == u64::MAX
-            || root.authority_turn_sequence == 0
-            || root.authority_turn_sequence != authority_turn_sequence
-            || root.session_keys.len() > config.max_sessions
-        {
-            return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                "distributed recovery root exceeds configured bounds",
-            ));
-        }
-        let session_keys = root
-            .session_keys
-            .iter()
-            .copied()
-            .map(boon_persistence::ProtocolStateKey)
-            .collect::<BTreeSet<_>>();
-        if session_keys.len() != root.session_keys.len() {
-            return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                "distributed recovery root repeats a Session record key",
-            ));
-        }
-
-        let mut scopes = BTreeSet::new();
-        let mut queued_bytes = 0usize;
-        for key in session_keys.iter().copied() {
-            let stored = snapshot.records.get(&key).ok_or(
-                DistributedSessionRegistryError::InvalidRecoveryState(
-                    "distributed recovery root references a missing Session record",
-                ),
-            )?;
-            if stored.revision == 0 {
-                return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                    "distributed Session recovery record has an invalid revision",
-                ));
-            }
-            let recovered: SessionRecoveryRecord = decode_recovery_record(&stored.payload)?;
-            validate_recovery_identity(
-                registry.identity,
-                recovered.format_version,
-                recovered.graph_id,
-                recovered.graph_revision,
-                recovered.schema_hash,
-            )?;
-            let session_id = SessionId::from_bytes(recovered.session_id);
-            if recovery_session_key(registry.identity, session_id) != key
-                || recovered.transport_generation == 0
-                || recovered.execution_scope == 0
-                || recovered.execution_scope == u64::MAX
-                || !scopes.insert(recovered.execution_scope)
-            {
-                return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                    "distributed Session recovery identity is invalid",
-                ));
-            }
-            recovered.principal.validate().map_err(|_| {
-                DistributedSessionRegistryError::InvalidRecoveryState(
-                    "distributed Session recovery principal is invalid",
-                )
-            })?;
-            let origin = SessionOrigin::new(recovered.origin_slot, recovered.origin_generation)?;
-            if registry.slots.contains_key(&recovered.origin_slot)
-                || root.slot_epochs.get(&recovered.origin_slot).copied()
-                    != Some(recovered.origin_generation)
-                || registry.resume_index.contains_key(&recovered.resume_digest)
-            {
-                return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                    "distributed Session recovery origin or resume digest is duplicated",
-                ));
-            }
-            let mut runtime = registry
-                .session_template
-                .restore(&recovered.runtime_payload, config.session_queue_limits)?;
-            if runtime.session_id() != session_id
-                || runtime.transport_generation() != recovered.transport_generation
-            {
-                return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                    "distributed Session runtime recovery identity does not match its envelope",
-                ));
-            }
-            let stale = runtime.mark_stale()?;
-            registry.record_session_update(origin, stale);
-
-            let (pending_server_messages, pending_server_bytes) = recovered
-                .pending_server_messages
-                .into_iter()
-                .try_fold((VecDeque::new(), 0usize), |(messages, _), message| {
-                    candidate_server_queue(&messages, message, config.session_queue_limits)
-                })?;
-            queued_bytes = queued_bytes.checked_add(pending_server_bytes).ok_or(
-                DistributedSessionRegistryError::InvalidRecoveryState(
-                    "distributed recovery queue byte count overflowed",
-                ),
-            )?;
-            if queued_bytes > config.max_global_queued_bytes {
-                return Err(DistributedSessionRegistryError::Runtime(
-                    DistributedRuntimeError::QueueBytesFull {
-                        limit: config.max_global_queued_bytes,
-                    },
-                ));
-            }
-            let (deadline, cleanup) = match recovered.state {
-                RecoveredSessionState::Connected => {
-                    (checked_deadline(now, DEFAULT_SESSION_RESUME_WINDOW)?, None)
-                }
-                RecoveredSessionState::Stale {
-                    deadline_millis,
-                    cleanup,
-                } => (Duration::from_millis(deadline_millis), cleanup),
-            };
-            registry
-                .resume_index
-                .insert(recovered.resume_digest, recovered.origin_slot);
-            registry.slots.insert(
-                recovered.origin_slot,
-                SessionSlot {
-                    origin,
-                    execution_scope: recovered.execution_scope,
-                    principal: recovered.principal,
-                    runtime,
-                    transport_generation: recovered.transport_generation,
-                    resume_digest: recovered.resume_digest,
-                    state: SessionSlotState::Stale { deadline, cleanup },
-                    inbound_frame_sizes: VecDeque::new(),
-                    pending_server_messages,
-                    pending_server_bytes,
-                    next_lane: 0,
-                },
-            );
-            registry.recovery_revisions.insert(key, stored.revision);
-        }
-        let queue_reservation = queue_reservation_per_session(config)?;
-        registry.global_reserved_queue_bytes = queue_reservation
-            .checked_mul(registry.slots.len())
-            .ok_or(DistributedSessionRegistryError::InvalidRecoveryState(
-                "distributed recovery queue reservation overflowed",
-            ))?;
-        if registry.global_reserved_queue_bytes > config.max_global_queued_bytes {
-            return Err(DistributedSessionRegistryError::Runtime(
-                DistributedRuntimeError::QueueBytesFull {
-                    limit: config.max_global_queued_bytes,
-                },
-            ));
-        }
-        if scopes
-            .iter()
-            .next_back()
-            .is_some_and(|scope| *scope >= root.next_execution_scope)
-        {
-            return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                "distributed recovery execution scope cursor is stale",
-            ));
-        }
-        registry.slot_epochs = root.slot_epochs;
-        registry.next_execution_scope = root.next_execution_scope;
-        registry.global_queued_bytes = queued_bytes;
-        registry
-            .recovery_revisions
-            .insert(root_key, root_record.revision);
-        Ok((registry, Some(root.router_payload)))
     }
 
     pub fn identity(&self) -> DistributedSessionRegistryIdentity {
@@ -741,168 +505,17 @@ impl DistributedSessionRegistry {
             global_reserved_queue_bytes: self.global_reserved_queue_bytes,
             pending_session_turns: self.pending_session_turns.clone(),
             pending_server_turns: self.pending_server_turns.clone(),
-            pending_durable_protocol_checkpoints: self.pending_durable_protocol_checkpoints,
-            recovery_revisions: self.recovery_revisions.clone(),
+            #[cfg(test)]
+            inject_server_publication_queue_pressure: Arc::clone(
+                &self.inject_server_publication_queue_pressure,
+            ),
         })
     }
 
-    pub(crate) fn prepare_recovery_checkpoint(
-        &self,
-        router_payload: Vec<u8>,
-    ) -> Result<PreparedDistributedRecoveryCheckpoint, DistributedSessionRegistryError> {
-        self.prepare_recovery_checkpoint_with_slot_overrides(router_payload, &BTreeMap::new())
-    }
-
-    fn prepare_recovery_checkpoint_with_slot_overrides(
-        &self,
-        router_payload: Vec<u8>,
-        slot_overrides: &BTreeMap<u32, SessionSlot>,
-    ) -> Result<PreparedDistributedRecoveryCheckpoint, DistributedSessionRegistryError> {
-        if slot_overrides.iter().any(|(slot_id, slot)| {
-            self.slots
-                .get(slot_id)
-                .is_none_or(|current| current.origin != slot.origin)
-        }) {
-            return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                "distributed recovery candidate replaces an unknown Session origin",
-            ));
-        }
-        let root_key = recovery_root_key(self.identity);
-        let mut payloads = BTreeMap::new();
-        let mut session_keys = Vec::with_capacity(self.slots.len());
-        for (slot_id, current_slot) in &self.slots {
-            let slot = slot_overrides.get(slot_id).unwrap_or(current_slot);
-            let session_id = slot.runtime.session_id();
-            let key = recovery_session_key(self.identity, session_id);
-            let state = match slot.state {
-                SessionSlotState::Connected { .. } => RecoveredSessionState::Connected,
-                SessionSlotState::Stale { deadline, cleanup } => RecoveredSessionState::Stale {
-                    deadline_millis: duration_millis(deadline)?,
-                    cleanup,
-                },
-            };
-            let record = SessionRecoveryRecord {
-                format_version: RECOVERY_FORMAT_VERSION,
-                graph_id: self.identity.graph_id,
-                graph_revision: self.identity.graph_revision,
-                schema_hash: self.identity.schema_hash,
-                session_id: session_id.into_bytes(),
-                origin_slot: slot.origin.slot(),
-                origin_generation: slot.origin.generation(),
-                execution_scope: slot.execution_scope,
-                principal: slot.principal.clone(),
-                transport_generation: slot.transport_generation,
-                resume_digest: slot.resume_digest,
-                state,
-                runtime_payload: slot.runtime.recovery_payload()?,
-                pending_server_messages: slot.pending_server_messages.iter().cloned().collect(),
-            };
-            payloads.insert(key, encode_recovery_record(&record)?);
-            session_keys.push(key.0);
-        }
-        let root = RegistryRecoveryRecord {
-            format_version: RECOVERY_FORMAT_VERSION,
-            graph_id: self.identity.graph_id,
-            graph_revision: self.identity.graph_revision,
-            schema_hash: self.identity.schema_hash,
-            session_keys,
-            slot_epochs: self.slot_epochs.clone(),
-            next_execution_scope: self.next_execution_scope,
-            authority_turn_sequence: 0,
-            router_payload,
-        };
-        payloads.insert(root_key, encode_recovery_record(&root)?);
-
-        let total_bytes = payloads
-            .values()
-            .try_fold(0usize, |total, payload| total.checked_add(payload.len()));
-        if total_bytes.is_none_or(|bytes| bytes > boon_persistence::MAX_PROTOCOL_STATE_BYTES) {
-            return Err(DistributedSessionRegistryError::Runtime(
-                DistributedRuntimeError::QueueBytesFull {
-                    limit: boon_persistence::MAX_PROTOCOL_STATE_BYTES,
-                },
-            ));
-        }
-
-        let mut puts = Vec::with_capacity(payloads.len());
-        let mut next_revisions = BTreeMap::new();
-        for (key, payload) in payloads {
-            let expected_revision = self.recovery_revisions.get(&key).copied();
-            let next_revision = expected_revision.unwrap_or(0).checked_add(1).ok_or(
-                DistributedSessionRegistryError::Runtime(
-                    DistributedRuntimeError::StaleTransportGeneration,
-                ),
-            )?;
-            puts.push(PreparedProtocolPut {
-                key,
-                expected_revision,
-                next_revision,
-                payload: payload.into(),
-            });
-            next_revisions.insert(key, next_revision);
-        }
-        let deletes = self
-            .recovery_revisions
-            .iter()
-            .filter_map(|(key, revision)| {
-                (!next_revisions.contains_key(key)).then_some((*key, *revision))
-            })
-            .collect();
-        Ok(PreparedDistributedRecoveryCheckpoint {
-            root_key,
-            puts,
-            deletes,
-            next_revisions,
-        })
-    }
-
-    pub(crate) fn prepare_recovery_checkpoint_with_deliveries(
-        &self,
-        router_payload: Vec<u8>,
-        deliveries: &PreparedDistributedSessionDeliveries,
-    ) -> Result<PreparedDistributedRecoveryCheckpoint, DistributedSessionRegistryError> {
-        let candidates = self.fork_delivery_slots(deliveries)?;
-        self.prepare_recovery_checkpoint_with_slot_overrides(router_payload, &candidates)
-    }
-
-    pub(crate) fn validate_router_recovery(
-        &self,
-        router: &boon_runtime::DistributedServerRuntime,
-    ) -> Result<(), DistributedSessionRegistryError> {
-        if router.recovery_origin_count() != self.slots.len()
-            || self.slots.values().any(|slot| {
-                !router.recovery_origin_matches(slot.origin, &slot.principal, slot.execution_scope)
-            })
-        {
-            return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-                "distributed Server router origins do not match recovered Sessions",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn commit_recovery_checkpoint(
+    fn commit_registry_candidate_checkpoint(
         &mut self,
-        prepared: PreparedDistributedRecoveryCheckpoint,
-    ) {
-        self.recovery_revisions = prepared.next_revisions;
-    }
-
-    fn commit_registry_candidate_checkpoint<M: DistributedServerMachine>(
-        &mut self,
-        server: &mut DistributedServerAuthority<'_, M>,
-        mut candidate: Self,
+        candidate: Self,
     ) -> Result<(), DistributedSessionRegistryError> {
-        if server.supports_protocol_state() {
-            let prepared = candidate.prepare_recovery_checkpoint(server.recovery_payload()?)?;
-            server.commit_protocol_checkpoint(|turn_sequence| {
-                prepared
-                    .changes(turn_sequence)
-                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-            })?;
-            candidate.commit_recovery_checkpoint(prepared);
-            candidate.pending_durable_protocol_checkpoints += 1;
-        }
         *self = candidate;
         Ok(())
     }
@@ -918,42 +531,7 @@ impl DistributedSessionRegistry {
             server.rollback_prepared_transaction(prepared)?;
             return Err(error);
         }
-        let checkpoint = if server.supports_protocol_state() {
-            match prepared
-                .candidate_recovery_payload()
-                .map_err(DistributedSessionRegistryError::from)
-                .and_then(|payload| candidate.prepare_recovery_checkpoint(payload))
-            {
-                Ok(checkpoint) => Some(checkpoint),
-                Err(error) => {
-                    server.rollback_prepared_transaction(prepared)?;
-                    return Err(error);
-                }
-            }
-        } else {
-            None
-        };
-        let update = match checkpoint.as_ref() {
-            Some(checkpoint) => server.commit_prepared_transaction_with_protocol_state(
-                prepared,
-                |turn_sequence| {
-                    checkpoint
-                        .changes(turn_sequence)
-                        .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-                },
-            )?,
-            None => server.commit_prepared_transaction(prepared)?,
-        };
-        let has_source_turn = update
-            .turns
-            .iter()
-            .any(|turn| turn.source_sequence.is_some());
-        if let Some(checkpoint) = checkpoint {
-            candidate.commit_recovery_checkpoint(checkpoint);
-            if !has_source_turn {
-                candidate.pending_durable_protocol_checkpoints += 1;
-            }
-        }
+        let update = server.commit_prepared_transaction(prepared)?;
         candidate
             .pending_server_turns
             .extend(update.turns.into_iter().map(|turn| (origin, turn)));
@@ -965,25 +543,16 @@ impl DistributedSessionRegistry {
         self.slots.len()
     }
 
-    pub(crate) fn take_direct_lifecycle_durable_admissions(
+    pub(crate) fn take_direct_lifecycle_turns(
         &mut self,
-    ) -> Result<usize, DistributedSessionRegistryError> {
-        let source_turns = self
-            .pending_server_turns
-            .iter()
-            .filter(|(_, turn)| turn.source_sequence.is_some())
-            .count();
-        self.pending_session_turns.clear();
-        self.pending_server_turns.clear();
-        source_turns
-            .checked_add(std::mem::take(
-                &mut self.pending_durable_protocol_checkpoints,
-            ))
-            .ok_or_else(|| {
-                DistributedSessionRegistryError::Runtime(DistributedRuntimeError::Runtime(
-                    "distributed lifecycle durability count overflowed".to_owned(),
-                ))
-            })
+    ) -> (
+        VecDeque<(SessionOrigin, RuntimeTurn)>,
+        VecDeque<(SessionOrigin, RuntimeTurn)>,
+    ) {
+        (
+            std::mem::take(&mut self.pending_session_turns),
+            std::mem::take(&mut self.pending_server_turns),
+        )
     }
 
     pub fn global_queued_bytes(&self) -> usize {
@@ -995,7 +564,9 @@ impl DistributedSessionRegistry {
     }
 
     pub fn has_runnable_work(&self) -> bool {
-        self.slots.values().any(SessionSlot::has_runnable_work)
+        self.slots
+            .values()
+            .any(|slot| slot.has_runnable_work(self.last_now))
     }
 
     pub fn pending_client_frames(
@@ -1037,12 +608,11 @@ impl DistributedSessionRegistry {
 
     pub fn begin_handshake(
         &mut self,
-        server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
         now: Duration,
         principal: SessionPrincipal,
         client_frame: &[u8],
     ) -> Result<DistributedSessionHandshakeStart, DistributedSessionRegistryError> {
-        self.expire(server, now)?;
+        self.observe_lifecycle(now)?;
         let SessionControlFrame::ClientHello(hello) = decode_session_control_frame(client_frame)?
         else {
             return Err(DistributedSessionRegistryError::UnexpectedControlFrame);
@@ -1144,7 +714,7 @@ impl DistributedSessionRegistry {
         slot_id: u32,
         connection_id: DistributedSessionConnectionId,
     ) -> Result<(), DistributedSessionRegistryError> {
-        let deadline = checked_deadline(now, DEFAULT_SESSION_RESUME_WINDOW)?;
+        let deadline = checked_deadline(now, self.config.resume_window)?;
         debug_assert!(matches!(
             self.connected_slot_id(connection_id),
             Ok(current) if current == slot_id
@@ -1186,55 +756,6 @@ impl DistributedSessionRegistry {
         Ok(acknowledgement)
     }
 
-    pub fn expire(
-        &mut self,
-        server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
-        now: Duration,
-    ) -> Result<usize, DistributedSessionRegistryError> {
-        self.observe_now(now)?;
-        self.pending_handshakes
-            .retain(|_, pending| now < pending.deadline);
-        let expired = self
-            .slots
-            .iter()
-            .filter_map(|(slot_id, slot)| {
-                let deadline = match &slot.state {
-                    SessionSlotState::Stale { deadline, .. } => *deadline,
-                    SessionSlotState::Connected { .. } => return None,
-                };
-                (now >= deadline).then_some(*slot_id)
-            })
-            .collect::<Vec<_>>();
-        let mut failure_count = 0usize;
-        let mut first_failure = None;
-        for slot_id in expired.iter().copied() {
-            let transition = match self.slots.get(&slot_id).map(|slot| &slot.state) {
-                Some(SessionSlotState::Stale {
-                    cleanup: Some(SessionCleanupDisposition::Remove),
-                    ..
-                }) => Ok(()),
-                Some(SessionSlotState::Stale { deadline, .. }) => self.begin_stale_cleanup(
-                    server,
-                    slot_id,
-                    *deadline,
-                    SessionCleanupDisposition::Remove,
-                ),
-                _ => continue,
-            };
-            if let Err(error) = transition.and_then(|()| self.drive_cleanup(server, slot_id)) {
-                failure_count += 1;
-                first_failure.get_or_insert_with(|| bounded_diagnostic(&error));
-            }
-        }
-        if let Some(first) = first_failure {
-            return Err(DistributedSessionRegistryError::CleanupFailures {
-                count: failure_count,
-                first,
-            });
-        }
-        Ok(expired.len())
-    }
-
     pub fn admit_client_frame(
         &mut self,
         connection_id: DistributedSessionConnectionId,
@@ -1246,7 +767,7 @@ impl DistributedSessionRegistry {
             .slots
             .get_mut(&slot_id)
             .expect("connection index points to a Session slot");
-        slot.runtime.admit_client_frame(frame)?;
+        slot.runtime.get_mut()?.admit_client_frame(frame)?;
         slot.inbound_frame_sizes.push_back(frame.len());
         self.global_queued_bytes += frame.len();
         Ok(())
@@ -1261,6 +782,7 @@ impl DistributedSessionRegistry {
             .get_mut(&slot_id)
             .expect("connection index points to a Session slot")
             .runtime
+            .get_mut()?
             .next_client_frame()
             .map_err(Into::into)
     }
@@ -1275,6 +797,7 @@ impl DistributedSessionRegistry {
             .get_mut(&slot_id)
             .expect("connection index points to a Session slot")
             .runtime
+            .get_mut()?
             .acknowledge_client_frame())
     }
 
@@ -1288,42 +811,40 @@ impl DistributedSessionRegistry {
             .get_mut(&slot_id)
             .expect("connection index points to a Session slot")
             .runtime
+            .get_mut()?
             .root_value_current(name)
             .map_err(Into::into)
     }
 
     pub fn complete_session_transient_effect(
         &mut self,
-        server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
         origin: SessionOrigin,
         call_id: boon_runtime::TransientEffectCallId,
         outcome: Value,
     ) -> Result<bool, DistributedSessionRegistryError> {
-        self.apply_session_transient_effect_update(server, origin, call_id, |runtime| {
+        self.apply_session_transient_effect_update(origin, call_id, |runtime| {
             runtime.complete_transient_effect(call_id, outcome)
         })
     }
 
     pub fn deliver_session_transient_effect_result(
         &mut self,
-        server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
         origin: SessionOrigin,
         call_id: boon_runtime::TransientEffectCallId,
         result_sequence: u64,
         outcome: Value,
     ) -> Result<bool, DistributedSessionRegistryError> {
-        self.apply_session_transient_effect_update(server, origin, call_id, |runtime| {
+        self.apply_session_transient_effect_update(origin, call_id, |runtime| {
             runtime.deliver_transient_effect_result(call_id, result_sequence, outcome)
         })
     }
 
     pub fn cancel_session_transient_effect(
         &mut self,
-        server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
         origin: SessionOrigin,
         call_id: boon_runtime::TransientEffectCallId,
     ) -> Result<(), DistributedSessionRegistryError> {
-        self.apply_session_transient_effect_update(server, origin, call_id, |runtime| {
+        self.apply_session_transient_effect_update(origin, call_id, |runtime| {
             runtime.cancel_transient_effect(call_id)
         })?;
         Ok(())
@@ -1331,7 +852,6 @@ impl DistributedSessionRegistry {
 
     fn apply_session_transient_effect_update(
         &mut self,
-        server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
         origin: SessionOrigin,
         call_id: boon_runtime::TransientEffectCallId,
         apply: impl FnOnce(
@@ -1344,22 +864,9 @@ impl DistributedSessionRegistry {
             .get(&slot_id)
             .expect("resolved Session origin remains registered")
             .fork_settled()?;
-        let update = apply(&mut candidate.runtime)?;
+        let update = apply(candidate.runtime.get_mut()?)?;
         let pending = candidate.runtime.has_pending_transient_effect(call_id);
         let candidates = BTreeMap::from([(slot_id, candidate)]);
-        if server.supports_protocol_state() {
-            let prepared = self.prepare_recovery_checkpoint_with_slot_overrides(
-                server.recovery_payload()?,
-                &candidates,
-            )?;
-            server.commit_protocol_checkpoint(|turn_sequence| {
-                prepared
-                    .changes(turn_sequence)
-                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-            })?;
-            self.commit_recovery_checkpoint(prepared);
-            self.pending_durable_protocol_checkpoints += 1;
-        }
         self.commit_slot_candidates(candidates);
         self.record_session_update(origin, update);
         Ok(pending)
@@ -1383,12 +890,19 @@ impl DistributedSessionRegistry {
         now: Duration,
         maximum_steps: usize,
     ) -> Result<DistributedSessionRegistryPoll, DistributedSessionRegistryError> {
-        let expired_sessions = self.expire(server, now)?;
-        let mut poll = DistributedSessionRegistryPoll::new(expired_sessions);
+        self.observe_lifecycle(now)?;
+        let mut poll = DistributedSessionRegistryPoll::new(0);
         for _ in 0..maximum_steps {
             let Some(slot_id) = self.next_runnable_slot() else {
                 break;
             };
+            let completing_expiry = matches!(
+                self.slots.get(&slot_id).map(|slot| &slot.state),
+                Some(SessionSlotState::Stale {
+                    cleanup: Some(SessionCleanupDisposition::Remove),
+                    ..
+                })
+            );
             let origin = self
                 .slots
                 .get(&slot_id)
@@ -1402,6 +916,9 @@ impl DistributedSessionRegistry {
                     poll.serviced_origins.push(origin);
                     if let Some(connection_id) = connection_id {
                         poll.serviced_connections.push(connection_id);
+                    }
+                    if completing_expiry && !self.slots.contains_key(&slot_id) {
+                        poll.expired_sessions += 1;
                     }
                 }
                 LanePoll::Backpressured => poll.backpressured_origins.push(origin),
@@ -1423,8 +940,6 @@ impl DistributedSessionRegistry {
             .extend(self.pending_session_turns.drain(..));
         poll.server_turns
             .extend(self.pending_server_turns.drain(..));
-        poll.durable_protocol_checkpoints =
-            std::mem::take(&mut self.pending_durable_protocol_checkpoints);
         Ok(poll)
     }
 
@@ -1490,7 +1005,7 @@ impl DistributedSessionRegistry {
                 origin,
                 execution_scope,
                 principal,
-                runtime,
+                runtime: SessionRuntimeSlab::new(runtime),
                 transport_generation: next_transport_generation,
                 resume_digest: next_resume_digest,
                 state: SessionSlotState::Connected { connection_id },
@@ -1550,40 +1065,24 @@ impl DistributedSessionRegistry {
             (slot.origin, slot.resume_digest)
         };
 
-        let transition = (|| {
-            let rebind = self
+        let mut candidate = self.fork_settled()?;
+        let (rebind, current) = {
+            let slot = candidate
                 .slots
                 .get_mut(&slot_id)
-                .expect("validated resumable Session remains registered")
-                .runtime
-                .rebind_client(next_transport_generation, applied_server_through)?;
-            self.record_session_update(origin, rebind);
-            let current = self
-                .slots
-                .get_mut(&slot_id)
-                .expect("validated resumable Session remains registered")
-                .runtime
-                .mark_current()?;
-            self.record_session_update(origin, current);
-            let server_update =
-                server.set_origin_status(origin, SessionConnectionStatus::Current)?;
-            self.route_server_update(origin, server_update)
-        })();
-        if let Err(error) = transition {
-            if let Ok(stale) = self
-                .slots
-                .get_mut(&slot_id)
-                .expect("failed resume keeps its Session slot")
-                .runtime
-                .mark_stale()
-            {
-                self.record_session_update(origin, stale);
-            }
-            if let Ok(stale) = server.set_origin_status(origin, SessionConnectionStatus::Stale) {
-                let _ = self.route_server_update(origin, stale);
-            }
-            return Err(error);
-        }
+                .expect("validated resumable Session remains registered");
+            let runtime = slot.runtime.get_mut()?;
+            let rebind =
+                runtime.rebind_client(next_transport_generation, applied_server_through)?;
+            let current = runtime.mark_current()?;
+            (rebind, current)
+        };
+        candidate.record_session_update(origin, rebind);
+        candidate.record_session_update(origin, current);
+
+        let prepared =
+            server.prepare_origin_status_transaction(origin, SessionConnectionStatus::Current)?;
+        self.commit_registry_candidate_transaction(server, candidate, origin, prepared)?;
 
         self.resume_index.remove(&old_resume_digest);
         self.resume_index.insert(next_resume_digest, slot_id);
@@ -1798,6 +1297,13 @@ impl DistributedSessionRegistry {
         Ok(())
     }
 
+    fn observe_lifecycle(&mut self, now: Duration) -> Result<(), DistributedSessionRegistryError> {
+        self.observe_now(now)?;
+        self.pending_handshakes
+            .retain(|_, pending| now < pending.deadline);
+        Ok(())
+    }
+
     fn begin_stale_cleanup<M: DistributedServerMachine>(
         &mut self,
         server: &mut DistributedServerAuthority<'_, M>,
@@ -1806,7 +1312,14 @@ impl DistributedSessionRegistry {
         disposition: SessionCleanupDisposition,
     ) -> Result<(), DistributedSessionRegistryError> {
         let mut candidate = self.fork_settled()?;
-        let (origin, connection_id, resume_digest, inbound_bytes, cancellation, stale_update) = {
+        let (
+            origin,
+            connection_id,
+            resume_digest,
+            released_queue_bytes,
+            cancellation,
+            stale_update,
+        ) = {
             let slot = candidate
                 .slots
                 .get_mut(&slot_id)
@@ -1819,8 +1332,26 @@ impl DistributedSessionRegistry {
                 .ok_or(DistributedSessionRegistryError::InvalidConfig(
                     "distributed Session inbound-byte accounting overflowed",
                 ))?;
-            let cancellation = slot.runtime.cancel_all_transient_effects()?;
-            let stale_update = slot.runtime.mark_stale()?;
+            let pending_before = slot.pending_server_bytes;
+            slot.pending_server_messages
+                .retain(DistributedMessage::is_session_resume_snapshot);
+            slot.pending_server_bytes = slot
+                .pending_server_messages
+                .iter()
+                .try_fold(0usize, |total, message| {
+                    total.checked_add(estimated_message_bytes(message)?)
+                })
+                .ok_or(DistributedSessionRegistryError::InvalidConfig(
+                    "distributed Session retained-message accounting overflowed",
+                ))?;
+            let released_server_bytes = pending_before
+                .checked_sub(slot.pending_server_bytes)
+                .ok_or(DistributedSessionRegistryError::InvalidConfig(
+                    "distributed Session retained-message accounting underflowed",
+                ))?;
+            let runtime = slot.runtime.get_mut()?;
+            let cancellation = runtime.cancel_all_transient_effects()?;
+            let stale_update = runtime.mark_stale()?;
             let connection_id = slot.connection_id();
             slot.inbound_frame_sizes.clear();
             slot.state = SessionSlotState::Stale {
@@ -1831,14 +1362,18 @@ impl DistributedSessionRegistry {
                 slot.origin,
                 connection_id,
                 slot.resume_digest,
-                inbound_bytes,
+                inbound_bytes.checked_add(released_server_bytes).ok_or(
+                    DistributedSessionRegistryError::InvalidConfig(
+                        "distributed Session released-byte accounting overflowed",
+                    ),
+                )?,
                 cancellation,
                 stale_update,
             )
         };
         candidate.global_queued_bytes = candidate
             .global_queued_bytes
-            .checked_sub(inbound_bytes)
+            .checked_sub(released_queue_bytes)
             .ok_or(DistributedSessionRegistryError::InvalidConfig(
                 "distributed Session inbound-byte accounting underflowed",
             ))?;
@@ -1864,7 +1399,7 @@ impl DistributedSessionRegistry {
                 server.prepare_origin_status_transaction(origin, SessionConnectionStatus::Stale)?;
             self.commit_registry_candidate_transaction(server, candidate, origin, prepared)
         } else {
-            self.commit_registry_candidate_checkpoint(server, candidate)
+            self.commit_registry_candidate_checkpoint(candidate)
         }
     }
 
@@ -1922,7 +1457,7 @@ impl DistributedSessionRegistry {
         };
 
         if has_server_delivery {
-            return self.poll_server_delivery(server, slot_id);
+            return self.poll_server_delivery(slot_id);
         }
         if has_session_effect {
             let mut candidate = self.fork_settled()?;
@@ -1931,9 +1466,10 @@ impl DistributedSessionRegistry {
                 .get_mut(&slot_id)
                 .expect("cleanup Session remains registered")
                 .runtime
+                .get_mut()?
                 .cancel_all_transient_effects()?;
             candidate.record_session_update(origin, cancellation);
-            return self.commit_registry_candidate_checkpoint(server, candidate);
+            return self.commit_registry_candidate_checkpoint(candidate);
         }
         if has_session_delivery {
             return self.poll_session_delivery(server, slot_id);
@@ -1956,7 +1492,7 @@ impl DistributedSessionRegistry {
                     unreachable!("cleanup only runs for stale Sessions")
                 };
                 *cleanup = None;
-                self.commit_registry_candidate_checkpoint(server, candidate)
+                self.commit_registry_candidate_checkpoint(candidate)
             }
             SessionCleanupDisposition::Remove => {
                 let mut candidate = self.fork_settled()?;
@@ -1967,7 +1503,7 @@ impl DistributedSessionRegistry {
                     let prepared = server.prepare_origin_expiration_transaction(origin)?;
                     self.commit_registry_candidate_transaction(server, candidate, origin, prepared)
                 } else {
-                    self.commit_registry_candidate_checkpoint(server, candidate)
+                    self.commit_registry_candidate_checkpoint(candidate)
                 }
             }
         }
@@ -2077,12 +1613,14 @@ impl DistributedSessionRegistry {
                     std::ops::Bound::Excluded(cursor),
                     std::ops::Bound::Unbounded,
                 ))
-                .find_map(|(slot_id, slot)| slot.has_runnable_work().then_some(*slot_id))
+                .find_map(|(slot_id, slot)| {
+                    slot.has_runnable_work(self.last_now).then_some(*slot_id)
+                })
         });
         after_cursor.or_else(|| {
-            self.slots
-                .iter()
-                .find_map(|(slot_id, slot)| slot.has_runnable_work().then_some(*slot_id))
+            self.slots.iter().find_map(|(slot_id, slot)| {
+                slot.has_runnable_work(self.last_now).then_some(*slot_id)
+            })
         })
     }
 
@@ -2091,6 +1629,27 @@ impl DistributedSessionRegistry {
         server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
         slot_id: u32,
     ) -> LanePoll {
+        if let SessionSlotState::Stale {
+            deadline,
+            cleanup: None,
+        } = self
+            .slots
+            .get(&slot_id)
+            .expect("selected Session slot remains registered")
+            .state
+            && self.last_now >= deadline
+        {
+            return match self.begin_stale_cleanup(
+                server,
+                slot_id,
+                deadline,
+                SessionCleanupDisposition::Remove,
+            ) {
+                Ok(()) => LanePoll::Progress,
+                Err(error) if is_queue_pressure(&error) => LanePoll::Backpressured,
+                Err(error) => LanePoll::Poisoned(error),
+            };
+        }
         if matches!(
             self.slots
                 .get(&slot_id)
@@ -2130,8 +1689,8 @@ impl DistributedSessionRegistry {
                 continue;
             }
             let outcome = match lane {
-                0 => self.poll_server_delivery(server, slot_id),
-                1 => self.poll_client_admission(server, slot_id),
+                0 => self.poll_server_delivery(slot_id),
+                1 => self.poll_client_admission(slot_id),
                 2 => self.poll_session_delivery(server, slot_id),
                 _ => unreachable!(),
             };
@@ -2150,7 +1709,6 @@ impl DistributedSessionRegistry {
 
     fn poll_server_delivery(
         &mut self,
-        server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
         slot_id: u32,
     ) -> Result<(), DistributedSessionRegistryError> {
         let (origin, message, next_pending_bytes, next_global_queued) = {
@@ -2185,23 +1743,13 @@ impl DistributedSessionRegistry {
             .get(&slot_id)
             .expect("selected Session slot remains registered")
             .fork_settled()?;
-        let update = candidate.runtime.accept_server_message(message)?;
+        let update = candidate
+            .runtime
+            .get_mut()?
+            .accept_server_message(message)?;
         candidate.pending_server_messages.pop_front();
         candidate.pending_server_bytes = next_pending_bytes;
         let candidates = BTreeMap::from([(slot_id, candidate)]);
-        if server.supports_protocol_state() {
-            let prepared = self.prepare_recovery_checkpoint_with_slot_overrides(
-                server.recovery_payload()?,
-                &candidates,
-            )?;
-            server.commit_protocol_checkpoint(|turn_sequence| {
-                prepared
-                    .changes(turn_sequence)
-                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-            })?;
-            self.commit_recovery_checkpoint(prepared);
-            self.pending_durable_protocol_checkpoints += 1;
-        }
         self.commit_slot_candidates(candidates);
         self.global_queued_bytes = next_global_queued;
         self.record_session_update(origin, update);
@@ -2210,7 +1758,6 @@ impl DistributedSessionRegistry {
 
     fn poll_client_admission(
         &mut self,
-        server: &mut DistributedServerAuthority<'_, impl DistributedServerMachine>,
         slot_id: u32,
     ) -> Result<(), DistributedSessionRegistryError> {
         let (origin, next_global_queued) = {
@@ -2234,22 +1781,9 @@ impl DistributedSessionRegistry {
             .get(&slot_id)
             .expect("selected Session slot remains registered")
             .fork_settled()?;
-        let update = candidate.runtime.poll_client_frame()?;
+        let update = candidate.runtime.get_mut()?.poll_client_frame()?;
         candidate.inbound_frame_sizes.pop_front();
         let candidates = BTreeMap::from([(slot_id, candidate)]);
-        if server.supports_protocol_state() {
-            let prepared = self.prepare_recovery_checkpoint_with_slot_overrides(
-                server.recovery_payload()?,
-                &candidates,
-            )?;
-            server.commit_protocol_checkpoint(|turn_sequence| {
-                prepared
-                    .changes(turn_sequence)
-                    .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-            })?;
-            self.commit_recovery_checkpoint(prepared);
-            self.pending_durable_protocol_checkpoints += 1;
-        }
         self.commit_slot_candidates(candidates);
         self.global_queued_bytes = next_global_queued;
         if let Some(update) = update {
@@ -2274,19 +1808,18 @@ impl DistributedSessionRegistry {
                 .expect("selected Session delivery lane is non-empty");
             (slot.origin, message)
         };
-        let prepared_update = server.prepare_session_message(origin, message)?;
-        let prepares_machine_turn = prepared_update.prepares_machine_turn();
-        let prepared_deliveries = match self.prepare_deliveries(prepared_update.deliveries()) {
+        let prepared_transaction = server.prepare_session_message(origin, message)?;
+        let prepared_deliveries = match self.prepare_deliveries(prepared_transaction.deliveries()) {
             Ok(prepared) => prepared,
             Err(error) => {
-                server.rollback_prepared_update(prepared_update)?;
+                server.rollback_prepared_transaction(prepared_transaction)?;
                 return Err(error);
             }
         };
         let mut candidates = match self.fork_delivery_slots(&prepared_deliveries) {
             Ok(candidates) => candidates,
             Err(error) => {
-                server.rollback_prepared_update(prepared_update)?;
+                server.rollback_prepared_transaction(prepared_transaction)?;
                 return Err(error);
             }
         };
@@ -2301,7 +1834,7 @@ impl DistributedSessionRegistry {
                 {
                     Ok(source) => source,
                     Err(error) => {
-                        server.rollback_prepared_update(prepared_update)?;
+                        server.rollback_prepared_transaction(prepared_transaction)?;
                         return Err(error);
                     }
                 };
@@ -2311,42 +1844,10 @@ impl DistributedSessionRegistry {
                     .expect("inserted source Session candidate")
             }
         };
-        let acknowledged = source.runtime.acknowledge_server_message();
+        let acknowledged = source.runtime.get_mut()?.acknowledge_server_message();
         debug_assert!(acknowledged);
 
-        let update = if server.supports_protocol_state() {
-            let router_payload = match prepared_update.candidate_recovery_payload() {
-                Ok(payload) => payload,
-                Err(error) => {
-                    server.rollback_prepared_update(prepared_update)?;
-                    return Err(error.into());
-                }
-            };
-            let checkpoint = match self
-                .prepare_recovery_checkpoint_with_slot_overrides(router_payload, &candidates)
-            {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => {
-                    server.rollback_prepared_update(prepared_update)?;
-                    return Err(error);
-                }
-            };
-            let update = server.commit_prepared_update_with_protocol_state(
-                prepared_update,
-                |turn_sequence| {
-                    checkpoint
-                        .changes(turn_sequence)
-                        .map_err(|error| DistributedRuntimeError::Runtime(error.to_string()))
-                },
-            )?;
-            self.commit_recovery_checkpoint(checkpoint);
-            if !prepares_machine_turn {
-                self.pending_durable_protocol_checkpoints += 1;
-            }
-            update
-        } else {
-            server.commit_prepared_update(prepared_update)?
-        };
+        let update = server.commit_prepared_transaction(prepared_transaction)?;
         self.commit_slot_candidates(candidates);
         self.global_queued_bytes = prepared_deliveries.prospective_global;
         self.pending_server_turns
@@ -2363,6 +1864,17 @@ impl DistributedSessionRegistry {
         &mut self,
         deliveries: Vec<ServerDelivery>,
     ) -> Result<(), DistributedSessionRegistryError> {
+        #[cfg(test)]
+        if self
+            .inject_server_publication_queue_pressure
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(DistributedSessionRegistryError::Runtime(
+                DistributedRuntimeError::QueueFull {
+                    limit: self.config.session_queue_limits.max_messages,
+                },
+            ));
+        }
         if deliveries.is_empty() {
             return Ok(());
         }
@@ -2416,6 +1928,11 @@ impl DistributedSessionRegistry {
                     .slots
                     .get(&slot_id)
                     .expect("server delivery target remains registered");
+                if matches!(slot.state, SessionSlotState::Stale { .. })
+                    && !delivery.message.is_session_resume_snapshot()
+                {
+                    continue;
+                }
                 let (current, current_bytes) = candidates
                     .get(&slot_id)
                     .map(|(messages, bytes)| (messages, *bytes))
@@ -2515,9 +2032,12 @@ fn validate_config(
             "distributed per-Session queue limits must be positive",
         ));
     }
-    if config.handshake_timeout.is_zero()
-        || config.handshake_timeout > DEFAULT_SESSION_RESUME_WINDOW
-    {
+    if config.resume_window.is_zero() {
+        return Err(DistributedSessionRegistryError::InvalidConfig(
+            "distributed Session resume window must be positive",
+        ));
+    }
+    if config.handshake_timeout.is_zero() || config.handshake_timeout > config.resume_window {
         return Err(DistributedSessionRegistryError::InvalidConfig(
             "distributed Session handshake timeout must be positive and no longer than the resume window",
         ));
@@ -2544,109 +2064,6 @@ fn checked_deadline(
 ) -> Result<Duration, DistributedSessionRegistryError> {
     now.checked_add(window)
         .ok_or(DistributedSessionRegistryError::TimeOverflow)
-}
-
-fn duration_millis(duration: Duration) -> Result<u64, DistributedSessionRegistryError> {
-    duration
-        .as_millis()
-        .try_into()
-        .map_err(|_| DistributedSessionRegistryError::TimeOverflow)
-}
-
-fn encode_recovery_record(
-    record: &impl Serialize,
-) -> Result<Vec<u8>, DistributedSessionRegistryError> {
-    let mut payload = Vec::new();
-    ciborium::ser::into_writer(record, &mut payload).map_err(|_| {
-        DistributedSessionRegistryError::Runtime(DistributedRuntimeError::InvalidTransportFrame)
-    })?;
-    if payload.len() > boon_persistence::MAX_PROTOCOL_STATE_RECORD_BYTES {
-        return Err(DistributedSessionRegistryError::Runtime(
-            DistributedRuntimeError::QueueBytesFull {
-                limit: boon_persistence::MAX_PROTOCOL_STATE_RECORD_BYTES,
-            },
-        ));
-    }
-    Ok(payload)
-}
-
-fn decode_recovery_record<T>(payload: &[u8]) -> Result<T, DistributedSessionRegistryError>
-where
-    T: DeserializeOwned + Serialize,
-{
-    if payload.is_empty() || payload.len() > boon_persistence::MAX_PROTOCOL_STATE_RECORD_BYTES {
-        return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-            "distributed recovery record exceeds its byte bound",
-        ));
-    }
-    let record: T = ciborium::de::from_reader(payload).map_err(|_| {
-        DistributedSessionRegistryError::InvalidRecoveryState(
-            "distributed recovery record is not valid CBOR",
-        )
-    })?;
-    let canonical = encode_recovery_record(&record)?;
-    if canonical != payload {
-        return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-            "distributed recovery record is not canonical",
-        ));
-    }
-    Ok(record)
-}
-
-fn validate_recovery_identity(
-    expected: DistributedSessionRegistryIdentity,
-    format_version: u16,
-    graph_id: [u8; 32],
-    graph_revision: u64,
-    schema_hash: [u8; 32],
-) -> Result<(), DistributedSessionRegistryError> {
-    if format_version != RECOVERY_FORMAT_VERSION {
-        return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-            "distributed recovery format version is unsupported",
-        ));
-    }
-    if graph_id != expected.graph_id
-        || graph_revision != expected.graph_revision
-        || schema_hash != expected.schema_hash
-    {
-        return Err(DistributedSessionRegistryError::InvalidRecoveryState(
-            "distributed recovery graph identity does not match the active bundle",
-        ));
-    }
-    Ok(())
-}
-
-fn recovery_root_key(
-    identity: DistributedSessionRegistryIdentity,
-) -> boon_persistence::ProtocolStateKey {
-    recovery_key(RECOVERY_ROOT_KEY_DOMAIN, identity, None)
-}
-
-fn recovery_session_key(
-    identity: DistributedSessionRegistryIdentity,
-    session_id: SessionId,
-) -> boon_persistence::ProtocolStateKey {
-    recovery_key(
-        RECOVERY_SESSION_KEY_DOMAIN,
-        identity,
-        Some(session_id.as_bytes()),
-    )
-}
-
-fn recovery_key(
-    domain: &[u8],
-    identity: DistributedSessionRegistryIdentity,
-    session_id: Option<&[u8; 32]>,
-) -> boon_persistence::ProtocolStateKey {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(identity.graph_id);
-    hasher.update(identity.graph_revision.to_be_bytes());
-    hasher.update(identity.schema_hash);
-    if let Some(session_id) = session_id {
-        hasher.update(session_id);
-    }
-    boon_persistence::ProtocolStateKey(hasher.finalize().into())
 }
 
 fn bounded_diagnostic(error: &impl Display) -> String {
@@ -2959,9 +2376,7 @@ store: [
             principal: SessionPrincipal,
             client_frame: &[u8],
         ) -> Result<DistributedSessionHandshakeStart, DistributedSessionRegistryError> {
-            let mut server = self.server.bind(&mut self.server_machine);
-            self.registry
-                .begin_handshake(&mut server, now, principal, client_frame)
+            self.registry.begin_handshake(now, principal, client_frame)
         }
 
         fn commit_handshake(
@@ -3053,11 +2468,45 @@ store: [
             global_reserved_queue_bytes: _,
             pending_session_turns: _,
             pending_server_turns: _,
-            pending_durable_protocol_checkpoints: _,
-            recovery_revisions: _,
+            inject_server_publication_queue_pressure: _,
         } = registry;
         let _: DistributedServerRuntime = server;
         let _: ProgramSession = server_machine;
+    }
+
+    #[test]
+    fn registry_candidates_fork_only_the_mutated_indexed_session_slab() {
+        let mut registry = harness(DistributedSessionRegistryConfig::default());
+        let _first = connect(&mut registry, Duration::ZERO);
+        let _second = connect(&mut registry, Duration::ZERO);
+        let slot_ids = registry.registry.slots.keys().copied().collect::<Vec<_>>();
+        let mut candidate = registry.registry.fork_settled().unwrap();
+
+        for slot_id in &slot_ids {
+            assert!(
+                registry.registry.slots[slot_id]
+                    .runtime
+                    .shares_settled_state_with(&candidate.slots[slot_id].runtime)
+            );
+        }
+
+        candidate
+            .slots
+            .get_mut(&slot_ids[0])
+            .unwrap()
+            .runtime
+            .get_mut()
+            .unwrap();
+        assert!(
+            !registry.registry.slots[&slot_ids[0]]
+                .runtime
+                .shares_settled_state_with(&candidate.slots[&slot_ids[0]].runtime)
+        );
+        assert!(
+            registry.registry.slots[&slot_ids[1]]
+                .runtime
+                .shares_settled_state_with(&candidate.slots[&slot_ids[1]].runtime)
+        );
     }
 
     #[test]
@@ -3150,7 +2599,6 @@ store: [
         }
 
         let mut observed_server_turn = false;
-        let mut protocol_checkpoints = 0usize;
         for _ in 0..16 {
             let poll = program
                 .poll_distributed_sessions(Duration::ZERO, 64)
@@ -3164,7 +2612,6 @@ store: [
                     .collect::<Vec<_>>()
                     .join("; ")
             );
-            protocol_checkpoints += poll.durable_protocol_checkpoints;
             observed_server_turn |= poll
                 .server_turns
                 .iter()
@@ -3189,8 +2636,7 @@ store: [
         }
         assert!(observed_server_turn);
         let lifecycle = program.lifecycle_handle().unwrap().status();
-        let expected_turns =
-            post_handshake.accepted_turns + u64::try_from(protocol_checkpoints).unwrap() + 1;
+        let expected_turns = post_handshake.accepted_turns + 1;
         assert_eq!(lifecycle.accepted_turns, expected_turns);
         assert_eq!(lifecycle.durably_acknowledged_turns, expected_turns);
         assert!(lifecycle.last_error.is_none());
@@ -3198,7 +2644,12 @@ store: [
     }
 
     #[test]
-    fn persistent_handshake_restores_and_resumes_without_storing_the_bearer_token() {
+    fn persistent_sessions_remain_process_local_and_restart_requires_a_fresh_session() {
+        const CONNECTION_MARKER: u64 = 0xd1c2_b3a4_9586_7768;
+        const EXECUTION_SCOPE_MARKER: u64 = 0xe1d2_c3b4_a596_8778;
+        const ORIGIN_EPOCH_MARKER: u64 = 0xf1e2_d3c4_b5a6_9788;
+        const TRANSPORT_GENERATION_MARKER: u64 = 0xc1b2_a394_8576_6758;
+
         let bundle = bundle();
         let shared = SharedPersistenceDriver::default();
         let (mut program, _) = crate::BoonServerProgram::with_distributed_persistence(
@@ -3210,6 +2661,12 @@ store: [
             DistributedSessionRegistryConfig::default(),
         )
         .unwrap();
+        {
+            let registry = program.distributed_sessions.as_mut().unwrap();
+            registry.next_connection_id = CONNECTION_MARKER;
+            registry.next_execution_scope = EXECUTION_SCOPE_MARKER;
+            registry.slot_epochs.insert(0, ORIGIN_EPOCH_MARKER - 1);
+        }
         let identity = program.distributed_identity().unwrap();
         let offer = offered(
             program
@@ -3222,6 +2679,15 @@ store: [
         );
         let token_bytes = *offer.resume_token.as_bytes();
         let session_id = offer.session_id;
+        let session_id_bytes = *session_id.as_bytes();
+        let resume_digest_bytes = resume_digest(&offer.resume_token);
+        let token_storage = offer
+            .resume_token
+            .to_lookup_key()
+            .as_storage_str()
+            .to_owned();
+        let token_bytes_debug = format!("{token_bytes:?}");
+        let session_id_debug = format!("{:?}", session_id.as_bytes());
         program
             .commit_distributed_handshake(
                 Duration::ZERO,
@@ -3229,20 +2695,68 @@ store: [
                 &offer.commit_frame(),
             )
             .unwrap();
+        program
+            .distributed_sessions
+            .as_mut()
+            .unwrap()
+            .slots
+            .values_mut()
+            .next()
+            .unwrap()
+            .transport_generation = TRANSPORT_GENERATION_MARKER;
         let lifecycle = program.lifecycle_handle().unwrap().status();
-        assert_eq!(lifecycle.accepted_turns, 1);
-        assert_eq!(lifecycle.durably_acknowledged_turns, 1);
+        assert_eq!(lifecycle.accepted_turns, 0);
+        assert_eq!(lifecycle.durably_acknowledged_turns, 0);
 
         let persisted = shared.snapshot();
-        let application = bundle.artifact(ProgramRole::Server).unwrap().application();
-        let protocol = persisted.protocol_state(application).unwrap();
-        assert_eq!(protocol.records.len(), 2);
-        assert!(protocol.records.values().all(|record| {
-            !record
-                .payload
-                .windows(token_bytes.len())
-                .any(|window| window == token_bytes)
-        }));
+        let durable_image = persisted
+            .image(bundle.artifact(ProgramRole::Server).unwrap().application())
+            .expect("persistent Server image");
+        let durable_bytes = boon_persistence::encode_restore_image(durable_image).unwrap();
+        let session_value = {
+            let registry = program.distributed_sessions.as_mut().unwrap();
+            let slot = registry.slots.values_mut().next().unwrap();
+            slot.runtime
+                .get_mut()
+                .unwrap()
+                .root_value_current("store.count")
+                .unwrap()
+        };
+        let observable_surfaces = format!(
+            "{session_value:?}\n{lifecycle:?}\n{persisted:?}\n{:?}",
+            program.last_diagnostic()
+        );
+        for secret in [
+            token_storage,
+            token_bytes_debug,
+            session_id_debug,
+            format!("{resume_digest_bytes:?}"),
+            CONNECTION_MARKER.to_string(),
+            EXECUTION_SCOPE_MARKER.to_string(),
+            ORIGIN_EPOCH_MARKER.to_string(),
+            TRANSPORT_GENERATION_MARKER.to_string(),
+        ] {
+            assert!(
+                !observable_surfaces.contains(&secret),
+                "host-private Session identity leaked into Boon state, lifecycle reports, or durable state: {secret}"
+            );
+        }
+        for secret in [
+            token_bytes.as_slice(),
+            session_id_bytes.as_slice(),
+            resume_digest_bytes.as_slice(),
+            CONNECTION_MARKER.to_be_bytes().as_slice(),
+            EXECUTION_SCOPE_MARKER.to_be_bytes().as_slice(),
+            ORIGIN_EPOCH_MARKER.to_be_bytes().as_slice(),
+            TRANSPORT_GENERATION_MARKER.to_be_bytes().as_slice(),
+        ] {
+            assert!(
+                !durable_bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret),
+                "host-private Session bytes leaked into canonical durable state"
+            );
+        }
         program.shutdown_persistent().unwrap();
 
         let (mut restarted, _) = crate::BoonServerProgram::with_distributed_persistence(
@@ -3254,143 +2768,13 @@ store: [
             DistributedSessionRegistryConfig::default(),
         )
         .unwrap();
-        assert_eq!(restarted.distributed_session_count(), Some(1));
+        assert_eq!(restarted.distributed_session_count(), Some(0));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
-        let resumed = offered(
-            restarted
-                .begin_distributed_handshake(
-                    now,
-                    SessionPrincipal::Anonymous,
-                    &hello(
-                        restarted.distributed_identity().unwrap(),
-                        Some(ResumeToken::from_bytes(token_bytes)),
-                    ),
-                )
-                .unwrap(),
-        );
-        assert!(resumed.session_id == session_id);
-        assert_eq!(resumed.generation, 2);
-        let ready = restarted
-            .commit_distributed_handshake(now, resumed.connection_id, &resumed.commit_frame())
-            .unwrap();
-        assert_eq!(ready_generation(&ready), 2);
-        restarted.shutdown_persistent().unwrap();
-    }
-
-    #[test]
-    fn failed_persistent_disconnect_does_not_publish_or_checkpoint_stale_state() {
-        let bundle = bundle();
-        let shared = SharedPersistenceDriver::default();
-        let (mut program, _) = crate::BoonServerProgram::with_distributed_persistence(
-            bundle,
-            shared.clone(),
-            crate::PersistentServerConfig::authoritative(
-                boon_persistence::PersistenceWorkerConfig::default(),
-            ),
-            DistributedSessionRegistryConfig::default(),
-        )
-        .unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        let offer = offered(
-            program
-                .begin_distributed_handshake(
-                    now,
-                    SessionPrincipal::Anonymous,
-                    &hello(program.distributed_identity().unwrap(), None),
-                )
-                .unwrap(),
-        );
-        program
-            .commit_distributed_handshake(now, offer.connection_id, &offer.commit_frame())
-            .unwrap();
-        let application = bundle.artifact(ProgramRole::Server).unwrap().application();
-        let before = shared
-            .snapshot()
-            .protocol_state(application)
-            .unwrap()
-            .clone();
-
-        shared.fail_after_commits(0);
-        assert!(
-            program
-                .disconnect_distributed_session(now, offer.connection_id)
-                .is_err()
-        );
-        assert_eq!(program.distributed_session_count(), Some(1));
-        assert_eq!(
-            program
-                .distributed_sessions
-                .as_mut()
-                .unwrap()
-                .session_root_value_current(offer.connection_id, "store.count")
-                .unwrap(),
-            Value::integer(0).unwrap()
-        );
-        assert_eq!(
-            shared.snapshot().protocol_state(application).unwrap(),
-            &before
-        );
-    }
-
-    #[test]
-    fn restart_resumes_a_durably_interrupted_disconnect_cleanup() {
-        let bundle = bundle();
-        let shared = SharedPersistenceDriver::default();
-        let (mut program, _) = crate::BoonServerProgram::with_distributed_persistence(
-            bundle,
-            shared.clone(),
-            crate::PersistentServerConfig::authoritative(
-                boon_persistence::PersistenceWorkerConfig::default(),
-            ),
-            DistributedSessionRegistryConfig::default(),
-        )
-        .unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        let offer = offered(
-            program
-                .begin_distributed_handshake(
-                    now,
-                    SessionPrincipal::Anonymous,
-                    &hello(program.distributed_identity().unwrap(), None),
-                )
-                .unwrap(),
-        );
-        let token_bytes = *offer.resume_token.as_bytes();
-        program
-            .commit_distributed_handshake(now, offer.connection_id, &offer.commit_frame())
-            .unwrap();
-        let session_id = offer.session_id;
-
-        shared.fail_after_commits(1);
-        assert!(
-            program
-                .disconnect_distributed_session(now, offer.connection_id)
-                .is_err()
-        );
-        let persisted = shared.snapshot();
-        drop(program);
-
-        let (mut restarted, _) = crate::BoonServerProgram::with_distributed_persistence(
-            bundle,
-            persisted,
-            crate::PersistentServerConfig::authoritative(
-                boon_persistence::PersistenceWorkerConfig::default(),
-            ),
-            DistributedSessionRegistryConfig::default(),
-        )
-        .unwrap();
-        let restart_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        let before_cleanup = restarted
+        let rejected = restarted
             .begin_distributed_handshake(
-                restart_now,
+                now,
                 SessionPrincipal::Anonymous,
                 &hello(
                     restarted.distributed_identity().unwrap(),
@@ -3399,30 +2783,60 @@ store: [
             )
             .unwrap();
         assert_rejected(
-            before_cleanup,
+            rejected,
             DistributedSessionHandshakeRejectionReason::ResumeUnavailable,
         );
-
-        let poll = restarted
-            .poll_distributed_sessions(restart_now, 64)
-            .unwrap();
-        assert!(poll.durable_protocol_checkpoints >= 1);
-        assert!(poll.poisoned_sessions.is_empty());
-        let resumed = offered(
+        let fresh = offered(
             restarted
                 .begin_distributed_handshake(
-                    restart_now,
+                    now,
                     SessionPrincipal::Anonymous,
-                    &hello(
-                        restarted.distributed_identity().unwrap(),
-                        Some(ResumeToken::from_bytes(token_bytes)),
-                    ),
+                    &hello(restarted.distributed_identity().unwrap(), None),
                 )
                 .unwrap(),
         );
-        assert!(resumed.session_id == session_id);
-        assert_eq!(resumed.generation, 2);
+        assert!(fresh.session_id != session_id);
+        assert_eq!(fresh.generation, 1);
+        let ready = restarted
+            .commit_distributed_handshake(now, fresh.connection_id, &fresh.commit_frame())
+            .unwrap();
+        assert_eq!(ready_generation(&ready), 1);
         restarted.shutdown_persistent().unwrap();
+    }
+
+    #[test]
+    fn process_local_disconnect_does_not_depend_on_persistence() {
+        let bundle = bundle();
+        let shared = SharedPersistenceDriver::default();
+        let (mut program, _) = crate::BoonServerProgram::with_distributed_persistence(
+            bundle,
+            shared.clone(),
+            crate::PersistentServerConfig::authoritative(
+                boon_persistence::PersistenceWorkerConfig::default(),
+            ),
+            DistributedSessionRegistryConfig::default(),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let offer = offered(
+            program
+                .begin_distributed_handshake(
+                    now,
+                    SessionPrincipal::Anonymous,
+                    &hello(program.distributed_identity().unwrap(), None),
+                )
+                .unwrap(),
+        );
+        program
+            .commit_distributed_handshake(now, offer.connection_id, &offer.commit_frame())
+            .unwrap();
+        shared.fail_after_commits(0);
+        program
+            .disconnect_distributed_session(now, offer.connection_id)
+            .unwrap();
+        assert_eq!(program.distributed_session_count(), Some(1));
     }
 
     #[test]
@@ -3551,16 +2965,13 @@ store: [
             Err(DistributedRuntimeError::InvalidLease)
         ));
 
-        {
-            let mut server = registry.server.bind(&mut registry.server_machine);
-            assert_eq!(
-                registry
-                    .registry
-                    .expire(&mut server, Duration::from_secs(12))
-                    .unwrap(),
-                0
-            );
-        }
+        assert_eq!(
+            registry
+                .poll(Duration::from_secs(12), 0)
+                .unwrap()
+                .expired_sessions,
+            0
+        );
         assert!(registry.registry.pending_handshakes.is_empty());
         assert!(matches!(
             registry.commit_handshake(
@@ -3670,123 +3081,175 @@ store: [
     }
 
     #[test]
-    fn recovery_restores_private_session_identity_state_and_fixed_resume_deadline() {
-        let config = DistributedSessionRegistryConfig::default();
-        let mut original = harness(config);
-        let mut client = connect(&mut original, Duration::from_secs(5));
-        dispatch_increment(&mut original, &mut client);
-        poll_until_idle(&mut original, Duration::from_secs(5));
-        let resume_token = *client.resume_token.as_bytes();
-        let session_id = original
+    fn failed_resume_publication_preserves_exact_generation_for_identical_retry() {
+        let mut registry = harness(DistributedSessionRegistryConfig::default());
+        let client = connect(&mut registry, Duration::ZERO);
+        let original_token = *client.resume_token.as_bytes();
+        registry
+            .disconnect(Duration::ZERO, client.connection_id)
+            .unwrap();
+        let (slot_id, runtime_before) = registry
             .registry
             .slots
-            .values()
+            .iter()
+            .map(|(slot_id, slot)| (*slot_id, slot.runtime.clone()))
             .next()
-            .unwrap()
-            .runtime
-            .session_id();
-
-        original
-            .disconnect(Duration::from_secs(5), client.connection_id)
             .unwrap();
-        let expected_deadline = stale_deadline(&original.registry);
-        let snapshot = checkpoint_snapshot(&mut original, 1);
-        assert_eq!(snapshot.records.len(), 2);
 
-        let root_key = recovery_root_key(original.identity());
-        let session_key = snapshot
-            .records
-            .keys()
-            .copied()
-            .find(|key| *key != root_key)
-            .unwrap();
-        let mut missing_session = snapshot.clone();
-        missing_session.records.remove(&session_key);
-        let Err(error) = DistributedSessionRegistry::start_with_recovery(
-            bundle(),
-            config,
-            &missing_session,
-            1,
-            Duration::from_secs(10),
-        ) else {
-            panic!("a recovery root must not tolerate a missing Session record");
-        };
+        let failed_offer = offered(
+            registry
+                .begin_handshake(
+                    Duration::from_secs(1),
+                    SessionPrincipal::Anonymous,
+                    &hello(
+                        registry.identity(),
+                        Some(ResumeToken::from_bytes(original_token)),
+                    ),
+                )
+                .unwrap(),
+        );
+        assert_eq!(failed_offer.generation, client.generation + 1);
+        let failed_rotated_token = *failed_offer.resume_token.as_bytes();
+        assert_ne!(failed_rotated_token, original_token);
+
+        let queue_limit = registry.registry.config.session_queue_limits.max_messages;
+        registry
+            .registry
+            .inject_server_publication_queue_pressure_for_test();
         assert!(matches!(
-            error,
-            DistributedSessionRegistryError::InvalidRecoveryState(_)
+            registry.commit_handshake(
+                Duration::from_secs(1),
+                failed_offer.connection_id,
+                &failed_offer.commit_frame(),
+            ),
+            Err(DistributedSessionRegistryError::Runtime(
+                DistributedRuntimeError::QueueFull { limit }
+            )) if limit == queue_limit
         ));
 
-        let mut wrong_authority_cursor = snapshot.clone();
-        let root_record = wrong_authority_cursor.records.get_mut(&root_key).unwrap();
-        let mut root: RegistryRecoveryRecord =
-            decode_recovery_record(&root_record.payload).unwrap();
-        root.authority_turn_sequence += 1;
-        root_record.payload = encode_recovery_record(&root).unwrap().into();
-        let Err(error) = DistributedSessionRegistry::start_with_recovery(
-            bundle(),
-            config,
-            &wrong_authority_cursor,
-            1,
-            Duration::from_secs(10),
-        ) else {
-            panic!("a recovery root must match the exact Server authority cursor");
-        };
+        let slot = &registry.registry.slots[&slot_id];
+        assert!(slot.runtime.shares_settled_state_with(&runtime_before));
+        assert_eq!(slot.runtime.transport_generation(), client.generation);
+        assert_eq!(slot.transport_generation, client.generation);
         assert!(matches!(
-            error,
-            DistributedSessionRegistryError::InvalidRecoveryState(_)
+            slot.state,
+            SessionSlotState::Stale { cleanup: None, .. }
         ));
-
-        let mut restarted =
-            restore_harness(bundle(), config, &snapshot, 1, Duration::from_secs(10));
-        assert_eq!(stale_deadline(&restarted.registry), expected_deadline);
-        assert!(
-            restarted
+        assert_eq!(
+            registry
                 .registry
-                .slots
-                .values()
-                .next()
-                .unwrap()
+                .resume_index
+                .get(&resume_digest(&ResumeToken::from_bytes(original_token))),
+            Some(&slot_id)
+        );
+        assert!(!registry.registry.resume_index.contains_key(&resume_digest(
+            &ResumeToken::from_bytes(failed_rotated_token)
+        )));
+
+        let retry_offer = offered(
+            registry
+                .begin_handshake(
+                    Duration::from_secs(2),
+                    SessionPrincipal::Anonymous,
+                    &hello(
+                        registry.identity(),
+                        Some(ResumeToken::from_bytes(original_token)),
+                    ),
+                )
+                .unwrap(),
+        );
+        assert!(retry_offer.session_id == failed_offer.session_id);
+        assert_eq!(retry_offer.generation, failed_offer.generation);
+        assert_ne!(retry_offer.resume_token.as_bytes(), &original_token);
+        let ready = registry
+            .commit_handshake(
+                Duration::from_secs(2),
+                retry_offer.connection_id,
+                &retry_offer.commit_frame(),
+            )
+            .unwrap();
+        assert_eq!(ready_generation(&ready), client.generation + 1);
+        assert_eq!(
+            registry.registry.slots[&slot_id]
                 .runtime
-                .session_id()
-                == session_id
+                .transport_generation(),
+            client.generation + 1
         );
+    }
 
-        let second_snapshot = checkpoint_snapshot(&mut restarted, 2);
-        let mut restarted = restore_harness(
-            bundle(),
-            config,
-            &second_snapshot,
-            2,
-            Duration::from_secs(20),
-        );
-        assert_eq!(stale_deadline(&restarted.registry), expected_deadline);
+    #[test]
+    fn resume_token_is_bound_to_the_authenticated_principal() {
+        let mut registry = harness(DistributedSessionRegistryConfig::default());
+        let alice = SessionPrincipal::authenticated("alice", ["member"]).unwrap();
+        let bob = SessionPrincipal::authenticated("bob", ["member"]).unwrap();
+        let start = registry
+            .begin_handshake(Duration::ZERO, alice, &hello(registry.identity(), None))
+            .unwrap();
+        let offer = offered(start);
+        registry
+            .commit_handshake(Duration::ZERO, offer.connection_id, &offer.commit_frame())
+            .unwrap();
+        registry
+            .disconnect(Duration::ZERO, offer.connection_id)
+            .unwrap();
 
-        let start = restarted
+        let rejected = registry
             .begin_handshake(
-                Duration::from_secs(64),
+                Duration::from_secs(1),
+                bob,
+                &hello(registry.identity(), Some(offer.resume_token)),
+            )
+            .unwrap();
+        assert_rejected(
+            rejected,
+            DistributedSessionHandshakeRejectionReason::ResumeUnavailable,
+        );
+        assert_eq!(registry.session_count(), 1);
+    }
+
+    #[test]
+    fn resumed_session_rejects_frames_from_the_previous_generation() {
+        let mut registry = harness(DistributedSessionRegistryConfig::default());
+        let mut client = connect(&mut registry, Duration::ZERO);
+        client
+            .runtime
+            .dispatch("store.increment", SourcePayload::default())
+            .unwrap();
+        let frames = take_client_session_frames(&mut client.runtime, 64);
+        let [stale_frame] = frames.as_slice() else {
+            panic!("expected one previous-generation Client frame");
+        };
+        let stale_frame = stale_frame.clone();
+
+        registry
+            .disconnect(Duration::ZERO, client.connection_id)
+            .unwrap();
+        let start = registry
+            .begin_handshake(
+                Duration::from_secs(1),
                 SessionPrincipal::Anonymous,
-                &hello(
-                    restarted.identity(),
-                    Some(ResumeToken::from_bytes(resume_token)),
-                ),
+                &hello(registry.identity(), Some(client.resume_token)),
             )
             .unwrap();
         let offer = offered(start);
-        assert!(offer.session_id == session_id);
-        let ready = restarted
+        let ready = registry
             .commit_handshake(
-                Duration::from_secs(64),
+                Duration::from_secs(1),
                 offer.connection_id,
                 &offer.commit_frame(),
             )
             .unwrap();
-        assert_eq!(ready_generation(&ready), 2);
-        assert_eq!(
-            restarted
-                .session_root_value_current(offer.connection_id, "store.count")
-                .unwrap(),
-            Value::integer(1).unwrap()
-        );
+        assert_eq!(ready_generation(&ready), client.generation + 1);
+        registry
+            .admit_client_frame(offer.connection_id, &stale_frame)
+            .unwrap();
+        let poll = registry.poll(Duration::from_secs(1), 1).unwrap();
+        let [poisoned] = poll.poisoned_sessions.as_slice() else {
+            panic!("stale generation must poison exactly its resumed Session");
+        };
+        assert_eq!(poisoned.connection_id, Some(offer.connection_id));
+        assert!(poisoned.diagnostic.contains("transport frame is stale"));
+        assert_eq!(registry.session_count(), 0);
     }
 
     #[test]
@@ -3848,7 +3311,7 @@ store: [
     }
 
     #[test]
-    fn expiration_at_exact_boundary_rejects_resume_and_removes_server_origin() {
+    fn expiration_at_exact_boundary_rejects_resume_and_schedules_bounded_origin_removal() {
         let mut registry = harness(DistributedSessionRegistryConfig::default());
         let client = connect(&mut registry, Duration::ZERO);
         let origin = registry.registry.slots.values().next().unwrap().origin;
@@ -3867,6 +3330,18 @@ store: [
             start,
             DistributedSessionHandshakeRejectionReason::ResumeUnavailable,
         );
+        assert_eq!(
+            registry.session_count(),
+            1,
+            "handshake admission must not run Session cleanup outside the scheduler budget"
+        );
+        let transition = registry.poll(DEFAULT_SESSION_RESUME_WINDOW, 1).unwrap();
+        assert_eq!(transition.serviced_origins, vec![origin]);
+        assert_eq!(transition.expired_sessions, 0);
+        assert_eq!(registry.session_count(), 1);
+        let removal = registry.poll(DEFAULT_SESSION_RESUME_WINDOW, 1).unwrap();
+        assert_eq!(removal.serviced_origins, vec![origin]);
+        assert_eq!(removal.expired_sessions, 1);
         assert_eq!(registry.session_count(), 0);
         assert!(matches!(
             registry
@@ -3906,7 +3381,7 @@ store: [
     }
 
     #[test]
-    fn expiry_invalidates_every_due_session_and_tolerates_already_removed_origins() {
+    fn expiry_is_bounded_fair_and_tolerates_already_removed_origins() {
         let mut registry = harness(DistributedSessionRegistryConfig::default());
         let clients = (0..3)
             .map(|_| connect(&mut registry, Duration::ZERO))
@@ -3928,14 +3403,32 @@ store: [
             .bind(&mut registry.server_machine)
             .expire_origin(origins[0])
             .unwrap();
-        let expired = {
-            let mut server = registry.server.bind(&mut registry.server_machine);
-            registry
-                .registry
-                .expire(&mut server, DEFAULT_SESSION_RESUME_WINDOW)
-                .unwrap()
-        };
+        let first = registry.poll(DEFAULT_SESSION_RESUME_WINDOW, 1).unwrap();
+        assert_eq!(first.serviced_origins.len(), 1);
+        assert_eq!(first.expired_sessions, 0);
+        assert_eq!(
+            registry.session_count(),
+            3,
+            "one scheduler step may start only one expiry cleanup"
+        );
+
+        let mut expired = 0usize;
+        let mut service_order = first.serviced_origins;
+        for _ in 0..8 {
+            let poll = registry.poll(DEFAULT_SESSION_RESUME_WINDOW, 1).unwrap();
+            assert!(poll.serviced_origins.len() <= 1);
+            expired += poll.expired_sessions;
+            service_order.extend(poll.serviced_origins);
+            if registry.session_count() == 0 {
+                break;
+            }
+        }
         assert_eq!(expired, 3);
+        assert_eq!(
+            &service_order[..3],
+            origins.as_slice(),
+            "each due Session must receive one cleanup transition before any repeats"
+        );
         assert_eq!(registry.session_count(), 0);
         assert!(registry.registry.resume_index.is_empty());
         assert_eq!(registry.registry.next_deadline(), None);
@@ -4089,6 +3582,32 @@ store: [
     }
 
     #[test]
+    fn one_saturated_session_cannot_starve_seven_quiet_sessions() {
+        let mut registry = harness(DistributedSessionRegistryConfig::default());
+        let mut clients = (0..8)
+            .map(|_| connect(&mut registry, Duration::ZERO))
+            .collect::<Vec<_>>();
+
+        for _ in 0..16 {
+            queue_increment(&mut registry, &mut clients[0]);
+        }
+        for client in &mut clients[1..] {
+            queue_increment(&mut registry, client);
+        }
+
+        let poll = registry.poll(Duration::ZERO, clients.len()).unwrap();
+        assert_eq!(poll.serviced_connections.len(), clients.len());
+        let mut unique = poll.serviced_connections.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            clients.len(),
+            "every runnable Session must receive one service step before the saturated Session repeats"
+        );
+    }
+
+    #[test]
     fn session_server_backpressure_retries_exactly_once_after_delivery_lane_progress() {
         let counter_bundle = compile_bundle(
             CLIENT_SOURCE,
@@ -4200,7 +3719,7 @@ store: [
     }
 
     #[test]
-    fn stale_session_keeps_processing_server_work_without_a_client_connection() {
+    fn stale_session_keeps_current_server_snapshot_without_a_client_connection() {
         let mut registry = harness(DistributedSessionRegistryConfig::default());
         let client = connect(&mut registry, Duration::ZERO);
         let (slot_id, origin) = registry
@@ -4254,9 +3773,118 @@ store: [
                 .get_mut(&slot_id)
                 .unwrap()
                 .runtime
+                .get_mut()
+                .unwrap()
                 .root_value_current("store.server_ready")
                 .unwrap(),
             Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn stale_session_drops_server_events_instead_of_replaying_them_on_resume() {
+        let event_bundle = compile_bundle(
+            CLIENT_SOURCE,
+            r#"
+store: [
+    pulse: Server/store.pulse
+    pulse_count:
+        0 |> HOLD pulse_count {
+            pulse |> THEN { pulse_count + 1 }
+        }
+]
+"#,
+            r#"
+store: [
+    pulse: SOURCE
+]
+"#,
+            "stale-event",
+        );
+        let mut registry =
+            RegistryHarness::start(&event_bundle, DistributedSessionRegistryConfig::default());
+        let client = connect_with_bundle(&mut registry, &event_bundle, Duration::ZERO);
+        let (slot_id, origin) = registry
+            .registry
+            .slots
+            .iter()
+            .map(|(slot_id, slot)| (*slot_id, slot.origin))
+            .next()
+            .unwrap();
+        let export_id = event_bundle
+            .artifact(ProgramRole::Server)
+            .unwrap()
+            .plan()
+            .distributed_endpoint
+            .as_ref()
+            .unwrap()
+            .wire_schema
+            .event_edges
+            .iter()
+            .find(|edge| {
+                edge.producer_role == ProgramRole::Server
+                    && edge.consumer_role == ProgramRole::Session
+            })
+            .unwrap()
+            .export_id;
+
+        registry
+            .route_server_delivery(ServerDelivery {
+                target: ServerDeliveryTarget::Origin(origin),
+                message: DistributedMessage {
+                    producer: ProgramRole::Server,
+                    consumer: ProgramRole::Session,
+                    payload: DistributedMessagePayload::Event {
+                        export_id,
+                        sequence: 1,
+                        value: DataValue::Null,
+                    },
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            registry.registry.slots[&slot_id]
+                .pending_server_messages
+                .len(),
+            1
+        );
+
+        registry
+            .disconnect(Duration::ZERO, client.connection_id)
+            .unwrap();
+        registry
+            .route_server_delivery(ServerDelivery {
+                target: ServerDeliveryTarget::Origin(origin),
+                message: DistributedMessage {
+                    producer: ProgramRole::Server,
+                    consumer: ProgramRole::Session,
+                    payload: DistributedMessagePayload::Event {
+                        export_id,
+                        sequence: 2,
+                        value: DataValue::Null,
+                    },
+                },
+            })
+            .unwrap();
+
+        assert!(
+            registry.registry.slots[&slot_id]
+                .pending_server_messages
+                .is_empty()
+        );
+        assert_eq!(registry.registry.global_queued_bytes(), 0);
+        assert_eq!(
+            registry
+                .registry
+                .slots
+                .get_mut(&slot_id)
+                .unwrap()
+                .runtime
+                .get_mut()
+                .unwrap()
+                .root_value_current("store.pulse_count")
+                .unwrap(),
+            Value::integer(0).unwrap()
         );
     }
 
@@ -4289,11 +3917,12 @@ store: [
 
     #[test]
     fn pending_server_queue_latest_wins_pure_work_and_keeps_events_fifo() {
-        use boon_plan::{ExportId, RemoteCallSiteId};
+        use boon_plan::{DistributedCallInstanceId, ExportId, RemoteCallSiteId};
 
         let limits = DistributedQueueLimits::default();
         let export_id = ExportId([7; 32]);
         let call_site_id = RemoteCallSiteId([9; 32]);
+        let call_instance_id = DistributedCallInstanceId::from_rows(call_site_id, &[]).unwrap();
         let current = |revision| DistributedMessage {
             producer: ProgramRole::Server,
             consumer: ProgramRole::Session,
@@ -4306,19 +3935,22 @@ store: [
         let call = |revision| DistributedMessage {
             producer: ProgramRole::Server,
             consumer: ProgramRole::Session,
-            payload: DistributedMessagePayload::CallResult {
+            payload: DistributedMessagePayload::CurrentCallResult {
                 call_site_id,
-                revision,
+                call_instance_id,
+                demand_revision: 1,
+                result_revision: revision,
                 value: DataValue::integer(revision as i64).unwrap(),
             },
         };
         let call_request = |revision| DistributedMessage {
             producer: ProgramRole::Server,
             consumer: ProgramRole::Session,
-            payload: DistributedMessagePayload::CallRequest {
+            payload: DistributedMessagePayload::CurrentCallRequest {
                 call_site_id,
+                call_instance_id,
                 function_export_id: export_id,
-                revision,
+                demand_revision: revision,
                 arguments: BTreeMap::new(),
             },
         };
@@ -4345,7 +3977,11 @@ store: [
         assert_eq!(queue.len(), 1);
         assert!(matches!(
             queue.front().unwrap().payload,
-            DistributedMessagePayload::CallResult { revision: 2, .. }
+            DistributedMessagePayload::CurrentCallResult {
+                demand_revision: 1,
+                result_revision: 2,
+                ..
+            }
         ));
 
         let (queue, _) = candidate_server_queue(&VecDeque::new(), call_request(1), limits).unwrap();
@@ -4353,7 +3989,10 @@ store: [
         assert_eq!(queue.len(), 1);
         assert!(matches!(
             queue.front().unwrap().payload,
-            DistributedMessagePayload::CallRequest { revision: 2, .. }
+            DistributedMessagePayload::CurrentCallRequest {
+                demand_revision: 2,
+                ..
+            }
         ));
 
         let (queue, _) = candidate_server_queue(&VecDeque::new(), event(1), limits).unwrap();
@@ -4585,79 +4224,6 @@ store: [
         RegistryHarness::start(bundle(), config)
     }
 
-    fn checkpoint_snapshot(
-        harness: &mut RegistryHarness,
-        turn_sequence: u64,
-    ) -> boon_persistence::ProtocolStateSnapshot {
-        let router_payload = harness.server.recovery_payload().unwrap();
-        let prepared = harness
-            .registry
-            .prepare_recovery_checkpoint(router_payload)
-            .unwrap();
-        assert!(prepared.deletes.is_empty());
-        let records = prepared
-            .changes(turn_sequence)
-            .unwrap()
-            .into_iter()
-            .map(|change| match change {
-                boon_persistence::DurableProtocolStateChange::Put {
-                    key,
-                    next_revision,
-                    payload,
-                    ..
-                } => (
-                    key,
-                    boon_persistence::ProtocolStateRecord {
-                        revision: next_revision,
-                        payload,
-                    },
-                ),
-                boon_persistence::DurableProtocolStateChange::Delete { .. } => {
-                    unreachable!("fresh test checkpoint has no deletes")
-                }
-            })
-            .collect();
-        harness.registry.commit_recovery_checkpoint(prepared);
-        boon_persistence::ProtocolStateSnapshot { records }
-    }
-
-    fn restore_harness(
-        bundle: &DistributedProgramBundle,
-        config: DistributedSessionRegistryConfig,
-        snapshot: &boon_persistence::ProtocolStateSnapshot,
-        authority_turn_sequence: u64,
-        now: Duration,
-    ) -> RegistryHarness {
-        let server_artifact = bundle.artifact(ProgramRole::Server).unwrap();
-        let (registry, router_payload) = DistributedSessionRegistry::start_with_recovery(
-            bundle,
-            config,
-            snapshot,
-            authority_turn_sequence,
-            now,
-        )
-        .unwrap();
-        let server = DistributedServerRuntime::start_with_recovery(
-            server_artifact,
-            &router_payload.expect("recovered registry carries its Server router"),
-        )
-        .unwrap();
-        registry.validate_router_recovery(&server).unwrap();
-        RegistryHarness {
-            registry,
-            server,
-            server_machine: ProgramSession::start(server_artifact.clone()).unwrap(),
-        }
-    }
-
-    fn stale_deadline(registry: &DistributedSessionRegistry) -> Duration {
-        let state = &registry.slots.values().next().unwrap().state;
-        let SessionSlotState::Stale { deadline, .. } = state else {
-            panic!("recovered Session must be stale until its client resumes");
-        };
-        *deadline
-    }
-
     fn bundle() -> &'static DistributedProgramBundle {
         static BUNDLE: OnceLock<DistributedProgramBundle> = OnceLock::new();
         BUNDLE.get_or_init(|| {
@@ -4874,7 +4440,6 @@ store: [
                 .append(&mut poll.poisoned_sessions);
             collected.session_turns.append(&mut poll.session_turns);
             collected.server_turns.append(&mut poll.server_turns);
-            collected.durable_protocol_checkpoints += poll.durable_protocol_checkpoints;
             collected.expired_sessions += poll.expired_sessions;
             if idle {
                 return collected;

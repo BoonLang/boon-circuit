@@ -1,10 +1,10 @@
 use super::{
     ApplicationTransfer, CheckpointBatch, ContentArtifact, ContentArtifactBinding,
     ContentArtifactId, ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention,
-    DurableChange, DurableContentArtifactChange, DurableEffectRow, DurableOutboxChange,
-    DurableOutboxItem, DurableOutboxState, DurableProtocolStateChange, OutboxItemId,
-    ProtocolStateKey, ProtocolStateRecord, RestoreImage, StoredList, StoredRow, StoredScalar,
-    StoredValue, validate_application_transfer, validate_content_artifact_manifest,
+    DurableChange, DurableContentArtifactChange, DurableOutboxChange, DurableOutboxItem,
+    DurableOutboxState, DurableOwner, DurableRowId, OutboxItemId, RestoreImage, StoredList,
+    StoredRow, StoredScalar, StoredValue, validate_application_transfer,
+    validate_content_artifact_manifest,
 };
 use boon_plan::{
     ApplicationIdentity, EffectId, EffectInvocationId, MemoryId, MemoryLeafId, MigrationEdgeId,
@@ -14,11 +14,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESTORE_IMAGE_FORMAT: u32 = 5;
-const APPLICATION_TRANSFER_FORMAT: u32 = 3;
-const CHECKPOINT_BATCH_FORMAT: u32 = 5;
-const OUTBOX_RECORD_FORMAT: u32 = 2;
-const PROTOCOL_STATE_RECORD_FORMAT: u32 = 1;
+const RESTORE_IMAGE_FORMAT: u32 = 8;
+const APPLICATION_TRANSFER_FORMAT: u32 = 6;
+const CHECKPOINT_BATCH_FORMAT: u32 = 8;
+const OUTBOX_RECORD_FORMAT: u32 = 3;
 const BLOB_RECORD_FORMAT: u32 = 1;
 pub const INLINE_BYTES_THRESHOLD: usize = 16 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 80 * 1024 * 1024;
@@ -144,10 +143,7 @@ pub fn decode_restore_image(
     let mut decoder = Decoder::new(bytes);
     let root_len = definite_len(decoder.array().map_err(decode_error)?, "restore image")?;
     let format = decoder.u32().map_err(decode_error)?;
-    if !matches!(
-        (format, root_len),
-        (1, 9) | (3, 10) | (4, 11) | (RESTORE_IMAGE_FORMAT, 11)
-    ) {
+    if (format, root_len) != (RESTORE_IMAGE_FORMAT, 11) {
         return Err(CodecError::new(format!(
             "unsupported restore image format {format} with {root_len} fields"
         )));
@@ -187,26 +183,20 @@ pub fn decode_restore_image(
         }
     }
     let mut outbox = BTreeMap::new();
-    if format >= 2 {
-        let item_count = collection_len(&mut decoder, limits, "outbox map", false)?;
-        for _ in 0..item_count {
-            let item_id = OutboxItemId(decode_digest(&mut decoder)?);
-            let item = decode_outbox_item(&mut decoder, limits)?;
-            if item.item_id != item_id {
-                return Err(CodecError::new(
-                    "restore image outbox key does not match item ID",
-                ));
-            }
-            if outbox.insert(item_id, item).is_some() {
-                return Err(CodecError::new("restore image repeats an outbox item ID"));
-            }
+    let item_count = collection_len(&mut decoder, limits, "outbox map", false)?;
+    for _ in 0..item_count {
+        let item_id = OutboxItemId(decode_digest(&mut decoder)?);
+        let item = decode_outbox_item(&mut decoder, limits)?;
+        if item.item_id != item_id {
+            return Err(CodecError::new(
+                "restore image outbox key does not match item ID",
+            ));
+        }
+        if outbox.insert(item_id, item).is_some() {
+            return Err(CodecError::new("restore image repeats an outbox item ID"));
         }
     }
-    let content_artifact_manifest = if format >= 4 {
-        decode_content_artifact_manifest(&mut decoder, limits)?
-    } else {
-        ContentArtifactManifest::default()
-    };
+    let content_artifact_manifest = decode_content_artifact_manifest(&mut decoder, limits)?;
     if decoder.position() != bytes.len() {
         return Err(CodecError::new("restore image has trailing bytes"));
     }
@@ -262,7 +252,7 @@ pub fn decode_application_transfer(
         "application transfer",
     )?;
     let format = decoder.u32().map_err(decode_error)?;
-    if !matches!(format, 2 | APPLICATION_TRANSFER_FORMAT) || root_len != 3 {
+    if format != APPLICATION_TRANSFER_FORMAT || root_len != 3 {
         return Err(CodecError::new(format!(
             "unsupported application transfer format {format} with {root_len} fields"
         )));
@@ -333,7 +323,7 @@ pub fn encode_checkpoint_batch(batch: &CheckpointBatch) -> Result<Vec<u8>, Codec
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
     encoder
-        .array(12)
+        .array(11)
         .and_then(|encoder| encoder.u32(CHECKPOINT_BATCH_FORMAT))
         .map_err(encode_error)?;
     encode_application(&mut encoder, &batch.application)?;
@@ -355,12 +345,6 @@ pub fn encode_checkpoint_batch(batch: &CheckpointBatch) -> Result<Vec<u8>, Codec
         encode_outbox_change(&mut encoder, change)?;
     }
     encoder
-        .array(batch.protocol_state_changes.len() as u64)
-        .map_err(encode_error)?;
-    for change in &batch.protocol_state_changes {
-        encode_protocol_state_change(&mut encoder, change)?;
-    }
-    encoder
         .array(batch.content_artifact_changes.len() as u64)
         .map_err(encode_error)?;
     for change in &batch.content_artifact_changes {
@@ -378,10 +362,7 @@ pub fn decode_checkpoint_batch(
     let mut decoder = Decoder::new(bytes);
     let root_len = definite_len(decoder.array().map_err(decode_error)?, "checkpoint batch")?;
     let format = decoder.u32().map_err(decode_error)?;
-    if !matches!(
-        (format, root_len),
-        (2, 10) | (3 | 4, 11) | (CHECKPOINT_BATCH_FORMAT, 12)
-    ) {
+    if (format, root_len) != (CHECKPOINT_BATCH_FORMAT, 11) {
         return Err(CodecError::new(format!(
             "unsupported checkpoint batch format {format} with {root_len} fields"
         )));
@@ -402,23 +383,11 @@ pub fn decode_checkpoint_batch(
     for _ in 0..outbox_count {
         outbox_changes.push(decode_outbox_change(&mut decoder, limits)?);
     }
-    let mut protocol_state_changes = Vec::new();
-    if format >= 5 {
-        let protocol_change_count =
-            collection_len(&mut decoder, limits, "protocol-state changes", true)?;
-        protocol_state_changes.reserve(protocol_change_count);
-        for _ in 0..protocol_change_count {
-            protocol_state_changes.push(decode_protocol_state_change(&mut decoder, limits)?);
-        }
-    }
-    let mut content_artifact_changes = Vec::new();
-    if format >= 3 {
-        let artifact_change_count =
-            collection_len(&mut decoder, limits, "content artifact changes", true)?;
-        content_artifact_changes.reserve(artifact_change_count);
-        for _ in 0..artifact_change_count {
-            content_artifact_changes.push(decode_content_artifact_change(&mut decoder)?);
-        }
+    let artifact_change_count =
+        collection_len(&mut decoder, limits, "content artifact changes", true)?;
+    let mut content_artifact_changes = Vec::with_capacity(artifact_change_count);
+    for _ in 0..artifact_change_count {
+        content_artifact_changes.push(decode_content_artifact_change(&mut decoder)?);
     }
     let checksum = decode_digest(&mut decoder)?;
     reject_trailing(&decoder, bytes, "checkpoint batch")?;
@@ -431,48 +400,8 @@ pub fn decode_checkpoint_batch(
         last_turn_sequence,
         changes,
         outbox_changes,
-        protocol_state_changes,
         content_artifact_changes,
         checksum,
-    })
-}
-
-pub(crate) fn encode_protocol_state_record(
-    record: &ProtocolStateRecord,
-) -> Result<Vec<u8>, CodecError> {
-    let mut bytes = Vec::with_capacity(record.payload.len().saturating_add(32));
-    Encoder::new(&mut bytes)
-        .array(3)
-        .and_then(|encoder| encoder.u32(PROTOCOL_STATE_RECORD_FORMAT))
-        .and_then(|encoder| encoder.u64(record.revision))
-        .and_then(|encoder| encoder.bytes(&record.payload))
-        .map_err(encode_error)?;
-    component_size(&bytes, DecodeLimits::default(), "protocol-state record")?;
-    Ok(bytes)
-}
-
-pub(crate) fn decode_protocol_state_record(
-    bytes: &[u8],
-    limits: DecodeLimits,
-) -> Result<ProtocolStateRecord, CodecError> {
-    component_size(bytes, limits, "protocol-state record")?;
-    let mut decoder = Decoder::new(bytes);
-    expect_array(&mut decoder, 3, "protocol-state record")?;
-    let format = decoder.u32().map_err(decode_error)?;
-    if format != PROTOCOL_STATE_RECORD_FORMAT {
-        return Err(CodecError::new(format!(
-            "unsupported protocol-state record format {format}"
-        )));
-    }
-    let revision = decoder.u64().map_err(decode_error)?;
-    let payload = decoder.bytes().map_err(decode_error)?;
-    if payload.len() > super::MAX_PROTOCOL_STATE_RECORD_BYTES {
-        return Err(CodecError::new("protocol-state record exceeds byte limit"));
-    }
-    reject_trailing(&decoder, bytes, "protocol-state record")?;
-    Ok(ProtocolStateRecord {
-        revision,
-        payload: payload.to_vec().into(),
     })
 }
 
@@ -562,11 +491,14 @@ pub(crate) fn encode_row_component(row: &StoredRow) -> Result<EncodedComponent, 
     let mut references = BTreeMap::new();
     let mut encoder = Encoder::new(&mut bytes);
     encoder
-        .array(4)
+        .array(7)
         .and_then(|encoder| encoder.u64(row.key))
         .and_then(|encoder| encoder.u64(row.generation))
-        .and_then(|encoder| encoder.map(row.fields.len() as u64))
         .map_err(encode_error)?;
+    encode_u128(&mut encoder, row.source_order_token)?;
+    encode_durable_owner(&mut encoder, &row.owner)?;
+    encode_optional_durable_owner(&mut encoder, row.materialization_origin.as_ref())?;
+    encoder.map(row.fields.len() as u64).map_err(encode_error)?;
     for (field, value) in &row.fields {
         encode_digest(&mut encoder, field.as_bytes())?;
         encode_component_value(&mut encoder, value, 0, &mut blobs, &mut references)?;
@@ -591,9 +523,12 @@ pub(crate) fn decode_row_component(
 ) -> Result<StoredRow, CodecError> {
     component_size(bytes, limits, "stored row")?;
     let mut decoder = Decoder::new(bytes);
-    expect_array(&mut decoder, 4, "stored row")?;
+    expect_array(&mut decoder, 7, "stored row")?;
     let key = decoder.u64().map_err(decode_error)?;
     let generation = decoder.u64().map_err(decode_error)?;
+    let source_order_token = decode_u128(&mut decoder)?;
+    let owner = decode_durable_owner(&mut decoder, limits)?;
+    let materialization_origin = decode_optional_durable_owner(&mut decoder, limits)?;
     let field_count = collection_len(&mut decoder, limits, "row fields", false)?;
     let mut fields = BTreeMap::new();
     let mut references = BTreeMap::new();
@@ -616,6 +551,9 @@ pub(crate) fn decode_row_component(
     Ok(StoredRow {
         key,
         generation,
+        source_order_token,
+        owner,
+        materialization_origin,
         fields,
         touched_fields,
     })
@@ -627,9 +565,12 @@ pub(crate) fn row_component_blob_references(
 ) -> Result<BTreeMap<BlobDigest, u64>, CodecError> {
     component_size(bytes, limits, "stored row")?;
     let mut decoder = Decoder::new(bytes);
-    expect_array(&mut decoder, 4, "stored row")?;
+    expect_array(&mut decoder, 7, "stored row")?;
     decoder.u64().map_err(decode_error)?;
     decoder.u64().map_err(decode_error)?;
+    decode_u128(&mut decoder)?;
+    decode_durable_owner(&mut decoder, limits)?;
+    decode_optional_durable_owner(&mut decoder, limits)?;
     let field_count = collection_len(&mut decoder, limits, "row fields", false)?;
     let mut references = BTreeMap::new();
     for _ in 0..field_count {
@@ -843,100 +784,6 @@ fn decode_content_artifact_change(
     }
 }
 
-fn encode_protocol_state_change(
-    encoder: &mut CborEncoder<'_>,
-    change: &DurableProtocolStateChange,
-) -> Result<(), CodecError> {
-    match change {
-        DurableProtocolStateChange::Put {
-            key,
-            expected_revision,
-            next_revision,
-            payload,
-            turn_sequence,
-        } => {
-            encoder
-                .array(6)
-                .and_then(|encoder| encoder.u8(0))
-                .map_err(encode_error)?;
-            encode_digest(encoder, key.as_bytes())?;
-            match expected_revision {
-                Some(revision) => encoder.u64(*revision).map_err(encode_error)?,
-                None => encoder.null().map_err(encode_error)?,
-            };
-            encoder
-                .u64(*next_revision)
-                .and_then(|encoder| encoder.u64(*turn_sequence))
-                .and_then(|encoder| encoder.bytes(payload))
-                .map_err(encode_error)?;
-        }
-        DurableProtocolStateChange::Delete {
-            key,
-            expected_revision,
-            turn_sequence,
-        } => {
-            encoder
-                .array(4)
-                .and_then(|encoder| encoder.u8(1))
-                .map_err(encode_error)?;
-            encode_digest(encoder, key.as_bytes())?;
-            encoder
-                .u64(*expected_revision)
-                .and_then(|encoder| encoder.u64(*turn_sequence))
-                .map_err(encode_error)?;
-        }
-    }
-    Ok(())
-}
-
-fn decode_protocol_state_change(
-    decoder: &mut Decoder<'_>,
-    limits: DecodeLimits,
-) -> Result<DurableProtocolStateChange, CodecError> {
-    let len = definite_len(
-        decoder.array().map_err(decode_error)?,
-        "protocol-state change",
-    )?;
-    let tag = decoder.u8().map_err(decode_error)?;
-    match (tag, len) {
-        (0, 6) => {
-            let key = ProtocolStateKey(decode_digest(decoder)?);
-            let expected_revision =
-                if decoder.datatype().map_err(decode_error)? == minicbor::data::Type::Null {
-                    decoder.null().map_err(decode_error)?;
-                    None
-                } else {
-                    Some(decoder.u64().map_err(decode_error)?)
-                };
-            let next_revision = decoder.u64().map_err(decode_error)?;
-            let turn_sequence = decoder.u64().map_err(decode_error)?;
-            let payload = decoder.bytes().map_err(decode_error)?;
-            if payload.len() > super::MAX_PROTOCOL_STATE_RECORD_BYTES
-                || payload.len() > limits.max_total_bytes
-            {
-                return Err(CodecError::new(
-                    "protocol-state change payload exceeds byte limit",
-                ));
-            }
-            Ok(DurableProtocolStateChange::Put {
-                key,
-                expected_revision,
-                next_revision,
-                payload: payload.to_vec().into(),
-                turn_sequence,
-            })
-        }
-        (1, 4) => Ok(DurableProtocolStateChange::Delete {
-            key: ProtocolStateKey(decode_digest(decoder)?),
-            expected_revision: decoder.u64().map_err(decode_error)?,
-            turn_sequence: decoder.u64().map_err(decode_error)?,
-        }),
-        _ => Err(CodecError::new(format!(
-            "unknown protocol-state change tag {tag} with {len} fields"
-        ))),
-    }
-}
-
 fn encode_durable_change(
     encoder: &mut CborEncoder<'_>,
     change: &DurableChange,
@@ -967,54 +814,70 @@ fn encode_durable_change(
         }
         DurableChange::SetRowField {
             memory_id,
+            list_revision,
             row_key,
             row_generation,
+            owner,
+            materialization_origin,
             field_id,
             value,
         } => {
             encoder
-                .array(6)
+                .array(9)
                 .and_then(|encoder| encoder.u8(3))
                 .map_err(encode_error)?;
             encode_digest(encoder, memory_id.as_bytes())?;
             encoder
-                .u64(*row_key)
+                .u64(*list_revision)
+                .and_then(|encoder| encoder.u64(*row_key))
                 .and_then(|encoder| encoder.u64(*row_generation))
                 .map_err(encode_error)?;
+            encode_durable_owner(encoder, owner)?;
+            encode_optional_durable_owner(encoder, materialization_origin.as_ref())?;
             encode_digest(encoder, field_id.as_bytes())?;
             encode_value(encoder, value, 0)?;
         }
         DurableChange::InsertRow {
             memory_id,
+            list_revision,
             index,
             row,
             next_key,
+            next_order_token,
         } => {
             encoder
-                .array(5)
+                .array(7)
                 .and_then(|encoder| encoder.u8(4))
                 .map_err(encode_error)?;
             encode_digest(encoder, memory_id.as_bytes())?;
-            encoder.u64(*index).map_err(encode_error)?;
+            encoder
+                .u64(*list_revision)
+                .and_then(|encoder| encoder.u64(*index))
+                .map_err(encode_error)?;
             encode_row(encoder, row)?;
             encoder.u64(*next_key).map_err(encode_error)?;
+            encode_u128(encoder, *next_order_token)?;
         }
         DurableChange::RemoveRow {
             memory_id,
+            list_revision,
             row_key,
             row_generation,
             next_key,
+            next_order_token,
         } => {
             encoder
-                .array(5)
+                .array(7)
                 .and_then(|encoder| encoder.u8(5))
                 .map_err(encode_error)?;
             encode_digest(encoder, memory_id.as_bytes())?;
             encoder
-                .u64(*row_key)
+                .u64(*list_revision)
+                .and_then(|encoder| encoder.u64(*row_key))
                 .and_then(|encoder| encoder.u64(*row_generation))
                 .and_then(|encoder| encoder.u64(*next_key))
                 .map_err(encode_error)?;
+            encode_u128(encoder, *next_order_token)?;
         }
         DurableChange::DeleteList { memory_id } => {
             encoder
@@ -1045,24 +908,31 @@ fn decode_durable_change(
             memory_id: MemoryId(decode_digest(decoder)?),
             value: decode_list(decoder, limits)?,
         }),
-        (3, 6) => Ok(DurableChange::SetRowField {
+        (3, 9) => Ok(DurableChange::SetRowField {
             memory_id: MemoryId(decode_digest(decoder)?),
+            list_revision: decoder.u64().map_err(decode_error)?,
             row_key: decoder.u64().map_err(decode_error)?,
             row_generation: decoder.u64().map_err(decode_error)?,
+            owner: decode_durable_owner(decoder, limits)?,
+            materialization_origin: decode_optional_durable_owner(decoder, limits)?,
             field_id: MemoryLeafId(decode_digest(decoder)?),
             value: decode_value(decoder, limits, 0)?,
         }),
-        (4, 5) => Ok(DurableChange::InsertRow {
+        (4, 7) => Ok(DurableChange::InsertRow {
             memory_id: MemoryId(decode_digest(decoder)?),
+            list_revision: decoder.u64().map_err(decode_error)?,
             index: decoder.u64().map_err(decode_error)?,
             row: decode_row(decoder, limits)?,
             next_key: decoder.u64().map_err(decode_error)?,
+            next_order_token: decode_u128(decoder)?,
         }),
-        (5, 5) => Ok(DurableChange::RemoveRow {
+        (5, 7) => Ok(DurableChange::RemoveRow {
             memory_id: MemoryId(decode_digest(decoder)?),
+            list_revision: decoder.u64().map_err(decode_error)?,
             row_key: decoder.u64().map_err(decode_error)?,
             row_generation: decoder.u64().map_err(decode_error)?,
             next_key: decoder.u64().map_err(decode_error)?,
+            next_order_token: decode_u128(decoder)?,
         }),
         (6, 2) => Ok(DurableChange::DeleteList {
             memory_id: MemoryId(decode_digest(decoder)?),
@@ -1077,10 +947,11 @@ fn encode_outbox_item(
     encoder: &mut CborEncoder<'_>,
     item: &DurableOutboxItem,
 ) -> Result<(), CodecError> {
-    encoder.array(10).map_err(encode_error)?;
+    encoder.array(11).map_err(encode_error)?;
     encode_digest(encoder, item.item_id.as_bytes())?;
     encode_digest(encoder, item.invocation_id.as_bytes())?;
     encode_digest(encoder, item.effect_id.as_bytes())?;
+    encode_durable_owner(encoder, &item.owner)?;
     encode_effect_row(encoder, item.target_row)?;
     encode_value(encoder, &item.idempotency_key, 0)?;
     encode_value(encoder, &item.intent, 0)?;
@@ -1097,11 +968,12 @@ fn decode_outbox_item(
     decoder: &mut Decoder<'_>,
     limits: DecodeLimits,
 ) -> Result<DurableOutboxItem, CodecError> {
-    expect_array(decoder, 10, "outbox item")?;
+    expect_array(decoder, 11, "outbox item")?;
     Ok(DurableOutboxItem {
         item_id: OutboxItemId(decode_digest(decoder)?),
         invocation_id: EffectInvocationId(decode_digest(decoder)?),
         effect_id: EffectId(decode_digest(decoder)?),
+        owner: decode_durable_owner(decoder, limits)?,
         target_row: decode_effect_row(decoder)?,
         idempotency_key: decode_value(decoder, limits, 0)?,
         intent: decode_value(decoder, limits, 0)?,
@@ -1112,9 +984,85 @@ fn decode_outbox_item(
     })
 }
 
+fn encode_durable_owner(
+    encoder: &mut CborEncoder<'_>,
+    owner: &DurableOwner,
+) -> Result<(), CodecError> {
+    encoder
+        .array(owner.ancestors.len() as u64)
+        .map_err(encode_error)?;
+    for row in &owner.ancestors {
+        encoder.array(3).map_err(encode_error)?;
+        encode_digest(encoder, row.list_memory_id.as_bytes())?;
+        encoder
+            .u64(row.row_key)
+            .and_then(|encoder| encoder.u64(row.row_generation))
+            .map_err(encode_error)?;
+    }
+    Ok(())
+}
+
+fn decode_durable_owner(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+) -> Result<DurableOwner, CodecError> {
+    let len = definite_len(decoder.array().map_err(decode_error)?, "durable owner")?;
+    if len > limits.max_collection_items || len > super::MAX_DURABLE_OWNER_DEPTH {
+        return Err(CodecError::new("durable owner exceeds depth limit"));
+    }
+    let mut ancestors = Vec::with_capacity(len);
+    for _ in 0..len {
+        expect_array(decoder, 3, "durable owner row")?;
+        ancestors.push(DurableRowId {
+            list_memory_id: MemoryId(decode_digest(decoder)?),
+            row_key: decoder.u64().map_err(decode_error)?,
+            row_generation: decoder.u64().map_err(decode_error)?,
+        });
+    }
+    Ok(DurableOwner { ancestors })
+}
+
+fn encode_optional_durable_owner(
+    encoder: &mut CborEncoder<'_>,
+    owner: Option<&DurableOwner>,
+) -> Result<(), CodecError> {
+    match owner {
+        Some(owner) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(1))
+                .map_err(encode_error)?;
+            encode_durable_owner(encoder, owner)
+        }
+        None => encoder
+            .array(1)
+            .and_then(|encoder| encoder.u8(0))
+            .map(|_| ())
+            .map_err(encode_error),
+    }
+}
+
+fn decode_optional_durable_owner(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+) -> Result<Option<DurableOwner>, CodecError> {
+    let len = definite_len(
+        decoder.array().map_err(decode_error)?,
+        "optional durable owner",
+    )?;
+    let tag = decoder.u8().map_err(decode_error)?;
+    match (tag, len) {
+        (0, 1) => Ok(None),
+        (1, 2) => decode_durable_owner(decoder, limits).map(Some),
+        _ => Err(CodecError::new(format!(
+            "unknown optional durable owner tag {tag} with {len} fields"
+        ))),
+    }
+}
+
 fn encode_effect_row(
     encoder: &mut CborEncoder<'_>,
-    row: Option<DurableEffectRow>,
+    row: Option<DurableRowId>,
 ) -> Result<(), CodecError> {
     match row {
         Some(row) => {
@@ -1138,11 +1086,11 @@ fn encode_effect_row(
     Ok(())
 }
 
-fn decode_effect_row(decoder: &mut Decoder<'_>) -> Result<Option<DurableEffectRow>, CodecError> {
+fn decode_effect_row(decoder: &mut Decoder<'_>) -> Result<Option<DurableRowId>, CodecError> {
     let len = definite_len(decoder.array().map_err(decode_error)?, "effect target row")?;
     match (decoder.u8().map_err(decode_error)?, len) {
         (0, 1) => Ok(None),
-        (1, 4) => Ok(Some(DurableEffectRow {
+        (1, 4) => Ok(Some(DurableRowId {
             list_memory_id: MemoryId(decode_digest(decoder)?),
             row_key: decoder.u64().map_err(decode_error)?,
             row_generation: decoder.u64().map_err(decode_error)?,
@@ -1375,10 +1323,14 @@ fn decode_scalar(
 
 fn encode_list(encoder: &mut CborEncoder<'_>, list: &StoredList) -> Result<(), CodecError> {
     encoder
-        .array(3)
+        .array(5)
         .and_then(|encoder| encoder.bool(list.touched))
+        .and_then(|encoder| encoder.u64(list.revision))
         .and_then(|encoder| encoder.u64(list.next_key))
-        .and_then(|encoder| encoder.array(list.rows.len() as u64))
+        .map_err(encode_error)?;
+    encode_u128(encoder, list.next_order_token)?;
+    encoder
+        .array(list.rows.len() as u64)
         .map_err(encode_error)?;
     for row in &list.rows {
         encode_row(encoder, row)?;
@@ -1387,9 +1339,11 @@ fn encode_list(encoder: &mut CborEncoder<'_>, list: &StoredList) -> Result<(), C
 }
 
 fn decode_list(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<StoredList, CodecError> {
-    expect_array(decoder, 3, "stored list")?;
+    expect_array(decoder, 5, "stored list")?;
     let touched = decoder.bool().map_err(decode_error)?;
+    let revision = decoder.u64().map_err(decode_error)?;
     let next_key = decoder.u64().map_err(decode_error)?;
+    let next_order_token = decode_u128(decoder)?;
     let row_count = collection_len(decoder, limits, "stored rows", true)?;
     let mut rows = Vec::with_capacity(row_count);
     for _ in 0..row_count {
@@ -1397,18 +1351,23 @@ fn decode_list(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<Stored
     }
     Ok(StoredList {
         touched,
+        revision,
         next_key,
+        next_order_token,
         rows,
     })
 }
 
 fn encode_row(encoder: &mut CborEncoder<'_>, row: &StoredRow) -> Result<(), CodecError> {
     encoder
-        .array(4)
+        .array(7)
         .and_then(|encoder| encoder.u64(row.key))
         .and_then(|encoder| encoder.u64(row.generation))
-        .and_then(|encoder| encoder.map(row.fields.len() as u64))
         .map_err(encode_error)?;
+    encode_u128(encoder, row.source_order_token)?;
+    encode_durable_owner(encoder, &row.owner)?;
+    encode_optional_durable_owner(encoder, row.materialization_origin.as_ref())?;
+    encoder.map(row.fields.len() as u64).map_err(encode_error)?;
     for (field, value) in &row.fields {
         encode_digest(encoder, field.as_bytes())?;
         encode_value(encoder, value, 0)?;
@@ -1423,9 +1382,12 @@ fn encode_row(encoder: &mut CborEncoder<'_>, row: &StoredRow) -> Result<(), Code
 }
 
 fn decode_row(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<StoredRow, CodecError> {
-    expect_array(decoder, 4, "stored row")?;
+    expect_array(decoder, 7, "stored row")?;
     let key = decoder.u64().map_err(decode_error)?;
     let generation = decoder.u64().map_err(decode_error)?;
+    let source_order_token = decode_u128(decoder)?;
+    let owner = decode_durable_owner(decoder, limits)?;
+    let materialization_origin = decode_optional_durable_owner(decoder, limits)?;
     let field_count = collection_len(decoder, limits, "row fields", false)?;
     let mut fields = BTreeMap::new();
     for _ in 0..field_count {
@@ -1446,6 +1408,9 @@ fn decode_row(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<StoredR
     Ok(StoredRow {
         key,
         generation,
+        source_order_token,
+        owner,
+        materialization_origin,
         fields,
         touched_fields,
     })
@@ -1866,6 +1831,20 @@ fn decode_digest(decoder: &mut Decoder<'_>) -> Result<[u8; 32], CodecError> {
         .map_err(|_| CodecError::new("digest must contain exactly 32 bytes"))
 }
 
+fn encode_u128(encoder: &mut CborEncoder<'_>, value: u128) -> Result<(), CodecError> {
+    encoder.bytes(&value.to_be_bytes()).map_err(encode_error)?;
+    Ok(())
+}
+
+fn decode_u128(decoder: &mut Decoder<'_>) -> Result<u128, CodecError> {
+    let bytes: [u8; 16] = decoder
+        .bytes()
+        .map_err(decode_error)?
+        .try_into()
+        .map_err(|_| CodecError::new("u128 value must contain exactly 16 bytes"))?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
 fn decode_text(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<String, CodecError> {
     let value = decoder.str().map_err(decode_error)?;
     if value.len() > limits.max_text_bytes {
@@ -1947,6 +1926,7 @@ mod tests {
             effect,
             StoredValue::Text("stable-key".to_owned()),
             number(42),
+            DurableOwner::default(),
             None,
             turn_sequence,
         )
@@ -2116,6 +2096,42 @@ mod tests {
     }
 
     #[test]
+    fn ownerless_row_and_checkpoint_formats_fail_closed() {
+        let mut old_row = Vec::new();
+        let mut encoder = Encoder::new(&mut old_row);
+        encoder
+            .array(4)
+            .and_then(|encoder| encoder.u64(1))
+            .and_then(|encoder| encoder.u64(1))
+            .and_then(|encoder| encoder.map(0))
+            .and_then(|encoder| encoder.array(0))
+            .unwrap();
+        assert!(decode_row_component(&old_row, DecodeLimits::default(), &BTreeMap::new()).is_err());
+
+        let mut old_change = Vec::new();
+        let memory = memory("rows");
+        let field = MemoryLeafId::from_memory_path(memory, "value").unwrap();
+        let mut encoder = Encoder::new(&mut old_change);
+        encoder.array(6).and_then(|encoder| encoder.u8(3)).unwrap();
+        encode_digest(&mut encoder, memory.as_bytes()).unwrap();
+        encoder.u64(1).and_then(|encoder| encoder.u64(1)).unwrap();
+        encode_digest(&mut encoder, field.as_bytes()).unwrap();
+        encode_value(&mut encoder, &number(1), 0).unwrap();
+        assert!(
+            decode_durable_change(&mut Decoder::new(&old_change), DecodeLimits::default()).is_err()
+        );
+
+        let image = RestoreImage::empty(
+            ApplicationIdentity::new("dev.boon.old-format", "test", "local"),
+            1,
+            [1; 32],
+        );
+        let mut old_restore = encode_restore_image(&image).unwrap();
+        old_restore[1] = RESTORE_IMAGE_FORMAT.saturating_sub(1) as u8;
+        assert!(decode_restore_image(&old_restore, DecodeLimits::default()).is_err());
+    }
+
+    #[test]
     fn checkpoint_batch_round_trips_outbox_transitions_canonically() {
         let item = outbox_item(1);
         let batch = CheckpointBatch {
@@ -2133,7 +2149,6 @@ mod tests {
                 },
             }],
             outbox_changes: vec![DurableOutboxChange::Enqueue { item }],
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: vec![
                 DurableContentArtifactChange::SetReplaceable {
                     owner_id: ContentArtifactOwnerId([0x51; 32]),

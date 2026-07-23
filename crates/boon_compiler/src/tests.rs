@@ -1,94 +1,10 @@
 use super::*;
 use boon_plan::{
-    DistributedRouteScopePlan, HostPortPlan, PlanListProjection, PlanQuerySelection,
-    PlanSourceGuard, QueryKeyType, QueryTextNormalization, SourcePayloadField,
-    distributed_graph_schema_hash,
+    DistributedRouteScopePlan, HostPortPlan, ListInitializerKind, PlanInfixOp,
+    PlanListAccessSelection, PlanListProjection, PlanListRowFieldRole, PlanRowBuiltin,
+    SourcePayloadField, distributed_graph_schema_hash,
 };
 use std::collections::BTreeSet;
-
-const INDEXED_PREFIX_QUERY_SOURCE: &str = r#"
-store: [
-    change: SOURCE
-    prefix:
-        TEXT { al } |> HOLD prefix {
-            change.text |> THEN { change.text }
-        }
-    catalog: LIST {
-        [id: TEXT { 1 }, name: TEXT { Alpha }]
-        [id: TEXT { 2 }, name: TEXT { Alpine }]
-        [id: TEXT { 3 }, name: TEXT { Beta }]
-    }
-    results:
-        List/query_prefix(
-            list: catalog
-            field: name
-            prefix: prefix
-            limit: 20
-            normalization: TrimLowercase
-        )
-]
-"#;
-
-const GENERIC_COMPOUND_QUERY_SOURCE: &str = r#"
-store: [
-    catalog: LIST {
-        [id: TEXT { 1 }, city: TEXT { Oslo }, name: TEXT { Alpha }, score: 10]
-        [id: TEXT { 2 }, city: TEXT { Oslo }, name: TEXT { Beta }, score: 20]
-        [id: TEXT { 3 }, city: TEXT { Bergen }, name: TEXT { Alpha }, score: 30]
-    }
-    exact_key: [city: TEXT { OSLO }, name: TEXT { alpha }]
-    exact_page:
-        List/query(
-            list: catalog
-            fields: TEXT { city,name }
-            normalization: TEXT { TrimLowercase,TrimLowercase }
-            select: Exact
-            key: exact_key
-            limit: 2
-            unique: False
-            order: Ascending
-            residual: None
-        )
-]
-"#;
-
-const GENERIC_NUMBER_AND_TAG_QUERY_SOURCE: &str = r#"
-store: [
-    catalog: LIST {
-        [id: TEXT { 1 }, score: 10, kind: Featured]
-        [id: TEXT { 2 }, score: 20, kind: Ordinary]
-        [id: TEXT { 3 }, score: 30, kind: Featured]
-    }
-    lower: 10
-    upper: 25
-    score_page:
-        List/query(
-            list: catalog
-            fields: TEXT { score }
-            normalization: TEXT { Exact }
-            select: Range
-            lower: lower
-            upper: upper
-            lower_inclusive: True
-            upper_inclusive: False
-            limit: 10
-            order: Descending
-            residual: None
-        )
-    kind: Featured
-    kind_page:
-        List/query(
-            list: catalog
-            fields: TEXT { kind }
-            normalization: TEXT { Exact }
-            select: Exact
-            key: kind
-            limit: 10
-            order: Ascending
-            residual: None
-        )
-]
-"#;
 
 #[test]
 fn nested_effect_guards_lower_to_bounded_selector_conjunctions() {
@@ -119,38 +35,85 @@ store: [
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    let guards = compiled
+    let gates = compiled
         .plan
         .regions
         .iter()
         .flat_map(|region| &region.ops)
         .filter_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::HostEffect,
-                source_guard: Some(guard),
+            PlanOpKind::StateUpdate {
+                effect: Some(effect),
                 ..
-            } => Some(guard),
+            } if compiled.plan.effects.iter().any(|contract| {
+                contract.effect_id == effect.effect_id && contract.host_operation == "Wellen/open"
+            }) =>
+            {
+                Some(&effect.gate)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
-    let [PlanSourceGuard::All { guards }] = guards.as_slice() else {
-        panic!("expected exactly one guarded nested host effect, got {guards:#?}");
+    let [gate] = gates.as_slice() else {
+        panic!("expected exactly one nested selector gate, got {gates:#?}");
     };
-    assert_eq!(guards.len(), 2);
+    let PlanRowExpressionNode::Select {
+        input: outer_input,
+        arms: outer_arms,
+    } = row_node(&compiled.plan.row_expressions, **gate)
+    else {
+        panic!("nested selector gate lost its outer selector: {gates:#?}");
+    };
     assert!(matches!(
-        &guards[0],
-        PlanSourceGuard::ValueOneOf {
+        row_node(&compiled.plan.row_expressions, *outer_input),
+        PlanRowExpressionNode::Field {
             input: ValueRef::State(_),
-            values,
-        } if values == &["Finished".to_owned()]
+        }
     ));
+    let retained_gate = outer_arms
+        .iter()
+        .find_map(|arm| {
+            match (
+                &arm.pattern,
+                row_node(&compiled.plan.row_expressions, arm.value),
+            ) {
+                (
+                    PlanRowSelectPattern::Text { value },
+                    PlanRowExpressionNode::Select { input, arms },
+                ) if value == "Finished" => Some((*input, arms)),
+                _ => None,
+            }
+        })
+        .expect("Finished arm must contain the retained-value selector");
     assert!(matches!(
-        &guards[1],
-        PlanSourceGuard::ValueOneOf {
+        row_node(&compiled.plan.row_expressions, retained_gate.0),
+        PlanRowExpressionNode::Field {
             input: ValueRef::StateProjection { field_path, .. },
-            values,
         } if field_path == &["retained".to_owned()]
-            && values == &["Retained".to_owned()]
+    ));
+    let true_constant = retained_gate
+        .1
+        .iter()
+        .find_map(|arm| {
+            match (
+                &arm.pattern,
+                row_node(&compiled.plan.row_expressions, arm.value),
+            ) {
+                (
+                    PlanRowSelectPattern::Text { value },
+                    PlanRowExpressionNode::Constant { constant_id },
+                ) if value == "Retained" => Some(*constant_id),
+                _ => None,
+            }
+        })
+        .expect("Retained arm must reach the effect");
+    assert!(matches!(
+        compiled
+            .plan
+            .constants
+            .iter()
+            .find(|constant| constant.id == true_constant)
+            .map(|constant| &constant.value),
+        Some(PlanConstantValue::Bool { value: true })
     ));
 }
 
@@ -318,143 +281,6 @@ fn compile_fixture_runtime_source_text_with_persistence_catalog(
 }
 
 #[test]
-fn compiler_owns_typed_prefix_query_index_plan() {
-    let compiled = compile_fixture_source_text_to_machine_plan(
-        "indexed-prefix-query.bn",
-        INDEXED_PREFIX_QUERY_SOURCE,
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-
-    assert_eq!(
-        compiled.plan.query_indexes.len(),
-        1,
-        "unresolved: {:#?}; projections: {:#?}; lists: {:#?}; statements: {:#?}; expressions: {:#?}",
-        compiled.plan.debug_map.unresolved_executable_refs,
-        compiled.ir.list_projections,
-        compiled.ir.lists,
-        compiled.parsed.ast.statements,
-        compiled.parsed.expressions,
-    );
-    let index = &compiled.plan.query_indexes[0];
-    assert_eq!(index.source_semantic_path, "catalog");
-    assert_eq!(index.fields[0].semantic_path, "catalog.name");
-    assert_eq!(
-        index.fields[0].normalization,
-        QueryTextNormalization::TrimLowercase
-    );
-    assert!(
-        compiled
-            .plan
-            .regions
-            .iter()
-            .flat_map(|region| &region.ops)
-            .any(|op| matches!(
-                &op.kind,
-                PlanOpKind::ListProjection {
-                    projection: PlanListProjection::TextPrefix {
-                        index: query_index,
-                        limit: 20,
-                        ..
-                    }
-                } if query_index == &index.id
-            ))
-    );
-    let verification = verify_plan(&compiled.plan).unwrap();
-    assert_eq!(verification.status, "pass", "{:#?}", verification.checks);
-    assert!(
-        compiled.plan.capability_summary.cpu_plan_executor_complete,
-        "capabilities: {:#?}; unresolved: {:#?}; unsupported: {:#?}",
-        compiled.plan.capability_summary,
-        compiled.plan.debug_map.unresolved_executable_refs,
-        boon_plan::cpu_plan_executor_unsupported_ops(&compiled.plan),
-    );
-}
-
-#[test]
-fn compiler_owns_generic_compound_query_and_page_contract() {
-    let compiled = compile_fixture_source_text_to_machine_plan(
-        "generic-compound-query.bn",
-        GENERIC_COMPOUND_QUERY_SOURCE,
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-    let [index] = compiled.plan.query_indexes.as_slice() else {
-        panic!(
-            "expected one canonical compound index, got {:?}; unresolved={:?}",
-            compiled.plan.query_indexes, compiled.plan.debug_map.unresolved_executable_refs
-        );
-    };
-    assert_eq!(index.fields.len(), 2);
-    assert!(
-        index
-            .fields
-            .iter()
-            .all(|field| field.key_type == QueryKeyType::Text)
-    );
-    assert!(
-        compiled
-            .plan
-            .regions
-            .iter()
-            .flat_map(|region| &region.ops)
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    PlanOpKind::ListProjection {
-                        projection: PlanListProjection::IndexedQuery {
-                            selection: PlanQuerySelection::Exact { .. },
-                            limit: 2,
-                            ..
-                        }
-                    }
-                )
-            })
-    );
-    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
-    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
-}
-
-#[test]
-fn compiler_owns_number_range_and_tag_exact_indexes() {
-    let compiled = compile_fixture_source_text_to_machine_plan(
-        "generic-number-tag-query.bn",
-        GENERIC_NUMBER_AND_TAG_QUERY_SOURCE,
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-    assert_eq!(
-        compiled
-            .plan
-            .query_indexes
-            .iter()
-            .flat_map(|index| index.fields.iter().map(|field| field.key_type))
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([QueryKeyType::Number, QueryKeyType::Tag])
-    );
-    assert!(
-        compiled
-            .plan
-            .regions
-            .iter()
-            .flat_map(|region| &region.ops)
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    PlanOpKind::ListProjection {
-                        projection: PlanListProjection::IndexedQuery {
-                            selection: PlanQuerySelection::Range { .. },
-                            ..
-                        }
-                    }
-                )
-            })
-    );
-    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
-    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
-}
-
-#[test]
 fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
     let compiled = compile_source_path_to_machine_plan_for_role(
         std::path::Path::new("examples/outbound_http_effect.bn"),
@@ -470,12 +296,9 @@ fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
         .flat_map(|region| &region.ops)
         .filter(|op| {
             !boon_plan::cpu_plan_executor_supports_whole_plan_op(
+                &compiled.plan.row_expressions,
                 &compiled.plan.storage_layout.scalar_slots,
-                &compiled.plan.storage_layout.list_slots,
-                &compiled.plan.constants,
                 op,
-                &empty,
-                &empty,
                 &empty,
             )
         })
@@ -515,7 +338,7 @@ fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
         .iter()
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
+            PlanOpKind::StateUpdate {
                 effect: Some(effect),
                 ..
             } if effect.effect_id == contract.effect_id => Some(effect),
@@ -596,27 +419,37 @@ store: [
             _ => None,
         })
         .expect("typed pending expression");
-    assert!(
-        matches!(
-            expression,
-            PlanDerivedExpression::RowExpression {
-                expression: PlanRowExpression::BuiltinCall {
-                    function,
-                    input: Some(input),
-                    args,
-                },
-            } if function == "Bool/not"
-                && args.is_empty()
-                && matches!(
-                    input.as_ref(),
-                    PlanRowExpression::NumberInfix { op, left, right }
-                        if op == "=="
-                            && matches!(left.as_ref(), PlanRowExpression::Field { input: ValueRef::State(_) })
-                            && matches!(right.as_ref(), PlanRowExpression::Field { input: ValueRef::State(_) })
-                )
-        ),
-        "unexpected root comparison expression: {expression:#?}"
-    );
+    let PlanDerivedExpression::RowExpression { expression: root } = expression else {
+        panic!("unexpected root comparison expression: {expression:#?}");
+    };
+    let PlanRowExpressionNode::BuiltinCall {
+        function,
+        input: Some(input),
+        args,
+    } = row_node(&compiled.plan.row_expressions, *root)
+    else {
+        panic!("unexpected root comparison expression: {expression:#?}");
+    };
+    assert_eq!(*function, PlanRowBuiltin::BoolNot);
+    assert!(args.is_empty());
+    let PlanRowExpressionNode::NumberInfix { op, left, right } =
+        row_node(&compiled.plan.row_expressions, *input)
+    else {
+        panic!("Bool/not input lost its typed comparison: {expression:#?}");
+    };
+    assert_eq!(*op, PlanInfixOp::Equal);
+    assert!(matches!(
+        row_node(&compiled.plan.row_expressions, *left),
+        PlanRowExpressionNode::Field {
+            input: ValueRef::State(_)
+        }
+    ));
+    assert!(matches!(
+        row_node(&compiled.plan.row_expressions, *right),
+        PlanRowExpressionNode::Field {
+            input: ValueRef::State(_)
+        }
+    ));
     let verification = verify_plan(&compiled.plan).unwrap();
     assert_eq!(verification.error_count, 0, "{:#?}", verification.checks);
 }
@@ -693,33 +526,37 @@ store: [
         .iter()
         .flat_map(|region| &region.ops)
         .find(|op| {
+            let PlanOpKind::StateUpdate {
+                value: Some(value), ..
+            } = &op.kind
+            else {
+                return false;
+            };
             matches!(
-                op.kind,
-                PlanOpKind::UpdateBranch {
-                    expression_kind: PlanExpressionKind::TextToNumber,
-                    ..
-                }
+                row_node(&compiled.plan.row_expressions, *value),
+                PlanRowExpressionNode::TextToNumber { .. }
             )
         })
         .expect("TextToNumber update op");
-    let PlanOpKind::UpdateBranch {
-        ordered_inputs,
-        source_payload_field,
-        ..
+    let PlanOpKind::StateUpdate {
+        value: Some(value), ..
     } = &update.kind
     else {
         unreachable!();
     };
+    let PlanRowExpressionNode::TextToNumber { input } =
+        row_node(&compiled.plan.row_expressions, *value)
+    else {
+        unreachable!();
+    };
     assert!(matches!(
-        source_payload_field,
-        Some(boon_plan::SourcePayloadField::Named(name)) if name == "amount"
-    ));
-    assert!(matches!(
-        ordered_inputs.as_slice(),
-        [ValueRef::SourcePayload {
-            field: boon_plan::SourcePayloadField::Named(name),
-            ..
-        }] if name == "amount"
+        row_node(&compiled.plan.row_expressions, *input),
+        PlanRowExpressionNode::Field {
+            input: ValueRef::SourcePayload {
+                field: boon_plan::SourcePayloadField::Named(name),
+                ..
+            },
+        } if name == "amount"
     ));
     let Some(ValueRef::State(output)) = update.output else {
         panic!("TextToNumber update must target scalar state");
@@ -745,97 +582,383 @@ store: [
             .collect::<Vec<_>>()
     );
 }
-use boon_plan::{
-    DataTypePlan, DocumentExprId, DocumentExprOp, DocumentMaterializationSource, DocumentRead,
-    DocumentValueClass, EffectBarrier, EffectReplay, EffectResultPolicy, EffectResultRoute,
-    FieldId, MemoryId, MemoryKind, MigrationExpressionPlan, MigrationPredecessorBinding,
-    MigrationTransferKindPlan, MigrationTransformPlan, OutputContractKind, OutputDemandPolicy,
-    OutputValueRef, PLAN_MAJOR_VERSION, PlanContextualOperationKind, PlanDerivedExpression,
-    PlanExpressionKind, PlanLocalId, PlanOpKind, PlanRowExpression, PlanStaticOwnerId,
-    RootOutputDemand, ValueRef, plan_binary, plan_sha256, verify_plan,
-};
 
-fn expect_contextual_map<'a>(
-    expression: &'a PlanRowExpression,
-    context: &str,
-) -> (
-    PlanStaticOwnerId,
-    PlanLocalId,
-    &'a PlanRowExpression,
-    &'a PlanRowExpression,
-) {
-    let PlanRowExpression::ContextualCollection {
-        owner,
-        operation,
-        source,
-        row_local,
-        body,
-        ..
-    } = expression
-    else {
-        panic!("{context} must lower as a typed contextual collection: {expression:#?}");
-    };
-    assert_eq!(
-        *operation,
-        PlanContextualOperationKind::Map,
-        "{context} must retain the exact List/map operation"
+#[test]
+fn nested_source_payload_reused_by_text_input_keeps_its_exact_payload_read() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "nested-text-input-source-payload.bn",
+        r#"
+store: [
+    sources: [station_input: [events: [change: SOURCE]]]
+    selected:
+        TEXT { initial } |> HOLD selected {
+            sources.station_input.events.change.text
+        }
+    watch:
+        TEXT { initial } |> HOLD watch {
+            sources.station_input.events.change.text
+        }
+]
+document: Document/new(
+    root: Element/text_input(
+        element: [events: store.sources.station_input.events]
+        style: []
+        label: TEXT { Station }
+        text: store.selected
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let updates = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::StateUpdate {
+                value: Some(value), ..
+            } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        updates.iter().all(|update| matches!(
+            row_node(&compiled.plan.row_expressions, **update),
+            PlanRowExpressionNode::Field {
+                input: ValueRef::SourcePayload {
+                    field: boon_plan::SourcePayloadField::Text,
+                    ..
+                }
+            }
+        )),
+        "nested source payload resolved through the UI record instead: {updates:#?}; reads={:#?}; bindings={:#?}",
+        compiled.ir.scope_index.reads,
+        compiled.ir.scope_index.bindings,
     );
-    (*owner, *row_local, source.as_ref(), body.as_ref())
 }
 
-fn expect_contextual_filter<'a>(
-    expression: &'a PlanRowExpression,
+#[test]
+fn connected_fixture_repeated_nested_source_payloads_are_exact() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "persistence-fjordpulse-fixture.bn",
+        include_str!("../../../examples/persistence_fjordpulse_fixture.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let station_source = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.sources.station_input.events.change")
+        .map(|route| route.source_id)
+        .expect("station source");
+    let updates = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::StateUpdate {
+                trigger: ValueRef::Source(source),
+                value: Some(value),
+                ..
+            } if *source == station_source => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(updates.len(), 2);
+    assert!(
+        updates.iter().all(|update| matches!(
+            row_node(&compiled.plan.row_expressions, **update),
+            PlanRowExpressionNode::Field {
+                input: ValueRef::SourcePayload {
+                    field: boon_plan::SourcePayloadField::Text,
+                    ..
+                }
+            }
+        )),
+        "station payload reads are not exact: {updates:#?}",
+    );
+}
+
+#[test]
+fn todo_v2_nested_mapped_rows_keep_typed_document_projections() {
+    let path = example_path("examples/migrations/todo/v2.bn");
+    let compiled =
+        compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault).unwrap();
+    let tasks = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.tasks")
+        .expect("tasks list");
+    let materialization = compiled
+        .ir
+        .materializations
+        .iter()
+        .find(|materialization| materialization.target_list_id == Some(tasks.id))
+        .expect("tasks materialization");
+    let source_list = materialization
+        .source_list_id
+        .expect("DRAIN source list identity");
+    assert_eq!(
+        materialization.source_scope_id,
+        compiled
+            .ir
+            .lists
+            .iter()
+            .find(|list| list.id == source_list)
+            .and_then(|list| list.row_scope_id),
+        "DRAIN must preserve the exact source row scope"
+    );
+    let expression = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression:
+                    Some(PlanDerivedExpression::MaterializeList {
+                        target_list,
+                        expression,
+                        ..
+                    }),
+                ..
+            } if *target_list == boon_plan::ListId(tasks.id.as_usize()) => Some(expression),
+            _ => None,
+        })
+        .expect("tasks materialization expression");
+    let PlanDerivedExpression::RowExpression { expression } = expression.as_ref() else {
+        panic!("tasks materialization must use a row expression: {expression:#?}");
+    };
+    let PlanRowExpressionNode::ContextualCollection { captures, .. } =
+        row_node(&compiled.plan.row_expressions, *expression)
+    else {
+        panic!("tasks materialization must use a contextual collection: {expression:#?}");
+    };
+    assert!(
+        captures.is_empty(),
+        "DRAIN authority transfer must not depend on transient row captures: {captures:#?}"
+    );
+    let verification = boon_plan::verify_plan(&compiled.plan).unwrap();
+    assert_eq!(
+        verification.status,
+        "pass",
+        "todo V2 plan is not ready: {verification:#?}; tasks slot={:#?}",
+        compiled
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.list_id == boon_plan::ListId(tasks.id.as_usize()))
+    );
+    let tasks_slot = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id == boon_plan::ListId(tasks.id.as_usize()))
+        .expect("tasks slot");
+    let authority_fields = tasks_slot
+        .row_fields
+        .iter()
+        .filter(|field| field.role.is_authority())
+        .map(|field| field.field_id)
+        .collect::<BTreeSet<_>>();
+    let state_defaults = compiled
+        .plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .filter(|slot| {
+            slot.scope_id
+                == tasks
+                    .row_scope_id
+                    .map(|scope| boon_plan::ScopeId(scope.as_usize()))
+        })
+        .collect::<Vec<_>>();
+    assert!(!state_defaults.is_empty());
+    assert!(
+        state_defaults.iter().all(|slot| {
+            let boon_plan::ScalarInitializerPlan::Expression { expression } = &slot.initializer
+            else {
+                return false;
+            };
+            matches!(
+                row_node(&compiled.plan.row_expressions, *expression),
+                PlanRowExpressionNode::Field {
+                    input: ValueRef::Field(field),
+                } if authority_fields.contains(field)
+            )
+        }),
+        "DRAIN-backed state defaults must read durable target authority: {state_defaults:#?}"
+    );
+}
+use boon_plan::{
+    DataTypePlan, DocumentExprId, DocumentExprOp, DocumentMaterializationSource, DocumentRead,
+    DocumentTextSegment, DocumentValueClass, EffectBarrier, EffectReplay, EffectResultPolicy,
+    EffectResultRoute, FieldId, ListId, MemoryId, MemoryKind, MigrationExpressionPlan,
+    MigrationPredecessorBinding, MigrationTransferKindPlan, MigrationTransformPlan,
+    OutputContractKind, OutputDemandPolicy, OutputValueRef, PLAN_MAJOR_VERSION, PlanConstantValue,
+    PlanContextualOperationKind, PlanDerivedExpression, PlanLocalId, PlanOpKind,
+    PlanRowExpressionArena, PlanRowExpressionId, PlanRowExpressionNode, PlanRowSelectPattern,
+    PlanStaticOwnerId, RootOutputDemand, ValueRef, plan_binary, plan_sha256, verify_plan,
+};
+
+fn row_node(
+    arena: &PlanRowExpressionArena,
+    expression: PlanRowExpressionId,
+) -> &PlanRowExpressionNode {
+    arena.node(expression).unwrap_or_else(|error| {
+        panic!(
+            "invalid row expression id {} for arena length {}: {error}",
+            expression.0,
+            arena.len()
+        )
+    })
+}
+
+fn derived_row_expression_ids(expression: &PlanDerivedExpression) -> Vec<PlanRowExpressionId> {
+    let mut roots = Vec::new();
+    let mut stack = vec![expression];
+    while let Some(expression) = stack.pop() {
+        match expression {
+            PlanDerivedExpression::MaterializeList { expression, .. }
+            | PlanDerivedExpression::BoolNotExpression { input: expression } => {
+                stack.push(expression);
+            }
+            PlanDerivedExpression::BoolAnd { left, right } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+                roots.push(*default);
+                roots.extend(arms.iter().map(|arm| arm.value));
+            }
+            PlanDerivedExpression::RowExpression { expression }
+            | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
+                roots.push(*expression);
+            }
+            PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
+            | PlanDerivedExpression::BoolNot { .. }
+            | PlanDerivedExpression::NumberCompareConst { .. }
+            | PlanDerivedExpression::ValueCompare { .. } => {}
+        }
+    }
+    roots
+}
+
+fn visit_derived_row_nodes(
+    arena: &PlanRowExpressionArena,
+    expression: &PlanDerivedExpression,
+    visitor: &mut impl FnMut(PlanRowExpressionId, &PlanRowExpressionNode),
+) {
+    for root in derived_row_expression_ids(expression) {
+        arena
+            .visit(root, visitor)
+            .unwrap_or_else(|error| panic!("invalid derived row expression {}: {error}", root.0));
+    }
+}
+
+fn expect_contextual_collection(
+    arena: &PlanRowExpressionArena,
+    expression: PlanRowExpressionId,
+    expected_operation: PlanContextualOperationKind,
     context: &str,
 ) -> (
     PlanStaticOwnerId,
     PlanLocalId,
-    &'a PlanRowExpression,
-    &'a PlanRowExpression,
+    PlanRowExpressionId,
+    PlanRowExpressionId,
 ) {
-    let PlanRowExpression::ContextualCollection {
+    let node = row_node(arena, expression);
+    let PlanRowExpressionNode::ContextualCollection {
         owner,
         operation,
         source,
         row_local,
         body,
         ..
-    } = expression
+    } = node
     else {
-        panic!("{context} must lower as a typed contextual collection: {expression:#?}");
+        panic!("{context} must lower as a typed contextual collection: {node:#?}");
     };
     assert_eq!(
-        *operation,
-        PlanContextualOperationKind::Filter,
-        "{context} must retain the exact List/filter operation"
+        *operation, expected_operation,
+        "{context} changed its contextual operation"
     );
-    (*owner, *row_local, source.as_ref(), body.as_ref())
+    (*owner, *row_local, *source, *body)
+}
+
+fn expect_contextual_map(
+    arena: &PlanRowExpressionArena,
+    expression: PlanRowExpressionId,
+    context: &str,
+) -> (
+    PlanStaticOwnerId,
+    PlanLocalId,
+    PlanRowExpressionId,
+    PlanRowExpressionId,
+) {
+    expect_contextual_collection(arena, expression, PlanContextualOperationKind::Map, context)
+}
+
+fn expect_contextual_filter(
+    arena: &PlanRowExpressionArena,
+    expression: PlanRowExpressionId,
+    context: &str,
+) -> (
+    PlanStaticOwnerId,
+    PlanLocalId,
+    PlanRowExpressionId,
+    PlanRowExpressionId,
+) {
+    expect_contextual_collection(
+        arena,
+        expression,
+        PlanContextualOperationKind::Filter,
+        context,
+    )
 }
 
 fn assert_contextual_local_projection(
-    expression: &PlanRowExpression,
+    arena: &PlanRowExpressionArena,
+    expression: PlanRowExpressionId,
     expected_owner: PlanStaticOwnerId,
     expected_local: PlanLocalId,
     expected_projection: &[&str],
     context: &str,
 ) {
-    let PlanRowExpression::Local {
-        owner,
-        local,
-        projection,
-    } = expression
-    else {
-        panic!("{context} must read the typed contextual local: {expression:#?}");
-    };
-    assert_eq!(*owner, expected_owner, "{context} changed static owner");
-    assert_eq!(*local, expected_local, "{context} changed local identity");
-    assert_eq!(
-        projection,
-        &expected_projection
-            .iter()
-            .map(|field| (*field).to_owned())
-            .collect::<Vec<_>>(),
-        "{context} changed its projected row fields"
-    );
+    let node = row_node(arena, expression);
+    match node {
+        PlanRowExpressionNode::Local {
+            owner,
+            local,
+            projection,
+        } => {
+            assert_eq!(*owner, expected_owner, "{context} changed static owner");
+            assert_eq!(*local, expected_local, "{context} changed local identity");
+            assert_eq!(
+                projection,
+                &expected_projection
+                    .iter()
+                    .map(|field| (*field).to_owned())
+                    .collect::<Vec<_>>(),
+                "{context} changed its projected row fields"
+            );
+        }
+        PlanRowExpressionNode::ListRowField { row, .. }
+            if expected_projection.len() == 1
+                && matches!(
+                    row_node(arena, *row),
+                    PlanRowExpressionNode::LocalRow { owner, local }
+                        if *owner == expected_owner && *local == expected_local
+                ) => {}
+        _ => panic!("{context} must read the typed contextual row: {node:#?}"),
+    }
 }
 
 fn example_path(path: &str) -> PathBuf {
@@ -968,8 +1091,10 @@ scene: Scene/Element/text(
         .iter()
         .find(|slot| !slot.indexed)
         .unwrap();
-    assert_eq!(slot.initial_value_kind, boon_plan::InitialValueKind::Text);
-    let constant = &compiled.plan.constants[slot.initial_constant_id.unwrap().0].value;
+    let boon_plan::ScalarInitializerPlan::Constant { constant_id } = &slot.initializer else {
+        panic!("multiline text state must have one constant initializer");
+    };
+    let constant = &compiled.plan.constants[constant_id.0].value;
     assert_eq!(
         constant,
         &boon_plan::PlanConstantValue::Text {
@@ -1047,7 +1172,8 @@ fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
     assert!(matches!(
         &response.value,
         OutputValueRef::RuntimeValue {
-            value: ValueRef::Field(_)
+            value: ValueRef::Field(_),
+            ..
         }
     ));
     let jobs = compiled.plan.output_root("pending_priorities").unwrap();
@@ -1060,7 +1186,8 @@ fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
     assert!(matches!(
         &jobs.value,
         OutputValueRef::RuntimeValue {
-            value: ValueRef::List(_)
+            value: ValueRef::Field(_),
+            ..
         }
     ));
     let [
@@ -1143,12 +1270,9 @@ fn compiler_executes_recursive_http_payload_list_get() {
         .flat_map(|region| &region.ops)
         .filter(|op| {
             !boon_plan::cpu_plan_executor_supports_whole_plan_op(
+                &compiled.plan.row_expressions,
                 &compiled.plan.storage_layout.scalar_slots,
-                &compiled.plan.storage_layout.list_slots,
-                &compiled.plan.constants,
                 op,
-                &empty,
-                &empty,
                 &empty,
             )
         })
@@ -1194,7 +1318,8 @@ store: [
             _ => None,
         })
         .expect("source event transform");
-    let PlanRowExpression::BuiltinCall {
+    let transform = row_node(&compiled.plan.row_expressions, *transform);
+    let PlanRowExpressionNode::BuiltinCall {
         function,
         input: Some(mapped),
         args: joined_args,
@@ -1202,37 +1327,65 @@ store: [
     else {
         panic!("terminal join call was not retained: {transform:#?}");
     };
-    assert_eq!(function, "Text/join");
+    assert_eq!(*function, PlanRowBuiltin::TextJoin);
     assert_eq!(
         joined_args
             .iter()
-            .filter_map(|arg| arg.name.as_deref())
+            .map(|arg| arg.name.as_str())
             .collect::<Vec<_>>(),
         ["separator"]
     );
-    let (map_owner, map_local, filtered, mapped_value) =
-        expect_contextual_map(mapped, "HTTP query value projection");
+    let (map_owner, map_local, filtered, mapped_value) = expect_contextual_map(
+        &compiled.plan.row_expressions,
+        *mapped,
+        "HTTP query value projection",
+    );
     assert_contextual_local_projection(
+        &compiled.plan.row_expressions,
         mapped_value,
         map_owner,
         map_local,
         &["value"],
         "HTTP query value projection",
     );
-    let (owner, row_local, _source, predicate) =
-        expect_contextual_filter(filtered, "HTTP query filter");
-    let PlanRowExpression::NumberInfix { op, left, .. } = predicate else {
+    let (owner, row_local, _source, predicate) = expect_contextual_filter(
+        &compiled.plan.row_expressions,
+        filtered,
+        "HTTP query filter",
+    );
+    let predicate_node = row_node(&compiled.plan.row_expressions, predicate);
+    let PlanRowExpressionNode::NumberInfix { op, left, .. } = predicate_node else {
         panic!("HTTP query filter must retain its typed equality: {predicate:#?}");
     };
-    assert_eq!(op, "==");
+    assert_eq!(*op, PlanInfixOp::Equal);
     assert_contextual_local_projection(
-        left,
+        &compiled.plan.row_expressions,
+        *left,
         owner,
         row_local,
         &["name"],
         "HTTP query parameter name",
     );
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+}
+
+#[test]
+fn source_event_transform_ignores_skip_when_inferring_its_value_type() {
+    compile_fixture_source_text_to_machine_plan(
+        "source-event-skip-type.bn",
+        r#"
+store: [
+    input: SOURCE
+    result:
+        input.key |> WHEN {
+            Enter => TEXT { saved }
+            __ => SKIP
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("SKIP is absence and must not make a Text event transform an Enum");
 }
 
 #[test]
@@ -1251,12 +1404,9 @@ fn fjordpulse_server_host_boundary_is_cpu_executable() {
         .flat_map(|region| &region.ops)
         .filter(|op| {
             !boon_plan::cpu_plan_executor_supports_whole_plan_op(
+                &compiled.plan.row_expressions,
                 &compiled.plan.storage_layout.scalar_slots,
-                &compiled.plan.storage_layout.list_slots,
-                &compiled.plan.constants,
                 op,
-                &empty,
-                &empty,
                 &empty,
             )
         })
@@ -1278,13 +1428,22 @@ fn fjordpulse_server_host_boundary_is_cpu_executable() {
         compiled.plan.capability_summary.cpu_plan_executor_complete,
         "FjordPulse server has unsupported ops: {unsupported:#?}"
     );
-    assert_eq!(compiled.plan.query_indexes.len(), 1);
+    let station_list = compiled
+        .plan
+        .debug_map
+        .list_slots
+        .iter()
+        .find(|entry| entry.label.ends_with("store.stations"))
+        .and_then(|entry| entry.id.strip_prefix("list:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(ListId)
+        .expect("station catalog list identity");
     let stations = compiled
         .plan
         .storage_layout
         .list_slots
         .iter()
-        .find(|slot| slot.list_id == compiled.plan.query_indexes[0].source_list)
+        .find(|slot| slot.list_id == station_list)
         .expect("station catalog list");
     assert_eq!(stations.initial_rows.len(), 5);
     assert!(stations.initial_rows.iter().all(|row| {
@@ -1292,6 +1451,34 @@ fn fjordpulse_server_host_boundary_is_cpu_executable() {
             .into_iter()
             .all(|name| row.fields.iter().any(|field| field.name == name))
     }));
+    assert_eq!(compiled.plan.list_indexes.len(), 1);
+    assert_eq!(compiled.plan.list_indexes[0].source_list, station_list);
+    assert_eq!(compiled.plan.list_indexes[0].keys.len(), 1);
+    let access = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+                ..
+            } => match expression.as_ref() {
+                PlanDerivedExpression::RowExpression { expression } => {
+                    match row_node(&compiled.plan.row_expressions, *expression) {
+                        PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("inline bounded station access");
+    assert!(matches!(
+        access.selection,
+        boon_plan::PlanListAccessSelection::TextPrefix { .. }
+    ));
 }
 
 #[test]
@@ -1320,6 +1507,711 @@ outputs: [
         )
     }));
     assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn omitted_order_direction_erases_to_an_ascending_typed_index() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "default-order-direction.bn",
+        r#"
+store: [
+    items: LIST {
+        [name: TEXT { Beta }]
+        [name: TEXT { Alpha }]
+    }
+    result:
+        items
+        |> List/sort_by(item, key: item.name)
+        |> List/take(count: 2)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("omitted order direction must have an executable default");
+
+    let [index] = compiled.plan.list_indexes.as_slice() else {
+        panic!(
+            "default ordering must lower to one typed index: {:#?}",
+            compiled.plan.list_indexes
+        );
+    };
+    assert_eq!(index.keys.len(), 1);
+    assert_eq!(
+        index.keys[0].direction,
+        boon_plan::PlanOrderDirection::Ascending
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn dynamic_order_direction_erases_to_prebuilt_static_index_branches() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "dynamic-order-direction.bn",
+        r#"
+store: [
+    reverse: SOURCE
+    direction:
+        Ascending |> HOLD direction {
+            reverse |> THEN { Descending }
+        }
+    items: LIST {
+        [name: TEXT { Beta }]
+        [name: TEXT { Alpha }]
+    }
+    result:
+        items
+        |> List/sort_by(item, key: item.name, direction: direction)
+        |> List/take(count: 2)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("dynamic order direction must lower to prebuilt physical branches");
+
+    assert_eq!(compiled.plan.list_indexes.len(), 2);
+    assert_eq!(
+        compiled
+            .plan
+            .list_indexes
+            .iter()
+            .filter(|index| {
+                index.keys.as_slice().first().map(|key| key.direction)
+                    == Some(boon_plan::PlanOrderDirection::Ascending)
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        compiled
+            .plan
+            .list_indexes
+            .iter()
+            .filter(|index| {
+                index.keys.as_slice().first().map(|key| key.direction)
+                    == Some(boon_plan::PlanOrderDirection::Descending)
+            })
+            .count(),
+        1
+    );
+
+    let mut directional_selects = 0;
+    for op in compiled.plan.regions.iter().flat_map(|region| &region.ops) {
+        let PlanOpKind::DerivedValue {
+            expression: Some(expression),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        visit_derived_row_nodes(
+            &compiled.plan.row_expressions,
+            expression,
+            &mut |_, node| {
+                if let PlanRowExpressionNode::Select { arms, .. } = node
+                    && arms.len() == 2
+                    && arms.iter().all(|arm| {
+                        matches!(
+                            row_node(&compiled.plan.row_expressions, arm.value),
+                            PlanRowExpressionNode::ListAccess { .. }
+                        )
+                    })
+                {
+                    directional_selects += 1;
+                }
+            },
+        );
+    }
+    assert_eq!(directional_selects, 1);
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn independent_dynamic_order_directions_prebuild_every_direction_vector() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "dynamic-order-vector.bn",
+        r#"
+store: [
+    reverse_primary: SOURCE
+    reverse_secondary: SOURCE
+    primary_direction:
+        Ascending |> HOLD primary_direction {
+            reverse_primary |> THEN { Descending }
+        }
+    secondary_direction:
+        Descending |> HOLD secondary_direction {
+            reverse_secondary |> THEN { Ascending }
+        }
+    items: LIST {
+        [name: TEXT { Beta }, rank: 2]
+        [name: TEXT { Alpha }, rank: 1]
+    }
+    result:
+        items
+        |> List/sort_by(item, key: item.name, direction: primary_direction)
+        |> List/then_by(item, key: item.rank, direction: secondary_direction)
+        |> List/take(count: 2)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("two independent directions must lower to four prebuilt indexes");
+
+    assert_eq!(compiled.plan.list_indexes.len(), 4);
+    let vectors = compiled
+        .plan
+        .list_indexes
+        .iter()
+        .map(|index| {
+            let [primary, secondary] = index.keys.as_slice() else {
+                panic!("dynamic compound index must have two keys: {index:#?}");
+            };
+            (
+                primary.direction == boon_plan::PlanOrderDirection::Descending,
+                secondary.direction == boon_plan::PlanOrderDirection::Descending,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        vectors,
+        BTreeSet::from([(false, false), (false, true), (true, false), (true, true)])
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn named_intermediate_preserves_authoritative_order_chain_into_access_planning() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "named-order-chain.bn",
+        r#"
+store: [
+    items: LIST {
+        [name: TEXT { Beta }, rank: 2]
+        [name: TEXT { Alpha }, rank: 1]
+        [name: TEXT { Alpha }, rank: 3]
+    }
+    primary:
+        items |> List/sort_by(item, key: item.name)
+    ordered:
+        primary
+        |> List/then_by(item, key: item.rank, direction: Descending)
+        |> List/take(count: 3)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("checked order provenance must survive a named intermediate");
+
+    let [index] = compiled.plan.list_indexes.as_slice() else {
+        panic!(
+            "named compound ordering must own one typed index: {:#?}",
+            compiled.plan.list_indexes
+        );
+    };
+    assert_eq!(index.keys.len(), 2);
+    assert_eq!(
+        index.keys[0].direction,
+        boon_plan::PlanOrderDirection::Ascending
+    );
+    assert_eq!(
+        index.keys[1].direction,
+        boon_plan::PlanOrderDirection::Descending
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn bounded_list_access_rejects_unseekable_filtered_take() {
+    for (label, predicate) in [
+        (
+            "or-prefix",
+            r#"Bool/or(
+                left: item.name |> Text/starts_with(prefix: store.query)
+                right: item.active
+            )"#,
+        ),
+        (
+            "contains",
+            "item.name |> Text/contains(needle: store.query)",
+        ),
+    ] {
+        let source = format!(
+            r#"
+store: [
+    query: TEXT {{ a }}
+    items: LIST {{
+        [name: TEXT {{ Alpha }}, active: True]
+        [name: TEXT {{ Beta }}, active: False]
+    }}
+    result:
+        items
+        |> List/filter(item, if: {predicate})
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/take(count: 1)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}))
+"#
+        );
+        let error = compile_fixture_source_text_to_machine_plan(
+            &format!("{label}.bn"),
+            &source,
+            TargetProfile::SoftwareDefault,
+        )
+        .expect_err("filtered take without a bounded access path must fail closed");
+        assert!(
+            error.to_string().contains(
+                "typed List/take has no compiler-proven bounded source-order or keyed access path"
+            ),
+            "unexpected {label} diagnostic: {error}"
+        );
+    }
+}
+
+#[test]
+fn repeated_filters_lower_to_one_conjunctive_typed_access() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "repeated-filter-access.bn",
+        r#"
+store: [
+    selected_city: TEXT { Oslo }
+    prefix: TEXT { A }
+    items: LIST {
+        [city: TEXT { Oslo }, name: TEXT { Alpha }]
+        [city: TEXT { Bergen }, name: TEXT { Alna }]
+        [city: TEXT { Oslo }, name: TEXT { Beta }]
+    }
+    result:
+        items
+        |> List/filter(item, if: item.city == selected_city)
+        |> List/filter(item, if: item.name |> Text/starts_with(prefix: prefix))
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/take(count: 10)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(compiled.plan.list_indexes.len(), 1);
+    assert_eq!(compiled.plan.list_indexes[0].keys.len(), 2);
+    let access = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+                ..
+            } => match expression.as_ref() {
+                PlanDerivedExpression::RowExpression { expression } => {
+                    match row_node(&compiled.plan.row_expressions, *expression) {
+                        PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("repeated filters must lower to typed access");
+    assert_eq!(access.filters.len(), 2);
+    assert!(matches!(
+        &access.selection,
+        boon_plan::PlanListAccessSelection::TextPrefix { leading, .. } if leading.len() == 1
+    ));
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn typed_token_membership_expands_one_bounded_index_key_per_list_item() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "typed-token-membership.bn",
+        r#"
+store: [
+    selected_token: TEXT { rail }
+    items: LIST {
+        [name: TEXT { Alpha }, rank: 2, tokens: LIST { TEXT { rail }, TEXT { oslo } }]
+        [name: TEXT { Beta }, rank: 1, tokens: LIST { TEXT { bus } }]
+        [name: TEXT { Gamma }, rank: 3, tokens: LIST {}]
+    }
+    result:
+        items
+        |> List/filter(item, if:
+            item.tokens
+            |> List/any(item, if: item == selected_token)
+        )
+        |> List/sort_by(item, key: item.rank, direction: Ascending)
+        |> List/take(count: 10)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("typed token membership must lower to a bounded expanded index");
+
+    let [index] = compiled.plan.list_indexes.as_slice() else {
+        panic!(
+            "token membership must own one typed index: {:#?}",
+            compiled.plan.list_indexes
+        );
+    };
+    let [tokens, rank] = index.keys.as_slice() else {
+        panic!("token index must precede semantic ordering: {index:#?}");
+    };
+    assert_eq!(
+        tokens.multiplicity,
+        boon_plan::PlanListIndexKeyMultiplicity::ListItems {
+            max_items: boon_plan::MAX_TYPED_LIST_EXPANDED_KEYS_PER_ROW,
+        }
+    );
+    assert_eq!(
+        rank.multiplicity,
+        boon_plan::PlanListIndexKeyMultiplicity::One
+    );
+    let access = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+                ..
+            } => match expression.as_ref() {
+                PlanDerivedExpression::RowExpression { expression } => {
+                    match row_node(&compiled.plan.row_expressions, *expression) {
+                        PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("token membership must lower to typed bounded access");
+    assert!(matches!(
+        &access.selection,
+        PlanListAccessSelection::KeyPrefix { values } if values.len() == 1
+    ));
+    assert_eq!(access.semantic_order.len(), 1);
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn transparent_user_wrappers_lower_to_the_same_typed_list_access_plan() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "wrapped-typed-list-access.bn",
+        r#"
+FUNCTION matching(list, entry: OUT, predicate) {
+    list |> List/filter(item: entry, if: predicate)
+}
+
+FUNCTION ordered(list, entry: OUT, key) {
+    list |> List/sort_by(item: entry, key: key, direction: Ascending)
+}
+
+FUNCTION secondary(list, entry: OUT, key) {
+    list |> List/then_by(item: entry, key: key, direction: Descending)
+}
+
+FUNCTION limited(list, count) {
+    list |> List/take(count: count)
+}
+
+FUNCTION paged(list, size, after) {
+    list |> List/page(size: size, after: after)
+}
+
+store: [
+    prefix: TEXT { A }
+    items: LIST {
+        [name: TEXT { Alpha }, rank: 1]
+        [name: TEXT { Alpha }, rank: 2]
+        [name: TEXT { Beta }, rank: 3]
+    }
+    matches:
+        items
+        |> matching(
+            entry
+            predicate: entry.name |> Text/starts_with(prefix: prefix)
+        )
+        |> ordered(entry, key: entry.name)
+        |> secondary(entry, key: entry.rank)
+        |> limited(count: 2)
+    page:
+        items
+        |> matching(
+            entry
+            predicate: entry.name |> Text/starts_with(prefix: prefix)
+        )
+        |> ordered(entry, key: entry.name)
+        |> secondary(entry, key: entry.rank)
+        |> paged(size: 2, after: Start)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("transparent wrappers must preserve typed list access lowering");
+
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    assert_eq!(compiled.plan.list_indexes.len(), 1);
+    let mut access_selections = Vec::new();
+    for op in compiled.plan.regions.iter().flat_map(|region| &region.ops) {
+        let PlanOpKind::DerivedValue {
+            expression: Some(expression),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        visit_derived_row_nodes(
+            &compiled.plan.row_expressions,
+            expression,
+            &mut |_, node| match node {
+                PlanRowExpressionNode::ListAccess { access } => {
+                    access_selections.push(access.selection.clone());
+                }
+                PlanRowExpressionNode::ListPage { page } => {
+                    access_selections.push(page.access.selection.clone());
+                }
+                _ => {}
+            },
+        );
+    }
+    assert_eq!(access_selections.len(), 2);
+    assert!(access_selections.iter().all(|selection| matches!(
+        selection,
+        PlanListAccessSelection::TextPrefix { leading, .. } if leading.is_empty()
+    )));
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn indexed_hold_used_as_a_mapped_row_field_has_one_exact_storage_binding() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "mapped-indexed-hold-field.bn",
+        r#"
+store: [
+    replace: SOURCE
+    rows:
+        LIST { [name: TEXT { initial }] }
+        |> List/map(item, new: [
+            name:
+                item.name |> HOLD name {
+                    replace.text |> THEN { replace.text }
+                }
+        ])
+    ordered:
+        rows
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/take(count: 1)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("a nested indexed HOLD is row authority, not a duplicate list declaration");
+
+    let unsupported = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter(|op| {
+            !boon_plan::cpu_plan_executor_supports_whole_plan_op(
+                &compiled.plan.row_expressions,
+                &compiled.plan.storage_layout.scalar_slots,
+                op,
+                &BTreeSet::new(),
+            )
+        })
+        .map(|op| (op.id, op.output.clone(), op.kind.clone()))
+        .collect::<Vec<_>>();
+    assert!(
+        compiled.plan.capability_summary.cpu_plan_executor_complete,
+        "mapped indexed HOLD has unsupported ops: {unsupported:#?}"
+    );
+    assert_eq!(compiled.plan.list_indexes.len(), 1);
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn terminal_list_page_lowers_in_source_order_and_inside_records() {
+    for (label, page_expression) in [
+        (
+            "root",
+            "items |> List/page(size: 2, after: Start)".to_owned(),
+        ),
+        (
+            "record",
+            "[result: items |> List/page(size: 2, after: Start)]".to_owned(),
+        ),
+    ] {
+        let compiled = compile_fixture_source_text_to_machine_plan(
+            &format!("page-{label}.bn"),
+            &format!(
+                r#"
+store: [
+    items: LIST {{
+        [name: TEXT {{ Alpha }}]
+        [name: TEXT {{ Beta }}]
+        [name: TEXT {{ Gamma }}]
+    }}
+    page: {page_expression}
+]
+document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}))
+"#
+            ),
+            TargetProfile::SoftwareDefault,
+        )
+        .unwrap();
+        assert_eq!(compiled.plan.list_indexes.len(), 1, "{label}");
+        assert!(compiled.plan.list_indexes[0].keys.is_empty(), "{label}");
+        let mut pages = Vec::new();
+        for op in compiled.plan.regions.iter().flat_map(|region| &region.ops) {
+            let PlanOpKind::DerivedValue {
+                expression: Some(expression),
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            visit_derived_row_nodes(
+                &compiled.plan.row_expressions,
+                expression,
+                &mut |_, node| {
+                    if let PlanRowExpressionNode::ListPage { page } = node {
+                        pages.push(page.as_ref().clone());
+                    }
+                },
+            );
+        }
+        assert_eq!(pages.len(), 1, "{label}");
+        assert_ne!(pages[0].view_fingerprint, [0; 32], "{label}");
+        assert!(matches!(
+            pages[0].access.selection,
+            PlanListAccessSelection::OrderedStart
+        ));
+    }
+}
+
+#[test]
+fn terminal_list_page_rejects_invalid_literal_sizes() {
+    for size in ["0", "1.5", "10001"] {
+        let error = compile_fixture_source_text_to_machine_plan(
+            "page-invalid-literal-size.bn",
+            &format!(
+                r#"
+store: [
+    items: LIST {{ [name: TEXT {{ Alpha }}] }}
+    page: items |> List/page(size: {size}, after: Start)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}))
+"#
+            ),
+            TargetProfile::SoftwareDefault,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("size must be a whole Number between 1 and 10000"),
+            "unexpected size {size} error: {error}"
+        );
+    }
+}
+
+#[test]
+fn typed_page_fingerprint_uses_semantics_instead_of_plan_local_ids() {
+    fn fingerprint(source: &str) -> [u8; 32] {
+        let compiled = compile_fixture_source_text_to_machine_plan(
+            "page-semantic-fingerprint.bn",
+            source,
+            TargetProfile::SoftwareDefault,
+        )
+        .unwrap();
+        let mut fingerprints = Vec::new();
+        for op in compiled.plan.regions.iter().flat_map(|region| &region.ops) {
+            if let PlanOpKind::DerivedValue {
+                expression: Some(expression),
+                ..
+            } = &op.kind
+            {
+                visit_derived_row_nodes(
+                    &compiled.plan.row_expressions,
+                    expression,
+                    &mut |_, node| {
+                        if let PlanRowExpressionNode::ListPage { page } = node {
+                            fingerprints.push(page.view_fingerprint);
+                        }
+                    },
+                );
+            }
+        }
+        assert_eq!(fingerprints.len(), 1);
+        fingerprints[0]
+    }
+
+    let base = r#"
+store: [
+    items: LIST { [name: TEXT { Alpha }] [name: TEXT { Beta }] }
+    page:
+        items
+        |> List/filter(item, if: item.name |> Text/starts_with(prefix: TEXT { A }))
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/page(size: 1, after: Start)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#;
+    let shifted_ids = r#"
+store: [
+    unrelated: TEXT { unrelated-constant }
+    items: LIST { [name: TEXT { Alpha }] [name: TEXT { Beta }] }
+    page:
+        items
+        |> List/filter(item, if: item.name |> Text/starts_with(prefix: TEXT { A }))
+        |> List/sort_by(item, key: item.name, direction: Ascending)
+        |> List/page(size: 1, after: Start)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#;
+    let changed_semantics = base.replace("prefix: TEXT { A }", "prefix: TEXT { B }");
+    assert_eq!(fingerprint(base), fingerprint(shifted_ids));
+    assert_ne!(fingerprint(base), fingerprint(&changed_semantics));
+}
+
+#[test]
+fn terminal_list_page_fails_closed_without_a_proven_seek_path() {
+    let error = compile_fixture_source_text_to_machine_plan(
+        "page-unseekable.bn",
+        r#"
+store: [
+    items: LIST {
+        [name: TEXT { Alpha }, active: True]
+        [name: TEXT { Beta }, active: False]
+    }
+    page:
+        items
+        |> List/filter(item, if: item.active)
+        |> List/page(size: 2, after: Start)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { static }))
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no compiler-proven bounded source-order or keyed access path"),
+        "unexpected page lowering error: {error}"
+    );
 }
 
 #[test]
@@ -1460,11 +2352,10 @@ fn compiler_uses_central_host_effect_contracts_for_bounded_file_operations() {
         .iter()
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::HostEffect,
-                effect,
+            PlanOpKind::StateUpdate {
+                effect: Some(effect),
                 ..
-            } => effect.as_ref(),
+            } => Some(effect),
             _ => None,
         })
         .expect("write effect invocation");
@@ -1485,6 +2376,28 @@ fn compiler_uses_central_host_effect_contracts_for_bounded_file_operations() {
             .all(|check| check.pass),
         "compiled bounded write plan must verify"
     );
+}
+
+#[test]
+fn numeric_byte_operations_lower_to_dedicated_typed_expressions() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "bytes-numeric-plan-ops.bn",
+        include_str!("../../../examples/bytes_numeric_plan_ops.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let plan = format!("{:#?}", compiled.plan);
+    for expression in [
+        "BytesReadUnsigned",
+        "BytesReadSigned",
+        "BytesWriteUnsigned",
+        "BytesWriteSigned",
+    ] {
+        assert!(
+            plan.contains(expression),
+            "compiled plan is missing {expression}"
+        );
+    }
 }
 
 fn typed_passkey_effect_source() -> &'static str {
@@ -1526,8 +2439,7 @@ fn compiler_lowers_typed_passkey_calls_to_canonical_outbox_and_result_states() {
         .iter()
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::HostEffect,
+            PlanOpKind::StateUpdate {
                 effect: Some(effect),
                 ..
             } if compiled.plan.effects.iter().any(|contract| {
@@ -1607,8 +2519,7 @@ fn host_effect_list_intent_uses_the_semantic_list_runtime_identity() {
         .iter()
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::HostEffect,
+            PlanOpKind::StateUpdate {
                 effect: Some(effect),
                 ..
             } if compiled.plan.effects.iter().any(|contract| {
@@ -1626,7 +2537,10 @@ fn host_effect_list_intent_uses_the_semantic_list_runtime_identity() {
         .find(|field| field.name == "headers")
         .expect("HTTP headers intent field");
     assert!(
-        matches!(headers.input, ValueRef::List(_)),
+        matches!(
+            row_node(&compiled.plan.row_expressions, headers.expression),
+            PlanRowExpressionNode::ListRef { .. }
+        ),
         "semantic list memory must lower to its runtime ListId, not a root FieldId"
     );
     assert!(
@@ -1660,8 +2574,7 @@ fn state_triggered_effect_plan_has_no_original_source_input() {
         .flat_map(|region| &region.ops)
         .find(|op| {
             matches!(&op.kind,
-                PlanOpKind::UpdateBranch {
-                    expression_kind: PlanExpressionKind::HostEffect,
+                PlanOpKind::StateUpdate {
                     effect: Some(effect),
                     ..
                 } if compiled.plan.effects.iter().any(|contract|
@@ -1669,7 +2582,7 @@ fn state_triggered_effect_plan_has_no_original_source_input() {
                         && contract.host_operation == "Random/bytes"))
         })
         .expect("Random/bytes plan op");
-    let PlanOpKind::UpdateBranch { trigger, .. } = &random.kind else {
+    let PlanOpKind::StateUpdate { trigger, .. } = &random.kind else {
         unreachable!();
     };
     assert!(matches!(trigger, ValueRef::State(_)));
@@ -1723,7 +2636,7 @@ store: [
         .iter()
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
+            PlanOpKind::StateUpdate {
                 effect: Some(effect),
                 ..
             } if effect.effect_id == stream_effect.effect_id => Some(effect),
@@ -1735,14 +2648,16 @@ store: [
         .iter()
         .find(|field| field.name == "chunk_bytes")
         .unwrap();
-    let ValueRef::Constant(constant_id) = chunk_bytes.input else {
+    let PlanRowExpressionNode::Constant { constant_id } =
+        row_node(&compiled.plan.row_expressions, chunk_bytes.expression)
+    else {
         panic!("defaulted chunk_bytes must lower to a plan constant");
     };
     let Some(boon_plan::PlanConstantValue::Number { value }) = compiled
         .plan
         .constants
         .iter()
-        .find(|constant| constant.id == constant_id)
+        .find(|constant| constant.id == *constant_id)
         .map(|constant| &constant.value)
     else {
         panic!("defaulted chunk_bytes constant must be a Number");
@@ -1803,26 +2718,24 @@ store: [
         .iter()
         .flat_map(|region| &region.ops)
         .filter_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
+            PlanOpKind::StateUpdate {
                 effect: Some(effect),
                 ..
-            } if effect.effect_id == stream.effect_id => Some(effect),
+            } if effect.effect_id == stream.effect_id => Some((op, effect)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(
-        invocations.len() > 1,
-        "the regression fixture must lower one call site through multiple possible causes"
-    );
-    assert_eq!(
-        invocations
-            .iter()
-            .map(|invocation| invocation.invocation_id)
-            .collect::<BTreeSet<_>>()
-            .len(),
-        1,
-        "trigger specialization must not split one effect result owner"
-    );
+    let [(invocation_op, invocation)] = invocations.as_slice() else {
+        panic!("one effect call site must lower once, got {invocations:#?}");
+    };
+    assert!(matches!(
+        &invocation_op.kind,
+        PlanOpKind::StateUpdate {
+            trigger: ValueRef::State(_),
+            ..
+        }
+    ));
+    assert_eq!(invocation.effect_id, stream.effect_id);
     assert!(
         verify_plan(&compiled.plan)
             .unwrap()
@@ -1862,21 +2775,21 @@ store: [
         .flat_map(|region| &region.ops)
         .find(|op| op.output == Some(ValueRef::Field(field)))
         .expect("asset operation");
-    assert!(
-        matches!(
-            (&operation.output, &operation.kind),
-            (
-                Some(ValueRef::Field(output)),
-                PlanOpKind::DerivedValue {
-                    expression: Some(PlanDerivedExpression::RowExpression {
-                        expression: PlanRowExpression::TaggedObject { tag, .. },
-                    }),
-                    ..
-                }
-            ) if *output == field && tag == "PackageAsset"
-        ),
-        "asset operation was not executable tagged data: {operation:#?}"
-    );
+    let (
+        Some(ValueRef::Field(output)),
+        PlanOpKind::DerivedValue {
+            expression: Some(PlanDerivedExpression::RowExpression { expression }),
+            ..
+        },
+    ) = (&operation.output, &operation.kind)
+    else {
+        panic!("asset operation was not executable tagged data: {operation:#?}");
+    };
+    assert_eq!(*output, field);
+    assert!(matches!(
+        row_node(&compiled.plan.row_expressions, *expression),
+        PlanRowExpressionNode::TaggedObject { tag, .. } if tag == "PackageAsset"
+    ));
 }
 
 #[test]
@@ -1929,7 +2842,9 @@ store: [
                 })
         })
         .expect("asset derived expression");
-    let PlanRowExpression::TaggedObject { tag, fields } = expression else {
+    let PlanRowExpressionNode::TaggedObject { tag, fields } =
+        row_node(&compiled.plan.row_expressions, *expression)
+    else {
         panic!("PackageAsset must lower as a generic tagged-object expression");
     };
     assert_eq!(tag, "PackageAsset");
@@ -2031,68 +2946,58 @@ store: [
     )
     .unwrap();
 
-    let branch = compiled
-        .ir
-        .update_branches
-        .iter()
-        .find(|branch| {
-            branch.target == "store.workspace_id" && branch.source == "store.lifecycle.started"
-        })
-        .unwrap();
-    let boon_ir::UpdateExpression::MatchTextIsEmptyConst { input, arms } = &branch.expression
-    else {
-        panic!("unexpected update expression: {:?}", branch.expression);
-    };
-    assert_eq!(input, "store.workspace_id");
-    assert!(arms.iter().any(|arm| {
-        arm.pattern == "True"
-            && matches!(
-                &arm.output,
-                boon_ir::UpdateValueExpression::ReadPath { path }
-                    if path == "store.lifecycle.started.workspace_id"
-            )
-    }));
-    assert!(arms.iter().any(|arm| {
-        arm.pattern == "False"
-            && matches!(
-                &arm.output,
-                boon_ir::UpdateValueExpression::ReadPath { path }
-                    if path == "store.workspace_id"
-            )
-    }));
-
     let op = compiled
         .plan
         .regions
         .iter()
         .flat_map(|region| &region.ops)
         .find(|op| {
+            let PlanOpKind::StateUpdate {
+                value: Some(value), ..
+            } = &op.kind
+            else {
+                return false;
+            };
+            let PlanRowExpressionNode::Select { input, .. } =
+                row_node(&compiled.plan.row_expressions, *value)
+            else {
+                return false;
+            };
             matches!(
-                op.kind,
-                PlanOpKind::UpdateBranch {
-                    expression_kind: PlanExpressionKind::MatchTextIsEmptyConst,
-                    ..
-                }
+                row_node(&compiled.plan.row_expressions, *input),
+                PlanRowExpressionNode::TextIsEmpty { .. }
             )
         })
         .unwrap();
-    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+    let PlanOpKind::StateUpdate {
+        value: Some(value), ..
+    } = &op.kind
+    else {
         unreachable!();
     };
+    let mut inputs = Vec::new();
+    compiled
+        .plan
+        .row_expressions
+        .visit_value_refs(*value, &mut |input| inputs.push(input.clone()))
+        .unwrap();
     assert!(
-        ordered_inputs
+        inputs
             .iter()
             .any(|input| matches!(input, ValueRef::State(_)))
     );
-    assert!(ordered_inputs.iter().any(|input| {
-        matches!(
-            input,
-            ValueRef::SourcePayload {
-                field: boon_plan::SourcePayloadField::Named(name),
-                ..
-            } if name == "workspace_id"
-        )
-    }));
+    assert!(
+        inputs.iter().any(|input| {
+            matches!(
+                input,
+                ValueRef::SourcePayload {
+                    field: boon_plan::SourcePayloadField::Named(name),
+                    ..
+                } if name == "workspace_id"
+            )
+        }),
+        "state update lost the exact source payload read: inputs={inputs:#?}; value={value:#?}"
+    );
     assert!(
         compiled.plan.capability_summary.cpu_plan_executor_complete,
         "call-derived match op must be CPU-executable: {op:?}; unresolved={:?}",
@@ -2125,7 +3030,7 @@ fn indexed_list_persistence_covers_every_executor_authority_field() {
         .iter()
         .find(|slot| {
             compiled.plan.debug_map.list_slots.iter().any(|entry| {
-                entry.id == format!("list:{}", slot.list_id.0) && entry.label == "todos"
+                entry.id == format!("list:{}", slot.list_id.0) && entry.label == "store.todos"
             })
         })
         .expect("todos list slot");
@@ -2153,13 +3058,13 @@ fn indexed_list_persistence_covers_every_executor_authority_field() {
         list_memory
             .row_fields
             .iter()
-            .any(|field| field.semantic_path == "store.todos.$input$title")
+            .any(|field| field.semantic_path == "store.todos.@authority:title")
     );
     assert!(
         list_memory
             .row_fields
             .iter()
-            .any(|field| field.semantic_path == "store.todos.$input$completed")
+            .any(|field| field.semantic_path == "store.todos.@authority:completed")
     );
     assert!(
         verify_plan(&compiled.plan)
@@ -2620,9 +3525,12 @@ status:
     };
     assert_eq!(
         arms.iter()
-            .map(|arm| arm.pattern.as_slice())
+            .map(|arm| arm.pattern.clone())
             .collect::<Vec<_>>(),
-        vec![&["False".to_owned()][..], &["True".to_owned()][..]]
+        vec![
+            boon_plan::PlanRowSelectPattern::Bool { value: false },
+            boon_plan::PlanRowSelectPattern::Bool { value: true },
+        ]
     );
     assert!(format!("{:?}", bound.plan.regions).find("Drain").is_none());
     assert_eq!(verify_plan(&bound.plan).unwrap().status, "pass");
@@ -2778,6 +3686,28 @@ FUNCTION new_todo(todo) {
         list_transfer.transform,
         MigrationTransformPlan::Identity { .. }
     ));
+    let migrated_materializations = list_plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression:
+                    Some(PlanDerivedExpression::MaterializeList {
+                        target_list,
+                        authority_source_list: Some(source_list),
+                        ..
+                    }),
+                ..
+            } if target_list != source_list => Some((*target_list, *source_list)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        migrated_materializations,
+        vec![(boon_plan::ListId(1), boon_plan::ListId(0))],
+        "the migrated target must retain predecessor row identity"
+    );
     let indexed_transfer = &indexed_plan.persistence.migration_recipes[0].transfers[0];
     assert_eq!(
         indexed_transfer.transfer_kind,
@@ -2853,19 +3783,30 @@ fn indexed_migrations_reconstruct_untouched_row_defaults() {
             .scalar_slots
             .iter()
             .find(|slot| slot.id == memory.runtime_slot)
-            .and_then(|slot| slot.initial_expression.clone())
+            .and_then(|slot| match &slot.initializer {
+                boon_plan::ScalarInitializerPlan::Expression { expression } => Some(*expression),
+                boon_plan::ScalarInitializerPlan::Constant { .. } => None,
+            })
             .unwrap_or_else(|| panic!("missing row default expression for `{path}`"))
     };
 
-    assert!(matches!(
-        initial_expression(&v5, "store.tasks.text"),
-        PlanRowExpression::Field { .. }
-    ));
-    let PlanRowExpression::Select { input, arms } = initial_expression(&v6, "store.tasks.status")
+    let v5_text = initial_expression(&v5, "store.tasks.text");
+    assert!(
+        matches!(
+            row_node(&v5.row_expressions, v5_text),
+            PlanRowExpressionNode::Field { .. }
+        ),
+        "V5 text initializer must read the exact predecessor row field: {v5_text:#?}"
+    );
+    let v6_status = initial_expression(&v6, "store.tasks.status");
+    let PlanRowExpressionNode::Select { input, arms } = row_node(&v6.row_expressions, v6_status)
     else {
-        panic!("pure indexed migration must compile to a sparse Select default");
+        panic!("pure indexed migration must compile to a sparse Select default: {v6_status:#?}");
     };
-    assert!(matches!(input.as_ref(), PlanRowExpression::Field { .. }));
+    assert!(matches!(
+        row_node(&v6.row_expressions, *input),
+        PlanRowExpressionNode::Field { .. }
+    ));
     assert_eq!(arms.len(), 2);
     assert!(arms.iter().any(|arm| matches!(
         arm.pattern,
@@ -2935,6 +3876,47 @@ fn compiler_root_demand_is_sorted_and_unique() {
     };
 
     assert!(field_ids.windows(2).all(|ids| ids[0] < ids[1]));
+}
+
+#[test]
+fn compiler_root_demand_includes_derived_document_control_flow() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "derived-document-control-flow.bn",
+        r#"
+store: [
+    show_program:
+        0 == 1 |> Bool/not()
+]
+
+scene:
+    store.show_program |> WHEN {
+        True => Scene/Element/text(
+            element: []
+            style: [width: Fill]
+            text: TEXT { visible }
+        )
+        False => NoElement
+    }
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let show_program = compiled
+        .ir
+        .semantic_index
+        .fields
+        .iter()
+        .find(|field| field.path == "store.show_program")
+        .map(|field| boon_plan::FieldId(field.id.0))
+        .expect("store.show_program semantic field");
+    let RootOutputDemand::Selected(fields) = compiled.plan.demand.root_derived_outputs else {
+        panic!("document demand must remain sparse");
+    };
+
+    assert!(
+        fields.contains(&show_program),
+        "derived fields used only as output control flow must remain demand-current"
+    );
 }
 
 #[test]
@@ -3017,7 +3999,9 @@ FUNCTION new_row(item) {
     else {
         panic!("row projection must lower to a source-event transform");
     };
-    let PlanRowExpression::Constant { constant_id } = default.as_ref() else {
+    let PlanRowExpressionNode::Constant { constant_id } =
+        row_node(&compiled.plan.row_expressions, *default)
+    else {
         panic!("event-only list projection must use a typed scalar default");
     };
     assert_eq!(
@@ -3173,20 +4157,96 @@ store: [
         .iter()
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
-                source_guard: Some(PlanSourceGuard::All { guards }),
-                effect: Some(_),
+            PlanOpKind::StateUpdate {
+                effect: Some(effect),
                 ..
-            } if guards
-                .iter()
-                .any(|guard| matches!(guard, PlanSourceGuard::ValuesEqual { .. })) =>
+            } if compiled.plan.effects.iter().any(|contract| {
+                contract.effect_id == effect.effect_id && contract.host_operation == "Random/bytes"
+            }) =>
             {
-                Some(op)
+                Some((op, effect))
             }
             _ => None,
         })
         .expect("typed field-equality host-effect guard");
-    assert_eq!(guarded_effect.unresolved_executable_ref_count, 0);
+    let (guarded_op, guarded_effect) = guarded_effect;
+    let PlanRowExpressionNode::Select { arms, .. } =
+        row_node(&compiled.plan.row_expressions, guarded_effect.gate)
+    else {
+        panic!("clock-result gate must remain an exact selector");
+    };
+    assert!(arms.iter().any(|arm| {
+        let PlanRowExpressionNode::Select { input, .. } =
+            row_node(&compiled.plan.row_expressions, arm.value)
+        else {
+            return false;
+        };
+        matches!(
+            row_node(&compiled.plan.row_expressions, *input),
+            PlanRowExpressionNode::NumberInfix { op, .. } if *op == PlanInfixOp::Equal
+        )
+    }));
+    assert_eq!(guarded_op.unresolved_executable_ref_count, 0);
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn one_effect_result_lane_accepts_trigger_specialized_gates_and_intents() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "trigger-specialized-effect-lane.bn",
+        r#"
+store: [
+    start: SOURCE
+    move: SOURCE
+    clock_result:
+        NotRequested |> HOLD clock_result {
+            start |> THEN { Clock/wall() }
+        }
+    random_result:
+        NotRequested |> HOLD random_result {
+            LATEST {
+                clock_result |> WHEN {
+                    WallClockRead => Random/bytes(byte_count: 4)
+                    __ => SKIP
+                }
+                move |> THEN {
+                    clock_result |> WHEN {
+                        WallClockRead => Random/bytes(byte_count: 8)
+                        __ => SKIP
+                    }
+                }
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let invocations = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::StateUpdate {
+                effect: Some(effect),
+                ..
+            } if compiled.plan.effects.iter().any(|contract| {
+                contract.effect_id == effect.effect_id && contract.host_operation == "Random/bytes"
+            }) =>
+            {
+                Some((op, effect))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [first, second] = invocations.as_slice() else {
+        panic!("expected two specialized random operations, got {invocations:#?}");
+    };
+    assert_eq!(first.1.invocation_id, second.1.invocation_id);
+    assert_eq!(first.1.owner, second.1.owner);
+    assert_ne!(first.0.inputs, second.0.inputs);
+    assert_ne!(first.1.intent_fields, second.1.intent_fields);
     assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
 }
 
@@ -3218,11 +4278,21 @@ store: [
         .iter()
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
-            PlanOpKind::UpdateBranch {
-                source_guard: Some(PlanSourceGuard::ListIsNotEmpty { expected: true, .. }),
-                effect: Some(_),
+            PlanOpKind::StateUpdate {
+                effect: Some(effect),
                 ..
-            } => Some(op),
+            } if matches!(
+                row_node(&compiled.plan.row_expressions, effect.gate),
+                PlanRowExpressionNode::Select { input, .. }
+                    if matches!(
+                        row_node(&compiled.plan.row_expressions, *input),
+                        PlanRowExpressionNode::BuiltinCall { function, .. }
+                            if *function == PlanRowBuiltin::ListIsNotEmpty
+                    )
+            ) =>
+            {
+                Some(op)
+            }
             _ => None,
         })
         .expect("typed scalar-list nonempty host-effect guard");
@@ -3269,17 +4339,29 @@ FUNCTION stateful_row(seed) {
     )
     .unwrap();
 
+    let value_state = compiled
+        .plan
+        .debug_map
+        .state_slots
+        .iter()
+        .find(|entry| entry.label.ends_with(".value"))
+        .and_then(|entry| entry.id.strip_prefix("state:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(boon_plan::StateId)
+        .expect("nested value state");
+    let value_slot = compiled
+        .plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == value_state)
+        .expect("nested value storage slot");
+    assert!(value_slot.indexed, "nested row state must be indexed");
     assert!(
-        compiled
-            .plan
-            .debug_map
-            .state_slots
-            .iter()
-            .any(|entry| { entry.label.ends_with(".value") && entry.label.contains("item") }),
-        "canonical item output lost its keyed nested state: {:?}",
-        compiled.plan.debug_map.state_slots
+        !value_slot.owner.static_owner.is_root() && !value_slot.owner.ancestors.is_empty(),
+        "nested row state lost exact owner ancestry: {value_slot:#?}"
     );
-    assert_eq!(compiled.plan.commit_plan.unresolved_update_branch_count, 0);
+    assert_eq!(compiled.plan.commit_plan.unresolved_state_update_count, 0);
     assert_eq!(
         compiled
             .plan
@@ -3382,22 +4464,27 @@ FUNCTION catalog_row(signal) {
     else {
         panic!("catalog materializer must retain the exact list map");
     };
-    let (owner, row_local, source, body) =
-        expect_contextual_map(expression, "catalog materializer");
+    let (owner, row_local, source, body) = expect_contextual_map(
+        &compiled.plan.row_expressions,
+        *expression,
+        "catalog materializer",
+    );
     let source_rows = compiled
         .ir
         .lists
         .iter()
         .find(|list| list.name.ends_with("source_rows"))
         .expect("source rows list");
-    assert_eq!(
-        source,
-        &PlanRowExpression::ListRef {
-            list_id: boon_plan::ListId(source_rows.id.0),
-        },
+    assert!(
+        matches!(
+            row_node(&compiled.plan.row_expressions, source),
+            PlanRowExpressionNode::ListRef { list_id }
+                if *list_id == boon_plan::ListId(source_rows.id.0)
+        ),
         "catalog map must retain the exact source list"
     );
-    let PlanRowExpression::Object { fields } = body else {
+    let PlanRowExpressionNode::Object { fields } = row_node(&compiled.plan.row_expressions, body)
+    else {
         panic!("catalog map must produce a record");
     };
     let label_projection = &fields
@@ -3406,7 +4493,8 @@ FUNCTION catalog_row(signal) {
         .expect("materialized catalog label")
         .value;
     assert_contextual_local_projection(
-        label_projection,
+        &compiled.plan.row_expressions,
+        *label_projection,
         owner,
         row_local,
         &["name"],
@@ -3496,27 +4584,33 @@ document: Document/new(
     let PlanDerivedExpression::RowExpression { expression } = expression else {
         panic!("selected list must lower its filtered map");
     };
-    let (owner, row_local, source, body) = expect_contextual_map(expression, "selected list");
+    let (owner, row_local, source, body) =
+        expect_contextual_map(&compiled.plan.row_expressions, *expression, "selected list");
     let (filter_owner, filter_local, filter_source, predicate) =
-        expect_contextual_filter(source, "selected source");
-    let PlanRowExpression::ListRef {
+        expect_contextual_filter(&compiled.plan.row_expressions, source, "selected source");
+    let filter_source_node = row_node(&compiled.plan.row_expressions, filter_source);
+    let PlanRowExpressionNode::ListRef {
         list_id: filter_list_id,
-    } = filter_source
+    } = filter_source_node
     else {
         panic!("selected filter must retain its typed list source: {filter_source:#?}");
     };
-    let PlanRowExpression::NumberInfix { op, left, .. } = predicate else {
+    let PlanRowExpressionNode::NumberInfix { op, left, .. } =
+        row_node(&compiled.plan.row_expressions, predicate)
+    else {
         panic!("selected filter must retain its typed equality: {predicate:#?}");
     };
-    assert_eq!(op, "==");
+    assert_eq!(*op, PlanInfixOp::Equal);
     assert_contextual_local_projection(
-        left,
+        &compiled.plan.row_expressions,
+        *left,
         filter_owner,
         filter_local,
         &["file"],
         "selected filter file",
     );
-    let PlanRowExpression::Object { fields } = body else {
+    let PlanRowExpressionNode::Object { fields } = row_node(&compiled.plan.row_expressions, body)
+    else {
         panic!("selected map must produce a record");
     };
     let file_projection = &fields
@@ -3525,7 +4619,8 @@ document: Document/new(
         .expect("selected file field")
         .value;
     assert_contextual_local_projection(
-        file_projection,
+        &compiled.plan.row_expressions,
+        *file_projection,
         owner,
         row_local,
         &["file"],
@@ -3573,9 +4668,11 @@ document: Document/new(
         }
         expression => expression,
     };
-    let PlanDerivedExpression::RowExpression {
-        expression: PlanRowExpression::Select { arms, .. },
-    } = expression
+    let PlanDerivedExpression::RowExpression { expression } = expression else {
+        panic!("continued list must lower to a select expression");
+    };
+    let PlanRowExpressionNode::Select { arms, .. } =
+        row_node(&compiled.plan.row_expressions, *expression)
     else {
         panic!("continued list must lower to a select expression");
     };
@@ -3583,8 +4680,8 @@ document: Document/new(
         .iter()
         .find(|arm| {
             matches!(
-                &arm.value,
-                PlanRowExpression::ContextualCollection {
+                row_node(&compiled.plan.row_expressions, arm.value),
+                PlanRowExpressionNode::ContextualCollection {
                     operation: PlanContextualOperationKind::Map,
                     ..
                 }
@@ -3594,19 +4691,27 @@ document: Document/new(
         .value;
     assert!(
         arms.iter().any(|arm| matches!(
-            &arm.value,
-            PlanRowExpression::ListLiteral { items } if items.is_empty()
+            row_node(&compiled.plan.row_expressions, arm.value),
+            PlanRowExpressionNode::ListLiteral { items } if items.is_empty()
         )),
         "continued select lost its empty fallback arm: {arms:#?}"
     );
     let (continued_owner, continued_local, continued_source, continued_body) =
-        expect_contextual_map(continued_map, "continued mapped select arm");
-    assert_eq!(
-        continued_source,
-        &PlanRowExpression::ListRef { list_id: selected },
+        expect_contextual_map(
+            &compiled.plan.row_expressions,
+            *continued_map,
+            "continued mapped select arm",
+        );
+    assert!(
+        matches!(
+            row_node(&compiled.plan.row_expressions, continued_source),
+            PlanRowExpressionNode::ListRef { list_id } if *list_id == selected
+        ),
         "continued map must retain the selected list as its exact source"
     );
-    let PlanRowExpression::Object { fields } = continued_body else {
+    let PlanRowExpressionNode::Object { fields } =
+        row_node(&compiled.plan.row_expressions, continued_body)
+    else {
         panic!("continued map must produce a record: {continued_body:#?}");
     };
     let continued_file = &fields
@@ -3615,7 +4720,8 @@ document: Document/new(
         .expect("continued file field")
         .value;
     assert_contextual_local_projection(
-        continued_file,
+        &compiled.plan.row_expressions,
+        *continued_file,
         continued_owner,
         continued_local,
         &["file"],
@@ -3675,10 +4781,14 @@ store: [
                 && op.inputs.contains(&ValueRef::Source(reset.source_id))
         })
         .expect("reset update operation");
-    let PlanOpKind::UpdateBranch {
-        update_constant_id: Some(constant_id),
-        ..
+    let PlanOpKind::StateUpdate {
+        value: Some(value), ..
     } = &reset_op.kind
+    else {
+        panic!("format reset must lower as a constant state update: {reset_op:#?}");
+    };
+    let PlanRowExpressionNode::Constant { constant_id } =
+        row_node(&compiled.plan.row_expressions, *value)
     else {
         panic!("format reset must lower as a constant state update: {reset_op:#?}");
     };
@@ -3757,7 +4867,8 @@ store: [
     let PlanDerivedExpression::RowExpression { expression } = expression.as_ref() else {
         panic!("mapped list lost its contextual row expression: {expression:#?}");
     };
-    let (owner, row_local, source, body) = expect_contextual_map(expression, "mapped field");
+    let (owner, row_local, source, body) =
+        expect_contextual_map(&compiled.plan.row_expressions, *expression, "mapped field");
     let selected_list = compiled
         .ir
         .derived_values
@@ -3766,14 +4877,15 @@ store: [
         .and_then(|derived| derived.materialized_list_id)
         .map(|list| boon_plan::ListId(list.0))
         .expect("selected materialized ListId");
-    assert_eq!(
-        source,
-        &PlanRowExpression::ListRef {
-            list_id: selected_list,
-        },
+    assert!(
+        matches!(
+            row_node(&compiled.plan.row_expressions, source),
+            PlanRowExpressionNode::ListRef { list_id } if *list_id == selected_list
+        ),
         "mapped field must retain the exact derived-list source"
     );
-    let PlanRowExpression::Object { fields } = body else {
+    let PlanRowExpressionNode::Object { fields } = row_node(&compiled.plan.row_expressions, body)
+    else {
         panic!("mapped field must produce a record: {body:#?}");
     };
     let label = &fields
@@ -3781,7 +4893,863 @@ store: [
         .find(|field| field.name == "label")
         .expect("mapped label field")
         .value;
-    assert_contextual_local_projection(label, owner, row_local, &["id"], "mapped label field");
+    assert_contextual_local_projection(
+        &compiled.plan.row_expressions,
+        *label,
+        owner,
+        row_local,
+        &["id"],
+        "mapped label field",
+    );
+}
+
+#[test]
+fn filtered_variant_rows_have_one_keyed_root_for_all_consumers() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "filtered-variant-rows.bn",
+        r#"
+store: [
+    load: SOURCE
+    asset: PackageAsset[url: TEXT { asset://wave.vcd }]
+    file_result:
+        NotStarted |> HOLD file_result {
+            load |> THEN {
+                File/read_stream(file: asset, retain_content: True)
+            }
+        }
+    waveform_result:
+        NotStarted |> HOLD waveform_result {
+            file_result |> WHEN {
+                Finished => file_result.retained |> WHEN {
+                    Retained => Wellen/open(content: file_result.retained.content)
+                    __ => SKIP
+                }
+                __ => SKIP
+            }
+        }
+    page:
+        NotStarted |> HOLD page {
+            waveform_result |> WHEN {
+                WaveformOpened => Wellen/hierarchy_page(
+                    artifact: waveform_result.artifact
+                    request_fingerprint: TEXT { hierarchy:test:0 }
+                    offset: 0
+                    limit: 32
+                )
+                __ => SKIP
+            }
+        }
+    start_time:
+        waveform_result |> WHEN {
+            WaveformOpened => waveform_result.start_time
+            __ => 0
+        }
+    filtered:
+        page |> WHEN {
+            HierarchyPage =>
+                page.rows
+                |> List/filter(item, if: item.kind == TEXT { Signal })
+            __ => LIST {}
+        }
+    mapped:
+        filtered
+        |> List/map(item, new: [label: item.id])
+    count: filtered |> List/length()
+    mapped_count: mapped |> List/length()
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: TEXT { {store.start_time}:{store.count}:{store.mapped_count} }
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let filtered = compiled
+        .ir
+        .derived_values
+        .iter()
+        .find(|derived| derived.path == "store.filtered")
+        .expect("filtered derived value");
+    assert_eq!(filtered.kind, boon_ir::DerivedValueKind::ListView);
+    let filtered_list = filtered
+        .materialized_list_id
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("filtered keyed ListId");
+    let producers = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter(|op| op.output == Some(ValueRef::List(filtered_list)))
+        .collect::<Vec<_>>();
+    assert_eq!(producers.len(), 1, "filtered producers: {producers:#?}");
+    let PlanOpKind::DerivedValue {
+        expression:
+            Some(PlanDerivedExpression::MaterializeList {
+                target_list,
+                authority_source_list,
+                fields: materialized_fields,
+                value_list_authorities,
+                expression,
+                ..
+            }),
+        ..
+    } = &producers[0].kind
+    else {
+        panic!("filtered host-result rows must have one materializer: {producers:#?}");
+    };
+    assert_eq!(*target_list, filtered_list);
+    assert_eq!(*authority_source_list, Some(filtered_list));
+    let [value_list_authority] = value_list_authorities.as_slice() else {
+        panic!(
+            "filtered host-result rows need exactly one canonical value-list authority: \
+             {value_list_authorities:#?}"
+        );
+    };
+    assert_eq!(value_list_authority.list_id, filtered_list);
+    assert_eq!(&value_list_authority.fields, materialized_fields);
+    let mut authority_owner_is_present = false;
+    visit_derived_row_nodes(
+        &compiled.plan.row_expressions,
+        expression,
+        &mut |_, node| {
+            authority_owner_is_present |= matches!(
+                node,
+                PlanRowExpressionNode::ContextualCollection { owner, .. }
+                    if *owner == value_list_authority.owner
+            );
+        },
+    );
+    assert!(
+        authority_owner_is_present,
+        "value-list authority metadata must identify a contextual owner in the materializer"
+    );
+    let filtered_slot = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id == filtered_list)
+        .expect("filtered list storage slot");
+    let expected_fields = filtered_slot
+        .row_fields
+        .iter()
+        .filter(|field| field.role.is_value())
+        .map(|field| field.name.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        materialized_fields.keys().cloned().collect::<BTreeSet<_>>(),
+        expected_fields,
+        "a row-preserving filter must retain the complete checked host-result row schema"
+    );
+    assert!(
+        materialized_fields.contains_key("encoding"),
+        "the filter lost a valid field that is not referenced by its predicate"
+    );
+    let consumers = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter(|op| op.inputs.contains(&ValueRef::List(filtered_list)))
+        .collect::<Vec<_>>();
+    assert!(
+        consumers.len() >= 2,
+        "filtered list must feed map and length consumers: {consumers:#?}"
+    );
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.pass)
+    );
+
+    let start_time = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.start_time")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("start_time field");
+    let expression = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| {
+            (op.output == Some(ValueRef::Field(start_time)))
+                .then_some(&op.kind)
+                .and_then(|kind| match kind {
+                    PlanOpKind::DerivedValue {
+                        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                        ..
+                    } => Some(expression),
+                    _ => None,
+                })
+        })
+        .expect("start_time continuous expression");
+    let PlanRowExpressionNode::Select { arms, .. } =
+        row_node(&compiled.plan.row_expressions, *expression)
+    else {
+        panic!("start_time is not a typed continuous selector: {expression:#?}");
+    };
+    let constant_id = arms
+        .iter()
+        .find_map(|arm| {
+            match (
+                &arm.pattern,
+                row_node(&compiled.plan.row_expressions, arm.value),
+            ) {
+                (
+                    boon_plan::PlanRowSelectPattern::Wildcard,
+                    PlanRowExpressionNode::Constant { constant_id },
+                ) => Some(constant_id),
+                _ => None,
+            }
+        })
+        .expect("start_time wildcard fallback constant");
+    assert_eq!(
+        compiled
+            .ir
+            .derived_values
+            .iter()
+            .find(|value| value.path == "store.start_time")
+            .map(|value| &value.kind),
+        Some(&boon_ir::DerivedValueKind::Pure)
+    );
+    let Some(constant) = compiled
+        .plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *constant_id)
+    else {
+        panic!("start_time fallback references missing constant {constant_id:?}");
+    };
+    assert!(matches!(
+        &constant.value,
+        boon_plan::PlanConstantValue::Number { value } if value.get() == 0.0
+    ));
+}
+
+#[test]
+fn nested_filtered_list_does_not_become_its_outer_row_list_authority() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "nested-filtered-list-authority.bn",
+        r#"
+store: [
+    inputs: LIST {
+        [
+            id: TEXT { one }
+            values: LIST {
+                [value: 1]
+                [value: 2]
+            }
+        ]
+        [
+            id: TEXT { two }
+            values: LIST {
+                [value: 3]
+            }
+        ]
+    }
+    rows:
+        inputs
+        |> List/map(item, new: [
+            id: item.id
+            visible_values:
+                item.values
+                |> List/filter(item, if: item.value > 1)
+                |> List/map(item, new: [label: item.value])
+        ])
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let rows = compiled
+        .ir
+        .derived_values
+        .iter()
+        .find(|derived| derived.path == "store.rows")
+        .and_then(|derived| derived.materialized_list_id)
+        .map(|list| boon_plan::ListId(list.0))
+        .expect("outer rows materialized list");
+    let materializer = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::List(rows)))
+        .expect("outer rows materializer");
+    let PlanOpKind::DerivedValue {
+        expression:
+            Some(PlanDerivedExpression::MaterializeList {
+                authority_source_list,
+                value_list_authorities,
+                ..
+            }),
+        ..
+    } = &materializer.kind
+    else {
+        panic!("outer rows did not lower to a materialized list: {materializer:#?}");
+    };
+    assert_eq!(*authority_source_list, None);
+    assert!(
+        value_list_authorities.is_empty(),
+        "nested list operators cannot own the outer row list: {value_list_authorities:#?}"
+    );
+}
+
+#[test]
+fn forwarded_row_resource_members_preserve_source_ownership() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "forwarded-row-resource-members.bn",
+        r#"
+FUNCTION new_row(input) {
+    [
+        controls: [remove: SOURCE]
+        label: input.label
+    ]
+}
+
+store: [
+    inputs: LIST {
+        [label: TEXT { same }]
+        [label: TEXT { same }]
+    }
+    rows:
+        inputs
+        |> List/map(item, new: new_row(input: item))
+    forwarded:
+        rows
+        |> List/map(item, new: [
+            controls: item.controls
+            label: item.label
+        ])
+    consumed:
+        forwarded
+        |> List/map(item, new: [
+            controls: item.controls
+            label: item.label
+        ])
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let remove = compiled
+        .ir
+        .sources
+        .iter()
+        .find(|source| source.path.ends_with(".controls.remove"))
+        .expect("row-scoped remove source");
+    let forwarded = compiled
+        .ir
+        .derived_values
+        .iter()
+        .find(|derived| derived.path == "store.forwarded")
+        .and_then(|derived| derived.materialized_list_id)
+        .expect("forwarded materialized list");
+    let forwarded_locals = compiled
+        .ir
+        .scope_index
+        .locals
+        .iter()
+        .filter(|local| local.row.is_some_and(|row| row.list == forwarded))
+        .collect::<Vec<_>>();
+    let forwarded_fields = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| field.row.is_some_and(|row| row.list == forwarded))
+        .map(|field| {
+            (
+                field,
+                field.producer.and_then(|producer| {
+                    compiled.ir.executable.expressions.get(producer.as_usize())
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        forwarded_locals.iter().any(|local| {
+            local.members.iter().any(|member| {
+                member.path == ["controls", "remove"]
+                    && member.target == boon_ir::ErasedLocalMemberTarget::Source(remove.id)
+                    && member.forwarded_from.is_some()
+            })
+        }),
+        "forwarded resource members lost source ownership: locals={forwarded_locals:#?}; \
+         fields={forwarded_fields:#?}"
+    );
+}
+
+#[test]
+fn remapped_row_resource_members_replace_filtered_source_ownership() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "remapped-row-resource-members.bn",
+        r#"
+FUNCTION new_row(input) {
+    [
+        controls: [remove: SOURCE]
+        label: input.label
+    ]
+}
+
+store: [
+    inputs: LIST {
+        [label: TEXT { same }]
+        [label: TEXT { other }]
+    }
+    rows:
+        inputs
+        |> List/map(item, new: new_row(input: item))
+    filtered:
+        rows
+        |> List/filter(item, if: item.label == TEXT { same })
+        |> List/map(item, new: new_row(input: item))
+    selected:
+        filtered
+        |> List/map(item, new: item.controls.remove |> THEN { item.label })
+        |> List/latest()
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let remove_routes = compiled
+        .plan
+        .source_routes
+        .iter()
+        .filter(|route| route.path.ends_with(".controls.remove"))
+        .collect::<Vec<_>>();
+    assert_eq!(remove_routes.len(), 2, "old and replacement row sources");
+    assert_ne!(remove_routes[0].source_id, remove_routes[1].source_id);
+}
+
+#[test]
+fn inline_typed_host_result_rows_support_contextual_field_reads() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "inline-typed-host-result-rows.bn",
+        r#"
+store: [
+    load: SOURCE
+    asset: PackageAsset[url: TEXT { asset://wave.vcd }]
+    file_result:
+        NotStarted |> HOLD file_result {
+            load |> THEN {
+                File/read_stream(file: asset, retain_content: True)
+            }
+        }
+    waveform_result:
+        NotStarted |> HOLD waveform_result {
+            file_result |> WHEN {
+                Finished => file_result.retained |> WHEN {
+                    Retained => Wellen/open(content: file_result.retained.content)
+                    __ => SKIP
+                }
+                __ => SKIP
+            }
+        }
+    page:
+        NotStarted |> HOLD page {
+            waveform_result |> WHEN {
+                WaveformOpened => Wellen/hierarchy_page(
+                    artifact: waveform_result.artifact
+                    request_fingerprint: TEXT { hierarchy:test:0 }
+                    offset: 0
+                    limit: 32
+                )
+                __ => SKIP
+            }
+        }
+    signal_page:
+        NotStarted |> HOLD signal_page {
+            page |> WHEN {
+                HierarchyPage => Wellen/signal_page(
+                    artifact: page.artifact
+                    request_fingerprint: TEXT { signal:test:0 }
+                    signal_ids: LIST { TEXT { top.clk } }
+                    start_time: 0
+                    end_time: 100
+                    offset: 0
+                    max_transitions: 32
+                )
+                __ => SKIP
+            }
+        }
+    selected:
+        signal_page |> WHEN {
+            SignalPage =>
+                signal_page.signals
+                |> List/find(item, if: item.signal_id == TEXT { top.clk })
+            __ => NotFound
+        }
+    hierarchy_selected:
+        page |> WHEN {
+            HierarchyPage =>
+                page.rows
+                |> List/find(item, if: item.signal_id == TEXT { top.clk })
+            __ => NotFound
+        }
+    selected_signal_id:
+        selected |> WHEN {
+            Found[value] => value.signal_id
+            NotFound => TEXT { none }
+        }
+    hierarchy_rows:
+        page |> WHEN {
+            HierarchyPage => page.rows
+            __ => LIST {}
+        }
+    selected_defaults:
+        hierarchy_rows
+        |> List/map(item, new:
+            select_visible(row: selected_row(signal_row: item))
+        )
+    selected_visible_items:
+        selected_defaults
+        |> List/filter(item, if: item.item_kind == VariableRow)
+    selected_visible_count: selected_visible_items |> List/length()
+    remove_defaults:
+        hierarchy_rows
+        |> List/map(item, new: remove_default(signal_row: item))
+    catalog:
+        hierarchy_rows
+        |> List/map(item, new: catalog_row(signal_row: item))
+]
+
+FUNCTION remove_default(signal_row) {
+    [
+        signal_id: signal_row.signal_id
+        item_kind: VariableRow
+        controls: [remove: SOURCE]
+    ]
+}
+
+FUNCTION catalog_row(signal_row) {
+    [
+        key: signal_row.signal_id
+        selected:
+            signal_row.kind == TEXT { Signal } |> HOLD selected {
+                LATEST {
+                    store.load |> THEN { False }
+                    store.remove_defaults
+                        |> List/filter(item, if: item.item_kind == VariableRow)
+                        |> List/map(item, new:
+                            item.controls.remove |> THEN {
+                                item.signal_id == signal_row.signal_id |> WHEN {
+                                    True => False
+                                    False => selected
+                                }
+                            }
+                        )
+                        |> List/latest()
+                }
+            }
+    ]
+}
+
+FUNCTION selected_row(signal_row) {
+    [
+        id: signal_row.signal_id
+        item_kind: VariableRow
+        formatter: Hexadecimal
+    ]
+}
+
+FUNCTION select_visible(row) {
+    row.item_kind |> WHEN {
+        VariableRow => stateful_visible(row: row)
+        __ => row
+    }
+}
+
+FUNCTION stateful_visible(row) {
+    [
+        id: row.id
+        item_kind: row.item_kind
+        formatter:
+            row.formatter |> HOLD formatter {
+                store.load |> THEN { formatter }
+            }
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+    let captures = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .flat_map(|slot| &slot.row_fields)
+        .filter(|field| field.role == PlanListRowFieldRole::Capture)
+        .collect::<Vec<_>>();
+    let materialization_rows = compiled
+        .ir
+        .materializations
+        .iter()
+        .map(|materialization| {
+            (
+                materialization.id,
+                materialization.owner,
+                materialization.operation,
+                materialization.source_list_id,
+                materialization.target_list_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    let local_rows = compiled
+        .ir
+        .scope_index
+        .locals
+        .iter()
+        .map(|local| (local.owner, local.local, local.row, local.captures.len()))
+        .collect::<Vec<_>>();
+    let indexed_states = compiled
+        .ir
+        .scope_index
+        .bindings
+        .iter()
+        .filter_map(|binding| match binding.target {
+            boon_ir::ErasedBindingTarget::State { row: Some(row), .. } => {
+                Some((binding.diagnostic_path.as_str(), binding.static_owner, row))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        captures.len() >= 2,
+        "the captured initializer and update values need hidden typed storage: captures={captures:#?}, materializations={materialization_rows:#?}, locals={local_rows:#?}, indexed_states={indexed_states:#?}",
+    );
+    assert!(
+        captures
+            .iter()
+            .all(|field| field.name.starts_with("@capture/")),
+        "capture slots must not use Boon-visible field names: {captures:#?}"
+    );
+    let durable_fields = compiled
+        .plan
+        .persistence
+        .lists
+        .iter()
+        .flat_map(|list| &list.row_fields)
+        .filter_map(|field| field.runtime_field_id)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        captures
+            .iter()
+            .all(|capture| !durable_fields.contains(&capture.field_id)),
+        "detached closure captures are regenerated runtime storage, not persisted authority"
+    );
+    assert!(
+        compiled
+            .ir
+            .semantic_index
+            .fields
+            .iter()
+            .all(|field| !field.path.starts_with("@capture/")),
+        "capture slots must stay out of the semantic field index"
+    );
+}
+
+#[test]
+fn nested_list_contextual_rows_do_not_reuse_the_parent_row_storage() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "nested-list-contextual-row-storage.bn",
+        r#"
+store: [
+    lanes: LIST {
+        [
+            id: TEXT { lane-a }
+            visible: True
+            segments: LIST {
+                [signal_id: TEXT { clk }, active: True]
+                [signal_id: TEXT { reset }, active: False]
+            }
+        ]
+    }
+    visible_lanes:
+        lanes
+        |> List/filter(item, if: item.visible)
+    visible_segments:
+        visible_lanes
+        |> List/map(item, new:
+            item.segments
+            |> List/retain(item, if: item.active)
+            |> List/map(item, new: item.signal_id)
+        )
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn nested_contextual_hold_update_reads_its_ancestor_row_state() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "nested-contextual-hold-update.bn",
+        r#"
+store: [
+    reset: SOURCE
+    defaults:
+        LIST {
+            [id: TEXT { first }]
+            [id: TEXT { second }]
+        }
+        |> List/map(item, new: default_row(row: item))
+    rows:
+        LIST {
+            [id: TEXT { first-row }, selected: False]
+            [id: TEXT { second-row }, selected: True]
+        }
+        |> List/map(item, new: stateful_row(row: item))
+]
+
+FUNCTION stateful_row(row) {
+    [
+        key: row.id
+        selected:
+            row.selected |> HOLD selected {
+                LATEST {
+                    store.reset |> THEN { False }
+                    store.defaults
+                        |> List/filter(item, if: item.kind == VariableRow)
+                        |> List/map(item, new:
+                            item.controls.remove |> THEN {
+                                item.id == row.id |> WHEN {
+                                    True => False
+                                    False => selected
+                                }
+                            }
+                        )
+                        |> List/latest()
+                }
+            }
+    ]
+}
+
+FUNCTION default_row(row) {
+    [
+        id: row.id
+        kind: VariableRow
+        controls: [remove: SOURCE]
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn nested_list_helper_results_are_specialized_from_the_concrete_row_item() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "nested-list-helper-result-specialization.bn",
+        r#"
+store: [
+    rows: LIST {
+        [
+            id: TEXT { lane }
+            segments: LIST {
+                [
+                    file: TEXT { wave.vcd }
+                    signal_id: TEXT { clk }
+                    start_time: 0
+                    end_time: 10
+                    state: High
+                    label: TEXT { 1 }
+                    click_time: TEXT { 0 ns }
+                ]
+            }
+        ]
+    }
+    selected_rows:
+        rows
+        |> List/map(item, new: selected_row(row: item))
+    lanes:
+        selected_rows
+        |> List/map(item, new: lane_row(row: item))
+]
+
+FUNCTION selected_row(row) {
+    [
+        id: row.id
+        segments: row.segments
+    ]
+}
+
+FUNCTION lane_row(row) {
+    [
+        id: row.id
+        segments: lane_segments(row: row)
+    ]
+}
+
+FUNCTION lane_segments(row) {
+    row.segments
+    |> List/retain(item, if: True)
+    |> List/map(item, new:
+        decorate_segment(segment: project_segment(segment: item))
+    )
+}
+
+FUNCTION project_segment(segment) {
+    [
+        file: segment.file
+        signal_id: segment.signal_id
+        start_time: segment.start_time
+        end_time: segment.end_time
+        state: segment.state
+        raw_label: segment.label
+        label: segment.label
+        click_time: segment.click_time
+        width: 10
+        projection_source: RuntimeTimelineMetadata
+    ]
+}
+
+FUNCTION decorate_segment(segment) {
+    [
+        file: segment.file
+        signal_id: segment.signal_id
+        start_time: segment.start_time
+        end_time: segment.end_time
+        state: segment.state
+        raw_label: segment.raw_label
+        label: segment.label
+        click_time: segment.click_time
+        width: segment.width
+        projection_source: segment.projection_source
+        page_kind: TEXT { waveform_page }
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
 }
 
 #[test]
@@ -3853,22 +5821,27 @@ FUNCTION decorate(item) {
     let PlanDerivedExpression::RowExpression { expression } = materialized.as_ref() else {
         panic!("record-returning helper lost its row expression: {materialized:#?}");
     };
-    let (owner, row_local, source, body) =
-        expect_contextual_map(expression, "record-returning helper");
+    let (owner, row_local, source, body) = expect_contextual_map(
+        &compiled.plan.row_expressions,
+        *expression,
+        "record-returning helper",
+    );
     let items = compiled
         .ir
         .lists
         .iter()
         .find(|list| list.name.ends_with("items"))
         .expect("items list");
-    assert_eq!(
-        source,
-        &PlanRowExpression::ListRef {
-            list_id: boon_plan::ListId(items.id.0),
-        },
+    assert!(
+        matches!(
+            row_node(&compiled.plan.row_expressions, source),
+            PlanRowExpressionNode::ListRef { list_id }
+                if *list_id == boon_plan::ListId(items.id.0)
+        ),
         "record-returning helper must retain the exact items source"
     );
-    let PlanRowExpression::Object { fields } = body else {
+    let PlanRowExpressionNode::Object { fields } = row_node(&compiled.plan.row_expressions, body)
+    else {
         panic!("record-returning helper must produce a record: {body:#?}");
     };
     let label = &fields
@@ -3876,23 +5849,24 @@ FUNCTION decorate(item) {
         .find(|field| field.name == "label")
         .expect("decorated label")
         .value;
-    assert_contextual_local_projection(label, owner, row_local, &["id"], "decorated label");
-    let PlanRowExpression::Object {
-        fields: detail_fields,
-    } = &fields
+    assert_contextual_local_projection(
+        &compiled.plan.row_expressions,
+        *label,
+        owner,
+        row_local,
+        &["id"],
+        "decorated label",
+    );
+    let details = fields
         .iter()
         .find(|field| field.name == "details")
         .expect("decorated details")
-        .value
+        .value;
+    let PlanRowExpressionNode::Object {
+        fields: detail_fields,
+    } = row_node(&compiled.plan.row_expressions, details)
     else {
-        panic!(
-            "decorated details must remain a record: {:#?}",
-            fields
-                .iter()
-                .find(|field| field.name == "details")
-                .expect("decorated details")
-                .value
-        );
+        panic!("decorated details must remain a record: {details:#?}");
     };
     let detail_value = &detail_fields
         .iter()
@@ -3900,7 +5874,8 @@ FUNCTION decorate(item) {
         .expect("decorated detail value")
         .value;
     assert_contextual_local_projection(
-        detail_value,
+        &compiled.plan.row_expressions,
+        *detail_value,
         owner,
         row_local,
         &["value"],
@@ -3979,25 +5954,39 @@ FUNCTION select_items(items) {
     let PlanDerivedExpression::RowExpression { expression } = materialized.as_ref() else {
         panic!("multiline helper lost its row expression: {materialized:#?}");
     };
-    let (owner, row_local, source, body) = expect_contextual_map(expression, "multiline helper");
-    let (filter_owner, filter_local, filter_source, predicate) =
-        expect_contextual_filter(source, "multiline helper filter");
+    let (owner, row_local, source, body) = expect_contextual_map(
+        &compiled.plan.row_expressions,
+        *expression,
+        "multiline helper",
+    );
+    let (filter_owner, filter_local, filter_source, predicate) = expect_contextual_filter(
+        &compiled.plan.row_expressions,
+        source,
+        "multiline helper filter",
+    );
     assert!(
-        matches!(filter_source, PlanRowExpression::ListRef { .. }),
+        matches!(
+            row_node(&compiled.plan.row_expressions, filter_source),
+            PlanRowExpressionNode::ListRef { .. }
+        ),
         "multiline helper filter must retain its typed list source: {filter_source:#?}"
     );
-    let PlanRowExpression::NumberInfix { op, left, .. } = predicate else {
+    let PlanRowExpressionNode::NumberInfix { op, left, .. } =
+        row_node(&compiled.plan.row_expressions, predicate)
+    else {
         panic!("multiline helper must retain its typed equality: {predicate:#?}");
     };
-    assert_eq!(op, "==");
+    assert_eq!(*op, PlanInfixOp::Equal);
     assert_contextual_local_projection(
-        left,
+        &compiled.plan.row_expressions,
+        *left,
         filter_owner,
         filter_local,
         &["family"],
         "multiline helper family",
     );
-    let PlanRowExpression::Object { fields } = body else {
+    let PlanRowExpressionNode::Object { fields } = row_node(&compiled.plan.row_expressions, body)
+    else {
         panic!("multiline helper map must produce a record: {body:#?}");
     };
     let label = &fields
@@ -4005,7 +5994,14 @@ FUNCTION select_items(items) {
         .find(|field| field.name == "label")
         .expect("multiline helper label")
         .value;
-    assert_contextual_local_projection(label, owner, row_local, &["id"], "multiline helper label");
+    assert_contextual_local_projection(
+        &compiled.plan.row_expressions,
+        *label,
+        owner,
+        row_local,
+        &["id"],
+        "multiline helper label",
+    );
 }
 
 #[test]
@@ -4050,23 +6046,27 @@ store: [
         .flatten()
         .collect::<Vec<_>>();
     assert!(
-        arm_values.iter().any(|value| matches!(
-            value,
-            PlanRowExpression::Select { input, .. }
-                if matches!(
-                    input.as_ref(),
-                    PlanRowExpression::ContextualCollection {
-                        operation: PlanContextualOperationKind::Find,
-                        ..
-                    }
-                )
-        )),
+        arm_values.iter().any(|value| {
+            let PlanRowExpressionNode::Select { input, .. } =
+                row_node(&compiled.plan.row_expressions, **value)
+            else {
+                return false;
+            };
+            matches!(
+                row_node(&compiled.plan.row_expressions, *input),
+                PlanRowExpressionNode::ContextualCollection {
+                    operation: PlanContextualOperationKind::Find,
+                    ..
+                }
+            )
+        }),
         "missing scalar typed List/find: {arm_values:#?}"
     );
     assert!(
         arm_values.iter().any(|value| matches!(
-            value,
-            PlanRowExpression::BuiltinCall { function, .. } if function == "List/get"
+            row_node(&compiled.plan.row_expressions, **value),
+            PlanRowExpressionNode::BuiltinCall { function, .. }
+                if *function == PlanRowBuiltin::ListGet
         )),
         "missing scalar List/get: {arm_values:#?}"
     );
@@ -4074,7 +6074,7 @@ store: [
 }
 
 #[test]
-fn stored_list_find_lowers_a_typed_field_id_index_lookup() {
+fn stored_list_find_lowers_a_typed_field_id_indexed_access() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "typed-indexed-find.bn",
         r#"
@@ -4148,46 +6148,456 @@ document: Document/new(
                     .collect::<Vec<_>>()
             )
         });
-    let PlanRowExpression::Select { input, .. } = expression else {
+    let PlanRowExpressionNode::Select { input, arms } =
+        row_node(&compiled.plan.row_expressions, *expression)
+    else {
         panic!("selected find result must lower through WHEN: {expression:#?}");
     };
-    let PlanRowExpression::ContextualCollection {
+    let PlanRowExpressionNode::ContextualCollection {
         owner,
         operation: PlanContextualOperationKind::Find,
         source,
         row_local,
         body,
-        index_lookup: Some(index_lookup),
-    } = input.as_ref()
+        indexed_access: Some(indexed_access),
+        ..
+    } = row_node(&compiled.plan.row_expressions, *input)
     else {
         panic!("selected find must carry typed index metadata: {input:#?}");
     };
-    assert_eq!(
-        source.as_ref(),
-        &PlanRowExpression::ListRef {
-            list_id: index_lookup.list_id,
-        }
-    );
-    let PlanRowExpression::NumberInfix { op, left, .. } = body.as_ref() else {
+    let index = compiled
+        .plan
+        .list_indexes
+        .get(indexed_access.index.0)
+        .filter(|index| index.id == indexed_access.index)
+        .expect("contextual Find typed index");
+    let [key] = index.keys.as_slice() else {
+        panic!("contextual Find must use one typed key: {index:#?}");
+    };
+    let PlanListAccessSelection::KeyPrefix { values } = &indexed_access.selection else {
+        panic!("contextual Find must use an exact key-prefix seek: {indexed_access:#?}");
+    };
+    let [expected] = values.as_slice() else {
+        panic!("contextual Find must seek one exact value: {values:#?}");
+    };
+    assert!(matches!(
+        row_node(&compiled.plan.row_expressions, *source),
+        PlanRowExpressionNode::ListRef { list_id } if *list_id == index.source_list
+    ));
+    let PlanRowExpressionNode::NumberInfix { op, left, right } =
+        row_node(&compiled.plan.row_expressions, *body)
+    else {
         panic!("typed find predicate lost equality: {body:#?}");
     };
-    assert_eq!(op, "==");
+    assert_eq!(*op, PlanInfixOp::Equal);
+    assert_eq!(*right, *expected);
+    let PlanRowExpressionNode::ListRowField {
+        row: key_row,
+        list_id: key_list,
+        field: key_field,
+    } = row_node(&compiled.plan.row_expressions, key.expression)
+    else {
+        panic!("typed index key lost its exact row field: {key:#?}");
+    };
+    assert_eq!(*key_list, index.source_list);
     assert!(matches!(
-        left.as_ref(),
-        PlanRowExpression::ListRowField {
-            row,
-            list_id,
-            field,
-        } if *list_id == index_lookup.list_id
-            && *field == index_lookup.field
-            && matches!(
-                row.as_ref(),
-                PlanRowExpression::LocalRow {
-                    owner: row_owner,
-                    local,
-                } if row_owner == owner && local == row_local
-            )
+        row_node(&compiled.plan.row_expressions, *key_row),
+        PlanRowExpressionNode::LocalRow {
+            owner,
+            local,
+        } if *owner == key.owner && *local == key.row_local
     ));
+    let PlanRowExpressionNode::ListRowField {
+        row,
+        list_id,
+        field,
+    } = row_node(&compiled.plan.row_expressions, *left)
+    else {
+        panic!("typed find predicate lost its exact row field: {left:#?}");
+    };
+    assert_eq!(*list_id, *key_list);
+    assert_eq!(*field, *key_field);
+    assert!(matches!(
+        row_node(&compiled.plan.row_expressions, *row),
+        PlanRowExpressionNode::LocalRow {
+            owner: row_owner,
+            local,
+        } if row_owner == owner && local == row_local
+    ));
+    let slot = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id == index.source_list)
+        .expect("stored items list slot");
+    let value_field = slot
+        .row_fields
+        .iter()
+        .find(|field| field.name == "value" && field.role.is_value())
+        .expect("stored value field")
+        .field_id;
+    assert!(
+        arms.iter().any(|arm| {
+            let PlanRowExpressionNode::ListRowField {
+                row,
+                list_id,
+                field,
+            } = row_node(&compiled.plan.row_expressions, arm.value)
+            else {
+                return false;
+            };
+            if *list_id != index.source_list || *field != value_field {
+                return false;
+            }
+            let PlanRowExpressionNode::ObjectField {
+                object,
+                field: object_field,
+            } = row_node(&compiled.plan.row_expressions, *row)
+            else {
+                return false;
+            };
+            object_field == "value"
+                && matches!(
+                    row_node(&compiled.plan.row_expressions, *object),
+                    PlanRowExpressionNode::ContextualCollection {
+                        operation: PlanContextualOperationKind::Find,
+                        ..
+                    }
+                )
+        }),
+        "Found row projection lost its compiler-owned field identity: {arms:#?}"
+    );
+    assert_eq!(slot.initializer_kind, ListInitializerKind::RecordLiteral);
+    assert_eq!(slot.initial_rows.len(), 2);
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .all(|op| op.output != Some(ValueRef::List(index.source_list))),
+        "a reconstructable literal list must not have a duplicate derived producer"
+    );
+    assert!(boon_plan::verify_plan(&compiled.plan).is_ok());
+}
+
+#[test]
+fn cells_scoped_source_routes_publish_complete_structural_owners() {
+    let path = example_path("examples/cells.bn");
+    let units = compiler_source_units_for_path(&path).unwrap();
+    let compiled = compile_runtime_source_units_to_machine_plan_with_persistence_identity(
+        "typed-cells-route-indexes.bn",
+        &units,
+        TargetProfile::SoftwareDefault,
+        ApplicationIdentity::new("dev.boon.cells-route-indexes", "test", "local"),
+        1,
+    )
+    .unwrap();
+    let evidence = compiled
+        .plan
+        .source_routes
+        .iter()
+        .filter(|route| route.scoped)
+        .map(|route| {
+            (
+                route.path.clone(),
+                route.scope_id,
+                route.owner.static_owner,
+                route.owner.ancestors.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!evidence.is_empty());
+    assert!(evidence.iter().all(|(_, scope, owner, ancestors)| {
+        scope.is_some()
+            && !owner.is_root()
+            && !ancestors.is_empty()
+            && ancestors
+                .last()
+                .is_some_and(|ancestor| Some(ancestor.scope) == *scope)
+    }));
+    let verification = boon_plan::verify_plan(&compiled.plan).unwrap();
+    assert_eq!(
+        verification.status, "pass",
+        "Cells structural route evidence: {evidence:#?}\nverification: {verification:#?}"
+    );
+}
+
+#[test]
+fn stored_find_result_preserves_exact_row_provenance() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "stored-typed-find-result.bn",
+        r#"
+store: [
+    items: LIST {
+        [key: TEXT { a }, value: TEXT { A }]
+        [key: TEXT { b }, value: TEXT { B }]
+    }
+    found:
+        items
+        |> List/find(item, if: item.key == TEXT { b })
+    selected:
+        found |> WHEN {
+            Found[value] => value.value
+            NotFound => TEXT { missing }
+        }
+]
+document: Document/new(
+    root: Element/label(element: [], label: store.selected)
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let found_binding = compiled
+        .ir
+        .scope_index
+        .bindings
+        .iter()
+        .find(|binding| binding.diagnostic_path == "store.found")
+        .expect("stored Find binding");
+    let row_value = compiled
+        .ir
+        .scope_index
+        .row_values
+        .iter()
+        .find(|row| {
+            row.expression == found_binding.producer && row.projection == ["value".to_owned()]
+        })
+        .expect("stored Find Found.value row provenance");
+    let items_slot = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id == boon_plan::ListId(row_value.row.list.as_usize()))
+        .expect("items list slot");
+    let value_field = items_slot
+        .row_fields
+        .iter()
+        .find(|field| field.name == "value" && field.role.is_value())
+        .expect("items value field")
+        .field_id;
+    let selected = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.selected")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("store.selected field id");
+    let expression = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match (&op.output, &op.kind) {
+            (
+                Some(ValueRef::Field(field)),
+                PlanOpKind::DerivedValue {
+                    expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                    ..
+                },
+            ) if *field == selected => Some(expression),
+            _ => None,
+        })
+        .expect("stored Find consumer expression");
+    let PlanRowExpressionNode::Select { arms, .. } =
+        row_node(&compiled.plan.row_expressions, *expression)
+    else {
+        panic!("stored Find consumer must lower through WHEN: {expression:#?}");
+    };
+    assert!(
+        arms.iter().any(|arm| {
+            let PlanRowExpressionNode::ListRowField {
+                row,
+                list_id,
+                field,
+            } = row_node(&compiled.plan.row_expressions, arm.value)
+            else {
+                return false;
+            };
+            *list_id == items_slot.list_id
+                && *field == value_field
+                && matches!(
+                    row_node(&compiled.plan.row_expressions, *row),
+                    PlanRowExpressionNode::ObjectField { field, .. } if field == "value"
+                )
+        }),
+        "stored Find row projection lost exact identity: {arms:#?}"
+    );
+    assert!(boon_plan::verify_plan(&compiled.plan).is_ok());
+}
+
+#[test]
+fn stored_list_get_and_latest_results_preserve_exact_row_provenance() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "stored-list-row-results.bn",
+        r#"
+store: [
+    items: LIST {
+        [key: TEXT { a }, value: TEXT { A }]
+        [key: TEXT { b }, value: TEXT { B }]
+    }
+    indexed_row: List/get(list: items, index: 1)
+    indexed_value: indexed_row.value
+    latest_row: List/latest(list: items)
+    latest_value: latest_row.value
+]
+document: Document/new(
+    root: Element/label(element: [], label: store.indexed_value)
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let items_slot = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| {
+            compiled.plan.debug_map.list_slots.iter().any(|entry| {
+                entry.label == "store.items" && entry.id == format!("list:{}", slot.list_id.0)
+            })
+        })
+        .expect("items list slot");
+    let value_field = items_slot
+        .row_fields
+        .iter()
+        .find(|field| field.name == "value" && field.role.is_value())
+        .expect("items value field")
+        .field_id;
+    for path in ["store.indexed_value", "store.latest_value"] {
+        let output = compiled
+            .plan
+            .debug_map
+            .fields
+            .iter()
+            .find(|field| field.label == path)
+            .and_then(|field| field.id.strip_prefix("field:"))
+            .and_then(|id| id.parse::<usize>().ok())
+            .map(FieldId)
+            .unwrap_or_else(|| panic!("{path} field id"));
+        let expression = compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .find_map(|op| match (&op.output, &op.kind) {
+                (
+                    Some(ValueRef::Field(field)),
+                    PlanOpKind::DerivedValue {
+                        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                        ..
+                    },
+                ) if *field == output => Some(expression),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{path} exact expression"));
+        assert!(
+            matches!(
+                row_node(&compiled.plan.row_expressions, *expression),
+                PlanRowExpressionNode::ListRowField {
+                    list_id,
+                    field,
+                    ..
+                } if *list_id == items_slot.list_id && *field == value_field
+            ),
+            "{path} lost exact stored row identity: {expression:#?}"
+        );
+    }
+    assert!(boon_plan::verify_plan(&compiled.plan).is_ok());
+}
+
+#[test]
+fn stored_row_value_rejects_mixed_list_ownership() {
+    let error = compile_fixture_source_text_to_machine_plan(
+        "mixed-stored-row-owner.bn",
+        r#"
+store: [
+    choose_left: True
+    left: LIST { [value: TEXT { left }] }
+    right: LIST { [value: TEXT { right }] }
+    selected_row:
+        choose_left |> WHILE {
+            True => List/get(list: left, index: 0)
+            False => List/get(list: right, index: 0)
+        }
+    selected_value: selected_row.value
+]
+document: Document/new(
+    root: Element/label(element: [], label: store.selected_value)
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("conflicting owners") || error.contains("multiple exact row owners"),
+        "mixed keyed row owners must fail explicitly: {error}"
+    );
+}
+
+#[test]
+fn retained_document_can_consume_an_inline_typed_find() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "retained-inline-typed-find.bn",
+        r#"
+store: [
+    items: LIST {
+        [key: TEXT { a }, value: TEXT { A }]
+        [key: TEXT { b }, value: TEXT { B }]
+    }
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label:
+            store.items
+            |> List/find(item, if: item.key == TEXT { b })
+            |> WHEN {
+                Found[value] => value.value
+                NotFound => TEXT { missing }
+            }
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let document = compiled.plan.document.as_ref().unwrap();
+    let runtime_find = document
+        .expressions
+        .iter()
+        .find_map(|expression| match &expression.op {
+            DocumentExprOp::RuntimeExpression {
+                expression: runtime_expression,
+                bindings,
+            } if matches!(
+                row_node(&compiled.plan.row_expressions, *runtime_expression),
+                PlanRowExpressionNode::ContextualCollection {
+                    operation: PlanContextualOperationKind::Find,
+                    indexed_access: Some(_),
+                    ..
+                }
+            ) =>
+            {
+                Some((*runtime_expression, bindings))
+            }
+            _ => None,
+        })
+        .expect("inline Find must use one indexed machine runtime expression");
+    assert!(runtime_find.1.is_empty());
+    assert!(document.materializations.is_empty());
     assert!(boon_plan::verify_plan(&compiled.plan).is_ok());
 }
 
@@ -4237,13 +6647,6 @@ document: Document/new(
     .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
 
-    assert!(
-        document
-            .expressions
-            .iter()
-            .all(|expression| !matches!(expression.op, DocumentExprOp::FunctionCall { .. })),
-        "transparent style helper must be erased before document lowering"
-    );
     assert!(document.expressions.iter().any(|expression| {
         let DocumentExprOp::Record { fields } = &expression.op else {
             return false;
@@ -4284,6 +6687,7 @@ FUNCTION render(profile) {
 FUNCTION project_row(project) {
     Scene/Element/text(element: [], style: [width: Fill], text: project.title)
 }
+
 "#
             .to_owned(),
         },
@@ -4311,13 +6715,6 @@ scene: ProfilePage/render(profile: profile)
         document.expressions[document.root.expression.0].op,
         DocumentExprOp::Constructor { .. }
     ));
-    assert!(
-        document
-            .expressions
-            .iter()
-            .all(|expression| !matches!(expression.op, DocumentExprOp::FunctionCall { .. })),
-        "transparent cross-module calls must be erased before document lowering"
-    );
     let demanded = match &compiled.plan.demand.root_derived_outputs {
         RootOutputDemand::Selected(fields) => fields.iter().copied().collect::<BTreeSet<_>>(),
         RootOutputDemand::All => panic!("document demand must remain sparse"),
@@ -4359,6 +6756,226 @@ scene: ProfilePage/render(profile: profile)
 }
 
 #[test]
+fn text_interpolation_is_checked_and_erased_before_document_lowering() {
+    let fixtures = [
+        (
+            "parameter",
+            r#"
+store: [
+    count: 7
+]
+
+FUNCTION value_label(value) {
+    Element/label(element: [], style: [], label: TEXT { value={value} })
+}
+
+document: Document/new(root: value_label(value: store.count))
+"#,
+        ),
+        (
+            "passed",
+            r#"
+store: [count: 7]
+
+FUNCTION passed_label() {
+    Element/label(element: [], style: [], label: TEXT { passed={PASSED.store.count} })
+}
+
+document: Document/new(root: passed_label(PASS: [store: store]))
+"#,
+        ),
+        (
+            "row",
+            r#"
+store: [
+    rows: LIST {
+        [name: TEXT { Alpha }]
+        [name: TEXT { Beta }]
+    }
+]
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: store.rows
+            |> List/map(item, new:
+                Element/label(element: [], style: [], label: TEXT { row={item.name} })
+            )
+    )
+)
+"#,
+        ),
+    ];
+
+    for (name, source) in fixtures {
+        let path = format!("typed-text-interpolation-{name}.bn");
+        let parsed = boon_parser::parse_source(&path, source).unwrap();
+        let report = boon_typecheck::check(&parsed);
+        assert!(
+            report.diagnostics.is_empty(),
+            "{name} text interpolation did not typecheck: {:#?}",
+            report.diagnostics
+        );
+        let compiled = compile_fixture_source_text_to_machine_plan(
+            &path,
+            source,
+            TargetProfile::SoftwareDefault,
+        )
+        .unwrap();
+
+        let dynamic_expressions = compiled
+            .ir
+            .executable
+            .expressions
+            .iter()
+            .filter_map(|expression| match &expression.kind {
+                boon_ir::ExecutableExpressionKind::TextTemplate { segments } => Some(segments),
+                _ => None,
+            })
+            .flat_map(|segments| segments.iter())
+            .filter_map(|segment| match segment {
+                boon_ir::ExecutableTextSegment::Static { .. } => None,
+                boon_ir::ExecutableTextSegment::Dynamic { value } => Some(*value),
+            })
+            .collect::<Vec<_>>();
+        assert!(!dynamic_expressions.is_empty(), "{name}");
+        for expression in dynamic_expressions {
+            let kind = &compiled.ir.executable.expressions[expression.as_usize()].kind;
+            if matches!(
+                kind,
+                boon_ir::ExecutableExpressionKind::CanonicalRead { .. }
+            ) {
+                assert!(compiled.ir.scope_index.reads.iter().any(|read| {
+                    read.expression == expression
+                        && !matches!(read.target, boon_ir::ErasedReadTarget::ExternalValue { .. })
+                }));
+            }
+            assert!(!matches!(
+                kind,
+                boon_ir::ExecutableExpressionKind::ExternalRead { .. }
+            ));
+        }
+
+        let document = compiled.plan.document.as_ref().expect("document plan");
+        let dynamic_reads = document
+            .expressions
+            .iter()
+            .filter_map(|expression| match &expression.op {
+                DocumentExprOp::TextTemplate { segments } => Some(segments),
+                _ => None,
+            })
+            .flat_map(|segments| segments.iter())
+            .filter_map(|segment| match segment {
+                DocumentTextSegment::Static { .. } => None,
+                DocumentTextSegment::Dynamic { value } => Some(*value),
+            })
+            .map(|value| &document.expressions[value.0].op)
+            .collect::<Vec<_>>();
+        assert_eq!(dynamic_reads.len(), 1, "{name}");
+        assert!(
+            matches!(
+                dynamic_reads[0],
+                DocumentExprOp::Read {
+                    read: DocumentRead::Field { .. }
+                        | DocumentRead::Parameter { .. }
+                        | DocumentRead::Row { .. }
+                } | DocumentExprOp::Project { .. }
+                    | DocumentExprOp::Constant { .. }
+            ),
+            "{name}: {:#?}",
+            dynamic_reads[0]
+        );
+    }
+
+    let implementation = include_str!("document_executable_backend.rs");
+    assert!(!implementation.contains("compile_named_path"));
+    assert!(!implementation.contains("canonical_root_exists"));
+}
+
+#[test]
+fn document_rejects_transient_source_payload_reads_instead_of_rendering_null() {
+    let error = compile_fixture_source_text_to_machine_plan(
+        "document-transient-source-payload.bn",
+        r#"
+store: [input: SOURCE]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: store.input.text
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("retain the event value in HOLD before rendering it"),
+        "unexpected document source-payload error: {error}"
+    );
+}
+
+#[test]
+fn retained_document_projects_passed_records_without_compiling_unused_event_fields() {
+    let units = [
+        CompilerSourceUnit {
+            path: "ProjectionView.bn".to_owned(),
+            source: r#"
+FUNCTION inner_label() {
+    Element/label(
+        element: []
+        style: []
+        label: PASSED.store.safe
+    )
+}
+
+FUNCTION outer_label() {
+    inner_label()
+}
+"#
+            .to_owned(),
+        },
+        CompilerSourceUnit {
+            path: "RUN.bn".to_owned(),
+            source: r#"
+store: [
+    input: SOURCE
+    safe: TEXT { ready }
+    transient: input.text
+]
+
+document: Document/new(
+    root: ProjectionView/outer_label(PASS: [store: store])
+)
+"#
+            .to_owned(),
+        },
+    ];
+    let compiled =
+        compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
+            .unwrap();
+
+    let document = compiled.plan.document.as_ref().expect("document plan");
+    assert!(
+        document.expressions.iter().all(|expression| !matches!(
+            &expression.op,
+            DocumentExprOp::Read {
+                read: DocumentRead::Source { .. }
+            }
+        )),
+        "unused source fields leaked into retained expressions: {:#?}",
+        document.expressions
+    );
+    assert!(boon_plan::verify_plan(&compiled.plan).is_ok());
+}
+
+#[test]
 fn document_row_alias_arguments_remain_rows_and_selects_follow_dynamic_inputs() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "document-row-argument.bn",
@@ -4373,15 +6990,19 @@ store: [
 ]
 
 FUNCTION new_row(title, kind) {
-    [
-        controls: [select: SOURCE]
-        selected:
-            False |> HOLD selected {
-                controls.select |> THEN { True }
-            }
-        title: title
-        kind: kind
-    ]
+    BLOCK {
+        row_title: title
+        row_kind: kind
+        [
+            controls: [select: SOURCE]
+            selected:
+                False |> HOLD selected {
+                    controls.select |> THEN { True }
+                }
+            title: row_title
+            kind: row_kind
+        ]
+    }
 }
 
 FUNCTION render_row(row) {
@@ -4434,13 +7055,11 @@ document: Document/new(
     .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
 
-    assert!(
-        document
-            .expressions
-            .iter()
-            .all(|expression| !matches!(expression.op, DocumentExprOp::FunctionCall { .. })),
-        "transparent row helpers must be erased before document lowering"
-    );
+    assert!(document.view_bindings.iter().any(|binding| matches!(
+        binding.target,
+        boon_plan::DocumentBindingTarget::ScopedField { .. }
+    )));
+
     assert!(document.expressions.iter().any(|expression| {
         let DocumentExprOp::Read {
             read: DocumentRead::Parameter { projection, .. },
@@ -4489,6 +7108,57 @@ fn cells_rows_are_typed_visible_range_materializations() {
     )
     .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
+    for state in &compiled.ir.state_cells {
+        let executable_state_id = state
+            .executable_state_id
+            .unwrap_or_else(|| panic!("Cells state `{}` has no executable identity", state.path));
+        let executable_state = compiled
+            .ir
+            .executable
+            .states
+            .get(executable_state_id.as_usize())
+            .filter(|candidate| candidate.id == executable_state_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Cells state `{}` has a stale executable identity",
+                    state.path
+                )
+            });
+        assert!(
+            compiled
+                .ir
+                .executable
+                .expressions
+                .get(executable_state.initial.as_usize())
+                .is_some_and(|candidate| candidate.id == executable_state.initial),
+            "Cells state `{}` has no exact executable initializer",
+            state.path
+        );
+    }
+    assert!(
+        compiled
+            .plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .all(|slot| slot.value_type != boon_plan::PlanValueType::Unknown)
+    );
+
+    let chunk_ops = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::ListProjection {
+                projection: PlanListProjection::Chunk { source_list, size },
+            } => Some((*source_list, *size, op.output.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(chunk_ops.len(), 1, "chunk ops: {chunk_ops:#?}");
+    assert_eq!(chunk_ops[0].1, 26);
+    assert!(matches!(chunk_ops[0].2, Some(ValueRef::List(_))));
 
     assert!(!document.materializations.is_empty());
     assert!(document.expressions.len() < 2_600);
@@ -4534,11 +7204,105 @@ fn cells_rows_are_typed_visible_range_materializations() {
         .debug_map
         .fields
         .iter()
-        .find(|field| field.label == "item.address")
+        .find(|field| field.label == "cells.address")
         .and_then(|field| field.id.strip_prefix("field:"))
         .and_then(|id| id.parse::<usize>().ok())
         .map(boon_plan::FieldId)
-        .expect("item.address field id");
+        .expect("cells.address field id");
+    let cells_slot = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.contains_row_field(address_field))
+        .expect("Cells list slot");
+    assert_eq!(
+        cells_slot.initializer_kind,
+        boon_plan::ListInitializerKind::Range
+    );
+    assert_eq!(
+        cells_slot.range,
+        Some(boon_plan::PlanRangeInitializer { from: 0, to: 2599 })
+    );
+    assert_eq!(
+        cells_slot
+            .row_fields
+            .iter()
+            .filter(|field| field.role.is_authority())
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["index", "value"]
+    );
+    let demand_current_fields = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match (&op.kind, op.output.as_ref()) {
+            (
+                PlanOpKind::DerivedValue {
+                    startup_recompute,
+                    expression: Some(boon_plan::PlanDerivedExpression::MaterializedRowField { .. }),
+                    ..
+                },
+                Some(ValueRef::Field(field)),
+            ) if !startup_recompute
+                && cells_slot.contains_row_field(*field)
+                && cells_slot
+                    .row_fields
+                    .iter()
+                    .any(|candidate| candidate.field_id == *field && candidate.role.is_value()) =>
+            {
+                cells_slot
+                    .row_fields
+                    .iter()
+                    .find(|candidate| candidate.field_id == *field)
+                    .map(|candidate| candidate.name.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let sources_field = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .find(|field| {
+            field.row.map(|row| boon_plan::ListId(row.list.as_usize())) == Some(cells_slot.list_id)
+                && field.name == "sources"
+                && field.role.is_value()
+        })
+        .expect("Cells source-only row field metadata");
+    assert!(sources_field.resource_only);
+    assert_eq!(
+        demand_current_fields,
+        BTreeSet::from([
+            "address",
+            "default_formula",
+            "display_text",
+            "error",
+            "value",
+        ])
+    );
+    assert!(
+        !compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    PlanOpKind::DerivedValue {
+                        expression: Some(boon_plan::PlanDerivedExpression::MaterializeList {
+                            target_list,
+                            ..
+                        }),
+                        ..
+                    } if *target_list == cells_slot.list_id
+                )
+            })
+    );
     let global_address_reads = document
         .expressions
         .iter()
@@ -4589,14 +7353,35 @@ fn cells_rows_are_typed_visible_range_materializations() {
                     .collect::<Vec<_>>()
             )
         });
-    assert!(!document.expressions.iter().any(|expression| {
-        matches!(
-            expression.op,
-            DocumentExprOp::Read {
-                read: DocumentRead::State { state }
-            } if state == editing_state
-        )
-    }));
+    let global_editing_reads = document
+        .expressions
+        .iter()
+        .enumerate()
+        .filter(|(_, expression)| {
+            matches!(
+                expression.op,
+                DocumentExprOp::Read {
+                    read: DocumentRead::State { state }
+                } if state == editing_state
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        global_editing_reads.is_empty(),
+        "indexed editing state leaked into global document reads: {:#?}",
+        global_editing_reads
+            .iter()
+            .map(|(index, expression)| (
+                index,
+                expression,
+                compiled
+                    .ir
+                    .executable
+                    .expressions
+                    .get(expression.compiler_id)
+            ))
+            .collect::<Vec<_>>()
+    );
 
     let selected_input = compiled
         .plan
@@ -4614,6 +7399,26 @@ fn cells_rows_are_typed_visible_range_materializations() {
         };
         document.names.get(field.0).map(String::as_str) == Some("editing_text")
             && expression_reads_field(document, expression.id, selected_input)
+    }));
+    assert!(document.expressions.iter().any(|expression| {
+        let DocumentExprOp::Select { input, arms } = &expression.op else {
+            return false;
+        };
+        if !expression_reads_field(document, *input, selected_input) {
+            return false;
+        }
+        arms.iter().any(|arm| {
+            matches!(
+                arm.pattern,
+                boon_plan::DocumentPattern::Tag { tag }
+                    if document.names.get(tag.0).map(String::as_str) == Some("Found")
+            ) && arm.bindings.len() == 1
+                && arm.bindings[0]
+                    .projection
+                    .iter()
+                    .map(|name| document.names[name.0].as_str())
+                    .eq(["value"])
+        })
     }));
 }
 
@@ -4743,35 +7548,35 @@ FUNCTION revision_view(revision) {
         .flat_map(|region| &region.ops)
         .find(|op| {
             matches!(
-                op.kind,
-                PlanOpKind::ListOperation {
-                    operation_kind: boon_plan::PlanListOperationKind::Append,
-                    ..
+                &op.kind,
+                PlanOpKind::ListMutation {
+                    mutation: boon_plan::PlanListMutation::Append(_),
                 }
             )
         })
         .expect("append op");
-    let PlanOpKind::ListOperation {
-        append: Some(append),
-        ..
+    let PlanOpKind::ListMutation {
+        mutation: boon_plan::PlanListMutation::Append(append),
     } = &append_op.kind
     else {
         unreachable!();
     };
     assert_eq!(append_op.unresolved_executable_ref_count, 0);
+    let mut item_refs = Vec::new();
+    compiled
+        .plan
+        .row_expressions
+        .visit_value_refs(append.item, &mut |value| item_refs.push(value.clone()))
+        .unwrap();
     for name in ["compiler", "target"] {
-        let field = append
-            .fields
-            .iter()
-            .find(|field| field.name == name)
-            .expect("payload-backed append field");
-        assert!(matches!(
-            &field.value_ref,
-            Some(ValueRef::SourcePayload {
+        assert!(append.fields.iter().any(|field| field.name == name));
+        assert!(item_refs.iter().any(|value| matches!(
+            value,
+            ValueRef::SourcePayload {
                 field: boon_plan::SourcePayloadField::Named(payload_name),
                 ..
-            }) if payload_name == name
-        ));
+            } if payload_name == name
+        )));
     }
 }
 
@@ -4900,17 +7705,11 @@ fn assert_distributed_endpoints_are_independently_routable(
             .unwrap();
         assert_eq!(caller.outbound_call_route(edge.call_site_id), Some(edge));
         assert_eq!(callee.inbound_call_route(edge.call_site_id), Some(edge));
-        assert!(
-            callee
-                .endpoint
-                .pure_function_exports
-                .iter()
-                .any(|function| {
-                    function.export_id == edge.function_export_id
-                        && function.parameters == edge.parameters
-                        && function.result_type == edge.result_type
-                })
-        );
+        assert!(callee.endpoint.function_exports.iter().any(|function| {
+            function.export_id == edge.function_export_id
+                && function.parameters == edge.parameters
+                && function.result_type == edge.result_type
+        }));
     }
 }
 
@@ -5013,8 +7812,8 @@ FUNCTION add(value) {
         .find(|endpoint| endpoint.role == ProgramRole::Server)
         .unwrap();
     assert_eq!(server.value_exports.len(), 1);
-    assert_eq!(server.pure_function_exports.len(), 1);
-    assert_eq!(server.pure_function_exports[0].parameters.len(), 1);
+    assert_eq!(server.function_exports.len(), 1);
+    assert_eq!(server.function_exports[0].parameters.len(), 1);
 
     let session = compiled
         .graph
@@ -5024,7 +7823,7 @@ FUNCTION add(value) {
         .unwrap();
     assert_eq!(session.value_imports.len(), 1);
     assert_eq!(session.value_exports.len(), 1);
-    assert_eq!(session.pure_function_exports.len(), 1);
+    assert_eq!(session.function_exports.len(), 1);
     assert_eq!(session.remote_call_sites.len(), 1);
     let session_plan = &compiled.program(ProgramRole::Session).unwrap().plan;
     assert!(session_plan.regions.iter().flat_map(|region| &region.ops).any(|op| {
@@ -5040,10 +7839,16 @@ FUNCTION add(value) {
         .find(|endpoint| endpoint.role == ProgramRole::Client)
         .unwrap();
     assert_eq!(client.value_imports.len(), 1);
-    let [call] = client.remote_call_sites.as_slice() else {
+    let client_plan = &compiled.program(ProgramRole::Client).unwrap().plan;
+    let client_execution_endpoint = &client_plan
+        .distributed_endpoint
+        .as_ref()
+        .expect("client execution endpoint")
+        .endpoint;
+    let [call] = client_execution_endpoint.remote_call_sites.as_slice() else {
         panic!(
             "expected one remote call, got {:?}",
-            client.remote_call_sites
+            client_execution_endpoint.remote_call_sites
         );
     };
     let [argument] = call.arguments.as_slice() else {
@@ -5053,11 +7858,13 @@ FUNCTION add(value) {
         );
     };
     assert!(
-        matches!(argument.value, PlanRowExpression::NumberInfix { .. }),
+        matches!(
+            row_node(&client_plan.row_expressions, argument.value),
+            PlanRowExpressionNode::NumberInfix { .. }
+        ),
         "remote argument was not preserved as a compound pure expression: {:?}",
         argument.value
     );
-    let client_plan = &compiled.program(ProgramRole::Client).unwrap().plan;
     let client_operation_imports = client_plan
         .regions
         .iter()
@@ -5072,7 +7879,7 @@ FUNCTION add(value) {
         .value_imports
         .iter()
         .map(|import| import.import_id)
-        .chain([call.result_import_id])
+        .chain(call.result.current_import_id())
         .collect::<BTreeSet<_>>();
     assert!(
         expected_client_imports.is_subset(&client_operation_imports),
@@ -5197,9 +8004,36 @@ FUNCTION double(value) {
         baseline_session.value_exports[0].value,
         changed_session.value_exports[0].value
     );
+    assert_eq!(
+        baseline_session.function_exports, changed_session.function_exports,
+        "function wire exports must remain signature-only"
+    );
+    let producer_expression = |compiled: &CompiledDistributedMachinePlans| {
+        let plan = &compiled.program(ProgramRole::Session).unwrap().plan;
+        let [instance] = plan.producer_function_instances.as_slice() else {
+            panic!("expected one producer function instance");
+        };
+        let ValueRef::Field(result) = instance.result else {
+            panic!("producer result must be an ordinary derived field");
+        };
+        plan.regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .find_map(|op| {
+                if op.output != Some(ValueRef::Field(result)) {
+                    return None;
+                }
+                match &op.kind {
+                    PlanOpKind::DerivedValue { expression, .. } => expression.clone(),
+                    _ => None,
+                }
+            })
+            .expect("producer result computation")
+    };
     assert_ne!(
-        baseline_session.pure_function_exports[0].body,
-        changed_session.pure_function_exports[0].body
+        producer_expression(&baseline),
+        producer_expression(&changed_locals),
+        "function implementation must live in the producer machine graph"
     );
 }
 
@@ -5243,23 +8077,138 @@ fn distributed_compiler_wire_hash_changes_with_type_and_edge() {
 }
 
 #[test]
-fn distributed_compiler_rejects_dependencies_in_the_wrong_role_direction() {
-    let error = compile_distributed_compiler_test_bundle(
+fn distributed_compiler_accepts_every_adjacent_value_and_call_direction() {
+    let compiled = compile_distributed_compiler_test_bundle(
         &format!(
-            "server_count: Server/store.count\n{}",
+            r#"
+store: [
+    local_value: 1
+    session_value: Session/store.local_value
+    session_call: Session/identity(value: local_value)
+]
+
+FUNCTION identity(value) {{
+    value
+}}
+
+{}
+"#,
             DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
         ),
-        "outputs: [\n    count: 1\n]\n",
-        "store: [\n    count: 1\n]\n",
+        r#"
+store: [
+    local_value: 2
+    client_value: Client/store.local_value
+    client_call: Client/identity(value: local_value)
+    server_value: Server/store.local_value
+    server_call: Server/identity(value: local_value)
+]
+
+FUNCTION identity(value) {
+    value
+}
+"#,
+        r#"
+store: [
+    local_value: 3
+    session_value: Session/store.local_value
+    session_call: Session/identity(value: local_value)
+]
+
+FUNCTION identity(value) {
+    value
+}
+"#,
+    )
+    .unwrap();
+
+    let expected_routes = BTreeSet::from([
+        (ProgramRole::Client, ProgramRole::Session),
+        (ProgramRole::Session, ProgramRole::Client),
+        (ProgramRole::Session, ProgramRole::Server),
+        (ProgramRole::Server, ProgramRole::Session),
+    ]);
+    let value_routes = compiled
+        .graph
+        .wire_schema
+        .value_edges
+        .iter()
+        .map(|edge| (edge.consumer_role, edge.producer_role))
+        .collect::<BTreeSet<_>>();
+    let call_routes = compiled
+        .graph
+        .wire_schema
+        .call_edges
+        .iter()
+        .map(|edge| (edge.caller_role, edge.callee_role))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(value_routes, expected_routes);
+    assert_eq!(call_routes, expected_routes);
+}
+
+#[test]
+fn distributed_compiler_rejects_both_direct_role_directions_for_values_and_calls() {
+    let client_document =
+        |body: &str| format!("{body}\n{DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT}");
+    let cases = [
+        (
+            "Client value read from Server",
+            client_document("store: [\n    forbidden: Server/store.value\n]"),
+            "store: [\n    ready: True\n]\n".to_owned(),
+            "store: [\n    value: 1\n]\n".to_owned(),
+            "Client cannot depend directly on Server",
+        ),
+        (
+            "Server value read from Client",
+            client_document("store: [\n    value: 1\n]"),
+            "store: [\n    ready: True\n]\n".to_owned(),
+            "store: [\n    forbidden: Client/store.value\n]\n".to_owned(),
+            "Server cannot depend directly on Client",
+        ),
+        (
+            "Client call into Server",
+            client_document("store: [\n    forbidden: Server/identity(value: 1)\n]"),
+            "store: [\n    ready: True\n]\n".to_owned(),
+            "FUNCTION identity(value) { value }\n".to_owned(),
+            "Client cannot depend directly on Server",
+        ),
+        (
+            "Server call into Client",
+            client_document("FUNCTION identity(value) { value }"),
+            "store: [\n    ready: True\n]\n".to_owned(),
+            "store: [\n    forbidden: Client/identity(value: 1)\n]\n".to_owned(),
+            "Server cannot depend directly on Client",
+        ),
+    ];
+
+    for (label, client, session, server, expected) in cases {
+        let error =
+            compile_distributed_compiler_test_bundle(&client, &session, &server).expect_err(label);
+        let message = error.to_string();
+        assert!(
+            message.contains(expected) && message.contains("route the value through Session"),
+            "unexpected {label} diagnostic: {message}"
+        );
+        assert!(
+            !message.contains("/call:") && !message.contains("/function:"),
+            "{label} diagnostic exposed digest identity: {message}"
+        );
+    }
+}
+
+#[test]
+fn distributed_compiler_propagates_obsolete_dotted_role_syntax_diagnostic() {
+    let error = compile_distributed_compiler_test_bundle(
+        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+        "store: [\n    forbidden: Client.foo\n]\n",
+        "store: [\n    ready: True\n]\n",
     )
     .unwrap_err();
     let message = error.to_string();
     assert!(
-        message.contains("Client cannot depend directly on Server")
-            && (message.contains("direction")
-                || message.contains("cannot depend")
-                || message.contains("route the value through Session")),
-        "unexpected error: {message}"
+        message
+            .contains("qualified role values use `Client/value.field`, not `Client.value.field`"),
+        "unexpected dotted-role diagnostic: {message}"
     );
 }
 
@@ -5342,7 +8291,7 @@ store: [
         .find(|endpoint| endpoint.role == ProgramRole::Session)
         .unwrap();
     assert_eq!(session.value_exports.len(), 1);
-    assert_eq!(session.pure_function_exports.len(), 1);
+    assert_eq!(session.function_exports.len(), 1);
 }
 
 #[test]
@@ -5418,31 +8367,115 @@ store: [
 
 #[test]
 fn distributed_compiler_rejects_session_info_captured_by_global_server_state() {
-    let error = compile_distributed_compiler_test_bundle(
-        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
-        r#"
+    for intrinsic in ["status", "principal"] {
+        let server = format!(
+            r#"
 store: [
     seed: 1
     saved: Server/store.saved
 ]
 "#,
-        r#"
+        );
+        let global_state = format!(
+            r#"
 store: [
     session_seed: Session/store.seed
     saved:
-        SessionInfo/principal() |> HOLD saved {
-            LATEST {}
-        }
+        SessionInfo/{intrinsic}() |> HOLD saved {{
+            LATEST {{}}
+        }}
 ]
 "#,
-    )
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("outside an active Session scope"),
-        "unexpected error: {error}"
-    );
+        );
+        let error = compile_distributed_compiler_test_bundle(
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+            &server,
+            &global_state,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside an active Session scope"),
+            "unexpected {intrinsic} error: {error}"
+        );
+    }
+}
+
+#[test]
+fn distributed_compiler_accepts_server_session_info_in_origin_scoped_call_branch() {
+    for intrinsic in ["status", "principal"] {
+        let session = format!(
+            r#"
+store: [
+    info: Server/session_info(seed: 1)
+]
+"#,
+        );
+        let server = format!(
+            r#"
+store: [
+    ready: True
+]
+
+FUNCTION session_info(seed) {{
+    seed |> WHILE {{
+        1 => SessionInfo/{intrinsic}()
+        __ => SessionInfo/{intrinsic}()
+    }}
+}}
+"#,
+        );
+        let compiled = compile_distributed_compiler_test_bundle(
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+            &session,
+            &server,
+        )
+        .unwrap();
+
+        let session_endpoint = compiled
+            .graph
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.role == ProgramRole::Session)
+            .unwrap();
+        let [call] = session_endpoint.remote_call_sites.as_slice() else {
+            panic!(
+                "expected one Session-origin Server call, got {:#?}",
+                session_endpoint.remote_call_sites
+            );
+        };
+        assert_eq!(call.scope, DistributedRouteScopePlan::OriginScoped);
+        assert!(compiled.graph.wire_schema.call_edges.iter().any(|edge| {
+            edge.call_site_id == call.call_site_id
+                && edge.scope == DistributedRouteScopePlan::OriginScoped
+                && edge.caller_role == ProgramRole::Session
+                && edge.callee_role == ProgramRole::Server
+        }));
+
+        let server_plan = &compiled.program(ProgramRole::Server).unwrap().plan;
+        assert!(
+            server_plan
+                .regions
+                .iter()
+                .flat_map(|region| &region.ops)
+                .any(|op| {
+                    let PlanOpKind::DerivedValue {
+                        expression: Some(expression),
+                        ..
+                    } = &op.kind
+                    else {
+                        return false;
+                    };
+                    let mut found = false;
+                    expression
+                        .visit_intrinsics(&server_plan.row_expressions, &mut |_| found = true)
+                        .unwrap();
+                    found
+                }),
+            "Server plan lost SessionInfo/{intrinsic}()"
+        );
+    }
 }
 
 #[test]
@@ -5543,6 +8576,148 @@ fn distributed_compiler_rejects_grounded_combinational_cycles() {
 }
 
 #[test]
+fn distributed_compiler_rejects_immediate_non_continuous_cycles() {
+    let error = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    left:
+        Session/store.right |> THEN {{ 1 }}
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    right:
+        Client/store.left |> THEN { 1 }
+]
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("distributed combinational cycle")
+            && message.contains("Client/store.left")
+            && message.contains("Session/store.right"),
+        "unexpected immediate event-flow cycle diagnostic: {message}"
+    );
+}
+
+#[test]
+fn distributed_compiler_rejects_current_call_only_cycles() {
+    let error = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    left: Session/from_client(value: 1)
+]
+
+FUNCTION from_session(value) {{
+    store.left + value
+}}
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    right: Client/from_session(value: 1)
+]
+
+FUNCTION from_client(value) {
+    store.right + value
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("distributed combinational cycle")
+            && message.contains("SOURCE, HOLD, or asynchronous effect")
+            && message.contains("Client/store.left")
+            && message.contains("Session/store.right")
+            && message.contains("Client/from_session")
+            && message.contains("Session/from_client")
+            && !message.contains("/call:")
+            && !message.contains("/function:"),
+        "unexpected current-call cycle diagnostic: {message}"
+    );
+}
+
+#[test]
+fn distributed_compiler_rejects_mixed_value_and_current_call_cycles() {
+    let error = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    left: Session/identity(value: Session/store.right + 1)
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    right: Client/store.left + 1
+]
+
+FUNCTION identity(value) {
+    value
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("distributed combinational cycle")
+            && message.contains("Client/store.left")
+            && message.contains("Session/store.right"),
+        "unexpected mixed distributed cycle diagnostic: {message}"
+    );
+}
+
+#[test]
+fn distributed_compiler_treats_invocation_calls_as_temporal_cycle_boundaries() {
+    compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    invoke: SOURCE
+    left:
+        0 |> HOLD left {{
+            invoke |> THEN {{
+                Session/identity(value: Session/store.right + 1)
+            }}
+        }}
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    right: Client/store.left + 1
+]
+
+FUNCTION identity(value) {
+    value
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+}
+
+#[test]
 fn distributed_compiler_accepts_a_cycle_broken_by_source_and_hold() {
     compile_distributed_compiler_test_bundle(
         &format!(
@@ -5590,11 +8765,446 @@ FUNCTION identity(value) {
         .iter()
         .find(|endpoint| endpoint.role == ProgramRole::Session)
         .unwrap();
-    let [identity] = session.pure_function_exports.as_slice() else {
+    let [identity] = session.function_exports.as_slice() else {
         panic!("expected one identity export");
     };
     assert_eq!(identity.parameters[0].data_type, DataTypePlan::Number);
     assert_eq!(identity.result_type, DataTypePlan::Number);
+}
+
+#[test]
+fn distributed_compiler_assigns_current_and_invocation_modes_per_call_site() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    invoke: SOURCE
+    current: Session/identity(value: 5)
+    invoked:
+        invoke |> THEN {{ Session/identity(value: 5) }}
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    ready: True
+]
+
+FUNCTION identity(value) {
+    value
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+
+    let client = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Client)
+        .unwrap();
+    assert_eq!(client.remote_call_sites.len(), 2);
+    let current = client
+        .remote_call_sites
+        .iter()
+        .find(|call| call.mode == boon_plan::DistributedCallMode::Current)
+        .expect("one current call site");
+    assert!(current.invocation_arms.is_empty());
+    let invocation = client
+        .remote_call_sites
+        .iter()
+        .find(|call| call.mode == boon_plan::DistributedCallMode::Invocation)
+        .expect("one invocation call site");
+    assert_eq!(invocation.invocation_arms.len(), 1);
+    assert!(matches!(
+        invocation.invocation_arms[0].trigger,
+        ValueRef::Source(_)
+    ));
+
+    let session_plan = &compiled.program(ProgramRole::Session).unwrap().plan;
+    assert_eq!(session_plan.producer_function_instances.len(), 2);
+    let current_instance = session_plan
+        .producer_function_instances
+        .iter()
+        .find(|instance| instance.mode == boon_plan::DistributedCallMode::Current)
+        .expect("one current producer instance");
+    assert_eq!(current_instance.call_site_id, current.call_site_id);
+    assert!(current_instance.invocation_source.is_none());
+    let invocation_instance = session_plan
+        .producer_function_instances
+        .iter()
+        .find(|instance| instance.mode == boon_plan::DistributedCallMode::Invocation)
+        .expect("one invocation producer instance");
+    assert_eq!(invocation_instance.call_site_id, invocation.call_site_id);
+    assert!(matches!(
+        invocation_instance.invocation_source,
+        Some(source) if invocation_instance.ownership.sources.contains(&source)
+    ));
+}
+
+#[test]
+fn distributed_compiler_keeps_hold_backed_remote_call_current() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    increment: SOURCE
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    increment: Client/store.increment
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+    doubled: Server/double(value: count)
+]
+"#,
+        r#"
+store: [ready: True]
+
+FUNCTION double(value) {
+    value * 2
+}
+"#,
+    )
+    .unwrap();
+
+    let session = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    let [call] = session.remote_call_sites.as_slice() else {
+        panic!("expected one Session-to-Server call")
+    };
+    assert_eq!(call.mode, boon_plan::DistributedCallMode::Current);
+    assert!(call.invocation_arms.is_empty());
+}
+
+#[test]
+fn distributed_compiler_expands_qualified_calls_through_reusable_functions() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    first: remote_add(value: 5)
+    second: outer(value: 8)
+]
+
+FUNCTION remote_add(value) {{
+    Session/add(value: value)
+}}
+
+FUNCTION outer(value) {{
+    remote_add(value: value)
+}}
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    ready: True
+]
+
+FUNCTION add(value) {
+    value + 1
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+
+    let client = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Client)
+        .unwrap();
+    assert_eq!(client.remote_call_sites.len(), 2);
+    assert_ne!(
+        client.remote_call_sites[0].call_site_id,
+        client.remote_call_sites[1].call_site_id
+    );
+    assert_ne!(
+        client.remote_call_sites[0].result.current_import_id(),
+        client.remote_call_sites[1].result.current_import_id()
+    );
+    let session_plan = &compiled.program(ProgramRole::Session).unwrap().plan;
+    let [first, second] = session_plan.producer_function_instances.as_slice() else {
+        panic!(
+            "expected two producer instances, got {:?}",
+            session_plan.producer_function_instances
+        );
+    };
+    assert_eq!(first.function_export_id, second.function_export_id);
+    assert_ne!(first.call_site_id, second.call_site_id);
+    assert_ne!(first.owner, second.owner);
+    assert_ne!(first.result, second.result);
+    assert_ne!(first.arguments[0].import_id, second.arguments[0].import_id);
+    macro_rules! assert_disjoint_ownership {
+        ($field:ident) => {
+            assert!(
+                first
+                    .ownership
+                    .$field
+                    .iter()
+                    .all(|id| !second.ownership.$field.contains(id))
+            );
+        };
+    }
+    assert_disjoint_ownership!(static_owners);
+    assert_disjoint_ownership!(sources);
+    assert_disjoint_ownership!(states);
+    assert_disjoint_ownership!(fields);
+    assert_disjoint_ownership!(lists);
+    assert_disjoint_ownership!(indexes);
+    assert_disjoint_ownership!(effects);
+    assert_eq!(
+        first.ownership.static_owners.first(),
+        Some(&first.owner.static_owner)
+    );
+    assert_eq!(
+        second.ownership.static_owners.first(),
+        Some(&second.owner.static_owner)
+    );
+    assert!(
+        matches!(first.result, ValueRef::Field(field) if first.ownership.fields.contains(&field))
+    );
+    assert!(
+        matches!(second.result, ValueRef::Field(field) if second.ownership.fields.contains(&field))
+    );
+}
+
+#[test]
+fn distributed_compiler_binds_hold_backed_producer_resources_before_plan_verification() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            "store: [\n    invoke: SOURCE\n    remembered:\n        invoke |> THEN {{ Session/remember(value: 5) }}\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    ready: True
+]
+
+FUNCTION remember(value) {
+    value |> HOLD current { LATEST {} }
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+
+    let session_plan = &compiled.program(ProgramRole::Session).unwrap().plan;
+    let [instance] = session_plan.producer_function_instances.as_slice() else {
+        panic!(
+            "expected one producer instance, got {:?}",
+            session_plan.producer_function_instances
+        );
+    };
+    assert_eq!(instance.mode, boon_plan::DistributedCallMode::Invocation);
+    assert!(matches!(
+        instance.invocation_source,
+        Some(source) if instance.ownership.sources.contains(&source)
+    ));
+    assert!(!instance.ownership.states.is_empty());
+    assert!(
+        matches!(instance.result, ValueRef::Field(field) if instance.ownership.fields.contains(&field))
+    );
+    let verification = verify_plan(session_plan).unwrap();
+    assert_eq!(verification.error_count, 0, "{verification:#?}");
+    assert!(verification.checks.iter().all(|check| check.pass));
+}
+
+#[test]
+fn distributed_compiler_rejects_durable_effect_owned_by_process_local_producer() {
+    let error = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    register: SOURCE
+    registration:
+        register |> THEN {{ Session/register() }}
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    ready: True
+]
+
+FUNCTION register() {
+    trigger: SOURCE
+    RegistrationNotRequested |> HOLD registration {
+        trigger |> THEN {
+            DevelopmentPasskey/register(
+                workspace_id: TEXT { workspace-1 }
+                workspace_grant_id: TEXT { grant-1 }
+                account_id: TEXT { account-1 }
+                credential_count: 1
+                simulation: Success
+            )
+        }
+    }
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("distributed producer function")
+            && message.contains("durable idempotent outbox effect")
+            && message.contains("DevelopmentPasskey/register")
+            && message.contains("process-local"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn distributed_compiler_allows_read_only_effect_owned_by_process_local_producer() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    refresh: SOURCE
+    reading:
+        refresh |> THEN {{ Session/read_clock() }}
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    ready: True
+]
+
+FUNCTION read_clock() {
+    trigger: SOURCE
+    ClockNotRead |> HOLD reading {
+        trigger |> THEN { Clock/wall() }
+    }
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+
+    let plan = &compiled.program(ProgramRole::Session).unwrap().plan;
+    let [instance] = plan.producer_function_instances.as_slice() else {
+        panic!("expected one producer instance");
+    };
+    let [invocation_id] = instance.ownership.effects.as_slice() else {
+        panic!("expected one producer-owned effect");
+    };
+    let invocation = plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::StateUpdate {
+                effect: Some(effect),
+                ..
+            } if effect.invocation_id == *invocation_id => Some(effect),
+            _ => None,
+        })
+        .expect("owned effect invocation");
+    let contract = plan
+        .effects
+        .iter()
+        .find(|contract| contract.effect_id == invocation.effect_id)
+        .expect("owned effect contract");
+    assert_eq!(contract.host_operation, "Clock/wall");
+    assert_eq!(contract.replay, EffectReplay::ReadOnly);
+    assert!(plan.persistence.effect_outbox.is_empty());
+}
+
+#[test]
+fn producer_effect_policy_allows_process_scoped_contract_for_process_local_owner() {
+    let write = compile_fixture_source_text_to_machine_plan(
+        "process-scoped-producer-policy.bn",
+        include_str!("../../../examples/bytes_file_write_effect.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let invocation_id = write
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::StateUpdate {
+                effect: Some(effect),
+                ..
+            } => Some(effect.invocation_id),
+            _ => None,
+        })
+        .expect("process-scoped effect invocation");
+    let contract = write
+        .plan
+        .effects
+        .iter()
+        .find(|contract| contract.host_operation == "File/write_bytes")
+        .expect("process-scoped effect contract");
+    assert_eq!(contract.replay, EffectReplay::ProcessScoped);
+    assert!(write.plan.persistence.effect_outbox.is_empty());
+
+    let distributed = compile_distributed_compiler_test_bundle(
+        &format!(
+            r#"
+store: [
+    invoke: SOURCE
+    result:
+        invoke |> THEN {{ Session/identity(value: 7) }}
+]
+
+{}
+"#,
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [
+    ready: True
+]
+
+FUNCTION identity(value) {
+    value
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap();
+    let plan = &distributed.program(ProgramRole::Session).unwrap().plan;
+    let [instance] = plan.producer_function_instances.as_slice() else {
+        panic!("expected one producer instance");
+    };
+    let mut instance = instance.clone();
+    instance.ownership.effects = vec![invocation_id];
+    super::machine_plan_backend::validate_producer_function_effect_ownership(
+        &[instance],
+        &write.plan.regions,
+        &write.plan.effects,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -5649,10 +9259,10 @@ store: [
 }
 
 #[test]
-fn distributed_compiler_rejects_effectful_function_exports() {
+fn distributed_compiler_rejects_an_effectful_call_without_an_exact_trigger() {
     let error = compile_distributed_compiler_test_bundle(
         DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
-        "result: Server/logged(value: 1)\noutputs: [\n    ready: True\n]\n",
+        "result: Server/logged(value: TEXT { one })\noutputs: [\n    ready: True\n]\n",
         r#"
 outputs: [
     ready: True
@@ -5666,19 +9276,18 @@ FUNCTION logged(value) {
     .unwrap_err();
     let message = error.to_string();
     assert!(
-        message.contains("Server/logged")
-            || message.contains("distributed function `logged`")
-            || message.contains("pure"),
+        message.contains("distributed call `Server/logged`")
+            && message.contains("no exact SOURCE or state trigger"),
         "unexpected error: {message}"
     );
 }
 
 #[test]
-fn distributed_compiler_rejects_remote_calls_inside_list_rows() {
+fn distributed_compiler_preserves_row_owned_remote_call_inputs() {
     let client = format!(
         r#"
 store: [
-    items: LIST {{ [value: 1] }}
+    items: LIST {{ [value: 1], [value: 2] }}
     rows:
         items
         |> List/map(item, new: decorate(item: item))
@@ -5692,7 +9301,7 @@ FUNCTION decorate(item) {{
 "#,
         DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
     );
-    let error = compile_distributed_compiler_test_bundle(
+    let compiled = compile_distributed_compiler_test_bundle(
         &client,
         r#"
 outputs: [
@@ -5705,14 +9314,50 @@ FUNCTION add(value) {
 "#,
         "outputs: [\n    ready: True\n]\n",
     )
-    .unwrap_err();
-    let message = error.to_string();
+    .unwrap();
+    let client_plan = &compiled.program(ProgramRole::Client).unwrap().plan;
+    let client = &client_plan
+        .distributed_endpoint
+        .as_ref()
+        .expect("client execution endpoint")
+        .endpoint;
+    let [call] = client.remote_call_sites.as_slice() else {
+        panic!(
+            "expected one row-owned call site, got {:#?}",
+            client.remote_call_sites
+        );
+    };
+    assert_eq!(call.mode, boon_plan::DistributedCallMode::Current);
+    assert_eq!(call.scope, DistributedRouteScopePlan::SessionLocal);
+    let [argument] = call.arguments.as_slice() else {
+        panic!(
+            "expected one row-owned call argument, got {:#?}",
+            call.arguments
+        );
+    };
+    let mut row_fields = Vec::new();
+    client_plan
+        .row_expressions
+        .visit_list_fields(argument.value, &mut |list, field| {
+            row_fields.push((list, field))
+        })
+        .unwrap();
+    assert_eq!(
+        row_fields.len(),
+        1,
+        "row identity was erased from the remote argument: {:?}",
+        argument.value
+    );
+    let mut inputs = Vec::new();
+    client_plan
+        .row_expressions
+        .visit_inputs(argument.value, &mut |input| inputs.push(input))
+        .unwrap();
     assert!(
-        message.contains("non-indexed root value")
-            || message.contains("scheduled call-site identity")
-            || message.contains("reusable functions")
-            || (message.contains("qualified external expression")
-                && message.contains("no checked type")),
-        "unexpected error: {message}"
+        inputs
+            .iter()
+            .any(|input| matches!(input, ValueRef::List(_))),
+        "row-owned call argument did not retain its source-list dependency: {:?}",
+        argument.value
     );
 }

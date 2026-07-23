@@ -4,12 +4,13 @@ use boon_host_runtime::{
 };
 use boon_plan::{ApplicationIdentity, ProgramRole};
 use boon_runtime::{
-    ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession, RuntimeSourceUnit,
-    SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
+    ProgramArtifact, ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession,
+    RuntimeSourceUnit, SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
@@ -34,19 +35,22 @@ outputs: [
 "#;
 
 fn program() -> ProgramSession {
-    let artifact = compile_program_artifact(&ProgramCompileRequest {
-        revision: 1,
-        entry_path: "file_read_stream.bn".to_owned(),
-        units: vec![RuntimeSourceUnit {
-            path: "file_read_stream.bn".to_owned(),
-            source: FILE_PROGRAM.to_owned(),
-        }],
-        application: ApplicationIdentity::new("dev.boon.file-read-stream", "test", "local"),
-        role: ProgramRole::Server,
-        capability_profile: ProgramCapabilityProfile::TrustedServer,
-    })
-    .unwrap();
-    ProgramSession::start(artifact).unwrap()
+    static ARTIFACT: OnceLock<ProgramArtifact> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| {
+        compile_program_artifact(&ProgramCompileRequest {
+            revision: 1,
+            entry_path: "file_read_stream.bn".to_owned(),
+            units: vec![RuntimeSourceUnit {
+                path: "file_read_stream.bn".to_owned(),
+                source: FILE_PROGRAM.to_owned(),
+            }],
+            application: ApplicationIdentity::new("dev.boon.file-read-stream", "test", "local"),
+            role: ProgramRole::Server,
+            capability_profile: ProgramCapabilityProfile::TrustedServer,
+        })
+        .unwrap()
+    });
+    ProgramSession::start(artifact.clone()).unwrap()
 }
 
 #[tokio::test]

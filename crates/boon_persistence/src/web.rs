@@ -6,14 +6,14 @@ use super::codec::{
 };
 #[cfg(target_arch = "wasm32")]
 use super::codec::{
-    decode_blob_record, decode_outbox_record, decode_protocol_state_record,
-    encode_protocol_state_record, row_component_blob_references, scalar_component_blob_references,
+    decode_blob_record, decode_outbox_record, row_component_blob_references,
+    scalar_component_blob_references,
 };
 use super::{
     ActivationBatch, CheckpointBatch, ContentArtifact, ContentArtifactBinding, ContentArtifactId,
     ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
-    DurableChange, DurableOutboxChange, OutboxItemId, PersistenceResult, ProtocolStateKey,
-    RestoreImage, StoreError, StoredRow, encode_restore_image, validate_content_artifact,
+    DurableChange, DurableOutboxChange, OutboxItemId, PersistenceResult, RestoreImage, StoreError,
+    StoredRow, encode_restore_image, validate_content_artifact,
 };
 use boon_plan::{ApplicationIdentity, MemoryId, MigrationEdgeId};
 use minicbor::{Decoder, Encoder};
@@ -25,14 +25,13 @@ use std::fmt;
 #[cfg(target_arch = "wasm32")]
 use super::{
     ActivationAck, ApplicationTransfer, BarrierAck, BarrierRequest, CommitAck, CompactAck,
-    CompactRequest, DurableContentArtifactChange, DurableProtocolStateChange,
-    ExportApplicationRequest, InspectRequest, LoadContentArtifactRequest, PersistenceCommand,
-    PersistenceInspectorSnapshot, ProtocolStateSnapshot, PutContentArtifactAck,
-    PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreRequest,
-    ShutdownAck, StoredList, apply_durable_content_artifact_changes,
-    apply_durable_protocol_state_changes, exact_content_artifact_closure,
-    inspector_snapshot_with_artifacts, validate_application_transfer,
-    validate_content_artifact_manifest, validate_content_artifact_storage, validate_protocol_state,
+    CompactRequest, DurableContentArtifactChange, ExportApplicationRequest, InspectRequest,
+    LoadContentArtifactRequest, PersistenceCommand, PersistenceInspectorSnapshot,
+    PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch,
+    RestoreRequest, ShutdownAck, StoredList, apply_durable_content_artifact_changes,
+    exact_content_artifact_closure, inspector_snapshot_with_artifacts,
+    validate_application_transfer, validate_content_artifact_manifest,
+    validate_content_artifact_storage,
 };
 #[cfg(target_arch = "wasm32")]
 use futures::channel::{mpsc, oneshot};
@@ -55,13 +54,18 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{DomException, StorageManager, WorkerGlobalScope};
 
-const DATABASE_VERSION: u32 = 3;
-const COMPONENT_FORMAT: u32 = 1;
+const DATABASE_VERSION: u32 = 4;
+const COMPONENT_FORMAT: u32 = 3;
 const MAX_CHECKPOINT_RECORDS_PER_APPLICATION: usize = 64;
 const DEFAULT_UPGRADE_TIMEOUT_MS: u32 = 15_000;
 const STORAGE_STATUS_TIMEOUT_MS: u32 = 2_000;
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 64;
 const MAX_COMMAND_QUEUE_CAPACITY: usize = 4_096;
+const DEFAULT_OUTSTANDING_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_OUTSTANDING_CHANGE_COUNT: usize = 262_144;
+const MAX_OUTSTANDING_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+const MAX_OUTSTANDING_CHANGE_COUNT: usize = 4_194_304;
+const RESTORE_RECORDS_PER_SLICE: usize = 128;
 const MAX_STATUS_DETAIL_BYTES: usize = 1_024;
 const HEX_PREFIX_UPPER_SENTINEL: char = 'g';
 
@@ -72,12 +76,11 @@ const ROWS: &str = "rows";
 const CHECKPOINTS: &str = "checkpoints";
 const MIGRATIONS: &str = "migrations";
 const OUTBOX: &str = "outbox";
-const PROTOCOL_STATE: &str = "protocol_state";
 const BLOBS: &str = "blobs";
 const ARTIFACTS: &str = "artifacts";
 const ARTIFACT_OWNERS: &str = "artifact_owners";
 
-const STORE_NAMES: [&str; 11] = [
+const STORE_NAMES: [&str; 10] = [
     META,
     SLOTS,
     LISTS,
@@ -85,7 +88,6 @@ const STORE_NAMES: [&str; 11] = [
     CHECKPOINTS,
     MIGRATIONS,
     OUTBOX,
-    PROTOCOL_STATE,
     BLOBS,
     ARTIFACTS,
     ARTIFACT_OWNERS,
@@ -178,6 +180,18 @@ pub struct BrowserStorageStatus {
     pub missing_or_evicted: bool,
     pub last_operation_failure: Option<BrowserFailureKind>,
     pub last_status_detail: Option<String>,
+    #[serde(default)]
+    pub restore_record_count: u64,
+    #[serde(default)]
+    pub restore_slice_count: u64,
+    #[serde(default)]
+    pub restore_yield_count: u64,
+    #[serde(default)]
+    pub restore_max_slice_records: u64,
+    #[serde(default)]
+    pub restore_max_slice_bytes: u64,
+    #[serde(default)]
+    pub restore_max_slice_us: u64,
 }
 
 impl BrowserStorageStatus {
@@ -199,7 +213,6 @@ impl BrowserStorageStatus {
         self.missing_or_evicted = matches!(
             result,
             PersistenceResult::Loaded(Ok(None))
-                | PersistenceResult::ProtocolStateLoaded(Err(StoreError::MissingApplication))
                 | PersistenceResult::Committed(Err(StoreError::MissingApplication))
                 | PersistenceResult::Activated(Err(StoreError::MissingApplication))
                 | PersistenceResult::ApplicationReset(Err(StoreError::MissingApplication))
@@ -219,6 +232,16 @@ impl BrowserStorageStatus {
             self.last_status_detail = None;
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn record_restore_metrics(&mut self, metrics: BrowserRestoreMetrics) {
+        self.restore_record_count = metrics.record_count;
+        self.restore_slice_count = metrics.slice_count;
+        self.restore_yield_count = metrics.yield_count;
+        self.restore_max_slice_records = metrics.max_slice_records;
+        self.restore_max_slice_bytes = metrics.max_slice_bytes;
+        self.restore_max_slice_us = metrics.max_slice_us;
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -230,10 +253,122 @@ impl BrowserStorageStatus {
 pub struct RexieDriver {
     sender: mpsc::Sender<CoordinatorRequest>,
     limits: std::rc::Rc<std::cell::Cell<DecodeLimits>>,
+    driver_id: u64,
+    next_operation_id: u64,
+    outstanding: BTreeMap<u64, TrackedBrowserPersistenceOperation>,
+    outstanding_payload_bytes: usize,
+    outstanding_change_count: usize,
     queue_capacity: usize,
+    max_outstanding_payload_bytes: usize,
+    max_outstanding_change_count: usize,
     closed: bool,
     storage_status: BrowserStorageStatus,
     _local: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrowserPersistenceOperation {
+    driver_id: u64,
+    operation_id: u64,
+    kind: CoordinatorResultKind,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct TrackedBrowserPersistenceOperation {
+    kind: CoordinatorResultKind,
+    response: oneshot::Receiver<CoordinatorResponse>,
+    cost: BrowserPersistenceAdmissionCost,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl TrackedBrowserPersistenceOperation {
+    const fn kind(&self) -> CoordinatorResultKind {
+        self.kind
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserPersistenceEnqueueError {
+    Backpressure,
+    Closed,
+    CrossDriver,
+    UnknownOperation,
+    PayloadTooLarge {
+        payload_bytes: usize,
+        max_payload_bytes: usize,
+    },
+    ChangeCountTooLarge {
+        change_count: usize,
+        max_change_count: usize,
+    },
+    PayloadBackpressure {
+        payload_bytes: usize,
+        outstanding_payload_bytes: usize,
+        max_payload_bytes: usize,
+    },
+    ChangeBackpressure {
+        change_count: usize,
+        outstanding_change_count: usize,
+        max_change_count: usize,
+    },
+}
+
+#[cfg(target_arch = "wasm32")]
+impl fmt::Display for BrowserPersistenceEnqueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backpressure => formatter.write_str("browser persistence queue is full"),
+            Self::Closed => formatter.write_str("browser persistence worker is closed"),
+            Self::CrossDriver => {
+                formatter.write_str("browser persistence operation belongs to a different driver")
+            }
+            Self::UnknownOperation => {
+                formatter.write_str("browser persistence operation is no longer outstanding")
+            }
+            Self::PayloadTooLarge {
+                payload_bytes,
+                max_payload_bytes,
+            } => write!(
+                formatter,
+                "browser persistence command retains {payload_bytes} payload bytes, limit is {max_payload_bytes}"
+            ),
+            Self::ChangeCountTooLarge {
+                change_count,
+                max_change_count,
+            } => write!(
+                formatter,
+                "browser persistence command contains {change_count} changes, limit is {max_change_count}"
+            ),
+            Self::PayloadBackpressure {
+                payload_bytes,
+                outstanding_payload_bytes,
+                max_payload_bytes,
+            } => write!(
+                formatter,
+                "browser persistence command retains {payload_bytes} payload bytes with {outstanding_payload_bytes} already outstanding, limit is {max_payload_bytes}"
+            ),
+            Self::ChangeBackpressure {
+                change_count,
+                outstanding_change_count,
+                max_change_count,
+            } => write!(
+                formatter,
+                "browser persistence command contains {change_count} changes with {outstanding_change_count} already outstanding, limit is {max_change_count}"
+            ),
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::error::Error for BrowserPersistenceEnqueueError {}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BrowserPersistenceAdmissionCost {
+    payload_bytes: usize,
+    change_count: usize,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -278,11 +413,19 @@ struct RowRef {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ListRowRef {
+    row: RowRef,
+    source_order_token: u128,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ListRecord {
     touched: bool,
+    revision: u64,
     next_key: u64,
-    rows: Vec<RowRef>,
+    next_order_token: u128,
+    rows: Vec<ListRowRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -321,9 +464,6 @@ impl SparseTransactionPlan {
         }
         if !batch.outbox_changes.is_empty() {
             plan.stores.insert(OUTBOX);
-        }
-        if !batch.protocol_state_changes.is_empty() {
-            plan.stores.insert(PROTOCOL_STATE);
         }
         if !batch.content_artifact_changes.is_empty() {
             plan.stores.extend([ARTIFACTS, ARTIFACT_OWNERS]);
@@ -444,18 +584,23 @@ fn encode_list_record(list: &ListRecord) -> Result<Vec<u8>, ComponentCodecError>
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
     encoder
-        .array(4)
+        .array(6)
         .and_then(|encoder| encoder.u32(COMPONENT_FORMAT))
         .and_then(|encoder| encoder.bool(list.touched))
+        .and_then(|encoder| encoder.u64(list.revision))
         .and_then(|encoder| encoder.u64(list.next_key))
-        .and_then(|encoder| encoder.array(list.rows.len() as u64))
+        .map_err(encode_error)?;
+    encode_u128(&mut encoder, list.next_order_token)?;
+    encoder
+        .array(list.rows.len() as u64)
         .map_err(encode_error)?;
     for row in &list.rows {
         encoder
-            .array(2)
-            .and_then(|encoder| encoder.u64(row.key))
-            .and_then(|encoder| encoder.u64(row.generation))
+            .array(3)
+            .and_then(|encoder| encoder.u64(row.row.key))
+            .and_then(|encoder| encoder.u64(row.row.generation))
             .map_err(encode_error)?;
+        encode_u128(&mut encoder, row.source_order_token)?;
     }
     Ok(bytes)
 }
@@ -466,23 +611,30 @@ fn decode_list_record(
 ) -> Result<ListRecord, ComponentCodecError> {
     component_size(bytes, limits, "list metadata")?;
     let mut decoder = Decoder::new(bytes);
-    expect_array(&mut decoder, 4, "list metadata")?;
+    expect_array(&mut decoder, 6, "list metadata")?;
     expect_format(&mut decoder, "list metadata")?;
     let touched = decoder.bool().map_err(decode_error)?;
+    let revision = decoder.u64().map_err(decode_error)?;
     let next_key = decoder.u64().map_err(decode_error)?;
+    let next_order_token = decode_u128(&mut decoder)?;
     let count = collection_len(&mut decoder, limits, "list row order", true)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
-        expect_array(&mut decoder, 2, "row identity")?;
-        rows.push(RowRef {
-            key: decoder.u64().map_err(decode_error)?,
-            generation: decoder.u64().map_err(decode_error)?,
+        expect_array(&mut decoder, 3, "row identity")?;
+        rows.push(ListRowRef {
+            row: RowRef {
+                key: decoder.u64().map_err(decode_error)?,
+                generation: decoder.u64().map_err(decode_error)?,
+            },
+            source_order_token: decode_u128(&mut decoder)?,
         });
     }
     reject_trailing(&decoder, bytes, "list metadata")?;
     let record = ListRecord {
         touched,
+        revision,
         next_key,
+        next_order_token,
         rows,
     };
     validate_list_record(&record)?;
@@ -605,6 +757,23 @@ fn decode_digest(decoder: &mut Decoder<'_>) -> Result<[u8; 32], ComponentCodecEr
         .map_err(|_| ComponentCodecError::new("digest must contain exactly 32 bytes"))
 }
 
+fn encode_u128(
+    encoder: &mut Encoder<&mut Vec<u8>>,
+    value: u128,
+) -> Result<(), ComponentCodecError> {
+    encoder.bytes(&value.to_be_bytes()).map_err(encode_error)?;
+    Ok(())
+}
+
+fn decode_u128(decoder: &mut Decoder<'_>) -> Result<u128, ComponentCodecError> {
+    let bytes: [u8; 16] = decoder
+        .bytes()
+        .map_err(decode_error)?
+        .try_into()
+        .map_err(|_| ComponentCodecError::new("u128 value must contain exactly 16 bytes"))?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
 fn decode_text(
     decoder: &mut Decoder<'_>,
     limits: DecodeLimits,
@@ -693,28 +862,65 @@ fn reject_trailing(
     Ok(())
 }
 
+fn advance_list_record_revision(
+    memory_id: MemoryId,
+    list: &mut ListRecord,
+    next_revision: u64,
+) -> Result<(), StoreError> {
+    if next_revision < list.revision {
+        return Err(StoreError::InvalidAuthority(format!(
+            "list {memory_id} revision moved backwards from {} to {next_revision}",
+            list.revision
+        )));
+    }
+    list.revision = next_revision;
+    Ok(())
+}
+
 fn validate_list_record(list: &ListRecord) -> Result<(), ComponentCodecError> {
-    let unique = list.rows.iter().copied().collect::<BTreeSet<_>>();
+    let unique = list
+        .rows
+        .iter()
+        .map(|row| (row.row.key, row.row.generation))
+        .collect::<BTreeSet<_>>();
     if unique.len() != list.rows.len() {
         return Err(ComponentCodecError::new(
             "list order repeats a row identity",
         ));
     }
-    if !list.touched && list.next_key != 0 {
+    if !list.touched
+        && (list.next_key != 0
+            || list.next_order_token != 0
+            || list.rows.iter().any(|row| row.source_order_token != 0))
+    {
         return Err(ComponentCodecError::new(
-            "sparse row overrides must not replace list allocator state",
+            "sparse row overrides must not replace list allocator or ordering state",
         ));
     }
     if list.touched {
         let minimum_next = list
             .rows
             .iter()
-            .fold(1u64, |next, row| next.max(row.key.saturating_add(1)));
+            .fold(1u64, |next, row| next.max(row.row.key.saturating_add(1)));
         if list.next_key < minimum_next {
             return Err(ComponentCodecError::new(format!(
                 "next key {} is below {}",
                 list.next_key, minimum_next
             )));
+        }
+        let mut previous = 0_u128;
+        for row in &list.rows {
+            if row.source_order_token == 0 || row.source_order_token <= previous {
+                return Err(ComponentCodecError::new(
+                    "list order has non-increasing source-order tokens",
+                ));
+            }
+            previous = row.source_order_token;
+        }
+        if list.next_order_token <= previous {
+            return Err(ComponentCodecError::new(
+                "next source-order token does not follow list rows",
+            ));
         }
     }
     Ok(())
@@ -820,14 +1026,6 @@ fn outbox_storage_key(application: &ApplicationIdentity, item_id: OutboxItemId) 
     )
 }
 
-fn protocol_state_storage_key(application: &ApplicationIdentity, key: ProtocolStateKey) -> String {
-    format!(
-        "{}{}",
-        application_storage_key(application),
-        encode_hex(key.as_bytes())
-    )
-}
-
 fn blob_storage_key(application: &ApplicationIdentity, digest: BlobDigest) -> String {
     format!(
         "{}{}",
@@ -863,13 +1061,6 @@ fn outbox_from_storage_key(key: &str) -> Result<OutboxItemId, StoreError> {
         return Err(corrupt("invalid outbox key"));
     }
     Ok(OutboxItemId(decode_hex_digest(&key[64..])?))
-}
-
-fn protocol_state_from_storage_key(key: &str) -> Result<ProtocolStateKey, StoreError> {
-    if key.len() != 128 {
-        return Err(corrupt("invalid protocol-state key"));
-    }
-    Ok(ProtocolStateKey(decode_hex_digest(&key[64..])?))
 }
 
 fn blob_from_storage_key(key: &str) -> Result<BlobDigest, StoreError> {
@@ -999,6 +1190,45 @@ struct LoadedApplication {
     meta: MetaRecord,
 }
 
+#[cfg(target_arch = "wasm32")]
+struct RawLoadedApplication {
+    meta: MetaRecord,
+    scalars: BTreeMap<MemoryId, super::StoredScalar>,
+    row_records: BTreeMap<(MemoryId, RowRef), StoredRow>,
+    list_records: BTreeMap<MemoryId, Vec<u8>>,
+    completed_migration_edges: BTreeSet<MigrationEdgeId>,
+    outbox: BTreeMap<OutboxItemId, super::DurableOutboxItem>,
+    content_artifact_manifest: ContentArtifactManifest,
+    blobs: BTreeMap<BlobDigest, BlobRecord>,
+    actual_blob_references: BTreeMap<BlobDigest, u64>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BrowserRestoreMetrics {
+    record_count: u64,
+    slice_count: u64,
+    yield_count: u64,
+    max_slice_records: u64,
+    max_slice_bytes: u64,
+    max_slice_us: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BrowserRestoreMetrics {
+    fn record_slice(&mut self, records: usize, bytes: usize, elapsed_us: u64) {
+        self.record_count = self.record_count.saturating_add(records as u64);
+        self.slice_count = self.slice_count.saturating_add(1);
+        self.max_slice_records = self.max_slice_records.max(records as u64);
+        self.max_slice_bytes = self.max_slice_bytes.max(bytes as u64);
+        self.max_slice_us = self.max_slice_us.max(elapsed_us);
+    }
+
+    fn record_yield(&mut self) {
+        self.yield_count = self.yield_count.saturating_add(1);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StoreMutation {
     Put {
@@ -1013,10 +1243,9 @@ enum StoreMutation {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoordinatorResultKind {
     Load,
-    LoadProtocolState,
     Initialize,
     Commit,
     Activate,
@@ -1035,7 +1264,6 @@ impl CoordinatorResultKind {
     fn from_command(command: &PersistenceCommand) -> Self {
         match command {
             PersistenceCommand::Load(_) => Self::Load,
-            PersistenceCommand::LoadProtocolState(_) => Self::LoadProtocolState,
             PersistenceCommand::Initialize(_) => Self::Initialize,
             PersistenceCommand::Commit(_) => Self::Commit,
             PersistenceCommand::Activate(_) => Self::Activate,
@@ -1053,7 +1281,6 @@ impl CoordinatorResultKind {
     fn error_result(self, error: StoreError) -> PersistenceResult {
         match self {
             Self::Load => PersistenceResult::Loaded(Err(error)),
-            Self::LoadProtocolState => PersistenceResult::ProtocolStateLoaded(Err(error)),
             Self::Initialize => PersistenceResult::Initialized(Err(error)),
             Self::Commit => PersistenceResult::Committed(Err(error)),
             Self::Activate => PersistenceResult::Activated(Err(error)),
@@ -1067,6 +1294,24 @@ impl CoordinatorResultKind {
             Self::Shutdown => PersistenceResult::ShutdownComplete(Err(error)),
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static NEXT_BROWSER_PERSISTENCE_DRIVER_ID: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(1) };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn next_browser_persistence_driver_id() -> u64 {
+    NEXT_BROWSER_PERSISTENCE_DRIVER_ID.with(|next| {
+        let id = next.get();
+        next.set(
+            id.checked_add(1)
+                .expect("browser persistence driver ID overflow"),
+        );
+        id
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1137,7 +1382,14 @@ impl RexieDriver {
         Ok(Self {
             sender,
             limits,
+            driver_id: next_browser_persistence_driver_id(),
+            next_operation_id: 1,
+            outstanding: BTreeMap::new(),
+            outstanding_payload_bytes: 0,
+            outstanding_change_count: 0,
             queue_capacity: command_queue_capacity,
+            max_outstanding_payload_bytes: DEFAULT_OUTSTANDING_PAYLOAD_BYTES,
+            max_outstanding_change_count: DEFAULT_OUTSTANDING_CHANGE_COUNT,
             closed: false,
             storage_status,
             _local: std::marker::PhantomData,
@@ -1169,12 +1421,192 @@ impl RexieDriver {
         self
     }
 
+    /// Configures aggregate admission limits for complete commands retained by
+    /// this driver. Limits cover queued, executing, and completed-but-not-yet-
+    /// acknowledged operations.
+    pub fn with_admission_limits(
+        mut self,
+        max_outstanding_payload_bytes: usize,
+        max_outstanding_change_count: usize,
+    ) -> Result<Self, StoreError> {
+        self.set_admission_limits(max_outstanding_payload_bytes, max_outstanding_change_count)?;
+        Ok(self)
+    }
+
+    pub fn set_admission_limits(
+        &mut self,
+        max_outstanding_payload_bytes: usize,
+        max_outstanding_change_count: usize,
+    ) -> Result<(), StoreError> {
+        validate_admission_limits(max_outstanding_payload_bytes, max_outstanding_change_count)?;
+        if !self.outstanding.is_empty() {
+            return Err(indexed_db_failure(
+                BrowserFailureKind::Backend,
+                "cannot change browser persistence admission limits while operations are outstanding",
+            ));
+        }
+        self.max_outstanding_payload_bytes = max_outstanding_payload_bytes;
+        self.max_outstanding_change_count = max_outstanding_change_count;
+        Ok(())
+    }
+
     pub fn storage_status(&self) -> &BrowserStorageStatus {
         &self.storage_status
     }
 
     pub const fn command_queue_capacity(&self) -> usize {
         self.queue_capacity
+    }
+
+    pub const fn max_outstanding_payload_bytes(&self) -> usize {
+        self.max_outstanding_payload_bytes
+    }
+
+    pub const fn max_outstanding_change_count(&self) -> usize {
+        self.max_outstanding_change_count
+    }
+
+    pub fn outstanding_operation_count(&self) -> usize {
+        self.outstanding.len()
+    }
+
+    pub const fn outstanding_payload_bytes(&self) -> usize {
+        self.outstanding_payload_bytes
+    }
+
+    pub const fn outstanding_change_count(&self) -> usize {
+        self.outstanding_change_count
+    }
+
+    /// Returns opaque handles for all admitted operations that have not yet
+    /// been acknowledged by this driver. This is the recovery path when a
+    /// convenience `execute` future was cancelled after admission.
+    pub fn outstanding_operations(&self) -> Vec<BrowserPersistenceOperation> {
+        self.outstanding
+            .iter()
+            .map(|(&operation_id, tracked)| BrowserPersistenceOperation {
+                driver_id: self.driver_id,
+                operation_id,
+                kind: tracked.kind(),
+            })
+            .collect()
+    }
+
+    /// Checks a checkpoint before the caller clones its changes and computes
+    /// its checksum. `try_enqueue` repeats the check against the complete
+    /// command, closing races with earlier acknowledgements or admissions.
+    pub fn validate_checkpoint_admission(
+        &self,
+        changes: &[DurableChange],
+        outbox_changes: &[DurableOutboxChange],
+        content_artifact_changes: &[DurableContentArtifactChange],
+    ) -> Result<(), BrowserPersistenceEnqueueError> {
+        self.validate_admission_cost(checkpoint_components_admission_cost(
+            changes,
+            outbox_changes,
+            content_artifact_changes,
+        ))
+    }
+
+    /// Admits one complete command without waiting for IndexedDB. The returned
+    /// operation owns its response and can be polled or awaited outside an
+    /// input/render callback.
+    pub fn try_enqueue(
+        &mut self,
+        command: PersistenceCommand,
+    ) -> Result<BrowserPersistenceOperation, BrowserPersistenceEnqueueError> {
+        let kind = CoordinatorResultKind::from_command(&command);
+        if self.closed {
+            return Err(BrowserPersistenceEnqueueError::Closed);
+        }
+        if self.outstanding.len() >= self.queue_capacity {
+            return Err(BrowserPersistenceEnqueueError::Backpressure);
+        }
+        let cost = command_admission_cost(&command);
+        self.validate_admission_cost(cost)?;
+        let operation_id = self.next_operation_id;
+        self.next_operation_id = self
+            .next_operation_id
+            .checked_add(1)
+            .ok_or(BrowserPersistenceEnqueueError::Closed)?;
+        let is_shutdown = matches!(kind, CoordinatorResultKind::Shutdown);
+        let (response, receiver) = oneshot::channel();
+        match self
+            .sender
+            .try_send(CoordinatorRequest::Execute { command, response })
+        {
+            Ok(()) => {
+                self.outstanding.insert(
+                    operation_id,
+                    TrackedBrowserPersistenceOperation {
+                        kind,
+                        response: receiver,
+                        cost,
+                    },
+                );
+                self.outstanding_payload_bytes = self
+                    .outstanding_payload_bytes
+                    .saturating_add(cost.payload_bytes);
+                self.outstanding_change_count = self
+                    .outstanding_change_count
+                    .saturating_add(cost.change_count);
+                if is_shutdown {
+                    self.closed = true;
+                }
+                Ok(BrowserPersistenceOperation {
+                    driver_id: self.driver_id,
+                    operation_id,
+                    kind,
+                })
+            }
+            Err(error) if error.is_full() => Err(BrowserPersistenceEnqueueError::Backpressure),
+            Err(_) => {
+                self.closed = true;
+                self.record_coordinator_failure(
+                    BrowserFailureKind::PrivateModeOrUnavailable,
+                    "browser persistence worker is unavailable",
+                );
+                Err(BrowserPersistenceEnqueueError::Closed)
+            }
+        }
+    }
+
+    /// Polls an admitted command without driving IndexedDB or yielding the
+    /// browser event loop.
+    pub fn try_complete(
+        &mut self,
+        operation: &BrowserPersistenceOperation,
+    ) -> Result<Option<PersistenceResult>, BrowserPersistenceEnqueueError> {
+        self.validate_operation_handle(operation)?;
+        let received = self
+            .outstanding
+            .get_mut(&operation.operation_id)
+            .expect("validated browser persistence operation")
+            .response
+            .try_recv();
+        match received {
+            Ok(Some(response)) => Ok(Some(self.finish_operation(*operation, Ok(response)))),
+            Ok(None) => Ok(None),
+            Err(_) => Ok(Some(self.finish_operation(*operation, Err(())))),
+        }
+    }
+
+    pub async fn complete(
+        &mut self,
+        operation: &BrowserPersistenceOperation,
+    ) -> Result<PersistenceResult, BrowserPersistenceEnqueueError> {
+        self.validate_operation_handle(operation)?;
+        let received = {
+            let tracked = self
+                .outstanding
+                .get_mut(&operation.operation_id)
+                .expect("validated browser persistence operation");
+            std::future::poll_fn(|context| {
+                std::future::Future::poll(std::pin::Pin::new(&mut tracked.response), context)
+            })
+            .await
+        };
+        Ok(self.finish_operation(*operation, received.map_err(|_| ())))
     }
 
     pub async fn refresh_storage_status(&mut self) -> &BrowserStorageStatus {
@@ -1211,40 +1643,110 @@ impl RexieDriver {
     /// Enqueues one owned target-neutral command and asynchronously awaits the worker response.
     pub async fn execute(&mut self, command: PersistenceCommand) -> PersistenceResult {
         let kind = CoordinatorResultKind::from_command(&command);
-        if self.closed {
-            return kind.error_result(StoreError::Closed);
-        }
-        let is_shutdown = matches!(kind, CoordinatorResultKind::Shutdown);
-        let (response, receiver) = oneshot::channel();
-        if self
-            .sender
-            .send(CoordinatorRequest::Execute { command, response })
-            .await
-            .is_err()
-        {
-            self.closed = true;
-            self.record_coordinator_failure(
-                BrowserFailureKind::PrivateModeOrUnavailable,
-                "browser persistence worker is unavailable",
-            );
-            return kind.error_result(StoreError::Closed);
-        }
-        let response = match receiver.await {
-            Ok(response) => response,
-            Err(_) => {
-                self.closed = true;
-                self.record_coordinator_failure(
-                    BrowserFailureKind::PrivateModeOrUnavailable,
-                    "browser persistence worker dropped a command response",
-                );
-                return kind.error_result(StoreError::Closed);
-            }
+        let operation = match self.try_enqueue(command) {
+            Ok(operation) => operation,
+            Err(error) => return kind.error_result(admission_store_error(error)),
         };
+        match self.complete(&operation).await {
+            Ok(result) => result,
+            Err(error) => kind.error_result(admission_store_error(error)),
+        }
+    }
+
+    fn validate_admission_cost(
+        &self,
+        cost: BrowserPersistenceAdmissionCost,
+    ) -> Result<(), BrowserPersistenceEnqueueError> {
+        if cost.payload_bytes > self.max_outstanding_payload_bytes {
+            return Err(BrowserPersistenceEnqueueError::PayloadTooLarge {
+                payload_bytes: cost.payload_bytes,
+                max_payload_bytes: self.max_outstanding_payload_bytes,
+            });
+        }
+        if cost.change_count > self.max_outstanding_change_count {
+            return Err(BrowserPersistenceEnqueueError::ChangeCountTooLarge {
+                change_count: cost.change_count,
+                max_change_count: self.max_outstanding_change_count,
+            });
+        }
+        if self
+            .outstanding_payload_bytes
+            .saturating_add(cost.payload_bytes)
+            > self.max_outstanding_payload_bytes
+        {
+            return Err(BrowserPersistenceEnqueueError::PayloadBackpressure {
+                payload_bytes: cost.payload_bytes,
+                outstanding_payload_bytes: self.outstanding_payload_bytes,
+                max_payload_bytes: self.max_outstanding_payload_bytes,
+            });
+        }
+        if self
+            .outstanding_change_count
+            .saturating_add(cost.change_count)
+            > self.max_outstanding_change_count
+        {
+            return Err(BrowserPersistenceEnqueueError::ChangeBackpressure {
+                change_count: cost.change_count,
+                outstanding_change_count: self.outstanding_change_count,
+                max_change_count: self.max_outstanding_change_count,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_operation_handle(
+        &self,
+        operation: &BrowserPersistenceOperation,
+    ) -> Result<(), BrowserPersistenceEnqueueError> {
+        if operation.driver_id != self.driver_id {
+            return Err(BrowserPersistenceEnqueueError::CrossDriver);
+        }
+        match self.outstanding.get(&operation.operation_id) {
+            Some(tracked) if tracked.kind() == operation.kind => Ok(()),
+            _ => Err(BrowserPersistenceEnqueueError::UnknownOperation),
+        }
+    }
+
+    fn finish_operation(
+        &mut self,
+        operation: BrowserPersistenceOperation,
+        received: Result<CoordinatorResponse, ()>,
+    ) -> PersistenceResult {
+        let tracked = self
+            .outstanding
+            .remove(&operation.operation_id)
+            .expect("completed browser persistence operation remains tracked");
+        self.outstanding_payload_bytes = self
+            .outstanding_payload_bytes
+            .saturating_sub(tracked.cost.payload_bytes);
+        self.outstanding_change_count = self
+            .outstanding_change_count
+            .saturating_sub(tracked.cost.change_count);
+        match received {
+            Ok(response) => self.adopt_response(operation.kind, response),
+            Err(()) => self.dropped_response(operation.kind),
+        }
+    }
+
+    fn adopt_response(
+        &mut self,
+        kind: CoordinatorResultKind,
+        response: CoordinatorResponse,
+    ) -> PersistenceResult {
         self.storage_status = response.storage_status;
-        if is_shutdown {
+        if matches!(kind, CoordinatorResultKind::Shutdown) {
             self.closed = true;
         }
         response.result
+    }
+
+    fn dropped_response(&mut self, kind: CoordinatorResultKind) -> PersistenceResult {
+        self.closed = true;
+        self.record_coordinator_failure(
+            BrowserFailureKind::PrivateModeOrUnavailable,
+            "browser persistence worker dropped a command response",
+        );
+        kind.error_result(StoreError::Closed)
     }
 
     fn record_coordinator_failure(&mut self, kind: BrowserFailureKind, detail: &str) {
@@ -1281,11 +1783,306 @@ async fn run_coordinator_worker(
                 backend.storage_status.missing_or_evicted = previous.missing_or_evicted;
                 backend.storage_status.last_operation_failure = previous.last_operation_failure;
                 backend.storage_status.last_status_detail = previous.last_status_detail;
+                backend.storage_status.restore_record_count = previous.restore_record_count;
+                backend.storage_status.restore_slice_count = previous.restore_slice_count;
+                backend.storage_status.restore_yield_count = previous.restore_yield_count;
+                backend.storage_status.restore_max_slice_records =
+                    previous.restore_max_slice_records;
+                backend.storage_status.restore_max_slice_bytes = previous.restore_max_slice_bytes;
+                backend.storage_status.restore_max_slice_us = previous.restore_max_slice_us;
                 let _ = response.send(backend.storage_status.clone());
             }
         }
     }
     backend.close_without_shutdown();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn admission_store_error(error: BrowserPersistenceEnqueueError) -> StoreError {
+    match error {
+        BrowserPersistenceEnqueueError::Closed => StoreError::Closed,
+        other => StoreError::Backend(format!("browser persistence admission: {other}")),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BrowserPersistenceAdmissionCost {
+    const fn from_parts(payload_bytes: usize, change_count: usize) -> Self {
+        Self {
+            payload_bytes,
+            change_count,
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.payload_bytes = self.payload_bytes.saturating_add(other.payload_bytes);
+        self.change_count = self.change_count.saturating_add(other.change_count);
+    }
+
+    fn add_payload(&mut self, payload_bytes: usize) {
+        self.payload_bytes = self.payload_bytes.saturating_add(payload_bytes);
+    }
+
+    fn add_change(&mut self, payload_bytes: usize) {
+        self.add_payload(payload_bytes);
+        self.change_count = self.change_count.saturating_add(1);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn command_admission_cost(command: &PersistenceCommand) -> BrowserPersistenceAdmissionCost {
+    const COMMAND_OVERHEAD: usize = 128;
+    let mut cost = BrowserPersistenceAdmissionCost::from_parts(COMMAND_OVERHEAD, 0);
+    match command {
+        PersistenceCommand::Load(request) => {
+            cost.add_payload(application_identity_bytes(&request.application) + 32);
+        }
+        PersistenceCommand::Initialize(image) => cost.add(restore_image_admission_cost(image)),
+        PersistenceCommand::Commit(batch) => {
+            cost.add_payload(application_identity_bytes(&batch.application) + 128);
+            cost.add(checkpoint_components_admission_cost(
+                &batch.changes,
+                &batch.outbox_changes,
+                &batch.content_artifact_changes,
+            ));
+        }
+        PersistenceCommand::Activate(batch) => {
+            cost.add_payload(application_identity_bytes(&batch.application) + 192);
+            for change in &batch.authority_changes {
+                cost.add(durable_change_admission_cost(change));
+            }
+            cost.change_count = cost
+                .change_count
+                .saturating_add(batch.completed_migration_edges.len())
+                .saturating_add(batch.deleted_memory.len())
+                .saturating_add(batch.target_content_artifact_manifest.bindings.len())
+                .saturating_add(batch.content_artifacts.len());
+            cost.add_payload(
+                batch
+                    .completed_migration_edges
+                    .len()
+                    .saturating_mul(32)
+                    .saturating_add(batch.deleted_memory.len().saturating_mul(32))
+                    .saturating_add(
+                        batch
+                            .target_content_artifact_manifest
+                            .bindings
+                            .len()
+                            .saturating_mul(72),
+                    ),
+            );
+            for artifact in batch.content_artifacts.values() {
+                cost.add_payload(
+                    64usize
+                        .saturating_add(artifact.media_type.len())
+                        .saturating_add(artifact.bytes.len()),
+                );
+            }
+        }
+        PersistenceCommand::ResetApplication(batch) => {
+            cost.add_payload(application_identity_bytes(&batch.application) + 96);
+            cost.add(restore_image_admission_cost(&batch.default_image));
+        }
+        PersistenceCommand::Barrier(request) => {
+            cost.add_payload(application_identity_bytes(&request.application) + 16);
+        }
+        PersistenceCommand::Inspect(request) => {
+            cost.add_payload(application_identity_bytes(&request.application));
+        }
+        PersistenceCommand::Compact(request) => {
+            cost.add_payload(application_identity_bytes(&request.application));
+        }
+        PersistenceCommand::ExportApplication(request) => {
+            cost.add_payload(application_identity_bytes(&request.application));
+        }
+        PersistenceCommand::PutContentArtifact(request) => {
+            cost.add_payload(
+                application_identity_bytes(&request.application)
+                    .saturating_add(64)
+                    .saturating_add(request.artifact.media_type.len())
+                    .saturating_add(request.artifact.bytes.len()),
+            );
+            cost.change_count = cost.change_count.saturating_add(1);
+        }
+        PersistenceCommand::LoadContentArtifact(request) => {
+            cost.add_payload(application_identity_bytes(&request.application) + 32);
+        }
+        PersistenceCommand::Shutdown(_) => {}
+    }
+    cost
+}
+
+#[cfg(target_arch = "wasm32")]
+fn checkpoint_components_admission_cost(
+    changes: &[DurableChange],
+    outbox_changes: &[DurableOutboxChange],
+    content_artifact_changes: &[DurableContentArtifactChange],
+) -> BrowserPersistenceAdmissionCost {
+    let mut cost = BrowserPersistenceAdmissionCost::default();
+    for change in changes {
+        cost.add(durable_change_admission_cost(change));
+    }
+    for change in outbox_changes {
+        cost.add(outbox_change_admission_cost(change));
+    }
+    for _ in content_artifact_changes {
+        cost.add_change(96);
+    }
+    cost
+}
+
+#[cfg(target_arch = "wasm32")]
+fn restore_image_admission_cost(image: &RestoreImage) -> BrowserPersistenceAdmissionCost {
+    let mut cost = BrowserPersistenceAdmissionCost::from_parts(
+        application_identity_bytes(&image.application).saturating_add(128),
+        0,
+    );
+    for scalar in image.scalars.values() {
+        cost.add_change(48usize.saturating_add(stored_value_bytes(&scalar.value, 0)));
+    }
+    for list in image.lists.values() {
+        cost.add(stored_list_admission_cost(list));
+    }
+    for item in image.outbox.values() {
+        cost.add_change(64usize.saturating_add(outbox_item_bytes(item)));
+    }
+    cost.change_count = cost
+        .change_count
+        .saturating_add(image.completed_migration_edges.len())
+        .saturating_add(image.content_artifact_manifest.bindings.len());
+    cost.add_payload(
+        image
+            .completed_migration_edges
+            .len()
+            .saturating_mul(32)
+            .saturating_add(
+                image
+                    .content_artifact_manifest
+                    .bindings
+                    .len()
+                    .saturating_mul(72),
+            ),
+    );
+    cost
+}
+
+#[cfg(target_arch = "wasm32")]
+fn durable_change_admission_cost(change: &DurableChange) -> BrowserPersistenceAdmissionCost {
+    let payload_bytes = match change {
+        DurableChange::SetScalar { value, .. } => {
+            64usize.saturating_add(stored_value_bytes(&value.value, 0))
+        }
+        DurableChange::DeleteScalar { .. } | DurableChange::DeleteList { .. } => 48,
+        DurableChange::SetList { value, .. } => {
+            let list = stored_list_admission_cost(value);
+            return BrowserPersistenceAdmissionCost::from_parts(
+                list.payload_bytes.saturating_add(48),
+                list.change_count.saturating_add(1),
+            );
+        }
+        DurableChange::SetRowField { owner, value, .. } => 160usize
+            .saturating_add(owner_bytes(owner))
+            .saturating_add(stored_value_bytes(value, 0)),
+        DurableChange::InsertRow { row, .. } => 128usize.saturating_add(stored_row_bytes(row)),
+        DurableChange::RemoveRow { .. } => 112,
+    };
+    BrowserPersistenceAdmissionCost::from_parts(payload_bytes, 1)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stored_list_admission_cost(list: &StoredList) -> BrowserPersistenceAdmissionCost {
+    let mut cost = BrowserPersistenceAdmissionCost::from_parts(64, 1);
+    for row in &list.rows {
+        cost.add_change(64usize.saturating_add(stored_row_bytes(row)));
+    }
+    cost
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stored_row_bytes(row: &StoredRow) -> usize {
+    let mut bytes = 128usize
+        .saturating_add(owner_bytes(&row.owner))
+        .saturating_add(row.materialization_origin.as_ref().map_or(0, owner_bytes))
+        .saturating_add(row.touched_fields.len().saturating_mul(32));
+    for value in row.fields.values() {
+        bytes = bytes
+            .saturating_add(32)
+            .saturating_add(stored_value_bytes(value, 0));
+    }
+    bytes
+}
+
+#[cfg(target_arch = "wasm32")]
+fn outbox_change_admission_cost(change: &DurableOutboxChange) -> BrowserPersistenceAdmissionCost {
+    let payload_bytes = match change {
+        DurableOutboxChange::Enqueue { item } => 64usize.saturating_add(outbox_item_bytes(item)),
+        DurableOutboxChange::BeginDispatch { .. }
+        | DurableOutboxChange::RequireReconciliation { .. } => 128,
+        DurableOutboxChange::Complete { outcome, .. } => {
+            128usize.saturating_add(stored_value_bytes(outcome, 0))
+        }
+    };
+    BrowserPersistenceAdmissionCost::from_parts(payload_bytes, 1)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn outbox_item_bytes(item: &super::DurableOutboxItem) -> usize {
+    let state_bytes = match &item.state {
+        super::DurableOutboxState::Completed { outcome, .. } => stored_value_bytes(outcome, 0),
+        super::DurableOutboxState::Pending
+        | super::DurableOutboxState::Dispatching { .. }
+        | super::DurableOutboxState::ReconciliationRequired { .. } => 0,
+    };
+    192usize
+        .saturating_add(owner_bytes(&item.owner))
+        .saturating_add(stored_value_bytes(&item.idempotency_key, 0))
+        .saturating_add(stored_value_bytes(&item.intent, 0))
+        .saturating_add(state_bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn owner_bytes(owner: &super::DurableOwner) -> usize {
+    24usize.saturating_add(owner.ancestors.len().saturating_mul(48))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stored_value_bytes(value: &super::StoredValue, depth: usize) -> usize {
+    if depth >= DecodeLimits::default().max_value_depth {
+        return usize::MAX;
+    }
+    match value {
+        super::StoredValue::Null | super::StoredValue::Bool(_) | super::StoredValue::Number(_) => {
+            16
+        }
+        super::StoredValue::Text(value) => 24usize.saturating_add(value.len()),
+        super::StoredValue::Bytes(value) => 24usize.saturating_add(value.len()),
+        super::StoredValue::List(values) => values.iter().fold(24, |bytes, value| {
+            bytes.saturating_add(stored_value_bytes(value, depth + 1))
+        }),
+        super::StoredValue::Record(fields) => fields.iter().fold(24, |bytes, (name, value)| {
+            bytes
+                .saturating_add(name.len())
+                .saturating_add(stored_value_bytes(value, depth + 1))
+        }),
+        super::StoredValue::Variant { tag, fields }
+        | super::StoredValue::Error { code: tag, fields } => {
+            fields
+                .iter()
+                .fold(32usize.saturating_add(tag.len()), |bytes, (name, value)| {
+                    bytes
+                        .saturating_add(name.len())
+                        .saturating_add(stored_value_bytes(value, depth + 1))
+                })
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn application_identity_bytes(application: &ApplicationIdentity) -> usize {
+    24usize
+        .saturating_add(application.package_id.len())
+        .saturating_add(application.state_namespace.len())
+        .saturating_add(application.deployment_domain.len())
 }
 
 fn validate_command_queue_capacity(capacity: usize) -> Result<(), StoreError> {
@@ -1299,6 +2096,29 @@ fn validate_command_queue_capacity(capacity: usize) -> Result<(), StoreError> {
             ),
         ))
     }
+}
+
+fn validate_admission_limits(
+    max_outstanding_payload_bytes: usize,
+    max_outstanding_change_count: usize,
+) -> Result<(), StoreError> {
+    if !(1..=MAX_OUTSTANDING_PAYLOAD_BYTES).contains(&max_outstanding_payload_bytes) {
+        return Err(indexed_db_failure(
+            BrowserFailureKind::Backend,
+            format!(
+                "outstanding payload byte limit {max_outstanding_payload_bytes} is outside 1..={MAX_OUTSTANDING_PAYLOAD_BYTES}"
+            ),
+        ));
+    }
+    if !(1..=MAX_OUTSTANDING_CHANGE_COUNT).contains(&max_outstanding_change_count) {
+        return Err(indexed_db_failure(
+            BrowserFailureKind::Backend,
+            format!(
+                "outstanding change limit {max_outstanding_change_count} is outside 1..={MAX_OUTSTANDING_CHANGE_COUNT}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1361,11 +2181,6 @@ impl IndexedDbBackend {
             PersistenceCommand::Load(request) => {
                 PersistenceResult::Loaded(self.load(request).await)
             }
-            PersistenceCommand::LoadProtocolState(request) => {
-                PersistenceResult::ProtocolStateLoaded(
-                    self.load_protocol_state(&request.application).await,
-                )
-            }
             PersistenceCommand::Initialize(image) => {
                 PersistenceResult::Initialized(self.initialize(image).await)
             }
@@ -1412,43 +2227,41 @@ impl IndexedDbBackend {
         }
     }
 
-    async fn load(&self, request: RestoreRequest) -> Result<Option<RestoreImage>, StoreError> {
+    async fn load(&mut self, request: RestoreRequest) -> Result<Option<RestoreImage>, StoreError> {
         let transaction = self
             .database()?
             .transaction(&LOAD_STORES, TransactionMode::ReadOnly)
             .map_err(|error| indexed_db_error("start load transaction", error))?;
-        let loaded = match load_application(&transaction, &request.application, self.limits).await {
-            Ok(loaded) => loaded,
-            Err(error) => return abort_with(transaction, error).await,
-        };
-        let image = loaded.map(|loaded| loaded.image);
-        if let (Some(expected), Some(image)) = (request.expected_schema_hash, image.as_ref())
-            && image.schema_hash != expected
+        let mut metrics = BrowserRestoreMetrics::default();
+        let raw = match load_application_raw_cooperatively(
+            &transaction,
+            &request.application,
+            self.limits,
+            &mut metrics,
+        )
+        .await
         {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.storage_status.record_restore_metrics(metrics);
+                return abort_with(transaction, error).await;
+            }
+        };
+        if let (Some(expected), Some(raw)) = (request.expected_schema_hash, raw.as_ref())
+            && raw.meta.schema_hash != expected
+        {
+            self.storage_status.record_restore_metrics(metrics);
             return abort_with(transaction, StoreError::SchemaMismatch).await;
         }
-        commit_with(transaction, image).await
-    }
-
-    async fn load_protocol_state(
-        &self,
-        application: &ApplicationIdentity,
-    ) -> Result<ProtocolStateSnapshot, StoreError> {
-        let transaction = self
-            .database()?
-            .transaction(&[META, PROTOCOL_STATE], TransactionMode::ReadOnly)
-            .map_err(|error| indexed_db_error("start protocol-state load transaction", error))?;
-        match read_meta(&transaction, application, self.limits).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return abort_with(transaction, StoreError::MissingApplication).await,
-            Err(error) => return abort_with(transaction, error).await,
-        }
-        let snapshot =
-            match load_protocol_state_records(&transaction, application, self.limits).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => return abort_with(transaction, error).await,
-            };
-        commit_with(transaction, snapshot).await
+        commit_with(transaction, ()).await?;
+        let image = match raw {
+            Some(raw) => assemble_restore_image_cooperatively(raw, self.limits, &mut metrics)
+                .await
+                .map(Some),
+            None => Ok(None),
+        };
+        self.storage_status.record_restore_metrics(metrics);
+        image
     }
 
     async fn initialize(&self, image: RestoreImage) -> Result<CommitAck, StoreError> {
@@ -1554,17 +2367,6 @@ impl IndexedDbBackend {
             self.limits,
         )
         .await
-        {
-            return abort_with(transaction, error).await;
-        }
-        if !batch.protocol_state_changes.is_empty()
-            && let Err(error) = apply_sparse_protocol_state_changes(
-                &transaction,
-                &batch.application,
-                &batch.protocol_state_changes,
-                self.limits,
-            )
-            .await
         {
             return abort_with(transaction, error).await;
         }
@@ -1753,7 +2555,6 @@ impl IndexedDbBackend {
             ROWS,
             MIGRATIONS,
             OUTBOX,
-            PROTOCOL_STATE,
             BLOBS,
             ARTIFACTS,
             ARTIFACT_OWNERS,
@@ -2147,13 +2948,16 @@ async fn apply_sparse_changes(
                         "memory {memory_id} is already a scalar"
                     )));
                 }
-                super::validate_list(value)?;
+                super::validate_list(*memory_id, value)?;
                 replace_list_sparse(transaction, application, *memory_id, value, limits).await?;
             }
             DurableChange::SetRowField {
                 memory_id,
+                list_revision,
                 row_key,
                 row_generation,
+                owner,
+                materialization_origin,
                 field_id,
                 value,
             } => {
@@ -2173,15 +2977,26 @@ async fn apply_sparse_changes(
                         .await?
                         .unwrap_or(ListRecord {
                             touched: false,
+                            revision: *list_revision,
                             next_key: 0,
+                            next_order_token: 0,
                             rows: Vec::new(),
                         });
-                let row_ref = RowRef {
-                    key: *row_key,
-                    generation: *row_generation,
-                };
-                let storage_key = row_storage_key(application, *memory_id, row_ref);
-                let (mut row, old) = if list.rows.contains(&row_ref) {
+                advance_list_record_revision(*memory_id, &mut list, *list_revision)?;
+                let existing_row_ref = list
+                    .rows
+                    .iter()
+                    .find(|row| row.row.key == *row_key && row.row.generation == *row_generation)
+                    .copied();
+                let row_ref = existing_row_ref.unwrap_or(ListRowRef {
+                    row: RowRef {
+                        key: *row_key,
+                        generation: *row_generation,
+                    },
+                    source_order_token: 0,
+                });
+                let storage_key = row_storage_key(application, *memory_id, row_ref.row);
+                let (mut row, old) = if existing_row_ref.is_some() {
                     let old = read_store_bytes(transaction, ROWS, &storage_key)
                         .await?
                         .ok_or_else(|| corrupt("list references a missing row"))?;
@@ -2189,7 +3004,7 @@ async fn apply_sparse_changes(
                         transaction,
                         application,
                         *memory_id,
-                        row_ref,
+                        row_ref.row,
                         &old,
                         limits,
                     )
@@ -2205,15 +3020,23 @@ async fn apply_sparse_changes(
                         StoredRow {
                             key: *row_key,
                             generation: *row_generation,
+                            source_order_token: 0,
+                            owner: owner.clone(),
+                            materialization_origin: materialization_origin.clone(),
                             fields: BTreeMap::new(),
                             touched_fields: BTreeSet::new(),
                         },
                         read_store_bytes(transaction, ROWS, &storage_key).await?,
                     )
                 };
+                if row.owner != *owner || row.materialization_origin != *materialization_origin {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "list {memory_id} row {row_key}:{row_generation} changed structural owner"
+                    )));
+                }
                 row.fields.insert(*field_id, value.clone());
                 row.touched_fields.insert(*field_id);
-                validate_stored_row(&row, !list.touched)?;
+                validate_stored_row(*memory_id, &row, !list.touched)?;
                 let encoded = encode_row_component(&row).map_err(codec_backend)?;
                 replace_encoded_component(
                     transaction,
@@ -2229,9 +3052,11 @@ async fn apply_sparse_changes(
             }
             DurableChange::InsertRow {
                 memory_id,
+                list_revision,
                 index,
                 row,
                 next_key,
+                next_order_token,
             } => {
                 let mut list = load_list_record_sparse(
                     transaction,
@@ -2250,11 +3075,16 @@ async fn apply_sparse_changes(
                         "cannot insert into sparse override list {memory_id}"
                     )));
                 }
-                let row_ref = RowRef {
-                    key: row.key,
-                    generation: row.generation,
+                let row_ref = ListRowRef {
+                    row: RowRef {
+                        key: row.key,
+                        generation: row.generation,
+                    },
+                    source_order_token: row.source_order_token,
                 };
-                if list.rows.contains(&row_ref) {
+                if list.rows.iter().any(|candidate| {
+                    candidate.row.key == row.key && candidate.row.generation == row.generation
+                }) {
                     return Err(StoreError::InvalidAuthority(format!(
                         "list {memory_id} already has row {}:{}",
                         row.key, row.generation
@@ -2271,13 +3101,15 @@ async fn apply_sparse_changes(
                         list.rows.len()
                     )));
                 }
-                validate_stored_row(row, false)?;
-                let key = row_storage_key(application, *memory_id, row_ref);
+                validate_stored_row(*memory_id, row, false)?;
+                let key = row_storage_key(application, *memory_id, row_ref.row);
                 if read_store_bytes(transaction, ROWS, &key).await?.is_some() {
                     return Err(corrupt("row store contains unreferenced authority"));
                 }
                 list.rows.insert(index, row_ref);
+                advance_list_record_revision(*memory_id, &mut list, *list_revision)?;
                 list.next_key = *next_key;
+                list.next_order_token = *next_order_token;
                 validate_list_record(&list).map_err(codec_backend)?;
                 let encoded = encode_row_component(row).map_err(codec_backend)?;
                 replace_encoded_component(
@@ -2294,9 +3126,11 @@ async fn apply_sparse_changes(
             }
             DurableChange::RemoveRow {
                 memory_id,
+                list_revision,
                 row_key,
                 row_generation,
                 next_key,
+                next_order_token,
             } => {
                 let mut list =
                     load_list_record_sparse(transaction, application, *memory_id, limits)
@@ -2311,23 +3145,23 @@ async fn apply_sparse_changes(
                         "cannot remove from sparse override list {memory_id}"
                     )));
                 }
-                let row_ref = RowRef {
-                    key: *row_key,
-                    generation: *row_generation,
-                };
                 let index = list
                     .rows
                     .iter()
-                    .position(|row| *row == row_ref)
+                    .position(|row| {
+                        row.row.key == *row_key && row.row.generation == *row_generation
+                    })
                     .ok_or_else(|| {
                         StoreError::InvalidAuthority(format!(
                             "list {memory_id} has no row {row_key}:{row_generation}"
                         ))
                     })?;
-                list.rows.remove(index);
+                let row_ref = list.rows.remove(index);
+                advance_list_record_revision(*memory_id, &mut list, *list_revision)?;
                 list.next_key = *next_key;
+                list.next_order_token = *next_order_token;
                 validate_list_record(&list).map_err(codec_backend)?;
-                let key = row_storage_key(application, *memory_id, row_ref);
+                let key = row_storage_key(application, *memory_id, row_ref.row);
                 let old = read_store_bytes(transaction, ROWS, &key)
                     .await?
                     .ok_or_else(|| corrupt("list references a missing row"))?;
@@ -2406,67 +3240,6 @@ async fn apply_sparse_outbox_changes(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn load_protocol_state_records(
-    transaction: &Transaction,
-    application: &ApplicationIdentity,
-    limits: DecodeLimits,
-) -> Result<ProtocolStateSnapshot, StoreError> {
-    let prefix = application_storage_key(application);
-    let mut records = BTreeMap::new();
-    let mut decoded_bytes = 0usize;
-    for (storage_key, bytes) in scan_prefix(transaction, PROTOCOL_STATE, &prefix, limits).await? {
-        decoded_bytes = decoded_bytes
-            .checked_add(bytes.len())
-            .ok_or_else(|| corrupt("protocol-state byte count overflow"))?;
-        if decoded_bytes > limits.max_total_bytes {
-            return Err(corrupt("protocol-state records exceed decode limit"));
-        }
-        let key = protocol_state_from_storage_key(&storage_key)?;
-        let record = decode_protocol_state_record(&bytes, limits).map_err(codec_backend)?;
-        if records.insert(key, record).is_some() {
-            return Err(corrupt("duplicate protocol-state key"));
-        }
-    }
-    validate_protocol_state(&records)?;
-    Ok(ProtocolStateSnapshot { records })
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn apply_sparse_protocol_state_changes(
-    transaction: &Transaction,
-    application: &ApplicationIdentity,
-    changes: &[DurableProtocolStateChange],
-    limits: DecodeLimits,
-) -> Result<(), StoreError> {
-    let current = load_protocol_state_records(transaction, application, limits).await?;
-    let mut candidate = current.clone();
-    apply_durable_protocol_state_changes(&mut candidate.records, changes)?;
-
-    let mut mutations = Vec::new();
-    for key in current
-        .records
-        .keys()
-        .filter(|key| !candidate.records.contains_key(key))
-    {
-        mutations.push(StoreMutation::Delete {
-            store: PROTOCOL_STATE,
-            key: protocol_state_storage_key(application, *key),
-        });
-    }
-    for (key, record) in &candidate.records {
-        if current.records.get(key) == Some(record) {
-            continue;
-        }
-        mutations.push(StoreMutation::Put {
-            store: PROTOCOL_STATE,
-            key: protocol_state_storage_key(application, *key),
-            value: encode_protocol_state_record(record).map_err(codec_backend)?,
-        });
-    }
-    apply_mutations(transaction, mutations).await
-}
-
-#[cfg(target_arch = "wasm32")]
 async fn replace_list_sparse(
     transaction: &Transaction,
     application: &ApplicationIdentity,
@@ -2477,13 +3250,18 @@ async fn replace_list_sparse(
     delete_rows_sparse(transaction, application, memory, limits).await?;
     let record = ListRecord {
         touched: list.touched,
+        revision: list.revision,
         next_key: list.next_key,
+        next_order_token: list.next_order_token,
         rows: list
             .rows
             .iter()
-            .map(|row| RowRef {
-                key: row.key,
-                generation: row.generation,
+            .map(|row| ListRowRef {
+                row: RowRef {
+                    key: row.key,
+                    generation: row.generation,
+                },
+                source_order_token: row.source_order_token,
             })
             .collect(),
     };
@@ -2493,7 +3271,7 @@ async fn replace_list_sparse(
             key: row.key,
             generation: row.generation,
         };
-        validate_stored_row(row, !list.touched)?;
+        validate_stored_row(memory, row, !list.touched)?;
         let encoded = encode_row_component(row).map_err(codec_backend)?;
         replace_encoded_component(
             transaction,
@@ -2842,7 +3620,8 @@ async fn store_key_exists(
         .map_err(|error| indexed_db_error(&format!("read {store_name} key"), error))
 }
 
-fn validate_stored_row(row: &StoredRow, sparse: bool) -> Result<(), StoreError> {
+fn validate_stored_row(memory: MemoryId, row: &StoredRow, sparse: bool) -> Result<(), StoreError> {
+    super::validate_row_owner(memory, row)?;
     if !row
         .touched_fields
         .iter()
@@ -3011,6 +3790,12 @@ async fn request_storage_status() -> BrowserStorageStatus {
             missing_or_evicted: false,
             last_operation_failure: Some(BrowserFailureKind::PrivateModeOrUnavailable),
             last_status_detail: Some(detail),
+            restore_record_count: 0,
+            restore_slice_count: 0,
+            restore_yield_count: 0,
+            restore_max_slice_records: 0,
+            restore_max_slice_bytes: 0,
+            restore_max_slice_us: 0,
         };
     };
 
@@ -3105,6 +3890,12 @@ async fn request_storage_status() -> BrowserStorageStatus {
         missing_or_evicted: false,
         last_operation_failure,
         last_status_detail,
+        restore_record_count: 0,
+        restore_slice_count: 0,
+        restore_yield_count: 0,
+        restore_max_slice_records: 0,
+        restore_max_slice_bytes: 0,
+        restore_max_slice_us: 0,
     }
 }
 
@@ -3314,6 +4105,469 @@ async fn replace_activation_content_artifacts(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn load_application_raw_cooperatively(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    limits: DecodeLimits,
+    metrics: &mut BrowserRestoreMetrics,
+) -> Result<Option<RawLoadedApplication>, StoreError> {
+    let meta_started = js_sys::Date::now();
+    let Some(meta) = read_meta(transaction, application, limits).await? else {
+        return Ok(None);
+    };
+    metrics.record_slice(
+        1,
+        0,
+        ((js_sys::Date::now() - meta_started).max(0.0) * 1_000.0) as u64,
+    );
+    let prefix = application_storage_key(application);
+    let mut decoded_bytes = 0usize;
+    let mut blobs = BTreeMap::new();
+    scan_prefix_cooperatively(transaction, BLOBS, &prefix, limits, metrics, |page| {
+        for (key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let digest = blob_from_storage_key(&key)?;
+            let record = decode_blob_record(&bytes, limits).map_err(codec_backend)?;
+            if record.digest != digest {
+                return Err(corrupt("blob payload digest does not match its key"));
+            }
+            if blobs.insert(digest, record).is_some() {
+                return Err(corrupt("duplicate blob digest key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    let mut actual_blob_references = BTreeMap::new();
+    let mut scalars = BTreeMap::new();
+    scan_prefix_cooperatively(transaction, SLOTS, &prefix, limits, metrics, |page| {
+        for (key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let memory = memory_from_storage_key(&key, "slot")?;
+            merge_blob_references(
+                &mut actual_blob_references,
+                &scalar_component_blob_references(&bytes, limits).map_err(codec_backend)?,
+            )?;
+            let scalar = decode_scalar_component(&bytes, limits, &blobs).map_err(codec_backend)?;
+            if scalars.insert(memory, scalar).is_some() {
+                return Err(corrupt("duplicate scalar memory key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    let mut row_records = BTreeMap::new();
+    scan_prefix_cooperatively(transaction, ROWS, &prefix, limits, metrics, |page| {
+        for (key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let (memory, row_ref) = row_from_storage_key(&key)?;
+            merge_blob_references(
+                &mut actual_blob_references,
+                &row_component_blob_references(&bytes, limits).map_err(codec_backend)?,
+            )?;
+            let row = decode_row_component(&bytes, limits, &blobs).map_err(codec_backend)?;
+            if row.key != row_ref.key || row.generation != row_ref.generation {
+                return Err(corrupt("row payload identity does not match its key"));
+            }
+            if row_records.insert((memory, row_ref), row).is_some() {
+                return Err(corrupt("duplicate row key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    let mut list_records = BTreeMap::new();
+    scan_prefix_cooperatively(transaction, LISTS, &prefix, limits, metrics, |page| {
+        for (key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let memory = memory_from_storage_key(&key, "list")?;
+            if scalars.contains_key(&memory) {
+                return Err(corrupt("one memory key is both a scalar and a list"));
+            }
+            if list_records.insert(memory, bytes).is_some() {
+                return Err(corrupt("duplicate list memory key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    let mut completed_migration_edges = BTreeSet::new();
+    scan_prefix_cooperatively(transaction, MIGRATIONS, &prefix, limits, metrics, |page| {
+        for (key, bytes) in page {
+            if key.len() != 128 || bytes.len() != 8 {
+                return Err(corrupt("invalid migration record"));
+            }
+            let edge = MigrationEdgeId(decode_hex_digest(&key[64..])?);
+            if !completed_migration_edges.insert(edge) {
+                return Err(corrupt("duplicate migration edge key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    let mut outbox = BTreeMap::new();
+    scan_prefix_cooperatively(transaction, OUTBOX, &prefix, limits, metrics, |page| {
+        for (key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let item_id = outbox_from_storage_key(&key)?;
+            let item = decode_outbox_record(&bytes, limits).map_err(codec_backend)?;
+            if item.item_id != item_id {
+                return Err(corrupt("outbox payload identity does not match its key"));
+            }
+            super::validate_outbox_item(&item)?;
+            if outbox.insert(item_id, item).is_some() {
+                return Err(corrupt("duplicate outbox item key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    let owner_limits = DecodeLimits {
+        max_collection_items: super::MAX_CONTENT_ARTIFACT_OWNERS,
+        ..limits
+    };
+    let mut bindings = BTreeMap::new();
+    scan_prefix_cooperatively(
+        transaction,
+        ARTIFACT_OWNERS,
+        &prefix,
+        owner_limits,
+        metrics,
+        |page| {
+            for (key, bytes) in page {
+                add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+                let owner_id = content_artifact_owner_from_storage_key(&key)?;
+                let binding =
+                    decode_content_artifact_binding(&bytes, limits).map_err(codec_backend)?;
+                if bindings.insert(owner_id, binding).is_some() {
+                    return Err(corrupt("duplicate content artifact owner key"));
+                }
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    let content_artifact_manifest = ContentArtifactManifest { bindings };
+    validate_content_artifact_manifest(&content_artifact_manifest)?;
+
+    let artifact_limits = DecodeLimits {
+        max_collection_items: super::MAX_RETAINED_CONTENT_ARTIFACTS
+            + super::MAX_STAGED_CONTENT_ARTIFACTS,
+        ..limits
+    };
+    let mut content_artifacts = BTreeMap::new();
+    let mut artifact_bytes = 0usize;
+    scan_prefix_cooperatively(
+        transaction,
+        ARTIFACTS,
+        &prefix,
+        artifact_limits,
+        metrics,
+        |page| {
+            for (key, bytes) in page {
+                let id = content_artifact_from_storage_key(&key)?;
+                let artifact =
+                    decode_content_artifact(id, &bytes, limits).map_err(codec_backend)?;
+                artifact_bytes = artifact_bytes
+                    .checked_add(artifact.bytes.len())
+                    .ok_or_else(|| corrupt("content artifact byte count overflow"))?;
+                if artifact_bytes
+                    > super::MAX_RETAINED_CONTENT_ARTIFACT_BYTES
+                        + super::MAX_STAGED_CONTENT_ARTIFACT_BYTES
+                {
+                    return Err(corrupt("content artifact store exceeds bounded byte count"));
+                }
+                if content_artifacts.insert(id, artifact).is_some() {
+                    return Err(corrupt("duplicate content artifact key"));
+                }
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    validate_content_artifact_storage(&content_artifact_manifest, &content_artifacts)?;
+
+    Ok(Some(RawLoadedApplication {
+        meta,
+        scalars,
+        row_records,
+        list_records,
+        completed_migration_edges,
+        outbox,
+        content_artifact_manifest,
+        blobs,
+        actual_blob_references,
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn decode_list_record_cooperatively(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    metrics: &mut BrowserRestoreMetrics,
+) -> Result<ListRecord, StoreError> {
+    component_size(bytes, limits, "list metadata").map_err(codec_backend)?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 6, "list metadata").map_err(codec_backend)?;
+    expect_format(&mut decoder, "list metadata").map_err(codec_backend)?;
+    let touched = decoder
+        .bool()
+        .map_err(decode_error)
+        .map_err(codec_backend)?;
+    let revision = decoder.u64().map_err(decode_error).map_err(codec_backend)?;
+    let next_key = decoder.u64().map_err(decode_error).map_err(codec_backend)?;
+    let next_order_token = decode_u128(&mut decoder).map_err(codec_backend)?;
+    let count =
+        collection_len(&mut decoder, limits, "list row order", true).map_err(codec_backend)?;
+    let mut rows = Vec::with_capacity(count);
+    let mut unique = BTreeSet::new();
+    let mut minimum_next = 1u64;
+    let mut previous_order_token = 0u128;
+    while rows.len() < count {
+        let started = js_sys::Date::now();
+        let slice_start = rows.len();
+        let slice_end = slice_start
+            .saturating_add(RESTORE_RECORDS_PER_SLICE)
+            .min(count);
+        while rows.len() < slice_end {
+            expect_array(&mut decoder, 3, "row identity").map_err(codec_backend)?;
+            let row = ListRowRef {
+                row: RowRef {
+                    key: decoder.u64().map_err(decode_error).map_err(codec_backend)?,
+                    generation: decoder.u64().map_err(decode_error).map_err(codec_backend)?,
+                },
+                source_order_token: decode_u128(&mut decoder).map_err(codec_backend)?,
+            };
+            if !unique.insert((row.row.key, row.row.generation)) {
+                return Err(corrupt("list order repeats a row identity"));
+            }
+            if !touched && row.source_order_token != 0 {
+                return Err(corrupt(
+                    "sparse row overrides must not replace list ordering state",
+                ));
+            }
+            if touched {
+                if row.source_order_token == 0 || row.source_order_token <= previous_order_token {
+                    return Err(corrupt("list order has non-increasing source-order tokens"));
+                }
+                previous_order_token = row.source_order_token;
+                minimum_next = minimum_next.max(row.row.key.saturating_add(1));
+            }
+            rows.push(row);
+        }
+        metrics.record_slice(
+            slice_end.saturating_sub(slice_start),
+            0,
+            ((js_sys::Date::now() - started).max(0.0) * 1_000.0) as u64,
+        );
+        if rows.len() < count {
+            metrics.record_yield();
+            TimeoutFuture::new(0).await;
+        }
+    }
+    reject_trailing(&decoder, bytes, "list metadata").map_err(codec_backend)?;
+    if !touched && (next_key != 0 || next_order_token != 0) {
+        return Err(corrupt(
+            "sparse row overrides must not replace list allocator or ordering state",
+        ));
+    }
+    if touched && next_key < minimum_next {
+        return Err(corrupt(format!(
+            "next key {next_key} is below {minimum_next}"
+        )));
+    }
+    if touched && next_order_token <= previous_order_token {
+        return Err(corrupt("next source-order token does not follow list rows"));
+    }
+    Ok(ListRecord {
+        touched,
+        revision,
+        next_key,
+        next_order_token,
+        rows,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn assemble_restore_image_cooperatively(
+    raw: RawLoadedApplication,
+    limits: DecodeLimits,
+    metrics: &mut BrowserRestoreMetrics,
+) -> Result<RestoreImage, StoreError> {
+    let RawLoadedApplication {
+        meta,
+        scalars,
+        mut row_records,
+        list_records,
+        completed_migration_edges,
+        outbox,
+        content_artifact_manifest,
+        blobs,
+        actual_blob_references,
+    } = raw;
+
+    if blobs.len() != actual_blob_references.len() {
+        return Err(corrupt(
+            "blob store reference counts do not match scalar and row records",
+        ));
+    }
+    let mut validated_blobs = 0usize;
+    let mut blob_started = js_sys::Date::now();
+    for (digest, record) in &blobs {
+        if actual_blob_references.get(digest).copied() != Some(record.reference_count) {
+            return Err(corrupt(
+                "blob store reference counts do not match scalar and row records",
+            ));
+        }
+        validated_blobs += 1;
+        if validated_blobs == RESTORE_RECORDS_PER_SLICE {
+            metrics.record_slice(
+                validated_blobs,
+                0,
+                ((js_sys::Date::now() - blob_started).max(0.0) * 1_000.0) as u64,
+            );
+            metrics.record_yield();
+            TimeoutFuture::new(0).await;
+            validated_blobs = 0;
+            blob_started = js_sys::Date::now();
+        }
+    }
+    if validated_blobs != 0 {
+        metrics.record_slice(
+            validated_blobs,
+            0,
+            ((js_sys::Date::now() - blob_started).max(0.0) * 1_000.0) as u64,
+        );
+    }
+
+    let mut lists = BTreeMap::new();
+    for (memory, bytes) in list_records {
+        let record = decode_list_record_cooperatively(&bytes, limits, metrics).await?;
+        let mut rows = Vec::with_capacity(record.rows.len());
+        let mut minimum_next = 1u64;
+        let mut previous_order_token = 0u128;
+        let structurally_touched = record.touched;
+        let mut assembled_in_slice = 0usize;
+        let mut assembled_bytes = 0usize;
+        let mut slice_started = js_sys::Date::now();
+        for row_ref in &record.rows {
+            let row = row_records
+                .remove(&(memory, row_ref.row))
+                .ok_or_else(|| corrupt("list order references a missing row"))?;
+            if row.source_order_token != row_ref.source_order_token {
+                return Err(corrupt(
+                    "row payload source-order token does not match list metadata",
+                ));
+            }
+            super::validate_row_owner(memory, &row)?;
+            if row
+                .touched_fields
+                .iter()
+                .any(|field| !row.fields.contains_key(field))
+            {
+                return Err(StoreError::InvalidAuthority(format!(
+                    "row {}:{} touches a missing field",
+                    row.key, row.generation
+                )));
+            }
+            if !structurally_touched
+                && (row.touched_fields.is_empty()
+                    || row
+                        .fields
+                        .keys()
+                        .any(|field| !row.touched_fields.contains(field))
+                    || row.source_order_token != 0)
+            {
+                return Err(StoreError::InvalidAuthority(format!(
+                    "sparse row {}:{} contains non-override fields",
+                    row.key, row.generation
+                )));
+            }
+            if structurally_touched {
+                if row.source_order_token == 0 || row.source_order_token <= previous_order_token {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "list {memory} row {}:{} has a non-increasing source-order token",
+                        row.key, row.generation
+                    )));
+                }
+                previous_order_token = row.source_order_token;
+                minimum_next = minimum_next.max(row.key.saturating_add(1));
+            }
+            assembled_bytes = assembled_bytes.saturating_add(stored_row_bytes(&row));
+            rows.push(row);
+            assembled_in_slice += 1;
+            if assembled_in_slice == RESTORE_RECORDS_PER_SLICE {
+                metrics.record_slice(
+                    assembled_in_slice,
+                    assembled_bytes,
+                    ((js_sys::Date::now() - slice_started).max(0.0) * 1_000.0) as u64,
+                );
+                metrics.record_yield();
+                TimeoutFuture::new(0).await;
+                assembled_in_slice = 0;
+                assembled_bytes = 0;
+                slice_started = js_sys::Date::now();
+            }
+        }
+        if assembled_in_slice != 0 {
+            metrics.record_slice(
+                assembled_in_slice,
+                assembled_bytes,
+                ((js_sys::Date::now() - slice_started).max(0.0) * 1_000.0) as u64,
+            );
+        }
+        if !structurally_touched && (record.next_key != 0 || record.next_order_token != 0) {
+            return Err(StoreError::InvalidAuthority(
+                "sparse row overrides must not replace list allocator or ordering state".to_owned(),
+            ));
+        }
+        if structurally_touched && record.next_key < minimum_next {
+            return Err(StoreError::InvalidAuthority(format!(
+                "next key {} is below {}",
+                record.next_key, minimum_next
+            )));
+        }
+        if structurally_touched && record.next_order_token <= previous_order_token {
+            return Err(StoreError::InvalidAuthority(format!(
+                "list {memory} next source-order token does not follow its rows"
+            )));
+        }
+        lists.insert(
+            memory,
+            StoredList {
+                touched: structurally_touched,
+                revision: record.revision,
+                next_key: record.next_key,
+                next_order_token: record.next_order_token,
+                rows,
+            },
+        );
+    }
+    if !row_records.is_empty() {
+        return Err(corrupt("row store contains unreferenced authority"));
+    }
+
+    Ok(RestoreImage {
+        application: meta.application,
+        schema_version: meta.schema_version,
+        schema_hash: meta.schema_hash,
+        epoch: meta.epoch,
+        through_turn_sequence: meta.through_turn_sequence,
+        scalars,
+        lists,
+        completed_migration_edges,
+        outbox,
+        content_artifact_manifest,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn load_application(
     transaction: &Transaction,
     application: &ApplicationIdentity,
@@ -3380,16 +4634,23 @@ async fn load_application(
         let mut rows = Vec::with_capacity(record.rows.len());
         for row_ref in &record.rows {
             let row = row_records
-                .remove(&(memory, *row_ref))
+                .remove(&(memory, row_ref.row))
                 .ok_or_else(|| corrupt("list order references a missing row"))?;
+            if row.source_order_token != row_ref.source_order_token {
+                return Err(corrupt(
+                    "row payload source-order token does not match list metadata",
+                ));
+            }
             rows.push(row);
         }
         let list = StoredList {
             touched: record.touched,
+            revision: record.revision,
             next_key: record.next_key,
+            next_order_token: record.next_order_token,
             rows,
         };
-        super::validate_list(&list)?;
+        super::validate_list(memory, &list)?;
         if lists.insert(memory, list).is_some() {
             return Err(corrupt("duplicate list memory key"));
         }
@@ -3466,6 +4727,90 @@ async fn read_meta(
         return Err(StoreError::IdentityMismatch);
     }
     Ok(Some(meta))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn indexed_db_prefix_page_range(
+    prefix: &str,
+    after_key: Option<&str>,
+) -> Result<KeyRange, StoreError> {
+    let range = prefix_range(prefix)?;
+    let lower = after_key.unwrap_or(&range.lower);
+    if !lower.starts_with(prefix) {
+        return Err(corrupt("IndexedDB restore page key left its prefix"));
+    }
+    KeyRange::bound(
+        &JsValue::from_str(lower),
+        &JsValue::from_str(&range.upper_exclusive),
+        Some(after_key.is_some()),
+        Some(true),
+    )
+    .map_err(|error| indexed_db_error("create restore page key range", error))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn scan_prefix_cooperatively(
+    transaction: &Transaction,
+    store_name: &'static str,
+    prefix: &str,
+    limits: DecodeLimits,
+    metrics: &mut BrowserRestoreMetrics,
+    mut consume: impl FnMut(Vec<(String, Vec<u8>)>) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let store = transaction
+        .store(store_name)
+        .map_err(|error| indexed_db_error(&format!("open {store_name} store"), error))?;
+    let page_limit = u32::try_from(RESTORE_RECORDS_PER_SLICE)
+        .map_err(|_| corrupt("restore page limit exceeds u32"))?;
+    let mut after_key = None::<String>;
+    let mut total_records = 0usize;
+    loop {
+        let range = indexed_db_prefix_page_range(prefix, after_key.as_deref())?;
+        let entries = store
+            .scan(Some(range), Some(page_limit), None, None)
+            .await
+            .map_err(|error| indexed_db_error(&format!("scan {store_name} restore page"), error))?;
+        if entries.is_empty() {
+            break;
+        }
+        total_records = total_records
+            .checked_add(entries.len())
+            .ok_or_else(|| corrupt(format!("{store_name} restore record count overflow")))?;
+        if total_records > limits.max_collection_items {
+            return Err(corrupt(format!(
+                "{store_name} prefix contains more than {} records",
+                limits.max_collection_items
+            )));
+        }
+
+        let started = js_sys::Date::now();
+        let entry_count = entries.len();
+        let mut page_bytes = 0usize;
+        let mut page = Vec::with_capacity(entry_count);
+        for (key, value) in entries {
+            let key = js_key(key)?;
+            if !key.starts_with(prefix) {
+                return Err(corrupt(format!(
+                    "{store_name} range returned a key outside its requested prefix"
+                )));
+            }
+            let bytes = js_bytes(value)?;
+            page_bytes = page_bytes.saturating_add(bytes.len());
+            page.push((key, bytes));
+        }
+        after_key = page.last().map(|(key, _)| key.clone());
+        consume(page)?;
+        let elapsed_us = ((js_sys::Date::now() - started).max(0.0) * 1_000.0) as u64;
+        metrics.record_slice(entry_count, page_bytes, elapsed_us);
+        if entry_count < RESTORE_RECORDS_PER_SLICE {
+            break;
+        }
+        // Opening the next IndexedDB cursor request before yielding keeps the
+        // transaction alive; awaiting that request gives the browser an event-
+        // loop turn between bounded decode slices.
+        metrics.record_yield();
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3595,16 +4940,21 @@ fn stage_initial_image(image: &RestoreImage) -> Result<Vec<StoreMutation>, Store
     }
 
     for (memory, list) in &image.lists {
-        super::validate_list(list)?;
+        super::validate_list(*memory, list)?;
         let record = ListRecord {
             touched: list.touched,
+            revision: list.revision,
             next_key: list.next_key,
+            next_order_token: list.next_order_token,
             rows: list
                 .rows
                 .iter()
-                .map(|row| RowRef {
-                    key: row.key,
-                    generation: row.generation,
+                .map(|row| ListRowRef {
+                    row: RowRef {
+                        key: row.key,
+                        generation: row.generation,
+                    },
+                    source_order_token: row.source_order_token,
                 })
                 .collect(),
         };
@@ -3913,7 +5263,6 @@ fn add_decode_bytes(
 fn persistence_result_error(result: &PersistenceResult) -> Option<&StoreError> {
     match result {
         PersistenceResult::Loaded(Err(error))
-        | PersistenceResult::ProtocolStateLoaded(Err(error))
         | PersistenceResult::Initialized(Err(error))
         | PersistenceResult::Committed(Err(error))
         | PersistenceResult::Activated(Err(error))
@@ -3997,11 +5346,9 @@ mod tests {
     use super::*;
     #[cfg(not(target_arch = "wasm32"))]
     use crate::codec::{decode_blob_record, decode_outbox_record};
-    use crate::{
-        DurableContentArtifactChange, DurableProtocolStateChange, StoredScalar, StoredValue,
-    };
+    use crate::{DurableContentArtifactChange, StoredScalar, StoredValue};
     #[cfg(not(target_arch = "wasm32"))]
-    use crate::{DurableEffectRow, DurableOutboxItem, StoredList, StoredRow};
+    use crate::{DurableOutboxItem, DurableRowId, StoredList, StoredRow};
     use boon_plan::MemoryLeafId;
     #[cfg(not(target_arch = "wasm32"))]
     use boon_plan::{EffectId, EffectInvocationId, MemoryKind, MemoryOwnerPath};
@@ -4060,6 +5407,15 @@ mod tests {
         let row = StoredRow {
             key: 9,
             generation: 3,
+            source_order_token: 1_u128 << 64,
+            owner: crate::DurableOwner {
+                ancestors: vec![crate::DurableRowId {
+                    list_memory_id: list,
+                    row_key: 9,
+                    row_generation: 3,
+                }],
+            },
+            materialization_origin: None,
             fields: BTreeMap::from([
                 (first, StoredValue::Text("text".to_owned())),
                 (second, StoredValue::Bytes(vec![0, 1, 2, 255].into())),
@@ -4086,15 +5442,23 @@ mod tests {
         };
         let list = ListRecord {
             touched: true,
+            revision: 7,
             next_key: 12,
+            next_order_token: 3_u128 << 64,
             rows: vec![
-                RowRef {
-                    key: 2,
-                    generation: 1,
+                ListRowRef {
+                    row: RowRef {
+                        key: 2,
+                        generation: 1,
+                    },
+                    source_order_token: 1_u128 << 64,
                 },
-                RowRef {
-                    key: 9,
-                    generation: 4,
+                ListRowRef {
+                    row: RowRef {
+                        key: 9,
+                        generation: 4,
+                    },
+                    source_order_token: 2_u128 << 64,
                 },
             ],
         };
@@ -4126,9 +5490,9 @@ mod tests {
                 digest(&checkpoint_bytes),
             ),
             (
-                "dcead203cbea9ef5b6f3ca6594f2c52757da82f09de18d36a5dcffd1f67376f0".to_owned(),
-                "863f07dbb1aa47deb2c72da21816526daecbe8a63be38a510021c86b08cfd011".to_owned(),
-                "1c225555fb7a2e5c16308493b20a803dc47a1fdd06429b8c0c630e5b8f05eece".to_owned(),
+                "df1c27a02b2140ec2ef767f96c4bf8e029c6d83c2c2dbde75805be3b5ea2dc75".to_owned(),
+                "8d8e37e06a2d136f6d0151c59c4e030d089e6ef14ffdb60958d8ce7a39682340".to_owned(),
+                "64c5f402d461a4f5b952dd27d2b617f92f8e61044404a96255fd05989a02b9e3".to_owned(),
             )
         );
     }
@@ -4256,8 +5620,17 @@ mod tests {
             last_turn_sequence: 8,
             changes: vec![DurableChange::SetRowField {
                 memory_id: memory,
+                list_revision: 1,
                 row_key: 3,
                 row_generation: 1,
+                owner: crate::DurableOwner {
+                    ancestors: vec![crate::DurableRowId {
+                        list_memory_id: memory,
+                        row_key: 3,
+                        row_generation: 1,
+                    }],
+                },
+                materialization_origin: None,
                 field_id: field,
                 value: number(9),
             }],
@@ -4266,13 +5639,6 @@ mod tests {
                 expected_revision: 0,
                 next_revision: 1,
                 attempt: 1,
-                turn_sequence: 8,
-            }],
-            protocol_state_changes: vec![DurableProtocolStateChange::Put {
-                key: ProtocolStateKey([0x45; 32]),
-                expected_revision: None,
-                next_revision: 1,
-                payload: vec![0x46].into(),
                 turn_sequence: 8,
             }],
             content_artifact_changes: vec![DurableContentArtifactChange::SetReplaceable {
@@ -4290,7 +5656,6 @@ mod tests {
                 ROWS,
                 CHECKPOINTS,
                 OUTBOX,
-                PROTOCOL_STATE,
                 BLOBS,
                 ARTIFACTS,
                 ARTIFACT_OWNERS,
@@ -4401,6 +5766,12 @@ mod tests {
             missing_or_evicted: false,
             last_operation_failure: None,
             last_status_detail: None,
+            restore_record_count: 0,
+            restore_slice_count: 0,
+            restore_yield_count: 0,
+            restore_max_slice_records: 0,
+            restore_max_slice_bytes: 0,
+            restore_max_slice_us: 0,
         };
         assert!(status.eviction_risk());
         assert_eq!(status.available_bytes(), Some(600));
@@ -4455,10 +5826,21 @@ mod tests {
             list_memory,
             StoredList {
                 touched: true,
+                revision: 0,
                 next_key: 1,
+                next_order_token: 2_u128 << 64,
                 rows: vec![StoredRow {
                     key: 0,
                     generation: 1,
+                    source_order_token: 1_u128 << 64,
+                    owner: crate::DurableOwner {
+                        ancestors: vec![crate::DurableRowId {
+                            list_memory_id: list_memory,
+                            row_key: 0,
+                            row_generation: 1,
+                        }],
+                    },
+                    materialization_origin: None,
                     fields: BTreeMap::from([(field, StoredValue::Bytes(payload.into()))]),
                     touched_fields: BTreeSet::from([field]),
                 }],
@@ -4466,16 +5848,20 @@ mod tests {
         );
         let effect = EffectId::from_host_operation("Test/send").unwrap();
         let invocation = EffectInvocationId::from_result_owner(effect, "test/target").unwrap();
+        let target_row = DurableRowId {
+            list_memory_id: list_memory,
+            row_key: 0,
+            row_generation: 1,
+        };
         let item = DurableOutboxItem::pending(
             invocation,
             effect,
             StoredValue::Text("key".to_owned()),
             number(1),
-            Some(DurableEffectRow {
-                list_memory_id: list_memory,
-                row_key: 0,
-                row_generation: 1,
-            }),
+            crate::DurableOwner {
+                ancestors: vec![target_row],
+            },
+            Some(target_row),
             1,
         );
         assert_eq!(
@@ -4484,6 +5870,7 @@ mod tests {
                 invocation,
                 effect,
                 &item.idempotency_key,
+                &item.owner,
                 item.target_row,
             )
         );

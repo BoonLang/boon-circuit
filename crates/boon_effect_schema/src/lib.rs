@@ -133,7 +133,36 @@ pub const WELLEN_MAX_SIGNAL_TRANSITIONS: u64 = 256;
 pub const WELLEN_MAX_CURSOR_SIGNALS: usize = 32;
 pub const WELLEN_MAX_SAFE_TIME: u64 = (1_u64 << 53) - 1;
 
+pub const HOST_EFFECT_OPERATIONS: &[&str] = &[
+    "Directory/entries",
+    FILE_READ_BYTES_OPERATION,
+    FILE_WRITE_BYTES_OPERATION,
+    FILE_READ_STREAM_OPERATION,
+    "File/read_text",
+    "File/write_text",
+    CONTENT_IMPORT_OPERATION,
+    CONTENT_SAVE_OPERATION,
+    "Log/error",
+    "Log/info",
+    "DevelopmentPasskey/register",
+    "DevelopmentPasskey/authenticate",
+    OUTBOUND_HTTP_REQUEST_OPERATION,
+    WALL_CLOCK_READ_OPERATION,
+    SECURE_RANDOM_BYTES_OPERATION,
+    SECRET_VERIFY_OPERATION,
+    HMAC_SHA256_SIGN_OPERATION,
+    HMAC_SHA256_VERIFY_OPERATION,
+    TIMER_DEADLINE_OPERATION,
+    WELLEN_OPEN_OPERATION,
+    WELLEN_HIERARCHY_PAGE_OPERATION,
+    WELLEN_SIGNAL_PAGE_OPERATION,
+    WELLEN_CURSOR_VALUES_OPERATION,
+];
+
 pub fn host_effect_spec(operation: &str) -> Option<HostEffectSpec> {
+    if !HOST_EFFECT_OPERATIONS.contains(&operation) {
+        return None;
+    }
     let simple = match operation {
         "Directory/entries" => Some((
             ReplaySpec::ReadOnly,
@@ -1277,6 +1306,23 @@ fn variant<const N: usize>(tag: &'static str, fields: [Field; N]) -> Variant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_host_effect_namespace_is_a_reserved_standard_root() {
+        for operation in HOST_EFFECT_OPERATIONS {
+            let (root, _) = operation
+                .split_once('/')
+                .expect("host effect operations use a standard-root namespace");
+            assert!(
+                boon_parser::is_reserved_standard_root(root),
+                "host effect namespace `{root}` is absent from STANDARD_ROOTS"
+            );
+            assert!(
+                host_effect_spec(operation).is_some(),
+                "registered host effect `{operation}` has no schema"
+            );
+        }
+    }
 
     #[test]
     fn development_passkey_is_explicit_and_has_closed_durable_schemas() {

@@ -23,7 +23,7 @@ FUNCTION cells_app() {
 
 FUNCTION formula_bar() {
     store.selected_input |> WHEN {
-        Found[cell] => selected_formula_bar(cell: cell)
+        Found[value] => selected_formula_bar(cell: value)
         NotFound => empty_formula_bar()
     }
 }

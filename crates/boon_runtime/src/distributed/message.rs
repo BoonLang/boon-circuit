@@ -1,8 +1,12 @@
 use boon_data::Value;
-use boon_plan::{DistributedArgumentId, ExportId, ProgramRole, RemoteCallSiteId};
+use boon_plan::{
+    DistributedArgumentId, DistributedCallInstanceId, ExportId, ProgramRole, RemoteCallSiteId,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DistributedQueueLimits {
@@ -40,7 +44,7 @@ pub struct DistributedMessage {
 ///     value: Value::Null,
 /// };
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DistributedMessagePayload {
     Current {
         export_id: ExportId,
@@ -52,26 +56,72 @@ pub enum DistributedMessagePayload {
         sequence: u64,
         value: Value,
     },
-    CallRequest {
+    CurrentCallRequest {
         call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
         function_export_id: ExportId,
-        revision: u64,
+        demand_revision: u64,
         arguments: BTreeMap<DistributedArgumentId, Value>,
     },
-    CallResult {
+    CurrentCallResult {
         call_site_id: RemoteCallSiteId,
-        revision: u64,
+        call_instance_id: DistributedCallInstanceId,
+        demand_revision: u64,
+        result_revision: u64,
+        value: Value,
+    },
+    CurrentCallDetach {
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        demand_revision: u64,
+    },
+    InvocationRequest {
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        function_export_id: ExportId,
+        sequence: u64,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+    },
+    InvocationResult {
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        sequence: u64,
         value: Value,
     },
 }
 
+impl fmt::Debug for DistributedMessagePayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Current { .. } => "Current",
+            Self::Event { .. } => "Event",
+            Self::CurrentCallRequest { .. } => "CurrentCallRequest",
+            Self::CurrentCallResult { .. } => "CurrentCallResult",
+            Self::CurrentCallDetach { .. } => "CurrentCallDetach",
+            Self::InvocationRequest { .. } => "InvocationRequest",
+            Self::InvocationResult { .. } => "InvocationResult",
+        };
+        write!(formatter, "DistributedMessagePayload::{variant}(..)")
+    }
+}
+
 impl DistributedMessage {
+    pub(super) fn semantic_fingerprint(&self) -> Result<[u8; 32], super::DistributedRuntimeError> {
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(self, &mut encoded)
+            .map_err(|_| super::DistributedRuntimeError::InvalidTransportFrame)?;
+        Ok(Sha256::digest(encoded).into())
+    }
+
     pub(super) fn edge_bytes(&self) -> [u8; 32] {
         match &self.payload {
             DistributedMessagePayload::Current { export_id, .. }
             | DistributedMessagePayload::Event { export_id, .. } => export_id.0,
-            DistributedMessagePayload::CallRequest { call_site_id, .. }
-            | DistributedMessagePayload::CallResult { call_site_id, .. } => call_site_id.0,
+            DistributedMessagePayload::CurrentCallRequest { call_site_id, .. }
+            | DistributedMessagePayload::CurrentCallResult { call_site_id, .. }
+            | DistributedMessagePayload::CurrentCallDetach { call_site_id, .. }
+            | DistributedMessagePayload::InvocationRequest { call_site_id, .. }
+            | DistributedMessagePayload::InvocationResult { call_site_id, .. } => call_site_id.0,
         }
     }
 
@@ -82,12 +132,17 @@ impl DistributedMessage {
         let payload = match &self.payload {
             DistributedMessagePayload::Current { value, .. }
             | DistributedMessagePayload::Event { value, .. }
-            | DistributedMessagePayload::CallResult { value, .. } => estimated_value_bytes(value),
-            DistributedMessagePayload::CallRequest { arguments, .. } => {
+            | DistributedMessagePayload::CurrentCallResult { value, .. }
+            | DistributedMessagePayload::InvocationResult { value, .. } => {
+                estimated_value_bytes(value)
+            }
+            DistributedMessagePayload::CurrentCallRequest { arguments, .. }
+            | DistributedMessagePayload::InvocationRequest { arguments, .. } => {
                 arguments.values().try_fold(0usize, |total, value| {
                     total.checked_add(estimated_value_bytes(value)?)
                 })
             }
+            DistributedMessagePayload::CurrentCallDetach { .. } => Some(0),
         };
         metadata.checked_add(payload?)
     }
@@ -96,6 +151,7 @@ impl DistributedMessage {
         if self.producer != queued.producer
             || self.consumer != queued.consumer
             || self.edge_bytes() != queued.edge_bytes()
+            || self.call_instance_id() != queued.call_instance_id()
         {
             return false;
         }
@@ -105,13 +161,47 @@ impl DistributedMessage {
                 DistributedMessagePayload::Current { .. },
                 DistributedMessagePayload::Current { .. }
             ) | (
-                DistributedMessagePayload::CallRequest { .. },
-                DistributedMessagePayload::CallRequest { .. }
+                DistributedMessagePayload::CurrentCallResult { .. },
+                DistributedMessagePayload::CurrentCallResult { .. }
             ) | (
-                DistributedMessagePayload::CallResult { .. },
-                DistributedMessagePayload::CallResult { .. }
+                DistributedMessagePayload::CurrentCallRequest { .. }
+                    | DistributedMessagePayload::CurrentCallDetach { .. },
+                DistributedMessagePayload::CurrentCallRequest { .. }
+                    | DistributedMessagePayload::CurrentCallDetach { .. }
             )
         )
+    }
+
+    pub fn call_instance_id(&self) -> Option<DistributedCallInstanceId> {
+        match &self.payload {
+            DistributedMessagePayload::Current { .. } | DistributedMessagePayload::Event { .. } => {
+                None
+            }
+            DistributedMessagePayload::CurrentCallRequest {
+                call_instance_id, ..
+            }
+            | DistributedMessagePayload::CurrentCallResult {
+                call_instance_id, ..
+            }
+            | DistributedMessagePayload::CurrentCallDetach {
+                call_instance_id, ..
+            }
+            | DistributedMessagePayload::InvocationRequest {
+                call_instance_id, ..
+            }
+            | DistributedMessagePayload::InvocationResult {
+                call_instance_id, ..
+            } => Some(*call_instance_id),
+        }
+    }
+
+    /// Only state snapshots may cross a disconnected Session interval.
+    ///
+    /// Events and call replies belong to the transport generation that
+    /// produced them. Retaining those messages for a resumed tab would replay
+    /// transient work after its owner had already been cancelled.
+    pub fn is_session_resume_snapshot(&self) -> bool {
+        matches!(self.payload, DistributedMessagePayload::Current { .. })
     }
 }
 
@@ -209,32 +299,22 @@ impl TypedMessageQueue {
         self.messages.front().cloned()
     }
 
-    pub(super) fn drain(&mut self, maximum: usize) -> Vec<DistributedMessage> {
-        let count = maximum.min(self.messages.len());
-        (0..count).filter_map(|_| self.pop_front()).collect()
+    pub(super) fn retain_session_resume_snapshots(&mut self) {
+        self.messages
+            .retain(DistributedMessage::is_session_resume_snapshot);
+        self.estimated_bytes = self
+            .messages
+            .iter()
+            .map(|message| {
+                message
+                    .estimated_bytes()
+                    .expect("admitted distributed message size remains representable")
+            })
+            .sum();
     }
 
     pub(super) fn len(&self) -> usize {
         self.messages.len()
-    }
-
-    pub(super) fn recovery_messages(&self) -> Vec<DistributedMessage> {
-        self.messages.iter().cloned().collect()
-    }
-
-    pub(super) fn from_recovery(
-        messages: Vec<DistributedMessage>,
-        limits: DistributedQueueLimits,
-    ) -> Result<Self, super::DistributedRuntimeError> {
-        let mut queue = Self::new(limits)?;
-        for message in messages {
-            let before = queue.messages.len();
-            queue.push([message])?;
-            if queue.messages.len() != before.saturating_add(1) {
-                return Err(super::DistributedRuntimeError::InvalidTransportFrame);
-            }
-        }
-        Ok(queue)
     }
 }
 
@@ -243,14 +323,29 @@ mod tests {
     use super::*;
     use boon_plan::RemoteCallSiteId;
 
-    fn call(revision: u64) -> DistributedMessage {
+    fn current_call(demand_revision: u64) -> DistributedMessage {
         DistributedMessage {
             producer: ProgramRole::Session,
             consumer: ProgramRole::Server,
-            payload: DistributedMessagePayload::CallRequest {
+            payload: DistributedMessagePayload::CurrentCallRequest {
                 call_site_id: RemoteCallSiteId([7; 32]),
+                call_instance_id: DistributedCallInstanceId([6; 32]),
                 function_export_id: ExportId([8; 32]),
-                revision,
+                demand_revision,
+                arguments: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn invocation(sequence: u64) -> DistributedMessage {
+        DistributedMessage {
+            producer: ProgramRole::Session,
+            consumer: ProgramRole::Server,
+            payload: DistributedMessagePayload::InvocationRequest {
+                call_site_id: RemoteCallSiteId([7; 32]),
+                call_instance_id: DistributedCallInstanceId([6; 32]),
+                function_export_id: ExportId([8; 32]),
+                sequence,
                 arguments: BTreeMap::new(),
             },
         }
@@ -269,13 +364,27 @@ mod tests {
     }
 
     #[test]
-    fn pending_pure_calls_are_latest_wins_but_events_remain_fifo() {
+    fn current_calls_are_latest_wins_but_invocations_and_events_remain_fifo() {
         let mut queue = TypedMessageQueue::new(DistributedQueueLimits::default()).unwrap();
-        queue.push([call(1), call(2)]).unwrap();
+        queue.push([current_call(1), current_call(2)]).unwrap();
         assert_eq!(queue.len(), 1);
         assert!(matches!(
             queue.pop_front().unwrap().payload,
-            DistributedMessagePayload::CallRequest { revision: 2, .. }
+            DistributedMessagePayload::CurrentCallRequest {
+                demand_revision: 2,
+                ..
+            }
+        ));
+
+        queue.push([invocation(1), invocation(2)]).unwrap();
+        assert_eq!(queue.len(), 2);
+        assert!(matches!(
+            queue.pop_front().unwrap().payload,
+            DistributedMessagePayload::InvocationRequest { sequence: 1, .. }
+        ));
+        assert!(matches!(
+            queue.pop_front().unwrap().payload,
+            DistributedMessagePayload::InvocationRequest { sequence: 2, .. }
         ));
 
         queue.push([event(1), event(2)]).unwrap();
@@ -291,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn distributed_payloads_and_recovery_are_canonical_data() {
+    fn distributed_payloads_are_canonical_data() {
         let message = DistributedMessage {
             producer: ProgramRole::Client,
             consumer: ProgramRole::Session,
@@ -303,21 +412,40 @@ mod tests {
         };
         let mut queue = TypedMessageQueue::new(DistributedQueueLimits::default()).unwrap();
         queue.push([message.clone()]).unwrap();
-        let recovered = TypedMessageQueue::from_recovery(
-            queue.recovery_messages(),
-            DistributedQueueLimits::default(),
-        )
-        .unwrap();
-        let DistributedMessagePayload::Event { value, .. } =
-            &recovered.front_cloned().unwrap().payload
+        let DistributedMessagePayload::Event { value, .. } = &queue.front_cloned().unwrap().payload
         else {
-            panic!("recovered message changed payload kind");
+            panic!("queued message changed payload kind");
         };
         let _: &boon_data::Value = value;
 
         let mut encoded = Vec::new();
         ciborium::into_writer(&message, &mut encoded).unwrap();
         assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn distributed_message_debug_is_structural_and_redacted() {
+        const SENTINEL: &str = "wire-secret-82be7a";
+        let message = DistributedMessage {
+            producer: ProgramRole::Session,
+            consumer: ProgramRole::Server,
+            payload: DistributedMessagePayload::CurrentCallRequest {
+                call_site_id: RemoteCallSiteId([0xa1; 32]),
+                call_instance_id: DistributedCallInstanceId([0xa2; 32]),
+                function_export_id: ExportId([0xa3; 32]),
+                demand_revision: 0xa4,
+                arguments: BTreeMap::from([(
+                    DistributedArgumentId([0xa5; 32]),
+                    Value::Text(SENTINEL.to_owned()),
+                )]),
+            },
+        };
+
+        let diagnostic = format!("{message:?}");
+        assert!(diagnostic.contains("CurrentCallRequest"));
+        for hidden in [SENTINEL, "a1a1", "a2a2", "a3a3", "a5a5"] {
+            assert!(!diagnostic.contains(hidden), "leaked `{hidden}`");
+        }
     }
 
     #[test]

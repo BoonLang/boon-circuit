@@ -9,9 +9,9 @@ pub use boon_document_model::{
     MapVisibleTile, MaterialStylePatch, MaterializedRange, PaintStylePatch,
     ProgramCapabilityProfile, Rect, SENSITIVE_INPUT_REDACTED_GLYPHS,
     SENSITIVE_INPUT_REDACTED_VALUE, SENSITIVE_INPUT_STYLE_KEY, ScrollRootId, ScrollState,
-    SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch, StyleRichTextSpan, StyleValue,
-    TextInputFocusRequest, TextInputId, TextStylePatch, TextValue, UiSemanticChange,
-    project_to_map_viewport, unproject_from_map_viewport,
+    SourceBindingId, SourceRouteToken, StyleEditorTypeHint, StyleMap, StylePatch,
+    StyleRichTextSpan, StyleValue, TextInputFocusRequest, TextInputId, TextStylePatch, TextValue,
+    UiSemanticChange, project_to_map_viewport, unproject_from_map_viewport,
 };
 pub mod render_scene;
 pub mod source_actions;
@@ -201,6 +201,7 @@ pub struct HitSideTableEntry {
     pub source_binding_id: Option<SourceBindingId>,
     pub source_path: Option<String>,
     pub source_intent: Option<String>,
+    pub source_route: Option<SourceRouteToken>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_binding_refs: Vec<DocumentTypedBindingRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -208,8 +209,6 @@ pub struct HitSideTableEntry {
     pub bounds: Rect,
     pub z_depth: u32,
     pub scroll_root: Option<ScrollRootId>,
-    pub row_key: Option<u64>,
-    pub row_generation: Option<u64>,
     pub spatial_bucket: HitSpatialBucket,
 }
 
@@ -252,32 +251,20 @@ impl HitSideTable {
                 source_binding_id: binding.map(|binding| binding.id.clone()),
                 source_path: binding.map(|binding| binding.source_path.clone()),
                 source_intent: binding.map(|binding| binding.intent.clone()),
+                source_route: binding.and_then(|binding| binding.route.clone()),
                 source_binding_refs: Vec::new(),
                 source_routes: binding
                     .map(|binding| {
                         vec![DocumentTypedBindingRoute {
                             source_path: binding.source_path.clone(),
                             intent: binding.intent.clone(),
+                            token: binding.route.clone(),
                         }]
                     })
                     .unwrap_or_default(),
                 bounds: hit.bounds,
                 z_depth: index as u32,
                 scroll_root: scroll_root_for_node(document, &hit.node),
-                row_key: node.and_then(|node| {
-                    style_u64_any(&node.style, &["row_key", "target_key", "__row_key"])
-                }),
-                row_generation: node.and_then(|node| {
-                    style_u64_any(
-                        &node.style,
-                        &[
-                            "row_generation",
-                            "target_generation",
-                            "generation",
-                            "__row_generation",
-                        ],
-                    )
-                }),
                 spatial_bucket,
             };
             table.push_entry(entry, entry_index);
@@ -304,14 +291,13 @@ impl HitSideTable {
             buckets: BTreeMap::new(),
         };
         for (index, hit) in layout.hit_regions.iter().enumerate() {
-            let node =
-                document
-                    .nodes
-                    .get(&hit.node)
-                    .ok_or_else(|| PatchApplyError::StaleReference {
-                        reference_kind: "hit_region_node",
-                        id: hit.node.clone(),
-                    })?;
+            document
+                .nodes
+                .get(&hit.node)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "hit_region_node",
+                    id: hit.node.clone(),
+                })?;
             let hot = hot_ids
                 .hot_id(&hit.node)
                 .ok_or_else(|| PatchApplyError::StaleReference {
@@ -328,6 +314,7 @@ impl HitSideTable {
                 source_binding_id: primary.map(|binding| binding.binding_id.clone()),
                 source_path: primary.map(|binding| binding.route.source_path.clone()),
                 source_intent: primary.map(|binding| binding.route.intent.clone()),
+                source_route: primary.and_then(|binding| binding.route.token.clone()),
                 source_binding_refs: bindings.iter().map(|binding| binding.reference).collect(),
                 source_routes: bindings
                     .iter()
@@ -336,16 +323,6 @@ impl HitSideTable {
                 bounds: hit.bounds,
                 z_depth: index as u32,
                 scroll_root: scroll_root_for_node(document, &hit.node),
-                row_key: style_u64_any(&node.style, &["row_key", "target_key", "__row_key"]),
-                row_generation: style_u64_any(
-                    &node.style,
-                    &[
-                        "row_generation",
-                        "target_generation",
-                        "generation",
-                        "__row_generation",
-                    ],
-                ),
                 spatial_bucket,
             };
             table.push_entry(entry, entry_index);
@@ -426,14 +403,13 @@ impl HitSideTable {
             if !changed_nodes.contains(&entry.node) {
                 continue;
             }
-            let node =
-                document
-                    .nodes
-                    .get(&entry.node)
-                    .ok_or_else(|| PatchApplyError::StaleReference {
-                        reference_kind: "hit_region_node",
-                        id: entry.node.clone(),
-                    })?;
+            document
+                .nodes
+                .get(&entry.node)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "hit_region_node",
+                    id: entry.node.clone(),
+                })?;
             let hot =
                 hot_ids
                     .hot_id(&entry.node)
@@ -446,22 +422,13 @@ impl HitSideTable {
             entry.source_binding_id = primary.map(|binding| binding.binding_id.clone());
             entry.source_path = primary.map(|binding| binding.route.source_path.clone());
             entry.source_intent = primary.map(|binding| binding.route.intent.clone());
+            entry.source_route = primary.and_then(|binding| binding.route.token.clone());
             entry.source_binding_refs = bindings.iter().map(|binding| binding.reference).collect();
             entry.source_routes = bindings
                 .iter()
                 .map(|binding| binding.route.clone())
                 .collect();
             entry.scroll_root = scroll_root_for_node(document, &entry.node);
-            entry.row_key = style_u64_any(&node.style, &["row_key", "target_key", "__row_key"]);
-            entry.row_generation = style_u64_any(
-                &node.style,
-                &[
-                    "row_generation",
-                    "target_generation",
-                    "generation",
-                    "__row_generation",
-                ],
-            );
         }
         Ok(())
     }
@@ -551,10 +518,6 @@ fn scroll_root_for_node(document: &DocumentFrame, node: &DocumentNodeId) -> Opti
         current = node.and_then(|node| node.parent.clone());
     }
     None
-}
-
-fn style_u64_any(style: &StyleMap, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| style_u64(style, key))
 }
 
 fn style_u64(style: &StyleMap, key: &str) -> Option<u64> {
@@ -1698,6 +1661,8 @@ pub struct DocumentTypedBindingRef {
 pub struct DocumentTypedBindingRoute {
     pub source_path: String,
     pub intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<SourceRouteToken>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2135,11 +2100,8 @@ impl DocumentInternIndex {
         let source_bindings = node
             .source_bindings()
             .map(|binding| {
-                self.source_bindings.intern(stable_source_binding_key(
-                    &binding.id.0,
-                    &binding.source_path,
-                    &binding.intent,
-                ))
+                self.source_bindings
+                    .intern(stable_source_binding_key(binding))
             })
             .collect::<Vec<_>>();
         self.nodes.insert(
@@ -2778,6 +2740,7 @@ impl DocumentTypedBindingIndex {
             let route = DocumentTypedBindingRoute {
                 source_path: binding.source_path.clone(),
                 intent: binding.intent.clone(),
+                token: binding.route.clone(),
             };
             let typed = DocumentTypedBinding {
                 node: hot_ref,
@@ -4349,11 +4312,6 @@ fn patch_hit_metadata_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeI
             DocumentPatch::SetBinding { id, .. } | DocumentPatch::SetBindingAt { id, .. } => {
                 Some(id.clone())
             }
-            DocumentPatch::SetStyle { id, patch }
-                if patch.keys().any(|key| hit_metadata_style_key(key)) =>
-            {
-                Some(id.clone())
-            }
             DocumentPatch::SetText { .. }
             | DocumentPatch::SetStyle { .. }
             | DocumentPatch::SetTextInputFocus { .. }
@@ -4367,19 +4325,6 @@ fn patch_hit_metadata_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeI
             | DocumentPatch::MoveChild { .. } => None,
         })
         .collect()
-}
-
-fn hit_metadata_style_key(key: &str) -> bool {
-    matches!(
-        key,
-        "row_key"
-            | "target_key"
-            | "__row_key"
-            | "row_generation"
-            | "target_generation"
-            | "generation"
-            | "__row_generation"
-    )
 }
 
 fn apply_ui_semantic_changes_unchecked(
@@ -6895,13 +6840,37 @@ fn stable_style_intern_key(
     key
 }
 
-fn stable_source_binding_key(id: &str, source_path: &str, intent: &str) -> String {
-    let mut key = String::from("boon-binding-v1:");
-    push_key_text(&mut key, id);
+fn stable_source_binding_key(binding: &boon_document_model::SourceBinding) -> String {
+    let mut key = String::from("boon-binding-v2:");
+    push_key_text(&mut key, &binding.id.0);
     key.push('|');
-    push_key_text(&mut key, source_path);
+    push_key_text(&mut key, &binding.source_path);
     key.push('|');
-    push_key_text(&mut key, intent);
+    push_key_text(&mut key, &binding.intent);
+    key.push('|');
+    if let Some(route) = &binding.route {
+        key.push_str(&route.program_revision.to_string());
+        key.push(':');
+        key.push_str(&route.owner.static_owner.0.to_string());
+        key.push(':');
+        key.push_str(&route.owner.ancestors.len().to_string());
+        for ancestor in &route.owner.ancestors {
+            key.push(':');
+            key.push_str(&ancestor.list.0.to_string());
+            key.push(':');
+            key.push_str(&ancestor.key.to_string());
+            key.push(':');
+            key.push_str(&ancestor.generation.to_string());
+        }
+        key.push(':');
+        key.push_str(&route.source.0.to_string());
+        key.push(':');
+        key.push_str(&route.row_generation.to_string());
+        key.push(':');
+        key.push_str(&route.binding_epoch.to_string());
+    } else {
+        key.push_str("none");
+    }
     key
 }
 

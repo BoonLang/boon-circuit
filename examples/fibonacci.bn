@@ -48,7 +48,7 @@ document: Document/new(
 
 FUNCTION fibonacci_result(sequence) {
     BLOCK {
-        selected: List/get(sequence, index: 10)
+        selected: sequence |> List/get(index: 10)
         TEXT { Position 10 is {selected.value} }
     }
 }

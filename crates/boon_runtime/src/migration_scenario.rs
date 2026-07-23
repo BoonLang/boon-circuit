@@ -653,10 +653,10 @@ impl MigrationScenarioRunner {
             .transpose()?;
         let event = runtime
             .runtime()
-            .source_event(
+            .source_event_for_path(
                 namespace.next_sequence,
                 public_source,
-                target,
+                target.as_slice(),
                 source_payload(payload)?,
             )
             .map_err(|error| ActionError::new("source_event_failed", error.to_string()))?;

@@ -69,4 +69,6 @@ cargo check -p boon_web_host --target wasm32-unknown-unknown
 cargo clippy -p boon_web_host --target wasm32-unknown-unknown --no-deps -- -D warnings
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test -p boon_web_host --target wasm32-unknown-unknown --test storage_wasm
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo test -p boon_web_effect_host --target wasm32-unknown-unknown --lib
 ```

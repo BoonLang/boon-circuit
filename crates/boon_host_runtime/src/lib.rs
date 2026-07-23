@@ -4,9 +4,10 @@
 
 mod content_store;
 
+pub use boon_runtime::ContentRef;
 pub use content_store::{
-    ContentLease, ContentRef, ContentStore, ContentStoreError, ContentStoreErrorKind,
-    ContentStoreLimits, ContentWriter,
+    ContentLease, ContentStore, ContentStoreError, ContentStoreErrorKind, ContentStoreLimits,
+    ContentWriter,
 };
 
 use atomic_write_file::AtomicWriteFile;
@@ -16,21 +17,24 @@ use boon_host_services::{
 };
 use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, FiniteReal};
 use boon_runtime::{
-    HostValueBinding, ProgramSession, RuntimeTurn, TransientEffectCallId,
-    TransientEffectCreditGrant, TransientEffectInvocation, Value,
+    ByteStreamValidator, EffectCommitPermit, EffectStopDisposition, EffectStopReason,
+    EffectTerminalReservation, HostCapabilityErrorKind, HostCapabilityRegistry, HostValueBinding,
+    ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectCreditGrant,
+    TransientEffectInvocation, Value,
 };
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle as TokioJoinHandle;
 
@@ -536,51 +540,10 @@ impl Drop for HostServiceEffectAdapter {
 }
 
 const FILE_CAPABILITY_TOKEN_BYTES: usize = 32;
-const FILE_CAPABILITY_FIRST_GENERATION: u32 = 1;
 const FILE_CAPABILITY_TOKEN_ATTEMPTS: usize = 16;
-const FILE_WORKER_RUNNING: u8 = 0;
-const FILE_WORKER_CANCEL_REQUESTED: u8 = 1;
-const FILE_WORKER_DISCARD: u8 = 2;
 const FILE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const FILE_EFFECT_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_CONTENT_TYPE: &str = "application/octet-stream";
-
-struct FileHostValueIssuer {
-    mint: Box<
-        dyn Fn([u8; FILE_CAPABILITY_TOKEN_BYTES], u32) -> Result<HostValueBinding, AdapterError>
-            + Send
-            + Sync,
-    >,
-    open: Box<
-        dyn Fn(&HostValueBinding) -> Option<([u8; FILE_CAPABILITY_TOKEN_BYTES], u32)> + Send + Sync,
-    >,
-}
-
-impl FileHostValueIssuer {
-    fn new(identity: [u8; FILE_CAPABILITY_TOKEN_BYTES]) -> Self {
-        let issuer = Arc::new(HostValueBinding::new_issuer(identity));
-        let mint_issuer = Arc::clone(&issuer);
-        Self {
-            mint: Box::new(move |handle, generation| {
-                mint_issuer
-                    .mint(handle, generation)
-                    .map_err(|error| AdapterError::new(AdapterErrorKind::Capability, error))
-            }),
-            open: Box::new(move |binding| issuer.open(binding)),
-        }
-    }
-
-    fn mint(
-        &self,
-        handle: [u8; FILE_CAPABILITY_TOKEN_BYTES],
-        generation: u32,
-    ) -> Result<HostValueBinding, AdapterError> {
-        (self.mint)(handle, generation)
-    }
-
-    fn open(&self, binding: &HostValueBinding) -> Option<([u8; FILE_CAPABILITY_TOKEN_BYTES], u32)> {
-        (self.open)(binding)
-    }
-}
 
 /// An opaque process-local reference to a host-owned file path.
 ///
@@ -647,14 +610,7 @@ fn package_asset_display_name(url: &str) -> String {
         .collect()
 }
 
-struct RegisteredFile {
-    generation: u32,
-    path: PathBuf,
-    access: FileCapabilityAccess,
-}
-
 struct ResolvedFileCapability {
-    handle: [u8; FILE_CAPABILITY_TOKEN_BYTES],
     path: PathBuf,
 }
 
@@ -666,9 +622,7 @@ enum FileCapabilityAccess {
 
 /// Bounded registry that keeps selected paths entirely on the host side.
 pub struct FileCapabilityRegistry {
-    max_capabilities: usize,
-    issuer: FileHostValueIssuer,
-    files: BTreeMap<[u8; FILE_CAPABILITY_TOKEN_BYTES], RegisteredFile>,
+    capabilities: HostCapabilityRegistry<PathBuf, FileCapabilityAccess>,
 }
 
 impl FileCapabilityRegistry {
@@ -686,23 +640,21 @@ impl FileCapabilityRegistry {
                 format_args!("cannot initialize file capability issuer: {error}"),
             )
         })?;
-        Ok(Self {
-            max_capabilities,
-            issuer: FileHostValueIssuer::new(issuer_identity),
-            files: BTreeMap::new(),
-        })
+        let capabilities = HostCapabilityRegistry::new(issuer_identity, max_capabilities)
+            .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidConfiguration, error))?;
+        Ok(Self { capabilities })
     }
 
     pub fn len(&self) -> usize {
-        self.files.len()
+        self.capabilities.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.capabilities.is_empty()
     }
 
     pub const fn capacity(&self) -> usize {
-        self.max_capabilities
+        self.capabilities.capacity()
     }
 
     pub fn register_file(
@@ -724,7 +676,7 @@ impl FileCapabilityRegistry {
         path: PathBuf,
         access: FileCapabilityAccess,
     ) -> Result<FileCapability, AdapterError> {
-        if self.files.len() >= self.max_capabilities {
+        if self.capabilities.len() >= self.capabilities.capacity() {
             return Err(AdapterError::new(
                 AdapterErrorKind::Capacity,
                 "file capability registry is at its configured capacity",
@@ -739,19 +691,13 @@ impl FileCapabilityRegistry {
                     format_args!("cannot mint file capability token: {error}"),
                 )
             })?;
-            if self.files.contains_key(&token) {
-                continue;
+            match self.capabilities.register(token, path.clone(), access) {
+                Ok(binding) => return Ok(FileCapability { binding }),
+                Err(error) if error.kind() == HostCapabilityErrorKind::DuplicateHandle => continue,
+                Err(error) => {
+                    return Err(AdapterError::new(AdapterErrorKind::Capability, error));
+                }
             }
-            self.files.insert(
-                token,
-                RegisteredFile {
-                    generation: FILE_CAPABILITY_FIRST_GENERATION,
-                    path,
-                    access,
-                },
-            );
-            let binding = self.issuer.mint(token, FILE_CAPABILITY_FIRST_GENERATION)?;
-            return Ok(FileCapability { binding });
         }
         Err(AdapterError::new(
             AdapterErrorKind::Capability,
@@ -765,60 +711,19 @@ impl FileCapabilityRegistry {
         path: impl Into<PathBuf>,
     ) -> Result<FileCapability, AdapterError> {
         let path = validated_host_path(path.into())?;
-        let (handle, binding_generation) =
-            self.issuer.open(&capability.binding).ok_or_else(|| {
-                AdapterError::new(
-                    AdapterErrorKind::Capability,
-                    "file capability belongs to another host issuer",
-                )
-            })?;
-        let entry = self.files.get_mut(&handle).ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::Capability,
-                "file capability is unknown or revoked",
-            )
-        })?;
-        if entry.generation != binding_generation {
-            return Err(AdapterError::new(
-                AdapterErrorKind::Capability,
-                "file capability generation is stale",
-            ));
-        }
-        let generation = entry.generation.checked_add(1).ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::Capability,
-                "file capability generation is exhausted",
-            )
-        })?;
-        entry.generation = generation;
-        entry.path = path;
-        let binding = self.issuer.mint(handle, generation)?;
+        let binding = self
+            .capabilities
+            .replace(&capability.binding, path)
+            .map_err(|error| AdapterError::new(AdapterErrorKind::Capability, error))?;
         Ok(FileCapability { binding })
     }
 
     pub fn revoke(&mut self, capability: &FileCapability) -> bool {
-        let Some((handle, generation)) = self.issuer.open(&capability.binding) else {
-            return false;
-        };
-        if self
-            .files
-            .get(&handle)
-            .is_none_or(|entry| entry.generation != generation)
-        {
-            return false;
-        }
-        self.files.remove(&handle);
-        true
+        self.capabilities.revoke(&capability.binding)
     }
 
     pub fn contains(&self, capability: &FileCapability) -> bool {
-        self.issuer
-            .open(&capability.binding)
-            .is_some_and(|(handle, generation)| {
-                self.files
-                    .get(&handle)
-                    .is_some_and(|entry| entry.generation == generation)
-            })
+        self.capabilities.contains(&capability.binding)
     }
 
     fn resolve_source(
@@ -840,22 +745,21 @@ impl FileCapabilityRegistry {
         capability: &FileCapability,
         access: FileCapabilityAccess,
     ) -> Result<ResolvedFileCapability, FileCapabilityLookup> {
-        let (handle, generation) = self
-            .issuer
-            .open(&capability.binding)
-            .ok_or(FileCapabilityLookup::Unknown)?;
-        let Some(entry) = self.files.get(&handle) else {
-            return Err(FileCapabilityLookup::Unknown);
-        };
-        if entry.generation != generation {
-            return Err(FileCapabilityLookup::Stale);
-        }
-        if entry.access != access {
-            return Err(FileCapabilityLookup::WrongAccess);
-        }
+        let resolved = self
+            .capabilities
+            .resolve(&capability.binding, access)
+            .map_err(|error| match error.kind() {
+                HostCapabilityErrorKind::Stale => FileCapabilityLookup::Stale,
+                HostCapabilityErrorKind::WrongAccess => FileCapabilityLookup::WrongAccess,
+                HostCapabilityErrorKind::Foreign
+                | HostCapabilityErrorKind::Unknown
+                | HostCapabilityErrorKind::InvalidConfiguration
+                | HostCapabilityErrorKind::Capacity
+                | HostCapabilityErrorKind::DuplicateHandle
+                | HostCapabilityErrorKind::GenerationExhausted => FileCapabilityLookup::Unknown,
+            })?;
         Ok(ResolvedFileCapability {
-            handle,
-            path: entry.path.clone(),
+            path: resolved.resource.clone(),
         })
     }
 }
@@ -870,6 +774,31 @@ fn validated_host_path(path: PathBuf) -> Result<PathBuf, AdapterError> {
     Ok(path)
 }
 
+fn target_resource_identity(path: &Path) -> Result<PathBuf, FileStreamFailure> {
+    if path.exists() {
+        return std::fs::canonicalize(path).map_err(|error| {
+            FileStreamFailure::new(
+                "invalid_target",
+                format!("cannot resolve file target identity: {:?}", error.kind()),
+            )
+        });
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent =
+        std::fs::canonicalize(parent.unwrap_or_else(|| Path::new("."))).map_err(|error| {
+            FileStreamFailure::new(
+                "invalid_target",
+                format!("cannot resolve file target directory: {:?}", error.kind()),
+            )
+        })?;
+    let name = path.file_name().ok_or_else(|| {
+        FileStreamFailure::new("invalid_target", "file target has no final path component")
+    })?;
+    Ok(parent.join(name))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileCapabilityLookup {
     Unknown,
@@ -882,6 +811,7 @@ pub struct FileEffectLimits {
     pub max_active: usize,
     pub event_queue_capacity: usize,
     pub credit_queue_capacity: usize,
+    pub operation_timeout: Duration,
 }
 
 impl FileEffectLimits {
@@ -894,7 +824,13 @@ impl FileEffectLimits {
             max_active,
             event_queue_capacity,
             credit_queue_capacity,
+            operation_timeout: FILE_EFFECT_DEFAULT_TIMEOUT,
         }
+    }
+
+    pub const fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
+        self.operation_timeout = operation_timeout;
+        self
     }
 }
 
@@ -904,6 +840,7 @@ impl Default for FileEffectLimits {
             max_active: 8,
             event_queue_capacity: 32,
             credit_queue_capacity: boon_effect_schema::FILE_STREAM_MAX_IN_FLIGHT as usize,
+            operation_timeout: FILE_EFFECT_DEFAULT_TIMEOUT,
         }
     }
 }
@@ -947,21 +884,37 @@ pub struct FileEffectSubmission {
 struct ActiveFileOperation {
     invocation_id: EffectInvocationId,
     max_in_flight: u32,
-    state: Arc<AtomicU8>,
+    permit: EffectCommitPermit,
+    deadline: Instant,
+    sequence_lock: Arc<Mutex<()>>,
+    next_emitted_sequence: Arc<AtomicU64>,
+    next_accepted_sequence: u64,
+    finished: Arc<AtomicBool>,
     outstanding_credits: Arc<AtomicU32>,
     credit_tx: std_mpsc::SyncSender<()>,
     task: Option<thread::JoinHandle<()>>,
-    target_token: Option<[u8; FILE_CAPABILITY_TOKEN_BYTES]>,
+    target_resource: Option<PathBuf>,
+    byte_stream_validator: Option<ByteStreamValidator>,
 }
 
 struct FileWorkerControl {
     call_id: TransientEffectCallId,
     invocation_id: EffectInvocationId,
-    state: Arc<AtomicU8>,
+    permit: EffectCommitPermit,
+    deadline: Instant,
+    sequence_lock: Arc<Mutex<()>>,
+    next_emitted_sequence: Arc<AtomicU64>,
     outstanding_credits: Arc<AtomicU32>,
     credit_rx: std_mpsc::Receiver<()>,
     events_tx: mpsc::Sender<FileEffectEvent>,
     stream: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FileWorkerExit {
+    call_id: TransientEffectCallId,
+    invocation_id: EffectInvocationId,
+    panicked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1033,10 +986,14 @@ pub struct FileEffectAdapter {
     effects: FileEffectIds,
     limits: FileEffectLimits,
     active: BTreeMap<TransientEffectCallId, ActiveFileOperation>,
-    busy_targets: BTreeMap<[u8; FILE_CAPABILITY_TOKEN_BYTES], TransientEffectCallId>,
+    retired: BTreeMap<TransientEffectCallId, ActiveFileOperation>,
+    busy_targets: BTreeMap<PathBuf, TransientEffectCallId>,
     queued_terminals: BTreeMap<TransientEffectCallId, EffectInvocationId>,
+    pending_host_events: VecDeque<FileEffectEvent>,
     events_tx: mpsc::Sender<FileEffectEvent>,
     events_rx: mpsc::Receiver<FileEffectEvent>,
+    worker_exits_tx: mpsc::UnboundedSender<FileWorkerExit>,
+    worker_exits_rx: mpsc::UnboundedReceiver<FileWorkerExit>,
 }
 
 impl FileEffectAdapter {
@@ -1078,14 +1035,16 @@ impl FileEffectAdapter {
         if limits.max_active == 0
             || limits.event_queue_capacity == 0
             || limits.credit_queue_capacity == 0
+            || limits.operation_timeout.is_zero()
         {
             return Err(AdapterError::new(
                 AdapterErrorKind::InvalidConfiguration,
-                "file stream active, event, and credit capacities must be positive",
+                "file stream active, event, credit, and timeout limits must be positive",
             ));
         }
         let effects = FileEffectIds::new()?;
         let (events_tx, events_rx) = mpsc::channel(limits.event_queue_capacity);
+        let (worker_exits_tx, worker_exits_rx) = mpsc::unbounded_channel();
         Ok(Self {
             capabilities,
             package_assets: BTreeMap::new(),
@@ -1093,10 +1052,14 @@ impl FileEffectAdapter {
             effects,
             limits,
             active: BTreeMap::new(),
+            retired: BTreeMap::new(),
             busy_targets: BTreeMap::new(),
             queued_terminals: BTreeMap::new(),
+            pending_host_events: VecDeque::new(),
             events_tx,
             events_rx,
+            worker_exits_tx,
+            worker_exits_rx,
         })
     }
 
@@ -1163,6 +1126,10 @@ impl FileEffectAdapter {
         self.active.len()
     }
 
+    pub fn retired_worker_count(&self) -> usize {
+        self.retired.len()
+    }
+
     pub fn owned_call_count(&self) -> usize {
         self.active.len() + self.queued_terminals.len()
     }
@@ -1177,6 +1144,7 @@ impl FileEffectAdapter {
         &mut self,
         invocation: TransientEffectInvocation,
     ) -> Result<FileEffectSubmission, AdapterError> {
+        self.reap_retired_workers();
         let operation = self
             .effects
             .operation(invocation.effect_id)
@@ -1187,6 +1155,7 @@ impl FileEffectAdapter {
                 )
             })?;
         if self.active.contains_key(&invocation.call_id)
+            || self.retired.contains_key(&invocation.call_id)
             || self.queued_terminals.contains_key(&invocation.call_id)
         {
             return Err(AdapterError::new(
@@ -1217,13 +1186,21 @@ impl FileEffectAdapter {
             Ok(source) => source,
             Err(failure) => return self.queue_terminal_failure(invocation, failure),
         };
-        self.start_operation(invocation, 0, 0, None, "file-read-bytes", move |control| {
-            run_file_read_bytes_worker(FileReadBytesWorker {
-                control,
-                source,
-                max_bytes: decoded.max_bytes,
-            })
-        })
+        self.start_operation(
+            invocation,
+            0,
+            0,
+            None,
+            None,
+            "file-read-bytes",
+            move |control| {
+                run_file_read_bytes_worker(FileReadBytesWorker {
+                    control,
+                    source,
+                    max_bytes: decoded.max_bytes,
+                })
+            },
+        )
     }
 
     fn submit_write_bytes(
@@ -1241,13 +1218,17 @@ impl FileEffectAdapter {
                 return self.queue_terminal_failure(invocation, file_target_lookup_failure(error));
             }
         };
-        let target_token = target.handle;
         let target_path = target.path;
+        let target_resource = match target_resource_identity(&target_path) {
+            Ok(resource) => resource,
+            Err(failure) => return self.queue_terminal_failure(invocation, failure),
+        };
         self.start_operation(
             invocation,
             0,
             0,
-            Some(target_token),
+            Some(target_resource),
+            None,
             "file-write-bytes",
             move |control| {
                 run_file_write_bytes_worker(FileWriteBytesWorker {
@@ -1279,6 +1260,7 @@ impl FileEffectAdapter {
             invocation,
             initial_credits,
             max_in_flight,
+            None,
             None,
             "content-import",
             move |control| {
@@ -1316,13 +1298,17 @@ impl FileEffectAdapter {
                 return self.queue_terminal_failure(invocation, content_store_failure(error));
             }
         };
-        let target_token = target.handle;
         let target_path = target.path;
+        let target_resource = match target_resource_identity(&target_path) {
+            Ok(resource) => resource,
+            Err(failure) => return self.queue_terminal_failure(invocation, failure),
+        };
         self.start_operation(
             invocation,
             initial_credits,
             max_in_flight,
-            Some(target_token),
+            Some(target_resource),
+            None,
             "content-save",
             move |control| {
                 run_content_save_worker(ContentSaveWorker {
@@ -1350,6 +1336,8 @@ impl FileEffectAdapter {
             Ok(source) => source,
             Err(failure) => return self.queue_terminal_failure(invocation, failure),
         };
+        let byte_stream_validator = ByteStreamValidator::new(decoded.chunk_bytes)
+            .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidConfiguration, error))?;
         let worker = FileReadWorkerInput {
             path: source.path,
             display_name: source.display_name,
@@ -1364,6 +1352,7 @@ impl FileEffectAdapter {
             initial_credits,
             max_in_flight,
             None,
+            Some(byte_stream_validator),
             "file-read-stream",
             move |control| {
                 run_file_read_worker(FileReadWorker {
@@ -1417,14 +1406,15 @@ impl FileEffectAdapter {
         invocation: TransientEffectInvocation,
         initial_credits: u32,
         max_in_flight: u32,
-        target_token: Option<[u8; FILE_CAPABILITY_TOKEN_BYTES]>,
+        target_resource: Option<PathBuf>,
+        byte_stream_validator: Option<ByteStreamValidator>,
         worker_name: &'static str,
         worker: F,
     ) -> Result<FileEffectSubmission, AdapterError>
     where
         F: FnOnce(FileWorkerControl) + Send + 'static,
     {
-        if self.active.len() >= self.limits.max_active {
+        if self.active.len().saturating_add(self.retired.len()) >= self.limits.max_active {
             return self.queue_terminal_failure(
                 invocation,
                 FileStreamFailure::new(
@@ -1433,30 +1423,54 @@ impl FileEffectAdapter {
                 ),
             );
         }
-        if let Some(token) = target_token
-            && self.busy_targets.contains_key(&token)
+        self.reap_retired_workers();
+        if let Some(resource) = target_resource.as_ref()
+            && self.busy_targets.contains_key(resource)
         {
             return self.queue_terminal_outcome(invocation, tagged("Busy", BTreeMap::new()));
         }
 
         let call_id = invocation.call_id;
         let invocation_id = invocation.invocation_id;
-        let state = Arc::new(AtomicU8::new(FILE_WORKER_RUNNING));
+        let deadline = Instant::now()
+            .checked_add(self.limits.operation_timeout)
+            .ok_or_else(|| {
+                AdapterError::new(
+                    AdapterErrorKind::InvalidConfiguration,
+                    "file operation timeout exceeds the monotonic clock range",
+                )
+            })?;
+        let permit = EffectCommitPermit::new();
+        let sequence_lock = Arc::new(Mutex::new(()));
+        let next_emitted_sequence = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
         let outstanding_credits = Arc::new(AtomicU32::new(initial_credits));
         let (credit_tx, credit_rx) = std_mpsc::sync_channel(self.limits.credit_queue_capacity);
         let control = FileWorkerControl {
             call_id,
             invocation_id,
-            state: Arc::clone(&state),
+            permit: permit.clone(),
+            deadline,
+            sequence_lock: Arc::clone(&sequence_lock),
+            next_emitted_sequence: Arc::clone(&next_emitted_sequence),
             outstanding_credits: Arc::clone(&outstanding_credits),
             credit_rx,
             events_tx: self.events_tx.clone(),
             stream: max_in_flight > 0,
         };
+        let worker_exits_tx = self.worker_exits_tx.clone();
+        let worker_finished = Arc::clone(&finished);
         let task = match thread::Builder::new()
-            .name(format!("boon-{worker_name}-{}", call_id.sequence()))
-            .spawn(move || worker(control))
-        {
+            .name(format!("boon-{worker_name}"))
+            .spawn(move || {
+                let panicked = catch_unwind(AssertUnwindSafe(|| worker(control))).is_err();
+                worker_finished.store(true, Ordering::Release);
+                let _ = worker_exits_tx.send(FileWorkerExit {
+                    call_id,
+                    invocation_id,
+                    panicked,
+                });
+            }) {
             Ok(task) => task,
             Err(error) => {
                 return self.queue_terminal_failure(
@@ -1468,19 +1482,25 @@ impl FileEffectAdapter {
                 );
             }
         };
-        if let Some(token) = target_token {
-            self.busy_targets.insert(token, call_id);
+        if let Some(resource) = target_resource.as_ref() {
+            self.busy_targets.insert(resource.clone(), call_id);
         }
         self.active.insert(
             call_id,
             ActiveFileOperation {
                 invocation_id,
                 max_in_flight,
-                state,
+                permit,
+                deadline,
+                sequence_lock,
+                next_emitted_sequence,
+                next_accepted_sequence: 0,
+                finished,
                 outstanding_credits,
                 credit_tx,
                 task: Some(task),
-                target_token,
+                target_resource,
+                byte_stream_validator,
             },
         );
         Ok(FileEffectSubmission {
@@ -1491,53 +1511,144 @@ impl FileEffectAdapter {
 
     pub async fn next_event(&mut self) -> Result<FileEffectEvent, AdapterError> {
         loop {
-            let event = self.events_rx.recv().await.ok_or_else(|| {
+            self.reap_retired_workers();
+            self.drain_worker_exits()?;
+            if let Some(event) = self.try_take_ready_event()? {
+                return Ok(event);
+            }
+            self.expire_deadlines()?;
+            if let Some(event) = self.try_take_ready_event()? {
+                return Ok(event);
+            }
+            let event = if let Some(deadline) = self.next_deadline() {
+                tokio::select! {
+                    biased;
+                    event = self.events_rx.recv() => event,
+                    exit = self.worker_exits_rx.recv() => {
+                        if let Some(exit) = exit {
+                            self.accept_worker_exit(exit)?;
+                        }
+                        continue;
+                    }
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        continue;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    event = self.events_rx.recv() => event,
+                    exit = self.worker_exits_rx.recv() => {
+                        if let Some(exit) = exit {
+                            self.accept_worker_exit(exit)?;
+                        }
+                        continue;
+                    }
+                }
+            }
+            .ok_or_else(|| {
                 AdapterError::new(AdapterErrorKind::Closed, "file stream event lane closed")
             })?;
-            if let Some(event) = self.accept_event(event) {
+            if let Some(event) = self.accept_event(event)? {
                 return Ok(event);
             }
         }
     }
 
     pub fn try_next_event(&mut self) -> Result<Option<FileEffectEvent>, AdapterError> {
+        self.reap_retired_workers();
+        self.drain_worker_exits()?;
+        if let Some(event) = self.try_take_ready_event()? {
+            return Ok(Some(event));
+        }
+        self.expire_deadlines()?;
+        self.try_take_ready_event()
+    }
+
+    fn try_take_ready_event(&mut self) -> Result<Option<FileEffectEvent>, AdapterError> {
         loop {
             match self.events_rx.try_recv() {
                 Ok(event) => {
-                    if let Some(event) = self.accept_event(event) {
+                    if let Some(event) = self.accept_event(event)? {
                         return Ok(Some(event));
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => return Ok(None),
+                Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(AdapterError::new(
-                        AdapterErrorKind::Closed,
-                        "file stream event lane closed",
-                    ));
+                    if self.pending_host_events.is_empty() {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Closed,
+                            "file stream event lane closed",
+                        ));
+                    }
+                    break;
                 }
             }
         }
+        while let Some(event) = self.pending_host_events.pop_front() {
+            if let Some(event) = self.accept_event(event)? {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.active
+            .values()
+            .filter_map(|active| {
+                active
+                    .permit
+                    .stop_reason()
+                    .is_none()
+                    .then_some(active.deadline)
+            })
+            .min()
+    }
+
+    fn expire_deadlines(&mut self) -> Result<(), AdapterError> {
+        let now = Instant::now();
+        let expired = self
+            .active
+            .iter()
+            .filter_map(|(call_id, active)| {
+                (active.deadline <= now && active.permit.stop_reason().is_none())
+                    .then_some(*call_id)
+            })
+            .collect::<Vec<_>>();
+        for call_id in expired {
+            let Some(active) = self.active.get_mut(&call_id) else {
+                continue;
+            };
+            let _sequence_guard = active
+                .sequence_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.permit.request_timeout()
+                == EffectStopDisposition::Accepted(EffectStopReason::TimedOut)
+            {
+                let _ = active.credit_tx.try_send(());
+            }
+        }
+        Ok(())
     }
 
     /// Requests an in-contract `Cancelled` terminal result.
     pub fn request_cancel(&mut self, call_id: TransientEffectCallId) -> bool {
-        let Some(active) = self.active.get(&call_id) else {
+        let Some(active) = self.active.get_mut(&call_id) else {
             return false;
         };
-        let requested = active
-            .state
-            .compare_exchange(
-                FILE_WORKER_RUNNING,
-                FILE_WORKER_CANCEL_REQUESTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-            || active.state.load(Ordering::Acquire) == FILE_WORKER_CANCEL_REQUESTED;
-        if requested {
+        let _sequence_guard = active
+            .sequence_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.permit.request_cancel()
+            == EffectStopDisposition::Accepted(EffectStopReason::Cancelled)
+        {
             let _ = active.credit_tx.try_send(());
+            return true;
         }
-        requested
+        false
     }
 
     /// Discards a runtime-cancelled call without trying to deliver another result.
@@ -1545,15 +1656,108 @@ impl FileEffectAdapter {
         let mut found = false;
         if let Some(active) = self.active.remove(&call_id) {
             found = true;
-            if let Some(target_token) = active.target_token {
-                self.busy_targets.remove(&target_token);
-            }
-            stop_file_worker(active);
+            active.permit.discard();
+            let _ = active.credit_tx.try_send(());
+            self.retired.insert(call_id, active);
         }
         if self.queued_terminals.remove(&call_id).is_some() {
             found = true;
         }
         found
+    }
+
+    fn reap_retired_workers(&mut self) {
+        let finished = self
+            .retired
+            .iter()
+            .filter_map(|(call_id, active)| {
+                active.finished.load(Ordering::Acquire).then_some(*call_id)
+            })
+            .collect::<Vec<_>>();
+        for call_id in finished {
+            let active = self
+                .retired
+                .remove(&call_id)
+                .expect("finished retired worker was just observed");
+            self.release_busy_target(call_id, &active);
+            release_file_worker(active);
+        }
+    }
+
+    fn drain_worker_exits(&mut self) -> Result<(), AdapterError> {
+        loop {
+            match self.worker_exits_rx.try_recv() {
+                Ok(exit) => self.accept_worker_exit(exit)?,
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+
+    fn accept_worker_exit(&mut self, exit: FileWorkerExit) -> Result<(), AdapterError> {
+        if self
+            .retired
+            .get(&exit.call_id)
+            .is_some_and(|active| active.invocation_id == exit.invocation_id)
+        {
+            self.reap_retired_workers();
+            return Ok(());
+        }
+        if !exit.panicked {
+            return Ok(());
+        }
+        let Some(active) = self.active.get_mut(&exit.call_id) else {
+            return Ok(());
+        };
+        if active.invocation_id != exit.invocation_id {
+            return Ok(());
+        }
+        let _sequence_guard = active
+            .sequence_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = match active.permit.reserve_terminal() {
+            EffectTerminalReservation::Deliver => file_failure_outcome(FileStreamFailure::new(
+                "worker_panicked",
+                "file worker terminated unexpectedly",
+            )),
+            EffectTerminalReservation::Cancelled => file_cancelled_outcome(),
+            EffectTerminalReservation::TimedOut => file_timed_out_outcome(),
+            EffectTerminalReservation::Discarded | EffectTerminalReservation::AlreadyReserved => {
+                return Ok(());
+            }
+        };
+        let result_sequence = active.next_emitted_sequence.load(Ordering::Acquire);
+        let next_sequence = result_sequence.checked_add(1).ok_or_else(|| {
+            AdapterError::new(
+                AdapterErrorKind::Capacity,
+                "file effect result sequence overflow",
+            )
+        })?;
+        active
+            .next_emitted_sequence
+            .store(next_sequence, Ordering::Release);
+        self.pending_host_events.push_back(FileEffectEvent {
+            call_id: exit.call_id,
+            invocation_id: exit.invocation_id,
+            result_sequence,
+            outcome,
+            terminal: true,
+            stream: active.max_in_flight > 0,
+        });
+        Ok(())
+    }
+
+    fn release_busy_target(
+        &mut self,
+        call_id: TransientEffectCallId,
+        active: &ActiveFileOperation,
+    ) {
+        if let Some(resource) = active.target_resource.as_ref()
+            && self.busy_targets.get(resource) == Some(&call_id)
+        {
+            self.busy_targets.remove(resource);
+        }
     }
 
     pub fn cancel_all(&mut self) -> Vec<TransientEffectCallId> {
@@ -1679,31 +1883,65 @@ impl FileEffectAdapter {
         })
     }
 
-    fn accept_event(&mut self, event: FileEffectEvent) -> Option<FileEffectEvent> {
+    fn accept_event(
+        &mut self,
+        event: FileEffectEvent,
+    ) -> Result<Option<FileEffectEvent>, AdapterError> {
         if let Some(invocation_id) = self.queued_terminals.remove(&event.call_id) {
-            if invocation_id != event.invocation_id || !event.terminal {
-                return None;
+            if invocation_id != event.invocation_id || !event.terminal || event.result_sequence != 0
+            {
+                return Ok(None);
             }
-            return Some(event);
+            return Ok(Some(event));
         }
-        let Some(active) = self.active.get(&event.call_id) else {
-            return None;
+        let Some(active) = self.active.get_mut(&event.call_id) else {
+            return Ok(None);
         };
         if active.invocation_id != event.invocation_id {
             self.cancel(event.call_id);
-            return None;
+            return Ok(None);
+        }
+        if event.result_sequence != active.next_accepted_sequence {
+            let expected = active.next_accepted_sequence;
+            self.cancel(event.call_id);
+            return Err(AdapterError::new(
+                AdapterErrorKind::Worker,
+                format_args!(
+                    "file effect expected result sequence {expected}, received {}",
+                    event.result_sequence
+                ),
+            ));
+        }
+        active.next_accepted_sequence =
+            active
+                .next_accepted_sequence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    AdapterError::new(
+                        AdapterErrorKind::Capacity,
+                        "file effect accepted result sequence overflow",
+                    )
+                })?;
+        if let Some(validator) = active.byte_stream_validator.as_mut()
+            && let Err(error) =
+                validator.accept(event.result_sequence, &event.outcome, event.terminal)
+        {
+            self.cancel(event.call_id);
+            return Err(AdapterError::new(AdapterErrorKind::Worker, error));
         }
         if event.terminal {
             let active = self
                 .active
                 .remove(&event.call_id)
                 .expect("active file call was just observed");
-            if let Some(target_token) = active.target_token {
-                self.busy_targets.remove(&target_token);
+            if active.finished.load(Ordering::Acquire) {
+                self.release_busy_target(event.call_id, &active);
+                release_file_worker(active);
+            } else {
+                self.retired.insert(event.call_id, active);
             }
-            finish_file_worker(active);
         }
-        Some(event)
+        Ok(Some(event))
     }
 }
 
@@ -2139,7 +2377,8 @@ impl FileStreamFailure {
     }
 }
 
-fn content_store_failure(error: ContentStoreError) -> FileStreamFailure {
+fn content_store_failure(error: impl Into<ContentStoreError>) -> FileStreamFailure {
+    let error = error.into();
     let code = match error.kind() {
         ContentStoreErrorKind::Capacity => "content_store_full",
         ContentStoreErrorKind::Missing => "content_missing",
@@ -2164,6 +2403,13 @@ fn file_failure_outcome(failure: FileStreamFailure) -> Value {
 
 fn file_cancelled_outcome() -> Value {
     tagged("Cancelled", BTreeMap::new())
+}
+
+fn file_timed_out_outcome() -> Value {
+    file_failure_outcome(FileStreamFailure::new(
+        "timeout",
+        "file operation exceeded its host deadline",
+    ))
 }
 
 struct FileReadWorker {
@@ -2209,6 +2455,7 @@ struct ContentSaveWorker {
 enum WorkerFlow {
     Continue,
     NeedCancelled,
+    NeedTimedOut,
     Terminal,
     Stopped,
 }
@@ -2217,14 +2464,26 @@ enum WorkerFlow {
 enum CreditReservation {
     Reserved,
     NeedCancelled,
+    NeedTimedOut,
     Stopped,
+}
+
+fn finish_worker_flow(control: &FileWorkerControl, result_sequence: &mut u64, flow: WorkerFlow) {
+    match flow {
+        WorkerFlow::NeedCancelled => {
+            emit_cancelled(control, result_sequence);
+        }
+        WorkerFlow::NeedTimedOut => {
+            emit_timed_out(control, result_sequence);
+        }
+        WorkerFlow::Continue | WorkerFlow::Terminal | WorkerFlow::Stopped => {}
+    }
 }
 
 fn run_file_read_bytes_worker(worker: FileReadBytesWorker) {
     let mut result_sequence = 0_u64;
-    if read_file_bytes(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
-        emit_cancelled(&worker.control, &mut result_sequence);
-    }
+    let flow = read_file_bytes(&worker, &mut result_sequence);
+    finish_worker_flow(&worker.control, &mut result_sequence, flow);
 }
 
 fn read_file_bytes(worker: &FileReadBytesWorker, result_sequence: &mut u64) -> WorkerFlow {
@@ -2331,9 +2590,8 @@ fn read_file_bytes(worker: &FileReadBytesWorker, result_sequence: &mut u64) -> W
 
 fn run_file_write_bytes_worker(worker: FileWriteBytesWorker) {
     let mut result_sequence = 0_u64;
-    if write_file_bytes(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
-        emit_cancelled(&worker.control, &mut result_sequence);
-    }
+    let flow = write_file_bytes(&worker, &mut result_sequence);
+    finish_worker_flow(&worker.control, &mut result_sequence, flow);
 }
 
 fn write_file_bytes(worker: &FileWriteBytesWorker, result_sequence: &mut u64) -> WorkerFlow {
@@ -2366,7 +2624,13 @@ fn write_file_bytes(worker: &FileWriteBytesWorker, result_sequence: &mut u64) ->
         WorkerFlow::Continue => {}
         other => return other,
     }
-    if let Err(error) = file.commit() {
+    let commit_guard = match worker.control.permit.begin_commit() {
+        Ok(guard) => guard,
+        Err(_) => return stopped_worker_flow(&worker.control),
+    };
+    let commit = file.commit();
+    commit_guard.finish();
+    if let Err(error) = commit {
         return send_io_failure(
             &worker.control,
             result_sequence,
@@ -2399,9 +2663,8 @@ fn write_file_bytes(worker: &FileWriteBytesWorker, result_sequence: &mut u64) ->
 
 fn run_content_import_worker(worker: ContentImportWorker) {
     let mut result_sequence = 0_u64;
-    if import_content(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
-        emit_cancelled(&worker.control, &mut result_sequence);
-    }
+    let flow = import_content(&worker, &mut result_sequence);
+    finish_worker_flow(&worker.control, &mut result_sequence, flow);
 }
 
 fn import_content(worker: &ContentImportWorker, result_sequence: &mut u64) -> WorkerFlow {
@@ -2527,6 +2790,7 @@ fn import_content(worker: &ContentImportWorker, result_sequence: &mut u64) -> Wo
         match reserve_credit(&worker.control) {
             CreditReservation::Reserved => {}
             CreditReservation::NeedCancelled => return WorkerFlow::NeedCancelled,
+            CreditReservation::NeedTimedOut => return WorkerFlow::NeedTimedOut,
             CreditReservation::Stopped => return WorkerFlow::Stopped,
         }
         let completed_value = match file_number(completed_bytes, "completed import bytes") {
@@ -2575,7 +2839,13 @@ fn import_content(worker: &ContentImportWorker, result_sequence: &mut u64) -> Wo
             );
         }
     };
-    let content = match content_writer.finish(content) {
+    let commit_guard = match worker.control.permit.begin_commit() {
+        Ok(guard) => guard,
+        Err(_) => return stopped_worker_flow(&worker.control),
+    };
+    let content = content_writer.finish(content);
+    commit_guard.finish();
+    let content = match content {
         Ok(content) => content,
         Err(error) => {
             return send_outcome(
@@ -2610,9 +2880,8 @@ fn import_content(worker: &ContentImportWorker, result_sequence: &mut u64) -> Wo
 
 fn run_content_save_worker(worker: ContentSaveWorker) {
     let mut result_sequence = 0_u64;
-    if save_content(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
-        emit_cancelled(&worker.control, &mut result_sequence);
-    }
+    let flow = save_content(&worker, &mut result_sequence);
+    finish_worker_flow(&worker.control, &mut result_sequence, flow);
 }
 
 fn save_content(worker: &ContentSaveWorker, result_sequence: &mut u64) -> WorkerFlow {
@@ -2709,6 +2978,7 @@ fn save_content(worker: &ContentSaveWorker, result_sequence: &mut u64) -> Worker
         match reserve_credit(&worker.control) {
             CreditReservation::Reserved => {}
             CreditReservation::NeedCancelled => return WorkerFlow::NeedCancelled,
+            CreditReservation::NeedTimedOut => return WorkerFlow::NeedTimedOut,
             CreditReservation::Stopped => return WorkerFlow::Stopped,
         }
         let completed_value = match file_number(completed_bytes, "completed saved bytes") {
@@ -2755,7 +3025,13 @@ fn save_content(worker: &ContentSaveWorker, result_sequence: &mut u64) -> Worker
             true,
         );
     }
-    if let Err(error) = target.commit() {
+    let commit_guard = match worker.control.permit.begin_commit() {
+        Ok(guard) => guard,
+        Err(_) => return stopped_worker_flow(&worker.control),
+    };
+    let commit = target.commit();
+    commit_guard.finish();
+    if let Err(error) = commit {
         return send_io_failure(
             &worker.control,
             result_sequence,
@@ -2776,10 +3052,21 @@ fn save_content(worker: &ContentSaveWorker, result_sequence: &mut u64) -> Worker
 }
 
 fn worker_state(control: &FileWorkerControl) -> WorkerFlow {
-    match control.state.load(Ordering::Acquire) {
-        FILE_WORKER_DISCARD => WorkerFlow::Stopped,
-        FILE_WORKER_CANCEL_REQUESTED => WorkerFlow::NeedCancelled,
-        _ => WorkerFlow::Continue,
+    if Instant::now() >= control.deadline {
+        control.permit.request_timeout();
+    }
+    match control.permit.stop_reason() {
+        Some(EffectStopReason::Discarded) => WorkerFlow::Stopped,
+        Some(EffectStopReason::TimedOut) => WorkerFlow::NeedTimedOut,
+        Some(EffectStopReason::Cancelled) => WorkerFlow::NeedCancelled,
+        None => WorkerFlow::Continue,
+    }
+}
+
+fn stopped_worker_flow(control: &FileWorkerControl) -> WorkerFlow {
+    match worker_state(control) {
+        WorkerFlow::Continue | WorkerFlow::Terminal => WorkerFlow::Stopped,
+        flow => flow,
     }
 }
 
@@ -2816,17 +3103,14 @@ fn send_io_failure(
 
 fn run_file_read_worker(worker: FileReadWorker) {
     let mut result_sequence = 0_u64;
-    if stream_file(&worker, &mut result_sequence) == WorkerFlow::NeedCancelled {
-        emit_cancelled(&worker.control, &mut result_sequence);
-    }
+    let flow = stream_file(&worker, &mut result_sequence);
+    finish_worker_flow(&worker.control, &mut result_sequence, flow);
 }
 
 fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow {
-    if worker.control.state.load(Ordering::Acquire) == FILE_WORKER_CANCEL_REQUESTED {
-        return WorkerFlow::NeedCancelled;
-    }
-    if worker.control.state.load(Ordering::Acquire) == FILE_WORKER_DISCARD {
-        return WorkerFlow::Stopped;
+    match worker_state(&worker.control) {
+        WorkerFlow::Continue => {}
+        other => return other,
     }
     let mut file = match File::open(&worker.input.path) {
         Ok(file) => file,
@@ -2918,10 +3202,9 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
     let mut chunk_sequence = 0_u64;
     let mut buffer = vec![0_u8; worker.input.chunk_bytes];
     loop {
-        match worker.control.state.load(Ordering::Acquire) {
-            FILE_WORKER_DISCARD => return WorkerFlow::Stopped,
-            FILE_WORKER_CANCEL_REQUESTED => return WorkerFlow::NeedCancelled,
-            _ => {}
+        match worker_state(&worker.control) {
+            WorkerFlow::Continue => {}
+            other => return other,
         }
         let read = match file.read(&mut buffer) {
             Ok(read) => read,
@@ -2952,7 +3235,13 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
                 }
             };
             let retained_content = if let Some(writer) = content_writer.take() {
-                match writer.finish(content) {
+                let commit_guard = match worker.control.permit.begin_commit() {
+                    Ok(guard) => guard,
+                    Err(_) => return stopped_worker_flow(&worker.control),
+                };
+                let retained_content = writer.finish(content);
+                commit_guard.finish();
+                match retained_content {
                     Ok(content) => Some(content),
                     Err(error) => {
                         return send_outcome(
@@ -3066,6 +3355,7 @@ fn stream_file(worker: &FileReadWorker, result_sequence: &mut u64) -> WorkerFlow
         match reserve_credit(&worker.control) {
             CreditReservation::Reserved => {}
             CreditReservation::NeedCancelled => return WorkerFlow::NeedCancelled,
+            CreditReservation::NeedTimedOut => return WorkerFlow::NeedTimedOut,
             CreditReservation::Stopped => return WorkerFlow::Stopped,
         }
         match send_outcome(
@@ -3098,12 +3388,17 @@ fn emit_cancelled(control: &FileWorkerControl, result_sequence: &mut u64) -> Wor
     send_outcome(control, result_sequence, file_cancelled_outcome(), true)
 }
 
+fn emit_timed_out(control: &FileWorkerControl, result_sequence: &mut u64) -> WorkerFlow {
+    send_outcome(control, result_sequence, file_timed_out_outcome(), true)
+}
+
 fn reserve_credit(control: &FileWorkerControl) -> CreditReservation {
     loop {
-        match control.state.load(Ordering::Acquire) {
-            FILE_WORKER_DISCARD => return CreditReservation::Stopped,
-            FILE_WORKER_CANCEL_REQUESTED => return CreditReservation::NeedCancelled,
-            _ => {}
+        match worker_state(control) {
+            WorkerFlow::Continue => {}
+            WorkerFlow::NeedCancelled => return CreditReservation::NeedCancelled,
+            WorkerFlow::NeedTimedOut => return CreditReservation::NeedTimedOut,
+            WorkerFlow::Terminal | WorkerFlow::Stopped => return CreditReservation::Stopped,
         }
         let mut current = control.outstanding_credits.load(Ordering::Acquire);
         while current > 0 {
@@ -3132,39 +3427,69 @@ fn send_outcome(
     mut outcome: Value,
     mut terminal: bool,
 ) -> WorkerFlow {
-    let mut event = FileEffectEvent {
-        call_id: control.call_id,
-        invocation_id: control.invocation_id,
-        result_sequence: *result_sequence,
-        outcome: outcome.clone(),
-        terminal,
-        stream: control.stream,
-    };
+    let mut terminal_reserved = false;
     loop {
-        match control.state.load(Ordering::Acquire) {
-            FILE_WORKER_DISCARD => return WorkerFlow::Stopped,
-            FILE_WORKER_CANCEL_REQUESTED if !terminal => {
-                outcome = file_cancelled_outcome();
-                terminal = true;
-                event.outcome = outcome.clone();
-                event.terminal = true;
+        let sequence_guard = control
+            .sequence_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !terminal {
+            match worker_state(control) {
+                WorkerFlow::Continue => {}
+                WorkerFlow::NeedCancelled => {
+                    outcome = file_cancelled_outcome();
+                    terminal = true;
+                }
+                WorkerFlow::NeedTimedOut => {
+                    outcome = file_timed_out_outcome();
+                    terminal = true;
+                }
+                WorkerFlow::Terminal | WorkerFlow::Stopped => return WorkerFlow::Stopped,
             }
-            _ => {}
         }
+        if terminal && !terminal_reserved {
+            outcome = match control.permit.reserve_terminal() {
+                EffectTerminalReservation::Deliver => outcome,
+                EffectTerminalReservation::Cancelled => file_cancelled_outcome(),
+                EffectTerminalReservation::TimedOut => file_timed_out_outcome(),
+                EffectTerminalReservation::Discarded
+                | EffectTerminalReservation::AlreadyReserved => return WorkerFlow::Stopped,
+            };
+            terminal_reserved = true;
+        }
+        let emitted_sequence = control.next_emitted_sequence.load(Ordering::Acquire);
+        let event = FileEffectEvent {
+            call_id: control.call_id,
+            invocation_id: control.invocation_id,
+            result_sequence: emitted_sequence,
+            outcome: outcome.clone(),
+            terminal,
+            stream: control.stream,
+        };
         match control.events_tx.try_send(event) {
             Ok(()) => {
-                *result_sequence = result_sequence.saturating_add(1);
+                let Some(next_sequence) = emitted_sequence.checked_add(1) else {
+                    return WorkerFlow::Stopped;
+                };
+                control
+                    .next_emitted_sequence
+                    .store(next_sequence, Ordering::Release);
+                *result_sequence = next_sequence;
+                drop(sequence_guard);
                 return if terminal {
                     WorkerFlow::Terminal
                 } else {
                     WorkerFlow::Continue
                 };
             }
-            Err(mpsc::error::TrySendError::Full(returned)) => {
-                event = returned;
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                drop(sequence_guard);
                 thread::sleep(FILE_WORKER_POLL_INTERVAL);
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => return WorkerFlow::Stopped,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                drop(sequence_guard);
+                return WorkerFlow::Stopped;
+            }
         }
     }
 }
@@ -3185,18 +3510,11 @@ fn file_number(value: u64, context: &str) -> Result<Value, FileStreamFailure> {
     Ok(Value::Number(value))
 }
 
-fn stop_file_worker(mut active: ActiveFileOperation) {
-    active.state.store(FILE_WORKER_DISCARD, Ordering::Release);
-    let _ = active.credit_tx.try_send(());
+fn release_file_worker(mut active: ActiveFileOperation) {
     drop(active.credit_tx);
-    if let Some(task) = active.task.take() {
-        let _ = task.join();
-    }
-}
-
-fn finish_file_worker(mut active: ActiveFileOperation) {
-    drop(active.credit_tx);
-    if let Some(task) = active.task.take() {
+    if let Some(task) = active.task.take()
+        && task.is_finished()
+    {
         let _ = task.join();
     }
 }

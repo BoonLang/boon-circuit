@@ -1,12 +1,15 @@
 use super::{
-    DerivedListStorageIds, ExecutableStatementId, ExprId, FieldDef, FieldId, ListId, ListMemory,
-    RowScope, ScopeId, SemanticMemoryId, StateCell, StateId, is_output_registry_value_path,
-    scope_id_for_path, statement_expr_ids_recursive,
+    ContextualMaterialization, DerivedListStorageIds, ErasedBinding, ErasedBindingTarget,
+    ErasedFieldDef, ErasedReadTarget, ErasedScopeIndex, ExecutableCallableKind, ExecutableExprId,
+    ExecutableExpressionKind, ExecutableProgram, ExecutableStatement, ExecutableStatementId,
+    ExprId, FieldId, ListId, ListMemory, ScopeId, SemanticMemoryId, StateCell, StateId,
+    executable_expression_children, is_output_registry_value_path,
+    reachable_executable_expression_ids,
 };
-use boon_parser::{
-    AstDrainPath, AstExpr, AstExprKind, AstStatement, AstStatementKind, ParsedProgram,
+use boon_typecheck::{
+    BytesType, CheckedDeclaration, CheckedExprId, CheckedExpression, CheckedExpressionKind,
+    CheckedProgram, CheckedProgramLoweringMetadata, DeclId, Type, Variant,
 };
-use boon_typecheck::{BytesType, Type, TypeCheckReport, Variant};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -148,71 +151,102 @@ pub enum MigrationTransform {
 }
 
 pub(super) fn lower_semantic_memory_and_migrations(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    row_scopes: &[RowScope],
+    checked: &CheckedProgram,
+    executable: &ExecutableProgram,
     state_cells: &[StateCell],
     lists: &[ListMemory],
+    materializations: &[ContextualMaterialization],
     derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    typecheck_report: &TypeCheckReport,
+    storage: &ErasedScopeIndex,
 ) -> Result<(Vec<SemanticMemory>, Vec<MigrationEdge>), String> {
     let mut memory = build_semantic_memory(
-        program,
-        fields,
-        row_scopes,
+        checked,
+        executable,
         state_cells,
         lists,
         derived_list_storage,
-        typecheck_report,
+        storage,
     )?;
-    let migration_fields = migration_field_defs(program, fields);
-    let fields = migration_fields.as_slice();
-    let has_markers = program.expressions.iter().any(|expr| {
-        matches!(
-            expr.kind,
-            AstExprKind::Drain { .. } | AstExprKind::Draining { .. }
-        )
+    let mut reachable = reachable_executable_expression_ids(executable, materializations)?;
+    loop {
+        let before = reachable.len();
+        for expression in &executable.expressions {
+            if let ExecutableExpressionKind::Draining { input } = expression.kind
+                && reachable.contains(&input)
+            {
+                reachable.insert(expression.id);
+            }
+        }
+        if reachable.len() == before {
+            break;
+        }
+    }
+    let has_markers = executable.expressions.iter().any(|expression| {
+        reachable.contains(&expression.id)
+            && matches!(
+                expression.kind,
+                ExecutableExpressionKind::Drain { .. } | ExecutableExpressionKind::Draining { .. }
+            )
     });
     if !has_markers {
         return Ok((memory, Vec::new()));
     }
 
-    let parents = expression_parents(&program.expressions);
-    associate_draining_markers(program, fields, state_cells, &parents, &mut memory)?;
-    let mut drains = {
-        let authority = AuthorityIndex::new(&memory, state_cells);
-        collect_drains(
-            program,
-            fields,
-            state_cells,
-            lists,
-            typecheck_report,
-            &parents,
-            &authority,
-        )?
-    };
+    validate_checked_marker_identity(checked, executable, &reachable)?;
+    associate_draining_markers(
+        executable,
+        derived_list_storage,
+        storage,
+        &reachable,
+        &mut memory,
+    )?;
+    let exact_drain_sources = exact_drain_sources(executable, storage, &reachable, &memory)?;
+    let exact_drain_destinations =
+        exact_drain_destinations(executable, materializations, storage, &reachable, &memory)?;
+    let mut drains = collect_drains(
+        checked,
+        executable,
+        materializations,
+        &reachable,
+        &memory,
+        &exact_drain_sources,
+        &exact_drain_destinations,
+    )?;
     refine_identity_destination_types(&mut memory, &mut drains);
     validate_pairs_and_coverage(&memory, &drains)?;
-    let authority = AuthorityIndex::new(&memory, state_cells);
-    validate_no_ordinary_draining_reads(program, fields, &memory, &authority)?;
-    let edges = lower_edges(program, typecheck_report, &memory, &drains)?;
+    validate_no_ordinary_draining_reads(
+        checked,
+        executable,
+        materializations,
+        derived_list_storage,
+        storage,
+        &reachable,
+        &memory,
+    )?;
+    let edges = lower_edges(checked, executable, materializations, &memory, &drains)?;
     validate_migration_cycles(&memory, &edges)?;
     validate_list_owner_changes(&memory, &edges)?;
     Ok((memory, edges))
 }
 
 fn build_semantic_memory(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    row_scopes: &[RowScope],
+    checked: &CheckedProgram,
+    executable: &ExecutableProgram,
     state_cells: &[StateCell],
     lists: &[ListMemory],
     derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    report: &TypeCheckReport,
+    storage: &ErasedScopeIndex,
 ) -> Result<Vec<SemanticMemory>, String> {
     let list_paths = lists
         .iter()
-        .map(|list| (list.id, semantic_list_path(list, fields)))
+        .map(|list| {
+            let path = derived_list_storage
+                .values()
+                .find(|candidate| candidate.list_id == list.id)
+                .map(|candidate| candidate.path.clone())
+                .unwrap_or_else(|| list.name.clone());
+            (list.id, path)
+        })
         .collect::<BTreeMap<_, _>>();
     let list_types = lists
         .iter()
@@ -225,50 +259,90 @@ fn build_semantic_memory(
                 });
             (
                 list.id,
-                typed.unwrap_or_else(|| semantic_type_for_list(program, list, fields, report)),
+                typed.unwrap_or_else(|| {
+                    semantic_type_for_list(executable, list, derived_list_storage)
+                }),
             )
         })
         .collect::<BTreeMap<_, _>>();
     let mut memory = Vec::with_capacity(state_cells.len() + lists.len());
 
-    for state in state_cells {
-        let field_candidates = fields
+    for state in state_cells.iter().filter(|state| state.published) {
+        let storage_bindings = storage
+            .bindings
             .iter()
-            .enumerate()
-            .filter(|(_, field)| field.statement.id == state.statement_id)
-            .filter(|(_, field)| scope_id_for_path(row_scopes, &field.path) == state.scope_id)
+            .filter(|binding| match binding.target {
+                ErasedBindingTarget::State {
+                    runtime, published, ..
+                } => runtime == state.id && published,
+                _ => false,
+            })
             .collect::<Vec<_>>();
-        let (field_id, field) = match field_candidates.as_slice() {
-            [] => (None, None),
-            [(id, field)] => (Some(FieldId(*id)), Some(*field)),
-            _ => {
-                return Err(format!(
-                    "state `{}` statement {} scope {:?} resolves to multiple semantic fields {:?}",
-                    state.path,
-                    state.statement_id,
-                    state.scope_id,
-                    field_candidates
-                        .iter()
-                        .map(|(_, field)| field.path.as_str())
-                        .collect::<Vec<_>>()
-                ));
-            }
+        let [binding] = storage_bindings.as_slice() else {
+            return Err(format!(
+                "state `{}` has {} exact erased storage bindings",
+                state.path,
+                storage_bindings.len()
+            ));
         };
-        let mut data_type = semantic_type_for_state(state, field, report);
+        let ErasedBindingTarget::State {
+            executable: executable_state_id,
+            runtime,
+            published: true,
+            field: field_id,
+            row: storage_row,
+        } = binding.target
+        else {
+            unreachable!("published state binding was filtered above")
+        };
+        if runtime != state.id || state.executable_state_id != Some(executable_state_id) {
+            return Err(format!(
+                "state `{}` identity differs from erased state binding {}",
+                state.path, binding.id
+            ));
+        }
+        if storage_row.map(|row| row.scope) != state.scope_id {
+            return Err(format!(
+                "state `{}` runtime scope {:?} differs from erased storage scope {:?}",
+                state.path,
+                state.scope_id,
+                storage_row.map(|row| row.scope)
+            ));
+        }
+        let storage_list_id = storage_row.map(|row| row.list);
+        let field = field_id
+            .map(|field_id| {
+                storage
+                    .fields
+                    .get(field_id.as_usize())
+                    .filter(|candidate| candidate.id == field_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "state `{}` binding {} references missing erased field {field_id}",
+                            state.path, binding.id
+                        )
+                    })
+            })
+            .transpose()?;
+        if let Some(field) = field
+            && (field.declaration != Some(binding.declaration)
+                || field.static_owner != binding.static_owner)
+        {
+            return Err(format!(
+                "state `{}` erased field {field_id:?} has declaration/owner identity inconsistent with binding {}",
+                state.path, binding.id
+            ));
+        }
+        let mut data_type = semantic_type_for_state(state, binding, field, executable)?;
         let (kind, owner_path, runtime_backing) = if let Some(scope_id) = state.scope_id {
-            let row_scope = row_scopes.iter().find(|scope| scope.id == scope_id);
-            let list = row_scope.and_then(|scope| {
+            let list = storage_list_id.and_then(|list_id| {
                 lists
-                    .iter()
-                    .find(|list| list.row_scope_id == Some(scope_id) || list.name == scope.list)
+                    .get(list_id.as_usize())
+                    .filter(|list| list.id == list_id)
             });
-            if let Some(indexed_type) = row_scope
-                .zip(list)
-                .and_then(|(scope, list)| {
-                    list_types
-                        .get(&list.id)
-                        .and_then(|list_type| indexed_state_type(state, scope, list_type))
-                })
+            if let Some(indexed_type) = list
+                .and_then(|list| list_paths.get(&list.id).zip(list_types.get(&list.id)))
+                .and_then(|(list_path, list_type)| indexed_state_type(state, list_path, list_type))
                 .cloned()
                 && type_quality(&indexed_type) > type_quality(&data_type)
             {
@@ -277,7 +351,6 @@ fn build_semantic_memory(
             let owner_path = list
                 .and_then(|list| list_paths.get(&list.id))
                 .cloned()
-                .or_else(|| row_scope.map(|scope| scope.list.clone()))
                 .unwrap_or_else(|| parent_path(&state.path));
             (
                 SemanticMemoryKind::IndexedField,
@@ -286,7 +359,7 @@ fn build_semantic_memory(
                     state_id: state.id,
                     field_id,
                     scope_id,
-                    list_id: list.map(|list| list.id),
+                    list_id: storage_list_id,
                 },
             )
         } else {
@@ -303,8 +376,11 @@ fn build_semantic_memory(
             .semantic_path
             .clone()
             .unwrap_or_else(|| state.path.clone());
+        let source_line = checked_declaration(checked, binding.declaration)
+            .map(|declaration| declaration.span.line)
+            .unwrap_or(state.source_line);
         let identity = SemanticMemoryIdentity {
-            canonical_module: canonical_module_for_line(program, state.source_line),
+            canonical_module: canonical_module_for_line(&checked.lowering_metadata, source_line),
             owner_path,
             semantic_path,
             kind,
@@ -333,20 +409,20 @@ fn build_semantic_memory(
                 .cloned()
                 .unwrap_or_else(|| SemanticDataType::Unknown {
                     reason: format!(
-                        "typecheck report has no recursive list type for `{}`",
+                        "checked executable has no recursive list type for `{}`",
                         list.name
                     ),
                 });
+        let source_line = derived_list_storage
+            .iter()
+            .find(|(_, candidate)| candidate.list_id == list.id)
+            .and_then(|(statement_id, _)| executable_statement(executable, *statement_id))
+            .and_then(|statement| statement.declaration)
+            .and_then(|declaration| checked_declaration(checked, declaration))
+            .map(|declaration| declaration.span.line)
+            .unwrap_or(list.source_line);
         let identity = SemanticMemoryIdentity {
-            canonical_module: canonical_module_for_line(
-                program,
-                program
-                    .list_memories
-                    .iter()
-                    .find(|candidate| candidate.name == list.name)
-                    .map(|candidate| candidate.line)
-                    .unwrap_or_default(),
-            ),
+            canonical_module: canonical_module_for_line(&checked.lowering_metadata, source_line),
             owner_path: parent_path(&semantic_path),
             semantic_path,
             kind: SemanticMemoryKind::ListOwner,
@@ -371,22 +447,18 @@ fn build_semantic_memory(
 
 fn indexed_state_type<'a>(
     state: &StateCell,
-    row_scope: &RowScope,
+    list_path: &str,
     list_type: &'a SemanticDataType,
 ) -> Option<&'a SemanticDataType> {
     let SemanticDataType::List { item } = list_type else {
         return None;
     };
-    let relative_path = state
-        .path
-        .strip_prefix(&format!("{}.", row_scope.row_scope))
-        .unwrap_or_else(|| {
-            state
-                .path
-                .split_once('.')
-                .map(|(_, suffix)| suffix)
-                .unwrap_or(state.path.as_str())
-        });
+    let state_path = state.semantic_path.as_deref().unwrap_or(&state.path);
+    let relative_path = state_path
+        .strip_prefix(list_path)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .or_else(|| state_path.rsplit_once('.').map(|(_, suffix)| suffix))
+        .unwrap_or(state_path);
     let parts = relative_path
         .split('.')
         .filter(|part| !part.is_empty())
@@ -396,73 +468,77 @@ fn indexed_state_type<'a>(
 
 fn semantic_type_for_state(
     state: &StateCell,
-    field: Option<&FieldDef>,
-    report: &TypeCheckReport,
-) -> SemanticDataType {
-    let mut expr_ids = Vec::new();
-    if let Some(field) = field {
-        expr_ids.extend(field.ast_exprs.iter().filter_map(|expr| match &expr.kind {
-            AstExprKind::Hold { .. } => Some(expr.id),
-            AstExprKind::Pipe { op, .. } if op == "HOLD" => Some(expr.id),
-            _ => None,
-        }));
-    }
-    expr_ids.extend(state.initial_expr_id.map(|id| id.as_usize()));
-    best_report_type(expr_ids, report).unwrap_or_else(|| SemanticDataType::Unknown {
-        reason: format!(
-            "typecheck report has no recursive type for state `{}`",
+    binding: &ErasedBinding,
+    field: Option<&ErasedFieldDef>,
+    executable: &ExecutableProgram,
+) -> Result<SemanticDataType, String> {
+    let state_id = state.executable_state_id.ok_or_else(|| {
+        format!(
+            "published state `{}` has no exact executable state identity",
             state.path
-        ),
-    })
+        )
+    })?;
+    let definition = executable
+        .states
+        .get(state_id.as_usize())
+        .filter(|candidate| candidate.id == state_id)
+        .ok_or_else(|| {
+            format!(
+                "state `{}` references missing executable state {state_id}",
+                state.path
+            )
+        })?;
+    if definition.declaration != binding.declaration
+        || definition.owner != binding.static_owner
+        || definition.expression != binding.producer
+    {
+        return Err(format!(
+            "state `{}` executable definition {state_id} disagrees with erased binding {}",
+            state.path, binding.id
+        ));
+    }
+    let initial = executable
+        .expressions
+        .get(definition.initial.as_usize())
+        .filter(|candidate| candidate.id == definition.initial)
+        .ok_or_else(|| {
+            format!(
+                "state `{}` executable definition {state_id} has missing initializer {}",
+                state.path, definition.initial
+            )
+        })?;
+    Ok(std::iter::once(semantic_data_type(&initial.flow_type.ty))
+        .chain(std::iter::once(semantic_data_type(&binding.flow_type.ty)))
+        .chain(field.map(|field| semantic_data_type(&field.flow_type.ty)))
+        .into_iter()
+        .max_by_key(type_quality)
+        .unwrap_or_else(|| SemanticDataType::Unknown {
+            reason: format!(
+                "checked executable has no recursive type for state `{}`",
+                state.path
+            ),
+        }))
 }
 
 fn semantic_type_for_list(
-    program: &ParsedProgram,
+    executable: &ExecutableProgram,
     list: &ListMemory,
-    fields: &[FieldDef],
-    report: &TypeCheckReport,
+    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
 ) -> SemanticDataType {
-    let mut candidates = fields
+    derived_list_storage
         .iter()
-        .filter(|field| field.path == list.name || field.path.ends_with(&format!(".{}", list.name)))
-        .flat_map(|field| field.ast_exprs.iter().map(|expr| expr.id))
-        .collect::<Vec<_>>();
-    if let Some(statement) = semantic_list_statement(program, list) {
-        candidates.extend(statement_expr_ids_recursive(
-            statement,
-            &program.expressions,
-        ));
-    }
-    candidates.sort_unstable();
-    candidates.dedup();
-    let mut data_types = candidates
-        .iter()
-        .filter_map(|expr_id| checked_type_for_expr(report, *expr_id))
-        .map(semantic_data_type)
+        .filter(|(_, storage)| storage.list_id == list.id)
+        .filter_map(|(statement_id, _)| {
+            executable_statement(executable, *statement_id)
+                .and_then(|statement| statement.flow_type.as_ref())
+                .map(|flow_type| semantic_data_type(&flow_type.ty))
+        })
         .filter(|data_type| matches!(data_type, SemanticDataType::List { .. }))
-        .collect::<Vec<_>>();
-    data_types.extend(candidates.iter().filter_map(|expr_id| {
-        let AstExprKind::ListLiteral { items, .. } = &program.expressions.get(*expr_id)?.kind
-        else {
-            return None;
-        };
-        let mut item_types = items
-            .iter()
-            .filter_map(|item| checked_type_for_expr(report, *item))
-            .map(semantic_data_type);
-        let item_type = item_types.next()?;
-        item_types
-            .all(|candidate| candidate == item_type)
-            .then(|| SemanticDataType::List {
-                item: Box::new(item_type),
-            })
-    }));
-    data_types
         .into_iter()
         .max_by_key(semantic_list_type_quality)
         .unwrap_or_else(|| SemanticDataType::Unknown {
             reason: format!(
-                "typecheck report has no recursive list type for `{}`",
+                "checked executable has no recursive list type for `{}`",
                 list.name
             ),
         })
@@ -481,56 +557,6 @@ fn semantic_list_type_quality(
     (record, closed, field_count, type_quality(data_type))
 }
 
-fn semantic_list_statement<'a>(
-    program: &'a ParsedProgram,
-    list: &ListMemory,
-) -> Option<&'a AstStatement> {
-    let line = program
-        .list_memories
-        .iter()
-        .find(|candidate| candidate.name == list.name)
-        .map(|candidate| candidate.line)?;
-    fn find(statements: &[AstStatement], line: usize) -> Option<&AstStatement> {
-        statements.iter().find_map(|statement| {
-            let matches =
-                statement.line == line && matches!(&statement.kind, AstStatementKind::List { .. });
-            matches
-                .then_some(statement)
-                .or_else(|| find(&statement.children, line))
-        })
-    }
-    find(&program.ast.statements, line)
-}
-
-fn best_report_type(
-    expr_ids: impl IntoIterator<Item = usize>,
-    report: &TypeCheckReport,
-) -> Option<SemanticDataType> {
-    best_report_type_matching(expr_ids, report, |_| true)
-}
-
-fn best_report_type_matching(
-    expr_ids: impl IntoIterator<Item = usize>,
-    report: &TypeCheckReport,
-    predicate: impl Fn(&SemanticDataType) -> bool,
-) -> Option<SemanticDataType> {
-    expr_ids
-        .into_iter()
-        .filter_map(|expr_id| checked_type_for_expr(report, expr_id))
-        .map(semantic_data_type)
-        .filter(|data_type| predicate(data_type))
-        .max_by_key(type_quality)
-}
-
-fn checked_type_for_expr(report: &TypeCheckReport, expr_id: usize) -> Option<&Type> {
-    report
-        .expr_type_table
-        .entries
-        .iter()
-        .find(|entry| entry.expr_id == expr_id)
-        .map(|entry| &entry.flow_type.ty)
-}
-
 pub(crate) fn semantic_data_type(value: &Type) -> SemanticDataType {
     match value {
         Type::Text => SemanticDataType::Text,
@@ -540,7 +566,11 @@ pub(crate) fn semantic_data_type(value: &Type) -> SemanticDataType {
             fixed_len: Some(*fixed_len),
         },
         Type::Skip => SemanticDataType::Null,
-        Type::VariantSet(variants) if variants_are_bool(variants) => SemanticDataType::Bool,
+        Type::VariantSet(variants)
+            if boon_typecheck::variants_use_boolean_runtime_representation(variants) =>
+        {
+            SemanticDataType::Bool
+        }
         Type::VariantSet(variants) => {
             let mut variants = variants
                 .iter()
@@ -593,18 +623,6 @@ fn semantic_type_fields(fields: &BTreeMap<String, Type>) -> Vec<SemanticTypeFiel
             data_type: semantic_data_type(data_type),
         })
         .collect()
-}
-
-fn variants_are_bool(variants: &[Variant]) -> bool {
-    variants.len() == 2
-        && variants
-            .iter()
-            .filter_map(|variant| match variant {
-                Variant::Tag(tag) => Some(tag.as_str()),
-                Variant::Tagged { .. } => None,
-            })
-            .collect::<BTreeSet<_>>()
-            == BTreeSet::from(["False", "True"])
 }
 
 fn type_quality(data_type: &SemanticDataType) -> (bool, usize, usize) {
@@ -691,28 +709,56 @@ fn collect_semantic_leaves(
     }
 }
 
-fn semantic_list_path(list: &ListMemory, fields: &[FieldDef]) -> String {
-    let mut candidates = fields
-        .iter()
-        .filter(|field| field.path == list.name || field.path.ends_with(&format!(".{}", list.name)))
-        .map(|field| field.path.clone())
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|path| (path.matches('.').count(), path.clone()));
-    candidates
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| list.name.clone())
+fn checked_declaration(
+    checked: &CheckedProgram,
+    declaration: DeclId,
+) -> Option<&CheckedDeclaration> {
+    checked
+        .declarations
+        .get(declaration.0 as usize)
+        .filter(|candidate| candidate.id == declaration)
+        .or_else(|| {
+            checked
+                .declarations
+                .iter()
+                .find(|candidate| candidate.id == declaration)
+        })
 }
 
-fn canonical_module_for_line(program: &ParsedProgram, line: usize) -> String {
-    program
-        .files
+fn executable_statement(
+    executable: &ExecutableProgram,
+    statement: ExecutableStatementId,
+) -> Option<&ExecutableStatement> {
+    executable
+        .statements
         .iter()
-        .find(|file| {
-            let line_count = file.source.lines().count().max(1);
-            line >= file.start_line && line < file.start_line + line_count
+        .find(|candidate| candidate.id == statement)
+}
+
+fn checked_expression(
+    checked: &CheckedProgram,
+    expression: CheckedExprId,
+) -> Option<&CheckedExpression> {
+    checked
+        .expressions
+        .get(expression.0 as usize)
+        .filter(|candidate| candidate.id == expression)
+        .or_else(|| {
+            checked
+                .expressions
+                .iter()
+                .find(|candidate| candidate.id == expression)
         })
-        .and_then(|file| file.module.clone())
+}
+
+fn canonical_module_for_line(metadata: &CheckedProgramLoweringMetadata, line: usize) -> String {
+    metadata
+        .source_units
+        .iter()
+        .find(|unit| {
+            line >= unit.start_line && line < unit.start_line.saturating_add(unit.line_count.max(1))
+        })
+        .and_then(|unit| unit.module.clone())
         .unwrap_or_else(|| "$root".to_owned())
 }
 
@@ -723,125 +769,12 @@ fn parent_path(path: &str) -> String {
         .unwrap_or_else(|| "$root".to_owned())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedRegion {
     memory_id: SemanticMemoryId,
     region_path: String,
     leaf_indexes: Vec<usize>,
     data_type: SemanticDataType,
-}
-
-struct AuthorityIndex<'a> {
-    memory: &'a [SemanticMemory],
-    runtime_aliases: BTreeMap<String, String>,
-}
-
-impl<'a> AuthorityIndex<'a> {
-    fn new(memory: &'a [SemanticMemory], states: &[StateCell]) -> Self {
-        let runtime_aliases = states
-            .iter()
-            .filter_map(|state| {
-                let semantic = state.semantic_path.as_ref()?;
-                (semantic != &state.path).then(|| (state.path.clone(), semantic.clone()))
-            })
-            .collect();
-        Self {
-            memory,
-            runtime_aliases,
-        }
-    }
-
-    fn resolve_drain_path(
-        &self,
-        path: &AstDrainPath,
-        context: Option<&FieldDef>,
-    ) -> Result<ResolvedRegion, String> {
-        let display = drain_path_text(path);
-        let candidates = drain_path_candidates(path, context);
-        let mut resolved = candidates
-            .iter()
-            .flat_map(|candidate| self.resolve_canonical_path(candidate))
-            .collect::<Vec<_>>();
-        resolved.sort_by_key(|region| (region.memory_id, region.region_path.clone()));
-        resolved.dedup_by(|left, right| {
-            left.memory_id == right.memory_id && left.region_path == right.region_path
-        });
-        match resolved.as_slice() {
-            [resolved] => Ok(resolved.clone()),
-            [] => Err(format!(
-                "DRAIN path `{display}` does not resolve to semantic authority; derived fields, sources, and ordinary values cannot be drained"
-            )),
-            _ => Err(format!(
-                "DRAIN path `{display}` is ambiguous across semantic authority owners: {}",
-                resolved
-                    .iter()
-                    .map(|region| {
-                        self.memory[region.memory_id.as_usize()]
-                            .identity
-                            .semantic_path
-                            .as_str()
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        }
-    }
-
-    fn resolve_reference_path(
-        &self,
-        parts: &[String],
-        context: Option<&FieldDef>,
-    ) -> Vec<ResolvedRegion> {
-        let raw = parts.join(".");
-        let mut candidates = vec![raw.clone()];
-        if let Some(context) = context
-            && !context.parent_path.is_empty()
-        {
-            candidates.insert(0, format!("{}.{}", context.parent_path, raw));
-        }
-        let mut resolved = candidates
-            .iter()
-            .flat_map(|candidate| self.resolve_canonical_path(candidate))
-            .collect::<Vec<_>>();
-        resolved.sort_by_key(|region| (region.memory_id, region.region_path.clone()));
-        resolved.dedup_by(|left, right| {
-            left.memory_id == right.memory_id && left.region_path == right.region_path
-        });
-        resolved
-    }
-
-    fn resolve_field_destination(&self, path: &str) -> Option<ResolvedRegion> {
-        let mut resolved = self.resolve_canonical_path(path);
-        resolved.sort_by_key(|region| {
-            std::cmp::Reverse(
-                self.memory[region.memory_id.as_usize()]
-                    .identity
-                    .semantic_path
-                    .len(),
-            )
-        });
-        resolved.into_iter().next()
-    }
-
-    fn resolve_canonical_path(&self, path: &str) -> Vec<ResolvedRegion> {
-        let canonical = self
-            .runtime_aliases
-            .iter()
-            .filter_map(|(runtime, semantic)| {
-                if path == runtime {
-                    return Some((runtime.len(), semantic.clone()));
-                }
-                let suffix = path.strip_prefix(runtime)?.strip_prefix('.')?;
-                Some((runtime.len(), format!("{semantic}.{suffix}")))
-            })
-            .max_by_key(|(matched, _)| *matched)
-            .map(|(_, canonical)| canonical);
-        let canonical = canonical.as_deref().unwrap_or(path);
-        self.memory
-            .iter()
-            .filter_map(|memory| region_for_memory_path(memory, canonical))
-            .collect()
-    }
 }
 
 fn region_for_memory_path(memory: &SemanticMemory, path: &str) -> Option<ResolvedRegion> {
@@ -894,170 +827,205 @@ fn semantic_type_at_path<'a>(
     semantic_type_at_path(data_type, rest)
 }
 
-fn drain_path_candidates(path: &AstDrainPath, context: Option<&FieldDef>) -> Vec<String> {
-    let raw = match path {
-        AstDrainPath::Binding { name } => name.clone(),
-        AstDrainPath::Field { binding, fields } => std::iter::once(binding.as_str())
-            .chain(fields.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join("."),
-        AstDrainPath::Passed { fields } => fields.join("."),
-    };
-    let mut candidates = Vec::new();
-    if let Some(context) = context
-        && !context.parent_path.is_empty()
-        && !matches!(path, AstDrainPath::Passed { .. })
-    {
-        candidates.push(format!("{}.{}", context.parent_path, raw));
-    }
-    candidates.push(raw);
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn drain_path_text(path: &AstDrainPath) -> String {
-    match path {
-        AstDrainPath::Binding { name } => name.clone(),
-        AstDrainPath::Field { binding, fields } => std::iter::once(binding.as_str())
-            .chain(fields.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join("."),
-        AstDrainPath::Passed { fields } => format!("PASSED.{}", fields.join(".")),
-    }
-}
-
-fn field_contexts_for_expr(expr_id: usize, fields: &[FieldDef]) -> Vec<&FieldDef> {
-    let mut contexts = fields
+fn validate_checked_marker_identity(
+    checked: &CheckedProgram,
+    executable: &ExecutableProgram,
+    reachable: &BTreeSet<ExecutableExprId>,
+) -> Result<(), String> {
+    for expression in executable
+        .expressions
         .iter()
-        .filter(|field| field.ast_exprs.iter().any(|expr| expr.id == expr_id))
-        .collect::<Vec<_>>();
-    let expr_line = contexts.iter().find_map(|field| {
-        field
-            .ast_exprs
-            .iter()
-            .find(|expr| expr.id == expr_id)
-            .map(|expr| expr.line)
-    });
-    if let Some(expr_line) = expr_line {
-        let physical = contexts
-            .iter()
-            .copied()
-            .filter(|field| field.ast_items.iter().any(|item| item.line == expr_line))
-            .collect::<Vec<_>>();
-        if !physical.is_empty() {
-            contexts = physical;
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        let checked_expression = checked_expression(checked, expression.checked_expr_id)
+            .ok_or_else(|| {
+                format!(
+                    "executable migration expression {} references missing checked expression {}",
+                    expression.id, expression.checked_expr_id.0
+                )
+            })?;
+        match (&expression.kind, &checked_expression.kind) {
+            (
+                ExecutableExpressionKind::Drain {
+                    target, projection, ..
+                },
+                CheckedExpressionKind::Drain {
+                    target: checked_target,
+                    projection: checked_projection,
+                },
+            ) if target == checked_target && projection == checked_projection => {}
+            (
+                ExecutableExpressionKind::Draining { input },
+                CheckedExpressionKind::Draining {
+                    input: checked_input,
+                },
+            ) => {
+                let concrete_input = executable
+                    .expressions
+                    .get(input.as_usize())
+                    .filter(|candidate| candidate.id == *input)
+                    .ok_or_else(|| {
+                        format!(
+                            "DRAINING expression {} references missing executable input {input}",
+                            expression.id
+                        )
+                    })?;
+                if concrete_input.checked_expr_id != *checked_input {
+                    return Err(format!(
+                        "DRAINING expression {} input identity differs between checked and executable graphs",
+                        checked_expression.id.0
+                    ));
+                }
+            }
+            (ExecutableExpressionKind::Drain { .. }, _)
+            | (ExecutableExpressionKind::Draining { .. }, _) => {
+                return Err(format!(
+                    "migration marker {} does not match checked expression {}",
+                    expression.id, expression.checked_expr_id.0
+                ));
+            }
+            _ => {}
         }
     }
-    let max_depth = contexts
-        .iter()
-        .map(|field| field.path.matches('.').count())
-        .max();
-    if let Some(max_depth) = max_depth {
-        contexts.retain(|field| field.path.matches('.').count() == max_depth);
-    }
-    contexts.sort_by(|left, right| left.path.cmp(&right.path));
-    contexts.dedup_by(|left, right| left.path == right.path);
-    contexts
+    Ok(())
 }
 
 fn associate_draining_markers(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    states: &[StateCell],
-    parents: &BTreeMap<usize, Vec<ParentLink>>,
+    executable: &ExecutableProgram,
+    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    storage: &ErasedScopeIndex,
+    reachable: &BTreeSet<ExecutableExprId>,
     memory: &mut [SemanticMemory],
 ) -> Result<(), String> {
-    let marker_owners = {
-        let authority = AuthorityIndex::new(memory, states);
-        let mut marker_owners = Vec::new();
-        for marker in program
-            .expressions
+    let mut markers = executable
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+        .filter_map(|expression| match expression.kind {
+            ExecutableExpressionKind::Draining { input } => Some((
+                expression.id,
+                expression.checked_expr_id,
+                expression.owner,
+                input,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    markers.sort_by_key(|(_, checked, owner, _)| (*checked, *owner));
+    let mut marker_owners =
+        BTreeMap::<boon_typecheck::CheckedExprId, BTreeSet<SemanticMemoryId>>::new();
+    for (marker, checked, owner, input) in markers {
+        let bindings = storage
+            .bindings
             .iter()
-            .filter(|expr| matches!(expr.kind, AstExprKind::Draining { .. }))
-        {
-            let contexts = field_contexts_for_expr(marker.id, fields);
-            if contexts.iter().any(|context| {
-                !draining_marker_is_terminal(marker.id, context, parents, &program.expressions)
-            }) {
-                return Err(format!(
-                    "DRAINING at line {} must be terminal in its semantic authority pipeline",
-                    marker.line
-                ));
-            }
-            let mut owners = contexts
-                .into_iter()
-                .filter_map(|context| authority.resolve_field_destination(&context.path))
-                .filter(|region| {
-                    authority.memory[region.memory_id.as_usize()]
-                        .identity
-                        .semantic_path
-                        == region.region_path
+            .filter(|binding| binding.static_owner == owner)
+            .filter(|binding| binding.producer == marker || binding.producer == input)
+            .collect::<Vec<_>>();
+        let mut owners = bindings
+            .into_iter()
+            .flat_map(|binding| semantic_memory_for_binding(memory, binding))
+            .collect::<BTreeSet<_>>();
+        owners.extend(memory.iter().filter_map(|candidate| {
+            let SemanticMemoryRuntimeBacking::List { list_id, .. } = candidate.runtime_backing
+            else {
+                return None;
+            };
+            let is_exact_root = derived_list_storage
+                .iter()
+                .filter(|(_, list)| list.list_id == list_id)
+                .filter_map(|(statement_id, _)| {
+                    executable_statement(executable, *statement_id)
+                        .and_then(|statement| statement.value)
                 })
-                .map(|region| region.memory_id)
-                .collect::<Vec<_>>();
-            owners.sort();
-            owners.dedup();
-            if owners.is_empty() {
-                return Err(format!(
-                    "DRAINING at line {} is not attached to a semantic authority owner",
-                    marker.line
-                ));
-            }
-            marker_owners.push((marker, owners));
+                .any(|root| root == marker);
+            is_exact_root.then_some(candidate.id)
+        }));
+        if owners.is_empty() {
+            return Err(format!(
+                "DRAINING expression {} is not attached to an exact state or list authority owner",
+                checked.0
+            ));
         }
-        marker_owners
-    };
+        marker_owners.entry(checked).or_default().extend(owners);
+    }
     for (marker, owners) in marker_owners {
         for owner in owners {
             let candidate = &mut memory[owner.as_usize()];
             if let SemanticMemoryStatus::Draining { marker_expr_id } = candidate.status {
                 return Err(format!(
                     "semantic authority `{}` has multiple DRAINING markers (expressions {} and {})",
-                    candidate.identity.semantic_path, marker_expr_id, marker.id
+                    candidate.identity.semantic_path, marker_expr_id, marker.0
                 ));
             }
             candidate.status = SemanticMemoryStatus::Draining {
-                marker_expr_id: ExprId(marker.id),
+                marker_expr_id: ExprId(marker.0 as usize),
             };
         }
     }
     Ok(())
 }
 
-fn draining_marker_is_terminal(
-    marker_id: usize,
-    context: &FieldDef,
-    parents: &BTreeMap<usize, Vec<ParentLink>>,
-    expressions: &[AstExpr],
-) -> bool {
-    let context_exprs = context
-        .ast_exprs
+fn semantic_memory_for_binding(
+    memory: &[SemanticMemory],
+    binding: &ErasedBinding,
+) -> Vec<SemanticMemoryId> {
+    memory
         .iter()
-        .map(|expr| expr.id)
-        .collect::<BTreeSet<_>>();
-    if parents
-        .get(&marker_id)
-        .into_iter()
-        .flatten()
-        .any(|parent| context_exprs.contains(&parent.parent))
-    {
-        return false;
-    }
-    let Some(pipeline) = statement_pipeline_expr_ids(&context.statement, expressions) else {
-        return true;
-    };
-    pipeline.iter().rposition(|expr_id| {
-        *expr_id == marker_id || expr_tree_contains(*expr_id, marker_id, expressions)
-    }) == Some(pipeline.len() - 1)
+        .filter_map(|candidate| {
+            let matches = match (&binding.target, &candidate.runtime_backing) {
+                (
+                    ErasedBindingTarget::State { runtime, .. },
+                    SemanticMemoryRuntimeBacking::RootState { state_id, .. }
+                    | SemanticMemoryRuntimeBacking::IndexedState { state_id, .. },
+                ) => runtime == state_id,
+                (
+                    ErasedBindingTarget::Value {
+                        field: Some(field),
+                        row: None,
+                    },
+                    SemanticMemoryRuntimeBacking::RootState {
+                        field_id: Some(memory_field),
+                        ..
+                    },
+                ) => field == memory_field,
+                (
+                    ErasedBindingTarget::Value {
+                        field: Some(field),
+                        row: Some(row),
+                    },
+                    SemanticMemoryRuntimeBacking::IndexedState {
+                        field_id: Some(memory_field),
+                        scope_id,
+                        list_id,
+                        ..
+                    },
+                ) => {
+                    field == memory_field
+                        && row.scope == *scope_id
+                        && list_id.is_none_or(|list| list == row.list)
+                }
+                (
+                    ErasedBindingTarget::Value {
+                        field: None,
+                        row: Some(row),
+                    },
+                    SemanticMemoryRuntimeBacking::List { list_id, .. },
+                ) => row.list == *list_id,
+                _ => false,
+            };
+            matches.then_some(candidate.id)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
 struct DrainUse {
     drain_expr_id: ExprId,
+    executable_drain: ExecutableExprId,
     source: ResolvedRegion,
     destination: ResolvedRegion,
     expression_root: ExprId,
+    executable_root: ExecutableExprId,
     pipeline: Vec<ExprId>,
     identity: bool,
 }
@@ -1112,567 +1080,331 @@ fn migration_type_is_closed(data_type: &SemanticDataType) -> bool {
     !migration_type_needs_refinement(data_type)
 }
 
-#[derive(Clone, Debug)]
-enum ParentRole {
-    Plain,
-    RecordField(String),
-    ListItem,
-    AuthorityWrapper,
-    DrainingWrapper,
-}
-
-#[derive(Clone, Debug)]
-struct ParentLink {
-    parent: usize,
-    role: ParentRole,
-}
-
-fn expression_parents(expressions: &[AstExpr]) -> BTreeMap<usize, Vec<ParentLink>> {
-    let mut parents = BTreeMap::<usize, Vec<ParentLink>>::new();
-    for expr in expressions {
-        let mut add = |child, role| {
-            parents.entry(child).or_default().push(ParentLink {
-                parent: expr.id,
-                role,
-            });
-        };
-        match &expr.kind {
-            AstExprKind::Call { args, pass, .. } => {
-                for arg in args {
-                    add(arg.value, ParentRole::Plain);
-                }
-                if let Some(pass) = pass {
-                    add(pass.value, ParentRole::Plain);
-                }
-            }
-            AstExprKind::Pipe {
-                input, args, pass, ..
-            } => {
-                add(*input, ParentRole::Plain);
-                for arg in args {
-                    add(arg.value, ParentRole::Plain);
-                }
-                if let Some(pass) = pass {
-                    add(pass.value, ParentRole::Plain);
-                }
-            }
-            AstExprKind::Draining { input } => add(*input, ParentRole::DrainingWrapper),
-            AstExprKind::Hold { initial, .. } => add(*initial, ParentRole::AuthorityWrapper),
-            AstExprKind::When { input, .. } => add(*input, ParentRole::AuthorityWrapper),
-            AstExprKind::Then { input, output } => {
-                add(*input, ParentRole::AuthorityWrapper);
-                if let Some(output) = output {
-                    add(*output, ParentRole::AuthorityWrapper);
-                }
-            }
-            AstExprKind::Infix { left, right, .. } => {
-                add(*left, ParentRole::Plain);
-                add(*right, ParentRole::Plain);
-            }
-            AstExprKind::MatchArm { output, .. } => {
-                if let Some(output) = output {
-                    add(*output, ParentRole::AuthorityWrapper);
-                }
-            }
-            AstExprKind::Block { bindings, result } => {
-                for binding in bindings {
-                    add(binding.value, ParentRole::Plain);
-                }
-                if let Some(result) = result {
-                    add(*result, ParentRole::AuthorityWrapper);
-                }
-            }
-            AstExprKind::Object(fields)
-            | AstExprKind::Record(fields)
-            | AstExprKind::TaggedObject { fields, .. } => {
-                for field in fields {
-                    add(field.value, ParentRole::RecordField(field.name.clone()));
-                }
-            }
-            AstExprKind::ListLiteral { items, .. } => {
-                for item in items {
-                    add(*item, ParentRole::ListItem);
-                }
-            }
-            AstExprKind::BytesLiteral { items, .. } => {
-                for item in items {
-                    add(*item, ParentRole::Plain);
-                }
-            }
-            AstExprKind::Identifier(_)
-            | AstExprKind::Path(_)
-            | AstExprKind::Drain { .. }
-            | AstExprKind::StringLiteral(_)
-            | AstExprKind::TextLiteral(_)
-            | AstExprKind::Number(_)
-            | AstExprKind::ByteLiteral { .. }
-            | AstExprKind::Bool(_)
-            | AstExprKind::Enum(_)
-            | AstExprKind::Tag(_)
-            | AstExprKind::Source
-            | AstExprKind::Latest
-            | AstExprKind::Delimiter
-            | AstExprKind::Unknown(_) => {}
-        }
-    }
-    parents
-}
-
 fn collect_drains(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
-    state_cells: &[StateCell],
-    lists: &[ListMemory],
-    report: &TypeCheckReport,
-    parents: &BTreeMap<usize, Vec<ParentLink>>,
-    authority: &AuthorityIndex<'_>,
+    checked: &CheckedProgram,
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    reachable: &BTreeSet<ExecutableExprId>,
+    memory: &[SemanticMemory],
+    exact_sources: &BTreeMap<ExecutableExprId, ResolvedRegion>,
+    exact_destinations: &BTreeMap<ExecutableExprId, DrainDestination>,
 ) -> Result<Vec<DrainUse>, String> {
     let mut drains = Vec::new();
-    for drain in program
+    let mut lowered = BTreeSet::new();
+    for drain in executable
         .expressions
         .iter()
-        .filter(|expr| matches!(expr.kind, AstExprKind::Drain { .. }))
+        .filter(|expression| reachable.contains(&expression.id))
+        .filter(|expression| matches!(expression.kind, ExecutableExpressionKind::Drain { .. }))
     {
-        let AstExprKind::Drain { path } = &drain.kind else {
-            unreachable!();
+        let checked_drain =
+            checked_expression(checked, drain.checked_expr_id).ok_or_else(|| {
+                format!(
+                    "DRAIN executable expression {} references missing checked expression {}",
+                    drain.id, drain.checked_expr_id.0
+                )
+            })?;
+        let line = checked_drain.span.line;
+        let source = exact_sources.get(&drain.id).cloned().ok_or_else(|| {
+            format!(
+                "DRAIN expression {} at line {line} has no exact erased authority binding",
+                drain.checked_expr_id.0
+            )
+        })?;
+        let destination = exact_destinations.get(&drain.id).ok_or_else(|| {
+            format!(
+                "DRAIN expression {} at line {line} has no exact erased destination authority",
+                drain.checked_expr_id.0
+            )
+        })?;
+        let destination_memory = memory
+            .get(destination.memory_id.as_usize())
+            .filter(|candidate| candidate.id == destination.memory_id)
+            .ok_or_else(|| {
+                format!(
+                    "DRAIN expression {} references missing destination memory {}",
+                    drain.checked_expr_id.0, destination.memory_id
+                )
+            })?;
+        let destination_region = region_for_memory_path(
+            destination_memory,
+            &destination_memory.identity.semantic_path,
+        )
+        .ok_or_else(|| {
+            format!(
+                "DRAIN destination `{}` has no closed semantic leaves",
+                destination_memory.identity.semantic_path
+            )
+        })?;
+        let root = if destination_memory.identity.kind == SemanticMemoryKind::ListOwner {
+            drain.id
+        } else {
+            destination.initializer
         };
-        let contexts = field_contexts_for_expr(drain.id, fields);
-        if contexts.is_empty() {
+        let root_expression = executable
+            .expressions
+            .get(root.as_usize())
+            .filter(|candidate| candidate.id == root)
+            .ok_or_else(|| {
+                format!(
+                    "DRAIN destination `{}` references missing initializer {root}",
+                    destination_memory.identity.semantic_path
+                )
+            })?;
+        if !migration_expression_reaches(executable, materializations, root, drain.id) {
             return Err(format!(
-                "DRAIN at line {} is not attached to a named destination field",
-                drain.line
+                "DRAIN at line {line} conflicts with destination authority `{}`; DRAIN must be part of its initializer",
+                destination_memory.identity.semantic_path
             ));
         }
-        let mut lowered_for_destination = BTreeSet::new();
-        for context in contexts {
-            let source = authority.resolve_drain_path(path, Some(context))?;
-            let Some(mut destination) = authority.resolve_field_destination(&context.path) else {
-                continue;
-            };
-            if destination.region_path
-                == authority.memory[destination.memory_id.as_usize()]
-                    .identity
-                    .semantic_path
-                && let Some(suffix) =
-                    record_destination_suffix(drain.id, context, parents, &program.expressions)
-            {
-                let nested = format!("{}.{}", destination.region_path, suffix);
-                if let Some(region) = authority
-                    .resolve_canonical_path(&nested)
-                    .into_iter()
-                    .find(|region| region.memory_id == destination.memory_id)
-                {
-                    destination = region;
-                }
-            }
-            if !lowered_for_destination
-                .insert((destination.memory_id, destination.region_path.clone()))
-            {
-                continue;
-            }
-            let (expression_root, pipeline) = if authority.memory[destination.memory_id.as_usize()]
-                .identity
-                .kind
-                == SemanticMemoryKind::ListOwner
-            {
-                (drain.id, vec![drain.id])
-            } else {
-                migration_expression_root(drain.id, context, parents, &program.expressions)
-            };
-            validate_drain_initializes_destination(
-                drain,
-                context,
-                destination.memory_id,
-                state_cells,
-                lists,
-                &program.expressions,
-            )?;
-            let identity = expression_root == drain.id;
-            if !identity && checked_type_for_expr(report, expression_root).is_none() {
-                return Err(format!(
-                    "migration transform rooted at expression {expression_root} has no typecheck entry"
-                ));
-            }
-            drains.push(DrainUse {
-                drain_expr_id: ExprId(drain.id),
-                source,
-                destination,
-                expression_root: ExprId(expression_root),
-                pipeline: pipeline.into_iter().map(ExprId).collect(),
-                identity,
-            });
+        let identity = root == drain.id;
+        let key = (
+            drain.checked_expr_id,
+            source.memory_id,
+            source.region_path.clone(),
+            destination.memory_id,
+            destination_region.region_path.clone(),
+            root_expression.checked_expr_id,
+        );
+        if !lowered.insert(key) {
+            continue;
         }
-        if !drains
-            .iter()
-            .any(|candidate| candidate.drain_expr_id == ExprId(drain.id))
-        {
-            return Err(format!(
-                "DRAIN at line {} does not initialize semantic authority; destinations must be scalar, indexed-field, or list memory",
-                drain.line
-            ));
-        }
+        drains.push(DrainUse {
+            drain_expr_id: ExprId(drain.checked_expr_id.0 as usize),
+            executable_drain: drain.id,
+            source,
+            destination: destination_region,
+            expression_root: ExprId(root_expression.checked_expr_id.0 as usize),
+            executable_root: root,
+            pipeline: vec![ExprId(root_expression.checked_expr_id.0 as usize)],
+            identity,
+        });
     }
     Ok(drains)
 }
 
-fn record_destination_suffix(
-    expr_id: usize,
-    context: &FieldDef,
-    parents: &BTreeMap<usize, Vec<ParentLink>>,
-    expressions: &[AstExpr],
-) -> Option<String> {
-    let context_exprs = context
-        .ast_exprs
+fn exact_drain_sources(
+    executable: &ExecutableProgram,
+    storage: &ErasedScopeIndex,
+    reachable: &BTreeSet<ExecutableExprId>,
+    memory: &[SemanticMemory],
+) -> Result<BTreeMap<ExecutableExprId, ResolvedRegion>, String> {
+    let mut sources = BTreeMap::<ExecutableExprId, ResolvedRegion>::new();
+    for expression in executable
+        .expressions
         .iter()
-        .map(|expr| expr.id)
-        .collect::<BTreeSet<_>>();
-    let mut current = expr_id;
-    let mut fields = Vec::new();
-    let mut seen = BTreeSet::new();
-    while seen.insert(current) {
-        let link = parents
-            .get(&current)
-            .into_iter()
-            .flat_map(|links| links.iter())
-            .find(|link| context_exprs.contains(&link.parent))?;
-        match &link.role {
-            ParentRole::RecordField(field) => fields.push(field.clone()),
-            ParentRole::ListItem | ParentRole::AuthorityWrapper | ParentRole::DrainingWrapper => {
-                break;
-            }
-            ParentRole::Plain => {}
-        }
-        current = link.parent;
-        if expressions.get(current).is_none() {
-            break;
-        }
-    }
-    fields.reverse();
-    (!fields.is_empty()).then(|| fields.join("."))
-}
-
-fn migration_expression_root(
-    drain_expr_id: usize,
-    context: &FieldDef,
-    parents: &BTreeMap<usize, Vec<ParentLink>>,
-    expressions: &[AstExpr],
-) -> (usize, Vec<usize>) {
-    let context_exprs = context
-        .ast_exprs
-        .iter()
-        .map(|expr| expr.id)
-        .collect::<BTreeSet<_>>();
-    let mut current = drain_expr_id;
-    let mut seen = BTreeSet::new();
-    while seen.insert(current) {
-        let Some(link) = parents
-            .get(&current)
-            .into_iter()
-            .flat_map(|links| links.iter())
-            .find(|link| context_exprs.contains(&link.parent))
-        else {
-            break;
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        let ExecutableExpressionKind::Drain { .. } = &expression.kind else {
+            continue;
         };
-        if !matches!(link.role, ParentRole::Plain) {
-            break;
-        }
-        current = link.parent;
-    }
-
-    let pipeline = statement_pipeline_expr_ids(&context.statement, expressions)
-        .unwrap_or_else(|| vec![current]);
-    let mut relevant = Vec::new();
-    let mut started = false;
-    let mut root = current;
-    for expr_id in pipeline {
-        if !started {
-            started = expr_tree_contains(expr_id, drain_expr_id, expressions)
-                || expr_id == current
-                || expr_tree_contains(expr_id, current, expressions);
-            if !started {
-                continue;
-            }
-        }
-        let Some(expr) = expressions.get(expr_id) else {
-            break;
-        };
-        if matches!(
-            expr.kind,
-            AstExprKind::Hold { .. } | AstExprKind::Draining { .. } | AstExprKind::Latest
-        ) || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if matches!(op.as_str(), "HOLD" | "LATEST"))
-        {
-            break;
-        }
-        relevant.push(expr_id);
-        root = expr_id;
-    }
-    if relevant.is_empty() {
-        relevant.push(current);
-    }
-    (root, relevant)
-}
-
-fn validate_drain_initializes_destination(
-    drain: &AstExpr,
-    context: &FieldDef,
-    destination_memory: SemanticMemoryId,
-    state_cells: &[StateCell],
-    lists: &[ListMemory],
-    expressions: &[AstExpr],
-) -> Result<(), String> {
-    let is_state = state_cells.iter().any(|state| {
-        matches!(state.id, StateId(id) if id == destination_memory.as_usize())
-            || state.path == context.path
-    });
-    let is_list = lists.iter().any(|list| {
-        list.name == context.path || context.path.ends_with(&format!(".{}", list.name))
-    });
-    if is_list {
-        return Ok(());
-    }
-    if !is_state {
-        // Nested fields of a record-valued root state are initialized with their owner.
-        return Ok(());
-    }
-    let pipeline = statement_pipeline_expr_ids(&context.statement, expressions);
-    if let Some(pipeline) = pipeline {
-        let drain_position = pipeline.iter().position(|expr_id| {
-            *expr_id == drain.id || expr_tree_contains(*expr_id, drain.id, expressions)
-        });
-        let authority_position = pipeline.iter().position(|expr_id| {
-            expressions.get(*expr_id).is_some_and(|expr| {
-                matches!(expr.kind, AstExprKind::Hold { .. } | AstExprKind::Latest)
-                    || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "HOLD" || op == "LATEST")
-            })
-        });
-        if let (Some(drain_position), Some(authority_position)) =
-            (drain_position, authority_position)
-            && drain_position <= authority_position
-        {
-            return Ok(());
-        }
-    }
-    if context.ast_exprs.iter().any(|expr| {
-        matches!(&expr.kind, AstExprKind::Hold { initial, .. } if expr_tree_contains(*initial, drain.id, expressions))
-            || matches!(&expr.kind, AstExprKind::Pipe { input, op, .. } if op == "HOLD" && expr_tree_contains(*input, drain.id, expressions))
-    }) {
-        return Ok(());
-    }
-    Err(format!(
-        "DRAIN at line {} conflicts with existing destination authority `{}`; DRAIN must be part of its initializer",
-        drain.line, context.path
-    ))
-}
-
-fn statement_pipeline_expr_ids(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-) -> Option<Vec<usize>> {
-    let mut expr_ids = Vec::new();
-    if let Some(expr_id) = statement.expr {
-        expr_ids.push(expr_id);
-        collect_pipeline_continuations(statement, expressions, &mut expr_ids);
-    } else {
-        expr_ids.extend(statement.children.iter().filter_map(|child| {
-            matches!(
-                child.kind,
-                AstStatementKind::Expression
-                    | AstStatementKind::Hold { .. }
-                    | AstStatementKind::List { field: None, .. }
-            )
-            .then_some(child.expr)
-            .flatten()
-        }));
-    }
-    (expr_ids.len() > 1
-        && expr_ids
+        let read = storage
+            .reads
             .iter()
-            .skip(1)
-            .all(|expr_id| expr_is_pipeline_continuation(*expr_id, expressions)))
-    .then_some(expr_ids)
-}
-
-fn migration_field_defs(program: &ParsedProgram, fields: &[FieldDef]) -> Vec<FieldDef> {
-    let mut output = fields.to_vec();
-    let items = program.ast.semantic_parser_items().collect::<Vec<_>>();
-    collect_structural_migration_fields(
-        &program.ast.statements,
-        &mut Vec::new(),
-        program,
-        &items,
-        &mut output,
-    );
-    output
-}
-
-fn collect_structural_migration_fields(
-    statements: &[AstStatement],
-    scope: &mut Vec<String>,
-    program: &ParsedProgram,
-    items: &[&boon_parser::ParserItem],
-    fields: &mut Vec<FieldDef>,
-) {
-    for statement in statements {
-        let name = match &statement.kind {
-            AstStatementKind::Field { name }
-            | AstStatementKind::List {
-                field: Some(name), ..
+            .find(|read| read.expression == expression.id)
+            .ok_or_else(|| {
+                format!(
+                    "DRAIN expression {} has no exact erased read target",
+                    expression.checked_expr_id.0
+                )
+            })?;
+        let (binding, projection) = match &read.target {
+            ErasedReadTarget::Binding {
+                binding,
+                projection,
+            } => (*binding, projection.as_slice()),
+            ErasedReadTarget::StateProjection {
+                binding, fields, ..
+            } => (*binding, fields.as_slice()),
+            target => {
+                return Err(format!(
+                    "DRAIN expression {} has non-authority read target {target:?}",
+                    expression.checked_expr_id.0
+                ));
             }
-            | AstStatementKind::Hold {
-                field: Some(name), ..
-            } if name != "document" && name != "scene" => Some(name.as_str()),
-            _ => None,
         };
-        if let Some(name) = name {
-            let parent_path = scope.join(".");
-            let path = if parent_path.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{parent_path}.{name}")
-            };
-            if !fields.iter().any(|field| field.path == path) {
-                fields.push(FieldDef {
-                    path: path.clone(),
-                    local_name: name.to_owned(),
-                    parent_path,
-                    statement: statement.clone(),
-                    ast_items: super::collect_statement_ast_items(statement, items),
-                    ast_exprs: super::collect_statement_ast_exprs(statement, program),
-                });
-            }
-            scope.push(name.to_owned());
-            collect_structural_migration_fields(&statement.children, scope, program, items, fields);
-            scope.pop();
+        let binding = storage
+            .bindings
+            .get(binding.as_usize())
+            .filter(|candidate| candidate.id == binding)
+            .ok_or_else(|| {
+                format!(
+                    "DRAIN expression {} references missing binding {binding}",
+                    expression.checked_expr_id.0
+                )
+            })?;
+        let owners = semantic_memory_for_binding(memory, binding);
+        let [owner] = owners.as_slice() else {
+            return Err(format!(
+                "DRAIN expression {} binding {} (`{}`; producer {}; target {:?}) resolves to {} semantic memories",
+                expression.checked_expr_id.0,
+                binding.id,
+                binding.diagnostic_path,
+                binding.producer,
+                binding.target,
+                owners.len()
+            ));
+        };
+        let memory = memory
+            .get(owner.as_usize())
+            .filter(|memory| memory.id == *owner)
+            .ok_or_else(|| format!("DRAIN references missing semantic memory {owner}"))?;
+        let path = if projection.is_empty() {
+            memory.identity.semantic_path.clone()
+        } else {
+            format!("{}.{}", memory.identity.semantic_path, projection.join("."))
+        };
+        let region = region_for_memory_path(memory, &path).ok_or_else(|| {
+            format!(
+                "DRAIN expression {} projection `{}` is outside semantic memory `{}`",
+                expression.checked_expr_id.0,
+                projection.join("."),
+                memory.identity.semantic_path
+            )
+        })?;
+        if let Some(previous) = sources.insert(expression.id, region.clone())
+            && previous != region
+        {
+            return Err(format!(
+                "DRAIN executable expression {} has incompatible concrete authority bindings",
+                expression.id
+            ));
+        }
+    }
+    Ok(sources)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DrainDestination {
+    memory_id: SemanticMemoryId,
+    initializer: ExecutableExprId,
+}
+
+fn exact_drain_destinations(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    storage: &ErasedScopeIndex,
+    reachable: &BTreeSet<ExecutableExprId>,
+    memory: &[SemanticMemory],
+) -> Result<BTreeMap<ExecutableExprId, DrainDestination>, String> {
+    let mut destinations = BTreeMap::<ExecutableExprId, DrainDestination>::new();
+    for expression in executable
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        if !matches!(expression.kind, ExecutableExpressionKind::Drain { .. }) {
             continue;
         }
-        if !matches!(statement.kind, AstStatementKind::Function { .. }) {
-            collect_structural_migration_fields(&statement.children, scope, program, items, fields);
+        let mut owners = storage
+            .bindings
+            .iter()
+            .filter(|binding| {
+                migration_expression_reaches(
+                    executable,
+                    materializations,
+                    binding.producer,
+                    expression.id,
+                )
+            })
+            .filter_map(|binding| {
+                let ErasedBindingTarget::State {
+                    executable: state, ..
+                } = binding.target
+                else {
+                    return None;
+                };
+                let definition = executable
+                    .states
+                    .get(state.as_usize())
+                    .filter(|candidate| candidate.id == state)?;
+                Some((binding, definition.initial))
+            })
+            .flat_map(|(binding, initializer)| {
+                semantic_memory_for_binding(memory, binding)
+                    .into_iter()
+                    .map(move |memory_id| DrainDestination {
+                        memory_id,
+                        initializer,
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        for materialization in materializations.iter().filter(|materialization| {
+            migration_expression_reaches(
+                executable,
+                materializations,
+                materialization.source,
+                expression.id,
+            )
+        }) {
+            let Some(target_list_id) = materialization.target_list_id else {
+                continue;
+            };
+            owners.extend(memory.iter().filter_map(|candidate| {
+                matches!(
+                    candidate.runtime_backing,
+                    SemanticMemoryRuntimeBacking::List { list_id, .. }
+                        if list_id == target_list_id
+                )
+                .then_some(DrainDestination {
+                    memory_id: candidate.id,
+                    initializer: expression.id,
+                })
+            }));
+        }
+        let owners = owners.into_iter().collect::<Vec<_>>();
+        let [owner] = owners.as_slice() else {
+            return Err(format!(
+                "DRAIN expression {} (executable {}) is contained by {} exact destination authorities",
+                expression.checked_expr_id.0,
+                expression.id,
+                owners.len()
+            ));
+        };
+        if let Some(previous) = destinations.insert(expression.id, *owner)
+            && previous != *owner
+        {
+            return Err(format!(
+                "DRAIN executable expression {} has incompatible concrete destination owners",
+                expression.id
+            ));
         }
     }
+    Ok(destinations)
 }
 
-fn collect_pipeline_continuations(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-    expr_ids: &mut Vec<usize>,
-) {
-    for child in statement.children.iter().filter(|child| {
-        matches!(
-            child.kind,
-            AstStatementKind::Expression
-                | AstStatementKind::Hold { .. }
-                | AstStatementKind::List { field: None, .. }
-        ) && child
-            .expr
-            .is_some_and(|expr_id| expr_is_pipeline_continuation(expr_id, expressions))
-    }) {
-        if let Some(expr_id) = child.expr {
-            expr_ids.push(expr_id);
-        }
-        collect_pipeline_continuations(child, expressions, expr_ids);
-    }
-}
-
-fn expr_is_pipeline_continuation(expr_id: usize, expressions: &[AstExpr]) -> bool {
-    let input = match expressions.get(expr_id).map(|expr| &expr.kind) {
-        Some(AstExprKind::Pipe { input, .. })
-        | Some(AstExprKind::Then { input, .. })
-        | Some(AstExprKind::When { input, .. })
-        | Some(AstExprKind::Draining { input })
-        | Some(AstExprKind::Hold { initial: input, .. }) => *input,
-        _ => return false,
-    };
-    expr_chain_starts_with_placeholder(input, expressions)
-}
-
-fn expr_chain_starts_with_placeholder(expr_id: usize, expressions: &[AstExpr]) -> bool {
-    match expressions.get(expr_id).map(|expr| &expr.kind) {
-        Some(AstExprKind::Delimiter) => true,
-        Some(AstExprKind::Unknown(tokens)) => !tokens.is_empty(),
-        Some(AstExprKind::Pipe { input, .. })
-        | Some(AstExprKind::Then { input, .. })
-        | Some(AstExprKind::When { input, .. })
-        | Some(AstExprKind::Draining { input })
-        | Some(AstExprKind::Hold { initial: input, .. }) => {
-            expr_chain_starts_with_placeholder(*input, expressions)
-        }
-        _ => false,
-    }
-}
-
-fn expr_tree_contains(root: usize, needle: usize, expressions: &[AstExpr]) -> bool {
-    expr_tree_contains_seen(root, needle, expressions, &mut BTreeSet::new())
-}
-
-fn expr_tree_contains_seen(
-    root: usize,
-    needle: usize,
-    expressions: &[AstExpr],
-    seen: &mut BTreeSet<usize>,
+fn migration_expression_reaches(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    root: ExecutableExprId,
+    target: ExecutableExprId,
 ) -> bool {
-    if root == needle {
-        return true;
-    }
-    if !seen.insert(root) {
-        return false;
-    }
-    let Some(expr) = expressions.get(root) else {
-        return false;
-    };
-    expr_children(expr)
-        .into_iter()
-        .any(|child| expr_tree_contains_seen(child, needle, expressions, seen))
-}
-
-fn expr_children(expr: &AstExpr) -> Vec<usize> {
-    match &expr.kind {
-        AstExprKind::Call { args, pass, .. } => args
-            .iter()
-            .map(|arg| arg.value)
-            .chain(pass.iter().map(|pass| pass.value))
-            .collect(),
-        AstExprKind::Pipe {
-            input, args, pass, ..
-        } => std::iter::once(*input)
-            .chain(args.iter().map(|arg| arg.value))
-            .chain(pass.iter().map(|pass| pass.value))
-            .collect(),
-        AstExprKind::Draining { input }
-        | AstExprKind::When { input, .. }
-        | AstExprKind::Hold { initial: input, .. } => vec![*input],
-        AstExprKind::Then { input, output } => std::iter::once(*input)
-            .chain(output.iter().copied())
-            .collect(),
-        AstExprKind::Infix { left, right, .. } => vec![*left, *right],
-        AstExprKind::MatchArm { output, .. } => output.iter().copied().collect(),
-        AstExprKind::Block { bindings, result } => bindings
-            .iter()
-            .map(|binding| binding.value)
-            .chain(result.iter().copied())
-            .collect(),
-        AstExprKind::Object(fields)
-        | AstExprKind::Record(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
-            fields.iter().map(|field| field.value).collect()
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
         }
-        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => {
-            items.clone()
+        if expression_id == target {
+            return true;
         }
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::Drain { .. }
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::Number(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::Source
-        | AstExprKind::Latest
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => Vec::new(),
+        let Some(expression) = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+        else {
+            continue;
+        };
+        if let ExecutableExpressionKind::Materialize { materialization } = expression.kind
+            && let Some(materialization) = materializations
+                .get(materialization)
+                .filter(|candidate| candidate.id == materialization)
+        {
+            pending.extend(materialization.expression_roots());
+        }
+        pending.extend(executable_expression_children(&expression.kind));
     }
+    false
 }
 
 fn validate_pairs_and_coverage(
@@ -1684,9 +1416,16 @@ fn validate_pairs_and_coverage(
     for drain in drains {
         let source_memory = &memory[drain.source.memory_id.as_usize()];
         if !matches!(source_memory.status, SemanticMemoryStatus::Draining { .. }) {
+            let draining = memory
+                .iter()
+                .filter(|candidate| {
+                    matches!(candidate.status, SemanticMemoryStatus::Draining { .. })
+                })
+                .map(|candidate| candidate.identity.semantic_path.as_str())
+                .collect::<Vec<_>>();
             return Err(format!(
-                "DRAIN source `{}` is not marked DRAINING (missing pair)",
-                drain.source.region_path
+                "DRAIN source `{}` is not marked DRAINING (missing pair); marked authorities={draining:?}",
+                drain.source.region_path,
             ));
         }
         if drain.source.memory_id == drain.destination.memory_id {
@@ -1760,10 +1499,13 @@ fn path_contains(ancestor: &str, descendant: &str) -> bool {
 }
 
 fn validate_no_ordinary_draining_reads(
-    program: &ParsedProgram,
-    fields: &[FieldDef],
+    checked: &CheckedProgram,
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    storage: &ErasedScopeIndex,
+    reachable: &BTreeSet<ExecutableExprId>,
     memory: &[SemanticMemory],
-    authority: &AuthorityIndex<'_>,
 ) -> Result<(), String> {
     let draining = memory
         .iter()
@@ -1773,57 +1515,174 @@ fn validate_no_ordinary_draining_reads(
     if draining.is_empty() {
         return Ok(());
     }
-    let definitions = draining
-        .iter()
-        .map(|memory_id| {
-            let memory = &memory[memory_id.as_usize()];
-            let exprs = fields
-                .iter()
-                .filter(|field| {
-                    field.path == memory.identity.semantic_path
-                        || (memory.identity.kind == SemanticMemoryKind::ListOwner
-                            && field
-                                .path
-                                .ends_with(&format!(".{}", memory.identity.semantic_path)))
-                })
-                .flat_map(|field| field.ast_exprs.iter().map(|expr| expr.id))
-                .collect::<BTreeSet<_>>();
-            (*memory_id, exprs)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut definitions = BTreeMap::new();
+    for memory_id in &draining {
+        let candidate = &memory[memory_id.as_usize()];
+        let roots =
+            semantic_memory_definition_roots(candidate, executable, derived_list_storage, storage)?;
+        let mut expressions = BTreeSet::new();
+        for root in roots {
+            expressions.extend(executable_subtree(executable, materializations, root)?);
+        }
+        definitions.insert(*memory_id, expressions);
+    }
 
-    for expr in &program.expressions {
-        let parts = match &expr.kind {
-            AstExprKind::Identifier(name) => vec![name.clone()],
-            AstExprKind::Path(parts) => parts.clone(),
+    for read in storage
+        .reads
+        .iter()
+        .filter(|read| reachable.contains(&read.expression))
+    {
+        let expression = executable
+            .expressions
+            .get(read.expression.as_usize())
+            .filter(|candidate| candidate.id == read.expression)
+            .ok_or_else(|| {
+                format!(
+                    "erased read references missing expression {}",
+                    read.expression
+                )
+            })?;
+        if matches!(expression.kind, ExecutableExpressionKind::Drain { .. }) {
+            continue;
+        }
+        let (binding_id, projection) = match &read.target {
+            ErasedReadTarget::Binding {
+                binding,
+                projection,
+            } => (*binding, projection.as_slice()),
+            ErasedReadTarget::StateProjection {
+                binding, fields, ..
+            } => (*binding, fields.as_slice()),
             _ => continue,
         };
-        for context in field_contexts_for_expr(expr.id, fields)
-            .into_iter()
-            .map(Some)
-            .chain(std::iter::once(None))
-        {
-            for resolved in authority.resolve_reference_path(&parts, context) {
-                if !draining.contains(&resolved.memory_id)
-                    || definitions
-                        .get(&resolved.memory_id)
-                        .is_some_and(|exprs| exprs.contains(&expr.id))
-                {
-                    continue;
-                }
-                return Err(format!(
-                    "ordinary reference to DRAINING authority `{}` at line {} is not allowed; use DRAIN at the migration destination",
-                    resolved.region_path, expr.line
-                ));
+        let binding = storage
+            .bindings
+            .get(binding_id.as_usize())
+            .filter(|candidate| candidate.id == binding_id)
+            .ok_or_else(|| {
+                format!(
+                    "ordinary migration read {} references missing binding {binding_id}",
+                    read.expression
+                )
+            })?;
+        for memory_id in semantic_memory_for_binding(memory, binding) {
+            if !draining.contains(&memory_id)
+                || definitions
+                    .get(&memory_id)
+                    .is_some_and(|expressions| expressions.contains(&read.expression))
+            {
+                continue;
             }
+            let authority = &memory[memory_id.as_usize()];
+            let region_path = if projection.is_empty() {
+                authority.identity.semantic_path.clone()
+            } else {
+                format!(
+                    "{}.{}",
+                    authority.identity.semantic_path,
+                    projection.join(".")
+                )
+            };
+            let line = checked_expression(checked, expression.checked_expr_id)
+                .map(|expression| expression.span.line)
+                .unwrap_or_default();
+            return Err(format!(
+                "ordinary reference to DRAINING authority `{region_path}` at line {line} is not allowed; use DRAIN at the migration destination"
+            ));
         }
     }
     Ok(())
 }
 
+fn semantic_memory_definition_roots(
+    memory: &SemanticMemory,
+    executable: &ExecutableProgram,
+    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    storage: &ErasedScopeIndex,
+) -> Result<Vec<ExecutableExprId>, String> {
+    match memory.runtime_backing {
+        SemanticMemoryRuntimeBacking::RootState { state_id, .. }
+        | SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => {
+            let roots = storage
+                .bindings
+                .iter()
+                .filter_map(|binding| match binding.target {
+                    ErasedBindingTarget::State {
+                        runtime,
+                        published: true,
+                        ..
+                    } if runtime == state_id => Some(binding.producer),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if roots.len() != 1 {
+                return Err(format!(
+                    "DRAINING authority `{}` has {} exact state definition roots",
+                    memory.identity.semantic_path,
+                    roots.len()
+                ));
+            }
+            Ok(roots)
+        }
+        SemanticMemoryRuntimeBacking::List { list_id, .. } => {
+            let roots = derived_list_storage
+                .iter()
+                .filter(|(_, candidate)| candidate.list_id == list_id)
+                .filter_map(|(statement_id, _)| {
+                    executable_statement(executable, *statement_id)
+                        .and_then(|statement| statement.value)
+                })
+                .collect::<Vec<_>>();
+            if roots.len() != 1 {
+                return Err(format!(
+                    "DRAINING list authority `{}` has {} exact checked definition roots",
+                    memory.identity.semantic_path,
+                    roots.len()
+                ));
+            }
+            Ok(roots)
+        }
+    }
+}
+
+fn executable_subtree(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    root: ExecutableExprId,
+) -> Result<BTreeSet<ExecutableExprId>, String> {
+    let mut expressions = BTreeSet::new();
+    let mut pending = vec![root];
+    while let Some(expression_id) = pending.pop() {
+        if !expressions.insert(expression_id) {
+            continue;
+        }
+        let expression = executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|candidate| candidate.id == expression_id)
+            .ok_or_else(|| {
+                format!("migration definition reaches missing expression {expression_id}")
+            })?;
+        if let ExecutableExpressionKind::Materialize { materialization } = expression.kind {
+            let materialization = materializations
+                .get(materialization)
+                .filter(|candidate| candidate.id == materialization)
+                .ok_or_else(|| {
+                    format!(
+                        "migration definition reaches missing materialization {materialization}"
+                    )
+                })?;
+            pending.extend(materialization.expression_roots());
+        }
+        pending.extend(executable_expression_children(&expression.kind));
+    }
+    Ok(expressions)
+}
+
 fn lower_edges(
-    program: &ParsedProgram,
-    report: &TypeCheckReport,
+    checked: &CheckedProgram,
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
     memory: &[SemanticMemory],
     drains: &[DrainUse],
 ) -> Result<Vec<MigrationEdge>, String> {
@@ -1866,7 +1725,6 @@ fn lower_edges(
             .push(drain);
     }
 
-    let functions = function_statements(&program.ast.statements);
     let mut edges = Vec::with_capacity(grouped.len());
     for ((destination_memory_id, destination_path, expression_root), uses) in grouped {
         let destination_region = &uses[0].destination;
@@ -1882,23 +1740,50 @@ fn lower_edges(
         let output_type = if all_identity {
             uses[0].source.data_type.clone()
         } else {
-            let data_type = checked_type_for_expr(report, expression_root.as_usize())
-                .map(semantic_data_type)
-                .ok_or_else(|| {
-                    format!(
-                        "migration transform expression {} has unknown type",
-                        expression_root
-                    )
-                })?;
+            let roots = uses
+                .iter()
+                .map(|drain| drain.executable_root)
+                .collect::<BTreeSet<_>>();
+            let data_types = roots
+                .iter()
+                .map(|root| {
+                    executable
+                        .expressions
+                        .get(root.as_usize())
+                        .filter(|candidate| candidate.id == *root)
+                        .map(|expression| semantic_data_type(&expression.flow_type.ty))
+                        .ok_or_else(|| {
+                            format!("migration transform references missing expression {root}")
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let Some(data_type) = data_types.first().cloned() else {
+                return Err(format!(
+                    "migration transform expression {expression_root} has no concrete output type"
+                ));
+            };
+            if data_types.iter().any(|candidate| candidate != &data_type) {
+                return Err(format!(
+                    "migration transform expression {expression_root} has inconsistent concrete output types"
+                ));
+            }
             ensure_closed_migration_type(
                 &data_type,
                 &format!("migration transform expression {expression_root}"),
             )?;
             let allowed_drains = uses
                 .iter()
-                .map(|drain| drain.drain_expr_id.as_usize())
+                .map(|drain| drain.executable_drain)
                 .collect::<BTreeSet<_>>();
-            validate_pure_transform(program, &uses[0].pipeline, &allowed_drains, &functions)?;
+            for root in roots {
+                validate_pure_transform(
+                    checked,
+                    executable,
+                    materializations,
+                    root,
+                    &allowed_drains,
+                )?;
+            }
             data_type
         };
         if !list_transfer && !migration_type_assignable(&output_type, &destination_region.data_type)
@@ -2061,343 +1946,177 @@ fn ensure_closed_migration_type(data_type: &SemanticDataType, context: &str) -> 
     }
 }
 
-fn function_statements(statements: &[AstStatement]) -> BTreeMap<String, &AstStatement> {
-    let mut functions = BTreeMap::new();
-    collect_function_statements(statements, &mut functions);
-    functions
-}
-
-fn collect_function_statements<'a>(
-    statements: &'a [AstStatement],
-    functions: &mut BTreeMap<String, &'a AstStatement>,
-) {
-    for statement in statements {
-        if let AstStatementKind::Function { name, .. } = &statement.kind {
-            functions.insert(name.clone(), statement);
-        }
-        collect_function_statements(&statement.children, functions);
-    }
-}
-
 fn validate_pure_transform(
-    program: &ParsedProgram,
-    pipeline: &[ExprId],
-    allowed_drains: &BTreeSet<usize>,
-    functions: &BTreeMap<String, &AstStatement>,
+    checked: &CheckedProgram,
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    root: ExecutableExprId,
+    allowed_drains: &BTreeSet<ExecutableExprId>,
 ) -> Result<(), String> {
-    let mut checker = PurityChecker {
-        program,
+    ExecutablePurityChecker {
+        checked,
+        executable,
+        materializations,
         allowed_drains,
-        functions,
-        active_functions: Vec::new(),
-    };
-    for expr_id in pipeline {
-        checker.check_expr(expr_id.as_usize(), &BTreeSet::new(), true)?;
+        active: BTreeSet::new(),
     }
-    Ok(())
+    .check(root, &BTreeSet::new())
 }
 
-struct PurityChecker<'a> {
-    program: &'a ParsedProgram,
-    allowed_drains: &'a BTreeSet<usize>,
-    functions: &'a BTreeMap<String, &'a AstStatement>,
-    active_functions: Vec<String>,
+struct ExecutablePurityChecker<'a> {
+    checked: &'a CheckedProgram,
+    executable: &'a ExecutableProgram,
+    materializations: &'a [ContextualMaterialization],
+    allowed_drains: &'a BTreeSet<ExecutableExprId>,
+    active: BTreeSet<ExecutableExprId>,
 }
 
-impl PurityChecker<'_> {
-    fn check_expr(
+impl ExecutablePurityChecker<'_> {
+    fn check(
         &mut self,
-        expr_id: usize,
-        params: &BTreeSet<String>,
-        allow_placeholder: bool,
+        expression_id: ExecutableExprId,
+        locals: &BTreeSet<DeclId>,
     ) -> Result<(), String> {
-        let expr = self.program.expressions.get(expr_id).ok_or_else(|| {
-            format!("migration transform references missing expression {expr_id}")
-        })?;
-        match &expr.kind {
-            AstExprKind::Drain { .. } if self.allowed_drains.contains(&expr.id) => Ok(()),
-            AstExprKind::Drain { .. } => Err(format!(
-                "migration transform at line {} contains a DRAIN owned by another destination",
-                expr.line
-            )),
-            AstExprKind::Identifier(name) if params.contains(name) => Ok(()),
-            AstExprKind::Path(parts) if parts.first().is_some_and(|root| params.contains(root)) => {
-                Ok(())
-            }
-            AstExprKind::Identifier(name) => Err(format!(
-                "migration transform at line {} reads `{name}` outside its DRAIN inputs",
-                expr.line
-            )),
-            AstExprKind::Path(parts) => Err(format!(
-                "migration transform at line {} reads `{}` outside its DRAIN inputs",
-                expr.line,
-                parts.join(".")
-            )),
-            AstExprKind::Source => Err(format!(
-                "migration transform at line {} reads SOURCE data",
-                expr.line
-            )),
-            AstExprKind::Call {
-                function,
-                args,
-                pass,
-            } => {
-                let mut local_params = params.clone();
-                local_params.extend(
-                    args.iter()
-                        .filter(|arg| arg.is_bare_binding())
-                        .map(|arg| arg.name.clone()),
-                );
-                for arg in args {
-                    if arg.named_name().is_some() {
-                        self.check_expr(arg.value, &local_params, false)?;
-                    }
-                }
-                if let Some(pass) = pass {
-                    self.check_expr(pass.value, params, false)?;
-                }
-                self.check_call(function, expr.line)
-            }
-            AstExprKind::Pipe {
-                input,
-                op,
-                args,
-                pass,
-                ..
-            } => {
-                self.check_expr(*input, params, true)?;
-                let mut local_params = params.clone();
-                local_params.extend(
-                    args.iter()
-                        .filter(|arg| arg.is_bare_binding())
-                        .map(|arg| arg.name.clone()),
-                );
-                for arg in args {
-                    if arg.named_name().is_some() {
-                        self.check_expr(arg.value, &local_params, false)?;
-                    }
-                }
-                if let Some(pass) = pass {
-                    self.check_expr(pass.value, params, false)?;
-                }
-                self.check_call(op, expr.line)
-            }
-            AstExprKind::Infix { left, right, .. } => {
-                self.check_expr(*left, params, false)?;
-                self.check_expr(*right, params, false)
-            }
-            AstExprKind::Object(fields)
-            | AstExprKind::Record(fields)
-            | AstExprKind::TaggedObject { fields, .. } => {
-                for field in fields {
-                    self.check_expr(field.value, params, false)?;
-                }
-                Ok(())
-            }
-            AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => {
-                for item in items {
-                    self.check_expr(*item, params, false)?;
-                }
-                Ok(())
-            }
-            AstExprKind::Delimiter if allow_placeholder => Ok(()),
-            AstExprKind::When { input, .. } => self.check_expr(*input, params, true),
-            AstExprKind::MatchArm { output, .. } => match output {
-                Some(output) => self.check_expr(*output, params, false),
-                None => Ok(()),
-            },
-            AstExprKind::Block { bindings, result } => {
-                let mut local_params = params.clone();
-                local_params.extend(bindings.iter().map(|binding| binding.name.clone()));
-                for binding in bindings {
-                    self.check_expr(binding.value, &local_params, false)?;
-                }
-                if let Some(result) = result {
-                    self.check_expr(*result, &local_params, false)?;
-                }
-                Ok(())
-            }
-            AstExprKind::StringLiteral(_)
-            | AstExprKind::TextLiteral(_)
-            | AstExprKind::Number(_)
-            | AstExprKind::ByteLiteral { .. }
-            | AstExprKind::Bool(_)
-            | AstExprKind::Enum(_)
-            | AstExprKind::Tag(_) => Ok(()),
-            AstExprKind::Hold { .. }
-            | AstExprKind::Latest
-            | AstExprKind::Then { .. }
-            | AstExprKind::Draining { .. } => Err(format!(
-                "migration transform at line {} uses a stateful or flow combinator",
-                expr.line
-            )),
-            AstExprKind::Delimiter | AstExprKind::Unknown(_) => Err(format!(
-                "migration transform at line {} contains an unknown expression",
-                expr.line
-            )),
-        }
-    }
-
-    fn check_call(&mut self, function: &str, line: usize) -> Result<(), String> {
-        if stateful_or_effectful_call(function) {
+        if !self.active.insert(expression_id) {
             return Err(format!(
-                "migration transform at line {line} calls stateful, nondeterministic, or host operation `{function}`"
+                "migration transform contains a recursive executable expression at {expression_id}"
             ));
         }
-        if pure_builtin(function) {
-            return Ok(());
-        }
-        let Some(statement) = self.functions.get(function).copied() else {
-            return Err(format!(
-                "migration transform at line {line} calls unknown function `{function}`"
-            ));
-        };
-        if self
-            .active_functions
-            .iter()
-            .any(|active| active == function)
-        {
-            return Err(format!(
-                "migration transform purity cannot prove recursive function `{function}` deterministic"
-            ));
-        }
-        let AstStatementKind::Function { parameters, .. } = &statement.kind else {
-            unreachable!();
-        };
-        let params = parameters
-            .iter()
-            .map(|parameter| parameter.name.clone())
-            .collect::<BTreeSet<_>>();
-        self.active_functions.push(function.to_owned());
-        let result = self.check_function_body(statement, &params);
-        self.active_functions.pop();
+        let result = self.check_inner(expression_id, locals);
+        self.active.remove(&expression_id);
         result
     }
 
-    fn check_function_body(
+    fn check_inner(
         &mut self,
-        statement: &AstStatement,
-        params: &BTreeSet<String>,
+        expression_id: ExecutableExprId,
+        locals: &BTreeSet<DeclId>,
     ) -> Result<(), String> {
-        for child in &statement.children {
-            if matches!(child.kind, AstStatementKind::Function { .. }) {
-                continue;
-            }
-            if let Some(expr_id) = child.expr {
-                self.check_expr(expr_id, params, true)?;
-            }
-            self.check_function_body(child, params)?;
+        let expression = self
+            .executable
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|candidate| candidate.id == expression_id)
+            .ok_or_else(|| {
+                format!("migration transform references missing expression {expression_id}")
+            })?;
+        let checked_expression = checked_expression(self.checked, expression.checked_expr_id)
+            .ok_or_else(|| {
+                format!(
+                    "migration transform expression {expression_id} references missing checked expression {}",
+                    expression.checked_expr_id.0
+                )
+            })?;
+        let line = checked_expression.span.line;
+        if matches!(
+            &checked_expression.kind,
+            CheckedExpressionKind::Hold { .. }
+                | CheckedExpressionKind::Latest { .. }
+                | CheckedExpressionKind::While { .. }
+                | CheckedExpressionKind::Then { .. }
+                | CheckedExpressionKind::Draining { .. }
+        ) {
+            return Err(format!(
+                "migration transform at line {line} uses a stateful or flow combinator"
+            ));
         }
-        Ok(())
+        if expression.effect.reads_state
+            || expression.effect.writes_state
+            || expression.effect.emits_source
+            || expression.effect.invokes_host
+        {
+            return Err(format!(
+                "migration transform at line {line} contains a stateful, source-emitting, or host effect"
+            ));
+        }
+
+        match &expression.kind {
+            ExecutableExpressionKind::Drain { .. }
+                if self.allowed_drains.contains(&expression_id) =>
+            {
+                Ok(())
+            }
+            ExecutableExpressionKind::Drain { .. } => Err(format!(
+                "migration transform at line {line} contains a DRAIN owned by another destination"
+            )),
+            ExecutableExpressionKind::CanonicalRead { path, .. } => Err(format!(
+                "migration transform at line {line} reads `{path}` outside its DRAIN inputs"
+            )),
+            ExecutableExpressionKind::LocalRead { declaration, .. } => {
+                if locals.contains(declaration) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "migration transform at line {line} reads unbound local declaration {}",
+                        declaration.0
+                    ))
+                }
+            }
+            ExecutableExpressionKind::ExternalRead { canonical_path } => Err(format!(
+                "migration transform at line {line} reads external value `{canonical_path}`"
+            )),
+            ExecutableExpressionKind::ElementState { .. } => Err(format!(
+                "migration transform at line {line} reads element state"
+            )),
+            ExecutableExpressionKind::Source { .. } => Err(format!(
+                "migration transform at line {line} reads SOURCE data"
+            )),
+            ExecutableExpressionKind::Call {
+                callable_kind: ExecutableCallableKind::External,
+                name,
+                ..
+            } => Err(format!(
+                "migration transform at line {line} calls external function `{name}`"
+            )),
+            ExecutableExpressionKind::Hold { .. }
+            | ExecutableExpressionKind::Latest { .. }
+            | ExecutableExpressionKind::Then { .. }
+            | ExecutableExpressionKind::Draining { .. } => Err(format!(
+                "migration transform at line {line} uses a stateful or flow combinator"
+            )),
+            ExecutableExpressionKind::Delimiter => Err(format!(
+                "migration transform at line {line} contains an unbound pipeline delimiter"
+            )),
+            ExecutableExpressionKind::Block { bindings, result } => {
+                let mut scoped = locals.clone();
+                for binding in bindings {
+                    self.check(binding.value, &scoped)?;
+                    scoped.insert(binding.declaration);
+                }
+                self.check(*result, &scoped)
+            }
+            ExecutableExpressionKind::Materialize { materialization } => {
+                let materialization = self
+                    .materializations
+                    .get(*materialization)
+                    .filter(|candidate| candidate.id == *materialization)
+                    .ok_or_else(|| {
+                        format!(
+                            "migration transform references missing materialization {materialization}"
+                        )
+                    })?;
+                for root in materialization.expression_roots() {
+                    self.check(root, locals)?;
+                }
+                Ok(())
+            }
+            ExecutableExpressionKind::FunctionParameter { .. } => Err(format!(
+                "migration transform at line {line} reads an unbound function parameter"
+            )),
+            ExecutableExpressionKind::MaterializationLocal { .. }
+            | ExecutableExpressionKind::Text(_)
+            | ExecutableExpressionKind::Number(_)
+            | ExecutableExpressionKind::BytesByte(_)
+            | ExecutableExpressionKind::Bool(_)
+            | ExecutableExpressionKind::Tag(_) => Ok(()),
+            _ => {
+                for child in executable_expression_children(&expression.kind) {
+                    self.check(child, locals)?;
+                }
+                Ok(())
+            }
+        }
     }
-}
-
-fn stateful_or_effectful_call(function: &str) -> bool {
-    matches!(
-        function,
-        "HOLD"
-            | "LATEST"
-            | "WHEN"
-            | "THEN"
-            | "WHILE"
-            | "Bool/toggle"
-            | "List/latest"
-            | "List/append"
-            | "List/remove"
-            | "Timer/interval"
-            | "Ulid/generate"
-            | "File/read_bytes"
-            | "File/read_text"
-            | "File/write_bytes"
-            | "Router/route"
-            | "Router/go_to"
-    ) || function.starts_with("Time/")
-        || function.starts_with("Timer/")
-        || function.starts_with("Random/")
-        || function.starts_with("Ulid/")
-        || function.starts_with("File/")
-        || function.starts_with("Router/")
-        || function.starts_with("Host/")
-        || function.starts_with("Document/")
-        || function.starts_with("Element/")
-        || function.starts_with("Scene/")
-        || function.starts_with("Widget/")
-}
-
-fn pure_builtin(function: &str) -> bool {
-    matches!(
-        function,
-        "Text/empty"
-            | "Text/space"
-            | "Text/trim"
-            | "Text/to_uppercase"
-            | "Text/concat"
-            | "Text/time_range_label"
-            | "Text/substring"
-            | "Text/is_empty"
-            | "Text/is_not_empty"
-            | "Text/starts_with"
-            | "Text/contains"
-            | "Text/all_chars_in"
-            | "Text/find"
-            | "Text/length"
-            | "Text/to_number"
-            | "Text/to_bytes"
-            | "Number/add"
-            | "Number/subtract"
-            | "Number/min"
-            | "Number/max"
-            | "Number/bit_width"
-            | "Number/interpolate"
-            | "Number/project_width"
-            | "Number/project_offset"
-            | "Number/project_time"
-            | "Number/to_text"
-            | "Number/to_codepoint_text"
-            | "Number/to_ascii_text"
-            | "Bool/not"
-            | "Bool/and"
-            | "Bytes/length"
-            | "Bytes/is_empty"
-            | "Bytes/get"
-            | "Bytes/set"
-            | "Bytes/slice"
-            | "Bytes/take"
-            | "Bytes/drop"
-            | "Bytes/concat"
-            | "Bytes/equal"
-            | "Bytes/find"
-            | "Bytes/starts_with"
-            | "Bytes/ends_with"
-            | "Bytes/to_text"
-            | "Bytes/to_hex"
-            | "Bytes/to_base64"
-            | "Bytes/from_hex"
-            | "Bytes/from_base64"
-            | "Bytes/zeros"
-            | "Bytes/read_unsigned"
-            | "Bytes/read_signed"
-            | "Bytes/write_unsigned"
-            | "Bytes/write_signed"
-            | "List/map"
-            | "List/filter"
-            | "List/retain"
-            | "List/range"
-            | "List/chunk"
-            | "List/move_field_first"
-            | "List/move_field_last"
-            | "List/find"
-            | "List/get"
-            | "List/count"
-            | "List/length"
-            | "List/sum"
-            | "List/every"
-            | "List/any"
-            | "List/is_not_empty"
-            | "Text/join"
-            | "Error/new"
-            | "Error/text"
-    ) || function.starts_with("Field/")
 }
 
 fn validate_migration_cycles(

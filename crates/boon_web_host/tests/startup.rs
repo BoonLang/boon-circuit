@@ -7,7 +7,9 @@ use boon_runtime::{
     ApplicationIdentity, ProgramArtifact, ProgramCapabilityProfile, ProgramCompileRequest,
     RuntimeSourceUnit, compile_distributed_program_bundle, compile_program_artifact,
 };
-use boon_web_host::{BrowserAppStartup, WebHostError, decode_browser_app_config};
+use boon_web_host::{
+    BrowserAppStartup, BrowserAppStartupPoll, WebHostError, decode_browser_app_config,
+};
 
 const CLIENT_SOURCE: &str = r#"
 store: [
@@ -71,6 +73,7 @@ fn browser_config(
         client_artifact_bytes_len: artifact_bytes.len(),
         client_capability_profile_id: client_capability_profile.id.clone(),
         client_capability_profile,
+        package_assets: Vec::new(),
         canvas_id: "boon-canvas".to_owned(),
     }
 }
@@ -106,6 +109,34 @@ fn native_startup_decoder_mounts_the_verified_distributed_client() {
 
     assert_eq!(startup.config(), &config);
     assert!(startup.runtime().document_frame().is_some());
+}
+
+#[test]
+fn startup_task_yields_and_matches_the_synchronous_runtime() {
+    let (config, artifact_bytes) = client_fixture();
+    let synchronous =
+        BrowserAppStartup::from_artifact_bytes(config.clone(), artifact_bytes.clone()).unwrap();
+    let expected_frame = synchronous.runtime().document_frame().cloned();
+
+    let mut task = BrowserAppStartup::begin_from_artifact_bytes(config.clone(), artifact_bytes)
+        .expect("verified Client artifact starts a cooperative build");
+    let mut pending_polls = 0;
+    let cooperative = loop {
+        match task.poll(1).unwrap() {
+            BrowserAppStartupPoll::Pending(_) => pending_polls += 1,
+            BrowserAppStartupPoll::Ready(startup) => break startup,
+        }
+    };
+
+    assert!(
+        pending_polls > 1,
+        "startup must expose real yield boundaries"
+    );
+    assert_eq!(cooperative.config(), &config);
+    assert_eq!(
+        cooperative.runtime().document_frame(),
+        expected_frame.as_ref()
+    );
 }
 
 #[test]

@@ -1,4 +1,99 @@
 #[test]
+fn checked_when_consumes_the_comparison_result() {
+    let parsed = boon_parser::parse_source(
+        "checked-comparison-when.bn",
+        r#"
+store: [
+    left: [value: 1]
+    right: [value: 1]
+    result:
+        left
+        == right
+        |> WHEN {
+            True => TEXT { equal }
+            False => TEXT { different }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid source has a checked program");
+    let when = program
+        .expressions
+        .iter()
+        .find(|expression| matches!(expression.kind, CheckedExpressionKind::When { .. }))
+        .expect("checked WHEN expression");
+    let CheckedExpressionKind::When { input, .. } = when.kind else {
+        unreachable!();
+    };
+    assert!(program.expressions.iter().any(|expression| {
+        expression.id == input
+            && matches!(
+                expression.kind,
+                CheckedExpressionKind::Infix { ref op, .. } if op == "=="
+            )
+    }));
+}
+
+#[test]
+fn checked_multiline_then_keeps_the_temporal_statement_root() {
+    let parsed = boon_parser::parse_source(
+        "checked-multiline-then-root.bn",
+        r#"
+store: [
+    start: SOURCE
+    result:
+        Initial |> HOLD result {
+            start |> THEN {
+                True
+                == True
+                |> WHEN {
+                    True => Ready
+                    False => SKIP
+                }
+            }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let then = parsed
+        .expressions
+        .iter()
+        .find(|expression| matches!(expression.kind, AstExprKind::Then { .. }))
+        .expect("multiline THEN expression");
+    let then_statement = parsed
+        .ast
+        .statements
+        .iter()
+        .flat_map(|statement| statement.children.iter())
+        .flat_map(|statement| statement.children.iter())
+        .flat_map(|statement| statement.children.iter())
+        .find(|statement| statement.expr == Some(then.id))
+        .expect("THEN statement");
+
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("fixture is checked");
+    let checked_statement = program
+        .statements
+        .iter()
+        .find(|statement| statement.id == CheckedStatementId(then_statement.id as u32))
+        .expect("checked THEN statement");
+    assert_eq!(checked_statement.value, Some(CheckedExprId(then.id as u32)));
+}
+
+#[test]
 fn checked_program_binds_fresh_and_forwarded_outputs() {
     let parsed = boon_parser::parse_source(
         "checked-out.bn",
@@ -93,6 +188,98 @@ result:
     }));
 }
 
+#[test]
+fn checked_program_uses_the_parser_link_for_a_multiline_pipeline() {
+    let parsed = boon_parser::parse_source(
+        "checked-linked-pipeline.bn",
+        r#"
+result:
+    1
+    |> Number/ceil()
+"#,
+    )
+    .unwrap();
+    let pipeline = parsed
+        .expressions
+        .iter()
+        .find(|expression| {
+            matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/ceil")
+        })
+        .expect("multiline Number/ceil pipeline");
+    let linked_input = pipeline
+        .linked_input
+        .expect("parser must own the multiline pipeline link");
+
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("linked pipeline is checked");
+    let call = program
+        .calls
+        .iter()
+        .find(|call| call.expression == CheckedExprId(pipeline.id as u32))
+        .expect("pipeline call");
+    assert!(call.entries.iter().any(|entry| {
+        matches!(
+            entry,
+            CheckedCallEntry::Input {
+                value,
+                from_pipe: true,
+                ..
+            } if *value == CheckedExprId(linked_input as u32)
+        )
+    }));
+}
+
+#[test]
+fn checked_program_rejects_a_multiline_pipeline_without_its_parser_link() {
+    let mut parsed = boon_parser::parse_source(
+        "checked-missing-pipeline-link.bn",
+        r#"
+result:
+    1
+    |> Number/ceil()
+"#,
+    )
+    .unwrap();
+    let pipeline = parsed
+        .expressions
+        .iter_mut()
+        .find(|expression| {
+            matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/ceil")
+        })
+        .expect("multiline Number/ceil pipeline");
+    assert!(pipeline.linked_input.take().is_some());
+
+    let output = check_program(&parsed);
+    assert!(output.program.is_none());
+    assert_eq!(
+        output
+            .report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.message == "pipeline continuation is missing its exact linked input"
+            })
+            .count(),
+        1,
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+
+    let provisional = check_program_with_external_types(
+        &parsed,
+        &ExternalTypeEnvironment::provisional(ProgramRole::Client),
+    );
+    assert!(
+        provisional.program.is_none(),
+        "structurally malformed linkage must not enter a provisional CheckedProgram"
+    );
+}
+
 fn wrapper_signature_result_expression(
     program: &CheckedProgram,
     name: &str,
@@ -113,6 +300,92 @@ fn checked_callable<'a>(program: &'a CheckedProgram, name: &str) -> &'a CheckedC
 }
 
 #[test]
+fn render_call_owns_element_state_without_shadowing_its_provider_input() {
+    let parsed = boon_parser::parse_source(
+        "render-call-context.bn",
+        r#"
+document: Document/new(root: render_button(element: []))
+
+FUNCTION render_button(element) {
+    Element/button(
+        element: element
+        style: [
+            opacity:
+                element.hovered |> WHILE {
+                    True => 1
+                    False => 0.5
+                }
+        ]
+        label: TEXT { Test }
+    )
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid render source is checked");
+    let call = program
+        .calls
+        .iter()
+        .find(|call| call.function == "Element/button")
+        .expect("button call is checked");
+    let [context] = call.contexts.as_slice() else {
+        panic!("button call must own exactly one element-state context")
+    };
+    let context_declaration = program
+        .declarations
+        .iter()
+        .find(|declaration| declaration.id == context.declaration)
+        .expect("element-state declaration exists");
+    assert_eq!(
+        context_declaration.kind,
+        CheckedDeclarationKind::ElementState
+    );
+    let provider = call
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            CheckedCallEntry::Input { name, value, .. } if name == "element" => Some(*value),
+            _ => None,
+        })
+        .expect("element provider input exists");
+    assert!(matches!(
+        program
+            .expressions
+            .iter()
+            .find(|expression| expression.id == provider)
+            .expect("provider expression is checked")
+            .kind,
+        CheckedExpressionKind::Read {
+            target,
+            ref projection,
+            ..
+        } if target != context.declaration && projection.is_empty()
+    ));
+    assert!(program.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            CheckedExpressionKind::Read {
+                target, projection, ..
+            }
+                if *target == context.declaration && projection == &["hovered".to_owned()]
+        )
+    }));
+    assert!(!program.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            CheckedExpressionKind::ExternalRead { canonical_path }
+                if canonical_path == "element.hovered"
+        )
+    }));
+}
+
+#[test]
 fn checked_callable_effects_include_nested_record_sources_and_state() {
     let parsed = boon_parser::parse_source(
         "nested-record-effects.bn",
@@ -121,9 +394,8 @@ FUNCTION row(initial) {
     [
         trigger: SOURCE
         value:
-            initial
-            |> HOLD value {
-                LATEST { PASSED }
+            initial |> HOLD value {
+                PASSED
             }
     ]
 }
@@ -142,7 +414,10 @@ rows:
     );
     let checked = output.program.expect("checked program");
     let effect = checked_callable(&checked, "row").effect;
-    assert!(effect.emits_source, "nested SOURCE must affect the callable");
+    assert!(
+        effect.emits_source,
+        "nested SOURCE must affect the callable"
+    );
     assert!(effect.writes_state, "nested HOLD must affect the callable");
 }
 
@@ -294,6 +569,21 @@ document: Document/new(
         "Element/label",
         &["element", "style", "label", "visible", "target"],
     );
+    assert_callable_parameters(
+        &program,
+        "Scene/Element/text_input",
+        &[
+            "element",
+            "input_id",
+            "style",
+            "label",
+            "text",
+            "placeholder",
+            "visible",
+            "target",
+            "focus",
+        ],
+    );
     assert_no_unbound_calls(&parsed, &program);
 }
 
@@ -369,6 +659,8 @@ label: detail(row: row).label
 #[test]
 fn checked_program_keeps_unimplemented_callable_names_fail_closed() {
     for function in [
+        "List/query",
+        "List/query_prefix",
         "List/move_field_first",
         "List/move_field_last",
         "Widget/table",
@@ -393,6 +685,30 @@ fn checked_program_keeps_unimplemented_callable_names_fail_closed() {
 }
 
 #[test]
+fn numeric_infix_operators_reject_text_coercion() {
+    for operator in ["+", "-", "*", "/", "%", ">", "<", ">=", "<="] {
+        let parsed = boon_parser::parse_source(
+            "numeric-infix-types.bn",
+            &format!("value: TEXT {{ A }} {operator} 1\n"),
+        )
+        .unwrap();
+        let report = check(&parsed);
+
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains(&format!("operator `{operator}` operand has incompatible type"))
+                    && diagnostic.message.contains("expected: NUMBER")
+                    && diagnostic.message.contains("found: TEXT")
+            }),
+            "operator `{operator}` diagnostics: {:#?}",
+            report.diagnostics
+        );
+    }
+}
+
+#[test]
 fn checked_runtime_builtins_use_exact_authoritative_schemas() {
     let parsed = boon_parser::parse_source(
         "checked-runtime-contracts.bn",
@@ -408,18 +724,21 @@ remaining:
         item
         when: item.remove
     )
-page:
+ordered:
     catalog
-    |> List/query(
-        fields: TEXT { name }
-        normalization: TEXT { TrimLowercase }
-        select: Prefix
-        prefix: TEXT { al }
-        limit: 20
-        unique: False
-        order: Ascending
-        residual: None
+    |> List/sort_by(
+        item
+        key: item.name
+        direction: Ascending
     )
+    |> List/then_by(
+        item
+        key: item.id
+        direction: Descending
+    )
+    |> List/take(count: 20)
+page: ordered |> List/page(size: 20, after: Start)
+visible: Bool/or(left: True, right: False)
 directional: Light/directional(
     azimuth: 90
     altitude: 60
@@ -454,38 +773,17 @@ spot: Light/spot(
     assert_callable_parameters(&program, "List/remove", &["list", "item", "when"]);
     assert_callable_parameters(
         &program,
-        "List/query",
-        &[
-            "list",
-            "fields",
-            "normalization",
-            "multi_value",
-            "select",
-            "key",
-            "leading",
-            "prefix",
-            "lower",
-            "upper",
-            "lower_inclusive",
-            "upper_inclusive",
-            "keys",
-            "limit",
-            "unique",
-            "order",
-            "residual",
-            "residual_field",
-            "residual_value",
-            "needle",
-            "minimum",
-            "maximum",
-            "latitude_field",
-            "longitude_field",
-            "center_latitude",
-            "center_longitude",
-            "radius_meters",
-            "cursor",
-        ],
+        "List/sort_by",
+        &["list", "item", "key", "direction"],
     );
+    assert_callable_parameters(
+        &program,
+        "List/then_by",
+        &["list", "item", "key", "direction"],
+    );
+    assert_callable_parameters(&program, "List/take", &["list", "count"]);
+    assert_callable_parameters(&program, "List/page", &["list", "size", "after"]);
+    assert_callable_parameters(&program, "Bool/or", &["left", "right"]);
     assert_callable_parameters(
         &program,
         "Light/directional",
@@ -516,9 +814,27 @@ spot: Light/spot(
             formal: item.decl_id
         }
     );
+    let sort = checked_callable(&program, "List/sort_by");
+    let item = sort
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "item")
+        .expect("sort item output");
+    let key = sort
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "key")
+        .expect("sort key");
+    assert_eq!(item.kind, CheckedParameterKind::Out);
+    assert_eq!(
+        key.evaluation_scope,
+        CheckedEvaluationScope::Output {
+            formal: item.decl_id
+        }
+    );
     assert!(matches!(
-        checked_callable(&program, "List/query").result.ty,
-        Type::Object(ObjectShape { open: false, .. })
+        checked_callable(&program, "List/page").result.ty,
+        Type::VariantSet(_)
     ));
     assert_no_unbound_calls(&parsed, &program);
 }
@@ -641,19 +957,9 @@ value: items |> List/remove(item, on: item.remove)
         (
             r#"
 items: LIST { [name: TEXT { Alpha }] }
-value:
-    items
-    |> List/query(
-        fields: TEXT { name }
-        select: Prefix
-        normalization: TEXT { TrimLowercase }
-        prefix: TEXT { al }
-        limit: 20
-        order: Ascending
-        residual: None
-    )
+value: items |> List/sort_by(item, direction: Ascending, key: item.name)
 "#,
-            "must be `normalization`, found `select`",
+            "must be `key`, found `direction`",
         ),
         (
             "value: Light/ambient(intensity: TEXT { high }, color: [])\n",
@@ -871,6 +1177,36 @@ result: identity(value: 1)
 }
 
 #[test]
+fn checked_chunk_rejects_caller_selected_result_field_names() {
+    let parsed = boon_parser::parse_source(
+        "chunk-result-field-names.bn",
+        r#"
+rows: LIST { [value: 1] }
+chunks: List/chunk(
+    list: rows
+    size: 1
+    items: TEXT { custom_items }
+    label: TEXT { custom_label }
+)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(output.program.is_none());
+    for name in ["items", "label"] {
+        assert!(
+            output.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message
+                    == format!("`List/chunk` has an unexpected extra call entry `{name}`")
+            }),
+            "diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+    }
+}
+
+#[test]
 fn checked_render_slot_use_is_owned_by_the_exact_statement() {
     let parsed = boon_parser::parse_source(
         "checked-render-slot-use.bn",
@@ -1060,8 +1396,17 @@ result:
     );
     let program = output.program.expect("valid source has a checked program");
     assert_eq!(program.role, ProgramRole::Client);
+    let fresh_item = program
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "item" && declaration.kind == CheckedDeclarationKind::FreshOut
+        })
+        .expect("List/map call creates one item output");
     assert!(program.scopes.iter().any(|scope| {
-        scope.kind == CheckedScopeKind::RepeatedOutput && scope.parent == Some(program.root_scope)
+        scope.kind == CheckedScopeKind::RepeatedOutput
+            && scope.parent == Some(fresh_item.scope_id)
+            && scope.owner == Some(fresh_item.id)
     }));
     assert!(program.declarations.iter().any(|declaration| {
         declaration.name == "rows" && declaration.kind == CheckedDeclarationKind::List
@@ -1165,8 +1510,67 @@ selected:
     assert!(program.expressions.iter().any(|expression| {
         matches!(
             expression.kind,
-            CheckedExpressionKind::Read { target, ref projection }
+            CheckedExpressionKind::Read {
+                target,
+                ref projection,
+                ..
+            }
                 if target == payload.id && projection.is_empty()
+        )
+    }));
+}
+
+#[test]
+fn propagating_error_branches_preserve_the_success_value_type() {
+    let parsed = boon_parser::parse_source(
+        "checked-propagating-error-result.bn",
+        r#"
+FUNCTION parse_number(text) {
+    text |> Text/to_number() |> WHILE {
+        NaN => Error/new(code: TEXT { invalid_number })
+        number => number
+    }
+}
+
+result: parse_number(text: TEXT { 41 }) + 1
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("error-capable function is checked");
+    let signature = program
+        .callables
+        .iter()
+        .find(|signature| signature.name == "parse_number")
+        .expect("parse_number signature");
+    assert_eq!(signature.result.ty, Type::Number);
+}
+
+#[test]
+fn typed_find_rejects_an_unknown_found_payload_field() {
+    let parsed = boon_parser::parse_source(
+        "checked-direct-find-unknown-payload.bn",
+        r#"
+rows: LIST { [value: 1] }
+
+selected:
+    rows |> List/find(item, if: item.value == 1) |> WHEN {
+        Found[row] => row
+        NotFound => [value: 0]
+    }
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.report.has_errors());
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains(
+            "tagged pattern `Found[row]` binds unknown payload field `row`; payload fields: value",
         )
     }));
 }
@@ -1180,9 +1584,7 @@ FUNCTION row_value(index) {
     index == 0 |> WHILE {
         True => 1
         False =>
-            rows
-            |> List/find(item, if: item.index == index - 1)
-            |> WHEN {
+            rows |> List/find(item, if: item.index == index - 1) |> WHEN {
                 Found[value] => value.value
                 NotFound => 0
             }
@@ -1197,9 +1599,7 @@ rows:
     ])
 
 selected:
-    rows
-    |> List/find(item, if: item.index == 2)
-    |> WHEN {
+    rows |> List/find(item, if: item.index == 2) |> WHEN {
         Found[value] => value.value
         NotFound => 0
     }
@@ -1342,7 +1742,11 @@ result: recover(input: Ready[value: 1])
     assert!(program.expressions.iter().any(|expression| {
         matches!(
             expression.kind,
-            CheckedExpressionKind::Read { target, ref projection }
+            CheckedExpressionKind::Read {
+                target,
+                ref projection,
+                ..
+            }
                 if target == fallback.id && projection.is_empty()
         )
     }));
@@ -1394,7 +1798,11 @@ store: [
     assert!(program.expressions.iter().any(|expression| {
         matches!(
             expression.kind,
-            CheckedExpressionKind::Read { target, ref projection }
+            CheckedExpressionKind::Read {
+                target,
+                ref projection,
+                ..
+            }
                 if target == selected.id && projection.is_empty()
         )
     }));
@@ -1466,7 +1874,9 @@ result: calculate(input: 3)
                 .find(|expression| expression.id == result)
                 .map(|expression| &expression.kind)
         }),
-        Some(CheckedExpressionKind::Read { target, projection })
+        Some(CheckedExpressionKind::Read {
+            target, projection, ..
+        })
             if *target == answer.id && projection.is_empty()
     ));
 }
@@ -1897,14 +2307,16 @@ result: entry_view(entry: [id: 1])
         .expect("record field value is closed over a checked expression");
     assert!(matches!(
         &value.kind,
-        CheckedExpressionKind::Read { target, projection }
+        CheckedExpressionKind::Read {
+            target, projection, ..
+        }
             if *target == entry.decl_id && projection == &["id"]
     ));
     assert_no_unbound_calls(&parsed, &program);
 }
 
 #[test]
-fn checked_record_field_with_a_parameter_name_is_not_self_referential() {
+fn checked_record_field_initializer_reads_a_same_name_outer_parameter() {
     let parsed = boon_parser::parse_source(
         "checked-record-parameter-shadow.bn",
         r#"
@@ -1924,9 +2336,59 @@ result: wrapped(value: TEXT { ok })
         "diagnostics: {:#?}",
         output.report.diagnostics
     );
-    let program = output.program.expect("valid record wrapper is checked");
+    let program = output
+        .program
+        .expect("same-name outer parameter is checked");
     let signature = checked_callable(&program, "wrapped");
     let parameter = signature.parameters.first().expect("value parameter");
+    let result = signature.result_expression.expect("record result");
+    let field_value = program
+        .expressions
+        .iter()
+        .find(|expression| expression.id == result)
+        .and_then(|expression| match &expression.kind {
+            CheckedExpressionKind::Record { fields } => fields.first().map(|field| field.value),
+            _ => None,
+        })
+        .expect("record field value");
+    assert!(matches!(
+        program
+            .expressions
+            .iter()
+            .find(|expression| expression.id == field_value)
+            .map(|expression| &expression.kind),
+        Some(CheckedExpressionKind::Read {
+            target,
+            projection,
+            ..
+        }) if *target == parameter.decl_id && projection.is_empty()
+    ));
+}
+
+#[test]
+fn checked_record_field_can_read_a_differently_named_outer_parameter() {
+    let parsed = boon_parser::parse_source(
+        "checked-record-distinct-parameter.bn",
+        r#"
+FUNCTION wrapped(input) {
+    [
+        value: input
+    ]
+}
+
+result: wrapped(input: TEXT { ok })
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid record wrapper is checked");
+    let signature = checked_callable(&program, "wrapped");
+    let parameter = signature.parameters.first().expect("input parameter");
     let result = signature
         .result_expression
         .expect("canonical record result");
@@ -1936,7 +2398,7 @@ result: wrapped(value: TEXT { ok })
         .find(|expression| expression.id == result)
         .expect("record result expression");
     let CheckedExpressionKind::Record { fields } = &record.kind else {
-        panic!("record wrapper result is not a checked record");
+        panic!("record wrapper result is not a checked record: {record:?}");
     };
     let value = fields.first().expect("value field").value;
     assert!(matches!(
@@ -1945,7 +2407,9 @@ result: wrapped(value: TEXT { ok })
             .iter()
             .find(|expression| expression.id == value)
             .map(|expression| &expression.kind),
-        Some(CheckedExpressionKind::Read { target, projection })
+        Some(CheckedExpressionKind::Read {
+            target, projection, ..
+        })
             if *target == parameter.decl_id && projection.is_empty()
     ));
     assert_no_unbound_calls(&parsed, &program);
@@ -1958,7 +2422,8 @@ fn checked_program_rejects_a_canonical_local_expansion_cycle() {
         r#"
 FUNCTION broken() {
     [
-        value: value
+        first: second
+        second: first
     ]
 }
 
@@ -1974,6 +2439,32 @@ result: broken()
             .message
             .contains("canonical checked value contains an expansion cycle")
     }));
+}
+
+#[test]
+fn tagged_pattern_arms_require_only_their_own_payload_fields() {
+    let parsed = boon_parser::parse_source(
+        "tagged-pattern-parameter-requirements.bn",
+        r#"
+FUNCTION display(value) {
+    value |> WHEN {
+        TextValue => value.text
+        NumberValue => value.number |> Number/to_text()
+    }
+}
+
+text: display(value: TextValue[text: TEXT { ok }])
+number: display(value: NumberValue[number: 3])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    assert!(output.program.is_some());
 }
 
 #[test]
@@ -2065,4 +2556,676 @@ store: [
         reads.iter().all(|(_, owner)| *owner == Some(prefix)),
         "source reads: {reads:#?}; expected owner: {prefix:?}",
     );
+}
+
+#[test]
+fn named_hold_alias_is_bound_to_its_state_declaration() {
+    let parsed = boon_parser::parse_source(
+        "named-hold-alias.bn",
+        r#"
+FUNCTION row(todo) {
+    [
+        change: SOURCE
+        edit_text:
+            todo.title |> HOLD draft {
+                change |> THEN { draft }
+            }
+    ]
+}
+
+rows:
+    LIST { [title: TEXT { one }] }
+    |> List/map(item, new: row(todo: item))
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("checked program");
+    let state = program
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "edit_text")
+        .expect("edit_text declaration");
+    assert!(
+        program.expressions.iter().any(|expression| matches!(
+            &expression.kind,
+            CheckedExpressionKind::Read {
+                target, projection, ..
+            }
+                if *target == state.id && projection.is_empty() && expression.span.line == 7
+        )),
+        "named HOLD alias must be an exact state read: {:#?}",
+        program.expressions
+    );
+    assert!(
+        !program.expressions.iter().any(|expression| matches!(
+            &expression.kind,
+            CheckedExpressionKind::ExternalRead { canonical_path } if canonical_path == "draft"
+        )),
+        "named HOLD alias escaped as an ambient read: {:#?}",
+        program.expressions
+    );
+}
+
+#[test]
+fn render_helper_may_return_no_element_but_plain_state_may_not() {
+    let render_source = boon_parser::parse_source(
+        "render-helper-no-element.bn",
+        r#"
+FUNCTION optional_child(show) {
+    show |> WHEN {
+        True => Scene/Element/text(element: [], text: TEXT { visible })
+        False => NoElement
+    }
+}
+
+document: Scene/new(root: optional_child(show: True))
+"#,
+    )
+    .unwrap();
+    let render_output = check_program(&render_source);
+    assert!(
+        !render_output.report.has_errors(),
+        "diagnostics: {:#?}",
+        render_output.report.diagnostics
+    );
+
+    let state_source =
+        boon_parser::parse_source("state-no-element.bn", "value: NoElement\n").unwrap();
+    let state_output = check_program(&state_source);
+    assert!(state_output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("`NoElement` can only be used as a render value")
+    }));
+}
+
+#[test]
+fn nested_render_helpers_preserve_parameter_types_through_chunked_rows() {
+    let parsed = boon_parser::parse_source(
+        "chunked-render-helper-parameters.bn",
+        r#"
+FUNCTION display_name(signal) {
+    signal.alias |> Text/is_empty() |> WHEN {
+        True => signal.name
+        False => signal.alias
+    }
+}
+
+FUNCTION name_text(label_text) {
+    Scene/Element/text(element: [], text: label_text)
+}
+
+FUNCTION signal_button(signal) {
+    signal_row(signal: signal)
+}
+
+FUNCTION signal_row(signal) {
+    name_text(label_text: display_name(signal: signal))
+}
+
+FUNCTION chunk_row(row) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        items: row.items |> List/map(item, new: signal_button(signal: item))
+    )
+}
+
+signal: TEXT { ambient binding must not type a function parameter }
+
+rows:
+    List/chunk(
+        list: LIST { [name: TEXT { clock }, alias: Text/empty()] }
+        size: 1
+    )
+
+document:
+    Scene/new(
+        root: Scene/Element/stripe(
+            element: []
+            direction: Column
+            items: rows |> List/map(item, new: chunk_row(row: item))
+        )
+    )
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn generic_user_calls_keep_exact_recursive_types_per_call_site() {
+    let parsed = boon_parser::parse_source(
+        "generic-user-call-instances.bn",
+        r#"
+FUNCTION chunk_rows(list, size) {
+    list |> List/chunk(size: size)
+}
+
+text_rows: LIST { [value: TEXT { ready }] }
+number_rows: LIST { [value: 7] }
+text_result: text_rows |> chunk_rows(size: 1)
+number_result: number_rows |> chunk_rows(size: 1)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("generic calls are checked");
+    let calls = program
+        .calls
+        .iter()
+        .filter(|call| call.function == "chunk_rows")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+
+    let result_value_type = |call: &CheckedCall| {
+        let Type::List(chunks) = &call.result.ty else {
+            panic!("chunk helper result is not a list: {:?}", call.result.ty);
+        };
+        let Type::Object(chunk) = chunks.as_ref() else {
+            panic!("chunk helper item is not a record: {chunks:?}");
+        };
+        let Some(Type::List(items)) = chunk.fields.get("items") else {
+            panic!("chunk helper item has no typed items: {chunk:?}");
+        };
+        let Type::Object(item) = items.as_ref() else {
+            panic!("chunk contents are not records: {items:?}");
+        };
+        item.fields.get("value").cloned()
+    };
+    assert_eq!(result_value_type(calls[0]), Some(Type::Text));
+    assert_eq!(result_value_type(calls[1]), Some(Type::Number));
+    assert_ne!(calls[0].type_substitutions, calls[1].type_substitutions);
+
+    let signature = checked_callable(&program, "chunk_rows");
+    assert!(checked_signature_is_generic(signature));
+    assert!(checked_type_contains_var(&signature.result.ty));
+}
+
+#[test]
+fn generic_user_call_flow_is_instantiated_per_call_site() {
+    let parsed = boon_parser::parse_source(
+        "generic-user-call-flow.bn",
+        r#"
+FUNCTION passthrough(value) {
+    BLOCK {
+        forwarded: value
+        forwarded
+    }
+}
+
+store: [pulse: SOURCE]
+continuous: passthrough(value: TEXT { ready })
+event: passthrough(value: store.pulse)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("passthrough calls are checked");
+    let calls = program
+        .calls
+        .iter()
+        .filter(|call| call.function == "passthrough")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].result.mode, FlowMode::Continuous);
+    assert_eq!(calls[1].result.mode, FlowMode::PresentOrAbsent);
+}
+
+#[test]
+fn generic_record_helpers_preserve_nested_call_results_in_list_rows() {
+    let parsed = boon_parser::parse_source(
+        "generic-record-list-rows.bn",
+        r#"
+store: [
+    places: LIST {
+        place(id: TEXT { alpha }, name: TEXT { Alpha }, x: 1.5, y: 2.5)
+        place(id: TEXT { beta }, name: TEXT { Beta }, x: 3.5, y: 4.5)
+    }
+]
+
+FUNCTION point(x, y) {
+    BLOCK {
+        point_x: x
+        point_y: y
+        [x: point_x, y: point_y]
+    }
+}
+
+FUNCTION place(id, name, x, y) {
+    BLOCK {
+        place_id: id
+        place_name: name
+        [
+            id: place_id
+            name: place_name
+            point: point(x: x, y: y)
+        ]
+    }
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("record helpers are checked");
+    let calls = program
+        .calls
+        .iter()
+        .filter(|call| call.function == "place")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        let Type::Object(place) = &call.result.ty else {
+            panic!("place result is not a record: {:?}", call.result.ty);
+        };
+        assert!(!place.open);
+        assert_eq!(place.fields.get("id"), Some(&Type::Text));
+        assert_eq!(place.fields.get("name"), Some(&Type::Text));
+        let Some(Type::Object(point)) = place.fields.get("point") else {
+            panic!("place result has no typed point: {place:?}");
+        };
+        assert!(!point.open);
+        assert_eq!(point.fields.get("x"), Some(&Type::Number));
+        assert_eq!(point.fields.get("y"), Some(&Type::Number));
+    }
+}
+
+#[test]
+fn forward_referenced_event_aliases_remain_present_or_absent_for_then() {
+    let parsed = boon_parser::parse_source(
+        "forward-event-alias-flow.bn",
+        r#"
+store: [
+    reset: forwarded |> THEN { TEXT { reset } }
+    forwarded: pressed
+    pressed: SOURCE
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("forward event aliases are checked");
+    for name in ["pressed", "forwarded", "reset"] {
+        let declaration = program
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .unwrap_or_else(|| panic!("missing declaration `{name}`"));
+        assert_eq!(
+            declaration.flow_type.mode,
+            FlowMode::PresentOrAbsent,
+            "`{name}` lost its event flow: {declaration:#?}"
+        );
+    }
+}
+
+#[test]
+fn block_record_parameters_are_instantiated_without_value_placeholders() {
+    let parsed = boon_parser::parse_source(
+        "fjordpulse-health-record.bn",
+        r#"
+FUNCTION health(version, request_count, readiness) {
+    BLOCK {
+        health_version: version
+        health_request_count: request_count
+        health_readiness: readiness
+        [
+            status: TEXT { ok }
+            version: health_version
+            readiness: health_readiness
+            request_count: health_request_count
+        ]
+    }
+}
+
+admin_status: health(
+    version: TEXT { v2 }
+    request_count: 41
+    readiness: [ready: True]
+)
+text_status: health(
+    version: TEXT { test }
+    request_count: TEXT { synthetic }
+    readiness: [ready: False]
+)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("health records are checked");
+    let calls = program
+        .calls
+        .iter()
+        .filter(|call| call.function == "health")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    let request_count_type = |call: &CheckedCall| {
+        let Type::Object(result) = &call.result.ty else {
+            panic!("health result is not a record: {:?}", call.result.ty);
+        };
+        assert!(!result.open);
+        result.fields.get("request_count").cloned()
+    };
+    assert_eq!(request_count_type(calls[0]), Some(Type::Number));
+    assert_eq!(request_count_type(calls[1]), Some(Type::Text));
+}
+
+#[test]
+fn projected_generic_rows_remain_closed_across_nested_list_maps() {
+    let parsed = boon_parser::parse_source(
+        "todo-migration-v2-generic-rows.bn",
+        r#"
+FUNCTION retiring_todo(todo) {
+    [title: todo.title, completed: todo.completed]
+}
+
+FUNCTION new_task(task) {
+    [
+        sources: [toggle: SOURCE]
+        title: task.title
+        completed: task.completed
+    ]
+}
+
+todos:
+    LIST {
+        [title: TEXT { Plan release }, completed: False]
+        [title: TEXT { Test migration }, completed: True]
+    }
+    |> List/map(item, new: retiring_todo(todo: item))
+
+tasks:
+    todos
+    |> List/map(item, new: new_task(task: item))
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("nested map rows are checked");
+    let call = program
+        .calls
+        .iter()
+        .find(|call| call.function == "new_task")
+        .expect("new_task call");
+    let Type::Object(task) = &call.result.ty else {
+        panic!("new_task result is not a record: {:?}", call.result.ty);
+    };
+    assert!(!task.open);
+    assert_eq!(task.fields.get("title"), Some(&Type::Text));
+    assert!(matches!(
+        task.fields.get("completed"),
+        Some(Type::VariantSet(variants))
+            if variants.contains(&Variant::Tag("True".to_owned()))
+                && variants.contains(&Variant::Tag("False".to_owned()))
+    ));
+    let Some(Type::Object(sources)) = task.fields.get("sources") else {
+        panic!("new_task result has no sources record: {task:?}");
+    };
+    assert!(!sources.open);
+    assert!(sources.fields.contains_key("toggle"));
+}
+
+#[test]
+fn static_when_specialization_visits_only_reachable_ordered_variant_arms() {
+    let parsed = boon_parser::parse_source(
+        "static-when-reachability.bn",
+        r#"
+result:
+    choice |> WHEN {
+        TraceEdge => 1
+        TraceFill => TEXT { fill }
+        fallback => BYTES {}
+        Never => [value: 1]
+    }
+"#,
+    )
+    .unwrap();
+    let when = parsed
+        .expressions
+        .iter()
+        .find(|expression| matches!(expression.kind, AstExprKind::When { .. }))
+        .expect("parsed WHEN expression");
+    let trace_edge = Type::VariantSet(vec![Variant::Tag("TraceEdge".to_owned())]);
+
+    let reachable = reachable_static_when_arms(when.id, &parsed.expressions, Some(&trace_edge));
+    assert_eq!(reachable.len(), 1, "singleton variants select one arm");
+    assert_eq!(reachable[0].pattern, ["TraceEdge"]);
+
+    let bindings = BTreeMap::from([("choice".to_owned(), trace_edge)]);
+    assert_eq!(
+        static_when_type_from_bindings(when.id, &parsed.expressions, &bindings),
+        Some(Type::Number),
+        "unreachable text, bytes, and record arms must not widen the specialized result"
+    );
+
+    let edge_or_other = Type::VariantSet(vec![
+        Variant::Tag("TraceEdge".to_owned()),
+        Variant::Tag("Other".to_owned()),
+    ]);
+    let reachable = reachable_static_when_arms(when.id, &parsed.expressions, Some(&edge_or_other));
+    assert_eq!(
+        reachable
+            .iter()
+            .map(|arm| arm.pattern.join(" "))
+            .collect::<Vec<_>>(),
+        vec!["TraceEdge".to_owned(), "fallback".to_owned()],
+        "the fallback consumes only variants left by earlier arms and ends ordered matching"
+    );
+}
+
+#[test]
+fn checked_nested_when_flow_inference_is_linear_per_epoch() {
+    fn nested_when(depth: usize, indent: usize) -> String {
+        let pad = " ".repeat(indent);
+        if depth == 0 {
+            return format!("{pad}1");
+        }
+        let nested = nested_when(depth - 1, indent + 8);
+        format!("{pad}value |> WHEN {{\n{pad}    True =>\n{nested}\n{pad}    False => 0\n{pad}}}")
+    }
+
+    let call_count = 24;
+    let calls = (0..call_count)
+        .map(|index| format!("result_{index}: nested_flow(value: True)\n"))
+        .collect::<String>();
+    let source = format!(
+        "FUNCTION nested_flow(value) {{\n{}\n}}\n\n{calls}",
+        nested_when(32, 4)
+    );
+    let parsed = boon_parser::parse_source("nested-when-linear-flow.bn", &source).unwrap();
+    reset_checked_flow_inference_test_stats();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let stats = checked_flow_inference_test_stats();
+    assert!(stats.epoch_count > 0, "checked inference ran no epochs");
+    assert!(
+        stats.epoch_count < call_count,
+        "inference epochs scaled with call count: stats={stats:?}, calls={call_count}"
+    );
+    assert!(
+        stats.max_epoch_computations <= parsed.expressions.len(),
+        "one epoch recomputed shared expressions: stats={stats:?}, expressions={}",
+        parsed.expressions.len()
+    );
+}
+
+#[test]
+fn checked_user_call_validation_rejects_a_missing_required_field() {
+    let parsed = boon_parser::parse_source(
+        "checked-user-call-missing-field.bn",
+        r#"
+store: [
+    label: row_label(row: [id: 1])
+]
+
+FUNCTION row_label(row) {
+    row.name
+}
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+
+    assert!(report.has_errors());
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains("object is missing field `name`")
+    }));
+}
+
+#[test]
+fn checked_user_call_validation_preserves_tagged_payload_narrowing() {
+    let parsed = boon_parser::parse_source(
+        "checked-user-call-tagged-payload.bn",
+        r#"
+store: [
+    text_label: value_label(value: TextValue[text: TEXT { ready }])
+    number_label: value_label(value: NumberValue[number: 5])
+]
+
+FUNCTION value_label(value) {
+    value |> WHEN {
+        TextValue => value.text
+        NumberValue => value.number |> Number/to_text(radix: 10)
+    }
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "tagged payload diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    for path in ["store.text_label", "store.number_label"] {
+        assert_eq!(
+            output
+                .report
+                .named_value_type_table
+                .entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .map(|entry| &entry.flow_type.ty),
+            Some(&Type::Text),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn projected_generic_calls_do_not_alias_unrelated_parameter_fields() {
+    let parsed = boon_parser::parse_source(
+        "projected-generic-call-fields.bn",
+        r#"
+store: [
+    rows: LIST {
+        [
+            completed: False
+            sources: [
+                first: [events: [press: []]]
+                second: [events: [press: []]]
+            ]
+        ]
+    }
+    rendered:
+        rows
+        |> List/map(item, new: render_row(row: item))
+]
+
+FUNCTION render_row(row) {
+    [
+        completed: bool_label(value: row.completed)
+        first: preserve(value: row.sources.first.events)
+        second: preserve(value: row.sources.second.events)
+    ]
+}
+
+FUNCTION bool_label(value) {
+    value |> WHEN {
+        True => TEXT { complete }
+        False => TEXT { active }
+    }
+}
+
+FUNCTION preserve(value) {
+    value
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "projected generic diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid source has a checked program");
+    let row = program
+        .callables
+        .iter()
+        .find(|signature| signature.name == "render_row")
+        .and_then(|signature| signature.parameters.first())
+        .map(|parameter| &parameter.flow_type.ty)
+        .expect("render_row row parameter");
+    let Type::Object(row) = row else {
+        panic!("render_row row parameter is not structural: {row:?}");
+    };
+    let completed = row.fields.get("completed").expect("completed field");
+    let events = type_for_nested_path(
+        &Type::Object(row.clone()),
+        &[
+            "sources".to_owned(),
+            "first".to_owned(),
+            "events".to_owned(),
+        ],
+    )
+    .expect("first event field");
+    assert_ne!(completed, &events, "unrelated projections share one type variable");
 }

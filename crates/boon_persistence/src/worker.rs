@@ -1,11 +1,11 @@
 use super::{
     ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, BarrierRequest,
     CheckpointBatch, CommitAck, CompactAck, CompactRequest, ContentArtifact, ContentArtifactId,
-    DurableChange, DurableContentArtifactChange, DurableOutboxChange, DurableProtocolStateChange,
-    ExportApplicationRequest, InspectRequest, LoadContentArtifactRequest, LoadProtocolStateRequest,
-    PersistenceCommand, PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult,
-    ProtocolStateSnapshot, PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck,
-    ResetApplicationBatch, RestoreImage, RestoreRequest, ShutdownAck, ShutdownRequest, StoreError,
+    DurableChange, DurableContentArtifactChange, DurableOutboxChange, ExportApplicationRequest,
+    InspectRequest, LoadContentArtifactRequest, PersistenceCommand, PersistenceDriver,
+    PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
+    PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
+    RestoreRequest, ShutdownAck, ShutdownRequest, StoreError,
 };
 use boon_plan::ApplicationIdentity;
 use serde::{Deserialize, Serialize};
@@ -28,8 +28,6 @@ pub struct AuthorityTurn {
     pub changes: Vec<DurableChange>,
     pub outbox_changes: Vec<DurableOutboxChange>,
     #[serde(default)]
-    pub protocol_state_changes: Vec<DurableProtocolStateChange>,
-    #[serde(default)]
     pub content_artifact_changes: Vec<DurableContentArtifactChange>,
 }
 
@@ -39,18 +37,12 @@ impl AuthorityTurn {
             turn_sequence,
             changes,
             outbox_changes: Vec::new(),
-            protocol_state_changes: Vec::new(),
             content_artifact_changes: Vec::new(),
         }
     }
 
     pub fn with_outbox_changes(mut self, changes: Vec<DurableOutboxChange>) -> Self {
         self.outbox_changes = changes;
-        self
-    }
-
-    pub fn with_protocol_state_changes(mut self, changes: Vec<DurableProtocolStateChange>) -> Self {
-        self.protocol_state_changes = changes;
         self
     }
 
@@ -86,7 +78,6 @@ impl Default for PersistenceWorkerConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistenceStartup {
     pub restore_image: RestoreImage,
-    pub protocol_state: ProtocolStateSnapshot,
     pub initialized: bool,
 }
 
@@ -97,6 +88,39 @@ pub enum PersistenceWorkerStartError {
     Store(StoreError),
     WorkerExited,
 }
+
+/// Result of resolving runtime state after the persistence worker has loaded
+/// canonical authority. The value is returned to the caller only after the
+/// worker has adopted or initialized the matching durable image.
+pub enum PersistenceStartupResolution<T> {
+    AdoptLoaded {
+        restore_image: RestoreImage,
+        value: T,
+    },
+    Initialize {
+        initial_image: RestoreImage,
+        value: T,
+    },
+}
+
+#[derive(Debug)]
+pub enum PersistenceResolvedStartError<E> {
+    Persistence(PersistenceWorkerStartError),
+    Resolver(E),
+}
+
+impl<E: fmt::Display> fmt::Display for PersistenceResolvedStartError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Persistence(error) => error.fmt(formatter),
+            Self::Resolver(error) => {
+                write!(formatter, "persistence startup resolver failed: {error}")
+            }
+        }
+    }
+}
+
+impl<E: fmt::Debug + fmt::Display> std::error::Error for PersistenceResolvedStartError<E> {}
 
 impl fmt::Display for PersistenceWorkerStartError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -712,6 +736,21 @@ pub struct PersistenceCoordinator {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
+enum WorkerStartup {
+    InitialImage(RestoreImage),
+    ResolveAfterLoad {
+        application: ApplicationIdentity,
+        loaded: SyncSender<Result<Option<RestoreImage>, StoreError>>,
+        resolution: Receiver<WorkerStartupResolution>,
+    },
+}
+
+enum WorkerStartupResolution {
+    AdoptLoaded(RestoreImage),
+    Initialize(RestoreImage),
+    Abort,
+}
+
 impl PersistenceCoordinator {
     pub fn start<D>(
         driver: D,
@@ -721,16 +760,7 @@ impl PersistenceCoordinator {
     where
         D: PersistenceDriver + Send + 'static,
     {
-        if config.queue_capacity == 0 {
-            return Err(PersistenceWorkerStartError::InvalidConfig(
-                "queue_capacity must be positive",
-            ));
-        }
-        if config.max_batch_turns == 0 {
-            return Err(PersistenceWorkerStartError::InvalidConfig(
-                "max_batch_turns must be positive",
-            ));
-        }
+        validate_worker_config(&config)?;
 
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
@@ -744,7 +774,7 @@ impl PersistenceCoordinator {
             .spawn(move || {
                 worker_main(
                     driver,
-                    initial_image,
+                    WorkerStartup::InitialImage(initial_image),
                     config,
                     receiver,
                     startup_sender,
@@ -773,6 +803,124 @@ impl PersistenceCoordinator {
                 worker: Mutex::new(Some(worker)),
             },
             startup,
+        ))
+    }
+
+    /// Start the persistence worker by loading authority before constructing
+    /// runtime-derived defaults or indexes.
+    ///
+    /// The driver remains owned by the worker throughout. The resolver runs on
+    /// the caller after `Load` and returns exactly one runtime value paired with
+    /// either the loaded image or an initial image for a missing application.
+    pub fn start_resolved<D, T, E, F>(
+        driver: D,
+        application: ApplicationIdentity,
+        config: PersistenceWorkerConfig,
+        resolver: F,
+    ) -> Result<(Self, PersistenceStartup, T), PersistenceResolvedStartError<E>>
+    where
+        D: PersistenceDriver + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(Option<RestoreImage>) -> Result<PersistenceStartupResolution<T>, E>,
+    {
+        validate_worker_config(&config).map_err(PersistenceResolvedStartError::Persistence)?;
+
+        let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
+        let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+        let (loaded_sender, loaded_receiver) = mpsc::sync_channel(1);
+        let (resolution_sender, resolution_receiver) = mpsc::sync_channel(1);
+        let shared = Arc::new(SharedState::new(
+            config.queue_capacity,
+            config.max_batch_turns,
+        ));
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::Builder::new()
+            .name("boon-persistence".to_owned())
+            .spawn(move || {
+                worker_main(
+                    driver,
+                    WorkerStartup::ResolveAfterLoad {
+                        application,
+                        loaded: loaded_sender,
+                        resolution: resolution_receiver,
+                    },
+                    config,
+                    receiver,
+                    startup_sender,
+                    worker_shared,
+                );
+            })
+            .map_err(|error| {
+                PersistenceResolvedStartError::Persistence(PersistenceWorkerStartError::Spawn(
+                    error.to_string(),
+                ))
+            })?;
+
+        let loaded = match loaded_receiver.recv() {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(PersistenceResolvedStartError::Persistence(
+                    PersistenceWorkerStartError::Store(error),
+                ));
+            }
+            Err(_) => {
+                let _ = worker.join();
+                return Err(PersistenceResolvedStartError::Persistence(
+                    PersistenceWorkerStartError::WorkerExited,
+                ));
+            }
+        };
+        let resolution = match resolver(loaded) {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                let _ = resolution_sender.send(WorkerStartupResolution::Abort);
+                let _ = worker.join();
+                return Err(PersistenceResolvedStartError::Resolver(error));
+            }
+        };
+        let (resolution, value) = match resolution {
+            PersistenceStartupResolution::AdoptLoaded {
+                restore_image,
+                value,
+            } => (WorkerStartupResolution::AdoptLoaded(restore_image), value),
+            PersistenceStartupResolution::Initialize {
+                initial_image,
+                value,
+            } => (WorkerStartupResolution::Initialize(initial_image), value),
+        };
+        if resolution_sender.send(resolution).is_err() {
+            let _ = worker.join();
+            return Err(PersistenceResolvedStartError::Persistence(
+                PersistenceWorkerStartError::WorkerExited,
+            ));
+        }
+
+        let startup = match startup_receiver.recv() {
+            Ok(Ok(startup)) => startup,
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(PersistenceResolvedStartError::Persistence(
+                    PersistenceWorkerStartError::Store(error),
+                ));
+            }
+            Err(_) => {
+                let _ = worker.join();
+                return Err(PersistenceResolvedStartError::Persistence(
+                    PersistenceWorkerStartError::WorkerExited,
+                ));
+            }
+        };
+
+        Ok((
+            Self {
+                sender,
+                shared,
+                control_lock: Mutex::new(()),
+                worker: Mutex::new(Some(worker)),
+            },
+            startup,
+            value,
         ))
     }
 
@@ -1129,7 +1277,7 @@ impl Drop for PersistenceCoordinator {
 
 fn worker_main<D>(
     mut driver: D,
-    initial_image: RestoreImage,
+    startup: WorkerStartup,
     config: PersistenceWorkerConfig,
     receiver: Receiver<WorkerMessage>,
     startup_sender: SyncSender<Result<PersistenceStartup, StoreError>>,
@@ -1138,12 +1286,26 @@ fn worker_main<D>(
     D: PersistenceDriver,
 {
     let restore_started = Instant::now();
-    let startup = start_driver(&mut driver, initial_image);
+    let startup = match startup {
+        WorkerStartup::InitialImage(initial_image) => {
+            start_driver(&mut driver, initial_image).map(Some)
+        }
+        WorkerStartup::ResolveAfterLoad {
+            application,
+            loaded,
+            resolution,
+        } => start_driver_resolved(&mut driver, application, loaded, resolution),
+    };
     shared
         .restore_us
         .store(duration_us(restore_started.elapsed()), Ordering::Release);
     let startup = match startup {
-        Ok(startup) => startup,
+        Ok(Some(startup)) => startup,
+        Ok(None) => {
+            let _ = driver.execute(PersistenceCommand::Shutdown(ShutdownRequest));
+            shared.worker_alive.store(false, Ordering::Release);
+            return;
+        }
         Err(error) => {
             shared.record_store_error(error.clone());
             shared.worker_alive.store(false, Ordering::Release);
@@ -1223,51 +1385,126 @@ fn start_driver<D>(
 where
     D: PersistenceDriver,
 {
-    let request = RestoreRequest {
-        application: initial_image.application.clone(),
-        expected_schema_hash: None,
-    };
-    let (restore_image, initialized) = match driver.execute(PersistenceCommand::Load(request)) {
-        PersistenceResult::Loaded(Ok(Some(image))) => {
-            if image.application != initial_image.application {
-                return Err(StoreError::IdentityMismatch);
-            }
-            (image, false)
-        }
-        PersistenceResult::Loaded(Ok(None)) => {
-            match driver.execute(PersistenceCommand::Initialize(initial_image.clone())) {
-                PersistenceResult::Initialized(Ok(_)) => Ok((initial_image, true)),
-                PersistenceResult::Initialized(Err(error)) => Err(error),
-                _ => Err(StoreError::Backend(
-                    "driver returned the wrong result for Initialize".to_owned(),
-                )),
-            }?
-        }
-        PersistenceResult::Loaded(Err(error)) => return Err(error),
-        _ => {
-            return Err(StoreError::Backend(
-                "driver returned the wrong result for Load".to_owned(),
-            ));
-        }
-    };
-    let protocol_state = match driver.execute(PersistenceCommand::LoadProtocolState(
-        LoadProtocolStateRequest {
-            application: restore_image.application.clone(),
-        },
-    )) {
-        PersistenceResult::ProtocolStateLoaded(Ok(snapshot)) => snapshot,
-        PersistenceResult::ProtocolStateLoaded(Err(error)) => return Err(error),
-        _ => {
-            return Err(StoreError::Backend(
-                "driver returned the wrong result for LoadProtocolState".to_owned(),
-            ));
-        }
+    let application = initial_image.application.clone();
+    let (restore_image, initialized) = match load_driver(driver, application.clone())? {
+        Some(image) => (image, false),
+        None => (initialize_driver(driver, initial_image)?, true),
     };
     Ok(PersistenceStartup {
         restore_image,
-        protocol_state,
         initialized,
     })
+}
+
+fn start_driver_resolved<D>(
+    driver: &mut D,
+    application: ApplicationIdentity,
+    loaded_sender: SyncSender<Result<Option<RestoreImage>, StoreError>>,
+    resolution_receiver: Receiver<WorkerStartupResolution>,
+) -> Result<Option<PersistenceStartup>, StoreError>
+where
+    D: PersistenceDriver,
+{
+    let loaded = match load_driver(driver, application.clone()) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let _ = loaded_sender.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let had_loaded = loaded.is_some();
+    if loaded_sender.send(Ok(loaded)).is_err() {
+        return Ok(None);
+    }
+    let resolution = match resolution_receiver.recv() {
+        Ok(WorkerStartupResolution::Abort) | Err(_) => return Ok(None),
+        Ok(resolution) => resolution,
+    };
+    let startup = match (had_loaded, resolution) {
+        (true, WorkerStartupResolution::AdoptLoaded(restore_image)) => {
+            if restore_image.application != application {
+                return Err(StoreError::IdentityMismatch);
+            }
+            PersistenceStartup {
+                restore_image,
+                initialized: false,
+            }
+        }
+        (false, WorkerStartupResolution::Initialize(initial_image)) => PersistenceStartup {
+            restore_image: initialize_driver(driver, initial_image)?,
+            initialized: true,
+        },
+        (true, WorkerStartupResolution::Initialize(_)) => {
+            return Err(StoreError::Backend(
+                "startup resolver attempted to initialize an existing application".to_owned(),
+            ));
+        }
+        (false, WorkerStartupResolution::AdoptLoaded(_)) => {
+            return Err(StoreError::Backend(
+                "startup resolver attempted to adopt a missing application".to_owned(),
+            ));
+        }
+        (_, WorkerStartupResolution::Abort) => unreachable!(),
+    };
+    Ok(Some(startup))
+}
+
+fn load_driver<D>(
+    driver: &mut D,
+    application: ApplicationIdentity,
+) -> Result<Option<RestoreImage>, StoreError>
+where
+    D: PersistenceDriver,
+{
+    let request = RestoreRequest {
+        application: application.clone(),
+        expected_schema_hash: None,
+    };
+    match driver.execute(PersistenceCommand::Load(request)) {
+        PersistenceResult::Loaded(Ok(Some(image))) => {
+            if image.application != application {
+                return Err(StoreError::IdentityMismatch);
+            }
+            Ok(Some(image))
+        }
+        PersistenceResult::Loaded(Ok(None)) => Ok(None),
+        PersistenceResult::Loaded(Err(error)) => Err(error),
+        _ => Err(StoreError::Backend(
+            "driver returned the wrong result for Load".to_owned(),
+        )),
+    }
+}
+
+fn initialize_driver<D>(
+    driver: &mut D,
+    initial_image: RestoreImage,
+) -> Result<RestoreImage, StoreError>
+where
+    D: PersistenceDriver,
+{
+    match driver.execute(PersistenceCommand::Initialize(initial_image.clone())) {
+        PersistenceResult::Initialized(Ok(_)) => Ok(initial_image),
+        PersistenceResult::Initialized(Err(error)) => Err(error),
+        _ => Err(StoreError::Backend(
+            "driver returned the wrong result for Initialize".to_owned(),
+        )),
+    }
+}
+
+fn validate_worker_config(
+    config: &PersistenceWorkerConfig,
+) -> Result<(), PersistenceWorkerStartError> {
+    if config.queue_capacity == 0 {
+        return Err(PersistenceWorkerStartError::InvalidConfig(
+            "queue_capacity must be positive",
+        ));
+    }
+    if config.max_batch_turns == 0 {
+        return Err(PersistenceWorkerStartError::InvalidConfig(
+            "max_batch_turns must be positive",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1435,10 +1672,6 @@ where
             .iter()
             .flat_map(|queued| queued.turn.outbox_changes.iter().cloned())
             .collect();
-        let protocol_state_changes = pending
-            .iter()
-            .flat_map(|queued| queued.turn.protocol_state_changes.iter().cloned())
-            .collect();
         let content_artifact_changes = pending
             .iter()
             .flat_map(|queued| queued.turn.content_artifact_changes.iter().cloned())
@@ -1452,7 +1685,6 @@ where
             last_turn_sequence,
             changes,
             outbox_changes,
-            protocol_state_changes,
             content_artifact_changes,
             checksum: [0; 32],
         }
@@ -1527,7 +1759,6 @@ where
         last_turn_sequence: turn.turn_sequence,
         changes: turn.changes,
         outbox_changes: turn.outbox_changes,
-        protocol_state_changes: turn.protocol_state_changes,
         content_artifact_changes: turn.content_artifact_changes,
         checksum: [0; 32],
     }
@@ -1992,6 +2223,78 @@ mod tests {
         .unwrap();
         assert!(startup.initialized);
         (coordinator, trace)
+    }
+
+    #[test]
+    fn resolved_start_loads_before_adopting_or_initializing_authority() {
+        let (fresh, startup, value) = PersistenceCoordinator::start_resolved(
+            InMemoryDriver::default(),
+            application(),
+            config(4, Duration::ZERO),
+            |loaded| -> Result<_, &'static str> {
+                assert_eq!(loaded, None);
+                Ok(PersistenceStartupResolution::Initialize {
+                    initial_image: initial_image(),
+                    value: 17_u32,
+                })
+            },
+        )
+        .unwrap();
+        assert!(startup.initialized);
+        assert_eq!(startup.restore_image, initial_image());
+        assert_eq!(value, 17);
+        fresh.shutdown().unwrap();
+
+        let mut restored_image = initial_image();
+        restored_image.epoch = 9;
+        let mut driver = InMemoryDriver::default();
+        driver.seed(restored_image.clone());
+        let expected = restored_image.clone();
+        let (restored, startup, value) = PersistenceCoordinator::start_resolved(
+            driver,
+            application(),
+            config(4, Duration::ZERO),
+            move |loaded| -> Result<_, &'static str> {
+                assert_eq!(loaded.as_ref(), Some(&expected));
+                Ok(PersistenceStartupResolution::AdoptLoaded {
+                    restore_image: loaded.expect("loaded authority"),
+                    value: 29_u32,
+                })
+            },
+        )
+        .unwrap();
+        assert!(!startup.initialized);
+        assert_eq!(startup.restore_image, restored_image);
+        assert_eq!(value, 29);
+        restored.shutdown().unwrap();
+    }
+
+    #[test]
+    fn resolved_start_aborts_the_worker_when_runtime_resolution_fails() {
+        let trace = DriverTrace::default();
+        let driver = RecordingDriver {
+            inner: InMemoryDriver::default(),
+            trace: trace.clone(),
+            commit_gate: None,
+            artifact_gate: None,
+            artifact_delay: Duration::ZERO,
+        };
+        let error = match PersistenceCoordinator::start_resolved(
+            driver,
+            application(),
+            config(4, Duration::ZERO),
+            |_loaded| -> Result<PersistenceStartupResolution<()>, _> {
+                Err("runtime build failed")
+            },
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("failed runtime resolution must abort startup"),
+        };
+        assert!(matches!(
+            error,
+            PersistenceResolvedStartError::Resolver("runtime build failed")
+        ));
+        assert_eq!(trace.shutdowns.load(Ordering::Acquire), 1);
     }
 
     #[test]

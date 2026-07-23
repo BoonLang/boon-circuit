@@ -5,7 +5,7 @@ FUNCTION cell_address(index) {
         column_index: index % 26
         row_index: index / 26 |> Number/floor()
         column: List/get(list: sheet_columns, index: column_index)
-        column.label + row_index
+        column.label |> Text/concat(with: row_index, separator: "")
     }
 }
 
@@ -35,7 +35,9 @@ FUNCTION cell_value(target_address) {
 }
 
 FUNCTION range_cell_value(column, row) {
-    cell_value(target_address: column + row)
+    numeric_operand(
+        text: column |> Text/concat(with: row, separator: "")
+    )
 }
 
 FUNCTION sum_range(start_address, end_address) {
@@ -84,7 +86,7 @@ FUNCTION add_value(text, bytes) {
                 right_length: inner_length - right_start
                 left: inner |> Text/substring(start: 0, length: index)
                 right: inner |> Text/substring(start: right_start, length: right_length)
-                reference_or_number(text: left) + reference_or_number(text: right)
+                numeric_operand(text: left) + numeric_operand(text: right)
             }
         }
     }
@@ -118,10 +120,10 @@ FUNCTION binary_value(text, operator_index, operator_text) {
         left: text |> Text/substring(start: 0, length: operator_index)
         right: text |> Text/substring(start: right_start, length: right_length)
         operator_text |> WHILE {
-            TEXT { + } => reference_or_number(text: left) + reference_or_number(text: right)
-            TEXT { - } => reference_or_number(text: left) - reference_or_number(text: right)
-            TEXT { * } => reference_or_number(text: left) * reference_or_number(text: right)
-            TEXT { / } => reference_or_number(text: left) / reference_or_number(text: right)
+            TEXT { + } => numeric_operand(text: left) + numeric_operand(text: right)
+            TEXT { - } => numeric_operand(text: left) - numeric_operand(text: right)
+            TEXT { * } => numeric_operand(text: left) * numeric_operand(text: right)
+            TEXT { / } => numeric_operand(text: left) / numeric_operand(text: right)
             __ => Error/new(code: TEXT { parse_error })
         }
     }
@@ -132,6 +134,21 @@ FUNCTION reference_or_number(text) {
         text |> Text/to_number() |> WHILE {
             NaN => cell_value(target_address: text)
             number => number
+        }
+    }
+}
+
+FUNCTION numeric_operand(text) {
+    BLOCK {
+        value: reference_or_number(text: text)
+        error: Error/text(value: value)
+        error |> Text/is_empty() |> WHILE {
+            False => Error/new(code: error)
+            True =>
+                value |> Text/to_number() |> WHILE {
+                    NaN => Error/new(code: TEXT { type_error })
+                    number => number
+                }
         }
     }
 }

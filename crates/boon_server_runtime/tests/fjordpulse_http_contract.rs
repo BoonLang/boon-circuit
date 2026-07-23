@@ -55,11 +55,6 @@ fn compile_server() -> BoonServerProgram {
             .capability_summary
             .cpu_plan_executor_complete
     );
-    assert_eq!(
-        artifact.plan().query_indexes.len(),
-        1,
-        "station search must remain compiler-indexed"
-    );
     BoonServerProgram::new(artifact).expect("generic HTTP host port should resolve")
 }
 

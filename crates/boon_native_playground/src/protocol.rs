@@ -102,6 +102,8 @@ pub struct TestStep {
     pub text: Option<String>,
     pub key: Option<String>,
     pub address: Option<String>,
+    pub target_key: Option<u64>,
+    pub target_generation: Option<u64>,
     pub target_occurrence: Option<u64>,
     pub pointer_x: Option<String>,
     pub pointer_y: Option<String>,
@@ -1875,6 +1877,8 @@ impl Encoder {
             self.optional_string(step.text.as_deref())?;
             self.optional_string(step.key.as_deref())?;
             self.optional_string(step.address.as_deref())?;
+            self.optional_u64(step.target_key);
+            self.optional_u64(step.target_generation);
             self.optional_u64(step.target_occurrence);
             self.optional_string(step.pointer_x.as_deref())?;
             self.optional_string(step.pointer_y.as_deref())?;
@@ -2538,6 +2542,8 @@ impl<'a> Decoder<'a> {
                     text: self.optional_string()?,
                     key: self.optional_string()?,
                     address: self.optional_string()?,
+                    target_key: self.optional_u64()?,
+                    target_generation: self.optional_u64()?,
                     target_occurrence: self.optional_u64()?,
                     pointer_x: self.optional_string()?,
                     pointer_y: self.optional_string()?,
@@ -2797,6 +2803,8 @@ mod tests {
                     text: None,
                     key: None,
                     address: None,
+                    target_key: Some(79),
+                    target_generation: Some(3),
                     target_occurrence: None,
                     pointer_x: Some("216".to_owned()),
                     pointer_y: Some("0".to_owned()),

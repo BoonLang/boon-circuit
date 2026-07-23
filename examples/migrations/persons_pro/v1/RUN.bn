@@ -6,7 +6,7 @@ store: [
     ]
 
     source_draft:
-        TEXT { scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { V1 page }) }
+        "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { V1 page })"
         |> HOLD source_draft {
             sources.seed.text
         }
@@ -18,7 +18,7 @@ store: [
         }
 
     last_valid_draft_source:
-        TEXT { scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { V1 page }) }
+        "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { V1 page })"
         |> HOLD last_valid_draft_source {
             sources.seed.last_valid_source
         }

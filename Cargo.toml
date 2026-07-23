@@ -8,14 +8,13 @@ members = [
     "crates/boon_typecheck",
     "crates/boon_ir",
     "crates/boon_plan",
+    "crates/boon_list_access",
     "crates/boon_persistence",
     "crates/boon_plan_executor",
     "crates/boon_server_host",
     "crates/boon_server_runtime",
     "crates/boon_http_client",
     "crates/boon_http_runtime",
-    "crates/boon_query",
-    "crates/boon_query_redb",
     "crates/boon_app_package",
     "crates/boon_app_cli",
     "crates/boon_app_server",
@@ -30,6 +29,7 @@ members = [
     "crates/boon_document",
     "crates/boon_editor",
     "crates/boon_native_gpu",
+    "crates/boon_web_effect_host",
     "crates/boon_web_host",
     "crates/boon_native_app_window",
     "crates/boon_native_playground",
@@ -51,14 +51,13 @@ boon_parser = { path = "crates/boon_parser" }
 boon_typecheck = { path = "crates/boon_typecheck" }
 boon_ir = { path = "crates/boon_ir" }
 boon_plan = { path = "crates/boon_plan" }
+boon_list_access = { path = "crates/boon_list_access" }
 boon_persistence = { path = "crates/boon_persistence" }
 boon_plan_executor = { path = "crates/boon_plan_executor" }
 boon_server_host = { path = "crates/boon_server_host" }
 boon_server_runtime = { path = "crates/boon_server_runtime" }
 boon_http_client = { path = "crates/boon_http_client" }
 boon_http_runtime = { path = "crates/boon_http_runtime" }
-boon_query = { path = "crates/boon_query" }
-boon_query_redb = { path = "crates/boon_query_redb" }
 boon_app_package = { path = "crates/boon_app_package" }
 boon_app_server = { path = "crates/boon_app_server" }
 boon_compiler = { path = "crates/boon_compiler" }
@@ -71,6 +70,7 @@ boon_wellen_host = { path = "crates/boon_wellen_host" }
 boon_document = { path = "crates/boon_document" }
 boon_editor = { path = "crates/boon_editor" }
 boon_native_gpu = { path = "crates/boon_native_gpu" }
+boon_web_effect_host = { path = "crates/boon_web_effect_host" }
 boon_web_host = { path = "crates/boon_web_host" }
 boon_native_app_window = { path = "crates/boon_native_app_window" }
 app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "6aec9831f281df355736df28a4c3aacdef7cf8a1" }
@@ -103,6 +103,7 @@ wgsl_bindgen = "=0.22.2"
 futures = "0.3"
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 hmac = "0.12.1"
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 libc = "0.2"
 evdev = "0.13.2"
 wayland-client = "0.31.14"

@@ -30,6 +30,11 @@ store: [
                 |> Text/join(separator: Text/empty())
         }
 
+    normalized_search_query:
+        search_query
+        |> Text/trim()
+        |> Text/to_lowercase()
+
     stations: LIST {
         [id: TEXT { NSR:StopPlace:548 }, name: TEXT { Førde rutebilstasjon }, latitude: 61.452, longitude: 5.857, kind: TEXT { bus_station }, modes: TEXT { bus,coach }]
         [id: TEXT { NSR:StopPlace:337 }, name: TEXT { Oslo S }, latitude: 59.9109, longitude: 10.7523, kind: TEXT { rail_station }, modes: TEXT { rail,metro,tram,bus }]
@@ -39,13 +44,28 @@ store: [
     }
 
     station_matches:
-        List/query_prefix(
-            list: stations
-            field: name
-            prefix: search_query
-            limit: 20
-            normalization: TrimLowercase
+        stations
+        |> List/filter(
+            item
+            if:
+                Bool/and(
+                    left: normalized_search_query |> Text/is_not_empty()
+                    right:
+                        item.name
+                        |> Text/trim()
+                        |> Text/to_lowercase()
+                        |> Text/starts_with(prefix: normalized_search_query)
+                )
         )
+        |> List/sort_by(
+            item
+            key:
+                item.name
+                |> Text/trim()
+                |> Text/to_lowercase()
+            direction: Ascending
+        )
+        |> List/take(count: 20)
 
     departures: LIST {
         [

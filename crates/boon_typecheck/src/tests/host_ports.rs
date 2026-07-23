@@ -37,6 +37,65 @@ fn typed_http_host_port_injects_closed_structural_request_payload() {
 }
 
 #[test]
+fn source_payload_list_rows_are_inferred_from_contextual_pipeline_uses() {
+    let parsed = boon_parser::parse_source(
+        "source-query-list-pipeline.bn",
+        r#"
+store: [
+    request: SOURCE
+    joined:
+        request.method |> THEN {
+            request.query
+                |> List/filter(item, if: item.name == TEXT { q })
+                |> List/map(item, new: item.value)
+                |> Text/join(separator: Text/empty())
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+
+    let payload = output
+        .report
+        .source_payload_shape_table
+        .iter()
+        .find(|entry| entry.source_path == "store.request")
+        .expect("request payload");
+    let query = payload
+        .fields
+        .iter()
+        .find(|field| field.name == "query")
+        .map(|field| &field.ty)
+        .expect("query payload field");
+    let Type::List(item) = query else {
+        panic!("query payload is not a list: {query:#?}");
+    };
+    let Type::Object(row) = item.as_ref() else {
+        panic!("query payload item is not a row: {item:#?}");
+    };
+    assert!(!row.open);
+    assert_eq!(row.fields.get("name"), Some(&Type::Text));
+    assert_eq!(row.fields.get("value"), Some(&Type::Text));
+
+    let checked = output.program.expect("source pipeline is checked");
+    let request = checked
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "request" && declaration.kind == CheckedDeclarationKind::Source
+        })
+        .expect("checked request source");
+    assert_eq!(request.flow_type.mode, FlowMode::PresentOrAbsent);
+    assert_eq!(request.flow_type.ty, payload.payload_type);
+}
+
+#[test]
 fn latest_preserves_merged_source_event_flow_for_one_host_effect() {
     let parsed = boon_parser::parse_source(
         "merged-file-effect.bn",
@@ -351,11 +410,7 @@ outputs: [
         headers: LIST {
             [name: TEXT { content-type }, value: TEXT { application/octet-stream }]
         }
-        body: response_body(
-            text: TEXT { ok }
-        )
-            |> Text/trim()
-            |> Text/to_bytes(encoding: Utf8)
+        body: response_body(text: TEXT { ok }) |> Text/trim() |> Text/to_bytes(encoding: Utf8)
     ]
 ]
 host_ports: [
@@ -388,10 +443,110 @@ FUNCTION response_body(text) {
 }
 
 #[test]
+fn structured_block_aliases_do_not_become_output_record_fields() {
+    let parsed = boon_parser::parse_source(
+        "block-alias-http-response.bn",
+        r#"
+store: [request: SOURCE]
+
+FUNCTION make_response() {
+    BLOCK {
+        response_status: 200
+        response_body: BYTES {}
+        [
+            status: response_status
+            body: response_body
+        ]
+    }
+}
+
+outputs: [
+    response: make_response()
+]
+
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+
+    assert!(!report.has_errors(), "{:?}", report.diagnostics);
+    let output = report
+        .output_root_types
+        .iter()
+        .find(|output| output.name == "response")
+        .expect("response output type");
+    let Type::Object(shape) = &output.ty else {
+        panic!("response output is not a record: {:?}", output.ty);
+    };
+    assert_eq!(shape.field_order, ["status", "body"]);
+    assert!(!shape.fields.contains_key("response_status"));
+    assert!(!shape.fields.contains_key("response_body"));
+}
+
+#[test]
 fn websocket_host_port_requires_direct_sources_and_the_generic_action_envelope() {
     let parsed = boon_parser::parse_source(
         "websocket-server.bn",
-        include_str!("../../../../examples/server_websocket_echo.bn"),
+        r#"
+FUNCTION websocket_action(action_kind, action_status, action_body_kind, action_body_text, action_frame_kind, action_text, action_bytes, action_room, action_code, action_reason) {
+    [
+        kind: action_kind
+        status: action_status
+        body_kind: action_body_kind
+        body_text: action_body_text
+        body_bytes: BYTES {}
+        frame_kind: action_frame_kind
+        text: action_text
+        bytes: action_bytes
+        room: action_room
+        include_current: False
+        code: action_code
+        reason: action_reason
+    ]
+}
+
+store: [
+    ws_open: SOURCE
+    ws_message: SOURCE
+    ws_close: SOURCE
+    ws_error: SOURCE
+    action_seed: LIST { [value: 0] }
+]
+
+outputs: [
+    websocket_actions:
+        store.action_seed |> List/map(item, new:
+            websocket_action(
+                action_kind: TEXT { Accept }
+                action_status: 0
+                action_body_kind: Text/empty()
+                action_body_text: Text/empty()
+                action_frame_kind: Text/empty()
+                action_text: Text/empty()
+                action_bytes: BYTES {}
+                action_room: Text/empty()
+                action_code: 0
+                action_reason: Text/empty()
+            )
+        )
+]
+
+host_ports: [
+    websocket: [
+        open: store.ws_open
+        message: store.ws_message
+        close: store.ws_close
+        error: store.ws_error
+        actions: websocket_actions
+    ]
+]
+"#,
     )
     .unwrap();
     let report = check(&parsed);

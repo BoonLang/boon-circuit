@@ -2118,6 +2118,7 @@ FUNCTION waveform_interaction_surface() {
                 key_down: PASSED.store.elements.keyboard_capture
             ]
             hovered: PASSED.store.elements.waveform_hover
+            target: TEXT { waveform canvas }
         ]
         style: [
             width: Fill
@@ -2125,7 +2126,6 @@ FUNCTION waveform_interaction_surface() {
             paint: False
         ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
-        target: TEXT { waveform canvas }
     )
 }
 
@@ -3389,11 +3389,11 @@ FUNCTION selected_signal_remove_x_button(signal) {
         element: [
             event: [press: signal.row_elements.remove_signal]
             hovered: signal.row_elements.remove_signal
+            address: signal.id
         ]
         style: row_remove_button_style(hovered: element.hovered)
         label: row_remove_label()
         target: signal.name
-        address: signal.id
     )
 }
 
@@ -3733,7 +3733,7 @@ FUNCTION value_pill_text(value_text) {
             }]
             material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
         ]
-        text: value_text
+        label: value_text
     )
 }
 
@@ -3842,11 +3842,10 @@ FUNCTION row_format_control(signal) {
 
 FUNCTION row_format_button(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_dropdown_toggle], hovered: signal.format_elements.format_dropdown_toggle]
+        element: [event: [press: signal.format_elements.format_dropdown_toggle], hovered: signal.format_elements.format_dropdown_toggle, address: signal.id]
         style: row_value_action_style(button_width: 64, hovered: element.hovered)
         label: row_value_action_label(button_text: signal.format_label)
         target: signal.name
-        address: signal.id
     )
 }
 
@@ -3899,71 +3898,64 @@ FUNCTION row_format_dropdown_menu(signal) {
 
 FUNCTION row_format_hex_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_hex], hovered: signal.format_elements.format_hex]
+        element: [event: [press: signal.format_elements.format_hex], hovered: signal.format_elements.format_hex, address: signal.id]
         style: format_dropdown_option_style(selected: signal.formatter == Hexadecimal)
         label: format_dropdown_option_label(option_text: TEXT { Hex }, selected: signal.formatter == Hexadecimal)
         target: signal.name
-        address: signal.id
     )
 }
 
 FUNCTION row_format_binary_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_binary], hovered: signal.format_elements.format_binary]
+        element: [event: [press: signal.format_elements.format_binary], hovered: signal.format_elements.format_binary, address: signal.id]
         style: format_dropdown_option_style(selected: signal.formatter == Binary)
         label: format_dropdown_option_label(option_text: TEXT { Bin }, selected: signal.formatter == Binary)
         target: signal.name
-        address: signal.id
     )
 }
 
 FUNCTION row_format_grouped_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_grouped], hovered: signal.format_elements.format_grouped]
+        element: [event: [press: signal.format_elements.format_grouped], hovered: signal.format_elements.format_grouped, address: signal.id]
         style: format_dropdown_option_style(selected: signal.formatter == GroupedBinary)
         label: format_dropdown_option_label(option_text: TEXT { Bins }, selected: signal.formatter == GroupedBinary)
         target: signal.name
-        address: signal.id
     )
 }
 
 FUNCTION row_format_octal_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_octal], hovered: signal.format_elements.format_octal]
+        element: [event: [press: signal.format_elements.format_octal], hovered: signal.format_elements.format_octal, address: signal.id]
         style: format_dropdown_option_style(selected: signal.formatter == Octal)
         label: format_dropdown_option_label(option_text: TEXT { Oct }, selected: signal.formatter == Octal)
         target: signal.name
-        address: signal.id
     )
 }
 
 FUNCTION row_format_signed_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_signed], hovered: signal.format_elements.format_signed]
+        element: [event: [press: signal.format_elements.format_signed], hovered: signal.format_elements.format_signed, address: signal.id]
         style: format_dropdown_option_style(selected: signal.formatter == Signed)
         label: format_dropdown_option_label(option_text: TEXT { Int }, selected: signal.formatter == Signed)
         target: signal.name
-        address: signal.id
     )
 }
 
 FUNCTION row_format_unsigned_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_unsigned], hovered: signal.format_elements.format_unsigned]
+        element: [event: [press: signal.format_elements.format_unsigned], hovered: signal.format_elements.format_unsigned, address: signal.id]
         style: format_dropdown_option_style(selected: signal.formatter == Unsigned)
         label: format_dropdown_option_label(option_text: TEXT { UInt }, selected: signal.formatter == Unsigned)
         target: signal.name
-        address: signal.id
     )
 }
 
 FUNCTION row_format_ascii_dropdown_option(signal) {
     Scene/Element/button(
-        element: [event: [press: signal.format_elements.format_ascii], hovered: signal.format_elements.format_ascii]
+        element: [event: [press: signal.format_elements.format_ascii], hovered: signal.format_elements.format_ascii, address: signal.id]
         style: format_dropdown_option_style(selected: signal.formatter == ASCII)
         label: format_dropdown_option_label(option_text: TEXT { Text }, selected: signal.formatter == ASCII)
         target: signal.name
-        address: signal.id
     )
 }
 
@@ -4542,6 +4534,7 @@ FUNCTION variable_signal_button(signal) {
         element: [
             event: [press: signal.signal_elements.select_signal]
             hovered: signal.signal_elements.select_signal
+            address: signal.key
         ]
         style: [
             width: Fill
@@ -4557,7 +4550,6 @@ FUNCTION variable_signal_button(signal) {
         ]
         label: variable_signal_row(signal: signal)
         target: signal.name
-        address: signal.key
     )
 }
 

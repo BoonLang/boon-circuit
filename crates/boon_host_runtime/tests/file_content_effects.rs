@@ -4,12 +4,13 @@ use boon_host_runtime::{
 };
 use boon_plan::{ApplicationIdentity, ProgramRole};
 use boon_runtime::{
-    ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession, RuntimeSourceUnit,
-    SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
+    ProgramArtifact, ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession,
+    RuntimeSourceUnit, SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
 };
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
@@ -62,19 +63,22 @@ document: Document/new(
 "#;
 
 fn program() -> ProgramSession {
-    let artifact = compile_program_artifact(&ProgramCompileRequest {
-        revision: 1,
-        entry_path: "file-content-effects.bn".to_owned(),
-        units: vec![RuntimeSourceUnit {
-            path: "file-content-effects.bn".to_owned(),
-            source: PROGRAM.to_owned(),
-        }],
-        application: ApplicationIdentity::new("dev.boon.file-content-effects", "test", "local"),
-        role: ProgramRole::Client,
-        capability_profile: ProgramCapabilityProfile::PublicClient,
-    })
-    .unwrap();
-    ProgramSession::start(artifact).unwrap()
+    static ARTIFACT: OnceLock<ProgramArtifact> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| {
+        compile_program_artifact(&ProgramCompileRequest {
+            revision: 1,
+            entry_path: "file-content-effects.bn".to_owned(),
+            units: vec![RuntimeSourceUnit {
+                path: "file-content-effects.bn".to_owned(),
+                source: PROGRAM.to_owned(),
+            }],
+            application: ApplicationIdentity::new("dev.boon.file-content-effects", "test", "local"),
+            role: ProgramRole::Client,
+            capability_profile: ProgramCapabilityProfile::PublicClient,
+        })
+        .unwrap()
+    });
+    ProgramSession::start(artifact.clone()).unwrap()
 }
 
 fn adapter(registry: FileCapabilityRegistry) -> FileEffectAdapter {
@@ -144,6 +148,17 @@ async fn next(adapter: &mut FileEffectAdapter) -> FileEffectEvent {
         .unwrap()
 }
 
+async fn settle_retired_workers(adapter: &mut FileEffectAdapter) {
+    for _ in 0..100 {
+        assert!(adapter.try_next_event().unwrap().is_none());
+        if adapter.retired_worker_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("retired file worker did not release its resources");
+}
+
 #[tokio::test]
 async fn bounded_read_and_atomic_write_use_directional_host_targets() {
     let input = source_file(b"source bytes");
@@ -187,6 +202,7 @@ async fn same_target_is_busy_until_the_active_atomic_operation_is_observed() {
     let target = source_file(b"old target");
     let mut registry = FileCapabilityRegistry::new(2).unwrap();
     let destination = registry.register_target(target.path()).unwrap();
+    let destination_alias = registry.register_target(target.path()).unwrap();
     let mut adapter = adapter(registry);
     let mut program = program();
 
@@ -201,7 +217,7 @@ async fn same_target_is_busy_until_the_active_atomic_operation_is_observed() {
         &mut program,
         2,
         "store.write",
-        BTreeMap::from([("file".to_owned(), destination.file_target_value())]),
+        BTreeMap::from([("file".to_owned(), destination_alias.file_target_value())]),
     );
     adapter.submit(second).unwrap();
 
@@ -223,6 +239,40 @@ async fn same_target_is_busy_until_the_active_atomic_operation_is_observed() {
     );
     assert!(!adapter.submit(third).unwrap().queued_terminal);
     assert_eq!(tag(&next(&mut adapter).await), "BytesWritten");
+}
+
+#[tokio::test]
+async fn credit_starved_operation_times_out_and_releases_pending_content() {
+    let payload = vec![0x71; 9 * 64 * 1024];
+    let input = source_file(&payload);
+    let mut registry = FileCapabilityRegistry::new(1).unwrap();
+    let source = registry.register_file(input.path()).unwrap();
+    let root = tempfile::tempdir().unwrap().keep();
+    let store = ContentStore::new(root, ContentStoreLimits::new(4, 2 * 1024 * 1024)).unwrap();
+    let limits = FileEffectLimits::new(1, 8, 4).with_operation_timeout(Duration::from_millis(500));
+    let mut adapter = FileEffectAdapter::with_limits(registry, store, limits).unwrap();
+    let mut program = program();
+
+    let import = dispatch(
+        &mut program,
+        1,
+        "store.import",
+        BTreeMap::from([("file".to_owned(), source.file_selected_value())]),
+    );
+    adapter.submit(import).unwrap();
+    assert_eq!(tag(&next(&mut adapter).await), "Started");
+    for _ in 0..4 {
+        assert_eq!(tag(&next(&mut adapter).await), "Progress");
+    }
+
+    let timed_out = next(&mut adapter).await;
+    assert_eq!(tag(&timed_out), "Failed");
+    assert_eq!(text(fields(&timed_out), "code"), "timeout");
+    assert!(timed_out.is_terminal());
+    assert_eq!(adapter.active_count(), 0);
+    assert_eq!(adapter.content_store().pending_writer_count(), 0);
+    settle_retired_workers(&mut adapter).await;
+    assert_eq!(adapter.retired_worker_count(), 0);
 }
 
 #[tokio::test]
@@ -420,6 +470,7 @@ async fn credit_starved_content_streams_cancel_once_and_release_owned_resources(
     }
     apply_event(&mut program, &mut adapter, cancelled).unwrap();
     assert_eq!(adapter.content_store().pending_writer_count(), 0);
+    settle_retired_workers(&mut adapter).await;
     assert!(adapter.try_next_event().unwrap().is_none());
 
     let content = adapter
@@ -456,6 +507,7 @@ async fn credit_starved_content_streams_cancel_once_and_release_owned_resources(
     }
     apply_event(&mut program, &mut adapter, cancelled).unwrap();
     assert_eq!(fs::read(&target_path).unwrap(), b"old target");
+    settle_retired_workers(&mut adapter).await;
     assert!(adapter.try_next_event().unwrap().is_none());
 
     let retry = dispatch(

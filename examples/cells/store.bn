@@ -4,11 +4,21 @@ store: [
     selected_address:
         TEXT { A0 } |> HOLD selected_address {
             LATEST {
-                item.sources.editor.select.address
-                item.sources.editor.change.address
-                item.sources.editor.commit.address
-                item.sources.editor.cancel.address
-                item.sources.editor.blur.address
+                cells
+                    |> List/map(item, new: item.sources.editor.select.address)
+                    |> List/latest()
+                cells
+                    |> List/map(item, new: item.sources.editor.change.address)
+                    |> List/latest()
+                cells
+                    |> List/map(item, new: item.sources.editor.commit.address)
+                    |> List/latest()
+                cells
+                    |> List/map(item, new: item.sources.editor.cancel.address)
+                    |> List/latest()
+                cells
+                    |> List/map(item, new: item.sources.editor.blur.address)
+                    |> List/latest()
             }
         }
 

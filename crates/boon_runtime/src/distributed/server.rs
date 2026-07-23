@@ -5,21 +5,25 @@ use super::{
 };
 use crate::program::ProgramArtifact;
 use crate::{
-    DistributedImportUpdate, RuntimeTurn, SessionConnectionStatus, SessionContext,
-    SessionPrincipal, SourceEvent, SourcePayload, TransientEffectCallId, Value,
+    DistributedCurrentCallInstance, DistributedImportUpdate, RuntimeTurn, SessionConnectionStatus,
+    SessionContext, SessionPrincipal, SourceEvent, SourcePayload, TransientEffectCallId, Value,
 };
 use boon_data::Value as DataValue;
 use boon_plan::{
-    DistributedArgumentId, DistributedEndpointContractPlan, DistributedRouteScopePlan,
-    DistributedWireSchemaPlan, ExportId, ImportId, ProgramRole, RemoteCallSiteId,
-    RemoteCallSitePlan, SourceId,
+    DistributedArgumentId, DistributedCallInstanceId, DistributedCallMode,
+    DistributedEndpointContractPlan, DistributedRouteScopePlan, DistributedWireSchemaPlan,
+    ExportId, ImportId, ProgramRole, RemoteCallSiteId, SourceId,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 
 const GLOBAL_EFFECT_SCOPE: u64 = u64::MAX;
 const MAX_EFFECT_CANCELLATION_ROUNDS: usize = 1024;
+const INVOCATION_REPLAY_WINDOW: u64 = 256;
+const CURRENT_CALL_TOMBSTONE_WINDOW: u64 = 256;
+const MAX_CURRENT_CALL_INSTANCES_PER_ORIGIN: usize = 4096;
+const MAX_INVOCATION_INSTANCES_PER_ORIGIN: usize = 4096;
 
 /// The narrow authority surface required by distributed Server routing.
 ///
@@ -48,20 +52,6 @@ pub trait DistributedServerMachine {
         evaluation: Self::EvaluationMachine,
     ) -> Result<RuntimeTurn, DistributedRuntimeError>;
 
-    fn commit_prepared_evaluation_with_protocol_state(
-        &mut self,
-        turn: RuntimeTurn,
-        evaluation: Self::EvaluationMachine,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
-        if !protocol_state_changes.is_empty() {
-            return Err(runtime_error(
-                "this Server authority cannot persist protocol recovery state",
-            ));
-        }
-        self.commit_prepared_evaluation(turn, evaluation)
-    }
-
     fn event_for_path(
         &self,
         path: &str,
@@ -71,6 +61,12 @@ pub trait DistributedServerMachine {
     fn event_for_source(
         &self,
         source: SourceId,
+        payload: SourcePayload,
+    ) -> Result<SourceEvent, DistributedRuntimeError>;
+
+    fn event_for_route(
+        &self,
+        route: boon_plan::SourceRouteToken,
         payload: SourcePayload,
     ) -> Result<SourceEvent, DistributedRuntimeError>;
 
@@ -89,16 +85,48 @@ pub trait DistributedServerMachine {
 
     fn export_current(&mut self, export_id: ExportId) -> Result<Value, DistributedRuntimeError>;
 
-    fn call_arguments(
+    /// Returns the complete live demand set for this call site in the current
+    /// machine origin. This includes root demands and demands retained inside
+    /// every active producer lease. Nested demand IDs must incorporate their
+    /// outer producer call instance; the router treats them as opaque.
+    fn current_call_instances(
         &mut self,
-        call: &RemoteCallSitePlan,
-    ) -> Result<BTreeMap<DistributedArgumentId, Value>, DistributedRuntimeError>;
+        call_site_id: RemoteCallSiteId,
+    ) -> Result<Vec<DistributedCurrentCallInstance>, DistributedRuntimeError>;
 
-    fn evaluate_function(
+    /// Reads the current result of an already-active producer lease without
+    /// replaying or advancing its demand revision. Nested call identities in
+    /// the lease must remain scoped by the outer `call_instance_id`. The read
+    /// is part of output collection and therefore must preserve any prepared
+    /// turn and any producer lease currently being evaluated.
+    fn producer_call_result_current(
         &mut self,
-        export_id: ExportId,
-        arguments: BTreeMap<DistributedArgumentId, Value>,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
     ) -> Result<Value, DistributedRuntimeError>;
+
+    fn evaluate_function_instance(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        export_id: ExportId,
+        demand_revision: u64,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+    ) -> Result<(Value, Option<RuntimeTurn>), DistributedRuntimeError>;
+
+    fn update_current_call_result_instance(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        content_revision: u64,
+        value: Value,
+    ) -> Result<Option<RuntimeTurn>, DistributedRuntimeError>;
+
+    fn drop_producer_call_instance(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+    ) -> Result<Option<RuntimeTurn>, DistributedRuntimeError>;
 
     fn replace_distributed_context(
         &mut self,
@@ -156,42 +184,34 @@ pub trait DistributedServerMachine {
         turn: RuntimeTurn,
     ) -> Result<RuntimeTurn, DistributedRuntimeError>;
 
-    fn commit_prepared_turn_with_protocol_state(
-        &mut self,
-        turn: RuntimeTurn,
-        protocol_state_changes: Vec<boon_persistence::DurableProtocolStateChange>,
-    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
-        if !protocol_state_changes.is_empty() {
-            return Err(runtime_error(
-                "this Server authority cannot persist protocol recovery state",
-            ));
-        }
-        self.commit_prepared_turn(turn)
-    }
-
-    fn prepare_protocol_checkpoint(&mut self) -> Result<RuntimeTurn, DistributedRuntimeError> {
-        Err(runtime_error(
-            "this Server authority cannot prepare a protocol recovery checkpoint",
-        ))
-    }
-
-    fn supports_protocol_state(&self) -> bool {
-        false
-    }
-
     fn rollback_prepared_turn(&mut self) -> Result<(), DistributedRuntimeError>;
 
     fn has_pending_transient_effect(&self, call_id: TransientEffectCallId) -> bool;
 
     fn set_transient_effect_scope(&mut self, scope: u64);
 
+    fn set_machine_origin(&mut self, origin: SessionOrigin) -> Result<(), DistributedRuntimeError>;
+
+    fn reset_machine_origin(&mut self) -> Result<(), DistributedRuntimeError>;
+
+    fn drop_producer_origin(
+        &mut self,
+        origin: SessionOrigin,
+    ) -> Result<Vec<TransientEffectCallId>, DistributedRuntimeError>;
+
     fn root_value_current(&mut self, name: &str) -> Result<Value, DistributedRuntimeError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SessionOrigin {
     slot: u32,
     generation: u64,
+}
+
+impl Debug for SessionOrigin {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionOrigin(..)")
+    }
 }
 
 impl SessionOrigin {
@@ -229,32 +249,68 @@ pub struct DistributedServerUpdate {
     pub deliveries: Vec<ServerDelivery>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ServerContextKey {
     Global,
     Origin(SessionOrigin),
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum EffectOwner {
     Global,
     Origin(SessionOrigin),
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct OriginState {
     status: SessionConnectionStatus,
     principal: SessionPrincipal,
     execution_scope: u64,
     imports: BTreeMap<ImportId, (u64, DataValue)>,
     accepted_events: BTreeMap<ExportId, u64>,
-    accepted_calls: BTreeMap<RemoteCallSiteId, u64>,
+    accepted_current_call_revisions: BTreeMap<RemoteCallSiteId, u64>,
+    accepted_current_calls: BTreeMap<CallInstanceKey, AcceptedCurrentCall>,
+    accepted_current_call_tombstones: BTreeMap<CallInstanceKey, u64>,
+    accepted_invocation_requests: BTreeMap<CallInstanceKey, u64>,
+    accepted_invocation_results: BTreeMap<CallInstanceKey, u64>,
+    invocation_request_replays: BTreeMap<InvocationKey, InvocationRequestReplay>,
+    invocation_result_replays: BTreeMap<InvocationKey, DataValue>,
     sent_values: BTreeMap<ExportId, (u64, DataValue)>,
     shared_sent_revisions: BTreeMap<ExportId, u64>,
-    sent_calls: BTreeMap<RemoteCallSiteId, (u64, BTreeMap<DistributedArgumentId, DataValue>)>,
+    sent_current_call_revisions: BTreeMap<RemoteCallSiteId, u64>,
+    sent_current_calls: BTreeMap<CallInstanceKey, SentCurrentCall>,
+    sent_current_call_tombstones: BTreeMap<CallInstanceKey, u64>,
+    accepted_result_content_revisions: BTreeMap<RemoteCallSiteId, u64>,
+    sent_invocation_sequences: BTreeMap<CallInstanceKey, u64>,
+    pending_invocation_results: BTreeMap<InvocationKey, boon_plan::SourceRouteToken>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+type CallInstanceKey = (RemoteCallSiteId, DistributedCallInstanceId);
+type InvocationKey = (RemoteCallSiteId, DistributedCallInstanceId, u64);
+
+#[derive(Clone)]
+struct AcceptedCurrentCall {
+    demand_revision: u64,
+    result_revision: u64,
+    value: DataValue,
+}
+
+#[derive(Clone)]
+struct SentCurrentCall {
+    demand_revision: u64,
+    accepted_result_revision: u64,
+    accepted_result: Option<DataValue>,
+    arguments: BTreeMap<DistributedArgumentId, DataValue>,
+}
+
+#[derive(Clone)]
+struct InvocationRequestReplay {
+    function_export_id: ExportId,
+    arguments: BTreeMap<DistributedArgumentId, DataValue>,
+    result: DataValue,
+}
+
+#[derive(Clone)]
 struct ServerRouterState {
     machine_context: ServerContextKey,
     origins: BTreeMap<SessionOrigin, OriginState>,
@@ -274,29 +330,52 @@ pub struct DistributedServerRuntime {
     contract: DistributedEndpointContractPlan,
     wire_schema: DistributedWireSchemaPlan,
     state: ServerRouterState,
+    next_transaction_id: u64,
+    open_transaction_id: Option<u64>,
 }
 
-const SERVER_ROUTER_RECOVERY_FORMAT_VERSION: u16 = 3;
-
-#[derive(Serialize, Deserialize)]
-struct ServerRouterRecoveryImage {
-    format_version: u16,
-    origins: BTreeMap<SessionOrigin, OriginState>,
-    shared_sent_values: BTreeMap<ExportId, (u64, DataValue)>,
-}
-
-pub struct PreparedDistributedServerUpdate {
-    update: DistributedServerUpdate,
-    candidate_state: ServerRouterState,
-    machine_turn: Option<RuntimeTurn>,
-}
-
+#[must_use = "prepared Server transactions must be committed or rolled back"]
 pub struct PreparedDistributedServerTransaction<E> {
+    transaction_id: u64,
     update: DistributedServerUpdate,
     candidate_runtime: DistributedServerRuntime,
     evaluation_machine: E,
+    rollback_machine: Option<E>,
     machine_turn: Option<(RuntimeTurn, usize)>,
-    protocol_checkpoint_turn: Option<RuntimeTurn>,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedMessageCompletion {
+    None,
+    FinishOrigin(SessionOrigin),
+}
+
+struct PreparedSessionMessage {
+    update: DistributedServerUpdate,
+    machine_turn: Option<RuntimeTurn>,
+    completion: PreparedMessageCompletion,
+}
+
+impl PreparedSessionMessage {
+    fn complete(update: DistributedServerUpdate) -> Self {
+        Self {
+            update,
+            machine_turn: None,
+            completion: PreparedMessageCompletion::None,
+        }
+    }
+
+    fn finish_origin(
+        origin: SessionOrigin,
+        update: DistributedServerUpdate,
+        machine_turn: Option<RuntimeTurn>,
+    ) -> Self {
+        Self {
+            update,
+            machine_turn,
+            completion: PreparedMessageCompletion::FinishOrigin(origin),
+        }
+    }
 }
 
 impl<E> PreparedDistributedServerTransaction<E> {
@@ -306,24 +385,6 @@ impl<E> PreparedDistributedServerTransaction<E> {
 
     pub fn prepares_machine_turn(&self) -> bool {
         self.machine_turn.is_some()
-    }
-
-    pub fn candidate_recovery_payload(&self) -> Result<Vec<u8>, DistributedRuntimeError> {
-        encode_server_router_recovery(&self.candidate_runtime.state)
-    }
-}
-
-impl PreparedDistributedServerUpdate {
-    pub fn deliveries(&self) -> &[ServerDelivery] {
-        &self.update.deliveries
-    }
-
-    pub fn prepares_machine_turn(&self) -> bool {
-        self.machine_turn.is_some()
-    }
-
-    pub fn candidate_recovery_payload(&self) -> Result<Vec<u8>, DistributedRuntimeError> {
-        encode_server_router_recovery(&self.candidate_state)
     }
 }
 
@@ -369,59 +430,42 @@ impl DistributedServerRuntime {
                 shared_sent_values: BTreeMap::new(),
                 effect_owners: BTreeMap::new(),
             },
+            next_transaction_id: 1,
+            open_transaction_id: None,
         })
     }
 
-    pub fn recovery_payload(&self) -> Result<Vec<u8>, DistributedRuntimeError> {
-        encode_server_router_recovery(&self.state)
+    fn ensure_no_open_transaction(&self) -> Result<(), DistributedRuntimeError> {
+        if self.open_transaction_id.is_some() {
+            return Err(runtime_error(
+                "distributed Server already has an open prepared transaction",
+            ));
+        }
+        Ok(())
     }
 
-    pub fn start_with_recovery(
-        artifact: &ProgramArtifact,
-        payload: &[u8],
-    ) -> Result<Self, DistributedRuntimeError> {
-        if payload.is_empty() || payload.len() > boon_persistence::MAX_PROTOCOL_STATE_RECORD_BYTES {
-            return Err(DistributedRuntimeError::InvalidTransportFrame);
-        }
-        let recovery: ServerRouterRecoveryImage = ciborium::de::from_reader(payload)
-            .map_err(|_| DistributedRuntimeError::InvalidTransportFrame)?;
-        if recovery.format_version != SERVER_ROUTER_RECOVERY_FORMAT_VERSION {
-            return Err(DistributedRuntimeError::ProtocolMismatch);
-        }
-        let mut canonical = Vec::new();
-        ciborium::ser::into_writer(&recovery, &mut canonical)
-            .map_err(|_| DistributedRuntimeError::InvalidTransportFrame)?;
-        if canonical != payload {
-            return Err(DistributedRuntimeError::InvalidTransportFrame);
-        }
-        let mut runtime = Self::start(artifact)?;
-        let state = ServerRouterState {
-            machine_context: ServerContextKey::Global,
-            origins: recovery.origins,
-            shared_sent_values: recovery.shared_sent_values,
-            effect_owners: BTreeMap::new(),
-        };
-        validate_server_router_recovery(runtime.contract.role, &runtime.wire_schema, &state)?;
-        runtime.state = state;
-        for origin in runtime.state.origins.values_mut() {
-            origin.status = SessionConnectionStatus::Stale;
-        }
-        Ok(runtime)
+    fn begin_transaction(&mut self) -> Result<u64, DistributedRuntimeError> {
+        self.ensure_no_open_transaction()?;
+        let transaction_id = self.next_transaction_id;
+        self.next_transaction_id = self
+            .next_transaction_id
+            .checked_add(1)
+            .ok_or_else(|| runtime_error("distributed Server transaction ID exhausted"))?;
+        self.open_transaction_id = Some(transaction_id);
+        Ok(transaction_id)
     }
 
-    pub fn recovery_origin_count(&self) -> usize {
-        self.state.origins.len()
+    fn require_transaction(&self, transaction_id: u64) -> Result<(), DistributedRuntimeError> {
+        if self.open_transaction_id != Some(transaction_id) {
+            return Err(DistributedRuntimeError::InvalidLease);
+        }
+        Ok(())
     }
 
-    pub fn recovery_origin_matches(
-        &self,
-        origin: SessionOrigin,
-        principal: &SessionPrincipal,
-        execution_scope: u64,
-    ) -> bool {
-        self.state.origins.get(&origin).is_some_and(|state| {
-            &state.principal == principal && state.execution_scope == execution_scope
-        })
+    fn clear_transaction(&mut self, transaction_id: u64) -> Result<(), DistributedRuntimeError> {
+        self.require_transaction(transaction_id)?;
+        self.open_transaction_id = None;
+        Ok(())
     }
 
     pub fn bind<'a, M>(&'a mut self, machine: &'a mut M) -> DistributedServerAuthority<'a, M>
@@ -445,162 +489,25 @@ impl DistributedServerRuntime {
     }
 }
 
-fn validate_server_router_recovery(
-    role: ProgramRole,
-    schema: &DistributedWireSchemaPlan,
-    state: &ServerRouterState,
-) -> Result<(), DistributedRuntimeError> {
-    if role != ProgramRole::Server {
-        return Err(DistributedRuntimeError::ProtocolMismatch);
-    }
-    if let ServerContextKey::Origin(origin) = state.machine_context
-        && !state.origins.contains_key(&origin)
-    {
-        return Err(DistributedRuntimeError::InvalidLease);
-    }
-    let mut scopes = std::collections::BTreeSet::new();
-    for origin_state in state.origins.values() {
-        if origin_state.execution_scope == 0
-            || origin_state.execution_scope == GLOBAL_EFFECT_SCOPE
-            || !scopes.insert(origin_state.execution_scope)
-        {
-            return Err(DistributedRuntimeError::InvalidLease);
-        }
-        SessionContext::Available {
-            status: origin_state.status.clone(),
-            principal: origin_state.principal.clone(),
-        }
-        .validate()
-        .map_err(runtime_error)?;
-        if origin_state
-            .imports
-            .iter()
-            .any(|(import_id, (revision, _))| {
-                *revision == 0
-                    || !schema.value_edges.iter().any(|edge| {
-                        edge.import_id == *import_id && edge.consumer_role == ProgramRole::Server
-                    })
-            })
-            || origin_state
-                .accepted_events
-                .iter()
-                .any(|(export_id, sequence)| {
-                    *sequence == 0
-                        || !schema.event_edges.iter().any(|edge| {
-                            edge.export_id == *export_id
-                                && edge.consumer_role == ProgramRole::Server
-                        })
-                })
-            || origin_state
-                .accepted_calls
-                .iter()
-                .any(|(call_site_id, revision)| {
-                    *revision == 0
-                        || !schema.call_edges.iter().any(|edge| {
-                            edge.call_site_id == *call_site_id
-                                && edge.callee_role == ProgramRole::Server
-                        })
-                })
-            || origin_state
-                .sent_values
-                .iter()
-                .any(|(export_id, (revision, _))| {
-                    *revision == 0
-                        || !schema.value_edges.iter().any(|edge| {
-                            edge.export_id == *export_id
-                                && edge.producer_role == ProgramRole::Server
-                        })
-                })
-            || origin_state
-                .sent_calls
-                .iter()
-                .any(|(call_site_id, (revision, _))| {
-                    *revision == 0
-                        || !schema.call_edges.iter().any(|edge| {
-                            edge.call_site_id == *call_site_id
-                                && edge.caller_role == ProgramRole::Server
-                        })
-                })
-        {
-            return Err(DistributedRuntimeError::UnknownTransportEdge);
-        }
-    }
-    if state
-        .shared_sent_values
-        .values()
-        .any(|(revision, _)| *revision == 0)
-        || !state.effect_owners.is_empty()
-    {
-        return Err(DistributedRuntimeError::InvalidLease);
-    }
-    Ok(())
-}
-
-fn encode_server_router_recovery(
-    state: &ServerRouterState,
-) -> Result<Vec<u8>, DistributedRuntimeError> {
-    let recovery = ServerRouterRecoveryImage {
-        format_version: SERVER_ROUTER_RECOVERY_FORMAT_VERSION,
-        origins: state.origins.clone(),
-        shared_sent_values: state.shared_sent_values.clone(),
-    };
-    let mut payload = Vec::new();
-    ciborium::ser::into_writer(&recovery, &mut payload)
-        .map_err(|_| runtime_error("failed to encode Server router recovery checkpoint"))?;
-    if payload.len() > boon_persistence::MAX_PROTOCOL_STATE_RECORD_BYTES {
-        return Err(DistributedRuntimeError::QueueBytesFull {
-            limit: boon_persistence::MAX_PROTOCOL_STATE_RECORD_BYTES,
-        });
-    }
-    Ok(payload)
-}
-
 impl<M> DistributedServerAuthority<'_, M>
 where
     M: DistributedServerMachine,
 {
-    pub fn supports_protocol_state(&self) -> bool {
-        self.machine.supports_protocol_state()
-    }
-
-    pub fn commit_protocol_checkpoint(
-        &mut self,
-        changes: impl FnOnce(
-            u64,
-        ) -> Result<
-            Vec<boon_persistence::DurableProtocolStateChange>,
-            DistributedRuntimeError,
-        >,
-    ) -> Result<RuntimeTurn, DistributedRuntimeError> {
-        let turn = self.machine.prepare_protocol_checkpoint()?;
-        let protocol_state_changes = match changes(turn.sequence) {
-            Ok(changes) => changes,
-            Err(error) => {
-                self.machine.rollback_prepared_turn()?;
-                return Err(error);
-            }
-        };
-        match self
-            .machine
-            .commit_prepared_turn_with_protocol_state(turn, protocol_state_changes)
-        {
-            Ok(turn) => Ok(turn),
-            Err(error) => {
-                let _ = self.machine.rollback_prepared_turn();
-                Err(error)
-            }
-        }
-    }
-
     pub fn attach_origin(
         &mut self,
         origin: SessionOrigin,
         principal: SessionPrincipal,
         execution_scope: u64,
     ) -> Result<(), DistributedRuntimeError> {
+        self.ensure_no_open_transaction()?;
         if execution_scope == 0
             || execution_scope == GLOBAL_EFFECT_SCOPE
             || self.state.origins.contains_key(&origin)
+            || self
+                .state
+                .origins
+                .keys()
+                .any(|attached| attached.slot() == origin.slot())
             || self
                 .state
                 .origins
@@ -619,10 +526,21 @@ where
                 execution_scope,
                 imports: BTreeMap::new(),
                 accepted_events: BTreeMap::new(),
-                accepted_calls: BTreeMap::new(),
+                accepted_current_call_revisions: BTreeMap::new(),
+                accepted_current_calls: BTreeMap::new(),
+                accepted_current_call_tombstones: BTreeMap::new(),
+                accepted_invocation_requests: BTreeMap::new(),
+                accepted_invocation_results: BTreeMap::new(),
+                invocation_request_replays: BTreeMap::new(),
+                invocation_result_replays: BTreeMap::new(),
                 sent_values: BTreeMap::new(),
                 shared_sent_revisions: BTreeMap::new(),
-                sent_calls: BTreeMap::new(),
+                sent_current_call_revisions: BTreeMap::new(),
+                sent_current_calls: BTreeMap::new(),
+                sent_current_call_tombstones: BTreeMap::new(),
+                accepted_result_content_revisions: BTreeMap::new(),
+                sent_invocation_sequences: BTreeMap::new(),
+                pending_invocation_results: BTreeMap::new(),
             },
         );
         Ok(())
@@ -633,6 +551,7 @@ where
         origin: SessionOrigin,
         status: SessionConnectionStatus,
     ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
+        self.ensure_no_open_transaction()?;
         self.state
             .origins
             .get_mut(&origin)
@@ -647,9 +566,12 @@ where
         status: SessionConnectionStatus,
     ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
     {
+        self.ensure_no_open_transaction()?;
         self.require_origin(origin)?;
         self.prepare_evaluated_transaction(
             DistributedServerUpdate::default(),
+            None,
+            None,
             None,
             move |authority, update, _| {
                 let status_update = authority.set_origin_status(origin, status)?;
@@ -664,10 +586,14 @@ where
         &mut self,
         origin: SessionOrigin,
     ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
+        self.ensure_no_open_transaction()?;
         self.require_origin(origin)?;
         let mut update = DistributedServerUpdate::default();
         self.enter_origin(origin, &mut update)?;
         if self.origin_inputs_are_current(origin) {
+            update
+                .deliveries
+                .extend(self.collect_producer_call_results(origin)?);
             update
                 .deliveries
                 .extend(self.collect_origin_outputs(origin)?);
@@ -683,16 +609,13 @@ where
         &mut self,
         origin: SessionOrigin,
     ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
+        self.ensure_no_open_transaction()?;
         self.require_origin(origin)?;
         let mut update = self.cancel_origin_transient_effects(origin)?;
-        self.state
-            .origins
-            .remove(&origin)
-            .ok_or(DistributedRuntimeError::InvalidLease)?;
-        self.enter_global(&mut update)?;
-        update
-            .deliveries
-            .retain(|delivery| delivery.target != ServerDeliveryTarget::Origin(origin));
+        let prepared = self.prepare_origin_expiration_transaction(origin)?;
+        let expired = self.commit_prepared_transaction(prepared)?;
+        update.turns.extend(expired.turns);
+        update.deliveries.extend(expired.deliveries);
         Ok(update)
     }
 
@@ -701,6 +624,7 @@ where
         origin: SessionOrigin,
     ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
     {
+        self.ensure_no_open_transaction()?;
         self.require_origin(origin)?;
         if self.pending_transient_effect_count(origin) != 0 {
             return Err(runtime_error(
@@ -710,7 +634,16 @@ where
         self.prepare_evaluated_transaction(
             DistributedServerUpdate::default(),
             None,
+            None,
+            None,
             move |authority, update, _| {
+                let untracked_effects = authority.machine.drop_producer_origin(origin)?;
+                if !untracked_effects.is_empty() {
+                    return Err(runtime_error(format!(
+                        "Server Session origin retained {} untracked producer effect(s) during expiration",
+                        untracked_effects.len()
+                    )));
+                }
                 authority
                     .state
                     .origins
@@ -731,18 +664,21 @@ where
         message: DistributedMessage,
     ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
         let prepared = self.prepare_session_message(origin, message)?;
-        self.commit_prepared_update(prepared)
+        self.commit_prepared_transaction(prepared)
     }
 
     pub fn prepare_session_message(
         &mut self,
         origin: SessionOrigin,
         message: DistributedMessage,
-    ) -> Result<PreparedDistributedServerUpdate, DistributedRuntimeError> {
+    ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
+    {
+        self.ensure_no_open_transaction()?;
         if message.producer != ProgramRole::Session || message.consumer != ProgramRole::Server {
             return Err(DistributedRuntimeError::UnknownTransportEdge);
         }
         self.require_origin(origin)?;
+        let rollback_machine = self.machine.fork_prepared_evaluation(None)?;
         let original_state = self.runtime.state.clone();
         let result = match message.payload {
             DistributedMessagePayload::Current {
@@ -751,151 +687,102 @@ where
                 value,
             } => self
                 .accept_current(origin, export_id, revision, value)
-                .map(|update| (update, None)),
+                .map(PreparedSessionMessage::complete),
             DistributedMessagePayload::Event {
                 export_id,
                 sequence,
                 value,
             } => self.prepare_event(origin, export_id, sequence, value),
-            DistributedMessagePayload::CallRequest {
+            DistributedMessagePayload::CurrentCallRequest {
                 call_site_id,
+                call_instance_id,
                 function_export_id,
-                revision,
+                demand_revision,
                 arguments,
-            } => self
-                .accept_call_request(
-                    origin,
-                    call_site_id,
-                    function_export_id,
-                    revision,
-                    arguments,
-                )
-                .map(|update| (update, None)),
-            DistributedMessagePayload::CallResult {
+            } => self.accept_call_request(
+                origin,
                 call_site_id,
-                revision,
+                call_instance_id,
+                function_export_id,
+                demand_revision,
+                arguments,
+            ),
+            DistributedMessagePayload::CurrentCallResult {
+                call_site_id,
+                call_instance_id,
+                demand_revision,
+                result_revision,
                 value,
-            } => self
-                .accept_call_result(origin, call_site_id, revision, value)
-                .map(|update| (update, None)),
+            } => self.accept_call_result(
+                origin,
+                call_site_id,
+                call_instance_id,
+                demand_revision,
+                result_revision,
+                value,
+            ),
+            DistributedMessagePayload::CurrentCallDetach {
+                call_site_id,
+                call_instance_id,
+                demand_revision,
+            } => self.accept_call_detach(origin, call_site_id, call_instance_id, demand_revision),
+            DistributedMessagePayload::InvocationRequest {
+                call_site_id,
+                call_instance_id,
+                function_export_id,
+                sequence,
+                arguments,
+            } => self.accept_invocation_request(
+                origin,
+                call_site_id,
+                call_instance_id,
+                function_export_id,
+                sequence,
+                arguments,
+            ),
+            DistributedMessagePayload::InvocationResult {
+                call_site_id,
+                call_instance_id,
+                sequence,
+                value,
+            } => self.accept_invocation_result(
+                origin,
+                call_site_id,
+                call_instance_id,
+                sequence,
+                value,
+            ),
         };
-        match result {
-            Ok((update, machine_turn)) => {
-                let candidate_state = std::mem::replace(&mut self.runtime.state, original_state);
-                self.runtime.state.machine_context = candidate_state.machine_context;
-                self.restore_effect_scope();
-                Ok(PreparedDistributedServerUpdate {
-                    update,
-                    candidate_state,
-                    machine_turn,
-                })
+        let prepared = match result {
+            Ok(prepared) => {
+                let rollback_machine = prepared.machine_turn.is_none().then_some(rollback_machine);
+                self.prepare_evaluated_transaction(
+                    prepared.update,
+                    prepared.machine_turn,
+                    rollback_machine,
+                    Some(original_state),
+                    move |authority, update, turn| match prepared.completion {
+                        PreparedMessageCompletion::None => Ok(()),
+                        PreparedMessageCompletion::FinishOrigin(origin) => {
+                            authority.finish_turn(EffectOwner::Origin(origin), turn, update)
+                        }
+                    },
+                )
             }
             Err(error) => {
-                let actual_context = self.runtime.state.machine_context;
+                let rollback = self.machine.install_evaluation(rollback_machine);
                 self.runtime.state = original_state;
-                self.runtime.state.machine_context = actual_context;
                 self.restore_effect_scope();
-                Err(error)
-            }
-        }
-    }
-
-    pub fn commit_prepared_update(
-        &mut self,
-        mut prepared: PreparedDistributedServerUpdate,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        if let Some(turn) = prepared.machine_turn.take() {
-            match self.machine.commit_prepared_turn(turn) {
-                Ok(turn) => prepared.update.turns.push(turn),
-                Err(error) => {
-                    let _ = self.machine.rollback_prepared_turn();
-                    self.restore_effect_scope();
-                    return Err(error);
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(runtime_error(format!(
+                        "distributed Server message preparation failed: {error}; rollback failed: {rollback}"
+                    ))),
                 }
             }
-        }
-        self.runtime.state = prepared.candidate_state;
-        self.restore_effect_scope();
-        Ok(prepared.update)
-    }
-
-    pub fn commit_prepared_update_with_protocol_state(
-        &mut self,
-        mut prepared: PreparedDistributedServerUpdate,
-        changes: impl FnOnce(
-            u64,
-        ) -> Result<
-            Vec<boon_persistence::DurableProtocolStateChange>,
-            DistributedRuntimeError,
-        >,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let synthesized_checkpoint = prepared.machine_turn.is_none();
-        let turn = match prepared.machine_turn.take() {
-            Some(turn) => turn,
-            None => self.machine.prepare_protocol_checkpoint()?,
         };
-        let protocol_state_changes = match changes(turn.sequence) {
-            Ok(changes) => changes,
-            Err(error) => {
-                let _ = self.machine.rollback_prepared_turn();
-                self.restore_effect_scope();
-                return Err(error);
-            }
-        };
-        let committed = match self
-            .machine
-            .commit_prepared_turn_with_protocol_state(turn, protocol_state_changes)
-        {
-            Ok(turn) => turn,
-            Err(error) => {
-                let _ = self.machine.rollback_prepared_turn();
-                self.restore_effect_scope();
-                return Err(error);
-            }
-        };
-        if !synthesized_checkpoint {
-            prepared.update.turns.push(committed);
-        }
-        self.runtime.state = prepared.candidate_state;
         self.restore_effect_scope();
-        Ok(prepared.update)
-    }
-
-    pub fn rollback_prepared_update(
-        &mut self,
-        prepared: PreparedDistributedServerUpdate,
-    ) -> Result<(), DistributedRuntimeError> {
-        if prepared.machine_turn.is_some() {
-            self.machine.rollback_prepared_turn()?;
-        }
-        self.restore_effect_scope();
-        Ok(())
-    }
-
-    fn finish_prepared_router_update(
-        &mut self,
-        original_state: ServerRouterState,
-        result: Result<(DistributedServerUpdate, Option<RuntimeTurn>), DistributedRuntimeError>,
-    ) -> Result<PreparedDistributedServerUpdate, DistributedRuntimeError> {
-        match result {
-            Ok((update, machine_turn)) => {
-                let candidate_state = std::mem::replace(&mut self.runtime.state, original_state);
-                self.runtime.state.machine_context = candidate_state.machine_context;
-                self.restore_effect_scope();
-                Ok(PreparedDistributedServerUpdate {
-                    update,
-                    candidate_state,
-                    machine_turn,
-                })
-            }
-            Err(error) => {
-                let actual_context = self.runtime.state.machine_context;
-                self.runtime.state = original_state;
-                self.runtime.state.machine_context = actual_context;
-                self.restore_effect_scope();
-                Err(error)
-            }
-        }
+        prepared
     }
 
     pub fn prepare_global_source_transaction(
@@ -905,6 +792,7 @@ where
         durable: bool,
     ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
     {
+        self.ensure_no_open_transaction()?;
         let mut update = DistributedServerUpdate::default();
         self.enter_global(&mut update)?;
         let event = self.machine.event_for_path(source_path, payload)?;
@@ -912,23 +800,23 @@ where
         let turn = self
             .machine
             .prepare_dispatch_with_durability(event, durable)?;
-        self.prepare_evaluated_transaction(update, Some(turn), |authority, update, turn| {
-            let turn = turn.expect("Global source transaction has a machine turn");
-            authority.record_transient_effects(EffectOwner::Global, std::slice::from_ref(turn))?;
-            authority.collect_after_global_turn(update)
-        })
+        self.prepare_evaluated_transaction(
+            update,
+            Some(turn),
+            None,
+            None,
+            |authority, update, turn| authority.finish_turn(EffectOwner::Global, turn, update),
+        )
     }
 
-    pub fn prepare_global_read_update(
+    pub fn prepare_global_read_transaction(
         &mut self,
-    ) -> Result<PreparedDistributedServerUpdate, DistributedRuntimeError> {
-        let original_state = self.runtime.state.clone();
-        let result = (|| {
-            let mut update = DistributedServerUpdate::default();
-            self.enter_global(&mut update)?;
-            Ok((update, None))
-        })();
-        self.finish_prepared_router_update(original_state, result)
+    ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
+    {
+        self.ensure_no_open_transaction()?;
+        let mut update = DistributedServerUpdate::default();
+        self.enter_global(&mut update)?;
+        self.prepare_evaluated_transaction(update, None, None, None, |_, _, _| Ok(()))
     }
 
     fn prepare_transient_effect_transaction(
@@ -937,6 +825,7 @@ where
         prepare: impl FnOnce(&mut M) -> Result<RuntimeTurn, DistributedRuntimeError>,
     ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
     {
+        self.ensure_no_open_transaction()?;
         let owner = self
             .state
             .effect_owners
@@ -946,15 +835,19 @@ where
         let mut update = DistributedServerUpdate::default();
         self.enter_effect_owner(owner, &mut update)?;
         let turn = prepare(self.machine)?;
-        self.prepare_evaluated_transaction(update, Some(turn), move |authority, update, turn| {
-            let turn = turn.expect("transient-effect transaction has a machine turn");
-            authority.record_transient_effects(owner, std::slice::from_ref(turn))?;
-            authority.finish_effect_owner(owner, update)?;
-            if !authority.machine.has_pending_transient_effect(call_id) {
-                authority.state.effect_owners.remove(&call_id);
-            }
-            Ok(())
-        })
+        self.prepare_evaluated_transaction(
+            update,
+            Some(turn),
+            None,
+            None,
+            move |authority, update, turn| {
+                authority.finish_turn(owner, turn, update)?;
+                if !authority.machine.has_pending_transient_effect(call_id) {
+                    authority.state.effect_owners.remove(&call_id);
+                }
+                Ok(())
+            },
+        )
     }
 
     pub fn prepare_transient_effect_completion_transaction(
@@ -993,30 +886,65 @@ where
         durable: bool,
     ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
     {
+        self.prepare_transient_effect_cancellations_transaction(&[call_id], durable)
+    }
+
+    fn prepare_transient_effect_cancellations_transaction(
+        &mut self,
+        call_ids: &[TransientEffectCallId],
+        durable: bool,
+    ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
+    {
+        self.ensure_no_open_transaction()?;
+        let Some(first) = call_ids.first() else {
+            return Err(runtime_error(
+                "transient effect cancellation requires at least one call",
+            ));
+        };
         let owner = self
             .state
             .effect_owners
-            .get(&call_id)
+            .get(first)
             .copied()
             .ok_or(DistributedRuntimeError::InvalidLease)?;
+        if call_ids
+            .iter()
+            .any(|call_id| self.state.effect_owners.get(call_id).copied() != Some(owner))
+        {
+            return Err(DistributedRuntimeError::InvalidLease);
+        }
         let mut update = DistributedServerUpdate::default();
         self.enter_effect_owner(owner, &mut update)?;
         let turn = self
             .machine
-            .prepare_transient_effect_cancellation_with_durability(&[call_id], durable)?;
-        self.prepare_evaluated_transaction(update, turn, move |authority, update, turn| {
-            if let Some(turn) = turn {
-                authority.record_transient_effects(owner, std::slice::from_ref(turn))?;
-            }
-            authority.state.effect_owners.remove(&call_id);
-            authority.finish_effect_owner(owner, update)
-        })
+            .prepare_transient_effect_cancellation_with_durability(call_ids, durable)?
+            .ok_or_else(|| {
+                runtime_error(
+                    "distributed Server effect ownership diverged from machine effect state",
+                )
+            })?;
+        let call_ids = call_ids.to_vec();
+        self.prepare_evaluated_transaction(
+            update,
+            Some(turn),
+            None,
+            None,
+            move |authority, update, turn| {
+                authority.finish_turn(owner, turn, update)?;
+                for call_id in call_ids {
+                    authority.state.effect_owners.remove(&call_id);
+                }
+                Ok(())
+            },
+        )
     }
 
     fn prepare_evaluated_transaction(
         &mut self,
         mut update: DistributedServerUpdate,
         machine_turn: Option<RuntimeTurn>,
+        rollback_machine: Option<M::EvaluationMachine>,
+        rollback_state: Option<ServerRouterState>,
         evaluate: impl FnOnce(
             &mut DistributedServerAuthority<'_, M::EvaluationMachine>,
             &mut DistributedServerUpdate,
@@ -1024,48 +952,97 @@ where
         ) -> Result<(), DistributedRuntimeError>,
     ) -> Result<PreparedDistributedServerTransaction<M::EvaluationMachine>, DistributedRuntimeError>
     {
-        let protocol_checkpoint_turn =
-            if machine_turn.is_none() && self.machine.supports_protocol_state() {
-                Some(self.machine.prepare_protocol_checkpoint()?)
-            } else {
-                None
-            };
-        let prepared_turn = machine_turn.as_ref().or(protocol_checkpoint_turn.as_ref());
-        let evaluation_machine = match self.machine.fork_prepared_evaluation(prepared_turn) {
-            Ok(machine) => machine,
+        let mut candidate_runtime = match rollback_state {
+            Some(rollback_state) => {
+                let candidate_state = std::mem::replace(&mut self.runtime.state, rollback_state);
+                self.runtime.state.machine_context = candidate_state.machine_context;
+                DistributedServerRuntime {
+                    contract: self.runtime.contract.clone(),
+                    wire_schema: self.runtime.wire_schema.clone(),
+                    state: candidate_state,
+                    next_transaction_id: self.runtime.next_transaction_id,
+                    open_transaction_id: None,
+                }
+            }
+            None => self.runtime.clone(),
+        };
+        let transaction_id = match self.runtime.begin_transaction() {
+            Ok(transaction_id) => transaction_id,
             Err(error) => {
-                return self.fail_evaluated_transaction(prepared_turn.is_some(), error);
+                let rollback = if machine_turn.is_some() {
+                    self.machine.rollback_prepared_turn()
+                } else if let Some(rollback_machine) = rollback_machine {
+                    self.machine.install_evaluation(rollback_machine)
+                } else {
+                    Ok(())
+                };
+                self.restore_effect_scope();
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(runtime_error(format!(
+                        "distributed Server transaction could not begin: {error}; rollback failed: {rollback}"
+                    ))),
+                };
             }
         };
-        let mut candidate_runtime = self.runtime.clone();
-        let mut evaluation_machine = evaluation_machine;
-        let result = {
-            let mut authority = candidate_runtime.bind(&mut evaluation_machine);
-            evaluate(&mut authority, &mut update, machine_turn.as_ref())
-        };
-        if let Err(error) = result {
-            return self.fail_evaluated_transaction(prepared_turn.is_some(), error);
-        }
+        candidate_runtime.next_transaction_id = self.runtime.next_transaction_id;
+        candidate_runtime.open_transaction_id = None;
         let machine_turn = machine_turn.map(|turn| {
             let index = update.turns.len();
             update.turns.push(turn.clone());
             (turn, index)
         });
+        let prepared_turn = machine_turn.as_ref().map(|(turn, _)| turn);
+        let evaluation_machine = match self.machine.fork_prepared_evaluation(prepared_turn) {
+            Ok(machine) => machine,
+            Err(error) => {
+                return self.fail_evaluated_transaction(
+                    transaction_id,
+                    prepared_turn.is_some(),
+                    rollback_machine,
+                    error,
+                );
+            }
+        };
+        let mut evaluation_machine = evaluation_machine;
+        let result = {
+            let mut authority = candidate_runtime.bind(&mut evaluation_machine);
+            evaluate(&mut authority, &mut update, prepared_turn)
+        };
+        if let Err(error) = result {
+            return self.fail_evaluated_transaction(
+                transaction_id,
+                prepared_turn.is_some(),
+                rollback_machine,
+                error,
+            );
+        }
         Ok(PreparedDistributedServerTransaction {
+            transaction_id,
             update,
             candidate_runtime,
             evaluation_machine,
+            rollback_machine,
             machine_turn,
-            protocol_checkpoint_turn,
         })
     }
 
     fn fail_evaluated_transaction<T>(
         &mut self,
+        transaction_id: u64,
         has_machine_turn: bool,
+        rollback_machine: Option<M::EvaluationMachine>,
         error: DistributedRuntimeError,
     ) -> Result<T, DistributedRuntimeError> {
-        if has_machine_turn && let Err(rollback) = self.machine.rollback_prepared_turn() {
+        self.runtime.clear_transaction(transaction_id)?;
+        let rollback = if has_machine_turn {
+            self.machine.rollback_prepared_turn()
+        } else if let Some(rollback_machine) = rollback_machine {
+            self.machine.install_evaluation(rollback_machine)
+        } else {
+            Ok(())
+        };
+        if let Err(rollback) = rollback {
             return Err(runtime_error(format!(
                 "distributed Server evaluation failed: {error}; rollback failed: {rollback}"
             )));
@@ -1074,75 +1051,73 @@ where
         Err(error)
     }
 
+    fn guard_function_evaluation<T>(
+        &mut self,
+        operation: &str,
+        turn: Option<&RuntimeTurn>,
+        finish: impl FnOnce(
+            &mut DistributedServerAuthority<'_, M>,
+            Option<&RuntimeTurn>,
+        ) -> Result<T, DistributedRuntimeError>,
+    ) -> Result<T, DistributedRuntimeError> {
+        match finish(self, turn) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if turn.is_some()
+                    && let Err(rollback) = self.machine.rollback_prepared_turn()
+                {
+                    return Err(runtime_error(format!(
+                        "distributed Server {operation} preparation failed: {error}; rollback failed: {rollback}"
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn fail_prepared_commit<T>(
+        &mut self,
+        transaction_id: u64,
+        error: DistributedRuntimeError,
+    ) -> Result<T, DistributedRuntimeError> {
+        self.runtime.clear_transaction(transaction_id)?;
+        self.restore_effect_scope();
+        Err(error)
+    }
+
     pub fn commit_prepared_transaction(
         &mut self,
         mut prepared: PreparedDistributedServerTransaction<M::EvaluationMachine>,
     ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
+        self.runtime.require_transaction(prepared.transaction_id)?;
         match prepared.machine_turn.take() {
             Some((turn, index)) => {
-                prepared.update.turns[index] = self
+                match self
                     .machine
-                    .commit_prepared_evaluation(turn, prepared.evaluation_machine)?;
-            }
-            None => match prepared.protocol_checkpoint_turn.take() {
-                Some(turn) => {
-                    self.machine
-                        .commit_prepared_evaluation(turn, prepared.evaluation_machine)?;
+                    .commit_prepared_evaluation(turn, prepared.evaluation_machine)
+                {
+                    Ok(turn) => prepared.update.turns[index] = turn,
+                    Err(error) => {
+                        return self.fail_prepared_commit(prepared.transaction_id, error);
+                    }
                 }
-                None => {
-                    self.machine
-                        .install_evaluation(prepared.evaluation_machine)?;
+            }
+            None => {
+                if let Err(error) = self.machine.install_evaluation(prepared.evaluation_machine) {
+                    let rollback = match prepared.rollback_machine {
+                        Some(rollback_machine) => self.machine.install_evaluation(rollback_machine),
+                        None => Ok(()),
+                    };
+                    self.runtime.clear_transaction(prepared.transaction_id)?;
+                    self.restore_effect_scope();
+                    return match rollback {
+                        Ok(()) => Err(error),
+                        Err(rollback) => Err(runtime_error(format!(
+                            "distributed Server transaction commit failed: {error}; rollback failed: {rollback}"
+                        ))),
+                    };
                 }
-            },
-        }
-        *self.runtime = prepared.candidate_runtime;
-        self.restore_effect_scope();
-        Ok(prepared.update)
-    }
-
-    pub fn commit_prepared_transaction_with_protocol_state(
-        &mut self,
-        mut prepared: PreparedDistributedServerTransaction<M::EvaluationMachine>,
-        changes: impl FnOnce(
-            u64,
-        ) -> Result<
-            Vec<boon_persistence::DurableProtocolStateChange>,
-            DistributedRuntimeError,
-        >,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let (turn, update_index) = match prepared.machine_turn.take() {
-            Some((turn, index)) => (turn, Some(index)),
-            None => (
-                prepared.protocol_checkpoint_turn.take().ok_or_else(|| {
-                    runtime_error(
-                        "protocol-state transaction was not prepared against a protocol checkpoint",
-                    )
-                })?,
-                None,
-            ),
-        };
-        let protocol_state_changes = match changes(turn.sequence) {
-            Ok(changes) => changes,
-            Err(error) => {
-                let _ = self.machine.rollback_prepared_turn();
-                self.restore_effect_scope();
-                return Err(error);
             }
-        };
-        let turn = match self.machine.commit_prepared_evaluation_with_protocol_state(
-            turn,
-            prepared.evaluation_machine,
-            protocol_state_changes,
-        ) {
-            Ok(turn) => turn,
-            Err(error) => {
-                let _ = self.machine.rollback_prepared_turn();
-                self.restore_effect_scope();
-                return Err(error);
-            }
-        };
-        if let Some(index) = update_index {
-            prepared.update.turns[index] = turn;
         }
         *self.runtime = prepared.candidate_runtime;
         self.restore_effect_scope();
@@ -1153,9 +1128,13 @@ where
         &mut self,
         prepared: PreparedDistributedServerTransaction<M::EvaluationMachine>,
     ) -> Result<(), DistributedRuntimeError> {
-        if prepared.machine_turn.is_some() || prepared.protocol_checkpoint_turn.is_some() {
+        self.runtime.require_transaction(prepared.transaction_id)?;
+        if prepared.machine_turn.is_some() {
             self.machine.rollback_prepared_turn()?;
+        } else if let Some(rollback_machine) = prepared.rollback_machine {
+            self.machine.install_evaluation(rollback_machine)?;
         }
+        self.runtime.clear_transaction(prepared.transaction_id)?;
         self.restore_effect_scope();
         Ok(())
     }
@@ -1167,121 +1146,8 @@ where
         source_path: &str,
         payload: SourcePayload,
     ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let mut update = DistributedServerUpdate::default();
-        self.enter_global(&mut update)?;
-        let event = self.machine.event_for_path(source_path, payload)?;
-        self.reject_imported_event_source(event.source)?;
-        let prepared_turn = self.machine.prepare_dispatch(event)?;
-        let turn = match self.machine.commit_prepared_turn(prepared_turn) {
-            Ok(turn) => turn,
-            Err(error) => {
-                let _ = self.machine.rollback_prepared_turn();
-                return Err(error);
-            }
-        };
-        self.record_transient_effects(EffectOwner::Global, std::slice::from_ref(&turn))?;
-        update.turns.push(turn);
-        self.collect_after_global_turn(&mut update)?;
-        Ok(update)
-    }
-
-    /// Installs the complete Global context and validates that a host source is
-    /// not owned by a Session transport edge. The caller may then execute the
-    /// source through its normal ephemeral or persistent admission policy.
-    pub fn prepare_global_source(
-        &mut self,
-        source_path: &str,
-        payload: &SourcePayload,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let mut update = DistributedServerUpdate::default();
-        self.enter_global(&mut update)?;
-        let event = self.machine.event_for_path(source_path, payload.clone())?;
-        self.reject_imported_event_source(event.source)?;
-        Ok(update)
-    }
-
-    pub fn prepare_global_read(
-        &mut self,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let mut update = DistributedServerUpdate::default();
-        self.enter_global(&mut update)?;
-        Ok(update)
-    }
-
-    /// Publishes a Global source turn that was already admitted by the owning
-    /// Server machine. This keeps host-specific durability outside routing
-    /// while retaining one authority and one distributed publication stream.
-    pub fn publish_global_turn(
-        &mut self,
-        turn: &RuntimeTurn,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        if self.state.machine_context != ServerContextKey::Global {
-            return Err(runtime_error(
-                "global Server turn was published outside the Global context",
-            ));
-        }
-        let mut update = DistributedServerUpdate::default();
-        self.record_transient_effects(EffectOwner::Global, std::slice::from_ref(turn))?;
-        update.turns.push(turn.clone());
-        self.collect_after_global_turn(&mut update)?;
-        Ok(update)
-    }
-
-    pub fn prepare_transient_effect(
-        &mut self,
-        call_id: TransientEffectCallId,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let owner = self
-            .state
-            .effect_owners
-            .get(&call_id)
-            .copied()
-            .ok_or(DistributedRuntimeError::InvalidLease)?;
-        let mut update = DistributedServerUpdate::default();
-        self.enter_effect_owner(owner, &mut update)?;
-        Ok(update)
-    }
-
-    pub fn publish_transient_effect_turn(
-        &mut self,
-        call_id: TransientEffectCallId,
-        turn: &RuntimeTurn,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let owner = self
-            .state
-            .effect_owners
-            .get(&call_id)
-            .copied()
-            .ok_or(DistributedRuntimeError::InvalidLease)?;
-        self.record_transient_effects(owner, std::slice::from_ref(turn))?;
-        let mut update = DistributedServerUpdate::default();
-        update.turns.push(turn.clone());
-        self.finish_effect_owner(owner, &mut update)?;
-        if !self.machine.has_pending_transient_effect(call_id) {
-            self.state.effect_owners.remove(&call_id);
-        }
-        Ok(update)
-    }
-
-    pub fn publish_transient_effect_cancellation(
-        &mut self,
-        call_id: TransientEffectCallId,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let owner = self
-            .state
-            .effect_owners
-            .get(&call_id)
-            .copied()
-            .ok_or(DistributedRuntimeError::InvalidLease)?;
-        if self.machine.has_pending_transient_effect(call_id) {
-            return Err(runtime_error(
-                "transient effect cancellation was published while the call remained active",
-            ));
-        }
-        self.state.effect_owners.remove(&call_id);
-        let mut update = DistributedServerUpdate::default();
-        self.finish_effect_owner(owner, &mut update)?;
-        Ok(update)
+        let prepared = self.prepare_global_source_transaction(source_path, payload, false)?;
+        self.commit_prepared_transaction(prepared)
     }
 
     pub fn root_value_current(
@@ -1308,31 +1174,9 @@ where
         call_id: TransientEffectCallId,
         outcome: Value,
     ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let owner = self
-            .state
-            .effect_owners
-            .get(&call_id)
-            .copied()
-            .ok_or(DistributedRuntimeError::InvalidLease)?;
-        let mut update = DistributedServerUpdate::default();
-        self.enter_effect_owner(owner, &mut update)?;
-        let prepared_turn = self
-            .machine
-            .prepare_transient_effect_completion(call_id, outcome)?;
-        let turn = match self.machine.commit_prepared_turn(prepared_turn) {
-            Ok(turn) => turn,
-            Err(error) => {
-                let _ = self.machine.rollback_prepared_turn();
-                return Err(error);
-            }
-        };
-        self.record_transient_effects(owner, std::slice::from_ref(&turn))?;
-        update.turns.push(turn);
-        self.finish_effect_owner(owner, &mut update)?;
-        if !self.machine.has_pending_transient_effect(call_id) {
-            self.state.effect_owners.remove(&call_id);
-        }
-        Ok(update)
+        let prepared =
+            self.prepare_transient_effect_completion_transaction(call_id, outcome, false)?;
+        self.commit_prepared_transaction(prepared)
     }
 
     pub fn deliver_transient_effect_result(
@@ -1341,31 +1185,13 @@ where
         result_sequence: u64,
         outcome: Value,
     ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
-        let owner = self
-            .state
-            .effect_owners
-            .get(&call_id)
-            .copied()
-            .ok_or(DistributedRuntimeError::InvalidLease)?;
-        let mut update = DistributedServerUpdate::default();
-        self.enter_effect_owner(owner, &mut update)?;
-        let prepared_turn =
-            self.machine
-                .prepare_transient_effect_result(call_id, result_sequence, outcome)?;
-        let turn = match self.machine.commit_prepared_turn(prepared_turn) {
-            Ok(turn) => turn,
-            Err(error) => {
-                let _ = self.machine.rollback_prepared_turn();
-                return Err(error);
-            }
-        };
-        self.record_transient_effects(owner, std::slice::from_ref(&turn))?;
-        update.turns.push(turn);
-        self.finish_effect_owner(owner, &mut update)?;
-        if !self.machine.has_pending_transient_effect(call_id) {
-            self.state.effect_owners.remove(&call_id);
-        }
-        Ok(update)
+        let prepared = self.prepare_transient_effect_result_transaction(
+            call_id,
+            result_sequence,
+            outcome,
+            false,
+        )?;
+        self.commit_prepared_transaction(prepared)
     }
 
     pub fn cancel_origin_transient_effects(
@@ -1405,38 +1231,8 @@ where
         if call_ids.is_empty() {
             return Ok(DistributedServerUpdate::default());
         }
-        let mut update = DistributedServerUpdate::default();
-        self.enter_origin(origin, &mut update)?;
-        if let Some(prepared_turn) = self
-            .machine
-            .prepare_transient_effect_cancellation(&call_ids)?
-        {
-            let turn = match self.machine.commit_prepared_turn(prepared_turn) {
-                Ok(turn) => turn,
-                Err(error) => {
-                    let _ = self.machine.rollback_prepared_turn();
-                    return Err(error);
-                }
-            };
-            self.record_transient_effects(
-                EffectOwner::Origin(origin),
-                std::slice::from_ref(&turn),
-            )?;
-            update.turns.push(turn);
-            if self.origin_inputs_are_current(origin) {
-                update
-                    .deliveries
-                    .extend(self.collect_origin_outputs(origin)?);
-            }
-        }
-        for call_id in call_ids {
-            self.state.effect_owners.remove(&call_id);
-        }
-        self.enter_global(&mut update)?;
-        update
-            .deliveries
-            .extend(self.collect_shared_outputs(Some(origin))?);
-        Ok(update)
+        let prepared = self.prepare_transient_effect_cancellations_transaction(&call_ids, false)?;
+        self.commit_prepared_transaction(prepared)
     }
 
     pub fn pending_transient_effect_count(&self, origin: SessionOrigin) -> usize {
@@ -1501,7 +1297,7 @@ where
         export_id: ExportId,
         sequence: u64,
         value: DataValue,
-    ) -> Result<(DistributedServerUpdate, Option<RuntimeTurn>), DistributedRuntimeError> {
+    ) -> Result<PreparedSessionMessage, DistributedRuntimeError> {
         let import = self
             .contract
             .event_imports
@@ -1534,48 +1330,28 @@ where
             .machine
             .event_for_source(import.local_source_id, payload)?;
         let turn = self.machine.prepare_dispatch(event)?;
-        let result = (|| {
-            self.record_transient_effects(
-                EffectOwner::Origin(origin),
-                std::slice::from_ref(&turn),
-            )?;
-            self.state
-                .origins
-                .get_mut(&origin)
-                .expect("validated origin")
-                .accepted_events
-                .insert(export_id, sequence);
-            if self.origin_inputs_are_current(origin) {
-                update
-                    .deliveries
-                    .extend(self.collect_origin_outputs(origin)?);
-            }
-            update
-                .deliveries
-                .extend(self.collect_shared_outputs(Some(origin))?);
-            Ok::<(), DistributedRuntimeError>(())
-        })();
-        match result {
-            Ok(()) => Ok((update, Some(turn))),
-            Err(error) => {
-                if let Err(rollback) = self.machine.rollback_prepared_turn() {
-                    return Err(runtime_error(format!(
-                        "distributed Server event preparation failed: {error}; rollback failed: {rollback}"
-                    )));
-                }
-                Err(error)
-            }
-        }
+        self.state
+            .origins
+            .get_mut(&origin)
+            .expect("validated origin")
+            .accepted_events
+            .insert(export_id, sequence);
+        Ok(PreparedSessionMessage::finish_origin(
+            origin,
+            update,
+            Some(turn),
+        ))
     }
 
     fn accept_call_request(
         &mut self,
         origin: SessionOrigin,
         call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
         function_export_id: ExportId,
-        revision: u64,
+        demand_revision: u64,
         arguments: BTreeMap<DistributedArgumentId, DataValue>,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
+    ) -> Result<PreparedSessionMessage, DistributedRuntimeError> {
         let edge = self
             .wire_schema
             .call_edges
@@ -1585,89 +1361,450 @@ where
                     && edge.caller_role == ProgramRole::Session
                     && edge.callee_role == ProgramRole::Server
                     && edge.function_export_id == function_export_id
+                    && edge.mode == DistributedCallMode::Current
             })
             .cloned()
             .ok_or(DistributedRuntimeError::UnknownTransportEdge)?;
-        let accepted = &self
+        let key = (call_site_id, call_instance_id);
+        let state = self.state.origins.get(&origin).expect("validated origin");
+        accept_greater(
+            state
+                .accepted_current_call_revisions
+                .get(&call_site_id)
+                .copied(),
+            demand_revision,
+        )?;
+        if !state.accepted_current_calls.contains_key(&key)
+            && state.accepted_current_calls.len() >= MAX_CURRENT_CALL_INSTANCES_PER_ORIGIN
+        {
+            return Err(runtime_error(
+                "distributed Server active current-call instance limit was exceeded",
+            ));
+        }
+        let mut update = DistributedServerUpdate::default();
+        self.enter_origin(origin, &mut update)?;
+        let (value, turn) = self.machine.evaluate_function_instance(
+            call_site_id,
+            call_instance_id,
+            edge.function_export_id,
+            demand_revision,
+            import_data_arguments(arguments),
+        )?;
+        let update =
+            self.guard_function_evaluation("Current call", turn.as_ref(), move |authority, _| {
+                let value = export_runtime_value(value)?;
+                let result_revision = 1;
+                let state = authority
+                    .state
+                    .origins
+                    .get_mut(&origin)
+                    .expect("validated origin");
+                state
+                    .accepted_current_call_revisions
+                    .insert(call_site_id, demand_revision);
+                state.accepted_current_calls.insert(
+                    key,
+                    AcceptedCurrentCall {
+                        demand_revision,
+                        result_revision,
+                        value: value.clone(),
+                    },
+                );
+                state.accepted_current_call_tombstones.remove(&key);
+                prune_current_call_tombstones(
+                    &mut state.accepted_current_call_tombstones,
+                    call_site_id,
+                    demand_revision,
+                );
+                update.deliveries.push(ServerDelivery {
+                    target: ServerDeliveryTarget::Origin(origin),
+                    message: DistributedMessage {
+                        producer: ProgramRole::Server,
+                        consumer: ProgramRole::Session,
+                        payload: DistributedMessagePayload::CurrentCallResult {
+                            call_site_id,
+                            call_instance_id,
+                            demand_revision,
+                            result_revision,
+                            value,
+                        },
+                    },
+                });
+                Ok(update)
+            })?;
+        Ok(PreparedSessionMessage::finish_origin(origin, update, turn))
+    }
+
+    fn accept_call_detach(
+        &mut self,
+        origin: SessionOrigin,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        demand_revision: u64,
+    ) -> Result<PreparedSessionMessage, DistributedRuntimeError> {
+        self.wire_schema
+            .call_edges
+            .iter()
+            .find(|edge| {
+                edge.call_site_id == call_site_id
+                    && edge.caller_role == ProgramRole::Session
+                    && edge.callee_role == ProgramRole::Server
+                    && edge.mode == DistributedCallMode::Current
+            })
+            .ok_or(DistributedRuntimeError::UnknownTransportEdge)?;
+        let key = (call_site_id, call_instance_id);
+        let state = self.state.origins.get(&origin).expect("validated origin");
+        accept_greater(
+            state
+                .accepted_current_call_revisions
+                .get(&call_site_id)
+                .copied(),
+            demand_revision,
+        )?;
+        if !state.accepted_current_calls.contains_key(&key) {
+            return Err(DistributedRuntimeError::InvalidLease);
+        }
+
+        let mut update = DistributedServerUpdate::default();
+        self.enter_origin(origin, &mut update)?;
+        let turn = self
+            .machine
+            .drop_producer_call_instance(call_site_id, call_instance_id)?;
+        let update = self.guard_function_evaluation(
+            "Current call detach",
+            turn.as_ref(),
+            move |authority, _| {
+                let state = authority
+                    .state
+                    .origins
+                    .get_mut(&origin)
+                    .expect("validated origin");
+                state
+                    .accepted_current_call_revisions
+                    .insert(call_site_id, demand_revision);
+                state.accepted_current_calls.remove(&key);
+                state
+                    .accepted_current_call_tombstones
+                    .insert(key, demand_revision);
+                prune_current_call_tombstones(
+                    &mut state.accepted_current_call_tombstones,
+                    call_site_id,
+                    demand_revision,
+                );
+                Ok(update)
+            },
+        )?;
+        Ok(PreparedSessionMessage::finish_origin(origin, update, turn))
+    }
+
+    fn accept_invocation_request(
+        &mut self,
+        origin: SessionOrigin,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        function_export_id: ExportId,
+        sequence: u64,
+        arguments: BTreeMap<DistributedArgumentId, DataValue>,
+    ) -> Result<PreparedSessionMessage, DistributedRuntimeError> {
+        let edge = self
+            .wire_schema
+            .call_edges
+            .iter()
+            .find(|edge| {
+                edge.call_site_id == call_site_id
+                    && edge.caller_role == ProgramRole::Session
+                    && edge.callee_role == ProgramRole::Server
+                    && edge.function_export_id == function_export_id
+                    && edge.mode == DistributedCallMode::Invocation
+            })
+            .cloned()
+            .ok_or(DistributedRuntimeError::UnknownTransportEdge)?;
+        let key = (call_site_id, call_instance_id);
+        let origin_state = self.state.origins.get(&origin).expect("validated origin");
+        if !origin_state.accepted_invocation_requests.contains_key(&key)
+            && origin_state.accepted_invocation_requests.len()
+                >= MAX_INVOCATION_INSTANCES_PER_ORIGIN
+        {
+            return Err(runtime_error(
+                "distributed Server invocation instance limit was exceeded",
+            ));
+        }
+        let accepted = self
             .state
             .origins
             .get(&origin)
             .expect("validated origin")
-            .accepted_calls;
-        accept_greater(accepted.get(&call_site_id).copied(), revision)?;
+            .accepted_invocation_requests
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if sequence <= accepted {
+            let replay = self
+                .state
+                .origins
+                .get(&origin)
+                .and_then(|state| {
+                    state.invocation_request_replays.get(&(
+                        call_site_id,
+                        call_instance_id,
+                        sequence,
+                    ))
+                })
+                .ok_or(DistributedRuntimeError::TransportSequenceMismatch)?;
+            if replay.function_export_id != function_export_id || replay.arguments != arguments {
+                return Err(DistributedRuntimeError::InvalidTransportFrame);
+            }
+            return Ok(PreparedSessionMessage::complete(DistributedServerUpdate {
+                turns: Vec::new(),
+                deliveries: vec![ServerDelivery {
+                    target: ServerDeliveryTarget::Origin(origin),
+                    message: DistributedMessage {
+                        producer: ProgramRole::Server,
+                        consumer: ProgramRole::Session,
+                        payload: DistributedMessagePayload::InvocationResult {
+                            call_site_id,
+                            call_instance_id,
+                            sequence,
+                            value: replay.result.clone(),
+                        },
+                    },
+                }],
+            }));
+        }
+        expect_next(
+            &self
+                .state
+                .origins
+                .get(&origin)
+                .expect("validated origin")
+                .accepted_invocation_requests,
+            key,
+            sequence,
+        )?;
         let mut update = DistributedServerUpdate::default();
         self.enter_origin(origin, &mut update)?;
-        let value = self
-            .machine
-            .evaluate_function(edge.function_export_id, import_data_arguments(arguments))?;
-        let value = export_runtime_value(value)?;
-        self.state
-            .origins
-            .get_mut(&origin)
-            .expect("validated origin")
-            .accepted_calls
-            .insert(call_site_id, revision);
-        update.deliveries.push(ServerDelivery {
-            target: ServerDeliveryTarget::Origin(origin),
-            message: DistributedMessage {
-                producer: ProgramRole::Server,
-                consumer: ProgramRole::Session,
-                payload: DistributedMessagePayload::CallResult {
-                    call_site_id,
-                    revision,
-                    value,
-                },
-            },
-        });
-        self.enter_global(&mut update)?;
-        Ok(update)
+        let (value, turn) = self.machine.evaluate_function_instance(
+            call_site_id,
+            call_instance_id,
+            edge.function_export_id,
+            sequence,
+            import_data_arguments(arguments.clone()),
+        )?;
+        let update =
+            self.guard_function_evaluation("invocation", turn.as_ref(), move |authority, _| {
+                let value = export_runtime_value(value)?;
+                let state = authority
+                    .state
+                    .origins
+                    .get_mut(&origin)
+                    .expect("validated origin");
+                state.accepted_invocation_requests.insert(key, sequence);
+                state.invocation_request_replays.insert(
+                    (call_site_id, call_instance_id, sequence),
+                    InvocationRequestReplay {
+                        function_export_id,
+                        arguments,
+                        result: value.clone(),
+                    },
+                );
+                prune_invocation_replays(&mut state.invocation_request_replays, key, sequence);
+                update.deliveries.push(ServerDelivery {
+                    target: ServerDeliveryTarget::Origin(origin),
+                    message: DistributedMessage {
+                        producer: ProgramRole::Server,
+                        consumer: ProgramRole::Session,
+                        payload: DistributedMessagePayload::InvocationResult {
+                            call_site_id,
+                            call_instance_id,
+                            sequence,
+                            value,
+                        },
+                    },
+                });
+                Ok(update)
+            })?;
+        Ok(PreparedSessionMessage::finish_origin(origin, update, turn))
     }
 
     fn accept_call_result(
         &mut self,
         origin: SessionOrigin,
         call_site_id: RemoteCallSiteId,
-        revision: u64,
+        call_instance_id: DistributedCallInstanceId,
+        demand_revision: u64,
+        result_revision: u64,
         value: DataValue,
-    ) -> Result<DistributedServerUpdate, DistributedRuntimeError> {
+    ) -> Result<PreparedSessionMessage, DistributedRuntimeError> {
+        self.contract
+            .remote_call_sites
+            .iter()
+            .any(|call| {
+                call.call_site_id == call_site_id
+                    && call.caller_role == ProgramRole::Server
+                    && call.callee_role == ProgramRole::Session
+                    && call.mode == DistributedCallMode::Current
+            })
+            .then_some(())
+            .ok_or(DistributedRuntimeError::UnknownTransportEdge)?;
+        if result_revision == 0 {
+            return Err(DistributedRuntimeError::TransportSequenceMismatch);
+        }
+        let key = (call_site_id, call_instance_id);
+        let state = self.state.origins.get(&origin).expect("validated origin");
+        let Some(sent) = state.sent_current_calls.get(&key) else {
+            return match state.sent_current_call_tombstones.get(&key).copied() {
+                Some(detach_revision) if demand_revision <= detach_revision => Ok(
+                    PreparedSessionMessage::complete(DistributedServerUpdate::default()),
+                ),
+                _ => Err(DistributedRuntimeError::InvalidLease),
+            };
+        };
+        if demand_revision < sent.demand_revision {
+            return Ok(PreparedSessionMessage::complete(
+                DistributedServerUpdate::default(),
+            ));
+        }
+        if demand_revision > sent.demand_revision {
+            return Err(DistributedRuntimeError::TransportSequenceMismatch);
+        }
+        if result_revision < sent.accepted_result_revision {
+            return Ok(PreparedSessionMessage::complete(
+                DistributedServerUpdate::default(),
+            ));
+        }
+        if result_revision == sent.accepted_result_revision {
+            return if sent.accepted_result.as_ref() == Some(&value) {
+                Ok(PreparedSessionMessage::complete(
+                    DistributedServerUpdate::default(),
+                ))
+            } else {
+                Err(DistributedRuntimeError::InvalidTransportFrame)
+            };
+        }
+        let content_revision = next_revision(
+            state
+                .accepted_result_content_revisions
+                .get(&call_site_id)
+                .copied(),
+        )?;
+
+        let mut update = DistributedServerUpdate::default();
+        self.enter_origin(origin, &mut update)?;
+        let turn = self.machine.update_current_call_result_instance(
+            call_site_id,
+            call_instance_id,
+            content_revision,
+            Value::from_data(&value),
+        )?;
+        let update = self.guard_function_evaluation(
+            "Current call result",
+            turn.as_ref(),
+            move |authority, _| {
+                let state = authority
+                    .state
+                    .origins
+                    .get_mut(&origin)
+                    .expect("validated origin");
+                state
+                    .accepted_result_content_revisions
+                    .insert(call_site_id, content_revision);
+                let sent = state
+                    .sent_current_calls
+                    .get_mut(&key)
+                    .expect("active call was validated");
+                sent.accepted_result_revision = result_revision;
+                sent.accepted_result = Some(value);
+                Ok(update)
+            },
+        )?;
+        Ok(PreparedSessionMessage::finish_origin(origin, update, turn))
+    }
+
+    fn accept_invocation_result(
+        &mut self,
+        origin: SessionOrigin,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        sequence: u64,
+        value: DataValue,
+    ) -> Result<PreparedSessionMessage, DistributedRuntimeError> {
         let call = self
             .contract
             .remote_call_sites
             .iter()
             .find(|call| {
-                call.call_site_id == call_site_id && call.callee_role == ProgramRole::Session
+                call.call_site_id == call_site_id
+                    && call.caller_role == ProgramRole::Server
+                    && call.callee_role == ProgramRole::Session
+                    && call.mode == DistributedCallMode::Invocation
             })
             .cloned()
             .ok_or(DistributedRuntimeError::UnknownTransportEdge)?;
-        let latest = self
-            .state
-            .origins
-            .get(&origin)
-            .and_then(|state| state.sent_calls.get(&call_site_id))
-            .map(|entry| entry.0)
+        let key = (call_site_id, call_instance_id);
+        let invocation_key = (call_site_id, call_instance_id, sequence);
+        let state = self.state.origins.get(&origin).expect("validated origin");
+        let latest = state
+            .sent_invocation_sequences
+            .get(&key)
+            .copied()
             .ok_or(DistributedRuntimeError::TransportSequenceMismatch)?;
-        if revision < latest {
-            return Ok(DistributedServerUpdate::default());
-        }
-        if revision > latest {
+        if sequence > latest {
             return Err(DistributedRuntimeError::TransportSequenceMismatch);
         }
+        let accepted = state
+            .accepted_invocation_results
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if sequence <= accepted {
+            let replay = state
+                .invocation_result_replays
+                .get(&invocation_key)
+                .ok_or(DistributedRuntimeError::TransportSequenceMismatch)?;
+            if replay != &value {
+                return Err(DistributedRuntimeError::InvalidTransportFrame);
+            }
+            return Ok(PreparedSessionMessage::complete(
+                DistributedServerUpdate::default(),
+            ));
+        }
+        expect_next(&state.accepted_invocation_results, key, sequence)?;
+        let result_route = state
+            .pending_invocation_results
+            .get(&invocation_key)
+            .cloned()
+            .ok_or(DistributedRuntimeError::TransportSequenceMismatch)?;
+        let (result_source, result_field) = call
+            .result
+            .invocation_source()
+            .map(|(source, field)| (source, field.clone()))
+            .ok_or_else(|| runtime_error("distributed invocation has no private result source"))?;
+        if result_route.source != result_source {
+            return Err(DistributedRuntimeError::InvalidTransportFrame);
+        }
+
+        let mut update = DistributedServerUpdate::default();
+        self.enter_origin(origin, &mut update)?;
+        let mut payload = SourcePayload::default();
+        set_source_payload_value(&mut payload, &result_field, Value::from_data(&value))?;
+        let event = self.machine.event_for_route(result_route, payload)?;
+        let turn = self.machine.prepare_dispatch(event)?;
         let state = self
             .state
             .origins
             .get_mut(&origin)
             .expect("validated origin");
-        accept_greater(
-            state
-                .imports
-                .get(&call.result_import_id)
-                .map(|entry| entry.0),
-            revision,
-        )?;
+        state.accepted_invocation_results.insert(key, sequence);
+        state.pending_invocation_results.remove(&invocation_key);
         state
-            .imports
-            .insert(call.result_import_id, (revision, value));
-        self.settle_origin(origin)
+            .invocation_result_replays
+            .insert(invocation_key, value);
+        prune_invocation_replays(&mut state.invocation_result_replays, key, sequence);
+        Ok(PreparedSessionMessage::finish_origin(
+            origin,
+            update,
+            Some(turn),
+        ))
     }
 
     fn enter_effect_owner(
@@ -1681,11 +1818,25 @@ where
         }
     }
 
-    fn finish_effect_owner(
+    fn finish_turn(
         &mut self,
         owner: EffectOwner,
+        turn: Option<&RuntimeTurn>,
         update: &mut DistributedServerUpdate,
     ) -> Result<(), DistributedRuntimeError> {
+        if let Some(turn) = turn {
+            if owner == EffectOwner::Global && !turn.distributed_invocations.is_empty() {
+                return Err(runtime_error(
+                    "Global-owned Server turn emitted an origin-scoped distributed invocation",
+                ));
+            }
+            self.record_transient_effects(owner, std::slice::from_ref(turn))?;
+            if let EffectOwner::Origin(origin) = owner {
+                update
+                    .deliveries
+                    .extend(self.collect_turn_invocation_deliveries(origin, turn)?);
+            }
+        }
         match owner {
             EffectOwner::Global => self.collect_after_global_turn(update),
             EffectOwner::Origin(origin) => self.finish_origin_turn(origin, update),
@@ -1697,6 +1848,7 @@ where
         origin: SessionOrigin,
         update: &mut DistributedServerUpdate,
     ) -> Result<(), DistributedRuntimeError> {
+        self.ensure_no_open_transaction()?;
         let state = self
             .state
             .origins
@@ -1714,14 +1866,27 @@ where
             })
             .collect();
         let scope = state.execution_scope;
+        let previous_context = self.state.machine_context;
+        self.machine.set_machine_origin(origin)?;
         self.machine.set_transient_effect_scope(scope);
-        match self.machine.replace_distributed_context(context, imports) {
-            Ok(Some(turn)) => Self::record_context_turn(update, turn)?,
-            Ok(None) => {}
-            Err(error) => {
+        let replaced = self
+            .machine
+            .replace_distributed_context(context, imports)
+            .and_then(|turn| {
+                if let Some(turn) = turn {
+                    Self::record_context_turn(update, turn)?;
+                }
+                Ok(())
+            });
+        if let Err(error) = replaced {
+            if let Err(restore) = self.restore_machine_origin(previous_context) {
                 self.restore_effect_scope();
-                return Err(error);
+                return Err(runtime_error(format!(
+                    "distributed Server failed to enter Session origin: {error}; origin restore failed: {restore}"
+                )));
             }
+            self.restore_effect_scope();
+            return Err(error);
         }
         self.state.machine_context = ServerContextKey::Origin(origin);
         Ok(())
@@ -1731,17 +1896,28 @@ where
         &mut self,
         update: &mut DistributedServerUpdate,
     ) -> Result<(), DistributedRuntimeError> {
+        self.ensure_no_open_transaction()?;
+        let previous_context = self.state.machine_context;
+        self.machine.reset_machine_origin()?;
         self.machine.set_transient_effect_scope(GLOBAL_EFFECT_SCOPE);
-        match self
+        let replaced = self
             .machine
             .replace_distributed_context(SessionContext::Unavailable, Vec::new())
-        {
-            Ok(Some(turn)) => Self::record_context_turn(update, turn)?,
-            Ok(None) => {}
-            Err(error) => {
+            .and_then(|turn| {
+                if let Some(turn) = turn {
+                    Self::record_context_turn(update, turn)?;
+                }
+                Ok(())
+            });
+        if let Err(error) = replaced {
+            if let Err(restore) = self.restore_machine_origin(previous_context) {
                 self.restore_effect_scope();
-                return Err(error);
+                return Err(runtime_error(format!(
+                    "distributed Server failed to enter Global context: {error}; origin restore failed: {restore}"
+                )));
             }
+            self.restore_effect_scope();
+            return Err(error);
         }
         self.state.machine_context = ServerContextKey::Global;
         Ok(())
@@ -1758,6 +1934,7 @@ where
             || !turn.transient_effects.is_empty()
             || !turn.cancelled_transient_effects.is_empty()
             || !turn.transient_effect_credit_grants.is_empty()
+            || !turn.distributed_invocations.is_empty()
             || !turn.document_patches.is_empty()
         {
             return Err(runtime_error(
@@ -1766,6 +1943,16 @@ where
         }
         update.turns.push(turn);
         Ok(())
+    }
+
+    fn restore_machine_origin(
+        &mut self,
+        context: ServerContextKey,
+    ) -> Result<(), DistributedRuntimeError> {
+        match context {
+            ServerContextKey::Global => self.machine.reset_machine_origin(),
+            ServerContextKey::Origin(origin) => self.machine.set_machine_origin(origin),
+        }
     }
 
     fn restore_effect_scope(&mut self) {
@@ -1787,6 +1974,9 @@ where
         update: &mut DistributedServerUpdate,
     ) -> Result<(), DistributedRuntimeError> {
         if self.origin_inputs_are_current(origin) {
+            update
+                .deliveries
+                .extend(self.collect_producer_call_results(origin)?);
             update
                 .deliveries
                 .extend(self.collect_origin_outputs(origin)?);
@@ -1811,6 +2001,9 @@ where
             self.enter_origin(origin, update)?;
             update
                 .deliveries
+                .extend(self.collect_producer_call_results(origin)?);
+            update
+                .deliveries
                 .extend(self.collect_origin_outputs(origin)?);
         }
         self.enter_global(update)
@@ -1825,6 +2018,63 @@ where
             .iter()
             .filter(|import| import.scope == DistributedRouteScopePlan::OriginScoped)
             .all(|import| state.imports.contains_key(&import.import_id))
+    }
+
+    fn collect_producer_call_results(
+        &mut self,
+        origin: SessionOrigin,
+    ) -> Result<Vec<ServerDelivery>, DistributedRuntimeError> {
+        let active = self
+            .state
+            .origins
+            .get(&origin)
+            .ok_or(DistributedRuntimeError::InvalidLease)?
+            .accepted_current_calls
+            .iter()
+            .map(|(key, call)| (*key, call.clone()))
+            .collect::<Vec<_>>();
+        let mut deliveries = Vec::new();
+        for ((call_site_id, call_instance_id), current) in active {
+            let value = export_runtime_value(
+                self.machine
+                    .producer_call_result_current(call_site_id, call_instance_id)?,
+            )?;
+            if value == current.value {
+                continue;
+            }
+            let result_revision = next_revision(Some(current.result_revision))?;
+            let state = self.state.origins.get_mut(&origin).expect("active origin");
+            let Some(call) = state
+                .accepted_current_calls
+                .get_mut(&(call_site_id, call_instance_id))
+            else {
+                return Err(DistributedRuntimeError::InvalidLease);
+            };
+            if call.demand_revision != current.demand_revision
+                || call.result_revision != current.result_revision
+            {
+                return Err(runtime_error(
+                    "distributed Server producer call changed during result collection",
+                ));
+            }
+            call.result_revision = result_revision;
+            call.value = value.clone();
+            deliveries.push(ServerDelivery {
+                target: ServerDeliveryTarget::Origin(origin),
+                message: DistributedMessage {
+                    producer: ProgramRole::Server,
+                    consumer: ProgramRole::Session,
+                    payload: DistributedMessagePayload::CurrentCallResult {
+                        call_site_id,
+                        call_instance_id,
+                        demand_revision: call.demand_revision,
+                        result_revision,
+                        value,
+                    },
+                },
+            });
+        }
+        Ok(deliveries)
     }
 
     fn collect_origin_outputs(
@@ -1873,37 +2123,185 @@ where
 
         let calls = self.contract.remote_call_sites.clone();
         for call in calls {
-            if call.callee_role != ProgramRole::Session {
+            if call.caller_role != ProgramRole::Server || call.callee_role != ProgramRole::Session {
                 return Err(DistributedRuntimeError::UnknownTransportEdge);
             }
-            let arguments = export_runtime_arguments(self.machine.call_arguments(&call)?)?;
-            let state = self.state.origins.get_mut(&origin).expect("active origin");
-            if state
-                .sent_calls
-                .get(&call.call_site_id)
-                .is_some_and(|(_, current)| current == &arguments)
-            {
+            if call.mode != DistributedCallMode::Current {
                 continue;
             }
-            let revision = next_revision(
+            let mut demanded = BTreeMap::new();
+            for instance in self.machine.current_call_instances(call.call_site_id)? {
+                let arguments = export_runtime_arguments(instance.arguments)?;
+                if demanded
+                    .insert(instance.call_instance_id, arguments)
+                    .is_some()
+                {
+                    return Err(runtime_error(
+                        "distributed Server machine returned a duplicate current-call instance",
+                    ));
+                }
+            }
+            let state = self.state.origins.get_mut(&origin).expect("active origin");
+            let active_other_sites = state
+                .sent_current_calls
+                .keys()
+                .filter(|(site, _)| *site != call.call_site_id)
+                .count();
+            if active_other_sites.saturating_add(demanded.len())
+                > MAX_CURRENT_CALL_INSTANCES_PER_ORIGIN
+            {
+                return Err(runtime_error(
+                    "distributed Server active current-call demand limit was exceeded",
+                ));
+            }
+            let detached = state
+                .sent_current_calls
+                .keys()
+                .filter_map(|(site, instance)| {
+                    (*site == call.call_site_id && !demanded.contains_key(instance))
+                        .then_some(*instance)
+                })
+                .collect::<Vec<_>>();
+            for call_instance_id in detached {
+                let demand_revision = next_revision(
+                    state
+                        .sent_current_call_revisions
+                        .get(&call.call_site_id)
+                        .copied(),
+                )?;
                 state
-                    .sent_calls
-                    .get(&call.call_site_id)
-                    .map(|entry| entry.0),
-            )?;
-            state
-                .sent_calls
-                .insert(call.call_site_id, (revision, arguments.clone()));
+                    .sent_current_call_revisions
+                    .insert(call.call_site_id, demand_revision);
+                let key = (call.call_site_id, call_instance_id);
+                state.sent_current_calls.remove(&key);
+                state
+                    .sent_current_call_tombstones
+                    .insert(key, demand_revision);
+                prune_current_call_tombstones(
+                    &mut state.sent_current_call_tombstones,
+                    call.call_site_id,
+                    demand_revision,
+                );
+                deliveries.push(ServerDelivery {
+                    target: ServerDeliveryTarget::Origin(origin),
+                    message: DistributedMessage {
+                        producer: ProgramRole::Server,
+                        consumer: ProgramRole::Session,
+                        payload: DistributedMessagePayload::CurrentCallDetach {
+                            call_site_id: call.call_site_id,
+                            call_instance_id,
+                            demand_revision,
+                        },
+                    },
+                });
+            }
+
+            for (call_instance_id, arguments) in demanded {
+                let key = (call.call_site_id, call_instance_id);
+                if state
+                    .sent_current_calls
+                    .get(&key)
+                    .is_some_and(|current| current.arguments == arguments)
+                {
+                    continue;
+                }
+                let demand_revision = next_revision(
+                    state
+                        .sent_current_call_revisions
+                        .get(&call.call_site_id)
+                        .copied(),
+                )?;
+                state
+                    .sent_current_call_revisions
+                    .insert(call.call_site_id, demand_revision);
+                state.sent_current_calls.insert(
+                    key,
+                    SentCurrentCall {
+                        demand_revision,
+                        accepted_result_revision: 0,
+                        accepted_result: None,
+                        arguments: arguments.clone(),
+                    },
+                );
+                state.sent_current_call_tombstones.remove(&key);
+                prune_current_call_tombstones(
+                    &mut state.sent_current_call_tombstones,
+                    call.call_site_id,
+                    demand_revision,
+                );
+                deliveries.push(ServerDelivery {
+                    target: ServerDeliveryTarget::Origin(origin),
+                    message: DistributedMessage {
+                        producer: ProgramRole::Server,
+                        consumer: ProgramRole::Session,
+                        payload: DistributedMessagePayload::CurrentCallRequest {
+                            call_site_id: call.call_site_id,
+                            call_instance_id,
+                            function_export_id: call.function_export_id,
+                            demand_revision,
+                            arguments,
+                        },
+                    },
+                });
+            }
+        }
+        Ok(deliveries)
+    }
+
+    fn collect_turn_invocation_deliveries(
+        &mut self,
+        origin: SessionOrigin,
+        turn: &RuntimeTurn,
+    ) -> Result<Vec<ServerDelivery>, DistributedRuntimeError> {
+        let mut deliveries = Vec::new();
+        for invocation in &turn.distributed_invocations {
+            let call = self
+                .contract
+                .remote_call_sites
+                .iter()
+                .find(|call| {
+                    call.call_site_id == invocation.call_site_id
+                        && call.mode == DistributedCallMode::Invocation
+                })
+                .cloned()
+                .ok_or(DistributedRuntimeError::UnknownTransportEdge)?;
+            if call.caller_role != ProgramRole::Server || call.callee_role != ProgramRole::Session {
+                return Err(DistributedRuntimeError::UnknownTransportEdge);
+            }
+            let state = self.state.origins.get_mut(&origin).expect("active origin");
+            let key = (call.call_site_id, invocation.call_instance_id);
+            if !state.sent_invocation_sequences.contains_key(&key)
+                && state.sent_invocation_sequences.len() >= MAX_INVOCATION_INSTANCES_PER_ORIGIN
+            {
+                return Err(runtime_error(
+                    "distributed Server outbound invocation instance limit was exceeded",
+                ));
+            }
+            let sequence = next_revision(state.sent_invocation_sequences.get(&key).copied())?;
+            state.sent_invocation_sequences.insert(key, sequence);
+            if state
+                .pending_invocation_results
+                .insert(
+                    (call.call_site_id, invocation.call_instance_id, sequence),
+                    invocation.result_route.clone(),
+                )
+                .is_some()
+            {
+                return Err(runtime_error(
+                    "distributed Server invocation result route was registered twice",
+                ));
+            }
             deliveries.push(ServerDelivery {
                 target: ServerDeliveryTarget::Origin(origin),
                 message: DistributedMessage {
                     producer: ProgramRole::Server,
                     consumer: ProgramRole::Session,
-                    payload: DistributedMessagePayload::CallRequest {
+                    payload: DistributedMessagePayload::InvocationRequest {
                         call_site_id: call.call_site_id,
+                        call_instance_id: invocation.call_instance_id,
                         function_export_id: call.function_export_id,
-                        revision,
-                        arguments,
+                        sequence,
+                        arguments: export_runtime_arguments(invocation.arguments.clone())?,
                     },
                 },
             });
@@ -2043,6 +2441,28 @@ fn next_revision(current: Option<u64>) -> Result<u64, DistributedRuntimeError> {
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| runtime_error("distributed Server revision exhausted"))
+}
+
+fn prune_invocation_replays<T>(
+    replays: &mut BTreeMap<InvocationKey, T>,
+    key: CallInstanceKey,
+    newest_sequence: u64,
+) {
+    let oldest_retained = newest_sequence.saturating_sub(INVOCATION_REPLAY_WINDOW - 1);
+    replays.retain(|(call_site_id, call_instance_id, sequence), _| {
+        (*call_site_id, *call_instance_id) != key || *sequence >= oldest_retained
+    });
+}
+
+fn prune_current_call_tombstones(
+    tombstones: &mut BTreeMap<CallInstanceKey, u64>,
+    call_site_id: RemoteCallSiteId,
+    newest_demand_revision: u64,
+) {
+    let oldest_retained = newest_demand_revision.saturating_sub(CURRENT_CALL_TOMBSTONE_WINDOW - 1);
+    tombstones.retain(|(candidate, _), demand_revision| {
+        *candidate != call_site_id || *demand_revision >= oldest_retained
+    });
 }
 
 fn accept_greater(current: Option<u64>, revision: u64) -> Result<(), DistributedRuntimeError> {

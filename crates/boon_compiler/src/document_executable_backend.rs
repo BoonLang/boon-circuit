@@ -1,11 +1,14 @@
+use crate::machine_plan_backend::{ValueIndex, lower_document_runtime_expression};
 use boon_ir::{self as ir, ErasedProgram};
 use boon_plan::*;
-use boon_typecheck::Type;
+use boon_typecheck::{Type, is_renderable_type};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn compile_document_plan(
     program: &ErasedProgram,
-    executable_fields: &BTreeSet<FieldId>,
+    value_index: &ValueIndex,
+    row_expressions: &mut PlanRowExpressionArena,
+    machine_constants: &mut Vec<PlanConstant>,
     distributed_expression_refs: &BTreeMap<ir::ExecutableExprId, ValueRef>,
     distributed_path_refs: &BTreeMap<String, ValueRef>,
 ) -> Result<Option<DocumentPlan>, PlanError> {
@@ -25,7 +28,9 @@ pub(crate) fn compile_document_plan(
     }
     DocumentCompiler::new(
         program,
-        executable_fields,
+        value_index,
+        row_expressions,
+        machine_constants,
         distributed_expression_refs,
         distributed_path_refs,
     )?
@@ -48,6 +53,7 @@ struct ContextualMaterializationInfo {
     operation: ir::ContextualOperationKind,
     source: ir::ExecutableExprId,
     body: ir::ExecutableExprId,
+    result_kind: ir::MaterializationResultKind,
     row_local: ir::MaterializationLocalId,
     owner: ir::StaticOwnerId,
 }
@@ -59,23 +65,22 @@ struct CompileContext {
     owner_function: Option<DocumentFunctionId>,
     materialization_locals:
         BTreeMap<(ir::StaticOwnerId, ir::MaterializationLocalId), DocumentParameterId>,
-    locals: BTreeMap<String, DocumentLocalId>,
-    pattern_bindings: BTreeMap<String, usize>,
+    locals: BTreeMap<boon_typecheck::DeclId, DocumentLocalId>,
+    pattern_bindings: BTreeMap<String, PatternBindingContext>,
 }
 
-#[derive(Default)]
-struct SourceGroupNode {
-    source: Option<SourceId>,
-    children: BTreeMap<String, SourceGroupNode>,
+#[derive(Clone)]
+struct PatternBindingContext {
+    selector: usize,
+    projection: Vec<String>,
 }
 
 struct DocumentCompiler<'a> {
     program: &'a ErasedProgram,
-    globals: BTreeMap<String, GlobalValue>,
-    globals_by_declaration:
-        BTreeMap<(boon_typecheck::DeclId, Option<ir::StaticOwnerId>), GlobalValue>,
-    globals_by_storage: BTreeMap<ir::StorageBindingId, GlobalValue>,
-    scoped_fields: BTreeMap<(ScopeId, String), Option<FieldId>>,
+    value_index: &'a ValueIndex,
+    row_expressions: &'a mut PlanRowExpressionArena,
+    machine_constants: &'a mut Vec<PlanConstant>,
+    globals_by_storage: BTreeMap<ir::ErasedBindingId, GlobalValue>,
     distributed_by_expression: BTreeMap<ir::ExecutableExprId, ValueRef>,
     distributed_by_path: BTreeMap<String, ValueRef>,
     materializations_by_id: BTreeMap<usize, ContextualMaterializationInfo>,
@@ -84,6 +89,7 @@ struct DocumentCompiler<'a> {
     constants: Vec<DocumentConstant>,
     expressions: Vec<DocumentExpr>,
     expression_cache: BTreeMap<(usize, usize), DocumentExprId>,
+    projected_expression_cache: BTreeMap<(usize, usize, Vec<String>), DocumentExprId>,
     functions: Vec<DocumentFunction>,
     function_ids: BTreeSet<DocumentFunctionId>,
     templates: Vec<DocumentTemplate>,
@@ -93,93 +99,105 @@ struct DocumentCompiler<'a> {
     materializations_in_progress: BTreeSet<usize>,
     compiled_materializations: BTreeSet<usize>,
     compiled_paths: BTreeMap<(Option<ScopeId>, String), DocumentExprId>,
+    compile_stack: Vec<ir::ExecutableExprId>,
     next_cache_scope: usize,
+    next_local: usize,
 }
 
 impl<'a> DocumentCompiler<'a> {
+    fn materialization_resource_read(
+        &self,
+        owner: ir::StaticOwnerId,
+        local: ir::MaterializationLocalId,
+        projection: &[String],
+    ) -> Result<Option<DocumentRead>, PlanError> {
+        let definition = self
+            .program
+            .scope_index
+            .locals
+            .iter()
+            .find(|definition| definition.owner == owner && definition.local == local)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "document expression references missing materialization local {owner}:{}",
+                    local.0
+                ))
+            })?;
+        let consumed = definition
+            .members
+            .iter()
+            .filter(|member| projection.starts_with(&member.path))
+            .map(|member| member.path.len())
+            .max()
+            .unwrap_or(0);
+        let candidates = definition
+            .members
+            .iter()
+            .filter(|member| member.path.len() == consumed && projection.starts_with(&member.path))
+            .collect::<Vec<_>>();
+        let [member] = candidates.as_slice() else {
+            return Ok(None);
+        };
+        let rest = &projection[consumed..];
+        match member.target {
+            ir::ErasedLocalMemberTarget::Source(source) if rest.is_empty() => {
+                Ok(Some(DocumentRead::Source {
+                    source: SourceId(source.0),
+                }))
+            }
+            ir::ErasedLocalMemberTarget::State(state) if rest.is_empty() => {
+                if self
+                    .program
+                    .state_cells
+                    .get(state.as_usize())
+                    .is_some_and(|candidate| candidate.id == state && candidate.scope_id.is_some())
+                {
+                    return Ok(None);
+                }
+                Ok(Some(DocumentRead::State {
+                    state: StateId(state.0),
+                }))
+            }
+            ir::ErasedLocalMemberTarget::Source(_) | ir::ErasedLocalMemberTarget::State(_) => {
+                Err(PlanError::new(format!(
+                    "document materialization resource `{}` cannot project `{}` directly",
+                    member.path.join("."),
+                    rest.join(".")
+                )))
+            }
+            ir::ErasedLocalMemberTarget::Field(_) => Ok(None),
+        }
+    }
+
     fn new(
         program: &'a ErasedProgram,
-        executable_fields: &BTreeSet<FieldId>,
+        value_index: &'a ValueIndex,
+        row_expressions: &'a mut PlanRowExpressionArena,
+        machine_constants: &'a mut Vec<PlanConstant>,
         distributed_expression_refs: &'a BTreeMap<ir::ExecutableExprId, ValueRef>,
         distributed_path_refs: &'a BTreeMap<String, ValueRef>,
     ) -> Result<Self, PlanError> {
-        let mut globals = BTreeMap::new();
-        for source in &program.sources {
-            globals.insert(
-                source.path.clone(),
-                GlobalValue::Source(SourceId(source.id.0)),
-            );
-        }
-        for state in &program.state_cells {
-            if state.scope_id.is_none() {
-                globals.insert(state.path.clone(), GlobalValue::State(StateId(state.id.0)));
-            }
-        }
-        for list in &program.lists {
-            globals.insert(list.name.clone(), GlobalValue::List(ListId(list.id.0)));
-        }
-        for field in &program.derived_values {
-            if field.scope_id.is_some() {
-                continue;
-            }
-            let field_id = program
-                .semantic_index
-                .fields
-                .iter()
-                .find(|semantic| semantic.path == field.path)
-                .map(|semantic| semantic.id.0)
-                .unwrap_or(field.id.0);
-            let field_id = FieldId(field_id);
-            let computed_list_view = field.kind == ir::DerivedValueKind::ListView
-                && executable_fields.contains(&field_id);
-            if list_for_semantic_path(program, &field.path).is_some() && !computed_list_view {
-                continue;
-            }
-            globals.insert(field.path.clone(), GlobalValue::Field(field_id));
-        }
-        for field in &program.semantic_index.fields {
-            if field.scope_id.is_some() {
-                continue;
-            }
-            globals.entry(field.path.clone()).or_insert_with(|| {
-                list_for_semantic_path(program, &field.path)
-                    .map(|list| GlobalValue::List(ListId(list.id.0)))
-                    .unwrap_or(GlobalValue::Field(FieldId(field.id.0)))
-            });
-        }
-        let mut globals_by_declaration = BTreeMap::new();
         let mut globals_by_storage = BTreeMap::new();
-        for binding in &program.storage.bindings {
-            let value = match binding.kind {
-                ir::StorageBindingKind::Value {
-                    list: Some(list), ..
-                } => Some(GlobalValue::List(ListId(list.0))),
-                ir::StorageBindingKind::Value {
+        for binding in &program.scope_index.bindings {
+            let value = match binding.target {
+                ir::ErasedBindingTarget::Value { row: Some(row), .. } => {
+                    Some(GlobalValue::List(ListId(row.list.0)))
+                }
+                ir::ErasedBindingTarget::Value {
                     field: Some(field), ..
                 } => Some(GlobalValue::Field(FieldId(field.0))),
-                ir::StorageBindingKind::Value { .. } => Some(GlobalValue::Inline(binding.producer)),
-                ir::StorageBindingKind::Source { runtime, .. } => {
+                ir::ErasedBindingTarget::Value { .. } => {
+                    Some(GlobalValue::Inline(binding.producer))
+                }
+                ir::ErasedBindingTarget::Source { runtime, .. } => {
                     Some(GlobalValue::Source(SourceId(runtime.0)))
                 }
-                ir::StorageBindingKind::State { runtime, .. } => {
+                ir::ErasedBindingTarget::State { runtime, .. } => {
                     Some(GlobalValue::State(StateId(runtime.0)))
                 }
             };
             if let Some(value) = value {
-                globals_by_declaration.insert((binding.declaration, binding.static_owner), value);
                 globals_by_storage.insert(binding.id, value);
-            }
-        }
-
-        let mut scoped_fields = BTreeMap::new();
-        for field in &program.semantic_index.fields {
-            let Some(scope) = field.scope_id else {
-                continue;
-            };
-            let scope = ScopeId(scope.0);
-            let field_id = FieldId(field.id.0);
-            for name in [&field.local_name, &field.path] {
-                insert_unique_scoped_field(&mut scoped_fields, scope, name, field_id);
             }
         }
 
@@ -190,6 +208,7 @@ impl<'a> DocumentCompiler<'a> {
                 operation: materialization.operation,
                 source: materialization.source,
                 body: materialization.body,
+                result_kind: materialization.result_kind,
                 row_local: materialization.row_local,
                 owner: materialization.owner,
             };
@@ -206,10 +225,10 @@ impl<'a> DocumentCompiler<'a> {
 
         Ok(Self {
             program,
-            globals,
-            globals_by_declaration,
+            value_index,
+            row_expressions,
+            machine_constants,
             globals_by_storage,
-            scoped_fields,
             distributed_by_expression: distributed_expression_refs.clone(),
             distributed_by_path: distributed_path_refs.clone(),
             materializations_by_id,
@@ -218,6 +237,7 @@ impl<'a> DocumentCompiler<'a> {
             constants: Vec::new(),
             expressions: Vec::new(),
             expression_cache: BTreeMap::new(),
+            projected_expression_cache: BTreeMap::new(),
             functions: Vec::new(),
             function_ids: BTreeSet::new(),
             templates: Vec::new(),
@@ -227,7 +247,9 @@ impl<'a> DocumentCompiler<'a> {
             materializations_in_progress: BTreeSet::new(),
             compiled_materializations: BTreeSet::new(),
             compiled_paths: BTreeMap::new(),
-            next_cache_scope: program.static_owners.len().saturating_add(1),
+            compile_stack: Vec::new(),
+            next_cache_scope: program.scope_index.owners.len().saturating_add(1),
+            next_local: 0,
         })
     }
 
@@ -311,21 +333,242 @@ impl<'a> DocumentCompiler<'a> {
             return Ok(expression);
         }
         let expression = self.expression(expression_id)?.clone();
+        self.compile_stack.push(expression_id);
         let result = if input_override.is_none() {
             if let Some(value) = self.distributed_by_expression.get(&expression_id).cloned() {
                 self.compile_distributed_value(
                     expression.id.0,
                     value,
                     value_class_for_type(&expression.flow_type.ty),
-                )?
+                )
             } else {
-                self.compile_expression_kind(&expression, context, input_override)?
+                self.compile_expression_kind(&expression, context, input_override)
             }
         } else {
-            self.compile_expression_kind(&expression, context, input_override)?
+            self.compile_expression_kind(&expression, context, input_override)
         };
+        self.compile_stack.pop();
+        let result = result?;
         if input_override.is_none() {
             self.expression_cache.insert(cache_key, result);
+        }
+        Ok(result)
+    }
+
+    fn compile_expression_projection(
+        &mut self,
+        expression_id: ir::ExecutableExprId,
+        projection: &[String],
+        context: &CompileContext,
+        input_override: Option<DocumentExprId>,
+        final_class: DocumentValueClass,
+    ) -> Result<DocumentExprId, PlanError> {
+        if projection.is_empty() {
+            return self.compile_expression(expression_id, context, input_override);
+        }
+        let cache_key = (context.cache_scope, expression_id.0, projection.to_vec());
+        if input_override.is_none()
+            && let Some(expression) = self.projected_expression_cache.get(&cache_key).copied()
+        {
+            return Ok(expression);
+        }
+
+        let expression = self.expression(expression_id)?.clone();
+        self.compile_stack.push(expression_id);
+        let result = (|| -> Result<DocumentExprId, PlanError> {
+            if input_override.is_some()
+                || self.distributed_by_expression.contains_key(&expression_id)
+            {
+                let input = self.compile_expression(expression_id, context, input_override)?;
+                Ok(self.project_fields(expression_id.0, input, projection, final_class))
+            } else {
+                match &expression.kind {
+                    ir::ExecutableExpressionKind::Object(fields)
+                    | ir::ExecutableExpressionKind::Record(fields)
+                        if fields.iter().all(|field| !field.spread) =>
+                    {
+                        let matches = fields
+                            .iter()
+                            .filter(|field| field.name == projection[0])
+                            .map(|field| field.value)
+                            .collect::<Vec<_>>();
+                        match matches.as_slice() {
+                            [field] => self.compile_expression_projection(
+                                *field,
+                                &projection[1..],
+                                context,
+                                None,
+                                final_class,
+                            ),
+                            _ => {
+                                let input =
+                                    self.compile_expression(expression_id, context, None)?;
+                                Ok(self.project_fields(
+                                    expression_id.0,
+                                    input,
+                                    projection,
+                                    final_class,
+                                ))
+                            }
+                        }
+                    }
+                    ir::ExecutableExpressionKind::TaggedObject { fields, .. }
+                        if fields.iter().all(|field| !field.spread) =>
+                    {
+                        let matches = fields
+                            .iter()
+                            .filter(|field| field.name == projection[0])
+                            .map(|field| field.value)
+                            .collect::<Vec<_>>();
+                        match matches.as_slice() {
+                            [field] => self.compile_expression_projection(
+                                *field,
+                                &projection[1..],
+                                context,
+                                None,
+                                final_class,
+                            ),
+                            _ => {
+                                let input =
+                                    self.compile_expression(expression_id, context, None)?;
+                                Ok(self.project_fields(
+                                    expression_id.0,
+                                    input,
+                                    projection,
+                                    final_class,
+                                ))
+                            }
+                        }
+                    }
+                    ir::ExecutableExpressionKind::Project { input, fields } => {
+                        let mut combined = fields.clone();
+                        combined.extend_from_slice(projection);
+                        self.compile_expression_projection(
+                            *input,
+                            &combined,
+                            context,
+                            None,
+                            final_class,
+                        )
+                    }
+                    ir::ExecutableExpressionKind::CanonicalRead { .. } => self
+                        .compile_erased_read_projection(
+                            expression_id,
+                            context,
+                            projection,
+                            final_class,
+                        ),
+                    ir::ExecutableExpressionKind::Draining { input } => self
+                        .compile_expression_projection(
+                            *input,
+                            projection,
+                            context,
+                            None,
+                            final_class,
+                        ),
+                    ir::ExecutableExpressionKind::LocalRead {
+                        declaration,
+                        projection: existing,
+                    } => {
+                        let local = context.locals.get(declaration).copied().ok_or_else(|| {
+                            PlanError::new(format!(
+                                "executable expression {} reads inactive lexical declaration {}",
+                                expression_id.0, declaration.0
+                            ))
+                        })?;
+                        let projection = existing
+                            .iter()
+                            .chain(projection)
+                            .map(|field| self.intern_name(field))
+                            .collect();
+                        Ok(self.push_expr(
+                            expression_id.0,
+                            final_class,
+                            DocumentExprOp::Read {
+                                read: DocumentRead::Local { local, projection },
+                            },
+                        ))
+                    }
+                    ir::ExecutableExpressionKind::ElementState {
+                        context: element_context,
+                        projection: existing,
+                    } => {
+                        let projection = existing
+                            .iter()
+                            .chain(projection)
+                            .map(|field| self.intern_name(field))
+                            .collect();
+                        Ok(self.push_expr(
+                            expression_id.0,
+                            final_class,
+                            DocumentExprOp::Read {
+                                read: DocumentRead::ElementState {
+                                    context: document_element_context(*element_context),
+                                    projection,
+                                },
+                            },
+                        ))
+                    }
+                    ir::ExecutableExpressionKind::MaterializationLocal {
+                        owner,
+                        local,
+                        projection: existing,
+                    } => {
+                        let projection = existing
+                            .iter()
+                            .chain(projection)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if let Some(read) =
+                            self.materialization_resource_read(*owner, *local, &projection)?
+                        {
+                            return Ok(self.push_expr(
+                                expression_id.0,
+                                final_class,
+                                DocumentExprOp::Read { read },
+                            ));
+                        }
+                        let parameter = context
+                            .materialization_locals
+                            .get(&(*owner, *local))
+                            .copied()
+                            .ok_or_else(|| {
+                                PlanError::new(format!(
+                                    "executable expression {} reads unbound materialization owner {} local {}",
+                                    expression_id.0, owner.0, local.0
+                                ))
+                            })?;
+                        let projection = projection
+                            .iter()
+                            .map(|field| self.intern_name(field))
+                            .collect();
+                        Ok(self.push_expr(
+                            expression_id.0,
+                            final_class,
+                            DocumentExprOp::Read {
+                                read: DocumentRead::Parameter {
+                                    parameter,
+                                    projection,
+                                },
+                            },
+                        ))
+                    }
+                    ir::ExecutableExpressionKind::Source { .. } => Err(PlanError::new(format!(
+                        "document executable expression {} projects transient SOURCE payload `{}`; retain the event value in HOLD before rendering it",
+                        expression_id.0,
+                        projection.join(".")
+                    ))),
+                    _ => {
+                        let input = self.compile_expression(expression_id, context, None)?;
+                        Ok(self.project_fields(expression_id.0, input, projection, final_class))
+                    }
+                }
+            }
+        })();
+        self.compile_stack.pop();
+        let result = result?;
+        if input_override.is_none() {
+            self.projected_expression_cache.insert(cache_key, result);
         }
         Ok(result)
     }
@@ -351,23 +594,9 @@ impl<'a> DocumentCompiler<'a> {
                     read: DocumentRead::Source { source },
                 },
             )),
-            ValueRef::SourcePayload { source_id, field } => {
-                let field = match field {
-                    SourcePayloadField::Address => "address".to_owned(),
-                    SourcePayloadField::Bytes => "bytes".to_owned(),
-                    SourcePayloadField::Key => "key".to_owned(),
-                    SourcePayloadField::Named(field) => field,
-                    SourcePayloadField::Text => "text".to_owned(),
-                };
-                let base = self.push_expr(
-                    compiler_id,
-                    DocumentValueClass::DynamicScalar,
-                    DocumentExprOp::Read {
-                        read: DocumentRead::Source { source: source_id },
-                    },
-                );
-                Ok(self.project_fields(compiler_id, base, &[field], class))
-            }
+            ValueRef::SourcePayload { source_id, field } => Err(PlanError::new(format!(
+                "document expression {compiler_id} reads transient payload {field:?} from source {source_id:?}; retain the event value in HOLD before rendering it"
+            ))),
             value => Err(PlanError::new(format!(
                 "distributed executable expression {compiler_id} has unsupported document value {value:?}"
             ))),
@@ -382,20 +611,33 @@ impl<'a> DocumentCompiler<'a> {
     ) -> Result<DocumentExprId, PlanError> {
         let compiler_id = expression.id.0;
         match &expression.kind {
-            ir::ExecutableExpressionKind::CanonicalRead {
-                target,
-                storage_binding,
-                path,
-                projection,
-            } => self.compile_canonical_read(
-                compiler_id,
-                Some(*target),
-                *storage_binding,
-                path,
-                projection,
+            ir::ExecutableExpressionKind::CanonicalRead { .. } => self.compile_erased_read(
+                expression.id,
                 context,
                 value_class_for_type(&expression.flow_type.ty),
             ),
+            ir::ExecutableExpressionKind::LocalRead {
+                declaration,
+                projection,
+            } => {
+                let local = context.locals.get(declaration).copied().ok_or_else(|| {
+                    PlanError::new(format!(
+                        "executable expression {compiler_id} reads inactive lexical declaration {}",
+                        declaration.0
+                    ))
+                })?;
+                let projection = projection
+                    .iter()
+                    .map(|field| self.intern_name(field))
+                    .collect();
+                Ok(self.push_expr(
+                    compiler_id,
+                    value_class_for_type(&expression.flow_type.ty),
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Local { local, projection },
+                    },
+                ))
+            }
             ir::ExecutableExpressionKind::ExternalRead { canonical_path } => self
                 .compile_external_read(
                     compiler_id,
@@ -403,11 +645,36 @@ impl<'a> DocumentCompiler<'a> {
                     context,
                     value_class_for_type(&expression.flow_type.ty),
                 ),
+            ir::ExecutableExpressionKind::ElementState {
+                context,
+                projection,
+            } => {
+                let projection = projection
+                    .iter()
+                    .map(|field| self.intern_name(field))
+                    .collect();
+                Ok(self.push_expr(
+                    compiler_id,
+                    value_class_for_type(&expression.flow_type.ty),
+                    DocumentExprOp::Read {
+                        read: DocumentRead::ElementState {
+                            context: document_element_context(*context),
+                            projection,
+                        },
+                    },
+                ))
+            }
             ir::ExecutableExpressionKind::Drain { path, .. } => Err(PlanError::new(format!(
                 "migration drain `{path}` at executable expression {compiler_id} cannot be lowered as a document value"
             ))),
-            ir::ExecutableExpressionKind::Text(value) => {
-                self.compile_text(compiler_id, value, context)
+            ir::ExecutableExpressionKind::Text(value) => Ok(self.constant_expr(
+                compiler_id,
+                DocumentConstantValue::Text {
+                    value: value.clone(),
+                },
+            )),
+            ir::ExecutableExpressionKind::TextTemplate { segments } => {
+                self.compile_text_template(compiler_id, segments, context)
             }
             ir::ExecutableExpressionKind::Number(value) => {
                 let (coefficient, scale) = parse_decimal(value)?;
@@ -478,43 +745,107 @@ impl<'a> DocumentCompiler<'a> {
                 callable_kind,
                 name,
                 arguments,
+                contexts,
             } => self.compile_call(
                 expression,
                 *callable_kind,
                 name,
                 arguments,
+                contexts,
                 context,
                 input_override,
             ),
             ir::ExecutableExpressionKind::Materialize { materialization } => {
-                let materialization =
-                    self.ensure_materialization(*materialization, compiler_id, context)?;
-                Ok(self.push_expr(
-                    compiler_id,
-                    DocumentValueClass::ChildList,
-                    DocumentExprOp::Materialize { materialization },
-                ))
+                let info = self
+                    .materializations_by_id
+                    .get(materialization)
+                    .copied()
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "executable expression {compiler_id} references missing contextual materialization {materialization}"
+                        ))
+                    })?;
+                let body_is_render = is_renderable_type(&self.expression(info.body)?.flow_type.ty);
+                let render_map = info.operation == ir::ContextualOperationKind::Map
+                    && info.result_kind == ir::MaterializationResultKind::RenderSlot
+                    && body_is_render;
+                if render_map {
+                    let materialization =
+                        self.ensure_materialization(*materialization, compiler_id, context)?;
+                    Ok(self.push_expr(
+                        compiler_id,
+                        DocumentValueClass::ChildList,
+                        DocumentExprOp::Materialize { materialization },
+                    ))
+                } else {
+                    if info.result_kind != ir::MaterializationResultKind::RuntimeValue
+                        || body_is_render
+                    {
+                        return Err(PlanError::new(format!(
+                            "contextual {:?} materialization {} has inconsistent {:?} / body type {:?}",
+                            info.operation,
+                            info.id,
+                            info.result_kind,
+                            self.expression(info.body)?.flow_type.ty
+                        )));
+                    }
+                    let runtime_expression = lower_document_runtime_expression(
+                        self.program,
+                        self.value_index,
+                        self.row_expressions,
+                        self.machine_constants,
+                        expression.id,
+                    )
+                    .map_err(|error| {
+                        PlanError::new(format!(
+                            "contextual {:?} materialization {} ({:?}, source {:?}, body {:?}, body type {:?}, result type {:?}) cannot be lowered as document runtime data: {error}",
+                            info.operation,
+                            info.id,
+                            info.result_kind,
+                            self.expression(info.source).map(|value| &value.kind),
+                            self.expression(info.body).map(|value| &value.kind),
+                            self.expression(info.body)
+                                .map(|body| body.flow_type.ty.clone())
+                                .unwrap_or(Type::Unknown),
+                            expression.flow_type.ty
+                        ))
+                    })?;
+                    let bindings = context
+                        .materialization_locals
+                        .iter()
+                        .map(|((owner, local), parameter)| DocumentRuntimeLocalBinding {
+                            owner: PlanStaticOwnerId(owner.0),
+                            local: PlanLocalId(local.0 as usize),
+                            parameter: *parameter,
+                        })
+                        .collect();
+                    Ok(self.push_expr(
+                        compiler_id,
+                        value_class_for_type(&expression.flow_type.ty),
+                        DocumentExprOp::RuntimeExpression {
+                            expression: runtime_expression,
+                            bindings,
+                        },
+                    ))
+                }
             }
             ir::ExecutableExpressionKind::Draining { input } => {
                 self.compile_expression(*input, context, input_override)
             }
             ir::ExecutableExpressionKind::Hold { name, .. } => {
-                let declaration = self
-                    .program
-                    .executable
-                    .states
-                    .iter()
-                    .find(|state| state.expression == expression.id)
-                    .map(|state| state.declaration)
+                let storage_binding = self.storage_binding_for_state_expression(expression.id)?;
+                let global = self
+                    .globals_by_storage
+                    .get(&storage_binding)
+                    .copied()
                     .ok_or_else(|| {
                         PlanError::new(format!(
-                            "HOLD executable expression {compiler_id} has no storage declaration"
+                            "state storage binding {storage_binding} (`{name}`) has no document value"
                         ))
                     })?;
-                self.compile_canonical_read(
+                self.compile_global_projection(
                     compiler_id,
-                    Some(declaration),
-                    self.storage_binding_for_state_expression(expression.id)?,
+                    global,
                     name,
                     &[],
                     context,
@@ -577,6 +908,9 @@ impl<'a> DocumentCompiler<'a> {
             | ir::ExecutableExpressionKind::Record(fields) => {
                 self.compile_record_fields(compiler_id, None, fields, context)
             }
+            ir::ExecutableExpressionKind::Block { bindings, result } => {
+                self.compile_local_block(expression, bindings, *result, context)
+            }
             ir::ExecutableExpressionKind::List { items, .. } => {
                 let items = items
                     .iter()
@@ -612,20 +946,28 @@ impl<'a> DocumentCompiler<'a> {
                     DocumentExprOp::Record { fields: Vec::new() },
                 )
             })),
-            ir::ExecutableExpressionKind::Project { input, fields } => {
-                let input = self.compile_expression(*input, context, input_override)?;
-                Ok(self.project_fields(
-                    compiler_id,
-                    input,
+            ir::ExecutableExpressionKind::Project { input, fields } => self
+                .compile_expression_projection(
+                    *input,
                     fields,
+                    context,
+                    input_override,
                     value_class_for_type(&expression.flow_type.ty),
-                ))
-            }
+                ),
             ir::ExecutableExpressionKind::MaterializationLocal {
                 owner,
                 local,
                 projection,
             } => {
+                if let Some(read) =
+                    self.materialization_resource_read(*owner, *local, projection)?
+                {
+                    return Ok(self.push_expr(
+                        compiler_id,
+                        value_class_for_type(&expression.flow_type.ty),
+                        DocumentExprOp::Read { read },
+                    ));
+                }
                 let parameter = context
                     .materialization_locals
                     .get(&(*owner, *local))
@@ -660,12 +1002,53 @@ impl<'a> DocumentCompiler<'a> {
         }
     }
 
+    fn compile_local_block(
+        &mut self,
+        expression: &ir::ExecutableExpression,
+        bindings: &[ir::ExecutableBlockBinding],
+        result: ir::ExecutableExprId,
+        context: &CompileContext,
+    ) -> Result<DocumentExprId, PlanError> {
+        let mut context = context.clone();
+        for binding in bindings {
+            if context
+                .locals
+                .insert(binding.declaration, DocumentLocalId(self.next_local))
+                .is_some()
+            {
+                return Err(PlanError::new(format!(
+                    "erased BLOCK expression {} repeats lexical declaration {}",
+                    expression.id, binding.declaration.0
+                )));
+            }
+            self.next_local += 1;
+        }
+
+        let mut lowered = Vec::with_capacity(bindings.len());
+        for binding in exact_block_binding_order(self.program, bindings)? {
+            let local = context.locals[&binding.declaration];
+            let value = self.compile_expression(binding.value, &context, None)?;
+            lowered.push(DocumentLocalBinding { local, value });
+        }
+        let result = self.compile_expression(result, &context, None)?;
+        let value_class = self.expressions[result.as_usize()].value_class;
+        Ok(self.push_expr(
+            expression.id.0,
+            value_class,
+            DocumentExprOp::LocalBlock {
+                bindings: lowered,
+                result,
+            },
+        ))
+    }
+
     fn compile_call(
         &mut self,
         expression: &ir::ExecutableExpression,
         callable_kind: ir::ExecutableCallableKind,
         function: &str,
         arguments: &[ir::ExecutableCallArgument],
+        contexts: &[ir::ExecutableCallContextId],
         context: &CompileContext,
         input_override: Option<DocumentExprId>,
     ) -> Result<DocumentExprId, PlanError> {
@@ -702,7 +1085,12 @@ impl<'a> DocumentCompiler<'a> {
                     "render constructor `{function}` cannot be used as a pipeline operator"
                 )));
             }
-            return self.compile_constructor(expression, constructor, arguments, context);
+            return self.compile_constructor(expression, constructor, arguments, contexts, context);
+        }
+        if !contexts.is_empty() {
+            return Err(PlanError::new(format!(
+                "non-render executable call `{function}` at expression {compiler_id} owns a call-local host context"
+            )));
         }
         if builtin_effect_contract(function)?
             .is_some_and(|contract| !matches!(contract.replay, EffectReplay::ReadOnly))
@@ -728,7 +1116,7 @@ impl<'a> DocumentCompiler<'a> {
                 }
             } else {
                 compiled_arguments.push(DocumentBuiltinArgument {
-                    name: Some(self.intern_name(&argument.name)),
+                    name: self.intern_name(&argument.name),
                     value,
                 });
             }
@@ -771,6 +1159,7 @@ impl<'a> DocumentCompiler<'a> {
         expression: &ir::ExecutableExpression,
         constructor: DocumentConstructor,
         arguments: &[ir::ExecutableCallArgument],
+        contexts: &[ir::ExecutableCallContextId],
         context: &CompileContext,
     ) -> Result<DocumentExprId, PlanError> {
         let compiler_id = expression.id.0;
@@ -794,6 +1183,20 @@ impl<'a> DocumentCompiler<'a> {
             DocumentExprOp::Constructor {
                 template,
                 constructor,
+                element_context: match (constructor.owns_element_context(), contexts) {
+                    (false, []) => None,
+                    (true, [context]) => Some(document_element_context(*context)),
+                    (false, _) => {
+                        return Err(PlanError::new(format!(
+                            "root constructor at expression {compiler_id} cannot own an element context"
+                        )));
+                    }
+                    (true, _) => {
+                        return Err(PlanError::new(format!(
+                            "element constructor at expression {compiler_id} must own exactly one element context"
+                        )));
+                    }
+                },
                 arguments: compiled_arguments,
             },
         );
@@ -860,9 +1263,18 @@ impl<'a> DocumentCompiler<'a> {
             )));
         }
         let body_owner = self.expression(info.body)?.owner;
-        if body_owner != Some(info.owner) {
+        if !body_owner
+            .map(|body_owner| {
+                self.program
+                    .scope_index
+                    .owner_descends_from(body_owner, info.owner)
+                    .map_err(PlanError::new)
+            })
+            .transpose()?
+            .unwrap_or(false)
+        {
             return Err(PlanError::new(format!(
-                "render materialization {} body root {} has owner {:?}, expected {}",
+                "render materialization {} body root {} has owner {:?}, expected owner subtree {}",
                 info.id, info.body.0, body_owner, info.owner
             )));
         }
@@ -994,14 +1406,31 @@ impl<'a> DocumentCompiler<'a> {
         for arm in executable_arms {
             let mut arm_context = context.clone();
             arm_context.cache_scope = self.allocate_cache_scope();
-            arm_context.pattern_bindings.extend(
-                pattern_binding_names(&arm.pattern)
-                    .into_iter()
-                    .map(|name| (name, expression.id.0)),
-            );
+            arm_context
+                .pattern_bindings
+                .extend(arm.bindings.iter().map(|binding| {
+                    (
+                        binding.name.clone(),
+                        PatternBindingContext {
+                            selector: expression.id.0,
+                            projection: binding.projection.clone(),
+                        },
+                    )
+                }));
             let output = self.compile_expression(arm.output, &arm_context, None)?;
             arms.push(DocumentSelectArm {
                 pattern: self.compile_pattern(&arm.pattern)?,
+                bindings: arm
+                    .bindings
+                    .iter()
+                    .map(|binding| DocumentSelectBinding {
+                        projection: binding
+                            .projection
+                            .iter()
+                            .map(|field| self.intern_name(field))
+                            .collect(),
+                    })
+                    .collect(),
                 output,
             });
         }
@@ -1025,40 +1454,50 @@ impl<'a> DocumentCompiler<'a> {
         ))
     }
 
-    fn compile_pattern(&mut self, tokens: &[String]) -> Result<DocumentPattern, PlanError> {
-        if tokens.iter().any(|token| token == "__") {
+    fn compile_pattern(
+        &mut self,
+        pattern: &boon_typecheck::CheckedMatchPattern,
+    ) -> Result<DocumentPattern, PlanError> {
+        use boon_typecheck::CheckedMatchPattern;
+
+        if matches!(
+            pattern,
+            CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. }
+        ) {
             return Ok(DocumentPattern::Wildcard);
         }
-        if tokens.first().is_some_and(|token| token == "TEXT") {
-            let value = tokens
-                .iter()
-                .skip_while(|token| token.as_str() != "{")
-                .skip(1)
-                .take_while(|token| token.as_str() != "}")
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let constant = self.push_constant(DocumentConstantValue::Text { value });
-            return Ok(DocumentPattern::Constant { constant });
-        }
-        let token = tokens
-            .first()
-            .ok_or_else(|| PlanError::new("conditional arm has an empty pattern"))?;
-        if token == "True" || token == "False" {
-            let constant = self.push_constant(DocumentConstantValue::Bool {
-                value: token == "True",
+        if let CheckedMatchPattern::Text { value } = pattern {
+            let constant = self.push_constant(DocumentConstantValue::Text {
+                value: value.clone(),
             });
             return Ok(DocumentPattern::Constant { constant });
         }
-        if token.parse::<i64>().is_ok() {
-            let (coefficient, scale) = parse_decimal(token)?;
+        if let CheckedMatchPattern::Bool { value } = pattern {
+            let constant = self.push_constant(DocumentConstantValue::Bool { value: *value });
+            return Ok(DocumentPattern::Constant { constant });
+        }
+        if let CheckedMatchPattern::Number { value } = pattern {
+            let (coefficient, scale) = parse_decimal(value)?;
             let constant = self.push_constant(DocumentConstantValue::Number { coefficient, scale });
             return Ok(DocumentPattern::Constant { constant });
         }
-        let tag = token.split('[').next().unwrap_or(token);
-        Ok(DocumentPattern::Tag {
-            tag: self.intern_name(tag),
-        })
+        match pattern {
+            CheckedMatchPattern::NaN => Ok(DocumentPattern::Tag {
+                tag: self.intern_name("NaN"),
+            }),
+            CheckedMatchPattern::Tag { name } => Ok(DocumentPattern::Tag {
+                tag: self.intern_name(name),
+            }),
+            CheckedMatchPattern::Unknown { tokens } => Err(PlanError::new(format!(
+                "conditional arm has an unknown checked pattern `{}`",
+                tokens.join(" ")
+            ))),
+            CheckedMatchPattern::Wildcard
+            | CheckedMatchPattern::Binding { .. }
+            | CheckedMatchPattern::Bool { .. }
+            | CheckedMatchPattern::Number { .. }
+            | CheckedMatchPattern::Text { .. } => unreachable!(),
+        }
     }
 
     fn compile_record_fields(
@@ -1090,131 +1529,32 @@ impl<'a> DocumentCompiler<'a> {
         Ok(self.push_expr(compiler_id, class, op))
     }
 
-    fn compile_text(
+    fn compile_text_template(
         &mut self,
         compiler_id: usize,
-        value: &str,
+        executable_segments: &[ir::ExecutableTextSegment],
         context: &CompileContext,
     ) -> Result<DocumentExprId, PlanError> {
-        let Some(first_open) = value.find('{') else {
-            return Ok(self.constant_expr(
-                compiler_id,
-                DocumentConstantValue::Text {
-                    value: value.to_owned(),
-                },
-            ));
-        };
-        let mut cursor = 0usize;
-        let mut segments = Vec::new();
-        let mut next_open = Some(first_open);
-        while let Some(open) = next_open {
-            if open > cursor {
-                let constant = self.push_constant(DocumentConstantValue::Text {
-                    value: value[cursor..open].to_owned(),
-                });
-                segments.push(DocumentTextSegment::Static { constant });
+        let mut segments = Vec::with_capacity(executable_segments.len());
+        for segment in executable_segments {
+            match segment {
+                ir::ExecutableTextSegment::Static { value } => {
+                    let constant = self.push_constant(DocumentConstantValue::Text {
+                        value: value.clone(),
+                    });
+                    segments.push(DocumentTextSegment::Static { constant });
+                }
+                ir::ExecutableTextSegment::Dynamic { value } => {
+                    let value = self.compile_expression(*value, context, None)?;
+                    segments.push(DocumentTextSegment::Dynamic { value });
+                }
             }
-            let close = value[open + 1..]
-                .find('}')
-                .map(|offset| open + 1 + offset)
-                .ok_or_else(|| {
-                    PlanError::new(format!(
-                        "text executable expression {compiler_id} has an unterminated interpolation"
-                    ))
-                })?;
-            let path = value[open + 1..close].trim();
-            if path.is_empty() {
-                return Err(PlanError::new(format!(
-                    "text executable expression {compiler_id} has an empty interpolation"
-                )));
-            }
-            let dynamic = self.compile_named_path(compiler_id, path, context)?;
-            segments.push(DocumentTextSegment::Dynamic { value: dynamic });
-            cursor = close + 1;
-            next_open = value[cursor..].find('{').map(|offset| cursor + offset);
-        }
-        if cursor < value.len() {
-            let constant = self.push_constant(DocumentConstantValue::Text {
-                value: value[cursor..].to_owned(),
-            });
-            segments.push(DocumentTextSegment::Static { constant });
         }
         Ok(self.push_expr(
             compiler_id,
             DocumentValueClass::DynamicScalar,
             DocumentExprOp::TextTemplate { segments },
         ))
-    }
-
-    fn compile_named_path(
-        &mut self,
-        compiler_id: usize,
-        path: &str,
-        context: &CompileContext,
-    ) -> Result<DocumentExprId, PlanError> {
-        let parts = path
-            .trim()
-            .trim_start_matches('$')
-            .split('.')
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-        if parts.is_empty() {
-            return Err(PlanError::new(format!(
-                "text executable expression {compiler_id} has an empty path"
-            )));
-        }
-        if let Some(selector) = context.pattern_bindings.get(parts[0]).copied() {
-            let projection = parts.iter().map(|part| self.intern_name(part)).collect();
-            return Ok(self.push_expr(
-                compiler_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Matched {
-                        selector,
-                        projection,
-                    },
-                },
-            ));
-        }
-        if parts[0] == "element" {
-            return self.compile_external_read(
-                compiler_id,
-                path,
-                context,
-                DocumentValueClass::DynamicScalar,
-            );
-        }
-        let root = (1..=parts.len()).rev().find_map(|length| {
-            let candidate = parts[..length].join(".");
-            (context.locals.contains_key(&candidate) || self.canonical_root_exists(&candidate))
-                .then_some((candidate, length))
-        });
-        if let Some((root, length)) = root {
-            let projection = parts[length..]
-                .iter()
-                .map(|part| (*part).to_owned())
-                .collect::<Vec<_>>();
-            return self.compile_canonical_read(
-                compiler_id,
-                None,
-                None,
-                &root,
-                &projection,
-                context,
-                DocumentValueClass::DynamicScalar,
-            );
-        }
-        if self.distributed_by_path.contains_key(path) {
-            return self.compile_external_read(
-                compiler_id,
-                path,
-                context,
-                DocumentValueClass::DynamicScalar,
-            );
-        }
-        Err(PlanError::new(format!(
-            "unresolved executable document interpolation `{path}` at expression {compiler_id}"
-        )))
     }
 
     fn compile_tag(
@@ -1233,127 +1573,130 @@ impl<'a> DocumentCompiler<'a> {
         Ok(self.constant_expr(compiler_id, DocumentConstantValue::Enum { name }))
     }
 
-    fn compile_canonical_read(
+    fn compile_erased_read(
         &mut self,
-        compiler_id: usize,
-        declaration: Option<boon_typecheck::DeclId>,
-        storage_binding: Option<ir::StorageBindingId>,
-        path: &str,
-        projection: &[String],
+        expression: ir::ExecutableExprId,
         context: &CompileContext,
         final_class: DocumentValueClass,
     ) -> Result<DocumentExprId, PlanError> {
-        if let Some(local) = context.locals.get(path).copied() {
-            let projection = projection
-                .iter()
-                .map(|field| self.intern_name(field))
-                .collect::<Vec<_>>();
-            let expression = self.push_expr(
-                compiler_id,
-                final_class,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Local { local, projection },
-                },
-            );
-            self.record_compiled_path(path, expression);
-            return Ok(expression);
-        }
-        if let Some(storage_binding) = storage_binding {
-            let global = self
-                .globals_by_storage
-                .get(&storage_binding)
-                .copied()
-                .ok_or_else(|| {
-                    PlanError::new(format!(
-                        "storage binding {storage_binding} (`{path}`) has no document value"
-                    ))
-                })?;
-            return self.compile_global_projection(
-                compiler_id,
-                global,
-                path,
-                projection,
-                context,
-                final_class,
-            );
-        }
-        if let Some(declaration) = declaration {
-            let global = self
-                .globals_by_declaration
-                .get(&(declaration, context.stable_owner))
-                .or_else(|| self.globals_by_declaration.get(&(declaration, None)))
-                .copied()
-                .ok_or_else(|| {
-                    PlanError::new(format!(
-                        "checked declaration {} owner {:?} (`{path}`) has no document storage binding",
-                        declaration.0, context.stable_owner
-                    ))
-                })?;
-            return self.compile_global_projection(
-                compiler_id,
-                global,
-                path,
-                projection,
-                context,
-                final_class,
-            );
-        }
-        if let Some(ValueRef::DistributedImport(import)) = self.distributed_by_path.get(path) {
-            let import = *import;
-            let base = self.push_expr(
-                compiler_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::Read {
-                    read: DocumentRead::DistributedImport { import },
-                },
-            );
-            let expression = self.project_fields(compiler_id, base, projection, final_class);
-            self.record_compiled_path(&joined_path(path, projection), expression);
-            return Ok(expression);
-        }
-        if self.source_group_exists(path)
-            && !matches!(self.globals.get(path), Some(GlobalValue::Source(_)))
-            && let Some(base) = self.compile_source_group(compiler_id, path)
-        {
-            let expression = self.project_fields(compiler_id, base, projection, final_class);
-            self.record_compiled_path(&joined_path(path, projection), expression);
-            return Ok(expression);
-        }
-        if let Some(global) = self.globals.get(path).copied() {
-            let (read, class) = match global {
-                GlobalValue::State(state) => (
-                    DocumentRead::State { state },
+        self.compile_erased_read_projection(expression, context, &[], final_class)
+    }
+
+    fn compile_erased_read_projection(
+        &mut self,
+        expression: ir::ExecutableExprId,
+        context: &CompileContext,
+        additional_projection: &[String],
+        final_class: DocumentValueClass,
+    ) -> Result<DocumentExprId, PlanError> {
+        let compiler_id = expression.0;
+        let target = self
+            .program
+            .scope_index
+            .reads
+            .iter()
+            .find(|read| read.expression == expression)
+            .map(|read| read.target.clone())
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "executable read {expression} has no exact erased read target"
+                ))
+            })?;
+        match target {
+            ir::ErasedReadTarget::Binding {
+                binding,
+                mut projection,
+            } => {
+                projection.extend_from_slice(additional_projection);
+                let storage = self
+                    .program
+                    .scope_index
+                    .bindings
+                    .get(binding.as_usize())
+                    .filter(|candidate| candidate.id == binding)
+                    .ok_or_else(|| {
+                        PlanError::new(format!("erased read references missing {binding}"))
+                    })?;
+                let global = self
+                    .globals_by_storage
+                    .get(&binding)
+                    .copied()
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "storage binding {binding} (`{}`) has no document value",
+                            storage.diagnostic_path
+                        ))
+                    })?;
+                self.compile_global_projection(
+                    compiler_id,
+                    global,
+                    &storage.diagnostic_path,
+                    &projection,
+                    context,
+                    final_class,
+                )
+            }
+            ir::ErasedReadTarget::SourcePayload {
+                source,
+                field,
+                mut projection,
+                ..
+            } => {
+                projection.extend_from_slice(additional_projection);
+                let source_path = self
+                    .program
+                    .sources
+                    .iter()
+                    .find(|candidate| candidate.id == source)
+                    .map(|source| source.path.as_str())
+                    .unwrap_or("<unknown>");
+                Err(PlanError::new(format!(
+                    "document executable read {expression} reads transient payload {field:?}{} from source {source} (`{source_path}`); retained path: {}; retain the event value in HOLD before rendering it",
+                    if projection.is_empty() {
+                        String::new()
+                    } else {
+                        format!(".{}", projection.join("."))
+                    },
+                    self.compile_stack
+                        .iter()
+                        .copied()
+                        .map(|expression| executable_debug_label(self.program, expression))
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                )))
+            }
+            ir::ErasedReadTarget::StateProjection {
+                state, mut fields, ..
+            } => {
+                fields.extend_from_slice(additional_projection);
+                let base = self.push_expr(
+                    compiler_id,
                     DocumentValueClass::DynamicScalar,
-                ),
-                GlobalValue::Field(field) => (
-                    DocumentRead::Field { field },
-                    DocumentValueClass::DynamicScalar,
-                ),
-                GlobalValue::List(list) => (
-                    DocumentRead::List { list },
-                    DocumentValueClass::DynamicStructure,
-                ),
-                GlobalValue::Source(source) => (
-                    DocumentRead::Source { source },
-                    DocumentValueClass::DynamicScalar,
-                ),
-                GlobalValue::Inline(_) => {
-                    unreachable!("path-indexed globals never contain inline declarations")
-                }
-            };
-            let base = self.push_expr(compiler_id, class, DocumentExprOp::Read { read });
-            let expression = self.project_fields(compiler_id, base, projection, final_class);
-            self.record_compiled_path(&joined_path(path, projection), expression);
-            return Ok(expression);
+                    DocumentExprOp::Read {
+                        read: DocumentRead::State {
+                            state: StateId(state.0),
+                        },
+                    },
+                );
+                Ok(self.project_fields(compiler_id, base, &fields, final_class))
+            }
+            ir::ErasedReadTarget::Expression {
+                expression,
+                mut projection,
+            } => {
+                projection.extend_from_slice(additional_projection);
+                self.compile_expression_projection(
+                    expression,
+                    &projection,
+                    context,
+                    None,
+                    final_class,
+                )
+            }
+            target => Err(PlanError::new(format!(
+                "executable read {expression} has non-document target {target:?}"
+            ))),
         }
-        if let Some(base) = self.compile_global_record(compiler_id, path)? {
-            let expression = self.project_fields(compiler_id, base, projection, final_class);
-            self.record_compiled_path(&joined_path(path, projection), expression);
-            return Ok(expression);
-        }
-        Err(PlanError::new(format!(
-            "unresolved canonical executable document path `{path}` at expression {compiler_id}"
-        )))
     }
 
     fn compile_global_projection(
@@ -1365,8 +1708,27 @@ impl<'a> DocumentCompiler<'a> {
         context: &CompileContext,
         final_class: DocumentValueClass,
     ) -> Result<DocumentExprId, PlanError> {
+        if let GlobalValue::Inline(producer) = global {
+            let expression = self.compile_expression_projection(
+                producer,
+                projection,
+                context,
+                None,
+                final_class,
+            )?;
+            self.record_compiled_path(&joined_path(path, projection), expression);
+            return Ok(expression);
+        }
+        if let GlobalValue::Source(source) = global
+            && !projection.is_empty()
+        {
+            return Err(PlanError::new(format!(
+                "document path `{}` projects transient payload from source {source:?}; retain the event value in HOLD before rendering it",
+                joined_path(path, projection)
+            )));
+        }
         let base = match global {
-            GlobalValue::Inline(producer) => self.compile_expression(producer, context, None)?,
+            GlobalValue::Inline(_) => unreachable!("inline globals return above"),
             GlobalValue::State(state) => self.push_expr(
                 compiler_id,
                 DocumentValueClass::DynamicScalar,
@@ -1423,34 +1785,26 @@ impl<'a> DocumentCompiler<'a> {
             .split('.')
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
-        if let Some(selector) = parts
+        if let Some(binding) = parts
             .first()
             .and_then(|name| context.pattern_bindings.get(*name))
-            .copied()
+            .cloned()
         {
-            let projection = parts.iter().map(|part| self.intern_name(part)).collect();
-            return Ok(self.push_expr(
-                compiler_id,
-                class,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Matched {
-                        selector,
-                        projection,
-                    },
-                },
-            ));
-        }
-        if parts.first() == Some(&"element") {
-            let projection = parts
+            let projection = binding
+                .projection
                 .iter()
-                .skip(1)
+                .map(String::as_str)
+                .chain(parts.iter().skip(1).copied())
                 .map(|part| self.intern_name(part))
                 .collect();
             return Ok(self.push_expr(
                 compiler_id,
                 class,
                 DocumentExprOp::Read {
-                    read: DocumentRead::ElementState { projection },
+                    read: DocumentRead::Matched {
+                        selector: binding.selector,
+                        projection,
+                    },
                 },
             ));
         }
@@ -1501,231 +1855,110 @@ impl<'a> DocumentCompiler<'a> {
         matches.next().is_none().then_some(value)
     }
 
-    fn compile_global_record(
-        &mut self,
-        compiler_id: usize,
-        path: &str,
-    ) -> Result<Option<DocumentExprId>, PlanError> {
-        let prefix = format!("{path}.");
-        let child_names = self
-            .globals
-            .keys()
-            .filter_map(|candidate| {
-                candidate
-                    .strip_prefix(&prefix)
-                    .and_then(|rest| rest.split('.').next())
-                    .filter(|child| !child.is_empty())
-                    .map(str::to_owned)
-            })
-            .collect::<BTreeSet<_>>();
-        if child_names.is_empty() {
-            return Ok(None);
-        }
-        let mut fields = Vec::with_capacity(child_names.len());
-        for child in child_names {
-            let child_path = format!("{path}.{child}");
-            let value = if let Some(global) = self.globals.get(&child_path).copied() {
-                let (read, class) = match global {
-                    GlobalValue::State(state) => (
-                        DocumentRead::State { state },
-                        DocumentValueClass::DynamicScalar,
-                    ),
-                    GlobalValue::Field(field) => (
-                        DocumentRead::Field { field },
-                        DocumentValueClass::DynamicScalar,
-                    ),
-                    GlobalValue::List(list) => (
-                        DocumentRead::List { list },
-                        DocumentValueClass::DynamicStructure,
-                    ),
-                    GlobalValue::Source(source) => (
-                        DocumentRead::Source { source },
-                        DocumentValueClass::DynamicScalar,
-                    ),
-                    GlobalValue::Inline(_) => {
-                        unreachable!("path-indexed globals never contain inline declarations")
-                    }
-                };
-                self.push_expr(compiler_id, class, DocumentExprOp::Read { read })
-            } else {
-                self.compile_global_record(compiler_id, &child_path)?
-                    .ok_or_else(|| {
-                        PlanError::new(format!(
-                            "canonical document record `{child_path}` has no typed children"
-                        ))
-                    })?
-            };
-            fields.push(DocumentRecordField {
-                name: Some(self.intern_name(&child)),
-                value,
-                spread: false,
-            });
-        }
-        Ok(Some(self.push_expr(
-            compiler_id,
-            DocumentValueClass::DynamicStructure,
-            DocumentExprOp::Record { fields },
-        )))
-    }
-
-    fn compile_source_group(&mut self, compiler_id: usize, path: &str) -> Option<DocumentExprId> {
-        let prefix = format!("{path}.");
-        let routes = self
-            .program
-            .sources
-            .iter()
-            .filter_map(|source| {
-                source
-                    .path
-                    .strip_prefix(&prefix)
-                    .map(|rest| (rest.to_owned(), SourceId(source.id.0)))
-            })
-            .collect::<Vec<_>>();
-        if routes.is_empty() {
-            return None;
-        }
-        let mut root = SourceGroupNode::default();
-        for (route, source) in routes {
-            let mut node = &mut root;
-            for part in route.split('.').filter(|part| !part.is_empty()) {
-                node = node.children.entry(part.to_owned()).or_default();
-            }
-            node.source = Some(source);
-        }
-        Some(self.push_source_group_node(compiler_id, root))
-    }
-
-    fn push_source_group_node(
-        &mut self,
-        compiler_id: usize,
-        node: SourceGroupNode,
-    ) -> DocumentExprId {
-        if node.children.is_empty()
-            && let Some(source) = node.source
-        {
-            return self.push_expr(
-                compiler_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Source { source },
-                },
-            );
-        }
-        let mut fields =
-            Vec::with_capacity(node.children.len() + usize::from(node.source.is_some()));
-        if let Some(source) = node.source {
-            let value = self.push_expr(
-                compiler_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Source { source },
-                },
-            );
-            fields.push(DocumentRecordField {
-                name: Some(self.intern_name("__source")),
-                value,
-                spread: false,
-            });
-        }
-        for (name, child) in node.children {
-            let value = self.push_source_group_node(compiler_id, child);
-            fields.push(DocumentRecordField {
-                name: Some(self.intern_name(&name)),
-                value,
-                spread: false,
-            });
-        }
-        let class = record_value_class(&fields, &self.expressions);
-        self.push_expr(compiler_id, class, DocumentExprOp::Record { fields })
-    }
-
     fn compile_view_bindings(&mut self) -> Result<Vec<DocumentViewBinding>, PlanError> {
         let mut result = Vec::new();
         for binding in self.program.view_bindings.clone() {
             let scope = binding.scope_id.map(|scope| ScopeId(scope.0));
             let target = match &binding.target {
-                ir::ViewBindingTarget::Storage {
-                    binding: storage_binding,
-                    projection,
+                ir::ViewBindingTarget::Read {
+                    read,
+                    additional_projection,
                 } => {
-                    let global = self
-                        .globals_by_storage
-                        .get(storage_binding)
-                        .copied()
+                    let read = self
+                        .program
+                        .scope_index
+                        .reads
+                        .get(read.as_usize())
+                        .filter(|candidate| candidate.id == *read)
+                        .cloned()
                         .ok_or_else(|| {
                             PlanError::new(format!(
-                                "view binding {} references storage binding {} without a document value",
-                                binding.id.0, storage_binding
+                                "view binding {} references missing erased read {read}",
+                                binding.id.0
                             ))
                         })?;
-                    if projection.is_empty() {
-                        match global {
-                            GlobalValue::State(state) => DocumentBindingTarget::State { state },
-                            GlobalValue::Field(field) => DocumentBindingTarget::Field { field },
-                            GlobalValue::List(list) => DocumentBindingTarget::List { list },
-                            GlobalValue::Source(source) => DocumentBindingTarget::Source { source },
-                            GlobalValue::Inline(_) => {
-                                let expression = self.compile_global_projection(
-                                    binding.id.0,
-                                    global,
-                                    &binding.path,
-                                    projection,
-                                    &CompileContext::default(),
-                                    DocumentValueClass::DynamicScalar,
-                                )?;
-                                DocumentBindingTarget::Expression { expression }
+                    let direct = match &read.target {
+                        ir::ErasedReadTarget::Binding {
+                            binding: storage_binding,
+                            projection: read_projection,
+                        } if read_projection.is_empty() && additional_projection.is_empty() => {
+                            let binding = self
+                                .program
+                                .scope_index
+                                .bindings
+                                .get(storage_binding.as_usize())
+                                .filter(|candidate| candidate.id == *storage_binding);
+                            match binding.map(|binding| &binding.target) {
+                                Some(ir::ErasedBindingTarget::Value {
+                                    field: Some(field),
+                                    row: Some(row),
+                                }) => Some(DocumentBindingTarget::ScopedField {
+                                    scope: ScopeId(row.scope.0),
+                                    field: FieldId(field.0),
+                                }),
+                                _ => self
+                                    .globals_by_storage
+                                    .get(storage_binding)
+                                    .copied()
+                                    .and_then(|global| match global {
+                                        GlobalValue::State(state) => {
+                                            Some(DocumentBindingTarget::State { state })
+                                        }
+                                        GlobalValue::Field(field) => {
+                                            Some(DocumentBindingTarget::Field { field })
+                                        }
+                                        GlobalValue::List(list) => {
+                                            Some(DocumentBindingTarget::List { list })
+                                        }
+                                        GlobalValue::Source(source) => {
+                                            Some(DocumentBindingTarget::Source { source })
+                                        }
+                                        GlobalValue::Inline(_) => None,
+                                    }),
                             }
                         }
-                    } else {
-                        let expression = self.compile_global_projection(
-                            binding.id.0,
-                            global,
-                            &binding.path,
+                        ir::ErasedReadTarget::MaterializationLocal {
+                            owner,
+                            local,
                             projection,
+                        } if additional_projection.is_empty() && !projection.is_empty() => {
+                            let scope = scope.ok_or_else(|| {
+                                PlanError::new(format!(
+                                    "view binding {} materialization local has no exact row scope",
+                                    binding.id.0
+                                ))
+                            })?;
+                            let target = self.resolve_view_materialization_target(
+                                binding.id.0,
+                                *owner,
+                                *local,
+                                scope,
+                                projection,
+                            )?;
+                            Some(target)
+                        }
+                        _ => None,
+                    };
+                    if let Some(direct) = direct {
+                        direct
+                    } else {
+                        let expression = self.compile_expression(
+                            read.expression,
                             &CompileContext::default(),
-                            DocumentValueClass::DynamicScalar,
+                            None,
                         )?;
+                        let expression = self.project_fields(
+                            binding.id.0,
+                            expression,
+                            additional_projection,
+                            DocumentValueClass::DynamicScalar,
+                        );
                         DocumentBindingTarget::Expression { expression }
                     }
                 }
-                ir::ViewBindingTarget::MaterializationLocal { projection, .. } => {
-                    let Some(scope) = scope else {
-                        return Err(PlanError::new(format!(
-                            "view binding {} materialization local has no exact row scope",
-                            binding.id.0
-                        )));
-                    };
-                    let field_path = projection.join(".");
-                    let field = self.resolve_scoped_field(scope, &field_path).ok_or_else(|| {
-                        let row_scope = self
-                            .program
-                            .row_scopes
-                            .iter()
-                            .find(|candidate| candidate.id.0 == scope.0)
-                            .map(|candidate| {
-                                format!("{} for list `{}`", candidate.row_scope, candidate.list)
-                            })
-                            .unwrap_or_else(|| "missing row scope".to_owned());
-                        let available = self
-                            .program
-                            .semantic_index
-                            .fields
-                            .iter()
-                            .filter(|field| field.scope_id.is_some_and(|id| id.0 == scope.0))
-                            .map(|field| field.local_name.as_str())
-                            .collect::<Vec<_>>();
-                        PlanError::new(format!(
-                            "view binding {} materialization local `{field_path}` has no typed field in scope {} ({row_scope}); available fields {available:?}",
-                            binding.id.0, scope.0,
-                        ))
-                    })?;
-                    DocumentBindingTarget::ScopedField { scope, field }
-                }
-                ir::ViewBindingTarget::ExternalExpression { expression } => {
-                    let expression =
-                        self.compile_expression(*expression, &CompileContext::default(), None)?;
-                    DocumentBindingTarget::Expression { expression }
-                }
+                ir::ViewBindingTarget::Source { source } => DocumentBindingTarget::Source {
+                    source: SourceId(source.0),
+                },
             };
             result.push(DocumentViewBinding {
                 id: DocumentBindingId(binding.id.0),
@@ -1743,6 +1976,122 @@ impl<'a> DocumentCompiler<'a> {
         Ok(result)
     }
 
+    fn resolve_view_materialization_target(
+        &self,
+        binding_id: usize,
+        owner: ir::StaticOwnerId,
+        local: ir::MaterializationLocalId,
+        scope: ScopeId,
+        projection: &[String],
+    ) -> Result<DocumentBindingTarget, PlanError> {
+        let definition = self
+            .program
+            .scope_index
+            .locals
+            .iter()
+            .find(|definition| definition.owner == owner && definition.local == local)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "view binding {binding_id} references missing materialization local {owner}:{local:?}"
+                ))
+            })?;
+        if definition.row.map(|row| row.scope.0) != Some(scope.0) {
+            let owner = self
+                .program
+                .scope_index
+                .owners
+                .get(owner.as_usize())
+                .filter(|definition| definition.id == owner);
+            return Err(PlanError::new(format!(
+                "view binding {binding_id} materialization local {}:{} source row {:?} does not directly own scope {}; owner source row {:?}, target row {:?}, projection `{}`, members {:?}",
+                definition.owner,
+                local.0,
+                definition.row,
+                scope.0,
+                owner.and_then(|owner| owner.source_row),
+                owner.and_then(|owner| owner.target_row),
+                projection.join("."),
+                definition.members,
+            )));
+        }
+        if projection.is_empty() {
+            return Err(PlanError::new(format!(
+                "view binding {binding_id} has an empty materialization-local projection"
+            )));
+        }
+        let matches = definition
+            .members
+            .iter()
+            .filter(|member| projection.starts_with(&member.path))
+            .collect::<Vec<_>>();
+        let consumed = matches
+            .iter()
+            .map(|member| member.path.len())
+            .max()
+            .unwrap_or(0);
+        let candidates = matches
+            .into_iter()
+            .filter(|member| member.path.len() == consumed)
+            .collect::<Vec<_>>();
+        let [member] = candidates.as_slice() else {
+            let available = definition
+                .members
+                .iter()
+                .map(|member| member.path.join("."))
+                .collect::<Vec<_>>();
+            return Err(PlanError::new(format!(
+                "view binding {binding_id} materialization local {owner}:{} projection `{}` resolves to {} longest exact targets for type {:?}; available {available:?}",
+                local.0,
+                projection.join("."),
+                candidates.len(),
+                definition.item_type
+            )));
+        };
+        let target = member.target;
+        let rest = &projection[consumed..];
+        let ir::ErasedLocalMemberTarget::Field(mut field) = target else {
+            if !rest.is_empty() {
+                return Err(PlanError::new(format!(
+                    "view binding {binding_id} materialization resource member `{}` cannot project `{}` directly",
+                    member.path.join("."),
+                    rest.join(".")
+                )));
+            }
+            return Ok(match &target {
+                ir::ErasedLocalMemberTarget::Source(source) => DocumentBindingTarget::Source {
+                    source: SourceId(source.0),
+                },
+                ir::ErasedLocalMemberTarget::State(state) => DocumentBindingTarget::State {
+                    state: StateId(state.0),
+                },
+                ir::ErasedLocalMemberTarget::Field(_) => unreachable!(),
+            });
+        };
+        for name in rest {
+            let nested = self
+                .program
+                .scope_index
+                .fields
+                .iter()
+                .filter(|candidate| candidate.parent == Some(field) && candidate.name == *name)
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>();
+            let [next] = nested.as_slice() else {
+                return Err(PlanError::new(format!(
+                    "view binding {binding_id} materialization field {} projection `{}` resolves to {} exact child fields",
+                    field.0,
+                    projection.join("."),
+                    nested.len()
+                )));
+            };
+            field = *next;
+        }
+        Ok(DocumentBindingTarget::ScopedField {
+            scope,
+            field: FieldId(field.0),
+        })
+    }
+
     fn expression(&self, id: ir::ExecutableExprId) -> Result<&ir::ExecutableExpression, PlanError> {
         self.program
             .executable
@@ -1757,7 +2106,7 @@ impl<'a> DocumentCompiler<'a> {
     fn storage_binding_for_state_expression(
         &self,
         expression: ir::ExecutableExprId,
-    ) -> Result<Option<ir::StorageBindingId>, PlanError> {
+    ) -> Result<ir::ErasedBindingId, PlanError> {
         let state = self
             .program
             .executable
@@ -1771,13 +2120,13 @@ impl<'a> DocumentCompiler<'a> {
             })?;
         let matches = self
             .program
-            .storage
+            .scope_index
             .bindings
             .iter()
             .filter(|binding| {
                 matches!(
-                    binding.kind,
-                    ir::StorageBindingKind::State { executable, .. } if executable == state.id
+                    binding.target,
+                    ir::ErasedBindingTarget::State { executable, .. } if executable == state.id
                 )
             })
             .collect::<Vec<_>>();
@@ -1788,7 +2137,7 @@ impl<'a> DocumentCompiler<'a> {
                 matches.len()
             )));
         };
-        Ok(Some(binding.id))
+        Ok(binding.id)
     }
 
     fn expression_kind(
@@ -1796,32 +2145,6 @@ impl<'a> DocumentCompiler<'a> {
         id: ir::ExecutableExprId,
     ) -> Result<&ir::ExecutableExpressionKind, PlanError> {
         self.expression(id).map(|expression| &expression.kind)
-    }
-
-    fn source_group_exists(&self, path: &str) -> bool {
-        let prefix = format!("{path}.");
-        self.program
-            .sources
-            .iter()
-            .any(|source| source.path.starts_with(&prefix))
-    }
-
-    fn canonical_root_exists(&self, path: &str) -> bool {
-        if self.globals.contains_key(path)
-            || self.distributed_by_path.contains_key(path)
-            || self.source_group_exists(path)
-        {
-            return true;
-        }
-        let prefix = format!("{path}.");
-        self.globals.keys().any(|value| value.starts_with(&prefix))
-    }
-
-    fn resolve_scoped_field(&self, scope: ScopeId, path: &str) -> Option<FieldId> {
-        self.scoped_fields
-            .get(&(scope, path.to_owned()))
-            .copied()
-            .flatten()
     }
 
     fn source_list_id(&self, expression: DocumentExprId) -> Option<ListId> {
@@ -1902,29 +2225,6 @@ impl<'a> DocumentCompiler<'a> {
     }
 }
 
-fn insert_unique_scoped_field(
-    fields: &mut BTreeMap<(ScopeId, String), Option<FieldId>>,
-    scope: ScopeId,
-    name: &str,
-    field: FieldId,
-) {
-    fields
-        .entry((scope, name.to_owned()))
-        .and_modify(|existing| {
-            if *existing != Some(field) {
-                *existing = None;
-            }
-        })
-        .or_insert(Some(field));
-}
-
-fn list_for_semantic_path<'a>(
-    program: &'a ErasedProgram,
-    path: &str,
-) -> Option<&'a ir::ListMemory> {
-    program.lists.iter().find(|list| list.name == path)
-}
-
 fn synthetic_scope_id(owner: ir::StaticOwnerId) -> Result<ScopeId, PlanError> {
     let namespace = 1usize << (usize::BITS - 1);
     if owner.0 >= namespace {
@@ -1968,27 +2268,6 @@ fn stable_compiler_identity(
     Ok((u64::from(kind) << 56) | ((owner as u64) << 32) | compiler_id as u64)
 }
 
-fn pattern_binding_names(tokens: &[String]) -> Vec<String> {
-    let Some(open) = tokens.iter().position(|token| token == "[") else {
-        return Vec::new();
-    };
-    tokens
-        .iter()
-        .skip(open + 1)
-        .take_while(|token| token.as_str() != "]")
-        .filter(|token| {
-            token
-                .chars()
-                .next()
-                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-                && token
-                    .chars()
-                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
-        })
-        .cloned()
-        .collect()
-}
-
 fn joined_path(path: &str, projection: &[String]) -> String {
     if projection.is_empty() {
         path.to_owned()
@@ -2027,6 +2306,13 @@ fn document_constructor(function: &str) -> Option<DocumentConstructor> {
         "Scene/Element/map" => DocumentConstructor::SceneElementMap,
         _ => return None,
     })
+}
+
+fn document_element_context(context: ir::ExecutableCallContextId) -> DocumentElementContextId {
+    DocumentElementContextId {
+        call_instance: context.call_instance,
+        ordinal: context.ordinal,
+    }
 }
 
 fn constructor_argument_role(
@@ -2085,19 +2371,14 @@ fn document_builtin(function: &str) -> Option<DocumentBuiltin> {
         "Light/ambient" => DocumentBuiltin::LightAmbient,
         "Light/directional" => DocumentBuiltin::LightDirectional,
         "Light/spot" => DocumentBuiltin::LightSpot,
-        "List/any" => DocumentBuiltin::ListAny,
         "List/append" => DocumentBuiltin::ListAppend,
         "List/chunk" => DocumentBuiltin::ListChunk,
         "List/count" => DocumentBuiltin::ListCount,
-        "List/find" => DocumentBuiltin::ListFind,
         "List/get" => DocumentBuiltin::ListGet,
         "List/is_not_empty" => DocumentBuiltin::ListIsNotEmpty,
         "List/latest" => DocumentBuiltin::ListLatest,
         "List/length" => DocumentBuiltin::ListLength,
-        "List/map" => DocumentBuiltin::ListMap,
         "List/range" => DocumentBuiltin::ListRange,
-        "List/remove" => DocumentBuiltin::ListRemove,
-        "List/retain" => DocumentBuiltin::ListRetain,
         "List/sort_by" => DocumentBuiltin::ListSortBy,
         "List/sum" => DocumentBuiltin::ListSum,
         "Number/bit_width" => DocumentBuiltin::NumberBitWidth,
@@ -2162,6 +2443,68 @@ fn scalar_operation(operator: &str) -> Result<DocumentScalarOp, PlanError> {
     })
 }
 
+fn exact_block_binding_order<'a>(
+    program: &ErasedProgram,
+    bindings: &'a [ir::ExecutableBlockBinding],
+) -> Result<Vec<&'a ir::ExecutableBlockBinding>, PlanError> {
+    let declarations = bindings
+        .iter()
+        .map(|binding| binding.declaration)
+        .collect::<BTreeSet<_>>();
+    let mut dependencies = BTreeMap::new();
+    for binding in bindings {
+        let mut pending = vec![binding.value];
+        let mut visited = BTreeSet::new();
+        let mut local_dependencies = BTreeSet::new();
+        while let Some(expression_id) = pending.pop() {
+            if !visited.insert(expression_id) {
+                continue;
+            }
+            let expression = program
+                .executable
+                .expressions
+                .get(expression_id.as_usize())
+                .filter(|expression| expression.id == expression_id)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "BLOCK declaration {} reaches missing executable expression {expression_id}",
+                        binding.declaration.0
+                    ))
+                })?;
+            if let ir::ExecutableExpressionKind::LocalRead { declaration, .. } = expression.kind
+                && declarations.contains(&declaration)
+            {
+                local_dependencies.insert(declaration);
+            }
+            pending.extend(ir::executable_expression_children(&expression.kind));
+        }
+        dependencies.insert(binding.declaration, local_dependencies);
+    }
+
+    let mut emitted = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(bindings.len());
+    while ordered.len() < bindings.len() {
+        let Some(binding) = bindings.iter().find(|binding| {
+            !emitted.contains(&binding.declaration)
+                && dependencies[&binding.declaration]
+                    .iter()
+                    .all(|dependency| emitted.contains(dependency))
+        }) else {
+            let remaining = bindings
+                .iter()
+                .filter(|binding| !emitted.contains(&binding.declaration))
+                .map(|binding| binding.declaration.0)
+                .collect::<Vec<_>>();
+            return Err(PlanError::new(format!(
+                "erased BLOCK contains a lexical value cycle across declarations {remaining:?}"
+            )));
+        };
+        emitted.insert(binding.declaration);
+        ordered.push(binding);
+    }
+    Ok(ordered)
+}
+
 fn parse_decimal(value: &str) -> Result<(i64, u32), PlanError> {
     let value = value.replace('_', "");
     let (base, exponent) = value
@@ -2220,6 +2563,35 @@ fn value_class_for_type(ty: &Type) -> DocumentValueClass {
         | Type::Var(_)
         | Type::Unknown => DocumentValueClass::DynamicScalar,
     }
+}
+
+fn executable_debug_label(program: &ErasedProgram, id: ir::ExecutableExprId) -> String {
+    let Some(expression) = program.executable.expressions.get(id.as_usize()) else {
+        return format!("{id}:missing");
+    };
+    let kind = match &expression.kind {
+        ir::ExecutableExpressionKind::Call { name, .. } => format!("call {name}"),
+        ir::ExecutableExpressionKind::Materialize { materialization } => program
+            .materializations
+            .get(*materialization)
+            .map(|value| format!("contextual {:?}", value.operation))
+            .unwrap_or_else(|| format!("materialization {materialization}")),
+        ir::ExecutableExpressionKind::CanonicalRead {
+            path, projection, ..
+        } => format!("read {path}.{}", projection.join(".")),
+        ir::ExecutableExpressionKind::Hold { name, .. } => format!("HOLD {name}"),
+        ir::ExecutableExpressionKind::When { .. } => "WHEN".to_owned(),
+        ir::ExecutableExpressionKind::Latest { .. } => "LATEST".to_owned(),
+        ir::ExecutableExpressionKind::Then { .. } => "THEN".to_owned(),
+        ir::ExecutableExpressionKind::Project { fields, .. } => {
+            format!("project {}", fields.join("."))
+        }
+        ir::ExecutableExpressionKind::Record(_) => "record".to_owned(),
+        ir::ExecutableExpressionKind::Object(_) => "object".to_owned(),
+        ir::ExecutableExpressionKind::List { .. } => "list".to_owned(),
+        _ => format!("{:?}", std::mem::discriminant(&expression.kind)),
+    };
+    format!("{id}:{kind}")
 }
 
 fn record_value_class(

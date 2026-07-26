@@ -1,9 +1,9 @@
 use super::{
     ContextualMaterialization, DerivedListStorageIds, ErasedBinding, ErasedBindingTarget,
     ErasedFieldDef, ErasedReadTarget, ErasedScopeIndex, ExecutableCallableKind, ExecutableExprId,
-    ExecutableExpressionKind, ExecutableProgram, ExecutableStatement, ExecutableStatementId,
-    ExprId, FieldId, ListId, ListMemory, ScopeId, SemanticMemoryId, StateCell, StateId,
-    executable_expression_children, is_output_registry_value_path,
+    ExecutableExpressionKind, ExecutableLocalBindingId, ExecutableProgram, ExecutableStatement,
+    ExecutableStatementId, ExprId, FieldId, ListId, ListMemory, ScopeId, SemanticMemoryId,
+    StateCell, StateId, executable_expression_children, is_output_registry_value_path,
     reachable_executable_expression_ids,
 };
 use boon_typecheck::{
@@ -1975,7 +1975,7 @@ impl ExecutablePurityChecker<'_> {
     fn check(
         &mut self,
         expression_id: ExecutableExprId,
-        locals: &BTreeSet<DeclId>,
+        locals: &BTreeSet<ExecutableLocalBindingId>,
     ) -> Result<(), String> {
         if !self.active.insert(expression_id) {
             return Err(format!(
@@ -1990,7 +1990,7 @@ impl ExecutablePurityChecker<'_> {
     fn check_inner(
         &mut self,
         expression_id: ExecutableExprId,
-        locals: &BTreeSet<DeclId>,
+        locals: &BTreeSet<ExecutableLocalBindingId>,
     ) -> Result<(), String> {
         let expression = self
             .executable
@@ -2042,13 +2042,17 @@ impl ExecutablePurityChecker<'_> {
             ExecutableExpressionKind::CanonicalRead { path, .. } => Err(format!(
                 "migration transform at line {line} reads `{path}` outside its DRAIN inputs"
             )),
-            ExecutableExpressionKind::LocalRead { declaration, .. } => {
-                if locals.contains(declaration) {
+            ExecutableExpressionKind::LocalRead {
+                binding,
+                declaration,
+                ..
+            } => {
+                if locals.contains(binding) {
                     Ok(())
                 } else {
                     Err(format!(
-                        "migration transform at line {line} reads unbound local declaration {}",
-                        declaration.0
+                        "migration transform at line {line} reads unbound local binding {} for declaration {}",
+                        binding.0, declaration.0
                     ))
                 }
             }
@@ -2080,8 +2084,10 @@ impl ExecutablePurityChecker<'_> {
             ExecutableExpressionKind::Block { bindings, result } => {
                 let mut scoped = locals.clone();
                 for binding in bindings {
+                    scoped.insert(binding.id);
+                }
+                for binding in bindings {
                     self.check(binding.value, &scoped)?;
-                    scoped.insert(binding.declaration);
                 }
                 self.check(*result, &scoped)
             }

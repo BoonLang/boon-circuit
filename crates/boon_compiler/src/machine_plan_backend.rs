@@ -537,9 +537,10 @@ pub(crate) fn producer_function_ownership_seed(
         .fields
         .iter()
         .filter(|field| {
-            field
-                .static_owner
-                .is_some_and(|owner| owned_ir.contains(&owner))
+            !field.resource_only
+                && field
+                    .static_owner
+                    .is_some_and(|owner| owned_ir.contains(&owner))
         })
         .map(|field| plan_field_id(field.id))
         .collect::<Vec<_>>();
@@ -778,22 +779,51 @@ fn plan_source_owner(
     Ok(owner)
 }
 
-fn demand_plan(program: &ErasedProgram) -> Result<DemandPlan, PlanError> {
-    let demanded_outputs = program
-        .derived_values
+fn plan_source_row_projections(
+    program: &ErasedProgram,
+    source: &ir::SourcePort,
+) -> Result<Vec<SourceRowProjection>, PlanError> {
+    let mut projections = program
+        .scope_index
+        .row_source_projections
         .iter()
-        .filter(|derived| !derived.indexed)
-        .filter(|derived| {
-            !executable_statement_is_source_group(program, derived.executable_statement_id)
+        .filter_map(|projection| {
+            (projection.source == source.id).then(|| SourceRowProjection {
+                list: plan_list_id(projection.row.list),
+                path: projection.path.clone(),
+            })
         })
-        .filter_map(|derived| match derived_output_ref(program, derived) {
-            ValueRef::Field(field_id) => Some(field_id),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+        .collect::<Vec<_>>();
+    projections.sort();
+    projections.dedup();
+    if projections
+        .iter()
+        .any(|projection| projection.path.is_empty())
+    {
+        return Err(PlanError::new(format!(
+            "source `{}` has an empty row projection",
+            source.path
+        )));
+    }
+    Ok(projections)
+}
+
+fn demand_plan(
+    program: &ErasedProgram,
+    scalar_fields: &ScalarFieldCatalog,
+) -> Result<DemandPlan, PlanError> {
+    let mut demanded_outputs = BTreeSet::new();
+    for derived in &program.derived_values {
+        if derived.indexed {
+            continue;
+        }
+        if let ValueRef::Field(field_id) = derived_output_ref(derived, scalar_fields)? {
+            demanded_outputs.insert(field_id);
+        }
+    }
     let mut outputs_by_producer = BTreeMap::<ir::ExecutableExprId, BTreeSet<FieldId>>::new();
     for derived in &program.derived_values {
-        let ValueRef::Field(field) = derived_output_ref(program, derived) else {
+        let ValueRef::Field(field) = derived_output_ref(derived, scalar_fields)? else {
             continue;
         };
         if !demanded_outputs.contains(&field) {
@@ -1296,47 +1326,6 @@ fn host_port_plans(
             }),
         })
         .collect()
-}
-
-fn executable_statement_is_source_group(
-    program: &ErasedProgram,
-    statement_id: ir::ExecutableStatementId,
-) -> bool {
-    let Some(statement) = program
-        .executable
-        .statements
-        .iter()
-        .find(|statement| statement.id == statement_id)
-    else {
-        return false;
-    };
-    !statement.children.is_empty()
-        && statement.children.iter().all(|child_id| {
-            let Some(child) = program
-                .executable
-                .statements
-                .iter()
-                .find(|statement| statement.id == *child_id)
-            else {
-                return false;
-            };
-            match child.kind {
-                ir::ExecutableStatementKind::Source { .. } => true,
-                ir::ExecutableStatementKind::Field { .. } => {
-                    executable_statement_is_source_group(program, *child_id)
-                }
-                _ => child.value.is_some_and(|expression| {
-                    matches!(
-                        program
-                            .executable
-                            .expressions
-                            .get(expression.as_usize())
-                            .map(|expression| &expression.kind),
-                        Some(ir::ExecutableExpressionKind::Delimiter)
-                    )
-                }),
-            }
-        })
 }
 
 fn source_payload_schema_from_ir(
@@ -1860,25 +1849,25 @@ fn plan_row_expression_static_data(
 
 fn state_only_authority_map_is_noop(
     expression: Option<&PlanDerivedExpression>,
+    materialization: Option<&PlanListMaterialization>,
     arena: &PlanRowExpressionArena,
 ) -> Result<bool, PlanError> {
-    let Some(PlanDerivedExpression::MaterializeList {
-        target_list,
-        authority_source_list: Some(authority_source_list),
-        fields,
-        row_field_copies,
-        expression,
-        ..
-    }) = expression
+    let (
+        Some(PlanDerivedExpression::RowExpression { expression }),
+        Some(PlanListMaterialization {
+            target_list,
+            authority_source_list: Some(authority_source_list),
+            fields,
+            row_field_copies,
+            ..
+        }),
+    ) = (expression, materialization)
     else {
         return Ok(false);
     };
     if target_list != authority_source_list || !fields.is_empty() || !row_field_copies.is_empty() {
         return Ok(false);
     }
-    let PlanDerivedExpression::RowExpression { expression } = expression.as_ref() else {
-        return Ok(false);
-    };
     let PlanRowExpressionNode::ContextualCollection {
         operation: PlanContextualOperationKind::Map,
         source,
@@ -2638,7 +2627,8 @@ fn durable_migration_source_list_plan(
         .iter()
         .find(|list| list.id == list_id)
         .ok_or_else(|| PlanError::new("migration source list backing is absent"))?;
-    let index = ValueIndex::new(program, &BTreeMap::new(), &BTreeMap::new());
+    let scalar_fields = ScalarFieldCatalog::new(program)?;
+    let index = ValueIndex::new(program, &BTreeMap::new(), &BTreeMap::new(), &scalar_fields)?;
     let mut arena = PlanRowExpressionArena::new();
     let mut constants = Vec::new();
     let mut list_indexes = Vec::new();
@@ -2817,8 +2807,8 @@ struct ExecutableMigrationExpressionLowerer<'a> {
     program: &'a ErasedProgram,
     drain_inputs: BTreeMap<boon_typecheck::CheckedExprId, MigrationInputId>,
     active_expressions: BTreeSet<ir::ExecutableExprId>,
-    lexical_bindings: Vec<BTreeMap<boon_typecheck::DeclId, ir::ExecutableExprId>>,
-    active_lexical_declarations: BTreeSet<boon_typecheck::DeclId>,
+    lexical_bindings: Vec<BTreeMap<ir::ExecutableLocalBindingId, ir::ExecutableExprId>>,
+    active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
 }
 
 impl ExecutableMigrationExpressionLowerer<'_> {
@@ -2931,6 +2921,7 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                 name,
                 arguments,
                 contexts,
+                ..
             } => {
                 if !contexts.is_empty() {
                     return Err(PlanError::new(format!(
@@ -2992,6 +2983,7 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                 })
             }
             ir::ExecutableExpressionKind::LocalRead {
+                binding,
                 declaration,
                 projection,
             } => {
@@ -2999,21 +2991,21 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                     .lexical_bindings
                     .iter()
                     .rev()
-                    .find_map(|bindings| bindings.get(&declaration).copied())
+                    .find_map(|bindings| bindings.get(&binding).copied())
                     .ok_or_else(|| {
                         PlanError::new(format!(
-                            "migration expression {expr_id} reads inactive lexical declaration {}",
-                            declaration.0
+                            "migration expression {expr_id} reads inactive lexical binding {} for declaration {}",
+                            binding.0, declaration.0
                         ))
                     })?;
-                if !self.active_lexical_declarations.insert(declaration) {
+                if !self.active_lexical_bindings.insert(binding) {
                     return Err(PlanError::new(format!(
-                        "migration lexical declaration {} forms a value cycle",
-                        declaration.0
+                        "migration lexical binding {} for declaration {} forms a value cycle",
+                        binding.0, declaration.0
                     )));
                 }
                 let lowered = self.lower_expr(value);
-                self.active_lexical_declarations.remove(&declaration);
+                self.active_lexical_bindings.remove(&binding);
                 let lowered = lowered?;
                 Ok(if projection.is_empty() {
                     lowered
@@ -3028,7 +3020,7 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                 self.lexical_bindings.push(
                     bindings
                         .into_iter()
-                        .map(|binding| (binding.declaration, binding.value))
+                        .map(|binding| (binding.id, binding.value))
                         .collect(),
                 );
                 let lowered = self.lower_expr(result);
@@ -3378,7 +3370,7 @@ fn migration_recipe(
                     drain_inputs,
                     active_expressions: BTreeSet::new(),
                     lexical_bindings: Vec::new(),
-                    active_lexical_declarations: BTreeSet::new(),
+                    active_lexical_bindings: BTreeSet::new(),
                 };
                 MigrationTransformPlan::Expression {
                     root: lowerer.lower_expr(root)?,
@@ -3941,11 +3933,13 @@ pub(crate) fn compile_typed_program_with_distributed_context(
     let effects = effect_contracts(program)?;
     let mut effect_outbox = effect_outbox_schemas(&effects)?;
     let authority_field_ids = list_authority_field_ids(program);
+    let scalar_fields = ScalarFieldCatalog::new(program)?;
     let index = ValueIndex::new(
         program,
         &distributed.expression_refs,
         &distributed.path_refs,
-    );
+        &scalar_fields,
+    )?;
     let mut next_op = 0usize;
     let mut unresolved_refs = BTreeSet::new();
 
@@ -3961,6 +3955,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 path: source.path.clone(),
                 scoped: source.scoped,
                 scope_id: plan_scope_id(source.scope_id),
+                row_projections: plan_source_row_projections(program, source)?,
                 interval_ms: source.interval_ms,
                 payload_schema: source_payload_schema_from_ir(program, source)?,
             })
@@ -4146,7 +4141,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
     let mut derived_ops = Vec::new();
     let mut materialized_row_outputs = BTreeSet::new();
     for derived in &program.derived_values {
-        let derived_output = derived_output_ref(program, derived);
+        let derived_output = derived_output_ref(derived, &scalar_fields)?;
         if projection_owned_outputs.contains(&derived_output) {
             continue;
         }
@@ -4175,6 +4170,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
             &mut list_indexes,
             &mut unresolved_refs,
         )?;
+        let mut materialization = None;
         if unresolved == 0
             && let Some(expression) = expression.as_mut()
         {
@@ -4262,6 +4258,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                             local: field.local,
                             expression: field.expression,
                         }),
+                        materialization: None,
                     },
                     field.inputs,
                     Some(ValueRef::Field(field.output)),
@@ -4293,6 +4290,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                                 local: field.local,
                                 expression: field.expression,
                             }),
+                            materialization: None,
                         },
                         field.inputs,
                         Some(ValueRef::Field(field.output)),
@@ -4363,16 +4361,20 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                     )?;
                     migration_source.filter(|source| row_sources.contains(source))
                 };
-            expression = Some(PlanDerivedExpression::MaterializeList {
+            materialization = Some(PlanListMaterialization {
                 target_list,
                 authority_source_list,
                 fields,
                 row_field_copies,
                 value_list_authorities,
-                expression: Box::new(inner),
             });
+            expression = Some(inner);
         }
-        if state_only_authority_map_is_noop(expression.as_ref(), &row_expressions)? {
+        if state_only_authority_map_is_noop(
+            expression.as_ref(),
+            materialization.as_ref(),
+            &row_expressions,
+        )? {
             continue;
         }
         derived_ops.push(op(
@@ -4381,6 +4383,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 derived_kind: plan_derived_kind_from_ir(&derived.kind),
                 startup_recompute: derived.startup_recompute,
                 expression,
+                materialization,
             },
             inputs,
             Some(derived_output),
@@ -4909,7 +4912,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         outputs,
         host_ports,
         list_indexes,
-        demand: demand_plan(program)?,
+        demand: demand_plan(program, &scalar_fields)?,
         document,
         row_expressions,
         constants,
@@ -4928,7 +4931,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
             unresolved_state_update_count,
         },
         delta_plan: DeltaPlan {
-            deltas: delta_routes(program),
+            deltas: delta_routes(program, &scalar_fields)?,
         },
         capability_summary: CapabilitySummary {
             executable: cpu_plan_executor_complete,
@@ -5012,10 +5015,10 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         },
         regions,
     };
-    validate_resource_only_fields_excluded(program, &plan)?;
     if !distributed_row_linking_pending(distributed) {
         finalize_machine_plan_row_expressions(&mut plan)?;
     }
+    validate_resource_only_fields_excluded(program, &plan)?;
     Ok(plan)
 }
 
@@ -5033,17 +5036,9 @@ fn collect_derived_row_expression_roots(
     roots: &mut Vec<PlanRowExpressionId>,
 ) {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. }
-        | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-            collect_derived_row_expression_roots(expression, roots);
-        }
         PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
             roots.push(*default);
             roots.extend(arms.iter().map(|arm| arm.value));
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            collect_derived_row_expression_roots(left, roots);
-            collect_derived_row_expression_roots(right, roots);
         }
         PlanDerivedExpression::RowExpression { expression }
         | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
@@ -5135,19 +5130,11 @@ fn remap_derived_row_expression_roots(
         }
     };
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. }
-        | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-            remap_derived_row_expression_roots(expression, replacements);
-        }
         PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
             remap(default);
             for arm in arms {
                 remap(&mut arm.value);
             }
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            remap_derived_row_expression_roots(left, replacements);
-            remap_derived_row_expression_roots(right, replacements);
         }
         PlanDerivedExpression::RowExpression { expression }
         | PlanDerivedExpression::MaterializedRowField { expression, .. } => remap(expression),
@@ -5240,7 +5227,51 @@ fn remap_machine_plan_row_expression_roots(
     }
 }
 
-fn validate_resource_only_fields_excluded(
+fn validate_resource_value_ref(
+    value: &ValueRef,
+    resource_fields: &BTreeSet<FieldId>,
+) -> Result<(), PlanError> {
+    if let ValueRef::Field(field) = value
+        && resource_fields.contains(field)
+    {
+        return Err(PlanError::new(format!(
+            "resource-only FieldId {} entered a final MachinePlan ValueRef",
+            field.0
+        )));
+    }
+    Ok(())
+}
+
+fn validate_resource_derived_expression(
+    expression: &PlanDerivedExpression,
+    resource_fields: &BTreeSet<FieldId>,
+) -> Result<(), PlanError> {
+    match expression {
+        PlanDerivedExpression::SourceKeyTextTrimNonEmpty { state, .. } => {
+            validate_resource_value_ref(state, resource_fields)
+        }
+        PlanDerivedExpression::SourceEventTransform { arms, .. } => {
+            for arm in arms {
+                validate_resource_value_ref(&arm.trigger, resource_fields)?;
+            }
+            Ok(())
+        }
+        PlanDerivedExpression::BoolNot { input } => {
+            validate_resource_value_ref(input, resource_fields)
+        }
+        PlanDerivedExpression::NumberCompareConst { left, .. } => {
+            validate_resource_value_ref(left, resource_fields)
+        }
+        PlanDerivedExpression::ValueCompare { left, right, .. } => {
+            validate_resource_value_ref(left, resource_fields)?;
+            validate_resource_value_ref(right, resource_fields)
+        }
+        PlanDerivedExpression::RowExpression { .. }
+        | PlanDerivedExpression::MaterializedRowField { .. } => Ok(()),
+    }
+}
+
+pub(crate) fn validate_resource_only_fields_excluded(
     program: &ErasedProgram,
     plan: &MachinePlan,
 ) -> Result<(), PlanError> {
@@ -5253,6 +5284,52 @@ fn validate_resource_only_fields_excluded(
         .collect::<BTreeSet<_>>();
     if resource_fields.is_empty() {
         return Ok(());
+    }
+
+    if let Some(distributed) = &plan.distributed_endpoint {
+        for export in &distributed.endpoint.value_exports {
+            validate_resource_value_ref(&export.value, &resource_fields)?;
+        }
+        for call in &distributed.endpoint.remote_call_sites {
+            for arm in &call.invocation_arms {
+                validate_resource_value_ref(&arm.trigger, &resource_fields)?;
+            }
+        }
+    }
+    for instance in &plan.producer_function_instances {
+        validate_resource_value_ref(&instance.result, &resource_fields)?;
+        for field in &instance.ownership.fields {
+            if resource_fields.contains(field) {
+                return Err(PlanError::new(format!(
+                    "resource-only FieldId {} entered producer scalar ownership",
+                    field.0
+                )));
+            }
+        }
+    }
+    for output in &plan.outputs {
+        match &output.value {
+            OutputValueRef::RetainedVisual { .. } => {}
+            OutputValueRef::RuntimeValue { value, list_fields } => {
+                validate_resource_value_ref(value, &resource_fields)?;
+                for field in list_fields {
+                    if resource_fields.contains(&field.field_id) {
+                        return Err(PlanError::new(format!(
+                            "resource-only FieldId {} entered output list metadata",
+                            field.field_id.0
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    for (_, expression) in plan.row_expressions.iter() {
+        if let PlanRowExpressionNode::Field { input } = expression {
+            validate_resource_value_ref(input, &resource_fields)?;
+        }
+    }
+    for delta in &plan.delta_plan.deltas {
+        validate_resource_value_ref(&delta.output, &resource_fields)?;
     }
 
     for slot in &plan.storage_layout.list_slots {
@@ -5281,36 +5358,14 @@ fn validate_resource_only_fields_excluded(
         Ok(())
     }
 
-    fn validate_derived_copies(
-        expression: &PlanDerivedExpression,
+    fn validate_materialization_copies(
+        materialization: &PlanListMaterialization,
         resource_fields: &BTreeSet<FieldId>,
     ) -> Result<(), PlanError> {
-        match expression {
-            PlanDerivedExpression::MaterializeList {
-                row_field_copies,
-                expression,
-                ..
-            } => {
-                for copy in row_field_copies {
-                    validate_copy(copy, resource_fields)?;
-                }
-                validate_derived_copies(expression, resource_fields)
-            }
-            PlanDerivedExpression::BoolAnd { left, right } => {
-                validate_derived_copies(left, resource_fields)?;
-                validate_derived_copies(right, resource_fields)
-            }
-            PlanDerivedExpression::BoolNotExpression { input } => {
-                validate_derived_copies(input, resource_fields)
-            }
-            PlanDerivedExpression::SourceEventTransform { .. }
-            | PlanDerivedExpression::RowExpression { .. }
-            | PlanDerivedExpression::MaterializedRowField { .. }
-            | PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
-            | PlanDerivedExpression::BoolNot { .. }
-            | PlanDerivedExpression::NumberCompareConst { .. }
-            | PlanDerivedExpression::ValueCompare { .. } => Ok(()),
+        for copy in &materialization.row_field_copies {
+            validate_copy(copy, resource_fields)?;
         }
+        Ok(())
     }
 
     let mut invalid_resource_field = None;
@@ -5333,26 +5388,62 @@ fn validate_resource_only_fields_excluded(
 
     for region in &plan.regions {
         for op in &region.ops {
+            for input in &op.inputs {
+                validate_resource_value_ref(input, &resource_fields)?;
+            }
+            if let Some(output) = &op.output {
+                validate_resource_value_ref(output, &resource_fields)?;
+            }
             match &op.kind {
                 PlanOpKind::DerivedValue {
-                    expression: Some(expression),
+                    materialization: Some(materialization),
+                    expression,
                     ..
-                } => validate_derived_copies(expression, &resource_fields)?,
+                } => {
+                    validate_materialization_copies(materialization, &resource_fields)?;
+                    if let Some(expression) = expression {
+                        validate_resource_derived_expression(expression, &resource_fields)?;
+                    }
+                }
+                PlanOpKind::DerivedValue {
+                    materialization: None,
+                    expression,
+                    ..
+                } => {
+                    if let Some(expression) = expression {
+                        validate_resource_derived_expression(expression, &resource_fields)?;
+                    }
+                }
+                PlanOpKind::StateUpdate {
+                    trigger, effect, ..
+                } => {
+                    validate_resource_value_ref(trigger, &resource_fields)?;
+                    if let Some(effect) = effect {
+                        match &effect.result {
+                            EffectResultRoute::Target { target, .. } => {
+                                validate_resource_value_ref(target, &resource_fields)?;
+                            }
+                        }
+                    }
+                }
                 PlanOpKind::ListMutation { mutation } => match mutation {
                     PlanListMutation::Append(append) => {
+                        validate_resource_value_ref(&append.trigger, &resource_fields)?;
                         for copy in &append.row_field_copies {
                             validate_copy(copy, &resource_fields)?;
                         }
                     }
-                    PlanListMutation::Remove(_) => {}
+                    PlanListMutation::Remove(remove) => {
+                        validate_resource_value_ref(&remove.trigger, &resource_fields)?;
+                    }
                 },
-                PlanOpKind::SourceRoute
-                | PlanOpKind::DerivedValue {
-                    expression: None, ..
-                }
-                | PlanOpKind::StateUpdate { .. }
-                | PlanOpKind::ListProjection { .. }
-                | PlanOpKind::DependencyEdge => {}
+                PlanOpKind::ListProjection { projection } => match projection {
+                    PlanListProjection::Chunk { .. } | PlanListProjection::Unknown { .. } => {}
+                    PlanListProjection::ChunkValue { source, .. } => {
+                        validate_resource_value_ref(source, &resource_fields)?;
+                    }
+                },
+                PlanOpKind::SourceRoute | PlanOpKind::DependencyEdge => {}
             }
         }
     }
@@ -5580,9 +5671,10 @@ fn validate_machine_plan_row_expression_reachability(plan: &MachinePlan) -> Resu
 
 pub(crate) fn distributed_exportable_values(
     program: &ErasedProgram,
-) -> BTreeMap<String, (boon_typecheck::FlowType, ValueRef)> {
-    let index = ValueIndex::new(program, &BTreeMap::new(), &BTreeMap::new());
-    program
+) -> Result<BTreeMap<String, (boon_typecheck::FlowType, ValueRef)>, PlanError> {
+    let scalar_fields = ScalarFieldCatalog::new(program)?;
+    let index = ValueIndex::new(program, &BTreeMap::new(), &BTreeMap::new(), &scalar_fields)?;
+    Ok(program
         .named_value_types
         .entries
         .iter()
@@ -5599,7 +5691,7 @@ pub(crate) fn distributed_exportable_values(
             )
             .then(|| (entry.path.clone(), (entry.flow_type.clone(), value_ref)))
         })
-        .collect()
+        .collect())
 }
 
 pub(crate) fn lower_distributed_root_expression(
@@ -5610,11 +5702,13 @@ pub(crate) fn lower_distributed_root_expression(
     constants: &mut Vec<PlanConstant>,
     distributed: &DistributedMachineContext,
 ) -> Result<PlanRowExpressionId, PlanError> {
+    let scalar_fields = ScalarFieldCatalog::new(program)?;
     let index = ValueIndex::new(
         program,
         &distributed.expression_refs,
         &distributed.path_refs,
-    );
+        &scalar_fields,
+    )?;
     program
         .executable
         .expressions
@@ -5645,11 +5739,13 @@ pub(crate) fn lower_distributed_invocation_gate(
     constants: &mut Vec<PlanConstant>,
     distributed: &DistributedMachineContext,
 ) -> Result<PlanRowExpressionId, PlanError> {
+    let scalar_fields = ScalarFieldCatalog::new(program)?;
     let index = ValueIndex::new(
         program,
         &distributed.expression_refs,
         &distributed.path_refs,
-    );
+        &scalar_fields,
+    )?;
     let mut inputs = Vec::new();
     ExecutableRowLowerer::new(program, &index, arena, constants, &mut inputs)
         .with_event_trigger(trigger)
@@ -6966,9 +7062,6 @@ fn strip_materialized_non_value_fields(
     arena: &mut PlanRowExpressionArena,
 ) -> Result<(), PlanError> {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => {
-            strip_materialized_non_value_fields(expression, omitted_fields, arena)?;
-        }
         PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
             *default = strip_materialized_non_value_row_fields(arena, *default, omitted_fields)?;
             for arm in arms {
@@ -6980,13 +7073,6 @@ fn strip_materialized_non_value_fields(
         | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
             *expression =
                 strip_materialized_non_value_row_fields(arena, *expression, omitted_fields)?;
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            strip_materialized_non_value_fields(left, omitted_fields, arena)?;
-            strip_materialized_non_value_fields(right, omitted_fields, arena)?;
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            strip_materialized_non_value_fields(input, omitted_fields, arena)?;
         }
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
         | PlanDerivedExpression::BoolNot { .. }
@@ -7054,9 +7140,6 @@ fn derived_expression_reads_state(
         })
     };
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => {
-            return derived_expression_reads_state(expression, state, arena);
-        }
         PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
             visit_row(*default)?;
             for arm in arms {
@@ -7065,13 +7148,6 @@ fn derived_expression_reads_state(
         }
         PlanDerivedExpression::RowExpression { expression }
         | PlanDerivedExpression::MaterializedRowField { expression, .. } => visit_row(*expression)?,
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            return Ok(derived_expression_reads_state(left, state, arena)?
-                || derived_expression_reads_state(right, state, arena)?);
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            return derived_expression_reads_state(input, state, arena);
-        }
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty { state: input, .. }
         | PlanDerivedExpression::BoolNot { input } => {
             found |= *input == ValueRef::State(state);
@@ -7092,9 +7168,6 @@ fn collect_materialized_list_field_names(
     arena: &PlanRowExpressionArena,
 ) -> Result<(), PlanError> {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => {
-            collect_materialized_list_field_names(expression, names, arena)?;
-        }
         PlanDerivedExpression::RowExpression { expression }
         | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
             collect_materialized_list_row_names(arena, *expression, names)?;
@@ -7104,13 +7177,6 @@ fn collect_materialized_list_field_names(
             for arm in arms {
                 collect_materialized_list_row_names(arena, arm.value, names)?;
             }
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            collect_materialized_list_field_names(left, names, arena)?;
-            collect_materialized_list_field_names(right, names, arena)?;
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            collect_materialized_list_field_names(input, names, arena)?;
         }
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
         | PlanDerivedExpression::BoolNot { .. }
@@ -7155,14 +7221,6 @@ fn lower_bounded_list_access(
     indexes: &mut Vec<PlanListIndex>,
 ) -> Result<(), PlanError> {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. }
-        | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-            lower_bounded_list_access(program, value_index, arena, constants, expression, indexes)
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            lower_bounded_list_access(program, value_index, arena, constants, left, indexes)?;
-            lower_bounded_list_access(program, value_index, arena, constants, right, indexes)
-        }
         PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
             *default = lower_bounded_row_access(
                 program,
@@ -8787,9 +8845,6 @@ fn collect_materialized_row_sources(
     sources: &mut BTreeSet<ListId>,
 ) -> Result<(), PlanError> {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => {
-            collect_materialized_row_sources(expression, arena, list_indexes, sources)?;
-        }
         PlanDerivedExpression::RowExpression { expression }
         | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
             collect_row_result_sources(arena, *expression, list_indexes, sources)?;
@@ -8799,13 +8854,6 @@ fn collect_materialized_row_sources(
             for arm in arms {
                 collect_row_result_sources(arena, arm.value, list_indexes, sources)?;
             }
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            collect_materialized_row_sources(left, arena, list_indexes, sources)?;
-            collect_materialized_row_sources(right, arena, list_indexes, sources)?;
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            collect_materialized_row_sources(input, arena, list_indexes, sources)?;
         }
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
         | PlanDerivedExpression::BoolNot { .. }
@@ -8822,10 +8870,6 @@ fn collect_materialized_iteration_sources(
     sources: &mut BTreeSet<ListId>,
 ) -> Result<(), PlanError> {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. }
-        | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-            collect_materialized_iteration_sources(expression, arena, list_indexes, sources)?;
-        }
         PlanDerivedExpression::RowExpression { expression }
         | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
             collect_row_iteration_sources(arena, *expression, list_indexes, sources)?;
@@ -8835,10 +8879,6 @@ fn collect_materialized_iteration_sources(
             for arm in arms {
                 collect_row_iteration_sources(arena, arm.value, list_indexes, sources)?;
             }
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            collect_materialized_iteration_sources(left, arena, list_indexes, sources)?;
-            collect_materialized_iteration_sources(right, arena, list_indexes, sources)?;
         }
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
         | PlanDerivedExpression::BoolNot { .. }
@@ -8894,10 +8934,6 @@ fn derived_expression_reads_authority_list(
     arena: &PlanRowExpressionArena,
 ) -> Result<bool, PlanError> {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. }
-        | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-            derived_expression_reads_authority_list(expression, list_id, arena)
-        }
         PlanDerivedExpression::RowExpression { expression }
         | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
             arena.reads_authority_list(*expression, list_id)
@@ -8913,10 +8949,6 @@ fn derived_expression_reads_authority_list(
             }
             Ok(false)
         }
-        PlanDerivedExpression::BoolAnd { left, right } => Ok(
-            derived_expression_reads_authority_list(left, list_id, arena)?
-                || derived_expression_reads_authority_list(right, list_id, arena)?,
-        ),
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
         | PlanDerivedExpression::BoolNot { .. }
         | PlanDerivedExpression::NumberCompareConst { .. }
@@ -9472,8 +9504,8 @@ struct ExecutableRowLowerer<'a> {
     active_state_update: Option<ir::ExecutableStateId>,
     state_initializer: Option<ir::StateId>,
     active_materialization_owners: Vec<PlanStaticOwnerId>,
-    lexical_bindings: Vec<BTreeMap<boon_typecheck::DeclId, ir::ExecutableExprId>>,
-    active_lexical_declarations: BTreeSet<boon_typecheck::DeclId>,
+    lexical_bindings: Vec<BTreeMap<ir::ExecutableLocalBindingId, ir::ExecutableExprId>>,
+    active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
     bindings: BTreeMap<ir::ExecutableExprId, PlanRowExpressionId>,
     memo: BTreeMap<
         (
@@ -9505,7 +9537,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             state_initializer: None,
             active_materialization_owners: Vec::new(),
             lexical_bindings: Vec::new(),
-            active_lexical_declarations: BTreeSet::new(),
+            active_lexical_bindings: BTreeSet::new(),
             bindings: BTreeMap::new(),
             memo: BTreeMap::new(),
         }
@@ -10155,6 +10187,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 name,
                 arguments,
                 contexts,
+                ..
             } => {
                 if !contexts.is_empty() {
                     return Err(PlanError::new(format!(
@@ -10405,7 +10438,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             ir::ExecutableExpressionKind::Block { bindings, result } => {
                 let bindings = bindings
                     .into_iter()
-                    .map(|binding| (binding.declaration, binding.value))
+                    .map(|binding| (binding.id, binding.value))
                     .collect();
                 self.lexical_bindings.push(bindings);
                 let value = self.lower_scoped(result, owner);
@@ -10694,6 +10727,7 @@ impl<'a> ExecutableRowLowerer<'a> {
 
     fn lower_local_read(
         &mut self,
+        binding: ir::ExecutableLocalBindingId,
         declaration: boon_typecheck::DeclId,
         projection: &[String],
         inherited_owner: Option<PlanStaticOwnerId>,
@@ -10702,21 +10736,21 @@ impl<'a> ExecutableRowLowerer<'a> {
             .lexical_bindings
             .iter()
             .rev()
-            .find_map(|bindings| bindings.get(&declaration).copied())
+            .find_map(|bindings| bindings.get(&binding).copied())
             .ok_or_else(|| {
                 PlanError::new(format!(
-                    "lexical declaration {} has no active erased BLOCK binding",
-                    declaration.0
+                    "lexical binding {} for declaration {} has no active erased BLOCK binding",
+                    binding.0, declaration.0
                 ))
             })?;
-        if !self.active_lexical_declarations.insert(declaration) {
+        if !self.active_lexical_bindings.insert(binding) {
             return Err(PlanError::new(format!(
-                "lexical declaration {} forms an executable value cycle",
-                declaration.0
+                "lexical binding {} for declaration {} forms an executable value cycle",
+                binding.0, declaration.0
             )));
         }
         let lowered = self.lower_scoped(value, inherited_owner);
-        self.active_lexical_declarations.remove(&declaration);
+        self.active_lexical_bindings.remove(&binding);
         let mut lowered = lowered?;
         for field in projection {
             lowered = self.project_field(lowered, field.clone())?;
@@ -10823,6 +10857,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 Ok(value)
             }
             ir::ErasedReadTarget::Local {
+                binding,
                 declaration,
                 value,
                 projection,
@@ -10831,11 +10866,11 @@ impl<'a> ExecutableRowLowerer<'a> {
                     .lexical_bindings
                     .iter()
                     .rev()
-                    .find_map(|bindings| bindings.get(declaration).copied())
+                    .find_map(|bindings| bindings.get(binding).copied())
                     .ok_or_else(|| {
                         PlanError::new(format!(
-                            "lexical declaration {} has no active erased BLOCK binding",
-                            declaration.0
+                            "lexical binding {} for declaration {} has no active erased BLOCK binding",
+                            binding.0, declaration.0
                         ))
                     })?;
                 if active != *value {
@@ -10844,7 +10879,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                         declaration.0
                     )));
                 }
-                self.lower_local_read(*declaration, projection, inherited_owner)
+                self.lower_local_read(*binding, *declaration, projection, inherited_owner)
             }
             ir::ErasedReadTarget::ExternalValue { reference } => {
                 let reference = self
@@ -11175,11 +11210,19 @@ impl<'a> ExecutableRowLowerer<'a> {
         fields
             .into_iter()
             .filter(|field| {
-                !field.resource_only
-                    && !self.program.scope_index.bindings.iter().any(|binding| {
-                        matches!(binding.target, ir::ErasedBindingTarget::Source { .. })
-                            && binding.producer == field.value
-                    })
+                !self.program.scope_index.fields.iter().any(|stored| {
+                    stored.resource_only
+                        && stored.producer == Some(field.value)
+                        && stored.declaration == field.declaration
+                        && stored.name == field.name
+                        && stored
+                            .static_owner
+                            .map(|stored_owner| PlanStaticOwnerId(stored_owner.as_usize()))
+                            == owner
+                }) && !self.program.scope_index.bindings.iter().any(|binding| {
+                    matches!(binding.target, ir::ErasedBindingTarget::Source { .. })
+                        && binding.producer == field.value
+                })
             })
             .map(|field| {
                 Ok(PlanRowObjectField {
@@ -12110,9 +12153,6 @@ fn retarget_derived_invocation_results(
     diagnostic: &str,
 ) -> Result<Vec<ValueRef>, PlanError> {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => {
-            retarget_derived_invocation_results(arena, expression, invocation_sources, diagnostic)
-        }
         PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
             if !invocation_result_sources_in_row(arena, *default, invocation_sources)?.is_empty() {
                 return Err(PlanError::new(format!(
@@ -12144,20 +12184,6 @@ fn retarget_derived_invocation_results(
                     "{diagnostic} reads an asynchronous distributed invocation result outside an event-owned continuation"
                 )))
             }
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            let mut triggers =
-                retarget_derived_invocation_results(arena, left, invocation_sources, diagnostic)?;
-            triggers.extend(retarget_derived_invocation_results(
-                arena,
-                right,
-                invocation_sources,
-                diagnostic,
-            )?);
-            Ok(triggers)
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            retarget_derived_invocation_results(arena, input, invocation_sources, diagnostic)
         }
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
             source_id, state, ..
@@ -12446,7 +12472,10 @@ fn unique_value_refs(value_refs: Vec<ValueRef>) -> Vec<ValueRef> {
         .collect()
 }
 
-fn delta_routes(program: &ErasedProgram) -> Vec<DeltaRoute> {
+fn delta_routes(
+    program: &ErasedProgram,
+    scalar_fields: &ScalarFieldCatalog,
+) -> Result<Vec<DeltaRoute>, PlanError> {
     let mut outputs = BTreeSet::new();
     for state in &program.state_cells {
         outputs.insert(ValueRef::State(plan_state_id(state.id)));
@@ -12455,31 +12484,67 @@ fn delta_routes(program: &ErasedProgram) -> Vec<DeltaRoute> {
         outputs.insert(ValueRef::List(plan_list_id(list.id)));
     }
     for derived in &program.derived_values {
-        outputs.insert(derived_output_ref(program, derived));
+        outputs.insert(derived_output_ref(derived, scalar_fields)?);
     }
-    outputs
+    Ok(outputs
         .into_iter()
         .enumerate()
         .map(|(id, output)| DeltaRoute {
             id: PlanDeltaId(id),
             output,
         })
-        .collect()
+        .collect())
 }
 
-fn derived_output_ref(program: &ErasedProgram, derived: &boon_ir::DerivedValue) -> ValueRef {
+fn derived_output_ref(
+    derived: &boon_ir::DerivedValue,
+    scalar_fields: &ScalarFieldCatalog,
+) -> Result<ValueRef, PlanError> {
     if let Some(list) = derived.materialized_list_id {
-        return ValueRef::List(plan_list_id(list));
+        return Ok(ValueRef::List(plan_list_id(list)));
     }
-    if let Some(field) = program
-        .semantic_index
-        .fields
-        .iter()
-        .find(|field| field.path == derived.path)
-    {
-        return ValueRef::Field(plan_field_id(field.id));
+    Ok(ValueRef::Field(scalar_fields.require(
+        derived.id,
+        &format!("derived value `{}`", derived.path),
+    )?))
+}
+
+#[derive(Clone, Debug)]
+struct ScalarFieldCatalog {
+    by_ir: BTreeMap<ir::FieldId, FieldId>,
+    plan_ids: BTreeSet<FieldId>,
+}
+
+impl ScalarFieldCatalog {
+    fn new(program: &ErasedProgram) -> Result<Self, PlanError> {
+        let mut by_ir = BTreeMap::new();
+        let mut plan_ids = BTreeSet::new();
+        for field in &program.scope_index.fields {
+            if field.resource_only {
+                continue;
+            }
+            let plan_id = plan_field_id(field.id);
+            if by_ir.insert(field.id, plan_id).is_some() || !plan_ids.insert(plan_id) {
+                return Err(PlanError::new(format!(
+                    "scalar field catalog contains duplicate FieldId {}",
+                    field.id
+                )));
+            }
+        }
+        Ok(Self { by_ir, plan_ids })
     }
-    ValueRef::Field(plan_field_id(derived.id))
+
+    fn require(&self, field: ir::FieldId, context: &str) -> Result<FieldId, PlanError> {
+        self.by_ir.get(&field).copied().ok_or_else(|| {
+            PlanError::new(format!(
+                "{context} references missing or resource-only FieldId {field}"
+            ))
+        })
+    }
+
+    fn contains_plan_id(&self, field: FieldId) -> bool {
+        self.plan_ids.contains(&field)
+    }
 }
 
 pub(super) struct ValueIndex {
@@ -12519,7 +12584,8 @@ impl ValueIndex {
         program: &ErasedProgram,
         distributed_by_expression: &BTreeMap<ir::ExecutableExprId, ValueRef>,
         distributed_by_path: &BTreeMap<String, ValueRef>,
-    ) -> Self {
+        scalar_fields: &ScalarFieldCatalog,
+    ) -> Result<Self, PlanError> {
         let mut by_path = BTreeMap::new();
         let mut by_storage = BTreeMap::new();
         let mut state_value_types = BTreeMap::new();
@@ -12619,7 +12685,7 @@ impl ValueIndex {
             }
         }
         for derived in &program.derived_values {
-            let output_ref = derived_output_ref(program, derived);
+            let output_ref = derived_output_ref(derived, scalar_fields)?;
             if let ValueRef::Field(field_id) = &output_ref
                 && let Some(value_type) = derived_value_output_type(program, derived)
             {
@@ -12634,7 +12700,10 @@ impl ValueIndex {
                 }
                 ir::ErasedBindingTarget::Value {
                     field: Some(field), ..
-                } => Some(ValueRef::Field(plan_field_id(field))),
+                } => Some(ValueRef::Field(scalar_fields.require(
+                    field,
+                    &format!("erased storage binding {}", binding.id),
+                )?)),
                 ir::ErasedBindingTarget::Value { .. } => None,
                 ir::ErasedBindingTarget::Source { runtime, .. } => {
                     Some(ValueRef::Source(plan_source_id(runtime)))
@@ -12671,6 +12740,9 @@ impl ValueIndex {
             }
         }
         for field in &program.scope_index.fields {
+            if !scalar_fields.contains_plan_id(plan_field_id(field.id)) {
+                continue;
+            }
             if field.role != ir::ErasedFieldRole::Capture {
                 by_path
                     .entry(field.diagnostic_path.clone())
@@ -12690,7 +12762,7 @@ impl ValueIndex {
         for (path, value_ref) in distributed_by_path {
             by_path.insert(path.clone(), value_ref.clone());
         }
-        Self {
+        Ok(Self {
             by_path,
             by_storage,
             row_source_by_value_projection,
@@ -12707,7 +12779,7 @@ impl ValueIndex {
             state_data_types,
             field_value_types,
             field_data_types,
-        }
+        })
     }
 
     fn resolve(&self, path: &str) -> Option<ValueRef> {
@@ -12835,6 +12907,202 @@ fn insert_field_value_type_if_absent(
         return;
     }
     field_value_types.entry(field_id).or_insert(value_type);
+}
+
+#[cfg(test)]
+mod scalar_field_catalog_tests {
+    use super::*;
+
+    const RESOURCE_ROWS: &str = r#"
+store: [
+    inputs: LIST { [label: TEXT { one }] }
+    rows:
+        inputs
+        |> List/map(item, new: new_row(input: item))
+    forwarded:
+        rows
+        |> List/map(item, new: [
+            controls: item.controls
+            label: item.label
+            selected: item.selected
+        ])
+]
+
+FUNCTION new_row(input) {
+    [
+        controls: [select: SOURCE]
+        label: input.label
+        selected:
+            True |> HOLD selected {
+                controls.select |> THEN { False }
+            }
+    ]
+}
+
+FUNCTION render_row(row) {
+    Element/button(
+        element: [events: [press: row.controls.select]]
+        style: []
+        label: row.label
+    )
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: store.forwarded |> List/map(item, new: render_row(row: item))
+    )
+)
+"#;
+
+    fn compiled_resource_rows() -> crate::CompiledMachinePlanFromSource {
+        crate::compile_source_text_to_machine_plan(
+            "scalar-field-catalog.bn",
+            RESOURCE_ROWS,
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("generic resource rows compile")
+    }
+
+    fn resource_field(compiled: &crate::CompiledMachinePlanFromSource) -> FieldId {
+        compiled
+            .ir
+            .scope_index
+            .fields
+            .iter()
+            .find(|field| field.resource_only)
+            .map(|field| plan_field_id(field.id))
+            .expect("resource-only structural field")
+    }
+
+    fn assert_resource_ref_rejected(
+        compiled: &crate::CompiledMachinePlanFromSource,
+        plan: &MachinePlan,
+        location: &str,
+    ) {
+        let error = validate_resource_only_fields_excluded(&compiled.ir, plan)
+            .expect_err("resource-only scalar reference must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("entered a final MachinePlan ValueRef"),
+            "{location}: {error}"
+        );
+    }
+
+    #[test]
+    fn value_index_excludes_resource_only_paths() {
+        let compiled = compiled_resource_rows();
+        let resource = compiled
+            .ir
+            .scope_index
+            .fields
+            .iter()
+            .find(|field| field.resource_only)
+            .expect("resource-only structural field");
+        let scalar = compiled
+            .ir
+            .scope_index
+            .fields
+            .iter()
+            .find(|field| {
+                !field.resource_only
+                    && field.row == resource.row
+                    && field.role.is_value()
+                    && field.name == "label"
+            })
+            .expect("ordinary scalar sibling");
+        let catalog = ScalarFieldCatalog::new(&compiled.ir).unwrap();
+        let index =
+            ValueIndex::new(&compiled.ir, &BTreeMap::new(), &BTreeMap::new(), &catalog).unwrap();
+
+        assert_ne!(
+            index.resolve(&resource.diagnostic_path),
+            Some(ValueRef::Field(plan_field_id(resource.id))),
+            "structural source metadata cannot resolve as a scalar field"
+        );
+        assert_eq!(
+            index.resolve(&scalar.diagnostic_path),
+            Some(ValueRef::Field(plan_field_id(scalar.id))),
+            "ordinary row values remain scalar-indexed"
+        );
+    }
+
+    #[test]
+    fn producer_ownership_and_source_routes_separate_resources_from_scalars() {
+        let compiled = compiled_resource_rows();
+        let resource = compiled
+            .ir
+            .scope_index
+            .fields
+            .iter()
+            .find(|field| field.resource_only)
+            .expect("resource-only structural field");
+        let owner = resource.static_owner.expect("row function owner");
+        let ownership = producer_function_ownership_seed(&compiled.ir, owner).unwrap();
+        assert!(
+            !ownership.fields.contains(&plan_field_id(resource.id)),
+            "resource-only metadata entered producer scalar ownership"
+        );
+        assert!(
+            compiled
+                .plan
+                .source_routes
+                .iter()
+                .any(
+                    |route| route.row_projections.iter().any(|projection| projection
+                        .path
+                        .iter()
+                        .map(String::as_str)
+                        .eq(["controls", "select"]))
+                ),
+            "scalar filtering removed the exact nested source row projection"
+        );
+    }
+
+    #[test]
+    fn final_plan_validator_rejects_resource_refs_in_independent_plan_surfaces() {
+        let compiled = compiled_resource_rows();
+        let resource = ValueRef::Field(resource_field(&compiled));
+
+        let mut output_plan = compiled.plan.clone();
+        output_plan.outputs[0].value = OutputValueRef::RuntimeValue {
+            value: resource.clone(),
+            list_fields: Vec::new(),
+        };
+        assert_resource_ref_rejected(&compiled, &output_plan, "output");
+
+        let mut op_plan = compiled.plan.clone();
+        op_plan.regions[0].ops[0].inputs.push(resource.clone());
+        assert_resource_ref_rejected(&compiled, &op_plan, "operation input");
+
+        let mut derived_plan = compiled.plan.clone();
+        let derived = derived_plan
+            .regions
+            .iter_mut()
+            .flat_map(|region| &mut region.ops)
+            .find_map(|op| match &mut op.kind {
+                PlanOpKind::DerivedValue { expression, .. } => Some(expression),
+                _ => None,
+            })
+            .expect("derived operation");
+        *derived = Some(PlanDerivedExpression::BoolNot {
+            input: resource.clone(),
+        });
+        assert_resource_ref_rejected(&compiled, &derived_plan, "derived operand");
+
+        let mut delta_plan = compiled.plan.clone();
+        delta_plan.delta_plan.deltas[0].output = resource.clone();
+        assert_resource_ref_rejected(&compiled, &delta_plan, "delta");
+
+        let mut arena_plan = compiled.plan.clone();
+        let mut nodes = arena_plan.row_expressions.clone().into_nodes();
+        nodes.push(PlanRowExpressionNode::Field { input: resource });
+        arena_plan.row_expressions = PlanRowExpressionArena::from_nodes(nodes).unwrap();
+        assert_resource_ref_rejected(&compiled, &arena_plan, "unreachable arena node");
+    }
 }
 
 #[cfg(test)]

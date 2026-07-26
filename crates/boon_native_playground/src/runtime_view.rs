@@ -1892,35 +1892,46 @@ impl RuntimeView {
                     .demand_document_window(materialization, visible, overscan.clone())
                     .map_err(|error| error.to_string())?
             } else {
-                let parent = match &mut self.runtime {
+                let (parent, parent_patches) = match &mut self.runtime {
                     RuntimeBackend::Single(runtime) => {
-                        runtime
+                        let patches = runtime
                             .demand_document_window_by_id(
                                 materialization,
                                 visible,
                                 overscan.clone(),
                             )
                             .map_err(|error| error.to_string())?;
-                        runtime
+                        let parent = runtime
                             .runtime()
                             .primary_retained_output_frame()
                             .map_err(|error| error.to_string())?
-                            .clone()
+                            .clone();
+                        (parent, patches)
                     }
                     RuntimeBackend::Distributed(runtime) => {
-                        runtime
+                        let patches = runtime
                             .demand_client_document_window_by_id(
                                 materialization,
                                 visible,
                                 overscan.clone(),
                             )
                             .map_err(|error| error.to_string())?;
-                        runtime.document_frame().cloned().ok_or_else(|| {
+                        let parent = runtime.document_frame().cloned().ok_or_else(|| {
                             "distributed Client lost its retained document".to_owned()
-                        })?
+                        })?;
+                        (parent, patches)
                     }
                 };
-                self.program_host.reconcile(&parent).patches
+                let update = self
+                    .program_host
+                    .reconcile_with_parent_patches(&parent, parent_patches);
+                if !update.requests.is_empty() || !update.rejections.is_empty() {
+                    return Err(
+                        "a retained window update unexpectedly changed an embedded Program"
+                            .to_owned(),
+                    );
+                }
+                update.patches
             };
             self.materialization_overscan
                 .insert(materialization, overscan);

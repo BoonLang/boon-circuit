@@ -203,6 +203,67 @@ store: [
 }
 
 #[test]
+fn distributed_call_in_then_output_is_prelinked_as_an_invocation() {
+    let parsed = boon_parser::parse_source(
+        "then-distributed-call.bn",
+        r#"
+store: [
+    increment: Client/store.increment
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+    forwarded:
+        count |> THEN { Server/double(value: count) }
+]
+"#,
+    )
+    .unwrap();
+    let mut environment =
+        boon_typecheck::ExternalTypeEnvironment::empty(boon_typecheck::ProgramRole::Session);
+    environment.values.insert(
+        "Client/store.increment".to_owned(),
+        boon_typecheck::FlowType {
+            mode: boon_typecheck::FlowMode::PresentOrAbsent,
+            ty: boon_typecheck::Type::Object(boon_typecheck::ObjectShape {
+                fields: BTreeMap::new(),
+                field_order: Vec::new(),
+                open: false,
+            }),
+        },
+    );
+    environment.functions.insert(
+        "Server/double".to_owned(),
+        distributed_test_function(
+            &[("value", boon_typecheck::Type::Number)],
+            boon_typecheck::Type::Number,
+        ),
+    );
+
+    let checked = boon_typecheck::check_runtime_program_profiled_with_external_types(
+        &parsed,
+        &environment,
+    )
+    .0
+    .program
+    .expect("valid distributed THEN fixture");
+    let occurrences = distributed_call_occurrences(&checked, &[]).unwrap();
+    let [occurrence] = occurrences.as_slice() else {
+        panic!("expected one distributed call occurrence")
+    };
+    assert_eq!(occurrence.mode, ProducerFunctionMode::Invocation);
+
+    let ir = lower_checked(checked, &[]).unwrap();
+    let [call] = ir.distributed_references.calls.as_slice() else {
+        panic!("expected one lowered distributed call")
+    };
+    assert!(
+        !call.invocation_arms.is_empty(),
+        "a call inside a THEN activation must retain its exact invocation trigger"
+    );
+}
+
+#[test]
 fn empty_environment_lowering_and_external_typecheck_errors_fail_closed() {
     let parsed = boon_parser::parse_source(
         "missing-distributed-ir.bn",

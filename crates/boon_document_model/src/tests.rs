@@ -120,11 +120,11 @@ fn runtime_route_identity_is_opaque_in_diagnostics() {
         key: 0x4242,
         generation: 0x4343,
     };
-    let owner = OwnerInstanceId::new(PlanStaticOwnerId(0x44), [row]).unwrap();
+    let owner = OwnerInstanceRoute::new(PlanStaticOwnerId(0x44), [row]).unwrap();
     let route = SourceRouteToken::new(0x45, owner.clone(), SourceId(0x46), 0x47).unwrap();
 
     assert_eq!(format!("{row:?}"), "OwnerInstanceRow(..)");
-    assert_eq!(format!("{owner:?}"), "OwnerInstanceId(..)");
+    assert_eq!(format!("{owner:?}"), "OwnerInstanceRoute(..)");
     assert_eq!(format!("{route:?}"), "SourceRouteToken(..)");
 
     let diagnostic = format!("{row:?}\n{owner:?}\n{route:?}");

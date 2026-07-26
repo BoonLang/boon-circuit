@@ -594,14 +594,48 @@ fn semantic_description(
                 format!("Reads {target_kind} {name}"),
             )
         }
-        SemanticKind::Call => (
-            format!("Call {name}"),
-            format!("Calls {name}; F12 opens its declaration"),
-        ),
-        SemanticKind::Pass => (
-            format!("PASS context for {name}"),
-            format!("Supplies lexical context to {name}; F12 opens its declaration"),
-        ),
+        SemanticKind::Call => {
+            let pass_detail = checked
+                .calls
+                .iter()
+                .find(|call| call.callable == target && call.span == span)
+                .and_then(|call| {
+                    if call.pass.is_some() {
+                        Some(" with explicit PASS")
+                    } else {
+                        checked
+                            .callables
+                            .iter()
+                            .find(|callable| callable.decl_id == call.callable)
+                            .and_then(|callable| {
+                                callable.requires_pass().then_some(" with inherited PASS")
+                            })
+                    }
+                })
+                .unwrap_or_default();
+            (
+                format!("Call {name}"),
+                format!("Calls {name}{pass_detail}; F12 opens its declaration"),
+            )
+        }
+        SemanticKind::Pass => {
+            let explicitly_bound = checked.calls.iter().any(|call| {
+                call.callable == target
+                    && call.pass.is_some_and(|pass| {
+                        pass.span.start == span.start && pass.span.end == span.end
+                    })
+            });
+            (
+                format!("PASS context for {name}"),
+                if explicitly_bound {
+                    format!(
+                        "Supplies explicit lexical context to {name}, replacing inherited context when present; F12 opens its declaration"
+                    )
+                } else {
+                    format!("Supplies lexical context to {name}; F12 opens its declaration")
+                },
+            )
+        }
         SemanticKind::Declaration => {
             let category = match declaration_kind {
                 Some(CheckedDeclarationKind::OutParameter) => "OUT parameter",
@@ -1069,12 +1103,49 @@ shown: render(value: mapped, PASS: [store: [count: 1]])
             .find(|item| item.kind == SemanticKind::Pass)
             .expect("PASS is a checked occurrence");
         assert_eq!(&source[pass.location.start..pass.location.end], "PASS");
+        assert!(pass.detail.contains("Supplies explicit lexical context"));
         assert_eq!(
             snapshot
                 .definition_at(pass.location.start)
                 .map(|item| item.name.as_str()),
             Some("RUN/render")
         );
+        assert!(snapshot.semantics.iter().any(|item| {
+            item.kind == SemanticKind::Call
+                && item.name == "RUN/render"
+                && item.detail.contains("with explicit PASS")
+        }));
+    }
+
+    #[test]
+    fn checked_call_hover_reports_implicit_pass_inheritance() {
+        let snapshot = snapshot(
+            r#"FUNCTION wrapper() {
+    leaf()
+}
+
+FUNCTION leaf() {
+    PASSED.store.count
+}
+
+result: wrapper(PASS: [store: [count: 1]])
+"#,
+        );
+        assert!(
+            snapshot.diagnostics.is_empty(),
+            "{:#?}",
+            snapshot.diagnostics
+        );
+        let inherited = snapshot
+            .semantics
+            .iter()
+            .find(|item| {
+                item.kind == SemanticKind::Call
+                    && item.name.ends_with("/leaf")
+                    && item.detail.contains("with inherited PASS")
+            })
+            .expect("nested requiring call exposes inherited PASS in hover");
+        assert!(!inherited.detail.contains("explicit PASS"));
     }
 
     #[test]

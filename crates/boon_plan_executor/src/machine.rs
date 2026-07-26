@@ -19,18 +19,18 @@ use boon_plan::{
     DataTypePlan, DistributedArgumentId, DistributedCallInstanceId, DistributedCallInstanceRow,
     DistributedCallMode, EffectInvocationId, EffectInvocationPlan, ExportId, FieldId, FiniteReal,
     ImportId, ListId, ListInitializerKind, ListStorageSlot, MachinePlan, OutputListFieldRef,
-    OwnerInstanceId, OwnerInstanceRow, PlanBoundedListPage, PlanConstantId, PlanConstantValue,
+    OwnerInstanceRoute, OwnerInstanceRow, PlanBoundedListPage, PlanConstantId, PlanConstantValue,
     PlanContextualIndexedAccess, PlanContextualOperationKind, PlanDerivedExpression,
     PlanDerivedKind, PlanInfixOp, PlanInitialListFieldInitializer, PlanIntrinsic, PlanListAccess,
     PlanListAccessSelection, PlanListIndex, PlanListIndexId, PlanListIndexKey,
-    PlanListIndexKeyKind, PlanListIndexKeyMultiplicity, PlanListMap, PlanListMutation,
-    PlanListPage, PlanListProjection, PlanLocalId, PlanMaterializedRowFieldCopy, PlanOp, PlanOpId,
-    PlanOpKind, PlanOrderDirection, PlanOrderOperationKind, PlanOwner, PlanRowBuiltin,
-    PlanRowCallArg, PlanRowExpressionArena, PlanRowExpressionId, PlanRowExpressionNode,
-    PlanRowSelectPattern, PlanStaticOwnerId, PlanValueListAuthority, ProducerFunctionInstancePlan,
-    RemoteCallSiteId, RemoteCallSitePlan, RootOutputDemand, ScalarInitializerPlan,
-    ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute, SourceRouteToken,
-    StateId, ValueRef, verify_plan,
+    PlanListIndexKeyKind, PlanListIndexKeyMultiplicity, PlanListMap, PlanListMaterialization,
+    PlanListMutation, PlanListPage, PlanListProjection, PlanLocalId, PlanMaterializedRowFieldCopy,
+    PlanOp, PlanOpId, PlanOpKind, PlanOrderDirection, PlanOrderOperationKind, PlanOwner,
+    PlanRowBuiltin, PlanRowCallArg, PlanRowExpressionArena, PlanRowExpressionId,
+    PlanRowExpressionNode, PlanRowObjectField, PlanRowSelectPattern, PlanStaticOwnerId,
+    PlanValueListAuthority, ProducerFunctionInstancePlan, RemoteCallSiteId, RemoteCallSitePlan,
+    RootOutputDemand, ScalarInitializerPlan, ScalarStorageSlot, ScopeId, SourceId,
+    SourcePayloadField, SourceRoute, SourceRouteToken, StateId, ValueRef, verify_plan,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -253,6 +253,312 @@ enum TriggerCause {
     Effect(EffectInvocationId),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct OwnerAncestryId(u32);
+
+impl OwnerAncestryId {
+    const ROOT: Self = Self(0);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OwnerAncestryNode {
+    parent: OwnerAncestryId,
+    row: Option<OwnerInstanceRow>,
+    depth: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct OwnerInstanceId(u32);
+
+impl OwnerInstanceId {
+    const ROOT: Self = Self(0);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OwnerInstanceNode {
+    static_owner: PlanStaticOwnerId,
+    ancestry: OwnerAncestryId,
+}
+
+#[derive(Clone, Debug)]
+struct OwnerInstanceInterner {
+    ancestry_nodes: Vec<OwnerAncestryNode>,
+    ancestry_ids: BTreeMap<(OwnerAncestryId, OwnerInstanceRow), OwnerAncestryId>,
+    owner_nodes: Vec<OwnerInstanceNode>,
+    owner_ids: BTreeMap<(PlanStaticOwnerId, OwnerAncestryId), OwnerInstanceId>,
+}
+
+impl Default for OwnerInstanceInterner {
+    fn default() -> Self {
+        Self {
+            ancestry_nodes: vec![OwnerAncestryNode {
+                parent: OwnerAncestryId::ROOT,
+                row: None,
+                depth: 0,
+            }],
+            ancestry_ids: BTreeMap::new(),
+            owner_nodes: vec![OwnerInstanceNode {
+                static_owner: PlanStaticOwnerId::ROOT,
+                ancestry: OwnerAncestryId::ROOT,
+            }],
+            owner_ids: BTreeMap::from([(
+                (PlanStaticOwnerId::ROOT, OwnerAncestryId::ROOT),
+                OwnerInstanceId::ROOT,
+            )]),
+        }
+    }
+}
+
+impl OwnerInstanceInterner {
+    fn intern_route(&mut self, route: &OwnerInstanceRoute) -> Result<OwnerInstanceId, Error> {
+        route
+            .validate()
+            .map_err(|detail| Error::InvalidPlan(detail.to_owned()))?;
+        self.intern_rows(route.static_owner, route.ancestors.iter().copied())
+    }
+
+    fn intern_rows(
+        &mut self,
+        static_owner: PlanStaticOwnerId,
+        rows: impl IntoIterator<Item = OwnerInstanceRow>,
+    ) -> Result<OwnerInstanceId, Error> {
+        let rows = rows.into_iter().collect::<Vec<_>>();
+        let ancestry = self.intern_ancestry_rows(rows.iter().copied())?;
+        if static_owner.is_root() && !rows.is_empty() {
+            return Err(Error::InvalidPlan(
+                "root owner instance cannot have ancestor rows".to_owned(),
+            ));
+        }
+        self.intern_owner(static_owner, ancestry)
+    }
+
+    fn intern_ancestry_rows(
+        &mut self,
+        rows: impl IntoIterator<Item = OwnerInstanceRow>,
+    ) -> Result<OwnerAncestryId, Error> {
+        let mut ancestry = OwnerAncestryId::ROOT;
+        for row in rows {
+            if row.generation == 0 {
+                return Err(Error::InvalidPlan(
+                    "owner instance row generations must be positive".to_owned(),
+                ));
+            }
+            ancestry = self.intern_ancestry(ancestry, row)?;
+        }
+        Ok(ancestry)
+    }
+
+    fn intern_ancestry(
+        &mut self,
+        parent: OwnerAncestryId,
+        row: OwnerInstanceRow,
+    ) -> Result<OwnerAncestryId, Error> {
+        if let Some(id) = self.ancestry_ids.get(&(parent, row)).copied() {
+            return Ok(id);
+        }
+        let parent_depth = self.ancestry_node(parent)?.depth;
+        let depth = parent_depth
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidPlan("owner ancestry depth overflow".to_owned()))?;
+        let raw_id = u32::try_from(self.ancestry_nodes.len())
+            .map_err(|_| Error::InvalidPlan("owner ancestry ID space exhausted".to_owned()))?;
+        let id = OwnerAncestryId(raw_id);
+        self.ancestry_nodes.push(OwnerAncestryNode {
+            parent,
+            row: Some(row),
+            depth,
+        });
+        self.ancestry_ids.insert((parent, row), id);
+        Ok(id)
+    }
+
+    fn intern_owner(
+        &mut self,
+        static_owner: PlanStaticOwnerId,
+        ancestry: OwnerAncestryId,
+    ) -> Result<OwnerInstanceId, Error> {
+        if let Some(id) = self.owner_ids.get(&(static_owner, ancestry)).copied() {
+            return Ok(id);
+        }
+        let raw_id = u32::try_from(self.owner_nodes.len())
+            .map_err(|_| Error::InvalidPlan("owner instance ID space exhausted".to_owned()))?;
+        let id = OwnerInstanceId(raw_id);
+        self.owner_nodes.push(OwnerInstanceNode {
+            static_owner,
+            ancestry,
+        });
+        self.owner_ids.insert((static_owner, ancestry), id);
+        Ok(id)
+    }
+
+    fn intern_prefix(
+        &mut self,
+        static_owner: PlanStaticOwnerId,
+        owner: OwnerInstanceId,
+        depth: usize,
+    ) -> Result<OwnerInstanceId, Error> {
+        let ancestry = self.ancestry_at_depth(owner, depth)?;
+        self.intern_owner(static_owner, ancestry)
+    }
+
+    fn route(&self, owner: OwnerInstanceId) -> Result<OwnerInstanceRoute, Error> {
+        let node = self.owner_node(owner)?;
+        OwnerInstanceRoute::new(node.static_owner, self.ancestry_rows(node.ancestry)?)
+            .map_err(|detail| Error::InvalidPlan(detail.to_owned()))
+    }
+
+    fn owner_ancestry(&self, owner: OwnerInstanceId) -> Result<OwnerAncestryId, Error> {
+        Ok(self.owner_node(owner)?.ancestry)
+    }
+
+    fn static_owner(&self, owner: OwnerInstanceId) -> Result<PlanStaticOwnerId, Error> {
+        Ok(self.owner_node(owner)?.static_owner)
+    }
+
+    fn depth(&self, owner: OwnerInstanceId) -> Result<usize, Error> {
+        let ancestry = self.owner_node(owner)?.ancestry;
+        usize::try_from(self.ancestry_node(ancestry)?.depth)
+            .map_err(|_| Error::InvalidPlan("owner ancestry depth does not fit usize".to_owned()))
+    }
+
+    fn leaf(&self, owner: OwnerInstanceId) -> Result<Option<OwnerInstanceRow>, Error> {
+        let ancestry = self.owner_node(owner)?.ancestry;
+        Ok(self.ancestry_node(ancestry)?.row)
+    }
+
+    fn row_at(
+        &self,
+        owner: OwnerInstanceId,
+        index: usize,
+    ) -> Result<Option<OwnerInstanceRow>, Error> {
+        let depth = self.depth(owner)?;
+        if index >= depth {
+            return Ok(None);
+        }
+        let target_depth = index + 1;
+        let ancestry = self.ancestry_at_depth(owner, target_depth)?;
+        Ok(self.ancestry_node(ancestry)?.row)
+    }
+
+    fn rows(&self, owner: OwnerInstanceId) -> Result<Vec<OwnerInstanceRow>, Error> {
+        self.ancestry_rows(self.owner_node(owner)?.ancestry)
+    }
+
+    fn ancestry_rows(&self, ancestry: OwnerAncestryId) -> Result<Vec<OwnerInstanceRow>, Error> {
+        let depth = usize::try_from(self.ancestry_node(ancestry)?.depth).map_err(|_| {
+            Error::InvalidPlan("owner ancestry depth does not fit usize".to_owned())
+        })?;
+        let mut rows = vec![None; depth];
+        let mut next = ancestry;
+        while next != OwnerAncestryId::ROOT {
+            let node = self.ancestry_node(next)?;
+            let index = usize::try_from(node.depth - 1).map_err(|_| {
+                Error::InvalidPlan("owner ancestry index does not fit usize".to_owned())
+            })?;
+            rows[index] = node.row;
+            next = node.parent;
+        }
+        rows.into_iter()
+            .map(|row| {
+                row.ok_or_else(|| {
+                    Error::InvalidPlan("owner ancestry contains a missing row".to_owned())
+                })
+            })
+            .collect()
+    }
+
+    fn ancestry_leaf(&self, ancestry: OwnerAncestryId) -> Result<Option<OwnerInstanceRow>, Error> {
+        Ok(self.ancestry_node(ancestry)?.row)
+    }
+
+    fn ancestry_parent(&self, ancestry: OwnerAncestryId) -> Result<OwnerAncestryId, Error> {
+        Ok(self.ancestry_node(ancestry)?.parent)
+    }
+
+    fn ancestry_depth(&self, ancestry: OwnerAncestryId) -> Result<usize, Error> {
+        usize::try_from(self.ancestry_node(ancestry)?.depth)
+            .map_err(|_| Error::InvalidPlan("owner ancestry depth does not fit usize".to_owned()))
+    }
+
+    fn ancestry_descends_from(
+        &self,
+        mut candidate: OwnerAncestryId,
+        ancestor: OwnerAncestryId,
+    ) -> Result<bool, Error> {
+        let ancestor_depth = self.ancestry_depth(ancestor)?;
+        let mut candidate_depth = self.ancestry_depth(candidate)?;
+        if candidate_depth < ancestor_depth {
+            return Ok(false);
+        }
+        while candidate_depth > ancestor_depth {
+            candidate = self.ancestry_parent(candidate)?;
+            candidate_depth -= 1;
+        }
+        Ok(candidate == ancestor)
+    }
+
+    fn ancestry_with_leaf_list(
+        &mut self,
+        ancestry: OwnerAncestryId,
+        list: ListId,
+    ) -> Result<OwnerAncestryId, Error> {
+        let mut leaf = self.ancestry_leaf(ancestry)?.ok_or_else(|| {
+            Error::InvalidPlan("cannot replace the leaf of root owner ancestry".to_owned())
+        })?;
+        leaf.list = list;
+        self.intern_ancestry(self.ancestry_parent(ancestry)?, leaf)
+    }
+
+    fn contains_row(&self, owner: OwnerInstanceId, row: RowId) -> Result<bool, Error> {
+        let mut ancestry = self.owner_node(owner)?.ancestry;
+        while ancestry != OwnerAncestryId::ROOT {
+            let node = self.ancestry_node(ancestry)?;
+            if node.row.is_some_and(|candidate| {
+                candidate.list == row.list
+                    && candidate.key == row.key
+                    && candidate.generation == row.generation
+            }) {
+                return Ok(true);
+            }
+            ancestry = node.parent;
+        }
+        Ok(false)
+    }
+
+    fn ancestry_at_depth(
+        &self,
+        owner: OwnerInstanceId,
+        target_depth: usize,
+    ) -> Result<OwnerAncestryId, Error> {
+        let mut ancestry = self.owner_node(owner)?.ancestry;
+        let mut depth = usize::try_from(self.ancestry_node(ancestry)?.depth).map_err(|_| {
+            Error::InvalidPlan("owner ancestry depth does not fit usize".to_owned())
+        })?;
+        if target_depth > depth {
+            return Err(Error::InvalidPlan(format!(
+                "owner instance has depth {depth}, requested prefix depth {target_depth}"
+            )));
+        }
+        while depth > target_depth {
+            ancestry = self.ancestry_node(ancestry)?.parent;
+            depth -= 1;
+        }
+        Ok(ancestry)
+    }
+
+    fn owner_node(&self, owner: OwnerInstanceId) -> Result<&OwnerInstanceNode, Error> {
+        self.owner_nodes
+            .get(owner.0 as usize)
+            .ok_or_else(|| Error::InvalidPlan(format!("unknown owner instance ID {}", owner.0)))
+    }
+
+    fn ancestry_node(&self, ancestry: OwnerAncestryId) -> Result<&OwnerAncestryNode, Error> {
+        self.ancestry_nodes
+            .get(ancestry.0 as usize)
+            .ok_or_else(|| Error::InvalidPlan(format!("unknown owner ancestry ID {}", ancestry.0)))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ActiveTrigger {
     cause: TriggerCause,
@@ -269,12 +575,12 @@ struct TriggerFrame<'a> {
 }
 
 impl<'a> TriggerFrame<'a> {
-    fn source(event: &'a SourceEvent, owner_plan: PlanOwner) -> Self {
+    fn source(event: &'a SourceEvent, owner_plan: PlanOwner, owner: OwnerInstanceId) -> Self {
         Self {
             active: ActiveTrigger {
                 cause: TriggerCause::Source(event.source),
                 owner_plan,
-                owner: event.route.owner.clone(),
+                owner,
                 target: event.target,
                 sequence: event.sequence,
             },
@@ -323,6 +629,7 @@ pub enum ValueTarget {
 pub struct RowSnapshot {
     pub id: RowId,
     pub fields: BTreeMap<FieldId, Value>,
+    pub provenance: BTreeMap<ScopeId, RowId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -553,7 +860,7 @@ pub struct TransientEffectInvocation {
     pub effect_id: boon_plan::EffectId,
     pub trigger_sequence: u64,
     pub authority_turn_sequence: u64,
-    pub owner: OwnerInstanceId,
+    pub owner: OwnerInstanceRoute,
     pub target: Option<RowId>,
     pub intent: Value,
     pub delivery: boon_plan::EffectDeliveryCardinality,
@@ -924,8 +1231,9 @@ impl Default for DerivedCell {
 
 #[derive(Clone, Debug, Default)]
 struct Row {
-    owner_ancestors: Vec<OwnerInstanceRow>,
-    materialization_origin: Option<Vec<OwnerInstanceRow>>,
+    owner_ancestry: OwnerAncestryId,
+    materialization_origin: Option<OwnerAncestryId>,
+    provenance: BTreeMap<ScopeId, RowId>,
     fields: BTreeMap<FieldId, Value>,
     derived: BTreeMap<FieldId, Currentness>,
     default_fields: BTreeSet<FieldId>,
@@ -2471,14 +2779,14 @@ struct ListState {
     order_tokens: BTreeMap<RowId, u128>,
     next_order_token: u128,
     revision: u64,
-    owner_partitions: BTreeMap<Vec<OwnerInstanceRow>, OwnerPartition>,
+    owner_partitions: BTreeMap<OwnerAncestryId, OwnerPartition>,
     next_key: u64,
 }
 
 #[derive(Clone, Debug, Default)]
 struct OwnerPartition {
     order: Vec<RowId>,
-    by_materialization_origin: BTreeMap<Vec<OwnerInstanceRow>, RowId>,
+    by_materialization_origin: BTreeMap<OwnerAncestryId, RowId>,
 }
 
 impl ListState {
@@ -2850,22 +3158,29 @@ impl ListState {
         Ok(())
     }
 
-    fn rebuild_owner_partitions(&mut self) -> Result<(), Error> {
+    fn rebuild_owner_partitions(
+        &mut self,
+        owner_instances: &OwnerInstanceInterner,
+    ) -> Result<(), Error> {
         self.owner_partitions.clear();
         for row_id in self.order.to_vec() {
-            self.index_owner_partition_row(row_id)?;
+            self.index_owner_partition_row(row_id, owner_instances)?;
         }
         Ok(())
     }
 
-    fn index_owner_partition_row(&mut self, row_id: RowId) -> Result<(), Error> {
+    fn index_owner_partition_row(
+        &mut self,
+        row_id: RowId,
+        owner_instances: &OwnerInstanceInterner,
+    ) -> Result<(), Error> {
         let row = self.rows.get(&row_id).ok_or_else(|| {
             Error::InvalidPlan(format!(
                 "list {} order contains missing row {}:{}",
                 row_id.list.0, row_id.key, row_id.generation
             ))
         })?;
-        let Some((leaf, owner_prefix)) = row.owner_ancestors.split_last() else {
+        let Some(leaf) = owner_instances.ancestry_leaf(row.owner_ancestry)? else {
             return Err(Error::InvalidPlan(format!(
                 "row {}:{}:{} has empty structural ownership",
                 row_id.list.0, row_id.key, row_id.generation
@@ -2876,46 +3191,52 @@ impl ListState {
             key: row_id.key,
             generation: row_id.generation,
         };
-        if *leaf != expected_leaf {
+        if leaf != expected_leaf {
             return Err(Error::InvalidPlan(format!(
                 "row {}:{}:{} structural owner has a different leaf",
                 row_id.list.0, row_id.key, row_id.generation
             )));
         }
-        let partition = self
-            .owner_partitions
-            .entry(owner_prefix.to_vec())
-            .or_default();
+        let owner_prefix = owner_instances.ancestry_parent(row.owner_ancestry)?;
+        let partition = self.owner_partitions.entry(owner_prefix).or_default();
         partition.order.push(row_id);
-        if let Some(origin) = &row.materialization_origin
-            && partition
+        if let Some(origin) = row.materialization_origin {
+            if partition
                 .by_materialization_origin
-                .insert(origin.clone(), row_id)
+                .insert(origin, row_id)
                 .is_some()
-        {
-            return Err(Error::InvalidPlan(format!(
-                "list {} owner partition repeats a materialization origin",
-                row_id.list.0
-            )));
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "list {} owner partition repeats a materialization origin",
+                    row_id.list.0
+                )));
+            }
         }
         Ok(())
     }
 
-    fn remove_owner_partition_row(&mut self, row_id: RowId, row: &Row) {
-        let Some((_, owner_prefix)) = row.owner_ancestors.split_last() else {
-            return;
-        };
+    fn remove_owner_partition_row(
+        &mut self,
+        row_id: RowId,
+        row: &Row,
+        owner_instances: &OwnerInstanceInterner,
+    ) -> Result<(), Error> {
+        if row.owner_ancestry == OwnerAncestryId::ROOT {
+            return Ok(());
+        }
+        let owner_prefix = owner_instances.ancestry_parent(row.owner_ancestry)?;
         let mut remove_partition = false;
-        if let Some(partition) = self.owner_partitions.get_mut(owner_prefix) {
+        if let Some(partition) = self.owner_partitions.get_mut(&owner_prefix) {
             partition.order.retain(|candidate| *candidate != row_id);
-            if let Some(origin) = &row.materialization_origin {
-                partition.by_materialization_origin.remove(origin);
+            if let Some(origin) = row.materialization_origin {
+                partition.by_materialization_origin.remove(&origin);
             }
             remove_partition = partition.order.is_empty();
         }
         if remove_partition {
-            self.owner_partitions.remove(owner_prefix);
+            self.owner_partitions.remove(&owner_prefix);
         }
+        Ok(())
     }
 }
 
@@ -3271,65 +3592,28 @@ fn derived_expression_has_intrinsic(
 }
 
 fn derived_expression_event_triggers(expression: &PlanDerivedExpression) -> Vec<ValueRef> {
-    let mut pending = vec![expression];
     let mut triggers = Vec::new();
-    while let Some(expression) = pending.pop() {
-        match expression {
-            PlanDerivedExpression::MaterializeList { expression, .. }
-            | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-                pending.push(expression);
-            }
-            PlanDerivedExpression::BoolAnd { left, right } => {
-                pending.push(right);
-                pending.push(left);
-            }
-            PlanDerivedExpression::SourceEventTransform { arms, .. } => {
-                for arm in arms {
-                    if !triggers.contains(&arm.trigger) {
-                        triggers.push(arm.trigger.clone());
-                    }
+    match expression {
+        PlanDerivedExpression::SourceEventTransform { arms, .. } => {
+            for arm in arms {
+                if !triggers.contains(&arm.trigger) {
+                    triggers.push(arm.trigger.clone());
                 }
             }
-            PlanDerivedExpression::SourceKeyTextTrimNonEmpty { source_id, .. } => {
-                let trigger = ValueRef::Source(*source_id);
-                if !triggers.contains(&trigger) {
-                    triggers.push(trigger);
-                }
-            }
-            PlanDerivedExpression::BoolNot { .. }
-            | PlanDerivedExpression::NumberCompareConst { .. }
-            | PlanDerivedExpression::ValueCompare { .. }
-            | PlanDerivedExpression::RowExpression { .. }
-            | PlanDerivedExpression::MaterializedRowField { .. } => {}
         }
+        PlanDerivedExpression::SourceKeyTextTrimNonEmpty { source_id, .. } => {
+            let trigger = ValueRef::Source(*source_id);
+            if !triggers.contains(&trigger) {
+                triggers.push(trigger);
+            }
+        }
+        PlanDerivedExpression::BoolNot { .. }
+        | PlanDerivedExpression::NumberCompareConst { .. }
+        | PlanDerivedExpression::ValueCompare { .. }
+        | PlanDerivedExpression::RowExpression { .. }
+        | PlanDerivedExpression::MaterializedRowField { .. } => {}
     }
     triggers
-}
-
-fn derived_expression_node_count(expression: &PlanDerivedExpression) -> usize {
-    let mut pending = vec![expression];
-    let mut count = 0usize;
-    while let Some(expression) = pending.pop() {
-        count = count.saturating_add(1);
-        match expression {
-            PlanDerivedExpression::MaterializeList { expression, .. }
-            | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-                pending.push(expression);
-            }
-            PlanDerivedExpression::BoolAnd { left, right } => {
-                pending.push(right);
-                pending.push(left);
-            }
-            PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
-            | PlanDerivedExpression::SourceEventTransform { .. }
-            | PlanDerivedExpression::BoolNot { .. }
-            | PlanDerivedExpression::NumberCompareConst { .. }
-            | PlanDerivedExpression::ValueCompare { .. }
-            | PlanDerivedExpression::RowExpression { .. }
-            | PlanDerivedExpression::MaterializedRowField { .. } => {}
-        }
-    }
-    count
 }
 
 fn typed_access_and_direct_list_inputs(
@@ -3385,17 +3669,7 @@ fn typed_access_and_direct_list_inputs(
         access: &mut BTreeSet<ListId>,
         direct: &mut BTreeSet<ListId>,
     ) -> Result<(), Error> {
-        let mut pending = vec![expression];
-        while let Some(expression) = pending.pop() {
         match expression {
-            PlanDerivedExpression::MaterializeList { expression, .. }
-            | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-                    pending.push(expression);
-            }
-            PlanDerivedExpression::BoolAnd { left, right } => {
-                    pending.push(right);
-                    pending.push(left);
-            }
             PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
                 collect_row(*default, arena, indexes, access, direct)?;
                 for arm in arms {
@@ -3410,7 +3684,6 @@ fn typed_access_and_direct_list_inputs(
             | PlanDerivedExpression::BoolNot { .. }
             | PlanDerivedExpression::NumberCompareConst { .. }
             | PlanDerivedExpression::ValueCompare { .. } => {}
-        }
         }
         Ok(())
     }
@@ -4061,9 +4334,10 @@ impl Metadata {
             .values()
             .filter_map(|op| match &op.kind {
                 PlanOpKind::DerivedValue {
-                    expression: Some(expression),
+                    expression: Some(_),
+                    materialization,
                     ..
-                } => Some(derived_expression_node_count(expression)),
+                } => Some(1usize.saturating_add(usize::from(materialization.is_some()))),
                 _ => None,
             })
             .fold(0usize, usize::saturating_add);
@@ -4875,7 +5149,7 @@ enum AuthorityUndo {
     ReorderRows {
         list: ListId,
         undo: SourceOrderUndo,
-        owner_partition: Option<(Vec<OwnerInstanceRow>, Vec<RowId>)>,
+        owner_partition: Option<(OwnerAncestryId, Vec<RowId>)>,
     },
 }
 
@@ -5167,6 +5441,7 @@ fn authority_delta_is_producer_local(
 fn instantiate_plan_owner(
     plan: &PlanOwner,
     trigger: &ActiveTrigger,
+    interner: &mut OwnerInstanceInterner,
 ) -> Result<OwnerInstanceId, Error> {
     if plan.static_owner.is_root() {
         if !plan.ancestors.is_empty() {
@@ -5174,37 +5449,38 @@ fn instantiate_plan_owner(
                 "root static owner declares repeated ancestors".to_owned(),
             ));
         }
-        return Ok(OwnerInstanceId::root());
+        return Ok(OwnerInstanceId::ROOT);
     }
     if plan.ancestors.is_empty() {
-        return OwnerInstanceId::new(plan.static_owner, Vec::new())
-            .map_err(|detail| Error::InvalidPlan(detail.to_owned()));
+        return interner.intern_rows(plan.static_owner, []);
     }
     if trigger.owner_plan.ancestors.len() < plan.ancestors.len()
-        || trigger.owner.ancestors.len() < plan.ancestors.len()
+        || interner.depth(trigger.owner)? < plan.ancestors.len()
     {
         return Err(Error::InvalidPlan(format!(
             "owner {} requires {} repeated ancestors, trigger owner {} provides {}",
             plan.static_owner.0,
             plan.ancestors.len(),
-            trigger.owner.static_owner.0,
-            trigger.owner.ancestors.len()
+            interner.static_owner(trigger.owner)?.0,
+            interner.depth(trigger.owner)?
         )));
     }
-    let mut ancestors = Vec::with_capacity(plan.ancestors.len());
     for (index, expected) in plan.ancestors.iter().enumerate() {
         let trigger_shape = &trigger.owner_plan.ancestors[index];
-        let row = trigger.owner.ancestors[index];
+        let row = interner.row_at(trigger.owner, index)?.ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "trigger owner has no row at required ancestor depth {index}"
+            ))
+        })?;
         if trigger_shape != expected || row.list != expected.list {
             return Err(Error::InvalidPlan(format!(
                 "owner {} ancestor depth {index} does not match trigger owner {}",
-                plan.static_owner.0, trigger.owner.static_owner.0
+                plan.static_owner.0,
+                interner.static_owner(trigger.owner)?.0
             )));
         }
-        ancestors.push(row);
     }
-    OwnerInstanceId::new(plan.static_owner, ancestors)
-        .map_err(|detail| Error::InvalidPlan(detail.to_owned()))
+    interner.intern_prefix(plan.static_owner, trigger.owner, plan.ancestors.len())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5290,12 +5566,6 @@ fn ensure_value_continuation_capacity<T>(
     Ok(())
 }
 
-enum PageTraversalFailure {
-    WorkLimit,
-    Runtime(Error),
-    Access(AccessError),
-}
-
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum EvaluatedListAccessSelection {
     OrderedStart,
@@ -5336,6 +5606,562 @@ enum ListAccessSelectionTask<'a> {
 
 const MAX_LIST_ACCESS_SELECTION_CONTINUATIONS: usize = 8_192;
 
+fn evaluate_list_access_selection_values(
+    selection: &PlanListAccessSelection,
+    index_plan: &PlanListIndex,
+    evaluated_values: Vec<Value>,
+) -> Result<(EvaluatedListAccessSelection, Vec<Value>), Error> {
+    let mut evaluated_values = evaluated_values.into_iter();
+    let mut tasks = vec![ListAccessSelectionTask::Evaluate(selection)];
+    let mut values = Vec::<(EvaluatedListAccessSelection, Vec<Value>)>::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            ListAccessSelectionTask::Evaluate(selection) => match selection {
+                PlanListAccessSelection::OrderedStart => {
+                    values.push((EvaluatedListAccessSelection::OrderedStart, Vec::new()));
+                }
+                PlanListAccessSelection::KeyPrefix {
+                    values: expressions,
+                } => {
+                    let mut evaluated = Vec::with_capacity(expressions.len());
+                    let mut captures = Vec::with_capacity(expressions.len());
+                    for position in 0..expressions.len() {
+                        let key = index_plan.keys.get(position).ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "typed list key prefix component {position} exceeds index {} arity",
+                                index_plan.id.0
+                            ))
+                        })?;
+                        let value = evaluated_values.next().ok_or_else(|| {
+                            Error::InvalidPlan(
+                                "typed list key prefix has no evaluated operand".to_owned(),
+                            )
+                        })?;
+                        evaluated.push(structural_index_value(key, value.clone())?);
+                        captures.push(value);
+                    }
+                    values.push((
+                        EvaluatedListAccessSelection::KeyPrefix { values: evaluated },
+                        captures,
+                    ));
+                }
+                PlanListAccessSelection::TextPrefix { leading, .. } => {
+                    let mut evaluated = Vec::with_capacity(leading.len());
+                    let mut captures = Vec::with_capacity(leading.len().saturating_add(1));
+                    for position in 0..leading.len() {
+                        let key = index_plan.keys.get(position).ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "typed list Text prefix component {position} exceeds index {} arity",
+                                index_plan.id.0
+                            ))
+                        })?;
+                        let value = evaluated_values.next().ok_or_else(|| {
+                            Error::InvalidPlan(
+                                "typed list Text prefix has no evaluated leading operand"
+                                    .to_owned(),
+                            )
+                        })?;
+                        evaluated.push(structural_index_value(key, value.clone())?);
+                        captures.push(value);
+                    }
+                    let prefix = evaluated_values.next().ok_or_else(|| {
+                        Error::InvalidPlan(
+                            "typed list Text prefix has no evaluated prefix operand".to_owned(),
+                        )
+                    })?;
+                    let prefix = value_to_text(&prefix)?;
+                    captures.push(Value::Text(prefix.clone()));
+                    values.push((
+                        EvaluatedListAccessSelection::TextPrefix {
+                            leading: evaluated,
+                            prefix,
+                        },
+                        captures,
+                    ));
+                }
+                PlanListAccessSelection::ComponentRange {
+                    leading,
+                    lower,
+                    upper,
+                } => {
+                    let mut evaluated = Vec::with_capacity(leading.len());
+                    let mut captures = Vec::with_capacity(
+                        leading
+                            .len()
+                            .saturating_add(usize::from(lower.is_some()))
+                            .saturating_add(usize::from(upper.is_some())),
+                    );
+                    for position in 0..leading.len() {
+                        let key = index_plan.keys.get(position).ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "typed list range component {position} exceeds index {} arity",
+                                index_plan.id.0
+                            ))
+                        })?;
+                        let value = evaluated_values.next().ok_or_else(|| {
+                            Error::InvalidPlan(
+                                "typed list range has no evaluated leading operand".to_owned(),
+                            )
+                        })?;
+                        evaluated.push(structural_index_value(key, value.clone())?);
+                        captures.push(value);
+                    }
+                    let target = index_plan.keys.get(leading.len()).ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "typed list range has no component {} in index {}",
+                            leading.len(),
+                            index_plan.id.0
+                        ))
+                    })?;
+                    let mut take_bound =
+                        |bound: &boon_plan::PlanListAccessBound| -> Result<_, Error> {
+                            let value = evaluated_values.next().ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "typed list range has no evaluated bound operand".to_owned(),
+                                )
+                            })?;
+                            let structural = structural_index_value(target, value.clone())?;
+                            captures.push(value);
+                            Ok((structural, bound.inclusive))
+                        };
+                    let lower = lower.as_ref().map(&mut take_bound).transpose()?;
+                    let upper = upper.as_ref().map(&mut take_bound).transpose()?;
+                    values.push((
+                        EvaluatedListAccessSelection::ComponentRange {
+                            leading: evaluated,
+                            lower,
+                            upper,
+                        },
+                        captures,
+                    ));
+                }
+                PlanListAccessSelection::Union { branches }
+                | PlanListAccessSelection::Intersection { branches } => {
+                    let additional = branches.len().saturating_add(1);
+                    if tasks.len().saturating_add(additional)
+                        > MAX_LIST_ACCESS_SELECTION_CONTINUATIONS
+                    {
+                        return Err(Error::InvalidPlan(format!(
+                            "list access selection continuation stack exceeded its checked bound of {}",
+                            MAX_LIST_ACCESS_SELECTION_CONTINUATIONS
+                        )));
+                    }
+                    let kind = match selection {
+                        PlanListAccessSelection::Union { .. } => {
+                            ListAccessSelectionBranchKind::Union
+                        }
+                        PlanListAccessSelection::Intersection { .. } => {
+                            ListAccessSelectionBranchKind::Intersection
+                        }
+                        _ => unreachable!(),
+                    };
+                    tasks.push(ListAccessSelectionTask::FinishBranches {
+                        kind,
+                        value_base: values.len(),
+                        branch_count: branches.len(),
+                    });
+                    for branch in branches.iter().rev() {
+                        tasks.push(ListAccessSelectionTask::Evaluate(branch));
+                    }
+                }
+            },
+            ListAccessSelectionTask::FinishBranches {
+                kind,
+                value_base,
+                branch_count,
+            } => {
+                if values.len() != value_base.saturating_add(branch_count) {
+                    return Err(Error::InvalidPlan(
+                        "list access selection branch continuation produced an invalid value count"
+                            .to_owned(),
+                    ));
+                }
+                let mut branches = Vec::with_capacity(branch_count);
+                let mut captures = Vec::new();
+                for (branch, branch_captures) in values.drain(value_base..) {
+                    branches.push(branch);
+                    captures.extend(branch_captures);
+                }
+                let selection = match kind {
+                    ListAccessSelectionBranchKind::Union => {
+                        EvaluatedListAccessSelection::Union { branches }
+                    }
+                    ListAccessSelectionBranchKind::Intersection => {
+                        EvaluatedListAccessSelection::Intersection { branches }
+                    }
+                };
+                values.push((selection, captures));
+            }
+        }
+    }
+    if evaluated_values.next().is_some() {
+        return Err(Error::InvalidPlan(
+            "typed list selection left an unused evaluated operand".to_owned(),
+        ));
+    }
+    if values.len() != 1 {
+        return Err(Error::InvalidPlan(format!(
+            "list access selection evaluation completed with {} values",
+            values.len()
+        )));
+    }
+    values.pop().ok_or_else(|| {
+        Error::InvalidPlan("list access selection evaluation produced no root value".to_owned())
+    })
+}
+
+fn collect_access_traversal_batch(
+    index: &OrderedIndex,
+    selection: &EvaluatedListAccessSelection,
+    after: Option<&AccessCursorKey>,
+    semantic_component_count: usize,
+    limits: AccessWorkLimits,
+    source_list: ListId,
+) -> AccessTraversalBatch {
+    let mut tracker = AccessWorkTracker::new(limits);
+    let mut candidates = Vec::new();
+    let mut stream =
+        match open_evaluated_list_access(index, selection, after, semantic_component_count) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return AccessTraversalBatch {
+                    candidates: candidates.into_iter(),
+                    terminal: AccessTraversalTerminal::Error {
+                        metrics: tracker.metrics(),
+                        error,
+                    },
+                };
+            }
+        };
+    let terminal = loop {
+        match stream.next(&mut tracker) {
+            Ok(Some(candidate)) => candidates.push(AccessTraversalCandidate {
+                row: runtime_row_id(source_list, candidate.row_id()),
+                cursor: candidate.cursor_key(),
+                metrics: tracker.metrics(),
+            }),
+            Ok(None) => break AccessTraversalTerminal::End(tracker.metrics()),
+            Err(error) => {
+                break AccessTraversalTerminal::Error {
+                    metrics: tracker.metrics(),
+                    error,
+                };
+            }
+        }
+    };
+    AccessTraversalBatch {
+        candidates: candidates.into_iter(),
+        terminal,
+    }
+}
+
+fn finish_ordered_index_key_components(
+    plan: &PlanListIndex,
+    components: Vec<Vec<StructuralValue>>,
+) -> Result<Vec<StructuralKey>, Error> {
+    let mut products = vec![Vec::with_capacity(plan.keys.len())];
+    for values in components {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut next = Vec::with_capacity(products.len().saturating_mul(values.len()));
+        for prefix in products {
+            for value in &values {
+                let mut parts = prefix.clone();
+                parts.push(value.clone());
+                next.push(parts);
+            }
+        }
+        products = next;
+    }
+    products
+        .into_iter()
+        .map(|parts| {
+            StructuralKey::new(parts).map_err(|error| Error::Evaluation(error.to_string()))
+        })
+        .collect()
+}
+
+enum ListSelectionContinuation<'event, 'plan> {
+    ListAccess {
+        access: &'plan PlanListAccess,
+        limit: usize,
+        context: ExpressionContext<'event>,
+    },
+    ListPage {
+        page: &'plan PlanListPage,
+        size: usize,
+        view_limit: u64,
+        view_limit_capture: Option<Value>,
+        guard_matches: bool,
+        context: ExpressionContext<'event>,
+    },
+    IndexedContextual {
+        access: &'plan PlanContextualIndexedAccess,
+        operation: PlanContextualOperationKind,
+        local: (PlanStaticOwnerId, PlanLocalId),
+        body: PlanRowExpressionId,
+        context: ExpressionContext<'event>,
+    },
+}
+
+struct ListSelectionEvaluationState<'event, 'plan> {
+    selection: &'plan PlanListAccessSelection,
+    index: PlanListIndexId,
+    expressions: Vec<PlanRowExpressionId>,
+    next_expression: usize,
+    values: Vec<Value>,
+    context: ExpressionContext<'event>,
+    continuation: ListSelectionContinuation<'event, 'plan>,
+}
+
+struct AccessTraversalCandidate {
+    row: RowId,
+    cursor: AccessCursorKey,
+    metrics: AccessMetrics,
+}
+
+enum AccessTraversalTerminal {
+    End(AccessMetrics),
+    Error {
+        metrics: AccessMetrics,
+        error: AccessError,
+    },
+}
+
+struct AccessTraversalBatch {
+    candidates: std::vec::IntoIter<AccessTraversalCandidate>,
+    terminal: AccessTraversalTerminal,
+}
+
+struct ListAccessTraversalState<'event, 'plan> {
+    access: &'plan PlanListAccess,
+    source_list: ListId,
+    limit: usize,
+    candidates: std::vec::IntoIter<AccessTraversalCandidate>,
+    terminal: Option<AccessTraversalTerminal>,
+    result: Vec<EvalValue>,
+    cleanup: usize,
+    context: ExpressionContext<'event>,
+}
+
+struct ListMapEvaluationState<'event, 'plan> {
+    maps: &'plan [PlanListMap],
+    next_map: usize,
+    value: EvalValue,
+    source_row: RowId,
+    context: ExpressionContext<'event>,
+}
+
+struct ListMapCaptureState<'event, 'plan> {
+    maps: &'plan [PlanListMap],
+    map_index: usize,
+    input: EvalValue,
+    origin: Option<RowId>,
+    mapped: EvalValue,
+    next_capture: usize,
+    captures: BTreeMap<FieldId, EvalValue>,
+    source_row: RowId,
+    context: ExpressionContext<'event>,
+}
+
+enum ListMapContinuation<'event, 'plan> {
+    ListAccess(Box<ListAccessTraversalState<'event, 'plan>>),
+    ListPage(Box<ListPageMaterializationState<'event, 'plan>>),
+}
+
+struct ListPageTraversalState<'event, 'plan> {
+    page: &'plan PlanListPage,
+    source_list: ListId,
+    size: usize,
+    capture_fingerprint: [u8; 32],
+    authority_revision: u64,
+    accepted_offset: u64,
+    requested: usize,
+    candidates: std::vec::IntoIter<AccessTraversalCandidate>,
+    terminal: Option<AccessTraversalTerminal>,
+    accepted: Vec<(RowId, AccessCursorKey)>,
+    cleanup: usize,
+    context: ExpressionContext<'event>,
+}
+
+struct ListPageMaterializationState<'event, 'plan> {
+    page: &'plan PlanListPage,
+    remaining: std::vec::IntoIter<RowId>,
+    items: Vec<Value>,
+    next: Option<Vec<u8>>,
+    context: ExpressionContext<'event>,
+}
+
+enum PageNormalizationContinuation<'event, 'plan> {
+    ListPage(Box<ListPageMaterializationState<'event, 'plan>>),
+    BoundedPage(Box<BoundedPageMaterializationState<'event, 'plan>>),
+}
+
+struct PageNormalizationState<'event, 'plan> {
+    tasks: Vec<PageValueTask>,
+    values: Vec<Value>,
+    continuation: PageNormalizationContinuation<'event, 'plan>,
+}
+
+struct PageRowMaterializationState<'event, 'plan> {
+    row: RowId,
+    fields: Vec<(String, FieldId)>,
+    next_field: usize,
+    output: BTreeMap<String, Value>,
+    scalar_type: Option<DataTypePlan>,
+    continuation: Box<PageNormalizationState<'event, 'plan>>,
+    event: Option<&'event SourceEvent>,
+}
+
+struct BoundedPageMaterializationState<'event, 'plan> {
+    page: &'plan PlanBoundedListPage,
+    size: usize,
+    remaining: std::vec::IntoIter<EvalValue>,
+    items: Vec<Value>,
+    context: ExpressionContext<'event>,
+}
+
+enum PageCaptureContinuation<'event, 'plan> {
+    ListPage {
+        page: &'plan PlanListPage,
+        size: usize,
+        view_limit: u64,
+        guard_matches: bool,
+        selection: EvaluatedListAccessSelection,
+        captures: Vec<Value>,
+        context: ExpressionContext<'event>,
+    },
+    BoundedPage {
+        page: &'plan PlanBoundedListPage,
+        size: usize,
+        items: Vec<Value>,
+        authority_revision: u64,
+        context: ExpressionContext<'event>,
+    },
+}
+
+enum PageTrailingCapture {
+    Value(Value),
+    Eval(EvalValue),
+}
+
+struct PageCaptureState<'event, 'plan> {
+    inputs: std::vec::IntoIter<ValueRef>,
+    captures: Vec<Value>,
+    trailing_captures: Vec<PageTrailingCapture>,
+    context: ExpressionContext<'event>,
+    continuation: PageCaptureContinuation<'event, 'plan>,
+}
+
+struct OrderedIndexPublicationState {
+    dirty_rows_snapshot: BTreeSet<RowId>,
+    subscriptions: ListAccessSubscriptions,
+    old_cursors: OrderedIndexCursorSnapshot,
+    requesting_consumer: Option<Consumer>,
+}
+
+struct OrderedIndexFullBuildState {
+    candidate: OrderedIndexCandidateBuild,
+    publication: OrderedIndexPublicationState,
+}
+
+struct OrderedIndexIncrementalState {
+    plan: PlanListIndex,
+    dirty_rows: BTreeSet<RowId>,
+    remaining: std::collections::btree_set::IntoIter<RowId>,
+    publication: OrderedIndexPublicationState,
+}
+
+enum OrderedIndexKeyContinuation {
+    Full {
+        state: Box<OrderedIndexFullBuildState>,
+        row: RowId,
+    },
+    Incremental {
+        state: Box<OrderedIndexIncrementalState>,
+        row: RowId,
+    },
+}
+
+struct OrderedIndexKeyEvaluationState {
+    plan: PlanListIndex,
+    row: RowId,
+    next_key: usize,
+    components: Vec<Vec<StructuralValue>>,
+}
+
+struct DetachedOrderedIndex {
+    index: OrderedIndex,
+    rollback_dirty_rows: BTreeSet<RowId>,
+}
+
+struct MaterializedListEvaluationState<'event, 'plan> {
+    list_id: ListId,
+    authority_source_list: Option<ListId>,
+    field_ids: &'plan BTreeMap<String, FieldId>,
+    row_field_copies: &'plan [PlanMaterializedRowFieldCopy],
+    owner_prefix: OwnerAncestryId,
+    existing: Vec<RowId>,
+    current_len: usize,
+    desired_len: usize,
+    remaining: std::vec::IntoIter<EvalValue>,
+    desired: Vec<(OwnerAncestryId, BTreeMap<FieldId, Value>)>,
+    event: Option<&'event SourceEvent>,
+    consumer: Option<Consumer>,
+}
+
+struct MaterializedRowCopyState<'event, 'plan> {
+    list: Box<MaterializedListEvaluationState<'event, 'plan>>,
+    row: RowId,
+    origin: OwnerAncestryId,
+    copies: std::vec::IntoIter<PlanMaterializedRowFieldCopy>,
+    fields: BTreeMap<FieldId, Value>,
+}
+
+struct ObjectMaterializationState<'event, 'plan> {
+    fields: &'plan [PlanRowObjectField],
+    next_field: usize,
+    values: std::vec::IntoIter<EvalValue>,
+    record: BTreeMap<String, EvalValue>,
+    context: ExpressionContext<'event>,
+}
+
+struct ObjectRowSpreadState<'event, 'plan> {
+    object: Box<ObjectMaterializationState<'event, 'plan>>,
+    row: RowId,
+    fields: std::vec::IntoIter<(FieldId, String)>,
+}
+
+#[derive(Clone, Copy)]
+enum WorkLimitCatchKind {
+    Page,
+}
+
+struct ExpressionCatchFrame {
+    kind: WorkLimitCatchKind,
+    task_depth: usize,
+    value_depth: usize,
+    binding_depth: usize,
+    currentness_depth: usize,
+    authority_depth: usize,
+    detached_index_depth: usize,
+    ordered_index_evaluation_depth: usize,
+    access_cleanup_depth: usize,
+    list_access_flush_started: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AccessCleanupKind {
+    ListAccess,
+    Page,
+}
+
+struct AccessCleanup {
+    kind: AccessCleanupKind,
+    metrics: AccessMetrics,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EvalOrderDirection {
     Ascending,
@@ -5357,6 +6183,22 @@ struct ExpressionContext<'a> {
     event: Option<&'a SourceEvent>,
     output: Option<FieldId>,
     consumer: Option<Consumer>,
+}
+
+fn exact_expression_row(
+    contextual: Option<RowId>,
+    triggered: Option<RowId>,
+    diagnostic: &str,
+) -> Result<Option<RowId>, Error> {
+    match (contextual, triggered) {
+        (Some(contextual), Some(triggered)) if contextual != triggered => {
+            Err(Error::InvalidPlan(format!(
+                "{diagnostic} has conflicting contextual row {contextual:?} and trigger row {triggered:?}"
+            )))
+        }
+        (Some(row), _) | (_, Some(row)) => Ok(Some(row)),
+        (None, None) => Ok(None),
+    }
 }
 
 enum ExpressionEntry<'a> {
@@ -5387,10 +6229,35 @@ enum ExpressionCurrentnessTarget {
     List(ListId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DirtyPropagationTask {
+    MarkConsumer(Consumer),
+    MarkRoot(FieldId),
+    MarkRow(RowId, FieldId),
+    MarkList(ListId),
+    InvalidateRoot(FieldId),
+    InvalidateRow(RowId, FieldId),
+    InvalidateList(ListId),
+}
+
+struct ChunkLogicalLenFrame {
+    list: ListId,
+    size: usize,
+    window: DerivedListWindow,
+}
+
+struct ChunkWindowFrame {
+    list: ListId,
+    size: usize,
+    logical_len: u64,
+    range: Range<u64>,
+}
+
 enum ExpressionValueRef<'plan> {
     Arena(PlanRowExpressionId),
     List(ListId),
     Derived(&'plan ValueRef),
+    Owned(ValueRef),
 }
 
 #[derive(Clone, Copy)]
@@ -5507,18 +6374,35 @@ enum ExpressionTask<'event, 'plan> {
         value_base: usize,
         context: ExpressionContext<'event>,
     },
+    ObjectMaterializeNext {
+        state: Box<ObjectMaterializationState<'event, 'plan>>,
+    },
+    ObjectRowSpreadNext {
+        state: Box<ObjectRowSpreadState<'event, 'plan>>,
+    },
+    ObjectRowSpreadAfterField {
+        state: Box<ObjectRowSpreadState<'event, 'plan>>,
+        name: String,
+    },
     EvaluateDerived {
         expression: &'plan PlanDerivedExpression,
         context: ExpressionContext<'event>,
     },
     MaterializeListAfterValue {
-        target_list: ListId,
-        authority_source_list: Option<ListId>,
-        fields: &'plan BTreeMap<String, FieldId>,
-        row_field_copies: &'plan [PlanMaterializedRowFieldCopy],
-        owner_prefix: Vec<OwnerInstanceRow>,
+        materialization: &'plan PlanListMaterialization,
+        owner_prefix: OwnerAncestryId,
         authority_depth: usize,
         event: Option<&'event SourceEvent>,
+    },
+    MaterializedListNext {
+        state: Box<MaterializedListEvaluationState<'event, 'plan>>,
+    },
+    MaterializedRowCopyNext {
+        state: Box<MaterializedRowCopyState<'event, 'plan>>,
+    },
+    MaterializedRowCopyAfterField {
+        state: Box<MaterializedRowCopyState<'event, 'plan>>,
+        target_field: FieldId,
     },
     DerivedSourceKeyAfterValue {
         skip_empty: bool,
@@ -5537,12 +6421,6 @@ enum ExpressionTask<'event, 'plan> {
         op: PlanInfixOp,
         left: EvalValue,
     },
-    DerivedBoolAndAfterLeft {
-        right: &'plan PlanDerivedExpression,
-        context: ExpressionContext<'event>,
-    },
-    DerivedBoolAndAfterRight,
-    DerivedBoolNotExpressionAfterValue,
     BeginRowOwnedCall {
         import_id: ImportId,
         context: ExpressionContext<'event>,
@@ -5570,10 +6448,14 @@ enum ExpressionTask<'event, 'plan> {
         state: StateId,
     },
     DerivedStateProjectionAfterValue {
-        field_path: &'plan [String],
+        field_path: Vec<String>,
         state: StateId,
     },
     EnsureRoot {
+        field: FieldId,
+        event: Option<&'event SourceEvent>,
+    },
+    EnsureRootCurrentness {
         field: FieldId,
         event: Option<&'event SourceEvent>,
     },
@@ -5585,11 +6467,20 @@ enum ExpressionTask<'event, 'plan> {
         field: FieldId,
         event: Option<&'event SourceEvent>,
     },
+    EnsureRowCurrentness {
+        row: RowId,
+        field: FieldId,
+        event: Option<&'event SourceEvent>,
+    },
     FinishRow {
         row: RowId,
         field: FieldId,
     },
     EnsureList {
+        list: ListId,
+        event: Option<&'event SourceEvent>,
+    },
+    EnsureListCurrentness {
         list: ListId,
         event: Option<&'event SourceEvent>,
     },
@@ -5617,6 +6508,252 @@ enum ExpressionTask<'event, 'plan> {
         field: FieldId,
         context: ExpressionContext<'event>,
     },
+    BeginListAccess {
+        access: &'plan PlanListAccess,
+        context: ExpressionContext<'event>,
+    },
+    ListAccessAfterGuard {
+        access: &'plan PlanListAccess,
+        context: ExpressionContext<'event>,
+    },
+    ListAccessAfterLimit {
+        access: &'plan PlanListAccess,
+        context: ExpressionContext<'event>,
+    },
+    BeginListPage {
+        page: &'plan PlanListPage,
+        context: ExpressionContext<'event>,
+    },
+    ListPageAfterSize {
+        page: &'plan PlanListPage,
+        context: ExpressionContext<'event>,
+    },
+    ListPageAfterViewLimit {
+        page: &'plan PlanListPage,
+        size: usize,
+        context: ExpressionContext<'event>,
+    },
+    ListPageAfterGuard {
+        page: &'plan PlanListPage,
+        size: usize,
+        view_limit: u64,
+        view_limit_capture: Option<Value>,
+        context: ExpressionContext<'event>,
+    },
+    BeginBoundedListPage {
+        page: &'plan PlanBoundedListPage,
+        context: ExpressionContext<'event>,
+    },
+    BoundedListPageAfterSize {
+        page: &'plan PlanBoundedListPage,
+        context: ExpressionContext<'event>,
+    },
+    BoundedListPageAfterView {
+        page: &'plan PlanBoundedListPage,
+        size: usize,
+        context: ExpressionContext<'event>,
+    },
+    ListSelectionNext {
+        state: Box<ListSelectionEvaluationState<'event, 'plan>>,
+    },
+    ListSelectionAfterValue {
+        state: Box<ListSelectionEvaluationState<'event, 'plan>>,
+    },
+    IndexedContextualAfterSelection {
+        access: &'plan PlanContextualIndexedAccess,
+        operation: PlanContextualOperationKind,
+        local: (PlanStaticOwnerId, PlanLocalId),
+        body: PlanRowExpressionId,
+        selection: EvaluatedListAccessSelection,
+        context: ExpressionContext<'event>,
+    },
+    IndexedContextualAfterIndex {
+        access: &'plan PlanContextualIndexedAccess,
+        operation: PlanContextualOperationKind,
+        local: (PlanStaticOwnerId, PlanLocalId),
+        body: PlanRowExpressionId,
+        selection: EvaluatedListAccessSelection,
+        context: ExpressionContext<'event>,
+    },
+    ListAccessAfterSelection {
+        access: &'plan PlanListAccess,
+        limit: usize,
+        selection: EvaluatedListAccessSelection,
+        context: ExpressionContext<'event>,
+    },
+    ListAccessAfterIndex {
+        access: &'plan PlanListAccess,
+        limit: usize,
+        selection: EvaluatedListAccessSelection,
+        context: ExpressionContext<'event>,
+    },
+    ListAccessNextCandidate {
+        state: Box<ListAccessTraversalState<'event, 'plan>>,
+    },
+    ListAccessFinish {
+        state: Box<ListAccessTraversalState<'event, 'plan>>,
+    },
+    ListAccessFilterNext {
+        state: Box<ListAccessTraversalState<'event, 'plan>>,
+        candidate: RowId,
+        next_filter: usize,
+    },
+    ListAccessAfterFilter {
+        state: Box<ListAccessTraversalState<'event, 'plan>>,
+        candidate: RowId,
+        next_filter: usize,
+    },
+    ListMapsNext {
+        state: Box<ListMapEvaluationState<'event, 'plan>>,
+        continuation: ListMapContinuation<'event, 'plan>,
+    },
+    ListMapAfterBody {
+        state: Box<ListMapEvaluationState<'event, 'plan>>,
+        continuation: ListMapContinuation<'event, 'plan>,
+        input: EvalValue,
+        origin: Option<RowId>,
+        map_index: usize,
+    },
+    ListMapCaptureNext {
+        state: Box<ListMapCaptureState<'event, 'plan>>,
+        continuation: ListMapContinuation<'event, 'plan>,
+    },
+    ListMapCaptureAfterValue {
+        state: Box<ListMapCaptureState<'event, 'plan>>,
+        continuation: ListMapContinuation<'event, 'plan>,
+        field: FieldId,
+    },
+    ListPageAfterSelection {
+        page: &'plan PlanListPage,
+        size: usize,
+        view_limit: u64,
+        view_limit_capture: Option<Value>,
+        guard_matches: bool,
+        selection: EvaluatedListAccessSelection,
+        selection_captures: Vec<Value>,
+        context: ExpressionContext<'event>,
+    },
+    PageCaptureNext {
+        state: Box<PageCaptureState<'event, 'plan>>,
+    },
+    PageCaptureAfterValue {
+        state: Box<PageCaptureState<'event, 'plan>>,
+    },
+    ListPageAfterCaptures {
+        page: &'plan PlanListPage,
+        size: usize,
+        view_limit: u64,
+        guard_matches: bool,
+        selection: EvaluatedListAccessSelection,
+        captures: Vec<Value>,
+        context: ExpressionContext<'event>,
+    },
+    ListPageAfterCursor {
+        page: &'plan PlanListPage,
+        size: usize,
+        view_limit: u64,
+        guard_matches: bool,
+        selection: EvaluatedListAccessSelection,
+        capture_fingerprint: [u8; 32],
+        authority_revision: u64,
+        context: ExpressionContext<'event>,
+    },
+    ListPageAfterIndex {
+        page: &'plan PlanListPage,
+        size: usize,
+        view_limit: u64,
+        selection: EvaluatedListAccessSelection,
+        capture_fingerprint: [u8; 32],
+        authority_revision: u64,
+        cursor_payload: Option<PageCursor>,
+        accepted_offset: u64,
+        context: ExpressionContext<'event>,
+    },
+    ListPageNextCandidate {
+        state: Box<ListPageTraversalState<'event, 'plan>>,
+    },
+    ListPageFinishTraversal {
+        state: Box<ListPageTraversalState<'event, 'plan>>,
+    },
+    ListPageFilterNext {
+        state: Box<ListPageTraversalState<'event, 'plan>>,
+        candidate: RowId,
+        cursor: AccessCursorKey,
+        next_filter: usize,
+    },
+    ListPageAfterFilter {
+        state: Box<ListPageTraversalState<'event, 'plan>>,
+        candidate: RowId,
+        cursor: AccessCursorKey,
+        next_filter: usize,
+    },
+    ListPageMaterializeNext {
+        state: Box<ListPageMaterializationState<'event, 'plan>>,
+    },
+    BoundedPageMaterializeNext {
+        state: Box<BoundedPageMaterializationState<'event, 'plan>>,
+    },
+    PageNormalizeContinue {
+        state: Box<PageNormalizationState<'event, 'plan>>,
+    },
+    PageRowMaterializeNext {
+        state: Box<PageRowMaterializationState<'event, 'plan>>,
+    },
+    PageRowMaterializeAfterField {
+        state: Box<PageRowMaterializationState<'event, 'plan>>,
+        name: String,
+    },
+    BoundedListPageAfterItems {
+        page: &'plan PlanBoundedListPage,
+        size: usize,
+        items: Vec<Value>,
+        context: ExpressionContext<'event>,
+    },
+    BoundedListPageAfterCaptures {
+        page: &'plan PlanBoundedListPage,
+        size: usize,
+        items: Vec<Value>,
+        captures: Vec<Value>,
+        authority_revision: u64,
+        context: ExpressionContext<'event>,
+    },
+    BoundedListPageAfterCursor {
+        page: &'plan PlanBoundedListPage,
+        size: usize,
+        items: Vec<Value>,
+        capture_fingerprint: [u8; 32],
+        authority_revision: u64,
+    },
+    EnsureOrderedIndex {
+        index: PlanListIndexId,
+        requesting_consumer: Option<Consumer>,
+    },
+    EnsureOrderedIndexAfterSource {
+        index: PlanListIndexId,
+        requesting_consumer: Option<Consumer>,
+        discard_source_value: bool,
+    },
+    OrderedIndexFullNext {
+        state: Box<OrderedIndexFullBuildState>,
+    },
+    OrderedIndexIncrementalNext {
+        state: Box<OrderedIndexIncrementalState>,
+    },
+    OrderedIndexKeyNext {
+        state: Box<OrderedIndexKeyEvaluationState>,
+        continuation: OrderedIndexKeyContinuation,
+    },
+    OrderedIndexKeyAfterValue {
+        state: Box<OrderedIndexKeyEvaluationState>,
+        continuation: OrderedIndexKeyContinuation,
+        key_position: usize,
+    },
+    FlushListAccessDependencies,
+    FlushListAccessDependenciesPass {
+        remaining_passes: usize,
+    },
+    FinishListAccessDependenciesFlush,
+    FinishWorkLimitCatch,
     SelectAfterInput {
         expression: PlanRowExpressionId,
         context: ExpressionContext<'event>,
@@ -5819,6 +6956,34 @@ fn schedule_isolated_expression<'event, 'plan>(
             context,
         })
     }
+}
+
+fn schedule_isolated_value_ref<'event, 'plan>(
+    stack: &mut ExpressionWorkStack<'event, 'plan>,
+    undos: &mut Vec<ExpressionBindingUndo>,
+    bindings: &mut PlanLocalBindings,
+    value_ref: ValueRef,
+    context: ExpressionContext<'event>,
+) -> Result<(), Error> {
+    if undos.len().saturating_add(bindings.len()) > stack.limit {
+        return Err(Error::InvalidPlan(format!(
+            "expression binding stack exceeded its plan-derived bound of {}",
+            stack.limit
+        )));
+    }
+    let keys = bindings.keys().copied().collect::<Vec<_>>();
+    let restore_start = undos.len();
+    for key in keys {
+        let previous = bindings.remove(&key);
+        undos.push(ExpressionBindingUndo { key, previous });
+    }
+    for undo in restore_start..undos.len() {
+        stack.push_task(ExpressionTask::RestoreBinding { undo })?;
+    }
+    stack.push_task(ExpressionTask::ValueRef {
+        value_ref: ExpressionValueRef::Owned(value_ref),
+        context,
+    })
 }
 
 fn finish_expression_currentness(
@@ -6105,9 +7270,9 @@ impl PendingListMutation {
         }
     }
 
-    fn site_owner(&self) -> (usize, &OwnerInstanceId) {
+    fn site_owner(&self) -> (usize, OwnerInstanceId) {
         match self {
-            Self::Append { site, owner, .. } | Self::Remove { site, owner, .. } => (*site, owner),
+            Self::Append { site, owner, .. } | Self::Remove { site, owner, .. } => (*site, *owner),
         }
     }
 
@@ -6147,6 +7312,7 @@ pub struct MachineInstance {
     next_transient_effect_sequence: u64,
     pending_transient_effects: BTreeMap<TransientEffectCallId, PendingTransientEffect>,
     effect_activations: BTreeMap<EffectConsumer, EffectActivation>,
+    owner_instances: OwnerInstanceInterner,
     root_source_bindings: BTreeMap<SourceId, u64>,
     next_binding_id: u64,
     touched_root_states: BTreeSet<StateId>,
@@ -6729,6 +7895,7 @@ impl MachineInstanceBuilder {
                 next_transient_effect_sequence: 1,
                 pending_transient_effects: BTreeMap::new(),
                 effect_activations: BTreeMap::new(),
+                owner_instances: OwnerInstanceInterner::default(),
                 root_source_bindings: BTreeMap::new(),
                 next_binding_id: 1,
                 touched_root_states: BTreeSet::new(),
@@ -7649,6 +8816,18 @@ impl MachineBuildTask {
                     )));
                 }
                 let session = self.session_mut();
+                let restored_owner = session
+                    .owner_instances
+                    .intern_ancestry_rows(restored_row.owner_ancestors.iter().copied())?;
+                let restored_origin = restored_row
+                    .materialization_origin
+                    .as_ref()
+                    .map(|origin| {
+                        session
+                            .owner_instances
+                            .intern_ancestry_rows(origin.iter().copied())
+                    })
+                    .transpose()?;
                 let row = session
                     .lists
                     .get(&build.list_id)
@@ -7659,13 +8838,13 @@ impl MachineBuildTask {
                             restored_row.id.key, restored_row.id.generation
                         ))
                     })?;
-                if row.owner_ancestors != restored_row.owner_ancestors {
+                if row.owner_ancestry != restored_owner {
                     return Err(Error::InvalidPlan(format!(
                         "restore row override {}:{} changed structural owner",
                         restored_row.id.key, restored_row.id.generation
                     )));
                 }
-                if row.materialization_origin != restored_row.materialization_origin {
+                if row.materialization_origin != restored_origin {
                     return Err(Error::InvalidPlan(format!(
                         "restore row override {}:{} changed materialization origin",
                         restored_row.id.key, restored_row.id.generation
@@ -7771,13 +8950,35 @@ impl MachineBuildTask {
                     )));
                 }
                 let row_id = restored_row.id;
+                let session = self.session_mut();
+                let owner_ancestry = session
+                    .owner_instances
+                    .intern_ancestry_rows(restored_row.owner_ancestors.iter().copied())?;
+                let materialization_origin = restored_row
+                    .materialization_origin
+                    .as_ref()
+                    .map(|origin| {
+                        session
+                            .owner_instances
+                            .intern_ancestry_rows(origin.iter().copied())
+                    })
+                    .transpose()?;
                 let mut row = Row {
-                    owner_ancestors: restored_row.owner_ancestors,
-                    materialization_origin: restored_row.materialization_origin,
+                    owner_ancestry,
+                    materialization_origin,
                     fields: restored_row.fields,
                     ..Row::default()
                 };
-                let session = self.session_mut();
+                if let Some(scope) = session
+                    .plan
+                    .storage_layout
+                    .list_slots
+                    .iter()
+                    .find(|slot| slot.list_id == build.list_id)
+                    .and_then(|slot| slot.scope_id)
+                {
+                    row.provenance.insert(scope, row_id);
+                }
                 for field in session.metadata.row_computations.keys() {
                     if session.metadata.row_field_owner.get(field) == Some(&build.list_id) {
                         row.derived.insert(*field, Currentness::Dirty);
@@ -7858,11 +9059,16 @@ impl MachineBuildTask {
             }
             RuntimeStateBuildPhase::RebuildOwnerPartitions(cursor) => {
                 if let Some(row) = self.next_list_row(cursor) {
-                    self.session_mut()
-                        .lists
+                    let session = self.session_mut();
+                    let MachineInstance {
+                        lists,
+                        owner_instances,
+                        ..
+                    } = session;
+                    lists
                         .get_mut(&row.list)
                         .expect("row list exists during owner rebuild")
-                        .index_owner_partition_row(row)?;
+                        .index_owner_partition_row(row, owner_instances)?;
                 } else {
                     build.phase = RuntimeStateBuildPhase::ClearDynamicDependencies;
                 }
@@ -9776,9 +10982,14 @@ impl MachineInstance {
                         "distributed invocation result source has no route".to_owned(),
                     )
                 })?;
-            let result_owner = instantiate_plan_owner(&result_owner_plan, &trigger.active)?;
-            let result_ancestors = result_owner
-                .ancestors
+            let result_owner = instantiate_plan_owner(
+                &result_owner_plan,
+                &trigger.active,
+                &mut self.owner_instances,
+            )?;
+            let result_ancestors = self
+                .owner_instances
+                .rows(result_owner)?
                 .iter()
                 .map(|row| RowId {
                     list: row.list,
@@ -9790,26 +11001,40 @@ impl MachineInstance {
             let call_instance_id = if call.row_bindings.is_empty() {
                 self.distributed_call_instance_id(call.call_site_id, &[])?
             } else {
-                let call_owner = instantiate_plan_owner(&call.owner, &trigger.active)?;
+                let call_owner = instantiate_plan_owner(
+                    &call.owner,
+                    &trigger.active,
+                    &mut self.owner_instances,
+                )?;
                 let mut rows = Vec::with_capacity(call.row_bindings.len());
                 for binding in &call.row_bindings {
-                    let index = call
-                        .owner
-                        .ancestors
-                        .iter()
-                        .position(|owner| owner.static_owner == binding.owner)
-                        .ok_or_else(|| {
-                            Error::InvalidPlan(
-                                "distributed invocation row binding is outside its structural owner"
-                                    .to_owned(),
-                            )
-                        })?;
-                    let runtime_row = *call_owner.ancestors.get(index).ok_or_else(|| {
+                    let index = usize::try_from(binding.ancestor_index).map_err(|_| {
                         Error::InvalidPlan(
-                            "distributed invocation has no runtime row for a required owner"
+                            "distributed invocation row binding index does not fit usize"
                                 .to_owned(),
                         )
                     })?;
+                    let expected = call.owner.ancestors.get(index).ok_or_else(|| {
+                        Error::InvalidPlan(
+                            "distributed invocation row binding is outside its structural owner"
+                                .to_owned(),
+                        )
+                    })?;
+                    if expected.static_owner != binding.owner || expected.list != binding.list {
+                        return Err(Error::InvalidPlan(
+                            "distributed invocation row binding coordinate does not match its structural owner"
+                                .to_owned(),
+                        ));
+                    }
+                    let runtime_row =
+                        self.owner_instances
+                            .row_at(call_owner, index)?
+                            .ok_or_else(|| {
+                                Error::InvalidPlan(
+                            "distributed invocation has no runtime row for a required owner"
+                                .to_owned(),
+                        )
+                            })?;
                     if runtime_row.list != binding.list {
                         return Err(Error::InvalidPlan(
                             "distributed invocation row binding resolved to the wrong list"
@@ -9986,6 +11211,7 @@ impl MachineInstance {
             })?;
         Ok(RowSnapshot {
             id: row,
+            provenance: state.provenance.clone(),
             fields: state
                 .fields
                 .iter()
@@ -10003,7 +11229,7 @@ impl MachineInstance {
     pub fn structural_owner_rows(&self, row: RowId) -> Result<Vec<RowId>, Error> {
         self.validate_row_ownership_for_row(row)?;
         Ok(self
-            .row_owner_ancestors(row)?
+            .row_owner_rows(row)?
             .iter()
             .map(|owner| RowId {
                 list: owner.list,
@@ -10013,44 +11239,11 @@ impl MachineInstance {
             .collect())
     }
 
-    fn row_materialization_origin(
-        &self,
-        row: RowId,
-    ) -> Result<Option<Vec<OwnerInstanceRow>>, Error> {
-        let state = self
-            .lists
-            .get(&row.list)
-            .and_then(|list| list.rows.get(&row))
-            .ok_or_else(|| {
-                Error::InvalidPlan(format!(
-                    "row {}:{}:{} has no materialization lineage",
-                    row.list.0, row.key, row.generation
-                ))
-            })?;
-        let Some(origin) = state.materialization_origin.clone() else {
-            return Ok(None);
-        };
-        for (depth, owner) in origin.iter().enumerate() {
-            let owner_row = RowId {
-                list: owner.list,
-                key: owner.key,
-                generation: owner.generation,
-            };
-            if self.row_owner_ancestors(owner_row)? != &origin[..=depth] {
-                return Err(Error::InvalidPlan(format!(
-                    "row {}:{}:{} has stale materialization lineage at depth {depth}",
-                    row.list.0, row.key, row.generation
-                )));
-            }
-        }
-        Ok(Some(origin))
-    }
-
-    fn row_owner_ancestors(&self, row: RowId) -> Result<&[OwnerInstanceRow], Error> {
+    fn row_owner_ancestry(&self, row: RowId) -> Result<OwnerAncestryId, Error> {
         self.lists
             .get(&row.list)
             .and_then(|list| list.rows.get(&row))
-            .map(|row| row.owner_ancestors.as_slice())
+            .map(|row| row.owner_ancestry)
             .ok_or_else(|| {
                 Error::InvalidPlan(format!(
                     "row {}:{}:{} has no structural owner",
@@ -10059,8 +11252,70 @@ impl MachineInstance {
             })
     }
 
+    fn row_owner_rows(&self, row: RowId) -> Result<Vec<OwnerInstanceRow>, Error> {
+        self.owner_instances
+            .ancestry_rows(self.row_owner_ancestry(row)?)
+    }
+
+    fn row_materialization_origin(&self, row: RowId) -> Result<Option<OwnerAncestryId>, Error> {
+        self.lists
+            .get(&row.list)
+            .and_then(|list| list.rows.get(&row))
+            .map(|row| row.materialization_origin)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "row {}:{}:{} has no materialization metadata",
+                    row.list.0, row.key, row.generation
+                ))
+            })
+    }
+
+    fn row_materialization_origin_rows(
+        &self,
+        row: RowId,
+    ) -> Result<Option<Vec<OwnerInstanceRow>>, Error> {
+        self.row_materialization_origin(row)?
+            .map(|origin| self.owner_instances.ancestry_rows(origin))
+            .transpose()
+    }
+
+    fn provenance_for_materialization_origin(
+        &self,
+        origin: Option<OwnerAncestryId>,
+    ) -> Result<BTreeMap<ScopeId, RowId>, Error> {
+        let Some(origin) = origin else {
+            return Ok(BTreeMap::new());
+        };
+        let Some(leaf) = self.owner_instances.ancestry_leaf(origin)? else {
+            return Ok(BTreeMap::new());
+        };
+        let source = RowId {
+            list: leaf.list,
+            key: leaf.key,
+            generation: leaf.generation,
+        };
+        let row = self
+            .lists
+            .get(&source.list)
+            .and_then(|list| list.rows.get(&source))
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "materialization origin row {}:{}:{} does not exist",
+                    source.list.0, source.key, source.generation
+                ))
+            })?;
+        if row.owner_ancestry != origin {
+            return Err(Error::InvalidPlan(format!(
+                "materialization origin row {}:{}:{} does not match its complete owner",
+                source.list.0, source.key, source.generation
+            )));
+        }
+        Ok(row.provenance.clone())
+    }
+
     fn validate_row_ownership_for_row(&self, row_id: RowId) -> Result<(), Error> {
-        let ancestors = self.row_owner_ancestors(row_id)?;
+        let owner_ancestry = self.row_owner_ancestry(row_id)?;
+        let ancestors = self.owner_instances.ancestry_rows(owner_ancestry)?;
         let expected_leaf = OwnerInstanceRow {
             list: row_id.list,
             key: row_id.key,
@@ -10078,8 +11333,8 @@ impl MachineInstance {
                 key: ancestor.key,
                 generation: ancestor.generation,
             };
-            let actual = self.row_owner_ancestors(ancestor_id)?;
-            if actual != &ancestors[..=depth] {
+            let actual = self.row_owner_rows(ancestor_id)?;
+            if actual != ancestors[..=depth] {
                 return Err(Error::InvalidPlan(format!(
                     "row {}:{}:{} has a mixed structural owner at depth {depth}",
                     row_id.list.0, row_id.key, row_id.generation
@@ -10090,11 +11345,12 @@ impl MachineInstance {
     }
 
     fn owner_instance_for_row(
-        &self,
+        &mut self,
         plan: &PlanOwner,
         row: RowId,
     ) -> Result<OwnerInstanceId, Error> {
-        let ancestors = self.row_owner_ancestors(row)?;
+        let owner_ancestry = self.row_owner_ancestry(row)?;
+        let ancestors = self.owner_instances.ancestry_rows(owner_ancestry)?;
         if ancestors.len() != plan.ancestors.len() {
             return Err(Error::InvalidPlan(format!(
                 "row {}:{}:{} has {} owner ancestors, owner {} requires {}",
@@ -10126,12 +11382,12 @@ impl MachineInstance {
                 row.list.0, row.key, row.generation
             )));
         }
-        OwnerInstanceId::new(plan.static_owner, ancestors.iter().copied())
-            .map_err(|detail| Error::InvalidPlan(detail.to_owned()))
+        self.owner_instances
+            .intern_owner(plan.static_owner, owner_ancestry)
     }
 
     fn state_owner_instance(
-        &self,
+        &mut self,
         state: StateId,
         origin: &ActiveTrigger,
         row: Option<RowId>,
@@ -10143,12 +11399,11 @@ impl MachineInstance {
             .cloned()
             .ok_or_else(|| Error::InvalidPlan(format!("state {} has no owner plan", state.0)))?;
         let owner = if plan.ancestors.is_empty() {
-            OwnerInstanceId::new(plan.static_owner, Vec::new())
-                .map_err(|detail| Error::InvalidPlan(detail.to_owned()))?
+            self.owner_instances.intern_rows(plan.static_owner, [])?
         } else if origin.owner_plan.ancestors.starts_with(&plan.ancestors)
-            && origin.owner.ancestors.len() >= plan.ancestors.len()
+            && self.owner_instances.depth(origin.owner)? >= plan.ancestors.len()
         {
-            instantiate_plan_owner(&plan, origin)?
+            instantiate_plan_owner(&plan, origin, &mut self.owner_instances)?
         } else {
             self.owner_instance_for_row(
                 &plan,
@@ -10164,7 +11419,7 @@ impl MachineInstance {
     }
 
     fn trigger_for_state_target<'a>(
-        &self,
+        &mut self,
         state: StateId,
         origin: &TriggerFrame<'a>,
         row: RowId,
@@ -10278,6 +11533,7 @@ impl MachineInstance {
                     })?;
                     Ok(RowSnapshot {
                         id: *row_id,
+                        provenance: row.provenance.clone(),
                         fields: row
                             .fields
                             .iter()
@@ -10381,8 +11637,11 @@ impl MachineInstance {
                             list_id.0, row_id.key, row_id.generation
                         ))
                     })?,
-                    owner_ancestors: row.owner_ancestors.clone(),
-                    materialization_origin: row.materialization_origin.clone(),
+                    owner_ancestors: self.owner_instances.ancestry_rows(row.owner_ancestry)?,
+                    materialization_origin: row
+                        .materialization_origin
+                        .map(|origin| self.owner_instances.ancestry_rows(origin))
+                        .transpose()?,
                     fields,
                     touched_fields,
                 })
@@ -11323,79 +12582,10 @@ impl MachineInstance {
                     Error::InvalidEvent(format!("source {} has no root binding", source.0))
                 })?
         };
-        let owner = OwnerInstanceId::new(route.owner.static_owner, owner_rows)
+        let owner = OwnerInstanceRoute::new(route.owner.static_owner, owner_rows)
             .map_err(|detail| Error::InvalidPlan(detail.to_owned()))?;
         SourceRouteToken::new(self.options.program_revision, owner, source, binding_epoch)
             .map_err(|detail| Error::InvalidEvent(detail.to_owned()))
-    }
-
-    pub fn source_route_token_for_descendant_row(
-        &self,
-        source: SourceId,
-        row: RowId,
-    ) -> Result<SourceRouteToken, Error> {
-        let route = self.metadata.routes.get(&source).ok_or_else(|| {
-            Error::InvalidEvent(format!("source {} is not in the plan", source.0))
-        })?;
-        let mut candidates = Vec::new();
-        let mut pending = vec![row];
-        let mut visited = BTreeSet::new();
-        while let Some(candidate_row) = pending.pop() {
-            if !visited.insert(candidate_row) {
-                return Err(Error::InvalidPlan(format!(
-                    "row {}:{}:{} materialization provenance contains a cycle",
-                    row.list.0, row.key, row.generation
-                )));
-            }
-            let structural = self.structural_owner_rows(candidate_row)?;
-            if !candidates.contains(&structural) {
-                candidates.push(structural);
-            }
-            let Some(origin) = self.row_materialization_origin(candidate_row)? else {
-                continue;
-            };
-            let origin = origin
-                .into_iter()
-                .map(|owner| RowId {
-                    list: owner.list,
-                    key: owner.key,
-                    generation: owner.generation,
-                })
-                .collect::<Vec<_>>();
-            if let Some(leaf) = origin.last().copied() {
-                pending.push(leaf);
-            }
-            if !candidates.contains(&origin) {
-                candidates.push(origin);
-            }
-        }
-        let mut matching = candidates
-            .into_iter()
-            .filter(|candidate| route.owner.ancestors.len() <= candidate.len())
-            .filter_map(|candidate| {
-                let route_rows = candidate[..route.owner.ancestors.len()].to_vec();
-                route
-                    .owner
-                    .ancestors
-                    .iter()
-                    .zip(&route_rows)
-                    .all(|(expected, actual)| expected.list == actual.list)
-                    .then_some(route_rows)
-            })
-            .collect::<Vec<_>>();
-        matching.sort();
-        matching.dedup();
-        match matching.as_slice() {
-            [route_rows] => self.source_route_token(source, route_rows),
-            [] => Err(Error::InvalidEvent(format!(
-                "source {} ownership does not match descendant row {}:{}:{}",
-                source.0, row.list.0, row.key, row.generation
-            ))),
-            _ => Err(Error::InvalidEvent(format!(
-                "source {} ownership is ambiguous for descendant row {}:{}:{}",
-                source.0, row.list.0, row.key, row.generation
-            ))),
-        }
     }
 
     pub fn source_route_token_for_path(
@@ -11513,8 +12703,9 @@ impl MachineInstance {
     }
 
     fn rebuild_runtime_state_after_rollback(&mut self, work: &mut Work) -> Result<(), Error> {
+        let owner_instances = &mut self.owner_instances;
         for list in self.lists.values_mut() {
-            list.rebuild_owner_partitions()?;
+            list.rebuild_owner_partitions(owner_instances)?;
         }
         self.ordered_indexes.clear();
         self.dirty_ordered_indexes = self.metadata.list_indexes.keys().copied().collect();
@@ -11679,16 +12870,22 @@ impl MachineInstance {
             key,
             generation: 1,
         };
-        let mut row = Row {
-            owner_ancestors: vec![OwnerInstanceRow {
+        let owner_ancestry = self
+            .owner_instances
+            .intern_ancestry_rows([OwnerInstanceRow {
                 list: row_id.list,
                 key: row_id.key,
                 generation: row_id.generation,
-            }],
+            }])?;
+        let mut row = Row {
+            owner_ancestry,
             fields,
             default_fields,
             ..Row::default()
         };
+        if let Some(scope) = slot.scope_id {
+            row.provenance.insert(scope, row_id);
+        }
         for field in self.metadata.row_computations.keys() {
             if self.metadata.row_field_owner.get(field) == Some(&slot.list_id) {
                 row.derived.insert(*field, Currentness::Dirty);
@@ -11718,7 +12915,7 @@ impl MachineInstance {
         prepared_order.commit(list);
         list.next_key = list.next_key.max(next_key);
         list.rows.insert(row_id, row);
-        list.index_owner_partition_row(row_id)?;
+        list.index_owner_partition_row(row_id, &mut self.owner_instances)?;
         record_source_order_maintenance(work, &maintenance);
         self.bind_row_sources(row_id, slot.scope_id)?;
         Ok(row_id)
@@ -11957,10 +13154,11 @@ impl MachineInstance {
                     item.item_id
                 )));
             }
+            let owner = self.owner_instances.intern_route(&owner)?;
             self.apply_effect_outcome(
                 &op,
                 &effect.result,
-                &owner,
+                owner,
                 row,
                 outcome.clone(),
                 sequence,
@@ -12033,7 +13231,7 @@ impl MachineInstance {
                     "transient effect call {call_id} is unknown, cancelled, or already completed"
                 ))
             })?;
-        self.validate_current_effect_owner(&pending.owner, pending.target, call_id)?;
+        self.validate_current_effect_owner(pending.owner, pending.target, call_id)?;
         let (op, effect) = self.effect_invocation(pending.invocation_id)?;
         if effect.effect_id != pending.effect_id {
             return Err(Error::InvalidPlan(format!(
@@ -12084,7 +13282,7 @@ impl MachineInstance {
             self.apply_effect_outcome(
                 &op,
                 &effect.result,
-                &pending.owner,
+                pending.owner,
                 pending.target,
                 stored_outcome,
                 sequence,
@@ -12160,7 +13358,7 @@ impl MachineInstance {
                 ))
             })?;
         let mut pending = previous_pending.clone();
-        self.validate_current_effect_owner(&pending.owner, pending.target, call_id)?;
+        self.validate_current_effect_owner(pending.owner, pending.target, call_id)?;
         let boon_plan::EffectDeliveryCardinality::Stream {
             max_in_flight,
             credit_result_tags,
@@ -12243,7 +13441,7 @@ impl MachineInstance {
             self.apply_effect_outcome(
                 &op,
                 &effect.result,
-                &pending.owner,
+                pending.owner,
                 pending.target,
                 stored_outcome,
                 sequence,
@@ -12543,7 +13741,7 @@ impl MachineInstance {
 
     fn durable_owner(
         &self,
-        owner: &OwnerInstanceId,
+        owner: &OwnerInstanceRoute,
     ) -> Result<boon_persistence::DurableOwner, Error> {
         durable_owner_for_rows(&self.plan, &owner.ancestors)
     }
@@ -12580,7 +13778,7 @@ impl MachineInstance {
         &self,
         plan: &PlanOwner,
         durable: &boon_persistence::DurableOwner,
-    ) -> Result<OwnerInstanceId, Error> {
+    ) -> Result<OwnerInstanceRoute, Error> {
         if durable.ancestors.len() != plan.ancestors.len() {
             return Err(Error::InvalidPlan(format!(
                 "durable owner for static owner {} has {} ancestors, expected {}",
@@ -12642,7 +13840,7 @@ impl MachineInstance {
                 key: row.key,
                 generation: row.generation,
             };
-            let runtime_prefix = self.row_owner_ancestors(row)?;
+            let runtime_prefix = self.row_owner_rows(row)?;
             if runtime_prefix.len() != index + 1
                 || runtime_prefix[..index] != ancestors
                 || runtime_prefix[index] != owner_row
@@ -12653,7 +13851,7 @@ impl MachineInstance {
             }
             ancestors.push(owner_row);
         }
-        OwnerInstanceId::new(plan.static_owner, ancestors)
+        OwnerInstanceRoute::new(plan.static_owner, ancestors)
             .map_err(|detail| Error::InvalidPlan(detail.to_owned()))
     }
 
@@ -12661,7 +13859,7 @@ impl MachineInstance {
         &mut self,
         op: &PlanOp,
         route: &boon_plan::EffectResultRoute,
-        owner: &OwnerInstanceId,
+        owner: OwnerInstanceId,
         row: Option<RowId>,
         outcome: boon_persistence::StoredValue,
         sequence: u64,
@@ -12679,7 +13877,7 @@ impl MachineInstance {
         &mut self,
         op: &PlanOp,
         target: &ValueRef,
-        owner: &OwnerInstanceId,
+        owner: OwnerInstanceId,
         row: Option<RowId>,
         value: Value,
         sequence: u64,
@@ -12709,12 +13907,8 @@ impl MachineInstance {
             self.touched_row_fields.insert((row, field));
             work.authority_deltas.push(AuthorityDelta::SetRowField {
                 row,
-                owner_ancestors: self.row_owner_ancestors(row)?.to_vec(),
-                materialization_origin: self
-                    .lists
-                    .get(&row.list)
-                    .and_then(|list| list.rows.get(&row))
-                    .and_then(|row| row.materialization_origin.clone()),
+                owner_ancestors: self.row_owner_rows(row)?,
+                materialization_origin: self.row_materialization_origin_rows(row)?,
                 field,
                 value: value.clone(),
             });
@@ -12722,7 +13916,7 @@ impl MachineInstance {
             let trigger = TriggerFrame::effect(
                 effect_invocation_id(op)?,
                 effect_invocation_plan(op)?.owner.clone(),
-                owner.clone(),
+                owner,
                 Some(row),
                 sequence,
             );
@@ -12744,7 +13938,7 @@ impl MachineInstance {
             let trigger = TriggerFrame::effect(
                 effect_invocation_id(op)?,
                 effect_invocation_plan(op)?.owner.clone(),
-                owner.clone(),
+                owner,
                 None,
                 sequence,
             );
@@ -12761,8 +13955,8 @@ impl MachineInstance {
         work: &mut Work,
     ) -> Result<(), Error> {
         let (owner_plan, owner) = self.state_owner_instance(state, &origin.active, row)?;
-        let route_key = (state, owner.clone());
-        if !work.active_state_routes.insert(route_key.clone()) {
+        let route_key = (state, owner);
+        if !work.active_state_routes.insert(route_key) {
             return Err(Error::InvalidPlan(format!(
                 "state transition cycle re-entered state {} for owner {:?}",
                 state.0, owner
@@ -13041,7 +14235,7 @@ impl MachineInstance {
                         Error::Evaluation(format!("rollback list {} is missing", row.list.0))
                     })?;
                     if let Some(removed) = list.rows.remove(&row) {
-                        list.remove_owner_partition_row(row, &removed);
+                        list.remove_owner_partition_row(row, &removed, &mut self.owner_instances)?;
                     }
                     list.restore_source_order(&source_order)?;
                     list.next_key = previous_next_key;
@@ -13067,7 +14261,7 @@ impl MachineInstance {
                     list.restore_source_order(&source_order)?;
                     if !list.rows.contains_key(&row) {
                         list.rows.insert(row, value);
-                        list.index_owner_partition_row(row)?;
+                        list.index_owner_partition_row(row, &mut self.owner_instances)?;
                     }
                     list.next_key = previous_next_key;
                     self.touched_row_fields
@@ -13172,15 +14366,18 @@ impl MachineInstance {
 
     fn commit_transient_effects(&mut self, work: &mut Work) -> Result<(), Error> {
         let mut latest = BTreeMap::<(EffectInvocationId, OwnerInstanceId), usize>::new();
+        let mut owner_ids = Vec::with_capacity(work.transient_effects.len());
         for (index, invocation) in work.transient_effects.iter().enumerate() {
-            latest.insert((invocation.invocation_id, invocation.owner.clone()), index);
+            let owner = self.owner_instances.intern_route(&invocation.owner)?;
+            latest.insert((invocation.invocation_id, owner), index);
+            owner_ids.push(owner);
         }
         work.transient_effects = work
             .transient_effects
             .drain(..)
             .enumerate()
             .filter_map(|(index, invocation)| {
-                (latest.get(&(invocation.invocation_id, invocation.owner.clone())) == Some(&index))
+                (latest.get(&(invocation.invocation_id, owner_ids[index])) == Some(&index))
                     .then_some(invocation)
             })
             .collect();
@@ -13189,11 +14386,13 @@ impl MachineInstance {
             let invocation_id = work.transient_effects[index].invocation_id;
             let effect_id = work.transient_effects[index].effect_id;
             let target = work.transient_effects[index].target;
-            let owner = work.transient_effects[index].owner.clone();
+            let owner = self
+                .owner_instances
+                .intern_route(&work.transient_effects[index].owner)?;
             let call_id = work.transient_effects[index].call_id;
             self.cancel_pending_transient_effect_owner(
                 invocation_id,
-                &owner,
+                owner,
                 self.transient_effect_scope,
                 work,
             );
@@ -13252,7 +14451,7 @@ impl MachineInstance {
     fn cancel_pending_transient_effect_owner(
         &mut self,
         invocation_id: EffectInvocationId,
-        owner: &OwnerInstanceId,
+        owner: OwnerInstanceId,
         execution_scope: u64,
         work: &mut Work,
     ) {
@@ -13261,7 +14460,7 @@ impl MachineInstance {
             .iter()
             .filter_map(|(call_id, pending)| {
                 (pending.invocation_id == invocation_id
-                    && &pending.owner == owner
+                    && pending.owner == owner
                     && pending.execution_scope == execution_scope)
                     .then_some(*call_id)
             })
@@ -13274,29 +14473,24 @@ impl MachineInstance {
         }
     }
 
-    fn cancel_pending_transient_effects_for_row(&mut self, row: RowId, work: &mut Work) {
-        let call_ids = self
-            .pending_transient_effects
-            .iter()
-            .filter_map(|(call_id, pending)| {
-                pending
-                    .owner
-                    .ancestors
-                    .iter()
-                    .any(|owner_row| {
-                        owner_row.list == row.list
-                            && owner_row.key == row.key
-                            && owner_row.generation == row.generation
-                    })
-                    .then_some(*call_id)
-            })
-            .collect::<Vec<_>>();
+    fn cancel_pending_transient_effects_for_row(
+        &mut self,
+        row: RowId,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let mut call_ids = Vec::new();
+        for (call_id, pending) in &self.pending_transient_effects {
+            if self.owner_instances.contains_row(pending.owner, row)? {
+                call_ids.push(*call_id);
+            }
+        }
         for call_id in call_ids {
             if let Some(previous) = self.pending_transient_effects.remove(&call_id) {
                 work.completed_transient_effects.push((call_id, previous));
                 work.cancelled_transient_effects.push(call_id);
             }
         }
+        Ok(())
     }
 
     fn route_event_with_work(
@@ -13395,14 +14589,18 @@ impl MachineInstance {
         self.validate_event_route(event, false)
     }
 
-    fn source_trigger_frame<'a>(&self, event: &'a SourceEvent) -> Result<TriggerFrame<'a>, Error> {
+    fn source_trigger_frame<'a>(
+        &mut self,
+        event: &'a SourceEvent,
+    ) -> Result<TriggerFrame<'a>, Error> {
         let owner = self
             .metadata
             .routes
             .get(&event.source)
             .map(|route| route.owner.clone())
             .ok_or_else(|| Error::InvalidEvent(format!("unknown source {}", event.source.0)))?;
-        Ok(TriggerFrame::source(event, owner))
+        let owner_instance = self.owner_instances.intern_route(&event.route.owner)?;
+        Ok(TriggerFrame::source(event, owner, owner_instance))
     }
 
     fn validate_event_route(
@@ -13459,14 +14657,11 @@ impl MachineInstance {
 
     fn validate_current_effect_owner(
         &self,
-        owner: &OwnerInstanceId,
+        owner: OwnerInstanceId,
         target: Option<RowId>,
         call_id: TransientEffectCallId,
     ) -> Result<(), Error> {
-        owner
-            .validate()
-            .map_err(|detail| Error::InvalidEvent(detail.to_owned()))?;
-        for ancestor in &owner.ancestors {
+        for ancestor in self.owner_instances.rows(owner)? {
             let row = RowId {
                 list: ancestor.list,
                 key: ancestor.key,
@@ -13598,12 +14793,8 @@ impl MachineInstance {
             if changed || !was_touched {
                 work.authority_deltas.push(AuthorityDelta::SetRowField {
                     row,
-                    owner_ancestors: self.row_owner_ancestors(row)?.to_vec(),
-                    materialization_origin: self
-                        .lists
-                        .get(&row.list)
-                        .and_then(|list| list.rows.get(&row))
-                        .and_then(|row| row.materialization_origin.clone()),
+                    owner_ancestors: self.row_owner_rows(row)?,
+                    materialization_origin: self.row_materialization_origin_rows(row)?,
                     field,
                     value,
                 });
@@ -13674,12 +14865,8 @@ impl MachineInstance {
             if changed || !was_touched {
                 work.authority_deltas.push(AuthorityDelta::SetRowField {
                     row,
-                    owner_ancestors: self.row_owner_ancestors(row)?.to_vec(),
-                    materialization_origin: self
-                        .lists
-                        .get(&row.list)
-                        .and_then(|list| list.rows.get(&row))
-                        .and_then(|row| row.materialization_origin.clone()),
+                    owner_ancestors: self.row_owner_rows(row)?,
+                    materialization_origin: self.row_materialization_origin_rows(row)?,
                     field,
                     value: value.clone(),
                 });
@@ -13859,9 +15046,10 @@ impl MachineInstance {
         } else {
             None
         };
-        let owner = instantiate_plan_owner(&effect.owner, &trigger.active)?;
+        let owner =
+            instantiate_plan_owner(&effect.owner, &trigger.active, &mut self.owner_instances)?;
         if let Some(result_row) = result_row {
-            let leaf = owner.leaf().ok_or_else(|| {
+            let leaf = self.owner_instances.leaf(owner)?.ok_or_else(|| {
                 Error::InvalidPlan(format!(
                     "indexed effect invocation {} has no repeated owner",
                     effect.invocation_id
@@ -13899,7 +15087,7 @@ impl MachineInstance {
             effect_consumer,
             EffectActivation {
                 invocation_id: effect.invocation_id,
-                owner: owner.clone(),
+                owner,
                 source_event: trigger.source_event.cloned(),
             },
         );
@@ -13918,7 +15106,7 @@ impl MachineInstance {
         if !value_to_bool(&self.materialize_eval(gate)?)? {
             self.cancel_pending_transient_effect_owner(
                 effect.invocation_id,
-                &owner,
+                owner,
                 self.transient_effect_scope,
                 work,
             );
@@ -13945,6 +15133,7 @@ impl MachineInstance {
             .turn_sequence
             .checked_add(1)
             .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
+        let owner_route = self.owner_instances.route(owner)?;
         if effect_replay_is_transient(&contract.replay) {
             let call_id = TransientEffectCallId {
                 launch_epoch: self.launch_epoch,
@@ -13963,7 +15152,7 @@ impl MachineInstance {
                 effect_id: effect.effect_id,
                 trigger_sequence: trigger.active.sequence,
                 authority_turn_sequence: sequence,
-                owner,
+                owner: owner_route.clone(),
                 target: result_row,
                 intent: transient_intent,
                 delivery: contract.delivery.clone(),
@@ -14003,7 +15192,7 @@ impl MachineInstance {
                 })
             })
             .transpose()?;
-        let durable_owner = self.durable_owner(&owner)?;
+        let durable_owner = self.durable_owner(&owner_route)?;
         let idempotency_key = match effect.idempotency_key {
             boon_plan::EffectIdempotencyKeyPlan::InvocationTurnIntentSha256 => {
                 boon_persistence::canonical_intent_key(&boon_persistence::StoredValue::Record(
@@ -14333,117 +15522,148 @@ impl MachineInstance {
         size: usize,
         work: &mut Work,
     ) -> Result<u64, Error> {
-        if size == 0 {
-            return Err(Error::InvalidPlan(format!(
-                "chunk projection for list {} has size zero",
-                list.0
-            )));
-        }
-        let cell = self
-            .derived_lists
-            .get(&list)
-            .ok_or_else(|| Error::InvalidPlan(format!("list {} has no derived cache", list.0)))?;
-        match cell.currentness {
-            Currentness::Current => {
-                if let Some(window) = &cell.window {
-                    return Ok(window.logical_len);
+        let mut frames = Vec::<ChunkLogicalLenFrame>::new();
+        let mut next = (list, source_list, size);
+        let result = (|| {
+            let mut source_len = loop {
+                let (current, source, chunk_size) = next;
+                if chunk_size == 0 {
+                    return Err(Error::InvalidPlan(format!(
+                        "chunk projection for list {} has size zero",
+                        current.0
+                    )));
                 }
-                if let Some(items) = &cell.items {
-                    return u64::try_from(items.len()).map_err(|_| {
-                        Error::Evaluation(
-                            "chunk row count does not fit the logical key space".to_owned(),
-                        )
+                let cell = self.derived_lists.get(&current).ok_or_else(|| {
+                    Error::InvalidPlan(format!("list {} has no derived cache", current.0))
+                })?;
+                match cell.currentness {
+                    Currentness::Current => {
+                        if let Some(window) = &cell.window {
+                            break window.logical_len;
+                        }
+                        if let Some(items) = &cell.items {
+                            break u64::try_from(items.len()).map_err(|_| {
+                                Error::Evaluation(
+                                    "chunk row count does not fit the logical key space".to_owned(),
+                                )
+                            })?;
+                        }
+                    }
+                    Currentness::Evaluating => {
+                        return Err(Error::ListCycle { list: current });
+                    }
+                    Currentness::Dirty => {}
+                }
+
+                work.consume(1)?;
+                let (window, had_full_items) = {
+                    let cell = self
+                        .derived_lists
+                        .get_mut(&current)
+                        .expect("derived chunk cache checked above");
+                    cell.currentness = Currentness::Evaluating;
+                    let had_full_items = cell.items.take().is_some();
+                    let window = cell.window.take().unwrap_or(DerivedListWindow {
+                        logical_len: 0,
+                        values_current: false,
+                        rows_by_index: BTreeMap::new(),
                     });
+                    (window, had_full_items)
+                };
+                let full_rows = had_full_items
+                    .then(|| self.list_row_ids(current))
+                    .unwrap_or_default();
+                frames.push(ChunkLogicalLenFrame {
+                    list: current,
+                    size: chunk_size,
+                    window,
+                });
+                for row in full_rows.into_iter().rev() {
+                    if self.row_exists(row) {
+                        self.remove_row(row, work)?;
+                    }
+                }
+
+                let consumer = Consumer::List(current);
+                self.clear_consumer_dependencies(consumer);
+                self.register_list_dependency(Some(consumer), source);
+                if let Some((nested_source, nested_size)) = self.chunk_projection(source) {
+                    next = (source, nested_source, nested_size);
+                    continue;
+                }
+                break if self.metadata.list_computations.contains_key(&source) {
+                    u64::try_from(self.ensure_list_current(source, None, work)?.len()).map_err(
+                        |_| {
+                            Error::Evaluation(
+                                "list row count does not fit the logical key space".to_owned(),
+                            )
+                        },
+                    )?
+                } else {
+                    u64::try_from(self.lists.get(&source).map_or(0, |state| state.order.len()))
+                        .map_err(|_| {
+                            Error::Evaluation(
+                                "list row count does not fit the logical key space".to_owned(),
+                            )
+                        })?
+                };
+            };
+
+            while let Some(frame) = frames.last() {
+                let size = u64::try_from(frame.size)
+                    .map_err(|_| Error::InvalidPlan("chunk size does not fit u64".to_owned()))?;
+                let logical_len =
+                    source_len
+                        .checked_add(size.saturating_sub(1))
+                        .ok_or_else(|| {
+                            Error::Evaluation("chunk logical length overflowed".to_owned())
+                        })?
+                        / size;
+                let stale_rows = frame
+                    .window
+                    .rows_by_index
+                    .iter()
+                    .filter_map(|(index, row)| {
+                        (*index >= logical_len && self.row_exists(*row)).then_some(*row)
+                    })
+                    .collect::<Vec<_>>();
+                for row in stale_rows.into_iter().rev() {
+                    self.remove_row(row, work)?;
+                }
+                let frame = frames
+                    .last_mut()
+                    .expect("chunk logical-length frame remains active");
+                frame.window.logical_len = logical_len;
+                frame.window.values_current = false;
+                frame
+                    .window
+                    .rows_by_index
+                    .retain(|index, row| *index < logical_len && self.row_exists(*row));
+                let frame = frames
+                    .pop()
+                    .expect("chunk logical-length frame remains active");
+                let cell = self
+                    .derived_lists
+                    .get_mut(&frame.list)
+                    .expect("derived chunk cache checked above");
+                cell.window = Some(frame.window);
+                cell.currentness = Currentness::Current;
+                work.metrics.recomputed_list_count += 1;
+                source_len = logical_len;
+            }
+            Ok(source_len)
+        })();
+        if result.is_err() {
+            while let Some(mut frame) = frames.pop() {
+                frame.window.values_current = false;
+                if let Some(cell) = self.derived_lists.get_mut(&frame.list) {
+                    cell.items = None;
+                    cell.window = Some(frame.window);
+                    cell.currentness = Currentness::Dirty;
                 }
             }
-            Currentness::Evaluating => return Err(Error::ListCycle { list }),
-            Currentness::Dirty => {}
         }
-
-        work.consume(1)?;
-        let (mut window, had_full_items) = {
-            let cell = self
-                .derived_lists
-                .get_mut(&list)
-                .expect("derived chunk cache checked above");
-            cell.currentness = Currentness::Evaluating;
-            let had_full_items = cell.items.take().is_some();
-            let window = cell.window.take().unwrap_or(DerivedListWindow {
-                logical_len: 0,
-                values_current: false,
-                rows_by_index: BTreeMap::new(),
-            });
-            (window, had_full_items)
-        };
-        let full_rows = had_full_items
-            .then(|| self.list_row_ids(list))
-            .unwrap_or_default();
-        for row in full_rows.into_iter().rev() {
-            if self.row_exists(row)
-                && let Err(error) = self.remove_row(row, work)
-            {
-                self.derived_lists
-                    .get_mut(&list)
-                    .expect("derived chunk cache checked above")
-                    .currentness = Currentness::Dirty;
-                return Err(error);
-            }
-        }
-
-        let consumer = Consumer::List(list);
-        self.clear_consumer_dependencies(consumer);
-        let source_len = match self.list_logical_len_with_work(source_list, Some(consumer), work) {
-            Ok(source_len) => source_len,
-            Err(error) => {
-                let cell = self
-                    .derived_lists
-                    .get_mut(&list)
-                    .expect("derived chunk cache checked above");
-                window.values_current = false;
-                cell.window = Some(window);
-                cell.currentness = Currentness::Dirty;
-                return Err(error);
-            }
-        };
-        let size = u64::try_from(size)
-            .map_err(|_| Error::InvalidPlan("chunk size does not fit u64".to_owned()))?;
-        let logical_len = source_len
-            .checked_add(size.saturating_sub(1))
-            .ok_or_else(|| Error::Evaluation("chunk logical length overflowed".to_owned()))?
-            / size;
-        window.logical_len = logical_len;
-        window.values_current = false;
-        let stale_rows = window
-            .rows_by_index
-            .iter()
-            .filter_map(|(index, row)| {
-                (*index >= logical_len && self.row_exists(*row)).then_some(*row)
-            })
-            .collect::<Vec<_>>();
-        for row in stale_rows.into_iter().rev() {
-            if let Err(error) = self.remove_row(row, work) {
-                let cell = self
-                    .derived_lists
-                    .get_mut(&list)
-                    .expect("derived chunk cache checked above");
-                cell.window = Some(window);
-                cell.currentness = Currentness::Dirty;
-                return Err(error);
-            }
-        }
-        window
-            .rows_by_index
-            .retain(|index, row| *index < logical_len && self.row_exists(*row));
-        {
-            let cell = self
-                .derived_lists
-                .get_mut(&list)
-                .expect("derived chunk cache checked above");
-            cell.window = Some(window);
-            cell.currentness = Currentness::Current;
-        }
-        work.metrics.recomputed_list_count += 1;
-        Ok(logical_len)
+        result
     }
 
     fn ensure_chunk_window_current(
@@ -14455,44 +15675,107 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         work: &mut Work,
     ) -> Result<(u64, Vec<EvalValue>), Error> {
-        let logical_len = self.ensure_chunk_logical_len_current(list, source_list, size, work)?;
-        let range = range.start.min(logical_len)..range.end.min(logical_len);
-        if self.derived_lists.get(&list).is_some_and(|cell| {
-            cell.currentness == Currentness::Current
-                && cell.window.as_ref().is_some_and(|window| {
-                    window.values_current
-                        && (range.start..range.end)
-                            .all(|index| window.rows_by_index.contains_key(&index))
-                })
-        }) {
-            let rows = self
-                .derived_lists
-                .get(&list)
-                .and_then(|cell| cell.window.as_ref())
-                .expect("covered chunk window exists")
-                .rows_by_index
-                .range(range.clone())
-                .map(|(_, row)| EvalValue::Row(*row))
-                .collect();
-            return Ok((logical_len, rows));
-        }
+        let mut frames = Vec::<ChunkWindowFrame>::new();
+        let mut current = list;
+        let mut source = source_list;
+        let mut chunk_size = size;
+        let mut current_range = range;
+        let result = (|| {
+            let (mut source_logical_len, mut source_items) = loop {
+                let logical_len =
+                    self.ensure_chunk_logical_len_current(current, source, chunk_size, work)?;
+                let requested =
+                    current_range.start.min(logical_len)..current_range.end.min(logical_len);
+                if self.derived_lists.get(&current).is_some_and(|cell| {
+                    cell.currentness == Currentness::Current
+                        && cell.window.as_ref().is_some_and(|window| {
+                            window.values_current
+                                && (requested.start..requested.end)
+                                    .all(|index| window.rows_by_index.contains_key(&index))
+                        })
+                }) {
+                    let rows = self
+                        .derived_lists
+                        .get(&current)
+                        .and_then(|cell| cell.window.as_ref())
+                        .expect("covered chunk window exists")
+                        .rows_by_index
+                        .range(requested)
+                        .map(|(_, row)| EvalValue::Row(*row))
+                        .collect();
+                    break (logical_len, rows);
+                }
 
-        {
-            let cell = self
-                .derived_lists
-                .get_mut(&list)
-                .expect("derived chunk cache checked above");
-            if cell.currentness == Currentness::Evaluating {
-                return Err(Error::ListCycle { list });
-            }
-            cell.currentness = Currentness::Evaluating;
-        }
-        let consumer = Consumer::List(list);
-        self.clear_consumer_dependencies(consumer);
-        let result =
-            self.reconcile_chunk_window(list, source_list, size, logical_len, range, event, work);
-        match result {
-            Ok((rows_by_index, rows)) => {
+                let cell = self
+                    .derived_lists
+                    .get_mut(&current)
+                    .expect("derived chunk cache checked above");
+                if cell.currentness == Currentness::Evaluating {
+                    return Err(Error::ListCycle { list: current });
+                }
+                cell.currentness = Currentness::Evaluating;
+                let consumer = Consumer::List(current);
+                self.clear_consumer_dependencies(consumer);
+                self.register_list_dependency(Some(consumer), source);
+                let size_u64 = u64::try_from(chunk_size)
+                    .map_err(|_| Error::InvalidPlan("chunk size does not fit u64".to_owned()))?;
+                let source_start = requested.start.checked_mul(size_u64).ok_or_else(|| {
+                    Error::Evaluation("chunk source window overflowed".to_owned())
+                })?;
+                let source_end = requested.end.checked_mul(size_u64).ok_or_else(|| {
+                    Error::Evaluation("chunk source window overflowed".to_owned())
+                })?;
+                frames.push(ChunkWindowFrame {
+                    list: current,
+                    size: chunk_size,
+                    logical_len,
+                    range: requested,
+                });
+                if let Some((nested_source, nested_size)) = self.chunk_projection(source) {
+                    current = source;
+                    source = nested_source;
+                    chunk_size = nested_size;
+                    current_range = source_start..source_end;
+                    continue;
+                }
+                break self.list_eval_window_with_work(
+                    source,
+                    source_start..source_end,
+                    event,
+                    Some(consumer),
+                    work,
+                )?;
+            };
+
+            while let Some(frame) = frames.last() {
+                let list = frame.list;
+                let size = frame.size;
+                let logical_len = frame.logical_len;
+                let range = frame.range.clone();
+                let expected_logical_len = source_logical_len
+                    .checked_add(
+                        u64::try_from(size)
+                            .map_err(|_| {
+                                Error::InvalidPlan("chunk size does not fit u64".to_owned())
+                            })?
+                            .saturating_sub(1),
+                    )
+                    .ok_or_else(|| {
+                        Error::Evaluation("chunk logical length overflowed".to_owned())
+                    })?
+                    / u64::try_from(size).map_err(|_| {
+                        Error::InvalidPlan("chunk size does not fit u64".to_owned())
+                    })?;
+                if expected_logical_len != logical_len {
+                    return Err(Error::Evaluation(
+                        "chunk source changed during one bounded currentness read".to_owned(),
+                    ));
+                }
+                let (rows_by_index, rows) =
+                    self.reconcile_chunk_window(list, size, range, source_items, work)?;
+                frames
+                    .pop()
+                    .expect("chunk window frame remains active after reconciliation");
                 let cell = self
                     .derived_lists
                     .get_mut(&list)
@@ -14505,60 +15788,32 @@ impl MachineInstance {
                 });
                 cell.currentness = Currentness::Current;
                 work.metrics.recomputed_list_count += 1;
-                Ok((logical_len, rows))
+                source_logical_len = logical_len;
+                source_items = rows;
             }
-            Err(error) => {
-                let cell = self
-                    .derived_lists
-                    .get_mut(&list)
-                    .expect("derived chunk cache checked above");
-                if let Some(window) = cell.window.as_mut() {
-                    window.values_current = false;
+            Ok((source_logical_len, source_items))
+        })();
+        if result.is_err() {
+            for frame in frames.into_iter().rev() {
+                if let Some(cell) = self.derived_lists.get_mut(&frame.list) {
+                    if let Some(window) = cell.window.as_mut() {
+                        window.values_current = false;
+                    }
+                    cell.currentness = Currentness::Dirty;
                 }
-                cell.currentness = Currentness::Dirty;
-                Err(error)
             }
         }
+        result
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn reconcile_chunk_window(
         &mut self,
         list: ListId,
-        source_list: ListId,
         size: usize,
-        logical_len: u64,
         range: Range<u64>,
-        event: Option<&SourceEvent>,
+        source_items: Vec<EvalValue>,
         work: &mut Work,
     ) -> Result<(BTreeMap<u64, RowId>, Vec<EvalValue>), Error> {
-        let size_u64 = u64::try_from(size)
-            .map_err(|_| Error::InvalidPlan("chunk size does not fit u64".to_owned()))?;
-        let source_start = range
-            .start
-            .checked_mul(size_u64)
-            .ok_or_else(|| Error::Evaluation("chunk source window overflowed".to_owned()))?;
-        let source_end = range
-            .end
-            .checked_mul(size_u64)
-            .ok_or_else(|| Error::Evaluation("chunk source window overflowed".to_owned()))?;
-        let (source_logical_len, source_items) = self.list_eval_window_with_work(
-            source_list,
-            source_start..source_end,
-            event,
-            Some(Consumer::List(list)),
-            work,
-        )?;
-        let expected_logical_len = source_logical_len
-            .checked_add(size_u64.saturating_sub(1))
-            .ok_or_else(|| Error::Evaluation("chunk logical length overflowed".to_owned()))?
-            / size_u64;
-        if expected_logical_len != logical_len {
-            return Err(Error::Evaluation(
-                "chunk source changed during one bounded currentness read".to_owned(),
-            ));
-        }
-
         let mut desired = BTreeMap::new();
         for (offset, chunk) in source_items.chunks(size).enumerate() {
             let index = range
@@ -14609,7 +15864,7 @@ impl MachineInstance {
             let row = if let Some(row) = existing {
                 row
             } else {
-                self.materialize_virtual_projection_row(list, index, fields.clone(), work)?
+                self.materialize_virtual_projection_row(list, fields.clone(), work)?
             };
             rows_by_index.insert(index, row);
             for (field, value) in fields {
@@ -14920,7 +16175,7 @@ impl MachineInstance {
                 self.projected_record_fields(list, fields)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let existing = self.list_row_ids_for_owner(list, &[])?;
+        let existing = self.list_row_ids_for_owner(list, OwnerAncestryId::ROOT);
         let capacity = self
             .plan
             .storage_layout
@@ -14966,7 +16221,13 @@ impl MachineInstance {
         }
         let mut rows = existing.into_iter().take(common).collect::<Vec<_>>();
         for fields in desired.into_iter().skip(common) {
-            rows.push(self.append_row_with_owner_prefix(list, fields, &[], None, work)?);
+            rows.push(self.append_row_with_owner_prefix(
+                list,
+                fields,
+                OwnerAncestryId::ROOT,
+                None,
+                work,
+            )?);
         }
         Ok(EvalValue::List(
             rows.into_iter().map(EvalValue::Row).collect(),
@@ -15262,9 +16523,6 @@ impl MachineInstance {
             .get(&state)
             .cloned()
             .unwrap_or_default();
-        for dependent in dynamic_dependents {
-            self.mark_consumer_dirty(dependent, work);
-        }
         let dependents = self
             .metadata
             .dependencies
@@ -15272,9 +16530,6 @@ impl MachineInstance {
             .get(&state)
             .cloned()
             .unwrap_or_default();
-        for field in dependents {
-            self.mark_root_dirty(field, work);
-        }
         let list_dependents = self
             .metadata
             .dependencies
@@ -15282,9 +16537,6 @@ impl MachineInstance {
             .get(&state)
             .cloned()
             .unwrap_or_default();
-        for list in list_dependents {
-            self.mark_list_dirty(list, work);
-        }
         let row_dependents = self
             .metadata
             .dependencies
@@ -15292,11 +16544,22 @@ impl MachineInstance {
             .get(&state)
             .cloned()
             .unwrap_or_default();
+        let mut dirty = dynamic_dependents
+            .into_iter()
+            .map(DirtyPropagationTask::MarkConsumer)
+            .collect::<Vec<_>>();
+        dirty.extend(dependents.into_iter().map(DirtyPropagationTask::MarkRoot));
+        dirty.extend(
+            list_dependents
+                .into_iter()
+                .map(DirtyPropagationTask::MarkList),
+        );
         for (list, field) in row_dependents {
             for row in self.list_row_ids(list) {
-                self.mark_row_dirty(row, field, work);
+                dirty.push(DirtyPropagationTask::MarkRow(row, field));
             }
         }
+        self.propagate_dirty(dirty, work);
         true
     }
 
@@ -16213,255 +17476,316 @@ impl MachineInstance {
     }
 
     fn mark_root_dirty(&mut self, field: FieldId, work: &mut Work) {
-        if self
-            .root_fields
-            .get(&field)
-            .is_some_and(|cell| cell.currentness == Currentness::Evaluating)
-        {
-            return;
-        }
-        let became_dirty = self.root_fields.get_mut(&field).map(|cell| {
-            let became_dirty = cell.currentness == Currentness::Current;
-            if became_dirty {
-                cell.currentness = Currentness::Dirty;
-            }
-            became_dirty
-        });
-        let consumer = Consumer::Root(field);
-        let first_in_turn = work.dirty_consumers.insert(consumer);
-        if became_dirty.is_none() || (!became_dirty.unwrap_or_default() && !first_in_turn) {
-            return;
-        }
-        self.clear_consumer_dependencies(consumer);
-        self.invalidate_root_field(field, work);
+        self.propagate_dirty([DirtyPropagationTask::MarkRoot(field)], work);
     }
 
     fn invalidate_root_field(&mut self, field: FieldId, work: &mut Work) {
-        let dynamic_dependents = self
-            .dynamic_dependencies
-            .by_root_field
-            .get(&field)
-            .cloned()
-            .unwrap_or_default();
-        for dependent in dynamic_dependents {
-            self.mark_consumer_dirty(dependent, work);
-        }
-        let root_dependents = self
-            .metadata
-            .dependencies
-            .root_by_field
-            .get(&field)
-            .cloned()
-            .unwrap_or_default();
-        for dependent in root_dependents {
-            if dependent != field {
-                self.mark_root_dirty(dependent, work);
-            }
-        }
-        let list_dependents = self
-            .metadata
-            .dependencies
-            .list_by_field
-            .get(&field)
-            .cloned()
-            .unwrap_or_default();
-        for list in list_dependents {
-            self.mark_list_dirty(list, work);
-        }
-        let row_dependents = self
-            .metadata
-            .dependencies
-            .row_by_root_field
-            .get(&field)
-            .cloned()
-            .unwrap_or_default();
-        for (list, dependent) in row_dependents {
-            for row in self.list_row_ids(list) {
-                self.mark_row_dirty(row, dependent, work);
-            }
-        }
+        self.propagate_dirty([DirtyPropagationTask::InvalidateRoot(field)], work);
     }
 
     fn mark_row_dirty(&mut self, row: RowId, field: FieldId, work: &mut Work) {
-        if self
-            .lists
-            .get(&row.list)
-            .and_then(|list| list.rows.get(&row))
-            .and_then(|row| row.derived.get(&field))
-            .is_some_and(|currentness| *currentness == Currentness::Evaluating)
-        {
-            return;
-        }
-        let became_dirty = self
-            .lists
-            .get_mut(&row.list)
-            .and_then(|list| list.rows.get_mut(&row))
-            .and_then(|row| row.derived.get_mut(&field))
-            .map(|currentness| {
-                let became_dirty = *currentness == Currentness::Current;
-                if became_dirty {
-                    *currentness = Currentness::Dirty;
-                }
-                became_dirty
-            });
-        let consumer = Consumer::Row(row, field);
-        let first_in_turn = work.dirty_consumers.insert(consumer);
-        if became_dirty == Some(true) {
-            let fanout = self.mark_ordered_index_row_dirty_for_field(row, field);
-            record_ordered_index_fanout(work, fanout);
-        }
-        if became_dirty.is_none() || (!became_dirty.unwrap_or_default() && !first_in_turn) {
-            return;
-        }
-        let dynamic_dependents = self
-            .dynamic_dependencies
-            .by_row_field
-            .get(&(row, field))
-            .cloned()
-            .unwrap_or_default();
-        self.clear_consumer_dependencies(consumer);
-        let dependents = self
-            .metadata
-            .dependencies
-            .row_by_field
-            .get(&(row.list, field))
-            .cloned()
-            .unwrap_or_default();
-        for dependent in dependents {
-            if dependent != field {
-                self.mark_row_dirty(row, dependent, work);
-            }
-        }
-        for dependent in dynamic_dependents {
-            if dependent != consumer {
-                self.mark_consumer_dirty(dependent, work);
-            }
-        }
+        self.propagate_dirty([DirtyPropagationTask::MarkRow(row, field)], work);
     }
 
     fn mark_list_dirty(&mut self, list: ListId, work: &mut Work) {
-        if self
-            .derived_lists
-            .get(&list)
-            .is_some_and(|cell| cell.currentness == Currentness::Evaluating)
-        {
-            return;
-        }
-        let became_dirty = self.derived_lists.get_mut(&list).map(|cell| {
-            let became_dirty = cell.currentness == Currentness::Current;
-            if became_dirty {
-                cell.currentness = Currentness::Dirty;
-            }
-            if let Some(window) = cell.window.as_mut() {
-                window.values_current = false;
-            }
-            became_dirty
-        });
-        let consumer = Consumer::List(list);
-        let first_in_turn = work.dirty_consumers.insert(consumer);
-        if became_dirty.is_none() || (!became_dirty.unwrap_or_default() && !first_in_turn) {
-            return;
-        }
-        self.clear_consumer_dependencies(consumer);
-        self.invalidate_list_structure(list, work);
+        self.propagate_dirty([DirtyPropagationTask::MarkList(list)], work);
     }
 
     fn mark_consumer_dirty(&mut self, consumer: Consumer, work: &mut Work) {
-        work.metrics.dependency_fanout_count += 1;
-        match consumer {
-            Consumer::Root(field) => self.mark_root_dirty(field, work),
-            Consumer::List(list) => self.mark_list_dirty(list, work),
-            Consumer::Row(row, field) => self.mark_row_dirty(row, field, work),
-            Consumer::ProducerResult(call_site_id) => {
-                let first_in_turn = work.dirty_consumers.insert(consumer);
-                if !first_in_turn {
-                    return;
-                }
-                self.clear_consumer_dependencies(consumer);
-                if let Some(active) = self
-                    .active_producer_lease
-                    .as_mut()
-                    .filter(|active| active.call_site_id == call_site_id)
-                {
-                    active.producer_result = None;
-                }
-            }
-            Consumer::Effect(effect) => {
-                let first_in_turn = work.dirty_consumers.insert(consumer);
-                if !first_in_turn && work.pending_effect_reconciliations.contains(&effect) {
-                    return;
-                }
-                self.clear_consumer_dependencies(consumer);
-                if self.effect_activations.contains_key(&effect) {
-                    work.pending_effect_reconciliations.insert(effect);
-                }
-            }
-        }
+        self.propagate_dirty([DirtyPropagationTask::MarkConsumer(consumer)], work);
     }
 
     fn invalidate_row_field(&mut self, row: RowId, field: FieldId, work: &mut Work) {
-        let mut consumers = self
-            .dynamic_dependencies
-            .by_row_field
-            .get(&(row, field))
-            .cloned()
-            .unwrap_or_default();
-        let static_dependents = self
-            .metadata
-            .dependencies
-            .row_by_field
-            .get(&(row.list, field))
-            .cloned()
-            .unwrap_or_default();
-        for dependent in static_dependents {
-            consumers.insert(Consumer::Row(row, dependent));
-        }
-        for consumer in consumers {
-            self.mark_consumer_dirty(consumer, work);
-        }
+        self.propagate_dirty([DirtyPropagationTask::InvalidateRow(row, field)], work);
     }
 
     fn invalidate_list_structure(&mut self, list: ListId, work: &mut Work) {
-        let mut consumers = self
-            .dynamic_dependencies
-            .by_list
-            .get(&list)
-            .cloned()
-            .unwrap_or_default();
-        for field in self
-            .metadata
-            .dependencies
-            .root_by_list
-            .get(&list)
-            .cloned()
-            .unwrap_or_default()
-        {
-            consumers.insert(Consumer::Root(field));
-        }
-        for dependent in self
-            .metadata
-            .dependencies
-            .list_by_list
-            .get(&list)
-            .cloned()
-            .unwrap_or_default()
-        {
-            consumers.insert(Consumer::List(dependent));
-        }
-        for (owner, field) in self
-            .metadata
-            .dependencies
-            .row_by_list
-            .get(&list)
-            .cloned()
-            .unwrap_or_default()
-        {
-            for row in self.list_row_ids(owner) {
-                consumers.insert(Consumer::Row(row, field));
+        self.propagate_dirty([DirtyPropagationTask::InvalidateList(list)], work);
+    }
+
+    fn propagate_dirty(
+        &mut self,
+        initial: impl IntoIterator<Item = DirtyPropagationTask>,
+        work: &mut Work,
+    ) {
+        let mut pending = Vec::new();
+        let mut scheduled = BTreeSet::new();
+        let schedule = |task, pending: &mut Vec<_>, scheduled: &mut BTreeSet<_>| {
+            if scheduled.insert(task) {
+                pending.push(task);
             }
+        };
+        let initial = initial.into_iter().collect::<Vec<_>>();
+        for task in initial.into_iter().rev() {
+            schedule(task, &mut pending, &mut scheduled);
         }
-        for consumer in consumers {
-            self.mark_consumer_dirty(consumer, work);
+
+        while let Some(task) = pending.pop() {
+            let mut next = Vec::new();
+            match task {
+                DirtyPropagationTask::MarkConsumer(consumer) => {
+                    work.metrics.dependency_fanout_count += 1;
+                    match consumer {
+                        Consumer::Root(field) => {
+                            next.push(DirtyPropagationTask::MarkRoot(field));
+                        }
+                        Consumer::List(list) => {
+                            next.push(DirtyPropagationTask::MarkList(list));
+                        }
+                        Consumer::Row(row, field) => {
+                            next.push(DirtyPropagationTask::MarkRow(row, field));
+                        }
+                        Consumer::ProducerResult(call_site_id) => {
+                            let first_in_turn = work.dirty_consumers.insert(consumer);
+                            if first_in_turn {
+                                self.clear_consumer_dependencies(consumer);
+                                if let Some(active) = self
+                                    .active_producer_lease
+                                    .as_mut()
+                                    .filter(|active| active.call_site_id == call_site_id)
+                                {
+                                    active.producer_result = None;
+                                }
+                            }
+                        }
+                        Consumer::Effect(effect) => {
+                            let first_in_turn = work.dirty_consumers.insert(consumer);
+                            if first_in_turn
+                                || !work.pending_effect_reconciliations.contains(&effect)
+                            {
+                                self.clear_consumer_dependencies(consumer);
+                                if self.effect_activations.contains_key(&effect) {
+                                    work.pending_effect_reconciliations.insert(effect);
+                                }
+                            }
+                        }
+                    }
+                }
+                DirtyPropagationTask::MarkRoot(field) => {
+                    if self
+                        .root_fields
+                        .get(&field)
+                        .is_some_and(|cell| cell.currentness == Currentness::Evaluating)
+                    {
+                        continue;
+                    }
+                    let became_dirty = self.root_fields.get_mut(&field).map(|cell| {
+                        let became_dirty = cell.currentness == Currentness::Current;
+                        if became_dirty {
+                            cell.currentness = Currentness::Dirty;
+                        }
+                        became_dirty
+                    });
+                    let consumer = Consumer::Root(field);
+                    let first_in_turn = work.dirty_consumers.insert(consumer);
+                    if became_dirty.is_some() && (became_dirty.unwrap_or_default() || first_in_turn)
+                    {
+                        self.clear_consumer_dependencies(consumer);
+                        next.push(DirtyPropagationTask::InvalidateRoot(field));
+                    }
+                }
+                DirtyPropagationTask::MarkRow(row, field) => {
+                    if self
+                        .lists
+                        .get(&row.list)
+                        .and_then(|list| list.rows.get(&row))
+                        .and_then(|row| row.derived.get(&field))
+                        .is_some_and(|currentness| *currentness == Currentness::Evaluating)
+                    {
+                        continue;
+                    }
+                    let became_dirty = self
+                        .lists
+                        .get_mut(&row.list)
+                        .and_then(|list| list.rows.get_mut(&row))
+                        .and_then(|row| row.derived.get_mut(&field))
+                        .map(|currentness| {
+                            let became_dirty = *currentness == Currentness::Current;
+                            if became_dirty {
+                                *currentness = Currentness::Dirty;
+                            }
+                            became_dirty
+                        });
+                    let consumer = Consumer::Row(row, field);
+                    let first_in_turn = work.dirty_consumers.insert(consumer);
+                    if became_dirty == Some(true) {
+                        let fanout = self.mark_ordered_index_row_dirty_for_field(row, field);
+                        record_ordered_index_fanout(work, fanout);
+                    }
+                    if became_dirty.is_none()
+                        || (!became_dirty.unwrap_or_default() && !first_in_turn)
+                    {
+                        continue;
+                    }
+                    let dynamic_dependents = self
+                        .dynamic_dependencies
+                        .by_row_field
+                        .get(&(row, field))
+                        .cloned()
+                        .unwrap_or_default();
+                    self.clear_consumer_dependencies(consumer);
+                    next.extend(
+                        self.metadata
+                            .dependencies
+                            .row_by_field
+                            .get(&(row.list, field))
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|dependent| *dependent != field)
+                            .map(|dependent| DirtyPropagationTask::MarkRow(row, dependent)),
+                    );
+                    next.extend(
+                        dynamic_dependents
+                            .into_iter()
+                            .filter(|dependent| *dependent != consumer)
+                            .map(DirtyPropagationTask::MarkConsumer),
+                    );
+                }
+                DirtyPropagationTask::MarkList(list) => {
+                    if self
+                        .derived_lists
+                        .get(&list)
+                        .is_some_and(|cell| cell.currentness == Currentness::Evaluating)
+                    {
+                        continue;
+                    }
+                    let became_dirty = self.derived_lists.get_mut(&list).map(|cell| {
+                        let became_dirty = cell.currentness == Currentness::Current;
+                        if became_dirty {
+                            cell.currentness = Currentness::Dirty;
+                        }
+                        if let Some(window) = cell.window.as_mut() {
+                            window.values_current = false;
+                        }
+                        became_dirty
+                    });
+                    let consumer = Consumer::List(list);
+                    let first_in_turn = work.dirty_consumers.insert(consumer);
+                    if became_dirty.is_some() && (became_dirty.unwrap_or_default() || first_in_turn)
+                    {
+                        self.clear_consumer_dependencies(consumer);
+                        next.push(DirtyPropagationTask::InvalidateList(list));
+                    }
+                }
+                DirtyPropagationTask::InvalidateRoot(field) => {
+                    next.extend(
+                        self.dynamic_dependencies
+                            .by_root_field
+                            .get(&field)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .map(DirtyPropagationTask::MarkConsumer),
+                    );
+                    next.extend(
+                        self.metadata
+                            .dependencies
+                            .root_by_field
+                            .get(&field)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|dependent| *dependent != field)
+                            .map(DirtyPropagationTask::MarkRoot),
+                    );
+                    next.extend(
+                        self.metadata
+                            .dependencies
+                            .list_by_field
+                            .get(&field)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .map(DirtyPropagationTask::MarkList),
+                    );
+                    for (list, dependent) in self
+                        .metadata
+                        .dependencies
+                        .row_by_root_field
+                        .get(&field)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        next.extend(
+                            self.list_row_ids(list)
+                                .into_iter()
+                                .map(|row| DirtyPropagationTask::MarkRow(row, dependent)),
+                        );
+                    }
+                }
+                DirtyPropagationTask::InvalidateRow(row, field) => {
+                    let mut consumers = self
+                        .dynamic_dependencies
+                        .by_row_field
+                        .get(&(row, field))
+                        .cloned()
+                        .unwrap_or_default();
+                    for dependent in self
+                        .metadata
+                        .dependencies
+                        .row_by_field
+                        .get(&(row.list, field))
+                        .into_iter()
+                        .flatten()
+                    {
+                        consumers.insert(Consumer::Row(row, *dependent));
+                    }
+                    next.extend(
+                        consumers
+                            .into_iter()
+                            .map(DirtyPropagationTask::MarkConsumer),
+                    );
+                }
+                DirtyPropagationTask::InvalidateList(list) => {
+                    let mut consumers = self
+                        .dynamic_dependencies
+                        .by_list
+                        .get(&list)
+                        .cloned()
+                        .unwrap_or_default();
+                    for field in self
+                        .metadata
+                        .dependencies
+                        .root_by_list
+                        .get(&list)
+                        .into_iter()
+                        .flatten()
+                    {
+                        consumers.insert(Consumer::Root(*field));
+                    }
+                    for dependent in self
+                        .metadata
+                        .dependencies
+                        .list_by_list
+                        .get(&list)
+                        .into_iter()
+                        .flatten()
+                    {
+                        consumers.insert(Consumer::List(*dependent));
+                    }
+                    for (owner, field) in self
+                        .metadata
+                        .dependencies
+                        .row_by_list
+                        .get(&list)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        for row in self.list_row_ids(owner) {
+                            consumers.insert(Consumer::Row(row, field));
+                        }
+                    }
+                    next.extend(
+                        consumers
+                            .into_iter()
+                            .map(DirtyPropagationTask::MarkConsumer),
+                    );
+                }
+            }
+            for task in next.into_iter().rev() {
+                schedule(task, &mut pending, &mut scheduled);
+            }
         }
     }
 
@@ -16472,9 +17796,12 @@ impl MachineInstance {
             .get(&import_id)
             .cloned()
             .unwrap_or_default();
-        for consumer in consumers {
-            self.mark_consumer_dirty(consumer, work);
-        }
+        self.propagate_dirty(
+            consumers
+                .into_iter()
+                .map(DirtyPropagationTask::MarkConsumer),
+            work,
+        );
     }
 
     fn invalidate_distributed_call_result(
@@ -16489,9 +17816,12 @@ impl MachineInstance {
             .get(&(import_id, call_instance_id))
             .cloned()
             .unwrap_or_default();
-        for consumer in consumers {
-            self.mark_consumer_dirty(consumer, work);
-        }
+        self.propagate_dirty(
+            consumers
+                .into_iter()
+                .map(DirtyPropagationTask::MarkConsumer),
+            work,
+        );
     }
 
     fn register_row_dependency(
@@ -16808,6 +18138,7 @@ impl MachineInstance {
 }
 
 impl MachineInstance {
+    #[cfg(test)]
     fn reconcile_materialized_list(
         &mut self,
         list_id: ListId,
@@ -16815,7 +18146,7 @@ impl MachineInstance {
         field_ids: &BTreeMap<String, FieldId>,
         row_field_copies: &[PlanMaterializedRowFieldCopy],
         value: EvalValue,
-        owner_prefix: &[OwnerInstanceRow],
+        owner_prefix: OwnerAncestryId,
         event: Option<&SourceEvent>,
         consumer: Option<Consumer>,
         work: &mut Work,
@@ -16823,7 +18154,7 @@ impl MachineInstance {
         let items = eval_to_list(value)?;
         let desired_len = items.len();
         let current_len = self.list_row_ids(list_id).len();
-        let existing = self.list_row_ids_for_owner(list_id, owner_prefix)?;
+        let existing = self.list_row_ids_for_owner(list_id, owner_prefix);
         work.consume(existing.len().try_into().unwrap_or(u64::MAX))?;
         let projected_len = current_len
             .checked_sub(existing.len())
@@ -16879,7 +18210,7 @@ impl MachineInstance {
             .collect::<Result<Vec<_>, _>>()?;
         let mut desired_origins = BTreeSet::new();
         for (origin, _) in &desired {
-            if !desired_origins.insert(origin.clone()) {
+            if !desired_origins.insert(*origin) {
                 return Err(Error::Evaluation(format!(
                     "materialized list {} produced duplicate structural row identity",
                     list_id.0
@@ -16897,7 +18228,7 @@ impl MachineInstance {
         if let Some(authority_source_list) = authority_source_list {
             let mut ordered_rows = Vec::with_capacity(desired_len);
             for (origin, fields) in desired {
-                let leaf = origin.last().copied().ok_or_else(|| {
+                let leaf = self.owner_instances.ancestry_leaf(origin)?.ok_or_else(|| {
                     Error::InvalidPlan(format!(
                         "materialized list {} authority-backed row has no structural origin",
                         list_id.0
@@ -16914,11 +18245,10 @@ impl MachineInstance {
                     key: leaf.key,
                     generation: leaf.generation,
                 };
-                let current_origin = self.row_owner_ancestors(row)?;
-                let mut target_origin = origin.clone();
-                let target_leaf = target_origin.last_mut().expect("origin has a leaf");
-                target_leaf.list = list_id;
-                if current_origin != target_origin.as_slice() {
+                let target_origin = self
+                    .owner_instances
+                    .ancestry_with_leaf_list(origin, list_id)?;
+                if self.row_owner_ancestry(row)? != target_origin {
                     return Err(Error::InvalidPlan(format!(
                         "materialized list {} authority row {}:{} has stale structural identity",
                         list_id.0, row.key, row.generation
@@ -16940,7 +18270,136 @@ impl MachineInstance {
         let mut existing_by_origin = self
             .lists
             .get(&list_id)
-            .and_then(|list| list.owner_partitions.get(owner_prefix))
+            .and_then(|list| list.owner_partitions.get(&owner_prefix))
+            .map(|partition| partition.by_materialization_origin.clone())
+            .unwrap_or_default();
+        if existing_by_origin.len() != existing.len() {
+            return Err(Error::InvalidPlan(format!(
+                "list {} owner partition mixes materialized and authoritative rows",
+                list_id.0
+            )));
+        }
+        let insertion_index = self
+            .lists
+            .get(&list_id)
+            .and_then(|list| list.order.minimum_position(&existing))
+            .unwrap_or(current_len);
+        let unmatched = existing_by_origin
+            .iter()
+            .filter_map(|(origin, row)| (!desired_origins.contains(origin)).then_some(*row))
+            .collect::<Vec<_>>();
+        for row in unmatched.into_iter().rev() {
+            self.remove_row(row, work)?;
+        }
+
+        let mut ordered_rows = Vec::with_capacity(desired_len);
+        for (origin, fields) in desired {
+            let row = if let Some(row) = existing_by_origin.remove(&origin) {
+                row
+            } else {
+                self.append_row_with_owner_prefix(
+                    list_id,
+                    fields.clone(),
+                    owner_prefix,
+                    Some(origin),
+                    work,
+                )?
+            };
+            for (field, value) in fields {
+                if state_fields.contains(&field) {
+                    continue;
+                }
+                self.record_row_field_undo(row, field, work);
+                self.set_row_authority_field(row, field, value, work)?;
+            }
+            ordered_rows.push(row);
+        }
+        if self.set_materialized_partition_order(list_id, insertion_index, &ordered_rows, work)? {
+            work.authority_deltas.push(AuthorityDelta::ReplaceList {
+                list_id,
+                authority: self.list_authority(list_id)?,
+            });
+            self.invalidate_list_structure(list_id, work);
+        }
+        Ok(EvalValue::List(
+            ordered_rows.into_iter().map(EvalValue::Row).collect(),
+        ))
+    }
+
+    fn finish_materialized_list_reconciliation(
+        &mut self,
+        list_id: ListId,
+        authority_source_list: Option<ListId>,
+        owner_prefix: OwnerAncestryId,
+        existing: Vec<RowId>,
+        current_len: usize,
+        desired_len: usize,
+        desired: Vec<(OwnerAncestryId, BTreeMap<FieldId, Value>)>,
+        work: &mut Work,
+    ) -> Result<EvalValue, Error> {
+        let mut desired_origins = BTreeSet::new();
+        for (origin, _) in &desired {
+            if !desired_origins.insert(*origin) {
+                return Err(Error::Evaluation(format!(
+                    "materialized list {} produced duplicate structural row identity",
+                    list_id.0
+                )));
+            }
+        }
+        let state_fields = self
+            .metadata
+            .indexed_state_field
+            .iter()
+            .filter_map(|(state, field)| {
+                (self.metadata.indexed_state_owner.get(state) == Some(&list_id)).then_some(*field)
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(authority_source_list) = authority_source_list {
+            let mut ordered_rows = Vec::with_capacity(desired_len);
+            for (origin, fields) in desired {
+                let leaf = self.owner_instances.ancestry_leaf(origin)?.ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "materialized list {} authority-backed row has no structural origin",
+                        list_id.0
+                    ))
+                })?;
+                if leaf.list != authority_source_list {
+                    return Err(Error::InvalidPlan(format!(
+                        "materialized list {} authority-backed row originates in ListId {}, expected {}",
+                        list_id.0, leaf.list.0, authority_source_list.0
+                    )));
+                }
+                let row = RowId {
+                    list: list_id,
+                    key: leaf.key,
+                    generation: leaf.generation,
+                };
+                let target_origin = self
+                    .owner_instances
+                    .ancestry_with_leaf_list(origin, list_id)?;
+                if self.row_owner_ancestry(row)? != target_origin {
+                    return Err(Error::InvalidPlan(format!(
+                        "materialized list {} authority row {}:{} has stale structural identity",
+                        list_id.0, row.key, row.generation
+                    )));
+                }
+                for (field, value) in fields {
+                    if state_fields.contains(&field) {
+                        continue;
+                    }
+                    self.record_row_field_undo(row, field, work);
+                    self.set_row_authority_field(row, field, value, work)?;
+                }
+                ordered_rows.push(row);
+            }
+            return Ok(EvalValue::List(
+                ordered_rows.into_iter().map(EvalValue::Row).collect(),
+            ));
+        }
+        let mut existing_by_origin = self
+            .lists
+            .get(&list_id)
+            .and_then(|list| list.owner_partitions.get(&owner_prefix))
             .map(|partition| partition.by_materialization_origin.clone())
             .unwrap_or_default();
         if existing_by_origin.len() != existing.len() {
@@ -17006,16 +18465,16 @@ impl MachineInstance {
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
         let owner_prefix = row
-            .map(|row| self.row_owner_ancestors(row).map(<[_]>::to_vec))
+            .map(|row| self.row_owner_ancestry(row))
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or(OwnerAncestryId::ROOT);
         let items = eval_to_list(value)?;
         work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
         self.reconcile_unkeyed_value_list_records(
             authority.list_id,
             &authority.fields,
             items,
-            &owner_prefix,
+            owner_prefix,
             work,
         )
     }
@@ -17025,7 +18484,7 @@ impl MachineInstance {
         list_id: ListId,
         fields_by_name: &BTreeMap<String, FieldId>,
         items: Vec<EvalValue>,
-        owner_prefix: &[OwnerInstanceRow],
+        owner_prefix: OwnerAncestryId,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
         let desired = items
@@ -17059,7 +18518,7 @@ impl MachineInstance {
                 self.materialized_constructor_fields(list_id, fields)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let existing = self.list_row_ids_for_owner(list_id, owner_prefix)?;
+        let existing = self.list_row_ids_for_owner(list_id, owner_prefix);
         let unchanged = existing.len() == desired.len()
             && existing.iter().zip(&desired).all(|(row, fields)| {
                 self.lists
@@ -17102,7 +18561,7 @@ impl MachineInstance {
         ordered_rows: &[RowId],
         work: &mut Work,
     ) -> Result<bool, Error> {
-        let (prepared, owner_partition) = {
+        let (prepared, owner_prefix) = {
             let list = self
                 .lists
                 .get(&list_id)
@@ -17111,29 +18570,31 @@ impl MachineInstance {
             else {
                 return Ok(false);
             };
-            let owner_partition = ordered_rows
+            let owner_prefix = ordered_rows
                 .first()
                 .map(|first| {
                     let row = list.rows.get(first).ok_or_else(|| {
                         Error::InvalidPlan("materialized partition row disappeared".to_owned())
                     })?;
-                    let (_, owner_prefix) = row.owner_ancestors.split_last().ok_or_else(|| {
-                        Error::InvalidPlan("materialized partition row has no owner".to_owned())
-                    })?;
-                    let owner_prefix = owner_prefix.to_vec();
-                    let previous_order = list
-                        .owner_partitions
-                        .get(&owner_prefix)
-                        .ok_or_else(|| {
-                            Error::InvalidPlan("materialized owner partition is missing".to_owned())
-                        })?
-                        .order
-                        .clone();
-                    Ok((owner_prefix, previous_order))
+                    self.owner_instances.ancestry_parent(row.owner_ancestry)
                 })
                 .transpose()?;
-            (prepared, owner_partition)
+            (prepared, owner_prefix)
         };
+        let owner_partition = owner_prefix
+            .map(|owner_prefix| {
+                let previous_order = self
+                    .lists
+                    .get(&list_id)
+                    .and_then(|list| list.owner_partitions.get(&owner_prefix))
+                    .ok_or_else(|| {
+                        Error::InvalidPlan("materialized owner partition is missing".to_owned())
+                    })?
+                    .order
+                    .clone();
+                Ok((owner_prefix, previous_order))
+            })
+            .transpose()?;
         if work.emit {
             self.turn_sequence
                 .checked_add(1)
@@ -17173,19 +18634,14 @@ impl MachineInstance {
         Ok(true)
     }
 
-    fn list_row_ids_for_owner(
-        &self,
-        list_id: ListId,
-        owner_prefix: &[OwnerInstanceRow],
-    ) -> Result<Vec<RowId>, Error> {
+    fn list_row_ids_for_owner(&self, list_id: ListId, owner_prefix: OwnerAncestryId) -> Vec<RowId> {
         let Some(list) = self.lists.get(&list_id) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
-        Ok(list
-            .owner_partitions
-            .get(owner_prefix)
+        list.owner_partitions
+            .get(&owner_prefix)
             .map(|partition| partition.order.clone())
-            .unwrap_or_default())
+            .unwrap_or_default()
     }
 
     fn materialized_row_fields(
@@ -17198,16 +18654,16 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         consumer: Option<Consumer>,
         work: &mut Work,
-    ) -> Result<(Vec<OwnerInstanceRow>, BTreeMap<FieldId, Value>), Error> {
+    ) -> Result<(OwnerAncestryId, BTreeMap<FieldId, Value>), Error> {
         let (origin, fields, captures) = match item {
-            EvalValue::Record(fields) => (Vec::new(), fields, BTreeMap::new()),
+            EvalValue::Record(fields) => (OwnerAncestryId::ROOT, fields, BTreeMap::new()),
             EvalValue::MappedRow {
                 id,
                 fields,
                 captures,
-            } => (self.row_owner_ancestors(id)?.to_vec(), fields, captures),
+            } => (self.row_owner_ancestry(id)?, fields, captures),
             EvalValue::Value(Value::Record(fields)) => (
-                Vec::new(),
+                OwnerAncestryId::ROOT,
                 fields
                     .into_iter()
                     .map(|(name, value)| (name, EvalValue::Value(value)))
@@ -17215,7 +18671,7 @@ impl MachineInstance {
                 BTreeMap::new(),
             ),
             EvalValue::Value(Value::MappedRow { id, fields }) => (
-                self.row_owner_ancestors(id)?.to_vec(),
+                self.row_owner_ancestry(id)?,
                 fields
                     .into_iter()
                     .map(|(name, value)| (name, EvalValue::Value(value)))
@@ -17223,7 +18679,7 @@ impl MachineInstance {
                 BTreeMap::new(),
             ),
             EvalValue::Row(row) | EvalValue::Value(Value::Row { id: row, .. }) => {
-                let origin = self.row_owner_ancestors(row)?.to_vec();
+                let origin = self.row_owner_ancestry(row)?;
                 if row.list == list_id && authority_source_list == Some(list_id) {
                     return Ok((origin, BTreeMap::new()));
                 }
@@ -17387,12 +18843,11 @@ impl MachineInstance {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_indexed_contextual_candidates(
+    fn collect_indexed_contextual_candidates(
         &mut self,
         access: &PlanContextualIndexedAccess,
-        context: ExpressionContext<'_>,
-        bindings: &mut PlanLocalBindings,
+        selection: &EvaluatedListAccessSelection,
+        consumer: Option<Consumer>,
         work: &mut Work,
     ) -> Result<Vec<RowId>, Error> {
         let metadata = Arc::clone(&self.metadata);
@@ -17402,18 +18857,7 @@ impl MachineInstance {
                 access.index.0
             ))
         })?;
-        let (selection, _) = self.evaluate_list_access_selection(
-            &access.selection,
-            index_plan,
-            context.row,
-            context.event,
-            context.output,
-            context.consumer,
-            bindings,
-            work,
-        )?;
-        self.register_list_access_dependency(context.consumer, access.index, &selection);
-        self.ensure_ordered_index_current(access.index, context.consumer, work)?;
+        self.register_list_access_dependency(consumer, access.index, selection);
         let index = self.ordered_indexes.remove(&access.index).ok_or_else(|| {
             Error::InvalidPlan(format!(
                 "typed contextual access index {} is not current",
@@ -17432,7 +18876,7 @@ impl MachineInstance {
         ));
         let result = (|| {
             let mut stream =
-                open_evaluated_list_access(&index, &selection, None, index_plan.keys.len())
+                open_evaluated_list_access(&index, selection, None, index_plan.keys.len())
                     .map_err(|error| Error::Evaluation(error.to_string()))?;
             let mut candidates = Vec::new();
             while let Some(candidate) = stream
@@ -17510,6 +18954,12 @@ impl MachineInstance {
         let mut stack = ExpressionWorkStack::new(stack_limit);
         let mut binding_undos = Vec::<ExpressionBindingUndo>::new();
         let mut currentness_targets = Vec::<ExpressionCurrentnessTarget>::new();
+        let mut catch_frames = Vec::<ExpressionCatchFrame>::new();
+        let mut detached_ordered_indexes = BTreeMap::<PlanListIndexId, DetachedOrderedIndex>::new();
+        let mut detached_ordered_index_order = Vec::<PlanListIndexId>::new();
+        let mut ordered_index_evaluations = Vec::<PlanListIndexId>::new();
+        let mut access_cleanups = Vec::<Option<AccessCleanup>>::new();
+        let mut list_access_flush_started = false;
         let authority_depth = work.active_value_list_authorities.len();
         match &entry {
             ExpressionEntry::Row {
@@ -17536,795 +18986,1059 @@ impl MachineInstance {
 
         let result = (|| {
             while let Some(task) = stack.tasks.pop() {
-                match task {
-                    ExpressionTask::Evaluate {
-                        expression,
-                        context,
-                    } => {
-                        work.consume(1)?;
-                        let node = plan
-                            .row_expressions
-                            .node(expression)
-                            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
-                        match node {
-                            PlanRowExpressionNode::Intrinsic { intrinsic } => stack
-                                .push_value(EvalValue::Value(self.eval_intrinsic(*intrinsic)))?,
-                            PlanRowExpressionNode::Field {
-                                input: ValueRef::DistributedImport(import_id),
-                            } if self.metadata.row_owned_call_results.contains_key(import_id) => {
-                                stack.push_task(ExpressionTask::BeginRowOwnedCall {
-                                    import_id: *import_id,
-                                    context,
-                                })?;
-                            }
-                            PlanRowExpressionNode::Field { .. } => {
-                                stack.push_task(ExpressionTask::ValueRef {
-                                    value_ref: ExpressionValueRef::Arena(expression),
-                                    context,
-                                })?;
-                            }
-                            PlanRowExpressionNode::Constant { constant_id } => {
-                                let value = self
+                let task_result = (|| -> Result<(), Error> {
+                    match task {
+                        ExpressionTask::Evaluate {
+                            expression,
+                            context,
+                        } => {
+                            work.consume(1)?;
+                            let node = plan
+                                .row_expressions
+                                .node(expression)
+                                .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                            match node {
+                                PlanRowExpressionNode::Intrinsic { intrinsic } => stack
+                                    .push_value(EvalValue::Value(
+                                        self.eval_intrinsic(*intrinsic),
+                                    ))?,
+                                PlanRowExpressionNode::Field {
+                                    input: ValueRef::DistributedImport(import_id),
+                                } if self
                                     .metadata
-                                    .constants
-                                    .get(constant_id)
-                                    .cloned()
-                                    .map(EvalValue::Value)
-                                    .ok_or_else(|| {
-                                        Error::InvalidPlan(format!(
-                                            "missing constant {}",
-                                            constant_id.0
-                                        ))
+                                    .row_owned_call_results
+                                    .contains_key(import_id) =>
+                                {
+                                    stack.push_task(ExpressionTask::BeginRowOwnedCall {
+                                        import_id: *import_id,
+                                        context,
                                     })?;
-                                stack.push_value(value)?;
-                            }
-                            PlanRowExpressionNode::ListRef { list_id } => {
-                                self.register_list_dependency(context.consumer, *list_id);
-                                if self.derived_lists.contains_key(list_id) {
-                                    stack.push_task(ExpressionTask::EnsureList {
-                                        list: *list_id,
-                                        event: context.event,
+                                }
+                                PlanRowExpressionNode::Field { .. } => {
+                                    stack.push_task(ExpressionTask::ValueRef {
+                                        value_ref: ExpressionValueRef::Arena(expression),
+                                        context,
                                     })?;
-                                } else {
+                                }
+                                PlanRowExpressionNode::Constant { constant_id } => {
+                                    let value = self
+                                        .metadata
+                                        .constants
+                                        .get(constant_id)
+                                        .cloned()
+                                        .map(EvalValue::Value)
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(format!(
+                                                "missing constant {}",
+                                                constant_id.0
+                                            ))
+                                        })?;
+                                    stack.push_value(value)?;
+                                }
+                                PlanRowExpressionNode::ListRef { list_id } => {
+                                    self.register_list_dependency(context.consumer, *list_id);
+                                    if self.derived_lists.contains_key(list_id) {
+                                        stack.push_task(ExpressionTask::EnsureList {
+                                            list: *list_id,
+                                            event: context.event,
+                                        })?;
+                                    } else {
+                                        let rows = self.list_row_ids(*list_id);
+                                        work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
+                                        stack.push_value(EvalValue::List(
+                                            rows.into_iter().map(EvalValue::Row).collect(),
+                                        ))?;
+                                    }
+                                }
+                                PlanRowExpressionNode::AuthorityListRef { list_id } => {
+                                    self.register_list_dependency(context.consumer, *list_id);
                                     let rows = self.list_row_ids(*list_id);
                                     work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                                     stack.push_value(EvalValue::List(
                                         rows.into_iter().map(EvalValue::Row).collect(),
                                     ))?;
                                 }
-                            }
-                            PlanRowExpressionNode::AuthorityListRef { list_id } => {
-                                self.register_list_dependency(context.consumer, *list_id);
-                                let rows = self.list_row_ids(*list_id);
-                                work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
-                                stack.push_value(EvalValue::List(
-                                    rows.into_iter().map(EvalValue::Row).collect(),
-                                ))?;
-                            }
-                            PlanRowExpressionNode::Local {
-                                owner,
-                                local,
-                                projection,
-                            } => {
-                                let mut value =
-                                    bindings.get(&(*owner, *local)).cloned().ok_or_else(|| {
-                                        Error::InvalidPlan(format!(
-                                            "contextual owner {} local {} is not active",
-                                            owner.0, local.0
-                                        ))
-                                    })?;
-                                for field in projection {
-                                    value =
-                                        self.eval_object_field(value, field, context.consumer)?;
+                                PlanRowExpressionNode::Local {
+                                    owner,
+                                    local,
+                                    projection,
+                                } => {
+                                    let mut value = bindings
+                                        .get(&(*owner, *local))
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(format!(
+                                                "contextual owner {} local {} is not active",
+                                                owner.0, local.0
+                                            ))
+                                        })?;
+                                    for field in projection {
+                                        value =
+                                            self.eval_object_field(value, field, context.consumer)?;
+                                    }
+                                    stack.push_value(value)?;
                                 }
-                                stack.push_value(value)?;
-                            }
-                            PlanRowExpressionNode::LocalRow { owner, local } => {
-                                let value =
-                                    bindings.get(&(*owner, *local)).cloned().ok_or_else(|| {
-                                        Error::InvalidPlan(format!(
-                                            "contextual row owner {} local {} is not active",
-                                            owner.0, local.0
-                                        ))
-                                    })?;
-                                stack.push_value(value)?;
-                            }
-                            PlanRowExpressionNode::EventRow { source, list_id } => {
-                                let event = context.event.ok_or_else(|| {
+                                PlanRowExpressionNode::LocalRow { owner, local } => {
+                                    let value = bindings
+                                        .get(&(*owner, *local))
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(format!(
+                                                "contextual row owner {} local {} is not active",
+                                                owner.0, local.0
+                                            ))
+                                        })?;
+                                    stack.push_value(value)?;
+                                }
+                                PlanRowExpressionNode::EventRow { source, list_id } => {
+                                    let event = context.event.ok_or_else(|| {
                                     Error::InvalidPlan(format!(
                                         "event row for source {} was evaluated without an active source event",
                                         source.0
                                     ))
                                 })?;
-                                if event.source != *source {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "event row expects source {}, received {}",
-                                        source.0, event.source.0
-                                    )));
-                                }
-                                let row = context.row.or(event.target).ok_or_else(|| {
-                                    Error::InvalidPlan(format!(
-                                        "event row for source {} has no exact row target",
-                                        source.0
-                                    ))
-                                })?;
-                                if row.list != *list_id || event.target != Some(row) {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "event row for source {} targets {:?}, expected exact ListId {} row {:?}",
-                                        source.0, event.target, list_id.0, row
-                                    )));
-                                }
-                                let leaf = event.route.owner.leaf().ok_or_else(|| {
-                                    Error::InvalidPlan(format!(
-                                        "event row for source {} has no owner-instance leaf",
-                                        source.0
-                                    ))
-                                })?;
-                                if leaf.list != row.list
-                                    || leaf.key != row.key
-                                    || leaf.generation != row.generation
-                                {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "event row for source {} does not match its owner-instance route",
-                                        source.0
-                                    )));
-                                }
-                                stack.push_value(EvalValue::Row(row))?;
-                            }
-                            PlanRowExpressionNode::ContextualCollection {
-                                owner,
-                                operation,
-                                source,
-                                row_local,
-                                body,
-                                indexed_access: None,
-                                ..
-                            } => {
-                                stack.push_task(
-                                    ExpressionTask::ContextualCollectionAfterSource {
-                                        expression,
-                                        owner: *owner,
-                                        operation: *operation,
-                                        row_local: *row_local,
-                                        body: *body,
-                                        context,
-                                    },
-                                )?;
-                                stack.push_task(ExpressionTask::Evaluate {
-                                    expression: *source,
-                                    context,
-                                })?;
-                            }
-                            PlanRowExpressionNode::ListGetField {
-                                list_id,
-                                index,
-                                field,
-                            } => {
-                                stack.push_task(ExpressionTask::ListGetFieldAfterIndex {
-                                    list: *list_id,
-                                    field: *field,
-                                    context,
-                                })?;
-                                stack.push_task(ExpressionTask::Evaluate {
-                                    expression: *index,
-                                    context,
-                                })?;
-                            }
-                            PlanRowExpressionNode::ListRowField {
-                                row: row_expression,
-                                list_id,
-                                field,
-                            } => {
-                                stack.push_task(ExpressionTask::ListRowFieldAfterRow {
-                                    list: *list_id,
-                                    field: *field,
-                                    context,
-                                })?;
-                                stack.push_task(ExpressionTask::Evaluate {
-                                    expression: *row_expression,
-                                    context,
-                                })?;
-                            }
-                            PlanRowExpressionNode::ContextualCollection {
-                                owner,
-                                operation,
-                                row_local,
-                                body,
-                                captures,
-                                indexed_access: Some(access),
-                                ..
-                            } => {
-                                if !captures.is_empty() {
-                                    return Err(Error::InvalidPlan(
-                                        "indexed contextual access cannot carry row captures"
-                                            .to_owned(),
-                                    ));
-                                }
-                                let candidates = self.prepare_indexed_contextual_candidates(
-                                    access, context, bindings, work,
-                                )?;
-                                let capacity = candidates.len();
-                                stack.push_task(ExpressionTask::IndexedContextualNext {
-                                    state: Box::new(IndexedContextualState {
-                                        operation: *operation,
-                                        local: (*owner, *row_local),
-                                        body: *body,
-                                        remaining: candidates.into_iter(),
-                                        retained: Vec::with_capacity(capacity),
-                                    }),
-                                    context,
-                                })?;
-                            }
-                            PlanRowExpressionNode::ContextualOrder {
-                                owner,
-                                operation,
-                                source,
-                                row_local,
-                                key,
-                                direction,
-                            } => {
-                                stack.push_task(ExpressionTask::ContextualOrderAfterSource {
-                                    operation: *operation,
-                                    owner: *owner,
-                                    row_local: *row_local,
-                                    key: *key,
-                                    direction: *direction,
-                                    context,
-                                })?;
-                                stack.push_task(ExpressionTask::Evaluate {
-                                    expression: *source,
-                                    context,
-                                })?;
-                            }
-                            PlanRowExpressionNode::ListAccess { access } => {
-                                let value = self.evaluate_list_access(
-                                    access,
-                                    context.row,
-                                    context.event,
-                                    context.output,
-                                    context.consumer,
-                                    bindings,
-                                    work,
-                                )?;
-                                stack.push_value(value)?;
-                            }
-                            PlanRowExpressionNode::ListPage { page } => {
-                                let value = self.evaluate_list_page(
-                                    page,
-                                    context.row,
-                                    context.event,
-                                    context.output,
-                                    context.consumer,
-                                    bindings,
-                                    work,
-                                )?;
-                                stack.push_value(value)?;
-                            }
-                            PlanRowExpressionNode::BoundedListPage { page } => {
-                                let value = self.evaluate_bounded_list_page(
-                                    page,
-                                    context.row,
-                                    context.event,
-                                    context.output,
-                                    context.consumer,
-                                    bindings,
-                                    work,
-                                )?;
-                                stack.push_value(value)?;
-                            }
-                            PlanRowExpressionNode::BuiltinCall {
-                                function,
-                                input,
-                                args,
-                            } if matches!(
-                                function,
-                                PlanRowBuiltin::BoolAnd | PlanRowBuiltin::BoolOr
-                            ) =>
-                            {
-                                let left = (*input).ok_or_else(|| {
-                                    Error::InvalidPlan(format!(
-                                        "{} has no compiled input",
-                                        function.function_name()
-                                    ))
-                                })?;
-                                let right = args
-                                    .iter()
-                                    .find(|argument| argument.name == "right")
-                                    .map(|argument| argument.value)
-                                    .ok_or_else(|| {
+                                    if event.source != *source {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "event row expects source {}, received {}",
+                                            source.0, event.source.0
+                                        )));
+                                    }
+                                    let row = event.target.ok_or_else(|| {
                                         Error::InvalidPlan(format!(
-                                            "{} has no compiled right operand",
+                                            "event row for source {} has no exact row target",
+                                            source.0
+                                        ))
+                                    })?;
+                                    if context.row.is_some_and(|contextual| contextual != row) {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "event row for source {} conflicts with its contextual row",
+                                            source.0
+                                        )));
+                                    }
+                                    if row.list != *list_id {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "event row for source {} targets {:?}, expected exact ListId {} row {:?}",
+                                            source.0, event.target, list_id.0, row
+                                        )));
+                                    }
+                                    let leaf = event.route.owner.leaf().ok_or_else(|| {
+                                        Error::InvalidPlan(format!(
+                                            "event row for source {} has no owner-instance leaf",
+                                            source.0
+                                        ))
+                                    })?;
+                                    if leaf.list != row.list
+                                        || leaf.key != row.key
+                                        || leaf.generation != row.generation
+                                    {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "event row for source {} does not match its owner-instance route",
+                                            source.0
+                                        )));
+                                    }
+                                    stack.push_value(EvalValue::Row(row))?;
+                                }
+                                PlanRowExpressionNode::ContextualCollection {
+                                    owner,
+                                    operation,
+                                    source,
+                                    row_local,
+                                    body,
+                                    indexed_access: None,
+                                    ..
+                                } => {
+                                    stack.push_task(
+                                        ExpressionTask::ContextualCollectionAfterSource {
+                                            expression,
+                                            owner: *owner,
+                                            operation: *operation,
+                                            row_local: *row_local,
+                                            body: *body,
+                                            context,
+                                        },
+                                    )?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: *source,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::ListGetField {
+                                    list_id,
+                                    index,
+                                    field,
+                                } => {
+                                    stack.push_task(ExpressionTask::ListGetFieldAfterIndex {
+                                        list: *list_id,
+                                        field: *field,
+                                        context,
+                                    })?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: *index,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::ListRowField {
+                                    row: row_expression,
+                                    list_id,
+                                    field,
+                                } => {
+                                    stack.push_task(ExpressionTask::ListRowFieldAfterRow {
+                                        list: *list_id,
+                                        field: *field,
+                                        context,
+                                    })?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: *row_expression,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::ContextualCollection {
+                                    owner,
+                                    operation,
+                                    row_local,
+                                    body,
+                                    captures,
+                                    indexed_access: Some(access),
+                                    ..
+                                } => {
+                                    if !captures.is_empty() {
+                                        return Err(Error::InvalidPlan(
+                                            "indexed contextual access cannot carry row captures"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                    let mut expressions = Vec::new();
+                                    access.selection.visit_expressions(&mut |expression| {
+                                        expressions.push(expression)
+                                    });
+                                    stack.push_task(ExpressionTask::ListSelectionNext {
+                                        state: Box::new(ListSelectionEvaluationState {
+                                            selection: &access.selection,
+                                            index: access.index,
+                                            expressions,
+                                            next_expression: 0,
+                                            values: Vec::new(),
+                                            context,
+                                            continuation:
+                                                ListSelectionContinuation::IndexedContextual {
+                                                    access,
+                                                    operation: *operation,
+                                                    local: (*owner, *row_local),
+                                                    body: *body,
+                                                    context,
+                                                },
+                                        }),
+                                    })?;
+                                }
+                                PlanRowExpressionNode::ContextualOrder {
+                                    owner,
+                                    operation,
+                                    source,
+                                    row_local,
+                                    key,
+                                    direction,
+                                } => {
+                                    stack.push_task(
+                                        ExpressionTask::ContextualOrderAfterSource {
+                                            operation: *operation,
+                                            owner: *owner,
+                                            row_local: *row_local,
+                                            key: *key,
+                                            direction: *direction,
+                                            context,
+                                        },
+                                    )?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: *source,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::ListAccess { access } => {
+                                    stack.push_task(ExpressionTask::BeginListAccess {
+                                        access,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::ListPage { page } => {
+                                    catch_frames.push(ExpressionCatchFrame {
+                                        kind: WorkLimitCatchKind::Page,
+                                        task_depth: stack.tasks.len(),
+                                        value_depth: stack.values.len(),
+                                        binding_depth: binding_undos.len(),
+                                        currentness_depth: currentness_targets.len(),
+                                        authority_depth: work.active_value_list_authorities.len(),
+                                        detached_index_depth: detached_ordered_index_order.len(),
+                                        ordered_index_evaluation_depth: ordered_index_evaluations
+                                            .len(),
+                                        access_cleanup_depth: access_cleanups.len(),
+                                        list_access_flush_started,
+                                    });
+                                    stack.push_task(ExpressionTask::FinishWorkLimitCatch)?;
+                                    stack.push_task(ExpressionTask::BeginListPage {
+                                        page,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::BoundedListPage { page } => {
+                                    catch_frames.push(ExpressionCatchFrame {
+                                        kind: WorkLimitCatchKind::Page,
+                                        task_depth: stack.tasks.len(),
+                                        value_depth: stack.values.len(),
+                                        binding_depth: binding_undos.len(),
+                                        currentness_depth: currentness_targets.len(),
+                                        authority_depth: work.active_value_list_authorities.len(),
+                                        detached_index_depth: detached_ordered_index_order.len(),
+                                        ordered_index_evaluation_depth: ordered_index_evaluations
+                                            .len(),
+                                        access_cleanup_depth: access_cleanups.len(),
+                                        list_access_flush_started,
+                                    });
+                                    stack.push_task(ExpressionTask::FinishWorkLimitCatch)?;
+                                    stack.push_task(ExpressionTask::BeginBoundedListPage {
+                                        page,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::BuiltinCall {
+                                    function,
+                                    input,
+                                    args,
+                                } if matches!(
+                                    function,
+                                    PlanRowBuiltin::BoolAnd | PlanRowBuiltin::BoolOr
+                                ) =>
+                                {
+                                    let left = (*input).ok_or_else(|| {
+                                        Error::InvalidPlan(format!(
+                                            "{} has no compiled input",
                                             function.function_name()
                                         ))
                                     })?;
-                                stack.push_task(ExpressionTask::BuiltinBoolAfterLeft {
-                                    function: *function,
-                                    right,
-                                    context,
-                                })?;
-                                stack.push_task(ExpressionTask::Evaluate {
-                                    expression: left,
-                                    context,
-                                })?;
-                            }
-                            PlanRowExpressionNode::BuiltinCall {
-                                function,
-                                input,
-                                args,
-                            } => {
-                                let value_base = stack.values.len();
-                                stack.push_task(ExpressionTask::BuiltinAfterOperands {
-                                    expression,
-                                    value_base,
-                                })?;
-                                schedule_builtin_operands(
-                                    &mut stack, *function, *input, args, context,
-                                )?;
-                            }
-                            PlanRowExpressionNode::Select { input, .. } => {
-                                stack.push_task(ExpressionTask::SelectAfterInput {
-                                    expression,
-                                    context,
-                                })?;
-                                stack.push_task(ExpressionTask::Evaluate {
-                                    expression: *input,
-                                    context,
-                                })?;
-                            }
-                            node => {
-                                let value_base = stack.values.len();
-                                stack.push_task(ExpressionTask::Apply {
-                                    expression,
-                                    value_base,
-                                    context,
-                                })?;
-                                schedule_apply_operands(&mut stack, node, context)?;
+                                    let right = args
+                                        .iter()
+                                        .find(|argument| argument.name == "right")
+                                        .map(|argument| argument.value)
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(format!(
+                                                "{} has no compiled right operand",
+                                                function.function_name()
+                                            ))
+                                        })?;
+                                    stack.push_task(ExpressionTask::BuiltinBoolAfterLeft {
+                                        function: *function,
+                                        right,
+                                        context,
+                                    })?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: left,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::BuiltinCall {
+                                    function,
+                                    input,
+                                    args,
+                                } => {
+                                    let value_base = stack.values.len();
+                                    stack.push_task(ExpressionTask::BuiltinAfterOperands {
+                                        expression,
+                                        value_base,
+                                    })?;
+                                    schedule_builtin_operands(
+                                        &mut stack, *function, *input, args, context,
+                                    )?;
+                                }
+                                PlanRowExpressionNode::Select { input, .. } => {
+                                    stack.push_task(ExpressionTask::SelectAfterInput {
+                                        expression,
+                                        context,
+                                    })?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: *input,
+                                        context,
+                                    })?;
+                                }
+                                node => {
+                                    let value_base = stack.values.len();
+                                    stack.push_task(ExpressionTask::Apply {
+                                        expression,
+                                        value_base,
+                                        context,
+                                    })?;
+                                    schedule_apply_operands(&mut stack, node, context)?;
+                                }
                             }
                         }
-                    }
-                    ExpressionTask::Apply {
-                        expression,
-                        value_base,
-                        context,
-                    } => {
-                        let node = plan
-                            .row_expressions
-                            .node(expression)
-                            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
-                        let value = self.apply_row_expression_node(
+                        ExpressionTask::Apply {
                             expression,
-                            node,
-                            &mut stack.values,
                             value_base,
                             context,
-                            work,
-                        )?;
-                        stack.push_value(value)?;
-                    }
-                    ExpressionTask::EvaluateDerived {
-                        expression,
-                        context,
-                    } => {
-                        work.consume(1)?;
-                        match expression {
-                            PlanDerivedExpression::MaterializeList {
+                        } => {
+                            let node = plan
+                                .row_expressions
+                                .node(expression)
+                                .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                            if let PlanRowExpressionNode::Object { fields }
+                            | PlanRowExpressionNode::TaggedObject { fields, .. } = node
+                            {
+                                if value_base > stack.values.len() {
+                                    return Err(Error::InvalidPlan(format!(
+                                        "row expression {} has an invalid value-stack boundary",
+                                        expression.0
+                                    )));
+                                }
+                                let values = stack.values.drain(value_base..).collect::<Vec<_>>();
+                                if values.len() != fields.len() {
+                                    return Err(Error::InvalidPlan(format!(
+                                        "row expression {} produced {} object operands for {} fields",
+                                        expression.0,
+                                        values.len(),
+                                        fields.len()
+                                    )));
+                                }
+                                let record = match node {
+                                    PlanRowExpressionNode::TaggedObject { tag, .. } => {
+                                        BTreeMap::from([(
+                                            "$tag".to_owned(),
+                                            EvalValue::Value(Value::Text(tag.clone())),
+                                        )])
+                                    }
+                                    PlanRowExpressionNode::Object { .. } => BTreeMap::new(),
+                                    _ => unreachable!(),
+                                };
+                                stack.push_task(ExpressionTask::ObjectMaterializeNext {
+                                    state: Box::new(ObjectMaterializationState {
+                                        fields,
+                                        next_field: 0,
+                                        values: values.into_iter(),
+                                        record,
+                                        context,
+                                    }),
+                                })?;
+                                return Ok(());
+                            }
+                            let value = self.apply_row_expression_node(
+                                expression,
+                                node,
+                                &mut stack.values,
+                                value_base,
+                                context,
+                                work,
+                            )?;
+                            stack.push_value(value)?;
+                        }
+                        ExpressionTask::ObjectMaterializeNext { mut state } => {
+                            let Some(field) = state.fields.get(state.next_field) else {
+                                if state.values.next().is_some() {
+                                    return Err(Error::InvalidPlan(
+                                        "object materialization left unused operands".to_owned(),
+                                    ));
+                                }
+                                stack.push_value(EvalValue::Record(state.record))?;
+                                return Ok(());
+                            };
+                            let value = state.values.next().ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "object materialization produced too few operands".to_owned(),
+                                )
+                            })?;
+                            state.next_field += 1;
+                            if !field.spread {
+                                state.record.insert(field.name.clone(), value);
+                                stack.push_task(ExpressionTask::ObjectMaterializeNext { state })?;
+                                return Ok(());
+                            }
+                            match value {
+                                EvalValue::Record(fields) | EvalValue::MappedRow { fields, .. } => {
+                                    state.record.extend(fields);
+                                    stack.push_task(ExpressionTask::ObjectMaterializeNext {
+                                        state,
+                                    })?;
+                                }
+                                EvalValue::Value(Value::Record(fields))
+                                | EvalValue::Value(Value::MappedRow { fields, .. }) => {
+                                    state.record.extend(
+                                        fields
+                                            .into_iter()
+                                            .map(|(name, value)| (name, EvalValue::Value(value))),
+                                    );
+                                    stack.push_task(ExpressionTask::ObjectMaterializeNext {
+                                        state,
+                                    })?;
+                                }
+                                EvalValue::Row(row)
+                                | EvalValue::Value(Value::Row { id: row, .. }) => {
+                                    let fields = metadata
+                                        .row_field_names
+                                        .iter()
+                                        .filter(|((list, _), _)| *list == row.list)
+                                        .map(|((_, field), name)| (*field, name.clone()))
+                                        .collect::<Vec<_>>();
+                                    stack.push_task(ExpressionTask::ObjectRowSpreadNext {
+                                        state: Box::new(ObjectRowSpreadState {
+                                            object: state,
+                                            row,
+                                            fields: fields.into_iter(),
+                                        }),
+                                    })?;
+                                }
+                                other => {
+                                    return Err(Error::Evaluation(format!(
+                                        "record spread requires a record or typed row, found {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        ExpressionTask::ObjectRowSpreadNext { mut state } => {
+                            let Some((field, name)) = state.fields.next() else {
+                                stack.push_task(ExpressionTask::ObjectMaterializeNext {
+                                    state: state.object,
+                                })?;
+                                return Ok(());
+                            };
+                            self.register_row_dependency(
+                                state.object.context.consumer,
+                                state.row,
+                                field,
+                            );
+                            let row = state.row;
+                            let event = state.object.context.event;
+                            stack.push_task(ExpressionTask::ObjectRowSpreadAfterField {
+                                state,
+                                name,
+                            })?;
+                            stack.push_task(ExpressionTask::EnsureRow { row, field, event })?;
+                        }
+                        ExpressionTask::ObjectRowSpreadAfterField { mut state, name } => {
+                            state.object.record.insert(name, stack.pop_value()?);
+                            stack.push_task(ExpressionTask::ObjectRowSpreadNext { state })?;
+                        }
+                        ExpressionTask::EvaluateDerived {
+                            expression,
+                            context,
+                        } => {
+                            work.consume(1)?;
+                            match expression {
+                                PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
+                                    source_id,
+                                    key_field,
+                                    required_key,
+                                    state,
+                                    skip_empty,
+                                } => {
+                                    let Some(event) = context.event else {
+                                        stack.push_value(EvalValue::Value(Value::Null))?;
+                                        return Ok(());
+                                    };
+                                    if event.source != *source_id {
+                                        stack.push_value(EvalValue::Value(Value::Null))?;
+                                        return Ok(());
+                                    }
+                                    let key = source_payload_value(&event.payload, key_field)
+                                        .map(|value| value_to_text(&value))
+                                        .transpose()?
+                                        .unwrap_or_default();
+                                    if key != *required_key {
+                                        stack.push_value(EvalValue::Value(Value::Null))?;
+                                        return Ok(());
+                                    }
+                                    stack.push_task(
+                                        ExpressionTask::DerivedSourceKeyAfterValue {
+                                            skip_empty: *skip_empty,
+                                        },
+                                    )?;
+                                    stack.push_task(ExpressionTask::ValueRef {
+                                        value_ref: ExpressionValueRef::Derived(state),
+                                        context,
+                                    })?;
+                                }
+                                PlanDerivedExpression::SourceEventTransform {
+                                    default,
+                                    arms,
+                                    ..
+                                } => {
+                                    let mut selected = None;
+                                    if let Some(ActiveTrigger {
+                                        cause: TriggerCause::State(state),
+                                        target,
+                                        ..
+                                    }) = &work.active_trigger
+                                    {
+                                        if let Some(arm) = arms.iter().find(|arm| {
+                                            matches!(
+                                                &arm.trigger,
+                                                ValueRef::State(trigger) if trigger == state
+                                            )
+                                        }) {
+                                            let triggered = match (*target, context.event) {
+                                                (Some(row), _) => Some(row),
+                                                (None, Some(event)) => event.target,
+                                                (None, None) => None,
+                                            };
+                                            selected = Some((
+                                                arm.value,
+                                                exact_expression_row(
+                                                    context.row,
+                                                    triggered,
+                                                    "state event transform",
+                                                )?,
+                                            ));
+                                        }
+                                    }
+                                    if selected.is_none()
+                                        && let Some(event) = context.event
+                                        && let Some(arm) = arms.iter().find(|arm| {
+                                            matches!(
+                                                &arm.trigger,
+                                                ValueRef::Source(source)
+                                                    if *source == event.source
+                                            )
+                                        })
+                                    {
+                                        selected = Some((
+                                            arm.value,
+                                            exact_expression_row(
+                                                context.row,
+                                                event.target,
+                                                "source event transform",
+                                            )?,
+                                        ));
+                                    }
+                                    let selected = selected.unwrap_or((*default, context.row));
+                                    schedule_isolated_expression(
+                                        &mut stack,
+                                        &mut binding_undos,
+                                        bindings,
+                                        None,
+                                        selected.0,
+                                        ExpressionContext {
+                                            row: selected.1,
+                                            ..context
+                                        },
+                                    )?;
+                                }
+                                PlanDerivedExpression::BoolNot { input } => {
+                                    stack.push_task(ExpressionTask::DerivedBoolNotAfterValue)?;
+                                    stack.push_task(ExpressionTask::ValueRef {
+                                        value_ref: ExpressionValueRef::Derived(input),
+                                        context,
+                                    })?;
+                                }
+                                PlanDerivedExpression::NumberCompareConst { left, op, right } => {
+                                    stack.push_task(
+                                        ExpressionTask::DerivedNumberCompareAfterValue {
+                                            op: *op,
+                                            right: *right,
+                                        },
+                                    )?;
+                                    stack.push_task(ExpressionTask::ValueRef {
+                                        value_ref: ExpressionValueRef::Derived(left),
+                                        context,
+                                    })?;
+                                }
+                                PlanDerivedExpression::ValueCompare { left, op, right } => {
+                                    stack.push_task(
+                                        ExpressionTask::DerivedValueCompareAfterLeft {
+                                            op: *op,
+                                            right,
+                                            context,
+                                        },
+                                    )?;
+                                    stack.push_task(ExpressionTask::ValueRef {
+                                        value_ref: ExpressionValueRef::Derived(left),
+                                        context,
+                                    })?;
+                                }
+                                PlanDerivedExpression::RowExpression { expression } => {
+                                    schedule_isolated_expression(
+                                        &mut stack,
+                                        &mut binding_undos,
+                                        bindings,
+                                        None,
+                                        *expression,
+                                        ExpressionContext {
+                                            row: expression_row(context.row),
+                                            ..context
+                                        },
+                                    )?;
+                                }
+                                PlanDerivedExpression::MaterializedRowField {
+                                    local,
+                                    expression,
+                                } => {
+                                    let row = context.row.ok_or_else(|| {
+                                        Error::InvalidPlan(
+                                        "materialized row field was evaluated without an exact row"
+                                            .to_owned(),
+                                    )
+                                    })?;
+                                    let binding = local.map(|local| {
+                                        (EvalValue::Row(row), (local.owner, local.row_local))
+                                    });
+                                    schedule_isolated_expression(
+                                        &mut stack,
+                                        &mut binding_undos,
+                                        bindings,
+                                        binding,
+                                        *expression,
+                                        ExpressionContext {
+                                            row: Some(row),
+                                            ..context
+                                        },
+                                    )?;
+                                }
+                            }
+                        }
+                        ExpressionTask::MaterializeListAfterValue {
+                            materialization,
+                            owner_prefix,
+                            authority_depth,
+                            event,
+                        } => {
+                            let PlanListMaterialization {
                                 target_list,
                                 authority_source_list,
                                 fields,
                                 row_field_copies,
-                                value_list_authorities,
-                                expression,
-                            } => {
-                                let owner_prefix = context
-                                    .row
-                                    .map(|row| self.row_owner_ancestors(row).map(<[_]>::to_vec))
-                                    .transpose()?
-                                    .unwrap_or_default();
-                                let authority_depth = work.active_value_list_authorities.len();
-                                if authority_depth.saturating_add(value_list_authorities.len())
-                                    > stack.limit
-                                {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "value-list authority stack exceeded its plan-derived bound of {}",
-                                        stack.limit
-                                    )));
+                                ..
+                            } = materialization;
+                            work.active_value_list_authorities.truncate(authority_depth);
+                            let value = match stack.pop_value()? {
+                                EvalValue::Value(Value::Null) => EvalValue::List(Vec::new()),
+                                EvalValue::Value(Value::Text(value)) if value == "SKIP" => {
+                                    EvalValue::List(Vec::new())
                                 }
-                                work.active_value_list_authorities
-                                    .extend(value_list_authorities.iter().cloned());
-                                stack.push_task(ExpressionTask::MaterializeListAfterValue {
-                                    target_list: *target_list,
-                                    authority_source_list: *authority_source_list,
+                                value @ (EvalValue::Record(_)
+                                | EvalValue::MappedRow { .. }
+                                | EvalValue::Row(_)
+                                | EvalValue::Value(Value::Record(_))
+                                | EvalValue::Value(Value::MappedRow { .. })
+                                | EvalValue::Value(Value::Row { .. })) => {
+                                    EvalValue::List(vec![value])
+                                }
+                                value => value,
+                            };
+                            let consumer = Some(Consumer::List(*target_list));
+                            let items = eval_to_list(value)?;
+                            let desired_len = items.len();
+                            let current_len = self.list_row_ids(*target_list).len();
+                            let existing = self.list_row_ids_for_owner(*target_list, owner_prefix);
+                            work.consume(existing.len().try_into().unwrap_or(u64::MAX))?;
+                            let projected_len = current_len
+                                .checked_sub(existing.len())
+                                .and_then(|len| len.checked_add(desired_len))
+                                .ok_or_else(|| {
+                                    Error::Evaluation("materialized list size overflow".to_owned())
+                                })?;
+                            let capacity = plan
+                                .storage_layout
+                                .list_slots
+                                .iter()
+                                .find(|slot| slot.list_id == *target_list)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "missing list slot {}",
+                                        target_list.0
+                                    ))
+                                })?
+                                .capacity;
+                            if capacity.is_some_and(|capacity| projected_len > capacity) {
+                                return Err(Error::Evaluation(format!(
+                                    "materialized list {} would contain {} rows, exceeding capacity {}",
+                                    target_list.0,
+                                    projected_len,
+                                    capacity.unwrap_or_default()
+                                )));
+                            }
+                            work.consume(desired_len.try_into().unwrap_or(u64::MAX))?;
+                            if authority_source_list.is_none()
+                                && items.iter().all(|item| {
+                                    matches!(
+                                        item,
+                                        EvalValue::Record(_) | EvalValue::Value(Value::Record(_))
+                                    )
+                                })
+                            {
+                                let value = self.reconcile_unkeyed_value_list_records(
+                                    *target_list,
                                     fields,
+                                    items,
+                                    owner_prefix,
+                                    work,
+                                )?;
+                                stack.push_value(value)?;
+                                return Ok(());
+                            }
+                            stack.push_task(ExpressionTask::MaterializedListNext {
+                                state: Box::new(MaterializedListEvaluationState {
+                                    list_id: *target_list,
+                                    authority_source_list: *authority_source_list,
+                                    field_ids: fields,
                                     row_field_copies,
                                     owner_prefix,
-                                    authority_depth,
-                                    event: context.event,
-                                })?;
-                                stack.push_task(ExpressionTask::EvaluateDerived {
-                                    expression,
-                                    context: ExpressionContext {
-                                        consumer: Some(Consumer::List(*target_list)),
-                                        ..context
-                                    },
-                                })?;
-                            }
-                            PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
-                                source_id,
-                                key_field,
-                                required_key,
-                                state,
-                                skip_empty,
-                            } => {
-                                let Some(event) = context.event else {
-                                    stack.push_value(EvalValue::Value(Value::Null))?;
-                                    continue;
-                                };
-                                if event.source != *source_id {
-                                    stack.push_value(EvalValue::Value(Value::Null))?;
-                                    continue;
-                                }
-                                let key = source_payload_value(&event.payload, key_field)
-                                    .map(|value| value_to_text(&value))
-                                    .transpose()?
-                                    .unwrap_or_default();
-                                if key != *required_key {
-                                    stack.push_value(EvalValue::Value(Value::Null))?;
-                                    continue;
-                                }
-                                stack.push_task(ExpressionTask::DerivedSourceKeyAfterValue {
-                                    skip_empty: *skip_empty,
-                                })?;
-                                stack.push_task(ExpressionTask::ValueRef {
-                                    value_ref: ExpressionValueRef::Derived(state),
-                                    context,
-                                })?;
-                            }
-                            PlanDerivedExpression::SourceEventTransform {
-                                default, arms, ..
-                            } => {
-                                let selected = if let Some(ActiveTrigger {
-                                    cause: TriggerCause::State(state),
-                                    target,
-                                    ..
-                                }) = &work.active_trigger
-                                {
-                                    arms.iter()
-                                        .find(|arm| {
-                                            matches!(
-                                                &arm.trigger,
-                                                ValueRef::State(trigger)
-                                                    if trigger == state
-                                            )
-                                        })
-                                        .map(|arm| {
-                                            (
-                                                arm.value,
-                                                context.row.or(*target).or_else(|| {
-                                                    context.event.and_then(|event| event.target)
-                                                }),
-                                            )
-                                        })
-                                } else {
-                                    None
-                                }
-                                .or_else(|| {
-                                    context.event.and_then(|event| {
-                                        arms.iter()
-                                            .find(|arm| {
-                                                matches!(
-                                                    &arm.trigger,
-                                                    ValueRef::Source(source)
-                                                        if *source == event.source
-                                                )
-                                            })
-                                            .map(|arm| (arm.value, context.row.or(event.target)))
-                                    })
-                                })
-                                .unwrap_or((*default, context.row));
-                                schedule_isolated_expression(
-                                    &mut stack,
-                                    &mut binding_undos,
-                                    bindings,
-                                    None,
-                                    selected.0,
-                                    ExpressionContext {
-                                        row: selected.1,
-                                        ..context
-                                    },
-                                )?;
-                            }
-                            PlanDerivedExpression::BoolNot { input } => {
-                                stack.push_task(ExpressionTask::DerivedBoolNotAfterValue)?;
-                                stack.push_task(ExpressionTask::ValueRef {
-                                    value_ref: ExpressionValueRef::Derived(input),
-                                    context,
-                                })?;
-                            }
-                            PlanDerivedExpression::NumberCompareConst { left, op, right } => {
-                                stack.push_task(
-                                    ExpressionTask::DerivedNumberCompareAfterValue {
-                                        op: *op,
-                                        right: *right,
-                                    },
-                                )?;
-                                stack.push_task(ExpressionTask::ValueRef {
-                                    value_ref: ExpressionValueRef::Derived(left),
-                                    context,
-                                })?;
-                            }
-                            PlanDerivedExpression::ValueCompare { left, op, right } => {
-                                stack.push_task(ExpressionTask::DerivedValueCompareAfterLeft {
-                                    op: *op,
-                                    right,
-                                    context,
-                                })?;
-                                stack.push_task(ExpressionTask::ValueRef {
-                                    value_ref: ExpressionValueRef::Derived(left),
-                                    context,
-                                })?;
-                            }
-                            PlanDerivedExpression::BoolAnd { left, right } => {
-                                stack.push_task(ExpressionTask::DerivedBoolAndAfterLeft {
-                                    right,
-                                    context,
-                                })?;
-                                stack.push_task(ExpressionTask::EvaluateDerived {
-                                    expression: left,
-                                    context,
-                                })?;
-                            }
-                            PlanDerivedExpression::BoolNotExpression { input } => {
-                                stack.push_task(
-                                    ExpressionTask::DerivedBoolNotExpressionAfterValue,
-                                )?;
-                                stack.push_task(ExpressionTask::EvaluateDerived {
-                                    expression: input,
-                                    context,
-                                })?;
-                            }
-                            PlanDerivedExpression::RowExpression { expression } => {
-                                schedule_isolated_expression(
-                                    &mut stack,
-                                    &mut binding_undos,
-                                    bindings,
-                                    None,
-                                    *expression,
-                                    ExpressionContext {
-                                        row: expression_row(context.row),
-                                        ..context
-                                    },
-                                )?;
-                            }
-                            PlanDerivedExpression::MaterializedRowField { local, expression } => {
-                                let row = context.row.ok_or_else(|| {
-                                    Error::InvalidPlan(
-                                        "materialized row field was evaluated without an exact row"
-                                            .to_owned(),
-                                    )
-                                })?;
-                                let binding = local.map(|local| {
-                                    (EvalValue::Row(row), (local.owner, local.row_local))
-                                });
-                                schedule_isolated_expression(
-                                    &mut stack,
-                                    &mut binding_undos,
-                                    bindings,
-                                    binding,
-                                    *expression,
-                                    ExpressionContext {
-                                        row: Some(row),
-                                        ..context
-                                    },
-                                )?;
-                            }
+                                    existing,
+                                    current_len,
+                                    desired_len,
+                                    remaining: items.into_iter(),
+                                    desired: Vec::with_capacity(desired_len),
+                                    event,
+                                    consumer,
+                                }),
+                            })?;
                         }
-                    }
-                    ExpressionTask::MaterializeListAfterValue {
-                        target_list,
-                        authority_source_list,
-                        fields,
-                        row_field_copies,
-                        owner_prefix,
-                        authority_depth,
-                        event,
-                    } => {
-                        work.active_value_list_authorities.truncate(authority_depth);
-                        let value = match stack.pop_value()? {
-                            EvalValue::Value(Value::Null) => EvalValue::List(Vec::new()),
-                            EvalValue::Value(Value::Text(value)) if value == "SKIP" => {
-                                EvalValue::List(Vec::new())
+                        ExpressionTask::MaterializedListNext { mut state } => {
+                            let Some(item) = state.remaining.next() else {
+                                let value = self.finish_materialized_list_reconciliation(
+                                    state.list_id,
+                                    state.authority_source_list,
+                                    state.owner_prefix,
+                                    state.existing,
+                                    state.current_len,
+                                    state.desired_len,
+                                    state.desired,
+                                    work,
+                                )?;
+                                stack.push_value(value)?;
+                                return Ok(());
+                            };
+                            let row = match item {
+                                EvalValue::Row(row)
+                                | EvalValue::Value(Value::Row { id: row, .. }) => row,
+                                item => {
+                                    let desired = self.materialized_row_fields(
+                                        state.list_id,
+                                        state.authority_source_list,
+                                        state.field_ids,
+                                        state.row_field_copies,
+                                        item,
+                                        state.event,
+                                        state.consumer,
+                                        work,
+                                    )?;
+                                    state.desired.push(desired);
+                                    stack.push_task(ExpressionTask::MaterializedListNext {
+                                        state,
+                                    })?;
+                                    return Ok(());
+                                }
+                            };
+                            let origin = self.row_owner_ancestry(row)?;
+                            if row.list == state.list_id
+                                && state.authority_source_list == Some(state.list_id)
+                            {
+                                state.desired.push((origin, BTreeMap::new()));
+                                stack.push_task(ExpressionTask::MaterializedListNext { state })?;
+                                return Ok(());
                             }
-                            value @ (EvalValue::Record(_)
-                            | EvalValue::MappedRow { .. }
-                            | EvalValue::Row(_)
-                            | EvalValue::Value(Value::Record(_))
-                            | EvalValue::Value(Value::MappedRow { .. })
-                            | EvalValue::Value(Value::Row { .. })) => EvalValue::List(vec![value]),
-                            value => value,
-                        };
-                        let consumer = Some(Consumer::List(target_list));
-                        let value = self.reconcile_materialized_list(
-                            target_list,
-                            authority_source_list,
-                            fields,
-                            row_field_copies,
-                            value,
-                            &owner_prefix,
-                            event,
-                            consumer,
-                            work,
-                        )?;
-                        stack.push_value(value)?;
-                    }
-                    ExpressionTask::DerivedSourceKeyAfterValue { skip_empty } => {
-                        let text = eval_to_text(&stack.pop_value()?)?.trim().to_owned();
-                        let value = if skip_empty && text.is_empty() {
-                            Value::Null
-                        } else {
-                            Value::Text(text)
-                        };
-                        stack.push_value(EvalValue::Value(value))?;
-                    }
-                    ExpressionTask::DerivedBoolNotAfterValue => {
-                        let value = !eval_to_bool(&stack.pop_value()?)?;
-                        stack.push_value(EvalValue::Value(Value::Bool(value)))?;
-                    }
-                    ExpressionTask::DerivedNumberCompareAfterValue { op, right } => {
-                        let left = eval_to_numeric(&stack.pop_value()?)?;
-                        let value = numeric_compare(left, op, right)?;
-                        stack.push_value(EvalValue::Value(Value::Bool(value)))?;
-                    }
-                    ExpressionTask::DerivedValueCompareAfterLeft { op, right, context } => {
-                        let left = stack.pop_value()?;
-                        stack.push_task(ExpressionTask::DerivedValueCompareAfterRight {
-                            op,
-                            left,
-                        })?;
-                        stack.push_task(ExpressionTask::ValueRef {
-                            value_ref: ExpressionValueRef::Derived(right),
-                            context,
-                        })?;
-                    }
-                    ExpressionTask::DerivedValueCompareAfterRight { op, left } => {
-                        let right = stack.pop_value()?;
-                        let EvalValue::Value(left) = left else {
-                            return Err(Error::Evaluation(
-                                "left comparison operand is not a scalar value".to_owned(),
-                            ));
-                        };
-                        let EvalValue::Value(right) = right else {
-                            return Err(Error::Evaluation(
-                                "right comparison operand is not a scalar value".to_owned(),
-                            ));
-                        };
-                        let value = compare_update_values(&left, op, &right)?;
-                        stack.push_value(EvalValue::Value(Value::Bool(value)))?;
-                    }
-                    ExpressionTask::DerivedBoolAndAfterLeft { right, context } => {
-                        if !eval_to_bool(&stack.pop_value()?)? {
-                            stack.push_value(EvalValue::Value(Value::Bool(false)))?;
-                        } else {
-                            stack.push_task(ExpressionTask::DerivedBoolAndAfterRight)?;
-                            stack.push_task(ExpressionTask::EvaluateDerived {
-                                expression: right,
+                            let copies = state
+                                .row_field_copies
+                                .iter()
+                                .filter(|copy| copy.source_list == row.list)
+                                .copied()
+                                .collect::<Vec<_>>();
+                            if copies.is_empty() {
+                                return Err(Error::Evaluation(format!(
+                                    "materialized list {} has no typed field copies for source list {}",
+                                    state.list_id.0, row.list.0
+                                )));
+                            }
+                            stack.push_task(ExpressionTask::MaterializedRowCopyNext {
+                                state: Box::new(MaterializedRowCopyState {
+                                    list: state,
+                                    row,
+                                    origin,
+                                    copies: copies.into_iter(),
+                                    fields: BTreeMap::new(),
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::MaterializedRowCopyNext { mut state } => {
+                            let Some(copy) = state.copies.next() else {
+                                let fields = self.materialized_constructor_fields(
+                                    state.list.list_id,
+                                    state.fields,
+                                )?;
+                                state.list.desired.push((state.origin, fields));
+                                stack.push_task(ExpressionTask::MaterializedListNext {
+                                    state: state.list,
+                                })?;
+                                return Ok(());
+                            };
+                            self.register_row_dependency(
+                                state.list.consumer,
+                                state.row,
+                                copy.source_field,
+                            );
+                            let row = state.row;
+                            let event = state.list.event;
+                            stack.push_task(ExpressionTask::MaterializedRowCopyAfterField {
+                                state,
+                                target_field: copy.target_field,
+                            })?;
+                            stack.push_task(ExpressionTask::EnsureRow {
+                                row,
+                                field: copy.source_field,
+                                event,
+                            })?;
+                        }
+                        ExpressionTask::MaterializedRowCopyAfterField {
+                            mut state,
+                            target_field,
+                        } => {
+                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            state.fields.insert(target_field, value);
+                            stack.push_task(ExpressionTask::MaterializedRowCopyNext { state })?;
+                        }
+                        ExpressionTask::DerivedSourceKeyAfterValue { skip_empty } => {
+                            let text = eval_to_text(&stack.pop_value()?)?.trim().to_owned();
+                            let value = if skip_empty && text.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::Text(text)
+                            };
+                            stack.push_value(EvalValue::Value(value))?;
+                        }
+                        ExpressionTask::DerivedBoolNotAfterValue => {
+                            let value = !eval_to_bool(&stack.pop_value()?)?;
+                            stack.push_value(EvalValue::Value(Value::Bool(value)))?;
+                        }
+                        ExpressionTask::DerivedNumberCompareAfterValue { op, right } => {
+                            let left = eval_to_numeric(&stack.pop_value()?)?;
+                            let value = numeric_compare(left, op, right)?;
+                            stack.push_value(EvalValue::Value(Value::Bool(value)))?;
+                        }
+                        ExpressionTask::DerivedValueCompareAfterLeft { op, right, context } => {
+                            let left = stack.pop_value()?;
+                            stack.push_task(ExpressionTask::DerivedValueCompareAfterRight {
+                                op,
+                                left,
+                            })?;
+                            stack.push_task(ExpressionTask::ValueRef {
+                                value_ref: ExpressionValueRef::Derived(right),
                                 context,
                             })?;
                         }
-                    }
-                    ExpressionTask::DerivedBoolAndAfterRight => {
-                        let value = eval_to_bool(&stack.pop_value()?)?;
-                        stack.push_value(EvalValue::Value(Value::Bool(value)))?;
-                    }
-                    ExpressionTask::DerivedBoolNotExpressionAfterValue => {
-                        let value = !eval_to_bool(&stack.pop_value()?)?;
-                        stack.push_value(EvalValue::Value(Value::Bool(value)))?;
-                    }
-                    ExpressionTask::BeginRowOwnedCall { import_id, context } => {
-                        let call =
-                            metadata
-                                .row_owned_call_results
-                                .get(&import_id)
-                                .ok_or_else(|| {
+                        ExpressionTask::DerivedValueCompareAfterRight { op, left } => {
+                            let right = stack.pop_value()?;
+                            let EvalValue::Value(left) = left else {
+                                return Err(Error::Evaluation(
+                                    "left comparison operand is not a scalar value".to_owned(),
+                                ));
+                            };
+                            let EvalValue::Value(right) = right else {
+                                return Err(Error::Evaluation(
+                                    "right comparison operand is not a scalar value".to_owned(),
+                                ));
+                            };
+                            let value = compare_update_values(&left, op, &right)?;
+                            stack.push_value(EvalValue::Value(Value::Bool(value)))?;
+                        }
+                        ExpressionTask::BeginRowOwnedCall { import_id, context } => {
+                            let call = metadata.row_owned_call_results.get(&import_id).ok_or_else(
+                                || {
                                     Error::InvalidPlan(
                                         "distributed import is not a row-owned call result"
                                             .to_owned(),
                                     )
-                                })?;
-                        let consumer = context.consumer.ok_or_else(|| {
-                            Error::InvalidPlan(
+                                },
+                            )?;
+                            let consumer = context.consumer.ok_or_else(|| {
+                                Error::InvalidPlan(
                                 "current call was evaluated without a retained currentness consumer"
                                     .to_owned(),
                             )
-                        })?;
-                        let mut instance_rows = Vec::with_capacity(call.row_bindings.len());
-                        for binding in &call.row_bindings {
-                            let active_row = match bindings.get(&(binding.owner, binding.local)) {
-                                Some(EvalValue::Row(row)) => *row,
-                                Some(_) => {
+                            })?;
+                            let mut instance_rows = Vec::with_capacity(call.row_bindings.len());
+                            for binding in &call.row_bindings {
+                                let active_row = match bindings.get(&(binding.owner, binding.local))
+                                {
+                                    Some(EvalValue::Row(row)) => *row,
+                                    Some(_) => {
+                                        return Err(Error::InvalidPlan(
+                                            "row-owned call binding is not a row".to_owned(),
+                                        ));
+                                    }
+                                    None => {
+                                        return Err(Error::InvalidPlan(
+                                            "row-owned call is missing a required row binding"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                };
+                                if active_row.list != binding.list {
                                     return Err(Error::InvalidPlan(
-                                        "row-owned call binding is not a row".to_owned(),
-                                    ));
-                                }
-                                None => {
-                                    return Err(Error::InvalidPlan(
-                                        "row-owned call is missing a required row binding"
+                                        "row-owned call binding resolved to the wrong list"
                                             .to_owned(),
                                     ));
                                 }
-                            };
-                            if active_row.list != binding.list {
-                                return Err(Error::InvalidPlan(
-                                    "row-owned call binding resolved to the wrong list".to_owned(),
-                                ));
-                            }
-                            instance_rows.push(DistributedCallInstanceRow {
-                                owner: binding.owner,
-                                local: binding.local,
-                                row: OwnerInstanceRow {
-                                    list: active_row.list,
-                                    key: active_row.key,
-                                    generation: active_row.generation,
-                                },
-                            });
-                        }
-                        let call_instance_id = self
-                            .distributed_call_instance_id(call.call_site_id, &instance_rows)
-                            .map_err(|error| {
-                                Error::InvalidPlan(format!(
-                                    "current call has invalid instance identity: {error}"
-                                ))
-                            })?;
-                        stack.push_task(ExpressionTask::RowOwnedCallNext {
-                            state: RowOwnedCallState {
-                                import_id,
-                                call,
-                                call_instance_id,
-                                consumer,
-                                context,
-                                next_argument: 0,
-                                arguments: BTreeMap::new(),
-                            },
-                        })?;
-                    }
-                    ExpressionTask::RowOwnedCallNext { state } => {
-                        let Some(argument) = state.call.arguments.get(state.next_argument) else {
-                            let result_arguments = state.arguments.clone();
-                            self.register_distributed_current_call_demand(
-                                state.consumer,
-                                state.call.call_site_id,
-                                state.call_instance_id,
-                                state.arguments,
-                            )?;
-                            self.register_distributed_call_result_dependency(
-                                state.consumer,
-                                state.import_id,
-                                state.call_instance_id,
-                            );
-                            let value = self
-                                .row_owned_call_results
-                                .get(&(state.import_id, state.call_instance_id))
-                                .filter(|result| result.arguments == result_arguments)
-                                .map(|result| result.value.clone())
-                                .unwrap_or_else(|| Value::Error {
-                                    code: "remote_not_current".to_owned(),
+                                instance_rows.push(DistributedCallInstanceRow {
+                                    owner: binding.owner,
+                                    local: binding.local,
+                                    row: OwnerInstanceRow {
+                                        list: active_row.list,
+                                        key: active_row.key,
+                                        generation: active_row.generation,
+                                    },
                                 });
-                            stack.push_value(EvalValue::Value(value))?;
-                            continue;
-                        };
-                        let expression = argument.value;
-                        let context = ExpressionContext {
-                            consumer: Some(state.consumer),
-                            ..state.context
-                        };
-                        stack.push_task(ExpressionTask::RowOwnedCallAfterArgument { state })?;
-                        stack.push_task(ExpressionTask::Evaluate {
-                            expression,
-                            context,
-                        })?;
-                    }
-                    ExpressionTask::RowOwnedCallAfterArgument { mut state } => {
-                        let argument =
-                            state
+                            }
+                            let call_instance_id = self
+                                .distributed_call_instance_id(call.call_site_id, &instance_rows)
+                                .map_err(|error| {
+                                    Error::InvalidPlan(format!(
+                                        "current call has invalid instance identity: {error}"
+                                    ))
+                                })?;
+                            stack.push_task(ExpressionTask::RowOwnedCallNext {
+                                state: RowOwnedCallState {
+                                    import_id,
+                                    call,
+                                    call_instance_id,
+                                    consumer,
+                                    context,
+                                    next_argument: 0,
+                                    arguments: BTreeMap::new(),
+                                },
+                            })?;
+                        }
+                        ExpressionTask::RowOwnedCallNext { state } => {
+                            let Some(argument) = state.call.arguments.get(state.next_argument)
+                            else {
+                                let result_arguments = state.arguments.clone();
+                                self.register_distributed_current_call_demand(
+                                    state.consumer,
+                                    state.call.call_site_id,
+                                    state.call_instance_id,
+                                    state.arguments,
+                                )?;
+                                self.register_distributed_call_result_dependency(
+                                    state.consumer,
+                                    state.import_id,
+                                    state.call_instance_id,
+                                );
+                                let value = self
+                                    .row_owned_call_results
+                                    .get(&(state.import_id, state.call_instance_id))
+                                    .filter(|result| result.arguments == result_arguments)
+                                    .map(|result| result.value.clone())
+                                    .unwrap_or_else(|| Value::Error {
+                                        code: "remote_not_current".to_owned(),
+                                    });
+                                stack.push_value(EvalValue::Value(value))?;
+                                return Ok(());
+                            };
+                            let expression = argument.value;
+                            let context = ExpressionContext {
+                                consumer: Some(state.consumer),
+                                ..state.context
+                            };
+                            stack.push_task(ExpressionTask::RowOwnedCallAfterArgument { state })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::RowOwnedCallAfterArgument { mut state } => {
+                            let argument = state
                                 .call
                                 .arguments
                                 .get(state.next_argument)
@@ -18334,1488 +20048,4284 @@ impl MachineInstance {
                                             .to_owned(),
                                     )
                                 })?;
-                        let value = self.materialize_eval(stack.pop_value()?)?;
-                        validate_distributed_boundary_value(
-                            &value,
-                            &argument.data_type,
-                            &format!("remote call argument `{}`", argument.name),
-                        )?;
-                        if state
-                            .arguments
-                            .insert(argument.argument_id, value)
-                            .is_some()
-                        {
-                            return Err(Error::InvalidPlan(
-                                "row-owned call has a duplicate boundary argument".to_owned(),
-                            ));
+                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            validate_distributed_boundary_value(
+                                &value,
+                                &argument.data_type,
+                                &format!("remote call argument `{}`", argument.name),
+                            )?;
+                            if state
+                                .arguments
+                                .insert(argument.argument_id, value)
+                                .is_some()
+                            {
+                                return Err(Error::InvalidPlan(
+                                    "row-owned call has a duplicate boundary argument".to_owned(),
+                                ));
+                            }
+                            state.next_argument = state.next_argument.saturating_add(1);
+                            stack.push_task(ExpressionTask::RowOwnedCallNext { state })?;
                         }
-                        state.next_argument = state.next_argument.saturating_add(1);
-                        stack.push_task(ExpressionTask::RowOwnedCallNext { state })?;
-                    }
-                    ExpressionTask::ValueRef { value_ref, context } => {
-                        work.consume(1)?;
-                        if let ExpressionValueRef::List(list) = value_ref {
-                            stack.push_task(ExpressionTask::ListValue { list, context })?;
-                            continue;
-                        }
-                        let (expression, value_ref, derived_value_ref) = match value_ref {
-                            ExpressionValueRef::Arena(expression) => {
-                                let node = plan
-                                    .row_expressions
-                                    .node(expression)
-                                    .map_err(|error| Error::InvalidPlan(error.to_string()))?;
-                                let PlanRowExpressionNode::Field { input } = node else {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "row expression {} is not a value reference",
-                                        expression.0
-                                    )));
-                                };
-                                (Some(expression), input, false)
+                        ExpressionTask::ValueRef { value_ref, context } => {
+                            work.consume(1)?;
+                            if let ExpressionValueRef::List(list) = value_ref {
+                                stack.push_task(ExpressionTask::ListValue { list, context })?;
+                                return Ok(());
                             }
-                            ExpressionValueRef::List(_) => unreachable!(),
-                            ExpressionValueRef::Derived(value_ref) => (None, value_ref, true),
-                        };
-                        match value_ref {
-                            ValueRef::Source(source) => {
-                                stack.push_value(EvalValue::Value(Value::Bool(
-                                    context.event.is_some_and(|event| event.source == *source),
-                                )))?
-                            }
-                            ValueRef::SourcePayload { source_id, field } => {
-                                let value = context
-                                    .event
-                                    .filter(|event| event.source == *source_id)
-                                    .and_then(|event| source_payload_value(&event.payload, field))
-                                    .unwrap_or(Value::Null);
-                                stack.push_value(EvalValue::Value(value))?;
-                            }
-                            ValueRef::Constant(constant) => {
-                                let value = self
-                                    .metadata
-                                    .constants
-                                    .get(constant)
-                                    .cloned()
-                                    .map(EvalValue::Value)
-                                    .ok_or_else(|| {
-                                        Error::InvalidPlan(format!(
-                                            "missing constant {}",
-                                            constant.0
-                                        ))
-                                    })?;
-                                stack.push_value(value)?;
-                            }
-                            ValueRef::DistributedImport(import_id) => {
-                                if self.metadata.row_owned_call_results.contains_key(import_id) {
-                                    stack.push_task(ExpressionTask::BeginRowOwnedCall {
-                                        import_id: *import_id,
-                                        context,
-                                    })?;
-                                } else {
-                                    self.register_distributed_import_dependency(
-                                        context.consumer,
-                                        *import_id,
-                                    );
+                            let (expression, value_ref, derived_value_ref) = match value_ref {
+                                ExpressionValueRef::Arena(expression) => {
+                                    let node = plan
+                                        .row_expressions
+                                        .node(expression)
+                                        .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                                    let PlanRowExpressionNode::Field { input } = node else {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "row expression {} is not a value reference",
+                                            expression.0
+                                        )));
+                                    };
+                                    (Some(expression), input, false)
+                                }
+                                ExpressionValueRef::List(_) => unreachable!(),
+                                ExpressionValueRef::Derived(value_ref) => (None, value_ref, true),
+                                ExpressionValueRef::Owned(ref value_ref) => (None, value_ref, true),
+                            };
+                            match value_ref {
+                                ValueRef::Source(source) => {
+                                    stack.push_value(EvalValue::Value(Value::Bool(
+                                        context.event.is_some_and(|event| event.source == *source),
+                                    )))?
+                                }
+                                ValueRef::SourcePayload { source_id, field } => {
+                                    let value = context
+                                        .event
+                                        .filter(|event| event.source == *source_id)
+                                        .and_then(|event| {
+                                            source_payload_value(&event.payload, field)
+                                        })
+                                        .unwrap_or(Value::Null);
+                                    stack.push_value(EvalValue::Value(value))?;
+                                }
+                                ValueRef::Constant(constant) => {
                                     let value = self
-                                        .distributed_imports
-                                        .get(import_id)
+                                        .metadata
+                                        .constants
+                                        .get(constant)
                                         .cloned()
                                         .map(EvalValue::Value)
                                         .ok_or_else(|| {
-                                            Error::InvalidPlan(
-                                                "value ref uses an undeclared distributed import"
-                                                    .to_owned(),
-                                            )
+                                            Error::InvalidPlan(format!(
+                                                "missing constant {}",
+                                                constant.0
+                                            ))
                                         })?;
                                     stack.push_value(value)?;
                                 }
-                            }
-                            ValueRef::List(list) => {
-                                stack.push_task(ExpressionTask::ListValue {
-                                    list: *list,
-                                    context,
-                                })?;
-                            }
-                            ValueRef::State(state) => {
-                                stack.push_task(ExpressionTask::StateValue {
-                                    state: *state,
-                                    context,
-                                })?;
-                            }
-                            ValueRef::StateProjection {
-                                state_id,
-                                field_path,
-                            } => {
-                                if let Some(expression) = expression {
-                                    stack.push_task(ExpressionTask::StateProjectionAfterValue {
-                                        expression,
-                                        state: *state_id,
-                                    })?;
-                                } else if derived_value_ref {
-                                    stack.push_task(
-                                        ExpressionTask::DerivedStateProjectionAfterValue {
-                                            field_path,
-                                            state: *state_id,
-                                        },
-                                    )?;
-                                } else {
-                                    return Err(Error::InvalidPlan(
-                                        "synthetic state reference cannot carry a projection"
-                                            .to_owned(),
-                                    ));
-                                }
-                                stack.push_task(ExpressionTask::StateValue {
-                                    state: *state_id,
-                                    context,
-                                })?;
-                            }
-                            ValueRef::Field(field) => {
-                                if let Some(owner) =
-                                    self.metadata.row_field_owner.get(field).copied()
-                                {
-                                    let row = context.row.ok_or_else(|| {
-                                        Error::Evaluation(format!(
-                                            "row field {} requires a row context",
-                                            field.0
-                                        ))
-                                    })?;
-                                    if row.list != owner {
-                                        return Err(Error::Evaluation(format!(
-                                            "field {} belongs to list {}, not {}",
-                                            field.0, owner.0, row.list.0
-                                        )));
-                                    }
-                                    if context.output == Some(*field)
-                                        && self
-                                            .metadata
-                                            .row_computations
-                                            .get(field)
-                                            .is_some_and(|op| source_event_transform_op(op))
+                                ValueRef::DistributedImport(import_id) => {
+                                    if self.metadata.row_owned_call_results.contains_key(import_id)
                                     {
-                                        stack.push_value(EvalValue::Value(
-                                            self.row_value(row, *field)?,
-                                        ))?;
-                                        continue;
-                                    }
-                                    self.register_row_dependency(context.consumer, row, *field);
-                                    if self.row_field_availability(row, *field)
-                                        == RowFieldAvailability::Missing
-                                    {
-                                        stack.push_value(EvalValue::Value(Value::Null))?;
+                                        stack.push_task(ExpressionTask::BeginRowOwnedCall {
+                                            import_id: *import_id,
+                                            context,
+                                        })?;
                                     } else {
-                                        stack.push_task(ExpressionTask::EnsureRow {
-                                            row,
+                                        self.register_distributed_import_dependency(
+                                            context.consumer,
+                                            *import_id,
+                                        );
+                                        let value = self
+                                            .distributed_imports
+                                            .get(import_id)
+                                            .cloned()
+                                            .map(EvalValue::Value)
+                                            .ok_or_else(|| {
+                                                Error::InvalidPlan(
+                                                "value ref uses an undeclared distributed import"
+                                                    .to_owned(),
+                                            )
+                                            })?;
+                                        stack.push_value(value)?;
+                                    }
+                                }
+                                ValueRef::List(list) => {
+                                    stack.push_task(ExpressionTask::ListValue {
+                                        list: *list,
+                                        context,
+                                    })?;
+                                }
+                                ValueRef::State(state) => {
+                                    stack.push_task(ExpressionTask::StateValue {
+                                        state: *state,
+                                        context,
+                                    })?;
+                                }
+                                ValueRef::StateProjection {
+                                    state_id,
+                                    field_path,
+                                } => {
+                                    if let Some(expression) = expression {
+                                        stack.push_task(
+                                            ExpressionTask::StateProjectionAfterValue {
+                                                expression,
+                                                state: *state_id,
+                                            },
+                                        )?;
+                                    } else if derived_value_ref {
+                                        stack.push_task(
+                                            ExpressionTask::DerivedStateProjectionAfterValue {
+                                                field_path: field_path.clone(),
+                                                state: *state_id,
+                                            },
+                                        )?;
+                                    } else {
+                                        return Err(Error::InvalidPlan(
+                                            "synthetic state reference cannot carry a projection"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                    stack.push_task(ExpressionTask::StateValue {
+                                        state: *state_id,
+                                        context,
+                                    })?;
+                                }
+                                ValueRef::Field(field) => {
+                                    if let Some(owner) =
+                                        self.metadata.row_field_owner.get(field).copied()
+                                    {
+                                        let row = context.row.ok_or_else(|| {
+                                            Error::Evaluation(format!(
+                                                "row field {} requires a row context",
+                                                field.0
+                                            ))
+                                        })?;
+                                        if row.list != owner {
+                                            return Err(Error::Evaluation(format!(
+                                                "field {} belongs to list {}, not {}",
+                                                field.0, owner.0, row.list.0
+                                            )));
+                                        }
+                                        if context.output == Some(*field)
+                                            && self
+                                                .metadata
+                                                .row_computations
+                                                .get(field)
+                                                .is_some_and(|op| source_event_transform_op(op))
+                                        {
+                                            stack.push_value(EvalValue::Value(
+                                                self.row_value(row, *field)?,
+                                            ))?;
+                                            return Ok(());
+                                        }
+                                        self.register_row_dependency(context.consumer, row, *field);
+                                        if self.row_field_availability(row, *field)
+                                            == RowFieldAvailability::Missing
+                                        {
+                                            stack.push_value(EvalValue::Value(Value::Null))?;
+                                        } else {
+                                            stack.push_task(ExpressionTask::EnsureRow {
+                                                row,
+                                                field: *field,
+                                                event: context.event,
+                                            })?;
+                                        }
+                                    } else {
+                                        if context.output == Some(*field)
+                                            && self
+                                                .metadata
+                                                .root_computations
+                                                .get(field)
+                                                .is_some_and(|op| source_event_transform_op(op))
+                                            && let Some(value) = self
+                                                .root_fields
+                                                .get(field)
+                                                .and_then(|cell| cell.value.clone())
+                                        {
+                                            stack.push_value(EvalValue::Value(value))?;
+                                            return Ok(());
+                                        }
+                                        self.register_root_field_dependency(
+                                            context.consumer,
+                                            *field,
+                                        );
+                                        stack.push_task(ExpressionTask::EnsureRoot {
                                             field: *field,
                                             event: context.event,
                                         })?;
                                     }
-                                } else {
-                                    if context.output == Some(*field)
-                                        && self
-                                            .metadata
-                                            .root_computations
-                                            .get(field)
-                                            .is_some_and(|op| source_event_transform_op(op))
-                                        && let Some(value) = self
-                                            .root_fields
-                                            .get(field)
-                                            .and_then(|cell| cell.value.clone())
-                                    {
-                                        stack.push_value(EvalValue::Value(value))?;
-                                        continue;
-                                    }
-                                    self.register_root_field_dependency(context.consumer, *field);
-                                    stack.push_task(ExpressionTask::EnsureRoot {
-                                        field: *field,
-                                        event: context.event,
-                                    })?;
                                 }
                             }
                         }
-                    }
-                    ExpressionTask::ListValue { list, context } => {
-                        self.register_list_dependency(context.consumer, list);
-                        if self.metadata.list_computations.contains_key(&list) {
-                            stack.push_task(ExpressionTask::EnsureList {
-                                list,
-                                event: context.event,
-                            })?;
-                        } else {
-                            let rows = self.list_row_ids(list);
-                            work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
-                            stack.push_value(EvalValue::List(
-                                rows.into_iter().map(EvalValue::Row).collect(),
-                            ))?;
-                        }
-                    }
-                    ExpressionTask::StateValue { state, context } => {
-                        if let Some(owner) = self.metadata.indexed_state_owner.get(&state).copied()
-                        {
-                            let row = context.row.ok_or_else(|| {
-                                Error::Evaluation(format!(
-                                    "indexed state {} requires a row context",
-                                    state.0
-                                ))
-                            })?;
-                            if row.list != owner {
-                                return Err(Error::Evaluation(format!(
-                                    "indexed state {} belongs to list {}, not {}",
-                                    state.0, owner.0, row.list.0
-                                )));
+                        ExpressionTask::ListValue { list, context } => {
+                            self.register_list_dependency(context.consumer, list);
+                            if self.metadata.list_computations.contains_key(&list) {
+                                stack.push_task(ExpressionTask::EnsureList {
+                                    list,
+                                    event: context.event,
+                                })?;
+                            } else {
+                                let rows = self.list_row_ids(list);
+                                work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
+                                stack.push_value(EvalValue::List(
+                                    rows.into_iter().map(EvalValue::Row).collect(),
+                                ))?;
                             }
-                            let field = *self.metadata.indexed_state_field.get(&state).ok_or_else(
-                                || {
-                                    Error::InvalidPlan(format!(
-                                        "indexed state {} has no field",
-                                        state.0
-                                    ))
-                                },
-                            )?;
-                            self.register_row_dependency(context.consumer, row, field);
-                            stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
-                        } else {
-                            self.register_root_state_dependency(context.consumer, state);
-                            let value = self
-                                .root_states
-                                .get(&state)
-                                .cloned()
-                                .map(EvalValue::Value)
-                                .ok_or_else(|| {
+                        }
+                        ExpressionTask::StateValue { state, context } => {
+                            if let Some(owner) =
+                                self.metadata.indexed_state_owner.get(&state).copied()
+                            {
+                                let row = context.row.ok_or_else(|| {
                                     Error::Evaluation(format!(
-                                        "root state {} has no value",
+                                        "indexed state {} requires a row context",
                                         state.0
                                     ))
                                 })?;
-                            stack.push_value(value)?;
-                        }
-                    }
-                    ExpressionTask::StateProjectionAfterValue { expression, state } => {
-                        let node = plan
-                            .row_expressions
-                            .node(expression)
-                            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
-                        let PlanRowExpressionNode::Field {
-                            input: ValueRef::StateProjection { field_path, .. },
-                        } = node
-                        else {
-                            return Err(Error::InvalidPlan(format!(
-                                "row expression {} lost its state projection",
-                                expression.0
-                            )));
-                        };
-                        let EvalValue::Value(value) = stack.pop_value()? else {
-                            return Err(Error::Evaluation(format!(
-                                "state {} projection does not reference a scalar value",
-                                state.0
-                            )));
-                        };
-                        let value = project_value(&value, field_path)
-                            .cloned()
-                            .map(EvalValue::Value)
-                            .ok_or_else(|| {
-                                Error::Evaluation(format!(
-                                    "state {} has no projection `{}`",
-                                    state.0,
-                                    field_path.join(".")
-                                ))
-                            })?;
-                        stack.push_value(value)?;
-                    }
-                    ExpressionTask::DerivedStateProjectionAfterValue { field_path, state } => {
-                        let EvalValue::Value(value) = stack.pop_value()? else {
-                            return Err(Error::Evaluation(format!(
-                                "state {} projection does not reference a scalar value",
-                                state.0
-                            )));
-                        };
-                        let value = project_value(&value, field_path)
-                            .cloned()
-                            .map(EvalValue::Value)
-                            .ok_or_else(|| {
-                                Error::Evaluation(format!(
-                                    "state {} has no projection `{}`",
-                                    state.0,
-                                    field_path.join(".")
-                                ))
-                            })?;
-                        stack.push_value(value)?;
-                    }
-                    ExpressionTask::EnsureRoot { field, event } => {
-                        self.flush_list_access_dependencies(work)?;
-                        let currentness = self
-                            .root_fields
-                            .get(&field)
-                            .map(|cell| cell.currentness)
-                            .ok_or_else(|| {
-                                Error::InvalidPlan(format!(
-                                    "field {} has no root computation",
-                                    field.0
-                                ))
-                            })?;
-                        match currentness {
-                            Currentness::Current => {
+                                if row.list != owner {
+                                    return Err(Error::Evaluation(format!(
+                                        "indexed state {} belongs to list {}, not {}",
+                                        state.0, owner.0, row.list.0
+                                    )));
+                                }
+                                let field =
+                                    *self.metadata.indexed_state_field.get(&state).ok_or_else(
+                                        || {
+                                            Error::InvalidPlan(format!(
+                                                "indexed state {} has no field",
+                                                state.0
+                                            ))
+                                        },
+                                    )?;
+                                self.register_row_dependency(context.consumer, row, field);
+                                stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
+                            } else {
+                                self.register_root_state_dependency(context.consumer, state);
                                 let value = self
-                                    .root_fields
-                                    .get(&field)
-                                    .and_then(|cell| cell.value.clone())
+                                    .root_states
+                                    .get(&state)
+                                    .cloned()
                                     .map(EvalValue::Value)
                                     .ok_or_else(|| {
                                         Error::Evaluation(format!(
-                                            "current root field {} has no value",
-                                            field.0
+                                            "root state {} has no value",
+                                            state.0
                                         ))
                                     })?;
                                 stack.push_value(value)?;
                             }
-                            Currentness::Evaluating => {
-                                return Err(Error::Cycle { field, row: None });
-                            }
-                            Currentness::Dirty => {
-                                if currentness_targets.len() >= stack.limit {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "expression currentness stack exceeded its plan-derived bound of {}",
-                                        stack.limit
-                                    )));
-                                }
-                                work.consume(1)?;
-                                self.root_fields
-                                    .get_mut(&field)
-                                    .expect("root cell checked above")
-                                    .currentness = Currentness::Evaluating;
-                                currentness_targets.push(ExpressionCurrentnessTarget::Root(field));
-                                let consumer = Consumer::Root(field);
-                                self.clear_consumer_dependencies(consumer);
-                                let op = metadata
-                                    .root_computations
-                                    .get(&field)
-                                    .map(|op| op.id)
-                                    .ok_or_else(|| {
-                                        Error::InvalidPlan(format!(
-                                            "root field {} has no plan op",
-                                            field.0
-                                        ))
-                                    })?;
-                                stack.push_task(ExpressionTask::FinishRoot { field })?;
-                                stack.push_task(ExpressionTask::EvaluateCurrentnessOp {
-                                    op,
-                                    row: None,
-                                    event,
+                        }
+                        ExpressionTask::StateProjectionAfterValue { expression, state } => {
+                            let node = plan
+                                .row_expressions
+                                .node(expression)
+                                .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                            let PlanRowExpressionNode::Field {
+                                input: ValueRef::StateProjection { field_path, .. },
+                            } = node
+                            else {
+                                return Err(Error::InvalidPlan(format!(
+                                    "row expression {} lost its state projection",
+                                    expression.0
+                                )));
+                            };
+                            let EvalValue::Value(value) = stack.pop_value()? else {
+                                return Err(Error::Evaluation(format!(
+                                    "state {} projection does not reference a scalar value",
+                                    state.0
+                                )));
+                            };
+                            let value = project_value(&value, field_path)
+                                .cloned()
+                                .map(EvalValue::Value)
+                                .ok_or_else(|| {
+                                    Error::Evaluation(format!(
+                                        "state {} has no projection `{}`",
+                                        state.0,
+                                        field_path.join(".")
+                                    ))
                                 })?;
-                            }
+                            stack.push_value(value)?;
                         }
-                    }
-                    ExpressionTask::FinishRoot { field } => {
-                        let value = self.materialize_eval(stack.pop_value()?)?;
-                        if stack.values.len() >= stack.limit {
-                            return Err(Error::InvalidPlan(format!(
-                                "expression value stack exceeded its plan-derived bound of {}",
-                                stack.limit
-                            )));
+                        ExpressionTask::DerivedStateProjectionAfterValue { field_path, state } => {
+                            let EvalValue::Value(value) = stack.pop_value()? else {
+                                return Err(Error::Evaluation(format!(
+                                    "state {} projection does not reference a scalar value",
+                                    state.0
+                                )));
+                            };
+                            let value = project_value(&value, field_path.as_slice())
+                                .cloned()
+                                .map(EvalValue::Value)
+                                .ok_or_else(|| {
+                                    Error::Evaluation(format!(
+                                        "state {} has no projection `{}`",
+                                        state.0,
+                                        field_path.join(".")
+                                    ))
+                                })?;
+                            stack.push_value(value)?;
                         }
-                        let old = self
-                            .root_fields
-                            .get(&field)
-                            .and_then(|cell| cell.value.clone());
-                        {
-                            let cell = self.root_fields.get_mut(&field).ok_or_else(|| {
-                                Error::InvalidPlan(format!(
-                                    "field {} has no root computation",
-                                    field.0
-                                ))
+                        ExpressionTask::EnsureRoot { field, event } => {
+                            stack.push_task(ExpressionTask::EnsureRootCurrentness {
+                                field,
+                                event,
                             })?;
-                            cell.value = Some(value.clone());
-                            cell.currentness = Currentness::Current;
+                            stack.push_task(ExpressionTask::FlushListAccessDependencies)?;
                         }
-                        finish_expression_currentness(
-                            &mut currentness_targets,
-                            ExpressionCurrentnessTarget::Root(field),
-                        )?;
-                        work.metrics.recomputed_field_count += 1;
-                        work.recomputed_targets.insert(ValueTarget::Field(field));
-                        if old.as_ref() != Some(&value) {
-                            self.invalidate_root_field(field, work);
-                            if work.emit {
-                                work.deltas.push(Delta::SetValue {
-                                    target: ValueTarget::Field(field),
-                                    value: value.clone(),
-                                });
+                        ExpressionTask::EnsureRootCurrentness { field, event } => {
+                            let currentness = self
+                                .root_fields
+                                .get(&field)
+                                .map(|cell| cell.currentness)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "field {} has no root computation",
+                                        field.0
+                                    ))
+                                })?;
+                            match currentness {
+                                Currentness::Current => {
+                                    let value = self
+                                        .root_fields
+                                        .get(&field)
+                                        .and_then(|cell| cell.value.clone())
+                                        .map(EvalValue::Value)
+                                        .ok_or_else(|| {
+                                            Error::Evaluation(format!(
+                                                "current root field {} has no value",
+                                                field.0
+                                            ))
+                                        })?;
+                                    stack.push_value(value)?;
+                                }
+                                Currentness::Evaluating => {
+                                    return Err(Error::Cycle { field, row: None });
+                                }
+                                Currentness::Dirty => {
+                                    if currentness_targets.len() >= stack.limit {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "expression currentness stack exceeded its plan-derived bound of {}",
+                                            stack.limit
+                                        )));
+                                    }
+                                    work.consume(1)?;
+                                    self.root_fields
+                                        .get_mut(&field)
+                                        .expect("root cell checked above")
+                                        .currentness = Currentness::Evaluating;
+                                    currentness_targets
+                                        .push(ExpressionCurrentnessTarget::Root(field));
+                                    let consumer = Consumer::Root(field);
+                                    self.clear_consumer_dependencies(consumer);
+                                    let op = metadata
+                                        .root_computations
+                                        .get(&field)
+                                        .map(|op| op.id)
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(format!(
+                                                "root field {} has no plan op",
+                                                field.0
+                                            ))
+                                        })?;
+                                    stack.push_task(ExpressionTask::FinishRoot { field })?;
+                                    stack.push_task(ExpressionTask::EvaluateCurrentnessOp {
+                                        op,
+                                        row: None,
+                                        event,
+                                    })?;
+                                }
                             }
                         }
-                        stack.push_value(EvalValue::Value(value))?;
-                    }
-                    ExpressionTask::EnsureRow { row, field, event } => {
-                        self.flush_list_access_dependencies(work)?;
-                        let field = self.resolve_row_field_alias(row, field);
-                        if self.touched_row_fields.contains(&(row, field))
-                            && self
+                        ExpressionTask::FinishRoot { field } => {
+                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            if stack.values.len() >= stack.limit {
+                                return Err(Error::InvalidPlan(format!(
+                                    "expression value stack exceeded its plan-derived bound of {}",
+                                    stack.limit
+                                )));
+                            }
+                            let old = self
+                                .root_fields
+                                .get(&field)
+                                .and_then(|cell| cell.value.clone());
+                            {
+                                let cell = self.root_fields.get_mut(&field).ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "field {} has no root computation",
+                                        field.0
+                                    ))
+                                })?;
+                                cell.value = Some(value.clone());
+                                cell.currentness = Currentness::Current;
+                            }
+                            finish_expression_currentness(
+                                &mut currentness_targets,
+                                ExpressionCurrentnessTarget::Root(field),
+                            )?;
+                            work.metrics.recomputed_field_count += 1;
+                            work.recomputed_targets.insert(ValueTarget::Field(field));
+                            if old.as_ref() != Some(&value) {
+                                self.invalidate_root_field(field, work);
+                                if work.emit {
+                                    work.deltas.push(Delta::SetValue {
+                                        target: ValueTarget::Field(field),
+                                        value: value.clone(),
+                                    });
+                                }
+                            }
+                            stack.push_value(EvalValue::Value(value))?;
+                        }
+                        ExpressionTask::EnsureRow { row, field, event } => {
+                            stack.push_task(ExpressionTask::EnsureRowCurrentness {
+                                row,
+                                field,
+                                event,
+                            })?;
+                            stack.push_task(ExpressionTask::FlushListAccessDependencies)?;
+                        }
+                        ExpressionTask::EnsureRowCurrentness { row, field, event } => {
+                            let field = self.resolve_row_field_alias(row, field);
+                            if self.touched_row_fields.contains(&(row, field))
+                                && self
+                                    .lists
+                                    .get(&row.list)
+                                    .and_then(|list| list.rows.get(&row))
+                                    .is_some_and(|row| row.default_fields.contains(&field))
+                            {
+                                stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
+                                return Ok(());
+                            }
+                            let currentness = self
                                 .lists
                                 .get(&row.list)
                                 .and_then(|list| list.rows.get(&row))
-                                .is_some_and(|row| row.default_fields.contains(&field))
-                        {
-                            stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
-                            continue;
-                        }
-                        let currentness = self
-                            .lists
-                            .get(&row.list)
-                            .and_then(|list| list.rows.get(&row))
-                            .and_then(|row| row.derived.get(&field))
-                            .copied();
-                        let Some(currentness) = currentness else {
-                            stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
-                            continue;
-                        };
-                        match currentness {
-                            Currentness::Current => {
+                                .and_then(|row| row.derived.get(&field))
+                                .copied();
+                            let Some(currentness) = currentness else {
                                 stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
-                            }
-                            Currentness::Evaluating => {
-                                return Err(Error::Cycle {
-                                    field,
-                                    row: Some(row),
-                                });
-                            }
-                            Currentness::Dirty => {
-                                if currentness_targets.len() >= stack.limit {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "expression currentness stack exceeded its plan-derived bound of {}",
-                                        stack.limit
-                                    )));
+                                return Ok(());
+                            };
+                            match currentness {
+                                Currentness::Current => {
+                                    stack.push_value(EvalValue::Value(
+                                        self.row_value(row, field)?,
+                                    ))?;
                                 }
-                                work.consume(1)?;
-                                self.set_row_currentness(row, field, Currentness::Evaluating)?;
-                                currentness_targets
-                                    .push(ExpressionCurrentnessTarget::Row(row, field));
-                                let consumer = Consumer::Row(row, field);
-                                self.clear_consumer_dependencies(consumer);
-                                let op = metadata.row_computations.get(&field).map(|op| op.id);
-                                let default = op
-                                    .is_none()
-                                    .then(|| self.row_default_expression(row, field))
-                                    .flatten();
-                                stack.push_task(ExpressionTask::FinishRow { row, field })?;
-                                if let Some(op) = op {
-                                    stack.push_task(ExpressionTask::EvaluateCurrentnessOp {
-                                        op,
+                                Currentness::Evaluating => {
+                                    return Err(Error::Cycle {
+                                        field,
                                         row: Some(row),
-                                        event,
-                                    })?;
-                                } else if let Some(expression) = default {
-                                    schedule_isolated_expression(
-                                        &mut stack,
-                                        &mut binding_undos,
-                                        bindings,
-                                        None,
-                                        expression,
-                                        ExpressionContext {
+                                    });
+                                }
+                                Currentness::Dirty => {
+                                    if currentness_targets.len() >= stack.limit {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "expression currentness stack exceeded its plan-derived bound of {}",
+                                            stack.limit
+                                        )));
+                                    }
+                                    work.consume(1)?;
+                                    self.set_row_currentness(row, field, Currentness::Evaluating)?;
+                                    currentness_targets
+                                        .push(ExpressionCurrentnessTarget::Row(row, field));
+                                    let consumer = Consumer::Row(row, field);
+                                    self.clear_consumer_dependencies(consumer);
+                                    let op = metadata.row_computations.get(&field).map(|op| op.id);
+                                    let default = op
+                                        .is_none()
+                                        .then(|| self.row_default_expression(row, field))
+                                        .flatten();
+                                    stack.push_task(ExpressionTask::FinishRow { row, field })?;
+                                    if let Some(op) = op {
+                                        stack.push_task(ExpressionTask::EvaluateCurrentnessOp {
+                                            op,
                                             row: Some(row),
                                             event,
-                                            output: Some(field),
-                                            consumer: Some(consumer),
-                                        },
-                                    )?;
-                                } else {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "row field {} has no plan op or row default",
-                                        field.0
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                    ExpressionTask::FinishRow { row, field } => {
-                        let value = self.materialize_eval(stack.pop_value()?)?;
-                        if stack.values.len() >= stack.limit {
-                            return Err(Error::InvalidPlan(format!(
-                                "expression value stack exceeded its plan-derived bound of {}",
-                                stack.limit
-                            )));
-                        }
-                        self.set_row_field(row, field, value.clone(), work)?;
-                        self.set_row_currentness(row, field, Currentness::Current)?;
-                        finish_expression_currentness(
-                            &mut currentness_targets,
-                            ExpressionCurrentnessTarget::Row(row, field),
-                        )?;
-                        work.metrics.recomputed_field_count += 1;
-                        work.recomputed_targets
-                            .insert(ValueTarget::RowField { row, field });
-                        stack.push_value(EvalValue::Value(value))?;
-                    }
-                    ExpressionTask::EnsureList { list, event } => {
-                        self.flush_list_access_dependencies(work)?;
-                        let currentness = self
-                            .derived_lists
-                            .get(&list)
-                            .map(|cell| cell.currentness)
-                            .ok_or_else(|| {
-                                Error::InvalidPlan(format!(
-                                    "list {} has no derived computation",
-                                    list.0
-                                ))
-                            })?;
-                        match currentness {
-                            Currentness::Current
-                                if self
-                                    .derived_lists
-                                    .get(&list)
-                                    .is_some_and(|cell| cell.items.is_some()) =>
-                            {
-                                let items = self
-                                    .derived_lists
-                                    .get(&list)
-                                    .and_then(|cell| cell.items.clone())
-                                    .ok_or_else(|| {
-                                        Error::Evaluation(format!(
-                                            "current derived list {} has no items",
-                                            list.0
-                                        ))
-                                    })?;
-                                stack.push_value(EvalValue::List(items))?;
-                            }
-                            Currentness::Evaluating => {
-                                return Err(Error::ListCycle { list });
-                            }
-                            Currentness::Current | Currentness::Dirty => {
-                                if currentness_targets.len() >= stack.limit {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "expression currentness stack exceeded its plan-derived bound of {}",
-                                        stack.limit
-                                    )));
-                                }
-                                work.consume(1)?;
-                                let virtual_rows = {
-                                    let cell = self
-                                        .derived_lists
-                                        .get_mut(&list)
-                                        .expect("derived list checked above");
-                                    cell.currentness = Currentness::Evaluating;
-                                    cell.items = None;
-                                    cell.window
-                                        .take()
-                                        .map(|window| {
-                                            window.rows_by_index.into_values().collect::<Vec<_>>()
-                                        })
-                                        .unwrap_or_default()
-                                };
-                                currentness_targets.push(ExpressionCurrentnessTarget::List(list));
-                                for row in virtual_rows.into_iter().rev() {
-                                    if self.row_exists(row) {
-                                        self.remove_row(row, work)?;
+                                        })?;
+                                    } else if let Some(expression) = default {
+                                        schedule_isolated_expression(
+                                            &mut stack,
+                                            &mut binding_undos,
+                                            bindings,
+                                            None,
+                                            expression,
+                                            ExpressionContext {
+                                                row: Some(row),
+                                                event,
+                                                output: Some(field),
+                                                consumer: Some(consumer),
+                                            },
+                                        )?;
+                                    } else {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "row field {} has no plan op or row default",
+                                            field.0
+                                        )));
                                     }
                                 }
-                                let consumer = Consumer::List(list);
-                                self.clear_consumer_dependencies(consumer);
-                                let op = metadata
-                                    .list_computations
-                                    .get(&list)
-                                    .map(|op| op.id)
-                                    .ok_or_else(|| {
-                                        Error::InvalidPlan(format!(
-                                            "derived list {} has no plan op",
-                                            list.0
-                                        ))
-                                    })?;
-                                stack.push_task(ExpressionTask::FinishList { list, op })?;
-                                stack.push_task(ExpressionTask::EvaluateCurrentnessOp {
-                                    op,
-                                    row: None,
-                                    event,
-                                })?;
                             }
                         }
-                    }
-                    ExpressionTask::FinishList { list, op } => {
-                        let evaluated = stack.pop_value()?;
-                        let EvalValue::List(items) = evaluated else {
-                            return Err(Error::InvalidPlan(format!(
-                                "list computation {} did not produce a list",
-                                op.0
-                            )));
-                        };
-                        if stack.values.len() >= stack.limit {
-                            return Err(Error::InvalidPlan(format!(
-                                "expression value stack exceeded its plan-derived bound of {}",
-                                stack.limit
-                            )));
+                        ExpressionTask::FinishRow { row, field } => {
+                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            if stack.values.len() >= stack.limit {
+                                return Err(Error::InvalidPlan(format!(
+                                    "expression value stack exceeded its plan-derived bound of {}",
+                                    stack.limit
+                                )));
+                            }
+                            self.set_row_field(row, field, value.clone(), work)?;
+                            self.set_row_currentness(row, field, Currentness::Current)?;
+                            finish_expression_currentness(
+                                &mut currentness_targets,
+                                ExpressionCurrentnessTarget::Row(row, field),
+                            )?;
+                            work.metrics.recomputed_field_count += 1;
+                            work.recomputed_targets
+                                .insert(ValueTarget::RowField { row, field });
+                            stack.push_value(EvalValue::Value(value))?;
                         }
-                        let old = self
-                            .derived_lists
-                            .get(&list)
-                            .and_then(|cell| cell.items.clone());
-                        {
-                            let cell = self.derived_lists.get_mut(&list).ok_or_else(|| {
+                        ExpressionTask::EnsureList { list, event } => {
+                            stack
+                                .push_task(ExpressionTask::EnsureListCurrentness { list, event })?;
+                            stack.push_task(ExpressionTask::FlushListAccessDependencies)?;
+                        }
+                        ExpressionTask::EnsureListCurrentness { list, event } => {
+                            let currentness = self
+                                .derived_lists
+                                .get(&list)
+                                .map(|cell| cell.currentness)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "list {} has no derived computation",
+                                        list.0
+                                    ))
+                                })?;
+                            match currentness {
+                                Currentness::Current
+                                    if self
+                                        .derived_lists
+                                        .get(&list)
+                                        .is_some_and(|cell| cell.items.is_some()) =>
+                                {
+                                    let items = self
+                                        .derived_lists
+                                        .get(&list)
+                                        .and_then(|cell| cell.items.clone())
+                                        .ok_or_else(|| {
+                                            Error::Evaluation(format!(
+                                                "current derived list {} has no items",
+                                                list.0
+                                            ))
+                                        })?;
+                                    stack.push_value(EvalValue::List(items))?;
+                                }
+                                Currentness::Evaluating => {
+                                    return Err(Error::ListCycle { list });
+                                }
+                                Currentness::Current | Currentness::Dirty => {
+                                    if currentness_targets.len() >= stack.limit {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "expression currentness stack exceeded its plan-derived bound of {}",
+                                            stack.limit
+                                        )));
+                                    }
+                                    work.consume(1)?;
+                                    let virtual_rows = {
+                                        let cell = self
+                                            .derived_lists
+                                            .get_mut(&list)
+                                            .expect("derived list checked above");
+                                        cell.currentness = Currentness::Evaluating;
+                                        cell.items = None;
+                                        cell.window
+                                            .take()
+                                            .map(|window| {
+                                                window
+                                                    .rows_by_index
+                                                    .into_values()
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default()
+                                    };
+                                    currentness_targets
+                                        .push(ExpressionCurrentnessTarget::List(list));
+                                    for row in virtual_rows.into_iter().rev() {
+                                        if self.row_exists(row) {
+                                            self.remove_row(row, work)?;
+                                        }
+                                    }
+                                    let consumer = Consumer::List(list);
+                                    self.clear_consumer_dependencies(consumer);
+                                    let op = metadata
+                                        .list_computations
+                                        .get(&list)
+                                        .map(|op| op.id)
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(format!(
+                                                "derived list {} has no plan op",
+                                                list.0
+                                            ))
+                                        })?;
+                                    stack.push_task(ExpressionTask::FinishList { list, op })?;
+                                    stack.push_task(ExpressionTask::EvaluateCurrentnessOp {
+                                        op,
+                                        row: None,
+                                        event,
+                                    })?;
+                                }
+                            }
+                        }
+                        ExpressionTask::FinishList { list, op } => {
+                            let evaluated = stack.pop_value()?;
+                            let EvalValue::List(items) = evaluated else {
+                                return Err(Error::InvalidPlan(format!(
+                                    "list computation {} did not produce a list",
+                                    op.0
+                                )));
+                            };
+                            if stack.values.len() >= stack.limit {
+                                return Err(Error::InvalidPlan(format!(
+                                    "expression value stack exceeded its plan-derived bound of {}",
+                                    stack.limit
+                                )));
+                            }
+                            let old = self
+                                .derived_lists
+                                .get(&list)
+                                .and_then(|cell| cell.items.clone());
+                            {
+                                let cell = self.derived_lists.get_mut(&list).ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "list {} has no derived computation",
+                                        list.0
+                                    ))
+                                })?;
+                                cell.items = Some(items.clone());
+                                cell.window = None;
+                                cell.currentness = Currentness::Current;
+                            }
+                            finish_expression_currentness(
+                                &mut currentness_targets,
+                                ExpressionCurrentnessTarget::List(list),
+                            )?;
+                            work.metrics.recomputed_list_count += 1;
+                            if old.as_ref() != Some(&items) {
+                                self.invalidate_list_structure(list, work);
+                            }
+                            stack.push_value(EvalValue::List(items))?;
+                        }
+                        ExpressionTask::EvaluateCurrentnessOp { op, row, event } => {
+                            let op = metadata.currentness_ops.get(&op).ok_or_else(|| {
                                 Error::InvalidPlan(format!(
-                                    "list {} has no derived computation",
-                                    list.0
+                                    "currentness op {} has no immutable metadata",
+                                    op.0
                                 ))
                             })?;
-                            cell.items = Some(items.clone());
-                            cell.window = None;
-                            cell.currentness = Currentness::Current;
-                        }
-                        finish_expression_currentness(
-                            &mut currentness_targets,
-                            ExpressionCurrentnessTarget::List(list),
-                        )?;
-                        work.metrics.recomputed_list_count += 1;
-                        if old.as_ref() != Some(&items) {
-                            self.invalidate_list_structure(list, work);
-                        }
-                        stack.push_value(EvalValue::List(items))?;
-                    }
-                    ExpressionTask::EvaluateCurrentnessOp { op, row, event } => {
-                        let op = metadata.currentness_ops.get(&op).ok_or_else(|| {
-                            Error::InvalidPlan(format!(
-                                "currentness op {} has no immutable metadata",
-                                op.0
-                            ))
-                        })?;
-                        match &op.kind {
-                            PlanOpKind::DerivedValue {
-                                derived_kind,
-                                expression,
-                                ..
-                            } => {
-                                let Some(expression) = expression else {
-                                    let output_label = match op.output.as_ref() {
-                                        Some(ValueRef::Field(field)) => debug_label(
-                                            &self.plan.debug_map.fields,
-                                            "field:",
-                                            field.0,
-                                        ),
-                                        _ => None,
-                                    };
-                                    return Err(Error::Unsupported {
-                                        op: op.id,
-                                        detail: format!(
-                                            "{derived_kind:?} derived value has no typed expression; output={:?}, path={}",
-                                            op.output,
-                                            output_label.unwrap_or("<unknown>")
-                                        ),
-                                    });
-                                };
-                                let consumer = (!source_event_transform_op(op))
-                                    .then(|| {
-                                        op.output.as_ref().and_then(|output| match output {
-                                            ValueRef::Field(field) => Some(match row {
-                                                Some(row) => Consumer::Row(row, *field),
-                                                None => Consumer::Root(*field),
-                                            }),
-                                            ValueRef::List(list) => Some(Consumer::List(*list)),
-                                            _ => None,
-                                        })
-                                    })
-                                    .flatten();
-                                let output = op.output.as_ref().and_then(|output| match output {
-                                    ValueRef::Field(field) => Some(*field),
-                                    _ => None,
-                                });
-                                stack.push_task(ExpressionTask::EvaluateDerived {
+                            match &op.kind {
+                                PlanOpKind::DerivedValue {
+                                    derived_kind,
                                     expression,
-                                    context: ExpressionContext {
+                                    materialization,
+                                    ..
+                                } => {
+                                    let Some(expression) = expression else {
+                                        let output_label = match op.output.as_ref() {
+                                            Some(ValueRef::Field(field)) => debug_label(
+                                                &self.plan.debug_map.fields,
+                                                "field:",
+                                                field.0,
+                                            ),
+                                            _ => None,
+                                        };
+                                        return Err(Error::Unsupported {
+                                            op: op.id,
+                                            detail: format!(
+                                                "{derived_kind:?} derived value has no typed expression; output={:?}, path={}",
+                                                op.output,
+                                                output_label.unwrap_or("<unknown>")
+                                            ),
+                                        });
+                                    };
+                                    let consumer = (!source_event_transform_op(op))
+                                        .then(|| {
+                                            op.output.as_ref().and_then(|output| match output {
+                                                ValueRef::Field(field) => Some(match row {
+                                                    Some(row) => Consumer::Row(row, *field),
+                                                    None => Consumer::Root(*field),
+                                                }),
+                                                ValueRef::List(list) => Some(Consumer::List(*list)),
+                                                _ => None,
+                                            })
+                                        })
+                                        .flatten();
+                                    let output =
+                                        op.output.as_ref().and_then(|output| match output {
+                                            ValueRef::Field(field) => Some(*field),
+                                            _ => None,
+                                        });
+                                    let mut context = ExpressionContext {
                                         row,
                                         event,
                                         output,
                                         consumer,
-                                    },
-                                })?;
-                            }
-                            PlanOpKind::ListProjection { projection } => {
-                                let (consumer, output, target) = match op.output.as_ref() {
-                                    Some(ValueRef::Field(field)) => (
-                                        Some(Consumer::Root(*field)),
-                                        Some(*field),
-                                        ExpressionProjectionTarget::Value,
-                                    ),
-                                    Some(ValueRef::List(list)) => (
-                                        Some(Consumer::List(*list)),
-                                        None,
-                                        ExpressionProjectionTarget::List(*list),
-                                    ),
-                                    output => {
-                                        return Err(Error::InvalidPlan(format!(
-                                            "list projection {} has unsupported output {output:?}",
-                                            op.id.0
-                                        )));
-                                    }
-                                };
-                                let context = ExpressionContext {
-                                    row: None,
-                                    event,
-                                    output,
-                                    consumer,
-                                };
-                                match projection {
-                                    PlanListProjection::Chunk { source_list, size } => {
-                                        if *size == 0 {
+                                    };
+                                    if let Some(materialization) = materialization {
+                                        work.consume(1)?;
+                                        let owner_prefix = context
+                                            .row
+                                            .map(|row| self.row_owner_ancestry(row))
+                                            .transpose()?
+                                            .unwrap_or(OwnerAncestryId::ROOT);
+                                        let authority_depth =
+                                            work.active_value_list_authorities.len();
+                                        if authority_depth.saturating_add(
+                                            materialization.value_list_authorities.len(),
+                                        ) > stack.limit
+                                        {
                                             return Err(Error::InvalidPlan(format!(
-                                                "chunk projection {} has size zero",
+                                                "value-list authority stack exceeded its plan-derived bound of {}",
+                                                stack.limit
+                                            )));
+                                        }
+                                        work.active_value_list_authorities.extend(
+                                            materialization.value_list_authorities.iter().cloned(),
+                                        );
+                                        stack.push_task(
+                                            ExpressionTask::MaterializeListAfterValue {
+                                                materialization,
+                                                owner_prefix,
+                                                authority_depth,
+                                                event: context.event,
+                                            },
+                                        )?;
+                                        context.consumer =
+                                            Some(Consumer::List(materialization.target_list));
+                                    }
+                                    stack.push_task(ExpressionTask::EvaluateDerived {
+                                        expression,
+                                        context,
+                                    })?;
+                                }
+                                PlanOpKind::ListProjection { projection } => {
+                                    let (consumer, output, target) = match op.output.as_ref() {
+                                        Some(ValueRef::Field(field)) => (
+                                            Some(Consumer::Root(*field)),
+                                            Some(*field),
+                                            ExpressionProjectionTarget::Value,
+                                        ),
+                                        Some(ValueRef::List(list)) => (
+                                            Some(Consumer::List(*list)),
+                                            None,
+                                            ExpressionProjectionTarget::List(*list),
+                                        ),
+                                        output => {
+                                            return Err(Error::InvalidPlan(format!(
+                                                "list projection {} has unsupported output {output:?}",
                                                 op.id.0
                                             )));
                                         }
-                                        stack.push_task(ExpressionTask::ProjectionAfterSource {
-                                            op: op.id,
-                                            size: *size,
-                                            target,
-                                        })?;
-                                        stack.push_task(ExpressionTask::ValueRef {
-                                            value_ref: ExpressionValueRef::List(*source_list),
-                                            context,
-                                        })?;
-                                    }
-                                    PlanListProjection::ChunkValue { source, size } => {
-                                        if *size == 0 {
-                                            return Err(Error::InvalidPlan(format!(
-                                                "chunk-value projection {} has size zero",
-                                                op.id.0
-                                            )));
+                                    };
+                                    let context = ExpressionContext {
+                                        row: None,
+                                        event,
+                                        output,
+                                        consumer,
+                                    };
+                                    match projection {
+                                        PlanListProjection::Chunk { source_list, size } => {
+                                            if *size == 0 {
+                                                return Err(Error::InvalidPlan(format!(
+                                                    "chunk projection {} has size zero",
+                                                    op.id.0
+                                                )));
+                                            }
+                                            stack.push_task(
+                                                ExpressionTask::ProjectionAfterSource {
+                                                    op: op.id,
+                                                    size: *size,
+                                                    target,
+                                                },
+                                            )?;
+                                            stack.push_task(ExpressionTask::ValueRef {
+                                                value_ref: ExpressionValueRef::List(*source_list),
+                                                context,
+                                            })?;
                                         }
-                                        stack.push_task(ExpressionTask::ProjectionAfterSource {
-                                            op: op.id,
-                                            size: *size,
-                                            target,
-                                        })?;
-                                        stack.push_task(ExpressionTask::ValueRef {
-                                            value_ref: ExpressionValueRef::Derived(source),
-                                            context,
-                                        })?;
-                                    }
-                                    PlanListProjection::Unknown { summary } => {
-                                        return Err(Error::Unsupported {
-                                            op: op.id,
-                                            detail: format!("unknown list projection: {summary}"),
-                                        });
+                                        PlanListProjection::ChunkValue { source, size } => {
+                                            if *size == 0 {
+                                                return Err(Error::InvalidPlan(format!(
+                                                    "chunk-value projection {} has size zero",
+                                                    op.id.0
+                                                )));
+                                            }
+                                            stack.push_task(
+                                                ExpressionTask::ProjectionAfterSource {
+                                                    op: op.id,
+                                                    size: *size,
+                                                    target,
+                                                },
+                                            )?;
+                                            stack.push_task(ExpressionTask::ValueRef {
+                                                value_ref: ExpressionValueRef::Derived(source),
+                                                context,
+                                            })?;
+                                        }
+                                        PlanListProjection::Unknown { summary } => {
+                                            return Err(Error::Unsupported {
+                                                op: op.id,
+                                                detail: format!(
+                                                    "unknown list projection: {summary}"
+                                                ),
+                                            });
+                                        }
                                     }
                                 }
-                            }
-                            _ => {
-                                return Err(Error::Unsupported {
-                                    op: op.id,
-                                    detail: "operation cannot produce a derived current value"
-                                        .to_owned(),
-                                });
+                                _ => {
+                                    return Err(Error::Unsupported {
+                                        op: op.id,
+                                        detail: "operation cannot produce a derived current value"
+                                            .to_owned(),
+                                    });
+                                }
                             }
                         }
-                    }
-                    ExpressionTask::ProjectionAfterSource { op, size, target } => {
-                        let rows = eval_to_list(stack.pop_value()?)?;
-                        work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
-                        let mut chunks = Vec::new();
-                        for (index, chunk) in rows.chunks(size).enumerate() {
-                            chunks.push(EvalValue::Record(BTreeMap::from([
-                                (
-                                    "label".to_owned(),
-                                    EvalValue::Value(Value::Text(index.to_string())),
-                                ),
-                                ("items".to_owned(), EvalValue::List(chunk.to_vec())),
-                            ])));
-                        }
-                        let projected = EvalValue::List(chunks);
-                        let value = match target {
-                            ExpressionProjectionTarget::Value => projected,
-                            ExpressionProjectionTarget::List(list) => {
-                                self.reconcile_positional_list_projection(list, projected, work)?
+                        ExpressionTask::ProjectionAfterSource { op, size, target } => {
+                            let rows = eval_to_list(stack.pop_value()?)?;
+                            work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
+                            let mut chunks = Vec::new();
+                            for (index, chunk) in rows.chunks(size).enumerate() {
+                                chunks.push(EvalValue::Record(BTreeMap::from([
+                                    (
+                                        "label".to_owned(),
+                                        EvalValue::Value(Value::Text(index.to_string())),
+                                    ),
+                                    ("items".to_owned(), EvalValue::List(chunk.to_vec())),
+                                ])));
                             }
-                        };
-                        if !matches!(value, EvalValue::List(_)) {
-                            return Err(Error::InvalidPlan(format!(
-                                "list projection {} did not produce a list",
-                                op.0
-                            )));
-                        }
-                        stack.push_value(value)?;
-                    }
-                    ExpressionTask::ListGetFieldAfterIndex {
-                        list,
-                        field,
-                        context,
-                    } => {
-                        let index =
-                            nonnegative_usize(eval_to_integer(&stack.pop_value()?)?, "list index")?;
-                        let target = self
-                            .lists
-                            .get(&list)
-                            .and_then(|list| list.order.get(index))
-                            .copied()
-                            .ok_or_else(|| {
-                                Error::Evaluation(format!(
-                                    "list {} index {index} is out of range",
-                                    list.0
-                                ))
-                            })?;
-                        self.register_row_dependency(context.consumer, target, field);
-                        stack.push_task(ExpressionTask::EnsureRow {
-                            row: target,
-                            field,
-                            event: context.event,
-                        })?;
-                    }
-                    ExpressionTask::ListRowFieldAfterRow {
-                        list,
-                        field,
-                        context,
-                    } => {
-                        let value = stack.pop_value()?;
-                        let row = match value {
-                            EvalValue::Row(row) | EvalValue::Value(Value::Row { id: row, .. }) => {
-                                row
-                            }
-                            other => {
-                                return Err(Error::Evaluation(format!(
-                                    "value {other:?} is not a typed list row"
+                            let projected = EvalValue::List(chunks);
+                            let value = match target {
+                                ExpressionProjectionTarget::Value => projected,
+                                ExpressionProjectionTarget::List(list) => self
+                                    .reconcile_positional_list_projection(list, projected, work)?,
+                            };
+                            if !matches!(value, EvalValue::List(_)) {
+                                return Err(Error::InvalidPlan(format!(
+                                    "list projection {} did not produce a list",
+                                    op.0
                                 )));
                             }
-                        };
-                        if row.list != list {
-                            return Err(Error::InvalidPlan(format!(
-                                "typed row field {} belongs to list {}, but expression produced list {}",
-                                field.0, list.0, row.list.0
-                            )));
+                            stack.push_value(value)?;
                         }
-                        if self.metadata.row_field_owner.get(&field) != Some(&list) {
-                            return Err(Error::InvalidPlan(format!(
-                                "typed row field {} (`{}`) does not belong to list {}",
-                                field.0,
-                                self.metadata
-                                    .field_labels
-                                    .get(&field)
-                                    .map(String::as_str)
-                                    .unwrap_or("<unlabeled>"),
-                                list.0
-                            )));
-                        }
-                        self.register_row_dependency(context.consumer, row, field);
-                        if self.row_field_availability(row, field) == RowFieldAvailability::Missing
-                        {
-                            stack.push_value(EvalValue::Value(Value::Null))?;
-                        } else {
+                        ExpressionTask::ListGetFieldAfterIndex {
+                            list,
+                            field,
+                            context,
+                        } => {
+                            let index = nonnegative_usize(
+                                eval_to_integer(&stack.pop_value()?)?,
+                                "list index",
+                            )?;
+                            let target = self
+                                .lists
+                                .get(&list)
+                                .and_then(|list| list.order.get(index))
+                                .copied()
+                                .ok_or_else(|| {
+                                    Error::Evaluation(format!(
+                                        "list {} index {index} is out of range",
+                                        list.0
+                                    ))
+                                })?;
+                            self.register_row_dependency(context.consumer, target, field);
                             stack.push_task(ExpressionTask::EnsureRow {
-                                row,
+                                row: target,
                                 field,
                                 event: context.event,
                             })?;
                         }
-                    }
-                    ExpressionTask::SelectAfterInput {
-                        expression,
-                        context,
-                    } => {
-                        let node = plan
-                            .row_expressions
-                            .node(expression)
-                            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
-                        let PlanRowExpressionNode::Select { arms, .. } = node else {
-                            return Err(Error::InvalidPlan(format!(
-                                "row expression {} lost its select continuation",
-                                expression.0
-                            )));
-                        };
-                        let input = self.materialize_eval(stack.pop_value()?)?;
-                        let expression = arms
-                            .iter()
-                            .find_map(|arm| {
-                                select_pattern_matches(&arm.pattern, &input).then_some(arm.value)
-                            })
-                            .ok_or_else(|| {
-                                Error::Evaluation(format!(
-                                    "select has no matching arm for {input:?}"
-                                ))
-                            })?;
-                        stack.push_task(ExpressionTask::Evaluate {
-                            expression,
+                        ExpressionTask::ListRowFieldAfterRow {
+                            list,
+                            field,
                             context,
-                        })?;
-                    }
-                    ExpressionTask::BuiltinAfterOperands {
-                        expression,
-                        value_base,
-                    } => {
-                        let node = plan
-                            .row_expressions
-                            .node(expression)
-                            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
-                        let PlanRowExpressionNode::BuiltinCall {
-                            function,
-                            input: compiled_input,
-                            args: compiled_args,
-                        } = node
-                        else {
-                            return Err(Error::InvalidPlan(format!(
-                                "row expression {} lost its builtin continuation",
-                                expression.0
-                            )));
-                        };
-                        let function = *function;
-                        if value_base > stack.values.len() {
-                            return Err(Error::InvalidPlan(format!(
-                                "{} has an invalid value-stack boundary",
-                                function.function_name()
-                            )));
-                        }
-                        let mut next_value = || {
-                            if value_base >= stack.values.len() {
+                        } => {
+                            let value = stack.pop_value()?;
+                            let row = match value {
+                                EvalValue::Row(row)
+                                | EvalValue::Value(Value::Row { id: row, .. }) => row,
+                                other => {
+                                    return Err(Error::Evaluation(format!(
+                                        "value {other:?} is not a typed list row"
+                                    )));
+                                }
+                            };
+                            if row.list != list {
                                 return Err(Error::InvalidPlan(format!(
-                                    "{} produced too few evaluated operands",
-                                    function.function_name()
+                                    "typed row field {} belongs to list {}, but expression produced list {}",
+                                    field.0, list.0, row.list.0
                                 )));
                             }
-                            Ok(stack.values.remove(value_base))
-                        };
-                        let mut input = None;
-                        let mut args = EvaluatedBuiltinArgs::new();
-                        if function == PlanRowBuiltin::ListTake {
-                            args.insert("count", next_value()?)?;
-                            input = Some(next_value()?);
-                        } else {
-                            for parameter in function.signature().parameters {
-                                if parameter.receiver {
-                                    if compiled_input.is_some() {
-                                        input = Some(next_value()?);
-                                    }
-                                } else if compiled_args
-                                    .iter()
-                                    .any(|argument| argument.name == parameter.name)
-                                {
-                                    args.insert(parameter.name, next_value()?)?;
-                                }
+                            if self.metadata.row_field_owner.get(&field) != Some(&list) {
+                                return Err(Error::InvalidPlan(format!(
+                                    "typed row field {} (`{}`) does not belong to list {}",
+                                    field.0,
+                                    self.metadata
+                                        .field_labels
+                                        .get(&field)
+                                        .map(String::as_str)
+                                        .unwrap_or("<unlabeled>"),
+                                    list.0
+                                )));
+                            }
+                            self.register_row_dependency(context.consumer, row, field);
+                            if self.row_field_availability(row, field)
+                                == RowFieldAvailability::Missing
+                            {
+                                stack.push_value(EvalValue::Value(Value::Null))?;
+                            } else {
+                                stack.push_task(ExpressionTask::EnsureRow {
+                                    row,
+                                    field,
+                                    event: context.event,
+                                })?;
                             }
                         }
-                        drop(next_value);
-                        if stack.values.len() != value_base {
-                            return Err(Error::InvalidPlan(format!(
-                                "{} produced extra evaluated operands",
-                                function.function_name()
-                            )));
-                        }
-                        let value = self.eval_builtin_values(function, input, args, work)?;
-                        stack.push_value(value)?;
-                    }
-                    ExpressionTask::BuiltinBoolAfterLeft {
-                        function,
-                        right,
-                        context,
-                    } => {
-                        let left = eval_to_bool(&stack.pop_value()?)?;
-                        let short_circuit = match function {
-                            PlanRowBuiltin::BoolAnd => !left,
-                            PlanRowBuiltin::BoolOr => left,
-                            _ => {
-                                return Err(Error::InvalidPlan(
-                                    "non-boolean builtin used a boolean continuation".to_owned(),
-                                ));
+                        ExpressionTask::BeginListAccess { access, context } => {
+                            if let Some(guard) = access.guard {
+                                stack.push_task(ExpressionTask::ListAccessAfterGuard {
+                                    access,
+                                    context,
+                                })?;
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression: guard,
+                                    context,
+                                })?;
+                            } else if let Some(limit) = access.exhaustive_candidate_limit {
+                                let mut expressions = Vec::new();
+                                access.selection.visit_expressions(&mut |expression| {
+                                    expressions.push(expression)
+                                });
+                                stack.push_task(ExpressionTask::ListSelectionNext {
+                                    state: Box::new(ListSelectionEvaluationState {
+                                        selection: &access.selection,
+                                        index: access.index,
+                                        expressions,
+                                        next_expression: 0,
+                                        values: Vec::new(),
+                                        context,
+                                        continuation: ListSelectionContinuation::ListAccess {
+                                            access,
+                                            limit: (limit as usize).saturating_add(1),
+                                            context,
+                                        },
+                                    }),
+                                })?;
+                            } else {
+                                stack.push_task(ExpressionTask::ListAccessAfterLimit {
+                                    access,
+                                    context,
+                                })?;
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression: access.limit,
+                                    context,
+                                })?;
                             }
-                        };
-                        if short_circuit {
-                            stack.push_value(EvalValue::Value(Value::Bool(left)))?;
-                        } else {
-                            stack.push_task(ExpressionTask::BuiltinBoolAfterRight)?;
+                        }
+                        ExpressionTask::ListAccessAfterGuard { access, context } => {
+                            if !eval_to_bool(&stack.pop_value()?)? {
+                                stack.push_value(EvalValue::List(Vec::new()))?;
+                                return Ok(());
+                            }
+                            if let Some(limit) = access.exhaustive_candidate_limit {
+                                let mut expressions = Vec::new();
+                                access.selection.visit_expressions(&mut |expression| {
+                                    expressions.push(expression)
+                                });
+                                stack.push_task(ExpressionTask::ListSelectionNext {
+                                    state: Box::new(ListSelectionEvaluationState {
+                                        selection: &access.selection,
+                                        index: access.index,
+                                        expressions,
+                                        next_expression: 0,
+                                        values: Vec::new(),
+                                        context,
+                                        continuation: ListSelectionContinuation::ListAccess {
+                                            access,
+                                            limit: (limit as usize).saturating_add(1),
+                                            context,
+                                        },
+                                    }),
+                                })?;
+                            } else {
+                                stack.push_task(ExpressionTask::ListAccessAfterLimit {
+                                    access,
+                                    context,
+                                })?;
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression: access.limit,
+                                    context,
+                                })?;
+                            }
+                        }
+                        ExpressionTask::ListAccessAfterLimit { access, context } => {
+                            let limit = usize::try_from(eval_to_integer(&stack.pop_value()?)?)
+                                .map_err(|_| {
+                                    Error::Evaluation(
+                                        "List/take count must be a non-negative integer".to_owned(),
+                                    )
+                                })?;
+                            if limit == 0 {
+                                stack.push_value(EvalValue::List(Vec::new()))?;
+                                return Ok(());
+                            }
+                            let mut expressions = Vec::new();
+                            access
+                                .selection
+                                .visit_expressions(&mut |expression| expressions.push(expression));
+                            stack.push_task(ExpressionTask::ListSelectionNext {
+                                state: Box::new(ListSelectionEvaluationState {
+                                    selection: &access.selection,
+                                    index: access.index,
+                                    expressions,
+                                    next_expression: 0,
+                                    values: Vec::new(),
+                                    context,
+                                    continuation: ListSelectionContinuation::ListAccess {
+                                        access,
+                                        limit,
+                                        context,
+                                    },
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::BeginListPage { page, context } => {
+                            stack.push_task(ExpressionTask::ListPageAfterSize { page, context })?;
                             stack.push_task(ExpressionTask::Evaluate {
-                                expression: right,
+                                expression: page.access.limit,
                                 context,
                             })?;
                         }
-                    }
-                    ExpressionTask::BuiltinBoolAfterRight => {
-                        let right = eval_to_bool(&stack.pop_value()?)?;
-                        stack.push_value(EvalValue::Value(Value::Bool(right)))?;
-                    }
-                    ExpressionTask::ContextualCollectionAfterSource {
-                        expression,
-                        owner,
-                        operation,
-                        row_local,
-                        body,
-                        context,
-                    } => {
-                        let input = stack.pop_value()?;
-                        let input = match work
-                            .active_value_list_authorities
-                            .iter()
-                            .rev()
-                            .find(|authority| authority.owner == owner)
-                            .cloned()
-                        {
-                            Some(authority) => self.reconcile_value_list_authority(
-                                &authority,
-                                input,
-                                context.row,
-                                context.event,
-                                context.consumer,
-                                work,
-                            )?,
-                            None => input,
-                        };
-                        let (items, directions) = eval_to_ordered_items(input)?;
-                        let local = (owner, row_local);
-                        if bindings.contains_key(&local) {
-                            return Err(Error::InvalidPlan(format!(
-                                "contextual owner {} local {} is already active",
-                                owner.0, row_local.0
-                            )));
+                        ExpressionTask::ListPageAfterSize { page, context } => {
+                            let value = stack.pop_value()?;
+                            let Ok(size) = eval_to_integer(&value) else {
+                                stack.push_value(page_terminal_variant("InvalidPageSize"))?;
+                                return Ok(());
+                            };
+                            if !(1..=10_000).contains(&size) {
+                                stack.push_value(page_terminal_variant("InvalidPageSize"))?;
+                                return Ok(());
+                            }
+                            let size =
+                                usize::try_from(size).expect("positive page size fits usize");
+                            if let Some(view_limit) = page.view_limit {
+                                stack.push_task(ExpressionTask::ListPageAfterViewLimit {
+                                    page,
+                                    size,
+                                    context,
+                                })?;
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression: view_limit,
+                                    context,
+                                })?;
+                            } else if let Some(guard) = page.access.guard {
+                                stack.push_task(ExpressionTask::ListPageAfterGuard {
+                                    page,
+                                    size,
+                                    view_limit: u64::MAX,
+                                    view_limit_capture: None,
+                                    context,
+                                })?;
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression: guard,
+                                    context,
+                                })?;
+                            } else {
+                                let mut expressions = Vec::new();
+                                page.access.selection.visit_expressions(&mut |expression| {
+                                    expressions.push(expression)
+                                });
+                                stack.push_task(ExpressionTask::ListSelectionNext {
+                                    state: Box::new(ListSelectionEvaluationState {
+                                        selection: &page.access.selection,
+                                        index: page.access.index,
+                                        expressions,
+                                        next_expression: 0,
+                                        values: Vec::new(),
+                                        context,
+                                        continuation: ListSelectionContinuation::ListPage {
+                                            page,
+                                            size,
+                                            view_limit: u64::MAX,
+                                            view_limit_capture: None,
+                                            guard_matches: true,
+                                            context,
+                                        },
+                                    }),
+                                })?;
+                            }
                         }
-                        if matches!(
-                            operation,
-                            PlanContextualOperationKind::Map
-                                | PlanContextualOperationKind::Filter
-                                | PlanContextualOperationKind::Retain
-                                | PlanContextualOperationKind::Remove
-                        ) {
-                            work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                        ExpressionTask::ListPageAfterViewLimit {
+                            page,
+                            size,
+                            context,
+                        } => {
+                            let value = stack.pop_value()?;
+                            let count = u64::try_from(eval_to_integer(&value)?).map_err(|_| {
+                                Error::Evaluation(
+                                "List/take count before List/page must be a non-negative integer"
+                                    .to_owned(),
+                            )
+                            })?;
+                            let capture = self.materialize_eval(value)?;
+                            if let Some(guard) = page.access.guard {
+                                stack.push_task(ExpressionTask::ListPageAfterGuard {
+                                    page,
+                                    size,
+                                    view_limit: count,
+                                    view_limit_capture: Some(capture),
+                                    context,
+                                })?;
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression: guard,
+                                    context,
+                                })?;
+                            } else {
+                                let mut expressions = Vec::new();
+                                page.access.selection.visit_expressions(&mut |expression| {
+                                    expressions.push(expression)
+                                });
+                                stack.push_task(ExpressionTask::ListSelectionNext {
+                                    state: Box::new(ListSelectionEvaluationState {
+                                        selection: &page.access.selection,
+                                        index: page.access.index,
+                                        expressions,
+                                        next_expression: 0,
+                                        values: Vec::new(),
+                                        context,
+                                        continuation: ListSelectionContinuation::ListPage {
+                                            page,
+                                            size,
+                                            view_limit: count,
+                                            view_limit_capture: Some(capture),
+                                            guard_matches: true,
+                                            context,
+                                        },
+                                    }),
+                                })?;
+                            }
                         }
-                        let capacity = items.len();
-                        stack.push_task(ExpressionTask::ContextualCollectionNext {
-                            state: Box::new(ContextualCollectionState {
+                        ExpressionTask::ListPageAfterGuard {
+                            page,
+                            size,
+                            view_limit,
+                            view_limit_capture,
+                            context,
+                        } => {
+                            let guard_matches = eval_to_bool(&stack.pop_value()?)?;
+                            let mut expressions = Vec::new();
+                            page.access
+                                .selection
+                                .visit_expressions(&mut |expression| expressions.push(expression));
+                            stack.push_task(ExpressionTask::ListSelectionNext {
+                                state: Box::new(ListSelectionEvaluationState {
+                                    selection: &page.access.selection,
+                                    index: page.access.index,
+                                    expressions,
+                                    next_expression: 0,
+                                    values: Vec::new(),
+                                    context,
+                                    continuation: ListSelectionContinuation::ListPage {
+                                        page,
+                                        size,
+                                        view_limit,
+                                        view_limit_capture,
+                                        guard_matches,
+                                        context,
+                                    },
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::BeginBoundedListPage { page, context } => {
+                            stack.push_task(ExpressionTask::BoundedListPageAfterSize {
+                                page,
+                                context,
+                            })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression: page.size,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::BoundedListPageAfterSize { page, context } => {
+                            let value = stack.pop_value()?;
+                            let Ok(size) = eval_to_integer(&value) else {
+                                stack.push_value(page_terminal_variant("InvalidPageSize"))?;
+                                return Ok(());
+                            };
+                            if !(1..=10_000).contains(&size) {
+                                stack.push_value(page_terminal_variant("InvalidPageSize"))?;
+                                return Ok(());
+                            }
+                            let size =
+                                usize::try_from(size).expect("positive page size fits usize");
+                            stack.push_task(ExpressionTask::BoundedListPageAfterView {
+                                page,
+                                size,
+                                context,
+                            })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression: page.view,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::BoundedListPageAfterView {
+                            page,
+                            size,
+                            context,
+                        } => {
+                            let evaluated = eval_to_list(stack.pop_value()?)?;
+                            if evaluated.len() > page.max_items as usize {
+                                work.metrics.access_work_limit_failure_count = work
+                                    .metrics
+                                    .access_work_limit_failure_count
+                                    .saturating_add(1);
+                                stack.push_value(page_terminal_variant("PageWorkLimitExceeded"))?;
+                                return Ok(());
+                            }
+                            work.metrics.bounded_page_scan_count =
+                                work.metrics.bounded_page_scan_count.saturating_add(1);
+                            work.metrics.bounded_page_candidate_count = work
+                                .metrics
+                                .bounded_page_candidate_count
+                                .saturating_add(u64::try_from(evaluated.len()).unwrap_or(u64::MAX));
+                            work.consume(evaluated.len().try_into().unwrap_or(u64::MAX))?;
+                            stack.push_task(ExpressionTask::BoundedPageMaterializeNext {
+                                state: Box::new(BoundedPageMaterializationState {
+                                    page,
+                                    size,
+                                    remaining: evaluated.into_iter(),
+                                    items: Vec::new(),
+                                    context,
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::ListSelectionNext { mut state } => {
+                            let Some(expression) =
+                                state.expressions.get(state.next_expression).copied()
+                            else {
+                                let index_plan =
+                                    metadata.list_indexes.get(&state.index).ok_or_else(|| {
+                                        Error::InvalidPlan(format!(
+                                            "typed list access references missing index {}",
+                                            state.index.0
+                                        ))
+                                    })?;
+                                let (selection, captures) = evaluate_list_access_selection_values(
+                                    state.selection,
+                                    index_plan,
+                                    std::mem::take(&mut state.values),
+                                )?;
+                                match state.continuation {
+                                    ListSelectionContinuation::ListAccess {
+                                        access,
+                                        limit,
+                                        context,
+                                    } => {
+                                        stack.push_task(
+                                            ExpressionTask::ListAccessAfterSelection {
+                                                access,
+                                                limit,
+                                                selection,
+                                                context,
+                                            },
+                                        )?;
+                                    }
+                                    ListSelectionContinuation::ListPage {
+                                        page,
+                                        size,
+                                        view_limit,
+                                        view_limit_capture,
+                                        guard_matches,
+                                        context,
+                                    } => {
+                                        stack.push_task(
+                                            ExpressionTask::ListPageAfterSelection {
+                                                page,
+                                                size,
+                                                view_limit,
+                                                view_limit_capture,
+                                                guard_matches,
+                                                selection,
+                                                selection_captures: captures,
+                                                context,
+                                            },
+                                        )?;
+                                    }
+                                    ListSelectionContinuation::IndexedContextual {
+                                        access,
+                                        operation,
+                                        local,
+                                        body,
+                                        context,
+                                    } => {
+                                        stack.push_task(
+                                            ExpressionTask::IndexedContextualAfterSelection {
+                                                access,
+                                                operation,
+                                                local,
+                                                body,
+                                                selection,
+                                                context,
+                                            },
+                                        )?;
+                                    }
+                                }
+                                return Ok(());
+                            };
+                            state.next_expression += 1;
+                            let context = state.context;
+                            stack.push_task(ExpressionTask::ListSelectionAfterValue { state })?;
+                            stack.push_task(ExpressionTask::Evaluate {
                                 expression,
-                                owner,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::ListSelectionAfterValue { mut state } => {
+                            state
+                                .values
+                                .push(self.materialize_eval(stack.pop_value()?)?);
+                            stack.push_task(ExpressionTask::ListSelectionNext { state })?;
+                        }
+                        ExpressionTask::IndexedContextualAfterSelection {
+                            access,
+                            operation,
+                            local,
+                            body,
+                            selection,
+                            context,
+                        } => {
+                            self.register_list_access_dependency(
+                                context.consumer,
+                                access.index,
+                                &selection,
+                            );
+                            stack.push_task(ExpressionTask::IndexedContextualAfterIndex {
+                                access,
                                 operation,
                                 local,
                                 body,
-                                remaining: items.into_iter(),
-                                directions,
-                                output: Vec::with_capacity(capacity),
-                            }),
-                            context,
-                        })?;
-                    }
-                    ExpressionTask::ContextualCollectionNext { mut state, context } => {
-                        let Some(item) = state.remaining.next() else {
-                            let value = match state.operation {
-                                PlanContextualOperationKind::Map
-                                | PlanContextualOperationKind::Filter
-                                | PlanContextualOperationKind::Retain
-                                | PlanContextualOperationKind::Remove => {
-                                    eval_ordered_items(state.output, state.directions)
-                                }
-                                PlanContextualOperationKind::Every => {
-                                    EvalValue::Value(Value::Bool(true))
-                                }
-                                PlanContextualOperationKind::Any => {
-                                    EvalValue::Value(Value::Bool(false))
-                                }
-                                PlanContextualOperationKind::Find => {
-                                    EvalValue::Record(BTreeMap::from([(
-                                        "$tag".to_owned(),
-                                        EvalValue::Value(Value::Text("NotFound".to_owned())),
-                                    )]))
-                                }
-                            };
-                            stack.push_value(value)?;
-                            continue;
-                        };
-                        match state.operation {
-                            PlanContextualOperationKind::Map => {
-                                let origin = eval_row_id(&item.value);
-                                let local = state.local;
-                                let body = state.body;
-                                let binding_value = item.value.clone();
-                                stack.push_task(
-                                    ExpressionTask::ContextualCollectionAfterMapBody {
-                                        state,
-                                        item: item.clone(),
-                                        origin,
-                                        context,
-                                    },
-                                )?;
-                                schedule_bound_expression(
-                                    &mut stack,
-                                    &mut binding_undos,
-                                    bindings,
-                                    (binding_value, local),
-                                    body,
-                                    context,
-                                )?;
-                            }
-                            PlanContextualOperationKind::Filter
-                            | PlanContextualOperationKind::Retain
-                            | PlanContextualOperationKind::Remove
-                            | PlanContextualOperationKind::Every
-                            | PlanContextualOperationKind::Any
-                            | PlanContextualOperationKind::Find => {
-                                if matches!(
-                                    state.operation,
-                                    PlanContextualOperationKind::Every
-                                        | PlanContextualOperationKind::Any
-                                        | PlanContextualOperationKind::Find
-                                ) {
-                                    work.consume(1)?;
-                                }
-                                if state.operation == PlanContextualOperationKind::Find {
-                                    work.metrics.list_find_scan_count += 1;
-                                }
-                                let local = state.local;
-                                let body = state.body;
-                                let binding_value = item.value.clone();
-                                stack.push_task(
-                                    ExpressionTask::ContextualCollectionAfterPredicate {
-                                        state,
-                                        item: item.clone(),
-                                        context,
-                                    },
-                                )?;
-                                schedule_bound_expression(
-                                    &mut stack,
-                                    &mut binding_undos,
-                                    bindings,
-                                    (binding_value, local),
-                                    body,
-                                    context,
-                                )?;
-                            }
-                        }
-                    }
-                    ExpressionTask::ContextualCollectionAfterPredicate {
-                        mut state,
-                        item,
-                        context,
-                    } => {
-                        let matches = eval_to_bool(&stack.pop_value()?)?;
-                        match state.operation {
-                            PlanContextualOperationKind::Filter
-                            | PlanContextualOperationKind::Retain => {
-                                if matches {
-                                    state.output.push(item);
-                                }
-                            }
-                            PlanContextualOperationKind::Remove => {
-                                if !matches {
-                                    state.output.push(item);
-                                }
-                            }
-                            PlanContextualOperationKind::Every if !matches => {
-                                stack.push_value(EvalValue::Value(Value::Bool(false)))?;
-                                continue;
-                            }
-                            PlanContextualOperationKind::Any if matches => {
-                                stack.push_value(EvalValue::Value(Value::Bool(true)))?;
-                                continue;
-                            }
-                            PlanContextualOperationKind::Find if matches => {
-                                stack.push_value(EvalValue::Record(BTreeMap::from([
-                                    (
-                                        "$tag".to_owned(),
-                                        EvalValue::Value(Value::Text("Found".to_owned())),
-                                    ),
-                                    ("value".to_owned(), item.value),
-                                ])))?;
-                                continue;
-                            }
-                            PlanContextualOperationKind::Map => {
-                                return Err(Error::InvalidPlan(
-                                    "map used a predicate continuation".to_owned(),
-                                ));
-                            }
-                            _ => {}
-                        }
-                        stack.push_task(ExpressionTask::ContextualCollectionNext {
-                            state,
-                            context,
-                        })?;
-                    }
-                    ExpressionTask::ContextualCollectionAfterMapBody {
-                        state,
-                        item,
-                        origin,
-                        context,
-                    } => {
-                        let mapped = stack.pop_value()?;
-                        stack.push_task(ExpressionTask::ContextualMapCaptureNext {
-                            state: Box::new(ContextualMapCaptureState {
-                                collection: state,
-                                item,
-                                origin,
-                                mapped,
-                                next_capture: 0,
-                                evaluated_captures: BTreeMap::new(),
-                            }),
-                            context,
-                        })?;
-                    }
-                    ExpressionTask::ContextualMapCaptureNext { mut state, context } => {
-                        let node = plan
-                            .row_expressions
-                            .node(state.collection.expression)
-                            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
-                        let PlanRowExpressionNode::ContextualCollection { captures, .. } = node
-                        else {
-                            return Err(Error::InvalidPlan(format!(
-                                "row expression {} lost its contextual collection continuation",
-                                state.collection.expression.0
-                            )));
-                        };
-                        let Some(capture) = captures.get(state.next_capture) else {
-                            state.item.value = match (
-                                state.origin,
-                                state.mapped,
-                                state.evaluated_captures,
-                            ) {
-                                (Some(id), EvalValue::Record(fields), captures) => {
-                                    EvalValue::MappedRow {
-                                        id,
-                                        fields,
-                                        captures,
-                                    }
-                                }
-                                (_, value, captures) if captures.is_empty() => value,
-                                _ => {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "contextual owner {} captures state for a map without a stored source row and typed record result",
-                                        state.collection.owner.0
-                                    )));
-                                }
-                            };
-                            state.collection.output.push(state.item);
-                            stack.push_task(ExpressionTask::ContextualCollectionNext {
-                                state: state.collection,
+                                selection,
                                 context,
                             })?;
-                            continue;
-                        };
-                        let capture_field = capture.field;
-                        let capture_value = capture.value;
-                        if !self.metadata.capture_fields.contains(&capture_field) {
-                            return Err(Error::InvalidPlan(format!(
-                                "contextual owner {} writes non-capture field {}",
-                                state.collection.owner.0, capture_field.0
-                            )));
-                        }
-                        state.next_capture += 1;
-                        let binding_value = state.item.value.clone();
-                        let local = state.collection.local;
-                        stack.push_task(ExpressionTask::ContextualMapCaptureAfterValue {
-                            state,
-                            field: capture_field,
-                            context,
-                        })?;
-                        schedule_bound_expression(
-                            &mut stack,
-                            &mut binding_undos,
-                            bindings,
-                            (binding_value, local),
-                            capture_value,
-                            context,
-                        )?;
-                    }
-                    ExpressionTask::ContextualMapCaptureAfterValue {
-                        mut state,
-                        field,
-                        context,
-                    } => {
-                        let captured = stack.pop_value()?;
-                        if state.evaluated_captures.insert(field, captured).is_some() {
-                            return Err(Error::InvalidPlan(format!(
-                                "contextual owner {} writes capture field {} more than once",
-                                state.collection.owner.0, field.0
-                            )));
-                        }
-                        stack.push_task(ExpressionTask::ContextualMapCaptureNext {
-                            state,
-                            context,
-                        })?;
-                    }
-                    ExpressionTask::ContextualOrderAfterSource {
-                        operation,
-                        owner,
-                        row_local,
-                        key,
-                        direction,
-                        context,
-                    } => {
-                        let (items, directions) = eval_to_ordered_items(stack.pop_value()?)?;
-                        stack.push_task(ExpressionTask::ContextualOrderAfterDirection {
-                            operation,
-                            owner,
-                            row_local,
-                            key,
-                            items,
-                            directions,
-                            context,
-                        })?;
-                        stack.push_task(ExpressionTask::Evaluate {
-                            expression: direction,
-                            context,
-                        })?;
-                    }
-                    ExpressionTask::ContextualOrderAfterDirection {
-                        operation,
-                        owner,
-                        row_local,
-                        key,
-                        mut items,
-                        mut directions,
-                        context,
-                    } => {
-                        if operation == PlanOrderOperationKind::ThenBy && directions.is_none() {
-                            return Err(Error::InvalidPlan(
-                                "List/then_by requires a compatible preceding typed order chain"
-                                    .to_owned(),
-                            ));
-                        }
-                        if operation == PlanOrderOperationKind::SortBy {
-                            directions = Some(Vec::new());
-                            for item in &mut items {
-                                item.keys.clear();
-                            }
-                        }
-                        let direction = eval_order_direction(&stack.pop_value()?)?;
-                        let local = (owner, row_local);
-                        if bindings.contains_key(&local) {
-                            return Err(Error::InvalidPlan(format!(
-                                "contextual owner {} local {} is already active",
-                                owner.0, row_local.0
-                            )));
-                        }
-                        work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                        let mut directions = directions.unwrap_or_default();
-                        directions.push(direction);
-                        let capacity = items.len();
-                        stack.push_task(ExpressionTask::ContextualOrderNext {
-                            state: Box::new(ContextualOrderState {
-                                local,
-                                key,
-                                remaining: items.into_iter(),
-                                ordered: Vec::with_capacity(capacity),
-                                directions,
-                            }),
-                            context,
-                        })?;
-                    }
-                    ExpressionTask::ContextualOrderNext { mut state, context } => {
-                        let Some(item) = state.remaining.next() else {
-                            state.ordered.sort_by(|left, right| {
-                                compare_ordered_items(left, right, &state.directions)
-                            });
-                            stack.push_value(EvalValue::OrderedList {
-                                items: state.ordered,
-                                directions: state.directions,
+                            stack.push_task(ExpressionTask::EnsureOrderedIndex {
+                                index: access.index,
+                                requesting_consumer: context.consumer,
                             })?;
-                            continue;
-                        };
-                        let local = state.local;
-                        let key = state.key;
-                        let binding_value = item.value.clone();
-                        stack.push_task(ExpressionTask::ContextualOrderAfterKey {
-                            state,
-                            item: item.clone(),
+                        }
+                        ExpressionTask::IndexedContextualAfterIndex {
+                            access,
+                            operation,
+                            local,
+                            body,
+                            selection,
                             context,
-                        })?;
-                        schedule_bound_expression(
-                            &mut stack,
-                            &mut binding_undos,
-                            bindings,
-                            (binding_value, local),
-                            key,
+                        } => {
+                            let candidates = self.collect_indexed_contextual_candidates(
+                                access,
+                                &selection,
+                                context.consumer,
+                                work,
+                            )?;
+                            let capacity = candidates.len();
+                            stack.push_task(ExpressionTask::IndexedContextualNext {
+                                state: Box::new(IndexedContextualState {
+                                    operation,
+                                    local,
+                                    body,
+                                    remaining: candidates.into_iter(),
+                                    retained: Vec::with_capacity(capacity),
+                                }),
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::ListAccessAfterSelection {
+                            access,
+                            limit,
+                            selection,
                             context,
-                        )?;
-                    }
-                    ExpressionTask::ContextualOrderAfterKey {
-                        mut state,
-                        mut item,
-                        context,
-                    } => {
-                        let evaluated = self.materialize_eval(stack.pop_value()?)?;
-                        item.keys.push(eval_order_key(evaluated)?);
-                        state.ordered.push(item);
-                        stack.push_task(ExpressionTask::ContextualOrderNext { state, context })?;
-                    }
-                    ExpressionTask::IndexedContextualNext { mut state, context } => {
-                        let Some(candidate) = state.remaining.next() else {
-                            let (value, result_count) = match state.operation {
-                                PlanContextualOperationKind::Filter
-                                | PlanContextualOperationKind::Retain => {
-                                    let result_count = state.retained.len();
-                                    (EvalValue::List(state.retained), result_count)
-                                }
-                                PlanContextualOperationKind::Any => {
-                                    (EvalValue::Value(Value::Bool(false)), 0)
-                                }
-                                PlanContextualOperationKind::Find => (
-                                    EvalValue::Record(BTreeMap::from([(
-                                        "$tag".to_owned(),
-                                        EvalValue::Value(Value::Text("NotFound".to_owned())),
-                                    )])),
-                                    0,
-                                ),
-                                operation => {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "typed contextual access is not valid for {operation:?}"
-                                    )));
-                                }
+                        } => {
+                            self.register_list_access_dependency(
+                                context.consumer,
+                                access.index,
+                                &selection,
+                            );
+                            stack.push_task(ExpressionTask::ListAccessAfterIndex {
+                                access,
+                                limit,
+                                selection,
+                                context,
+                            })?;
+                            stack.push_task(ExpressionTask::EnsureOrderedIndex {
+                                index: access.index,
+                                requesting_consumer: context.consumer,
+                            })?;
+                        }
+                        ExpressionTask::ListAccessAfterIndex {
+                            access,
+                            limit,
+                            selection,
+                            context,
+                        } => {
+                            let index_plan =
+                                metadata.list_indexes.get(&access.index).ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "typed list access references missing index {}",
+                                        access.index.0
+                                    ))
+                                })?;
+                            let limits = self.options.list_access_work_limits;
+                            let limits = AccessWorkLimits::new(
+                                limits.max_index_seeks,
+                                limits.max_key_ranges,
+                                limits.max_keys_visited,
+                                limits.max_candidates_visited,
+                                limits.max_rows_returned,
+                                limits.max_branch_polls,
+                                0,
+                            );
+                            let batch = {
+                                let index =
+                                    self.ordered_indexes.get(&access.index).ok_or_else(|| {
+                                        Error::InvalidPlan(format!(
+                                            "typed list access index {} is not current",
+                                            access.index.0
+                                        ))
+                                    })?;
+                                collect_access_traversal_batch(
+                                    index,
+                                    &selection,
+                                    None,
+                                    access.semantic_order.len(),
+                                    limits,
+                                    index_plan.source_list,
+                                )
                             };
-                            work.metrics.access_result_count = work
-                                .metrics
-                                .access_result_count
-                                .saturating_add(u64::try_from(result_count).unwrap_or(u64::MAX));
-                            stack.push_value(value)?;
-                            continue;
-                        };
-                        let local = state.local;
-                        let body = state.body;
-                        stack.push_task(ExpressionTask::IndexedContextualAfterPredicate {
+                            let cleanup = access_cleanups.len();
+                            access_cleanups.push(Some(AccessCleanup {
+                                kind: AccessCleanupKind::ListAccess,
+                                metrics: AccessMetrics::default(),
+                            }));
+                            stack.push_task(ExpressionTask::ListAccessNextCandidate {
+                                state: Box::new(ListAccessTraversalState {
+                                    access,
+                                    source_list: index_plan.source_list,
+                                    limit,
+                                    candidates: batch.candidates,
+                                    terminal: Some(batch.terminal),
+                                    result: Vec::with_capacity(limit),
+                                    cleanup,
+                                    context,
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::ListAccessNextCandidate { mut state } => {
+                            if state.result.len() >= state.limit {
+                                stack.push_task(ExpressionTask::ListAccessFinish { state })?;
+                                return Ok(());
+                            }
+                            let Some(candidate) = state.candidates.next() else {
+                                let terminal = state.terminal.take().ok_or_else(|| {
+                                    Error::InvalidPlan(
+                                        "typed list access traversal lost its terminal state"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                let (metrics, error) = match terminal {
+                                    AccessTraversalTerminal::End(metrics) => (metrics, None),
+                                    AccessTraversalTerminal::Error { metrics, error } => {
+                                        (metrics, Some(error))
+                                    }
+                                };
+                                access_cleanups
+                                    .get_mut(state.cleanup)
+                                    .and_then(Option::as_mut)
+                                    .ok_or_else(|| {
+                                        Error::InvalidPlan(
+                                            "typed list access cleanup disappeared".to_owned(),
+                                        )
+                                    })?
+                                    .metrics = metrics;
+                                if let Some(error) = error {
+                                    return Err(Error::Evaluation(error.to_string()));
+                                }
+                                stack.push_task(ExpressionTask::ListAccessFinish { state })?;
+                                return Ok(());
+                            };
+                            access_cleanups
+                                .get_mut(state.cleanup)
+                                .and_then(Option::as_mut)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(
+                                        "typed list access cleanup disappeared".to_owned(),
+                                    )
+                                })?
+                                .metrics = candidate.metrics;
+                            work.consume(1)?;
+                            if candidate.row.list != state.source_list
+                                || !self.row_exists(candidate.row)
+                            {
+                                return Err(Error::InvalidPlan(format!(
+                                    "typed list access on index {} returned stale row {}:{}:{}",
+                                    state.access.index.0,
+                                    candidate.row.list.0,
+                                    candidate.row.key,
+                                    candidate.row.generation
+                                )));
+                            }
+                            stack.push_task(ExpressionTask::ListAccessFilterNext {
+                                state,
+                                candidate: candidate.row,
+                                next_filter: 0,
+                            })?;
+                        }
+                        ExpressionTask::ListAccessFinish { mut state } => {
+                            let cleanup = access_cleanups
+                                .get_mut(state.cleanup)
+                                .and_then(Option::take)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(
+                                        "typed list access cleanup disappeared".to_owned(),
+                                    )
+                                })?;
+                            if let Some(limit) = state.access.exhaustive_candidate_limit
+                                && state.result.len() > limit as usize
+                            {
+                                record_access_metrics(work, cleanup.metrics, 0);
+                                return Err(Error::WorkBudgetExceeded {
+                                    limit: u64::from(limit),
+                                    attempted: state.result.len() as u64,
+                                });
+                            }
+                            record_access_metrics(work, cleanup.metrics, state.result.len());
+                            stack.push_value(EvalValue::List(std::mem::take(&mut state.result)))?;
+                        }
+                        ExpressionTask::ListAccessFilterNext {
                             state,
                             candidate,
+                            next_filter,
+                        } => {
+                            let Some(filter) = state.access.filters.get(next_filter) else {
+                                let context = ExpressionContext {
+                                    row: Some(candidate),
+                                    ..state.context
+                                };
+                                stack.push_task(ExpressionTask::ListMapsNext {
+                                    state: Box::new(ListMapEvaluationState {
+                                        maps: &state.access.maps,
+                                        next_map: 0,
+                                        value: EvalValue::Row(candidate),
+                                        source_row: candidate,
+                                        context,
+                                    }),
+                                    continuation: ListMapContinuation::ListAccess(state),
+                                })?;
+                                return Ok(());
+                            };
+                            let context = ExpressionContext {
+                                row: Some(candidate),
+                                ..state.context
+                            };
+                            stack.push_task(ExpressionTask::ListAccessAfterFilter {
+                                state,
+                                candidate,
+                                next_filter: next_filter + 1,
+                            })?;
+                            schedule_bound_expression(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                (EvalValue::Row(candidate), (filter.owner, filter.row_local)),
+                                filter.predicate,
+                                context,
+                            )?;
+                        }
+                        ExpressionTask::ListAccessAfterFilter {
+                            state,
+                            candidate,
+                            next_filter,
+                        } => {
+                            if eval_to_bool(&stack.pop_value()?)? {
+                                stack.push_task(ExpressionTask::ListAccessFilterNext {
+                                    state,
+                                    candidate,
+                                    next_filter,
+                                })?;
+                            } else {
+                                stack
+                                    .push_task(ExpressionTask::ListAccessNextCandidate { state })?;
+                            }
+                        }
+                        ExpressionTask::ListMapsNext {
+                            mut state,
+                            continuation,
+                        } => {
+                            let Some(map) = state.maps.get(state.next_map) else {
+                                match continuation {
+                                    ListMapContinuation::ListAccess(mut access) => {
+                                        access.result.push(state.value);
+                                        stack.push_task(
+                                            ExpressionTask::ListAccessNextCandidate {
+                                                state: access,
+                                            },
+                                        )?;
+                                    }
+                                    ListMapContinuation::ListPage(page) => {
+                                        let value = self.materialize_eval(state.value)?;
+                                        stack.push_task(ExpressionTask::PageNormalizeContinue {
+                                            state: Box::new(PageNormalizationState {
+                                                tasks: vec![PageValueTask::Evaluate(value)],
+                                                values: Vec::new(),
+                                                continuation:
+                                                    PageNormalizationContinuation::ListPage(page),
+                                            }),
+                                        })?;
+                                    }
+                                }
+                                return Ok(());
+                            };
+                            let map_index = state.next_map;
+                            state.next_map += 1;
+                            let input = state.value.clone();
+                            let origin = eval_row_id(&input);
+                            let context = state.context;
+                            stack.push_task(ExpressionTask::ListMapAfterBody {
+                                state,
+                                continuation,
+                                input: input.clone(),
+                                origin,
+                                map_index,
+                            })?;
+                            schedule_bound_expression(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                (input, (map.owner, map.row_local)),
+                                map.body,
+                                context,
+                            )?;
+                        }
+                        ExpressionTask::ListMapAfterBody {
+                            state,
+                            continuation,
+                            input,
+                            origin,
+                            map_index,
+                        } => {
+                            let mapped = stack.pop_value()?;
+                            let context = state.context;
+                            stack.push_task(ExpressionTask::ListMapCaptureNext {
+                                state: Box::new(ListMapCaptureState {
+                                    maps: state.maps,
+                                    map_index,
+                                    input,
+                                    origin,
+                                    mapped,
+                                    next_capture: 0,
+                                    captures: BTreeMap::new(),
+                                    source_row: state.source_row,
+                                    context,
+                                }),
+                                continuation,
+                            })?;
+                        }
+                        ExpressionTask::ListMapCaptureNext {
+                            mut state,
+                            continuation,
+                        } => {
+                            let map = state.maps.get(state.map_index).ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "typed list map continuation lost its map".to_owned(),
+                                )
+                            })?;
+                            let Some(capture) = map.captures.get(state.next_capture) else {
+                                let value = match (state.origin, state.mapped, state.captures) {
+                                    (Some(id), EvalValue::Record(fields), captures) => {
+                                        EvalValue::MappedRow {
+                                            id,
+                                            fields,
+                                            captures,
+                                        }
+                                    }
+                                    (_, value, captures) if captures.is_empty() => value,
+                                    _ => {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "typed list map owner {} captures state without a typed source row and record result",
+                                            map.owner.0
+                                        )));
+                                    }
+                                };
+                                stack.push_task(ExpressionTask::ListMapsNext {
+                                    state: Box::new(ListMapEvaluationState {
+                                        maps: state.maps,
+                                        next_map: state.map_index + 1,
+                                        value,
+                                        source_row: state.source_row,
+                                        context: state.context,
+                                    }),
+                                    continuation,
+                                })?;
+                                return Ok(());
+                            };
+                            if !self.metadata.capture_fields.contains(&capture.field) {
+                                return Err(Error::InvalidPlan(format!(
+                                    "typed list map owner {} writes non-capture field {}",
+                                    map.owner.0, capture.field.0
+                                )));
+                            }
+                            let field = capture.field;
+                            let expression = capture.value;
+                            state.next_capture += 1;
+                            let context = state.context;
+                            let binding = (state.input.clone(), (map.owner, map.row_local));
+                            stack.push_task(ExpressionTask::ListMapCaptureAfterValue {
+                                state,
+                                continuation,
+                                field,
+                            })?;
+                            schedule_bound_expression(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                binding,
+                                expression,
+                                context,
+                            )?;
+                        }
+                        ExpressionTask::ListMapCaptureAfterValue {
+                            mut state,
+                            continuation,
+                            field,
+                        } => {
+                            let captured = stack.pop_value()?;
+                            if state.captures.insert(field, captured).is_some() {
+                                let owner = state
+                                    .maps
+                                    .get(state.map_index)
+                                    .map(|map| map.owner.0)
+                                    .unwrap_or_default();
+                                return Err(Error::InvalidPlan(format!(
+                                    "typed list map owner {owner} writes capture field {} more than once",
+                                    field.0
+                                )));
+                            }
+                            stack.push_task(ExpressionTask::ListMapCaptureNext {
+                                state,
+                                continuation,
+                            })?;
+                        }
+                        ExpressionTask::ListPageAfterSelection {
+                            page,
+                            size,
+                            view_limit,
+                            view_limit_capture,
+                            guard_matches,
+                            selection,
+                            selection_captures,
                             context,
-                        })?;
-                        schedule_bound_expression(
-                            &mut stack,
-                            &mut binding_undos,
-                            bindings,
-                            (EvalValue::Row(candidate), local),
+                        } => {
+                            let index_plan = metadata
+                                .list_indexes
+                                .get(&page.access.index)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "typed list page references missing index {}",
+                                        page.access.index.0
+                                    ))
+                                })?;
+                            self.register_list_dependency(context.consumer, index_plan.source_list);
+                            self.register_list_access_dependency(
+                                context.consumer,
+                                page.access.index,
+                                &selection,
+                            );
+                            let mut selection_expressions = Vec::new();
+                            page.access.selection.visit_expressions(&mut |expression| {
+                                selection_expressions.push(expression)
+                            });
+                            if selection_expressions.len() != selection_captures.len() {
+                                return Err(Error::InvalidPlan(format!(
+                                    "typed list page selection produced {} captures for {} expressions",
+                                    selection_captures.len(),
+                                    selection_expressions.len()
+                                )));
+                            }
+                            let mut captured_filter_expressions = Vec::new();
+                            let mut captures = Vec::new();
+                            for (expression, value) in
+                                selection_expressions.into_iter().zip(selection_captures)
+                            {
+                                if page
+                                    .access
+                                    .filters
+                                    .iter()
+                                    .try_fold(false, |found, filter| {
+                                        if found {
+                                            Ok(true)
+                                        } else {
+                                            row_expression_contains(
+                                                &plan.row_expressions,
+                                                filter.predicate,
+                                                expression,
+                                            )
+                                        }
+                                    })?
+                                {
+                                    captured_filter_expressions.push(expression);
+                                    captures.push(value);
+                                }
+                            }
+
+                            let mut inputs = BTreeSet::new();
+                            let mut intrinsics = BTreeSet::new();
+                            for filter in &page.access.filters {
+                                collect_uncaptured_page_dependencies(
+                                    &plan.row_expressions,
+                                    filter.predicate,
+                                    &captured_filter_expressions,
+                                    index_plan.source_list,
+                                    &mut inputs,
+                                    &mut intrinsics,
+                                )?;
+                            }
+                            for map in &page.access.maps {
+                                collect_uncaptured_page_dependencies(
+                                    &plan.row_expressions,
+                                    map.body,
+                                    &captured_filter_expressions,
+                                    index_plan.source_list,
+                                    &mut inputs,
+                                    &mut intrinsics,
+                                )?;
+                                for capture in &map.captures {
+                                    collect_uncaptured_page_dependencies(
+                                        &plan.row_expressions,
+                                        capture.value,
+                                        &captured_filter_expressions,
+                                        index_plan.source_list,
+                                        &mut inputs,
+                                        &mut intrinsics,
+                                    )?;
+                                }
+                            }
+                            let mut trailing_captures = intrinsics
+                                .into_iter()
+                                .map(|intrinsic| {
+                                    PageTrailingCapture::Value(self.eval_intrinsic(intrinsic))
+                                })
+                                .collect::<Vec<_>>();
+                            for ((owner, local), value) in bindings.iter() {
+                                let referenced = page
+                                    .access
+                                    .filters
+                                    .iter()
+                                    .map(|filter| filter.predicate)
+                                    .chain(page.access.maps.iter().flat_map(|map| {
+                                        std::iter::once(map.body)
+                                            .chain(map.captures.iter().map(|capture| capture.value))
+                                    }))
+                                    .try_fold(false, |found, expression| {
+                                        if found {
+                                            Ok(true)
+                                        } else {
+                                            uncaptured_expression_references_local(
+                                                &plan.row_expressions,
+                                                expression,
+                                                &captured_filter_expressions,
+                                                *owner,
+                                                *local,
+                                            )
+                                        }
+                                    })?;
+                                if referenced {
+                                    trailing_captures
+                                        .push(PageTrailingCapture::Eval(value.clone()));
+                                }
+                            }
+                            if let Some(view_limit) = view_limit_capture {
+                                trailing_captures.push(PageTrailingCapture::Value(view_limit));
+                            }
+                            stack.push_task(ExpressionTask::PageCaptureNext {
+                                state: Box::new(PageCaptureState {
+                                    inputs: inputs.into_iter().collect::<Vec<_>>().into_iter(),
+                                    captures,
+                                    trailing_captures,
+                                    context,
+                                    continuation: PageCaptureContinuation::ListPage {
+                                        page,
+                                        size,
+                                        view_limit,
+                                        guard_matches,
+                                        selection,
+                                        captures: Vec::new(),
+                                        context,
+                                    },
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::PageCaptureNext { mut state } => {
+                            let Some(input) = state.inputs.next() else {
+                                for trailing in state.trailing_captures {
+                                    state.captures.push(match trailing {
+                                        PageTrailingCapture::Value(value) => value,
+                                        PageTrailingCapture::Eval(value) => {
+                                            self.materialize_eval(value)?
+                                        }
+                                    });
+                                }
+                                match state.continuation {
+                                    PageCaptureContinuation::ListPage {
+                                        page,
+                                        size,
+                                        view_limit,
+                                        guard_matches,
+                                        selection,
+                                        mut captures,
+                                        context,
+                                    } => {
+                                        captures.extend(state.captures);
+                                        stack.push_task(ExpressionTask::ListPageAfterCaptures {
+                                            page,
+                                            size,
+                                            view_limit,
+                                            guard_matches,
+                                            selection,
+                                            captures,
+                                            context,
+                                        })?;
+                                    }
+                                    PageCaptureContinuation::BoundedPage {
+                                        page,
+                                        size,
+                                        items,
+                                        authority_revision,
+                                        context,
+                                    } => {
+                                        stack.push_task(
+                                            ExpressionTask::BoundedListPageAfterCaptures {
+                                                page,
+                                                size,
+                                                items,
+                                                captures: state.captures,
+                                                authority_revision,
+                                                context,
+                                            },
+                                        )?;
+                                    }
+                                }
+                                return Ok(());
+                            };
+                            let context = state.context;
+                            stack.push_task(ExpressionTask::PageCaptureAfterValue { state })?;
+                            schedule_isolated_value_ref(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                input,
+                                context,
+                            )?;
+                        }
+                        ExpressionTask::PageCaptureAfterValue { mut state } => {
+                            state
+                                .captures
+                                .push(self.materialize_eval(stack.pop_value()?)?);
+                            stack.push_task(ExpressionTask::PageCaptureNext { state })?;
+                        }
+                        ExpressionTask::ListPageAfterCaptures {
+                            page,
+                            size,
+                            view_limit,
+                            guard_matches,
+                            selection,
+                            captures,
+                            context,
+                        } => {
+                            let index_plan = metadata
+                                .list_indexes
+                                .get(&page.access.index)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "typed list page references missing index {}",
+                                        page.access.index.0
+                                    ))
+                                })?;
+                            let owner_scope = context
+                                .row
+                                .map(|row| {
+                                    self.row_owner_rows(row).map(|owners| {
+                                        owners
+                                            .iter()
+                                            .map(|owner| RowId {
+                                                list: owner.list,
+                                                key: owner.key,
+                                                generation: owner.generation,
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                })
+                                .transpose()?
+                                .unwrap_or_default();
+                            let principal_scope =
+                                self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal);
+                            let capture_fingerprint = capture_fingerprint(
+                                page.view_fingerprint,
+                                self.cursor_ephemeral_launch_epoch,
+                                self.options.cursor_scope_fingerprint.as_ref(),
+                                &owner_scope,
+                                &principal_scope,
+                                captures.iter(),
+                                self,
+                            )
+                            .map_err(|_| {
+                                Error::InvalidPlan(
+                                    "typed list page cursor capture has no canonical memory identity"
+                                        .to_owned(),
+                                )
+                            })?;
+                            let authority_revision = self
+                                .lists
+                                .get(&index_plan.source_list)
+                                .map(|list| list.revision)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "typed list page source list {} is missing",
+                                        index_plan.source_list.0
+                                    ))
+                                })?;
+                            stack.push_task(ExpressionTask::ListPageAfterCursor {
+                                page,
+                                size,
+                                view_limit,
+                                guard_matches,
+                                selection,
+                                capture_fingerprint,
+                                authority_revision,
+                                context,
+                            })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression: page.after,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::ListPageAfterCursor {
+                            page,
+                            size,
+                            view_limit,
+                            guard_matches,
+                            selection,
+                            capture_fingerprint,
+                            authority_revision,
+                            context,
+                        } => {
+                            let after = self.materialize_eval(stack.pop_value()?)?;
+                            let (cursor_payload, accepted_offset) =
+                                match page_position_bytes(&after) {
+                                    Ok(None) => (None, 0),
+                                    Ok(Some(bytes)) => {
+                                        let cursor =
+                                            match open_cursor(&self.cursor_sealing_key, &bytes) {
+                                                Ok(cursor) => cursor,
+                                                Err(_) => {
+                                                    stack.push_value(page_terminal_variant(
+                                                        "InvalidPageCursor",
+                                                    ))?;
+                                                    return Ok(());
+                                                }
+                                            };
+                                        if cursor.view_fingerprint != page.view_fingerprint
+                                            || cursor.capture_fingerprint != capture_fingerprint
+                                        {
+                                            stack.push_value(page_terminal_variant(
+                                                "InvalidPageCursor",
+                                            ))?;
+                                            return Ok(());
+                                        }
+                                        if cursor.authority_revision != authority_revision {
+                                            stack
+                                                .push_value(page_terminal_variant("PageExpired"))?;
+                                            return Ok(());
+                                        }
+                                        let accepted_offset = cursor.accepted_offset;
+                                        (Some(cursor), accepted_offset)
+                                    }
+                                    Err(()) => {
+                                        stack.push_value(page_terminal_variant(
+                                            "InvalidPageCursor",
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                };
+                            if accepted_offset > view_limit {
+                                stack.push_value(page_terminal_variant("InvalidPageCursor"))?;
+                                return Ok(());
+                            }
+                            if !guard_matches || accepted_offset == view_limit {
+                                stack.push_value(page_result(Vec::new(), None))?;
+                                return Ok(());
+                            }
+                            stack.push_task(ExpressionTask::ListPageAfterIndex {
+                                page,
+                                size,
+                                view_limit,
+                                selection,
+                                capture_fingerprint,
+                                authority_revision,
+                                cursor_payload,
+                                accepted_offset,
+                                context,
+                            })?;
+                            stack.push_task(ExpressionTask::EnsureOrderedIndex {
+                                index: page.access.index,
+                                requesting_consumer: context.consumer,
+                            })?;
+                        }
+                        ExpressionTask::ListPageAfterIndex {
+                            page,
+                            size,
+                            view_limit,
+                            selection,
+                            capture_fingerprint,
+                            authority_revision,
+                            cursor_payload,
+                            accepted_offset,
+                            context,
+                        } => {
+                            let index_plan = metadata
+                                .list_indexes
+                                .get(&page.access.index)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "typed list page references missing index {}",
+                                        page.access.index.0
+                                    ))
+                                })?;
+                            let after_cursor = match cursor_payload {
+                                Some(payload) => {
+                                    let index = self
+                                        .ordered_indexes
+                                        .get(&page.access.index)
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(format!(
+                                                "typed list page index {} is not current",
+                                                page.access.index.0
+                                            ))
+                                        })?;
+                                    let semantic_components = page.access.semantic_order.len();
+                                    let matching_current_key = index
+                                        .cursor_keys_for(payload.row_id)
+                                        .into_iter()
+                                        .any(|cursor| {
+                                            cursor.source_order() == payload.source_order
+                                                && semantic_page_cursor_key(
+                                                    &cursor,
+                                                    semantic_components,
+                                                )
+                                                .is_ok_and(|key| key == payload.semantic_key)
+                                        });
+                                    if !matching_current_key {
+                                        stack.push_value(page_terminal_variant(
+                                            "InvalidPageCursor",
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                    Some(AccessCursorKey::new(
+                                        payload.semantic_key,
+                                        payload.source_order,
+                                        payload.row_id,
+                                    ))
+                                }
+                                None => None,
+                            };
+                            let remaining = view_limit.saturating_sub(accepted_offset);
+                            let requested = u64::try_from(size)
+                                .unwrap_or(u64::MAX)
+                                .saturating_add(1)
+                                .min(remaining);
+                            let requested = usize::try_from(requested).unwrap_or(usize::MAX);
+                            let limits = self.options.list_access_work_limits;
+                            let limits = AccessWorkLimits::new(
+                                limits.max_index_seeks,
+                                limits.max_key_ranges,
+                                limits.max_keys_visited,
+                                limits.max_candidates_visited,
+                                limits.max_rows_returned,
+                                limits.max_branch_polls,
+                                0,
+                            );
+                            let batch = {
+                                let index = self
+                                    .ordered_indexes
+                                    .get(&page.access.index)
+                                    .ok_or_else(|| {
+                                        Error::InvalidPlan(format!(
+                                            "typed list page index {} is not current",
+                                            page.access.index.0
+                                        ))
+                                    })?;
+                                collect_access_traversal_batch(
+                                    index,
+                                    &selection,
+                                    after_cursor.as_ref(),
+                                    page.access.semantic_order.len(),
+                                    limits,
+                                    index_plan.source_list,
+                                )
+                            };
+                            let cleanup = access_cleanups.len();
+                            access_cleanups.push(Some(AccessCleanup {
+                                kind: AccessCleanupKind::Page,
+                                metrics: AccessMetrics::default(),
+                            }));
+                            stack.push_task(ExpressionTask::ListPageNextCandidate {
+                                state: Box::new(ListPageTraversalState {
+                                    page,
+                                    source_list: index_plan.source_list,
+                                    size,
+                                    capture_fingerprint,
+                                    authority_revision,
+                                    accepted_offset,
+                                    requested,
+                                    candidates: batch.candidates,
+                                    terminal: Some(batch.terminal),
+                                    accepted: Vec::with_capacity(
+                                        requested.min(size.saturating_add(1)),
+                                    ),
+                                    cleanup,
+                                    context,
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::ListPageNextCandidate { mut state } => {
+                            if state.accepted.len() >= state.requested {
+                                stack
+                                    .push_task(ExpressionTask::ListPageFinishTraversal { state })?;
+                                return Ok(());
+                            }
+                            let Some(candidate) = state.candidates.next() else {
+                                let terminal = state.terminal.take().ok_or_else(|| {
+                                    Error::InvalidPlan(
+                                        "typed list page traversal lost its terminal state"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                let (metrics, error) = match terminal {
+                                    AccessTraversalTerminal::End(metrics) => (metrics, None),
+                                    AccessTraversalTerminal::Error { metrics, error } => {
+                                        (metrics, Some(error))
+                                    }
+                                };
+                                access_cleanups
+                                    .get_mut(state.cleanup)
+                                    .and_then(Option::as_mut)
+                                    .ok_or_else(|| {
+                                        Error::InvalidPlan(
+                                            "typed list page cleanup disappeared".to_owned(),
+                                        )
+                                    })?
+                                    .metrics = metrics;
+                                match error {
+                                    Some(AccessError::WorkLimitExceeded(_)) => {
+                                        let cleanup = access_cleanups
+                                            .get_mut(state.cleanup)
+                                            .and_then(Option::take)
+                                            .ok_or_else(|| {
+                                                Error::InvalidPlan(
+                                                    "typed list page cleanup disappeared"
+                                                        .to_owned(),
+                                                )
+                                            })?;
+                                        record_access_metrics(work, cleanup.metrics, 0);
+                                        stack.push_value(page_terminal_variant(
+                                            "PageWorkLimitExceeded",
+                                        ))?;
+                                    }
+                                    Some(error) => {
+                                        return Err(Error::Evaluation(error.to_string()));
+                                    }
+                                    None => {
+                                        stack.push_task(
+                                            ExpressionTask::ListPageFinishTraversal { state },
+                                        )?;
+                                    }
+                                }
+                                return Ok(());
+                            };
+                            access_cleanups
+                                .get_mut(state.cleanup)
+                                .and_then(Option::as_mut)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(
+                                        "typed list page cleanup disappeared".to_owned(),
+                                    )
+                                })?
+                                .metrics = candidate.metrics;
+                            work.consume(1)?;
+                            if candidate.row.list != state.source_list
+                                || !self.row_exists(candidate.row)
+                            {
+                                return Err(Error::InvalidPlan(format!(
+                                    "typed list page on index {} returned stale row {}:{}:{}",
+                                    state.page.access.index.0,
+                                    candidate.row.list.0,
+                                    candidate.row.key,
+                                    candidate.row.generation
+                                )));
+                            }
+                            stack.push_task(ExpressionTask::ListPageFilterNext {
+                                state,
+                                candidate: candidate.row,
+                                cursor: candidate.cursor,
+                                next_filter: 0,
+                            })?;
+                        }
+                        ExpressionTask::ListPageFilterNext {
+                            mut state,
+                            candidate,
+                            cursor,
+                            next_filter,
+                        } => {
+                            let Some(filter) = state.page.access.filters.get(next_filter) else {
+                                state.accepted.push((candidate, cursor));
+                                stack.push_task(ExpressionTask::ListPageNextCandidate { state })?;
+                                return Ok(());
+                            };
+                            let context = ExpressionContext {
+                                row: Some(candidate),
+                                ..state.context
+                            };
+                            stack.push_task(ExpressionTask::ListPageAfterFilter {
+                                state,
+                                candidate,
+                                cursor,
+                                next_filter: next_filter + 1,
+                            })?;
+                            schedule_bound_expression(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                (EvalValue::Row(candidate), (filter.owner, filter.row_local)),
+                                filter.predicate,
+                                context,
+                            )?;
+                        }
+                        ExpressionTask::ListPageAfterFilter {
+                            state,
+                            candidate,
+                            cursor,
+                            next_filter,
+                        } => {
+                            if eval_to_bool(&stack.pop_value()?)? {
+                                stack.push_task(ExpressionTask::ListPageFilterNext {
+                                    state,
+                                    candidate,
+                                    cursor,
+                                    next_filter,
+                                })?;
+                            } else {
+                                stack.push_task(ExpressionTask::ListPageNextCandidate { state })?;
+                            }
+                        }
+                        ExpressionTask::ListPageFinishTraversal { mut state } => {
+                            let cleanup = access_cleanups
+                                .get_mut(state.cleanup)
+                                .and_then(Option::take)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(
+                                        "typed list page cleanup disappeared".to_owned(),
+                                    )
+                                })?;
+                            let has_more = state.accepted.len() > state.size;
+                            if has_more {
+                                state.accepted.truncate(state.size);
+                            }
+                            record_access_metrics(work, cleanup.metrics, state.accepted.len());
+                            let next = if has_more {
+                                let (_, position) = state.accepted.last().ok_or_else(|| {
+                                    Error::InvalidPlan(
+                                        "non-empty page lost its continuation position".to_owned(),
+                                    )
+                                })?;
+                                let cursor = PageCursor {
+                                    view_fingerprint: state.page.view_fingerprint,
+                                    authority_revision: state.authority_revision,
+                                    capture_fingerprint: state.capture_fingerprint,
+                                    accepted_offset: state.accepted_offset.saturating_add(
+                                        u64::try_from(state.accepted.len()).unwrap_or(u64::MAX),
+                                    ),
+                                    semantic_key: semantic_page_cursor_key(
+                                        position,
+                                        state.page.access.semantic_order.len(),
+                                    )?,
+                                    source_order: position.source_order(),
+                                    row_id: position.row_id(),
+                                };
+                                match seal_cursor(&self.cursor_sealing_key, &cursor) {
+                                    Ok(cursor) => Some(cursor),
+                                    Err(CursorError::TooLarge) => {
+                                        stack.push_value(page_terminal_variant(
+                                            "PageWorkLimitExceeded",
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                    Err(CursorError::Invalid | CursorError::Randomness) => {
+                                        return Err(Error::Evaluation(
+                                            "failed to seal typed list page cursor".to_owned(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let rows = state
+                                .accepted
+                                .into_iter()
+                                .map(|(row, _)| row)
+                                .collect::<Vec<_>>();
+                            let capacity = rows.len();
+                            stack.push_task(ExpressionTask::ListPageMaterializeNext {
+                                state: Box::new(ListPageMaterializationState {
+                                    page: state.page,
+                                    remaining: rows.into_iter(),
+                                    items: Vec::with_capacity(capacity),
+                                    next,
+                                    context: state.context,
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::ListPageMaterializeNext { mut state } => {
+                            let Some(row) = state.remaining.next() else {
+                                stack.push_value(page_result(state.items, state.next))?;
+                                return Ok(());
+                            };
+                            let context = ExpressionContext {
+                                row: Some(row),
+                                ..state.context
+                            };
+                            stack.push_task(ExpressionTask::ListMapsNext {
+                                state: Box::new(ListMapEvaluationState {
+                                    maps: &state.page.access.maps,
+                                    next_map: 0,
+                                    value: EvalValue::Row(row),
+                                    source_row: row,
+                                    context,
+                                }),
+                                continuation: ListMapContinuation::ListPage(state),
+                            })?;
+                        }
+                        ExpressionTask::BoundedPageMaterializeNext { mut state } => {
+                            let Some(value) = state.remaining.next() else {
+                                stack.push_task(ExpressionTask::BoundedListPageAfterItems {
+                                    page: state.page,
+                                    size: state.size,
+                                    items: state.items,
+                                    context: state.context,
+                                })?;
+                                return Ok(());
+                            };
+                            let value = self.materialize_eval(value)?;
+                            stack.push_task(ExpressionTask::PageNormalizeContinue {
+                                state: Box::new(PageNormalizationState {
+                                    tasks: vec![PageValueTask::Evaluate(value)],
+                                    values: Vec::new(),
+                                    continuation: PageNormalizationContinuation::BoundedPage(state),
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::PageNormalizeContinue { mut state } => {
+                            while let Some(task) = state.tasks.pop() {
+                                match task {
+                                    PageValueTask::Evaluate(value) => match value {
+                                        Value::Row { id, .. } => {
+                                            let slot = plan
+                                                .storage_layout
+                                                .list_slots
+                                                .iter()
+                                                .find(|slot| slot.list_id == id.list)
+                                                .cloned()
+                                                .ok_or_else(|| {
+                                                    Error::InvalidPlan(format!(
+                                                        "typed list page source list {} has no storage slot",
+                                                        id.list.0
+                                                    ))
+                                                })?;
+                                            let item_type = plan
+                                                .persistence
+                                                .lists
+                                                .iter()
+                                                .find(|memory| {
+                                                    memory.runtime_slot == slot.id
+                                                })
+                                                .and_then(|memory| {
+                                                    match &memory.data_type {
+                                                        DataTypePlan::List { item } => {
+                                                            Some(item.as_ref().clone())
+                                                        }
+                                                        _ => None,
+                                                    }
+                                                })
+                                                .ok_or_else(|| {
+                                                    Error::InvalidPlan(format!(
+                                                        "typed list page source list {} has no declared item type",
+                                                        id.list.0
+                                                    ))
+                                                })?;
+                                            let output_fields = slot
+                                                .row_fields
+                                                .iter()
+                                                .map(|field| OutputListFieldRef {
+                                                    list_id: id.list,
+                                                    name: field.name.clone(),
+                                                    field_id: field.field_id,
+                                                })
+                                                .collect::<Vec<_>>();
+                                            let (fields, scalar_type) = match &item_type {
+                                                DataTypePlan::Record {
+                                                    fields,
+                                                    open: false,
+                                                } => (
+                                                    fields
+                                                        .iter()
+                                                        .map(|field| {
+                                                            Ok((
+                                                                field.name.clone(),
+                                                                output_list_field(
+                                                                    &output_fields,
+                                                                    id.list,
+                                                                    &field.name,
+                                                                )?,
+                                                            ))
+                                                        })
+                                                        .collect::<Result<Vec<_>, Error>>()?,
+                                                    None,
+                                                ),
+                                                _ => (
+                                                    vec![(
+                                                        "value".to_owned(),
+                                                        output_list_field(
+                                                            &output_fields,
+                                                            id.list,
+                                                            "value",
+                                                        )?,
+                                                    )],
+                                                    Some(item_type),
+                                                ),
+                                            };
+                                            let event = match &state.continuation {
+                                                PageNormalizationContinuation::ListPage(page) => {
+                                                    page.context.event
+                                                }
+                                                PageNormalizationContinuation::BoundedPage(
+                                                    page,
+                                                ) => page.context.event,
+                                            };
+                                            stack.push_task(
+                                                ExpressionTask::PageRowMaterializeNext {
+                                                    state: Box::new(PageRowMaterializationState {
+                                                        row: id,
+                                                        fields,
+                                                        next_field: 0,
+                                                        output: BTreeMap::new(),
+                                                        scalar_type,
+                                                        continuation: state,
+                                                        event,
+                                                    }),
+                                                },
+                                            )?;
+                                            return Ok(());
+                                        }
+                                        Value::MappedRow { fields, .. } | Value::Record(fields) => {
+                                            ensure_value_continuation_capacity(
+                                                &state.tasks,
+                                                1,
+                                                "page value normalization",
+                                            )?;
+                                            state.tasks.push(PageValueTask::Continue(
+                                                PageValueCollection::Record {
+                                                    remaining: fields.into_iter(),
+                                                    output: BTreeMap::new(),
+                                                },
+                                            ));
+                                        }
+                                        Value::List(items) => {
+                                            let capacity = items.len();
+                                            ensure_value_continuation_capacity(
+                                                &state.tasks,
+                                                1,
+                                                "page value normalization",
+                                            )?;
+                                            state.tasks.push(PageValueTask::Continue(
+                                                PageValueCollection::List {
+                                                    remaining: items.into_iter(),
+                                                    output: Vec::with_capacity(capacity),
+                                                },
+                                            ));
+                                        }
+                                        value => state.values.push(value),
+                                    },
+                                    PageValueTask::Continue(mut collection) => {
+                                        let next = match &mut collection {
+                                            PageValueCollection::List { remaining, .. } => {
+                                                remaining.next().map(|value| {
+                                                    (EvalMaterializationSlot::Item, value)
+                                                })
+                                            }
+                                            PageValueCollection::Record { remaining, .. } => {
+                                                remaining.next().map(|(name, value)| {
+                                                    (EvalMaterializationSlot::Field(name), value)
+                                                })
+                                            }
+                                        };
+                                        if let Some((slot, value)) = next {
+                                            ensure_value_continuation_capacity(
+                                                &state.tasks,
+                                                2,
+                                                "page value normalization",
+                                            )?;
+                                            state
+                                                .tasks
+                                                .push(PageValueTask::Append { collection, slot });
+                                            state.tasks.push(PageValueTask::Evaluate(value));
+                                        } else {
+                                            let value = match collection {
+                                                PageValueCollection::List { output, .. } => {
+                                                    Value::List(output)
+                                                }
+                                                PageValueCollection::Record { output, .. } => {
+                                                    Value::Record(output)
+                                                }
+                                            };
+                                            state.values.push(value);
+                                        }
+                                    }
+                                    PageValueTask::Append {
+                                        mut collection,
+                                        slot,
+                                    } => {
+                                        let value = state.values.pop().ok_or_else(|| {
+                                            Error::InvalidPlan(
+                                                "page value normalization produced no child value"
+                                                    .to_owned(),
+                                            )
+                                        })?;
+                                        match (&mut collection, slot) {
+                                            (
+                                                PageValueCollection::List { output, .. },
+                                                EvalMaterializationSlot::Item,
+                                            ) => output.push(value),
+                                            (
+                                                PageValueCollection::Record { output, .. },
+                                                EvalMaterializationSlot::Field(name),
+                                            ) => {
+                                                output.insert(name, value);
+                                            }
+                                            _ => {
+                                                return Err(Error::InvalidPlan(
+                                                    "page value normalization continuation type mismatch"
+                                                        .to_owned(),
+                                                ));
+                                            }
+                                        }
+                                        ensure_value_continuation_capacity(
+                                            &state.tasks,
+                                            1,
+                                            "page value normalization",
+                                        )?;
+                                        state.tasks.push(PageValueTask::Continue(collection));
+                                    }
+                                }
+                            }
+                            if state.values.len() != 1 {
+                                return Err(Error::InvalidPlan(format!(
+                                    "page value normalization completed with {} values",
+                                    state.values.len()
+                                )));
+                            }
+                            let value = state.values.pop().ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "page value normalization produced no root value".to_owned(),
+                                )
+                            })?;
+                            match state.continuation {
+                                PageNormalizationContinuation::ListPage(mut page) => {
+                                    page.items.push(value);
+                                    stack.push_task(ExpressionTask::ListPageMaterializeNext {
+                                        state: page,
+                                    })?;
+                                }
+                                PageNormalizationContinuation::BoundedPage(mut page) => {
+                                    page.items.push(value);
+                                    stack.push_task(
+                                        ExpressionTask::BoundedPageMaterializeNext { state: page },
+                                    )?;
+                                }
+                            }
+                        }
+                        ExpressionTask::PageRowMaterializeNext { mut state } => {
+                            let Some((name, field)) = state.fields.get(state.next_field).cloned()
+                            else {
+                                let value = if state.scalar_type.is_some() {
+                                    state.output.remove("value").ok_or_else(|| {
+                                        Error::InvalidPlan(
+                                            "scalar typed list page row lost its value".to_owned(),
+                                        )
+                                    })?
+                                } else {
+                                    Value::Record(state.output)
+                                };
+                                state.continuation.values.push(value);
+                                stack.push_task(ExpressionTask::PageNormalizeContinue {
+                                    state: state.continuation,
+                                })?;
+                                return Ok(());
+                            };
+                            state.next_field += 1;
+                            if self.metadata.row_computations.contains_key(&field) {
+                                let row = state.row;
+                                let event = state.event;
+                                stack.push_task(ExpressionTask::PageRowMaterializeAfterField {
+                                    state,
+                                    name,
+                                })?;
+                                stack.push_task(ExpressionTask::EnsureRow { row, field, event })?;
+                            } else {
+                                let value = self.row_value(state.row, field)?;
+                                let value = match state.scalar_type.as_ref() {
+                                    Some(item_type) => {
+                                        normalize_scalar_list_item(value, item_type)?
+                                    }
+                                    None => normalize_host_output_value(value)?,
+                                };
+                                state.output.insert(name, value);
+                                stack
+                                    .push_task(ExpressionTask::PageRowMaterializeNext { state })?;
+                            }
+                        }
+                        ExpressionTask::PageRowMaterializeAfterField { mut state, name } => {
+                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            let value = match state.scalar_type.as_ref() {
+                                Some(item_type) => normalize_scalar_list_item(value, item_type)?,
+                                None => normalize_host_output_value(value)?,
+                            };
+                            state.output.insert(name, value);
+                            stack.push_task(ExpressionTask::PageRowMaterializeNext { state })?;
+                        }
+                        ExpressionTask::BoundedListPageAfterItems {
+                            page,
+                            size,
+                            items,
+                            context,
+                        } => {
+                            let authority_revision =
+                                self.bounded_page_authority_revision(page.view)?;
+                            let mut inputs = BTreeSet::new();
+                            plan.row_expressions
+                                .visit_value_refs(page.view, &mut |input| {
+                                    let row_field = matches!(
+                                        input,
+                                        ValueRef::Field(field)
+                                            if self.metadata.row_field_owner.contains_key(field)
+                                    );
+                                    if !row_field
+                                        && !matches!(
+                                            input,
+                                            ValueRef::Constant(_) | ValueRef::List(_)
+                                        )
+                                    {
+                                        inputs.insert(input.clone());
+                                    }
+                                })
+                                .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                            stack.push_task(ExpressionTask::PageCaptureNext {
+                                state: Box::new(PageCaptureState {
+                                    inputs: inputs.into_iter().collect::<Vec<_>>().into_iter(),
+                                    captures: Vec::new(),
+                                    trailing_captures: Vec::new(),
+                                    context,
+                                    continuation: PageCaptureContinuation::BoundedPage {
+                                        page,
+                                        size,
+                                        items,
+                                        authority_revision,
+                                        context,
+                                    },
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::BoundedListPageAfterCaptures {
+                            page,
+                            size,
+                            items,
+                            mut captures,
+                            authority_revision,
+                            context,
+                        } => {
+                            captures.push(Value::List(items.clone()));
+                            let owner_scope = context
+                                .row
+                                .map(|row| {
+                                    self.row_owner_rows(row).map(|owners| {
+                                        owners
+                                            .iter()
+                                            .map(|owner| RowId {
+                                                list: owner.list,
+                                                key: owner.key,
+                                                generation: owner.generation,
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                })
+                                .transpose()?
+                                .unwrap_or_default();
+                            let principal_scope =
+                                self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal);
+                            let capture_fingerprint = capture_fingerprint(
+                                page.view_fingerprint,
+                                self.cursor_ephemeral_launch_epoch,
+                                self.options.cursor_scope_fingerprint.as_ref(),
+                                &owner_scope,
+                                &principal_scope,
+                                captures.iter(),
+                                self,
+                            )
+                            .map_err(|_| {
+                                Error::InvalidPlan(
+                                    "bounded page cursor capture has no canonical memory identity"
+                                        .to_owned(),
+                                )
+                            })?;
+                            stack.push_task(ExpressionTask::BoundedListPageAfterCursor {
+                                page,
+                                size,
+                                items,
+                                capture_fingerprint,
+                                authority_revision,
+                            })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression: page.after,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::BoundedListPageAfterCursor {
+                            page,
+                            size,
+                            items,
+                            capture_fingerprint,
+                            authority_revision,
+                        } => {
+                            let after = self.materialize_eval(stack.pop_value()?)?;
+                            let accepted_offset = match page_position_bytes(&after) {
+                                Ok(None) => 0,
+                                Ok(Some(bytes)) => {
+                                    let cursor = match open_cursor(&self.cursor_sealing_key, &bytes)
+                                    {
+                                        Ok(cursor) => cursor,
+                                        Err(_) => {
+                                            stack.push_value(page_terminal_variant(
+                                                "InvalidPageCursor",
+                                            ))?;
+                                            return Ok(());
+                                        }
+                                    };
+                                    if cursor.view_fingerprint != page.view_fingerprint
+                                        || cursor.capture_fingerprint != capture_fingerprint
+                                    {
+                                        stack.push_value(page_terminal_variant(
+                                            "InvalidPageCursor",
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                    if cursor.authority_revision != authority_revision {
+                                        stack.push_value(page_terminal_variant("PageExpired"))?;
+                                        return Ok(());
+                                    }
+                                    if !cursor.semantic_key.parts().is_empty()
+                                        || cursor.accepted_offset == 0
+                                        || cursor.accepted_offset > items.len() as u64
+                                    {
+                                        stack.push_value(page_terminal_variant(
+                                            "InvalidPageCursor",
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                    let previous = usize::try_from(cursor.accepted_offset - 1)
+                                        .map_err(|_| {
+                                            Error::Evaluation(
+                                                "page cursor offset overflow".to_owned(),
+                                            )
+                                        })?;
+                                    let (source_order, row_id) = bounded_page_position(
+                                        cursor.accepted_offset,
+                                        &items[previous],
+                                        self,
+                                    )
+                                    .map_err(|_| {
+                                        Error::InvalidPlan(
+                                            "bounded page continuation has no canonical memory identity"
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                    if cursor.source_order != source_order
+                                        || cursor.row_id != row_id
+                                    {
+                                        stack.push_value(page_terminal_variant(
+                                            "InvalidPageCursor",
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                    cursor.accepted_offset
+                                }
+                                Err(()) => {
+                                    stack.push_value(page_terminal_variant("InvalidPageCursor"))?;
+                                    return Ok(());
+                                }
+                            };
+                            let offset = usize::try_from(accepted_offset).map_err(|_| {
+                                Error::Evaluation("page cursor offset overflow".to_owned())
+                            })?;
+                            let end = offset.saturating_add(size).min(items.len());
+                            let page_items = items[offset..end].to_vec();
+                            let next = if end < items.len() {
+                                let accepted_offset = u64::try_from(end).unwrap_or(u64::MAX);
+                                let (source_order, row_id) =
+                                    bounded_page_position(accepted_offset, &items[end - 1], self)
+                                        .map_err(|_| {
+                                        Error::InvalidPlan(
+                                            "bounded page result has no canonical memory identity"
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                let cursor = PageCursor {
+                                    view_fingerprint: page.view_fingerprint,
+                                    authority_revision,
+                                    capture_fingerprint,
+                                    accepted_offset,
+                                    semantic_key: StructuralKey::new(Vec::new())
+                                        .expect("empty bounded page key is valid"),
+                                    source_order,
+                                    row_id,
+                                };
+                                match seal_cursor(&self.cursor_sealing_key, &cursor) {
+                                    Ok(cursor) => Some(cursor),
+                                    Err(CursorError::TooLarge) => {
+                                        stack.push_value(page_terminal_variant(
+                                            "PageWorkLimitExceeded",
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                    Err(CursorError::Invalid | CursorError::Randomness) => {
+                                        return Err(Error::Evaluation(
+                                            "failed to seal bounded typed list page cursor"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            work.metrics.access_result_count =
+                                work.metrics.access_result_count.saturating_add(
+                                    u64::try_from(page_items.len()).unwrap_or(u64::MAX),
+                                );
+                            stack.push_value(page_result(page_items, next))?;
+                        }
+                        ExpressionTask::EnsureOrderedIndex {
+                            index,
+                            requesting_consumer,
+                        } => {
+                            if self.evaluating_ordered_indexes.contains(&index) {
+                                return Err(Error::Evaluation(format!(
+                                    "typed ordered index {} forms a recursive key dependency",
+                                    index.0
+                                )));
+                            }
+                            let source_list = metadata
+                                .list_indexes
+                                .get(&index)
+                                .map(|plan| plan.source_list)
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "missing typed list index {}",
+                                        index.0
+                                    ))
+                                })?;
+                            let discard_source_value =
+                                metadata.list_computations.contains_key(&source_list);
+                            stack.push_task(ExpressionTask::EnsureOrderedIndexAfterSource {
+                                index,
+                                requesting_consumer,
+                                discard_source_value,
+                            })?;
+                            if discard_source_value {
+                                stack.push_task(ExpressionTask::EnsureListCurrentness {
+                                    list: source_list,
+                                    event: None,
+                                })?;
+                            }
+                        }
+                        ExpressionTask::EnsureOrderedIndexAfterSource {
+                            index,
+                            requesting_consumer,
+                            discard_source_value,
+                        } => {
+                            if discard_source_value {
+                                let _ = stack.pop_value()?;
+                            }
+                            if self.evaluating_ordered_indexes.contains(&index) {
+                                return Err(Error::Evaluation(format!(
+                                    "typed ordered index {} forms a recursive key dependency",
+                                    index.0
+                                )));
+                            }
+                            let fully_dirty = self.dirty_ordered_indexes.contains(&index);
+                            let pending_rows = self
+                                .dirty_ordered_index_rows
+                                .get(&index)
+                                .is_some_and(|rows| !rows.is_empty());
+                            if self.ordered_indexes.contains_key(&index)
+                                && !fully_dirty
+                                && !pending_rows
+                            {
+                                self.record_ordered_index_footprint(work);
+                                return Ok(());
+                            }
+                            let dirty_rows_snapshot = self
+                                .dirty_ordered_index_rows
+                                .get(&index)
+                                .cloned()
+                                .unwrap_or_default();
+                            let (subscriptions, old_cursors) =
+                                self.ordered_index_subscriber_snapshot(index, &dirty_rows_snapshot);
+                            let plan =
+                                metadata.list_indexes.get(&index).cloned().ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "missing typed list index {}",
+                                        index.0
+                                    ))
+                                })?;
+                            let publication = OrderedIndexPublicationState {
+                                dirty_rows_snapshot,
+                                subscriptions,
+                                old_cursors,
+                                requesting_consumer,
+                            };
+                            if fully_dirty || !self.ordered_indexes.contains_key(&index) {
+                                let candidate = self.begin_ordered_index_candidate(plan, work)?;
+                                stack.push_task(ExpressionTask::OrderedIndexFullNext {
+                                    state: Box::new(OrderedIndexFullBuildState {
+                                        candidate,
+                                        publication,
+                                    }),
+                                })?;
+                                return Ok(());
+                            }
+
+                            let dirty_rows = self
+                                .dirty_ordered_index_rows
+                                .get(&index)
+                                .cloned()
+                                .unwrap_or_default();
+                            if dirty_rows.is_empty() {
+                                self.record_ordered_index_footprint(work);
+                                return Ok(());
+                            }
+                            work.consume(dirty_rows.len().try_into().unwrap_or(u64::MAX))?;
+                            if detached_ordered_indexes.contains_key(&index) {
+                                return Err(Error::Evaluation(format!(
+                                    "typed ordered index {} is already detached",
+                                    index.0
+                                )));
+                            }
+                            let mut ordered_index =
+                                self.ordered_indexes.remove(&index).ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "typed list index {} disappeared during incremental maintenance",
+                                        index.0
+                                    ))
+                                })?;
+                            let remaining_payload =
+                                self.ordered_index_payload_bytes_excluding(index);
+                            let payload_limit = self
+                                .plan
+                                .target_profile
+                                .typed_list_index_limits()
+                                .max_total_payload_bytes
+                                .saturating_sub(remaining_payload);
+                            if let Err(error) = ordered_index.set_max_payload_bytes(payload_limit) {
+                                self.ordered_indexes.insert(index, ordered_index);
+                                work.metrics.ordered_index_resource_limit_failure_count = work
+                                    .metrics
+                                    .ordered_index_resource_limit_failure_count
+                                    .saturating_add(1);
+                                return Err(Error::Evaluation(error.to_string()));
+                            }
+                            self.dirty_ordered_index_rows.remove(&index);
+                            detached_ordered_indexes.insert(
+                                index,
+                                DetachedOrderedIndex {
+                                    index: ordered_index,
+                                    rollback_dirty_rows: dirty_rows.clone(),
+                                },
+                            );
+                            detached_ordered_index_order.push(index);
+                            stack.push_task(ExpressionTask::OrderedIndexIncrementalNext {
+                                state: Box::new(OrderedIndexIncrementalState {
+                                    plan,
+                                    remaining: dirty_rows.clone().into_iter(),
+                                    dirty_rows,
+                                    publication,
+                                }),
+                            })?;
+                        }
+                        ExpressionTask::OrderedIndexFullNext { state } => {
+                            let Some(row) = self.ordered_index_candidate_next_row(&state.candidate)
+                            else {
+                                let index_id = state.candidate.plan.id;
+                                let (_, index, report) =
+                                    self.finish_ordered_index_candidate(state.candidate, work)?;
+                                let other_payload =
+                                    self.ordered_index_payload_bytes_excluding(index_id);
+                                self.check_ordered_index_total_payload(
+                                    other_payload.saturating_add(report.payload_bytes()),
+                                    work,
+                                )?;
+                                self.ordered_indexes.insert(index_id, index);
+                                self.dirty_ordered_indexes.remove(&index_id);
+                                self.dirty_ordered_index_rows.remove(&index_id);
+                                self.publish_ordered_index_subscriber_changes(
+                                    index_id,
+                                    true,
+                                    &state.publication.dirty_rows_snapshot,
+                                    &state.publication.subscriptions,
+                                    &state.publication.old_cursors,
+                                    state.publication.requesting_consumer,
+                                    work,
+                                )?;
+                                self.record_ordered_index_footprint(work);
+                                return Ok(());
+                            };
+                            work.consume(1)?;
+                            let plan = state.candidate.plan.clone();
+                            if ordered_index_evaluations.len() >= stack.limit {
+                                return Err(Error::InvalidPlan(format!(
+                                    "ordered-index evaluation stack exceeded its plan-derived bound of {}",
+                                    stack.limit
+                                )));
+                            }
+                            if !self.evaluating_ordered_indexes.insert(plan.id) {
+                                return Err(Error::Evaluation(format!(
+                                    "typed ordered index {} forms a recursive key dependency",
+                                    plan.id.0
+                                )));
+                            }
+                            ordered_index_evaluations.push(plan.id);
+                            stack.push_task(ExpressionTask::OrderedIndexKeyNext {
+                                state: Box::new(OrderedIndexKeyEvaluationState {
+                                    plan,
+                                    row,
+                                    next_key: 0,
+                                    components: Vec::new(),
+                                }),
+                                continuation: OrderedIndexKeyContinuation::Full { state, row },
+                            })?;
+                        }
+                        ExpressionTask::OrderedIndexIncrementalNext { mut state } => {
+                            let Some(row) = state.remaining.next() else {
+                                let index_id = state.plan.id;
+                                if detached_ordered_index_order.last().copied() != Some(index_id) {
+                                    return Err(Error::InvalidPlan(format!(
+                                        "typed list index {} detached cleanup order is invalid",
+                                        index_id.0
+                                    )));
+                                }
+                                let detached = detached_ordered_indexes
+                                    .remove(&index_id)
+                                    .ok_or_else(|| {
+                                        Error::InvalidPlan(format!(
+                                            "typed list index {} detached image disappeared",
+                                            index_id.0
+                                        ))
+                                    })?;
+                                detached_ordered_index_order.pop();
+                                self.ordered_indexes.insert(index_id, detached.index);
+                                if let Some(rows) = self.dirty_ordered_index_rows.get_mut(&index_id)
+                                {
+                                    for row in &state.dirty_rows {
+                                        rows.remove(row);
+                                    }
+                                    if rows.is_empty() {
+                                        self.dirty_ordered_index_rows.remove(&index_id);
+                                    }
+                                }
+                                self.publish_ordered_index_subscriber_changes(
+                                    index_id,
+                                    false,
+                                    &state.dirty_rows,
+                                    &state.publication.subscriptions,
+                                    &state.publication.old_cursors,
+                                    state.publication.requesting_consumer,
+                                    work,
+                                )?;
+                                self.record_ordered_index_footprint(work);
+                                return Ok(());
+                            };
+                            work.metrics.ordered_index_incremental_row_count = work
+                                .metrics
+                                .ordered_index_incremental_row_count
+                                .saturating_add(1);
+                            if !self.row_exists(row) {
+                                let outcome = detached_ordered_indexes
+                                    .get_mut(&state.plan.id)
+                                    .ok_or_else(|| {
+                                        Error::InvalidPlan(format!(
+                                            "typed list index {} detached image disappeared",
+                                            state.plan.id.0
+                                        ))
+                                    })?
+                                    .index
+                                    .remove(access_row_id(row))
+                                    .map_err(|error| {
+                                        if matches!(
+                                            error,
+                                            AccessError::ResourceLimitExceeded { .. }
+                                        ) {
+                                            work.metrics
+                                                .ordered_index_resource_limit_failure_count = work
+                                                .metrics
+                                                .ordered_index_resource_limit_failure_count
+                                                .saturating_add(1);
+                                        }
+                                        Error::Evaluation(error.to_string())
+                                    })?;
+                                match outcome {
+                                    MutationOutcome::Removed => {
+                                        work.metrics.ordered_index_remove_count = work
+                                            .metrics
+                                            .ordered_index_remove_count
+                                            .saturating_add(1);
+                                    }
+                                    MutationOutcome::Inserted
+                                    | MutationOutcome::Updated
+                                    | MutationOutcome::Unchanged
+                                    | MutationOutcome::NotFound => {}
+                                }
+                                stack.push_task(ExpressionTask::OrderedIndexIncrementalNext {
+                                    state,
+                                })?;
+                                return Ok(());
+                            }
+                            let plan = state.plan.clone();
+                            if ordered_index_evaluations.len() >= stack.limit {
+                                return Err(Error::InvalidPlan(format!(
+                                    "ordered-index evaluation stack exceeded its plan-derived bound of {}",
+                                    stack.limit
+                                )));
+                            }
+                            if !self.evaluating_ordered_indexes.insert(plan.id) {
+                                return Err(Error::Evaluation(format!(
+                                    "typed ordered index {} forms a recursive key dependency",
+                                    plan.id.0
+                                )));
+                            }
+                            ordered_index_evaluations.push(plan.id);
+                            stack.push_task(ExpressionTask::OrderedIndexKeyNext {
+                                state: Box::new(OrderedIndexKeyEvaluationState {
+                                    plan,
+                                    row,
+                                    next_key: 0,
+                                    components: Vec::new(),
+                                }),
+                                continuation: OrderedIndexKeyContinuation::Incremental {
+                                    state,
+                                    row,
+                                },
+                            })?;
+                        }
+                        ExpressionTask::OrderedIndexKeyNext {
+                            mut state,
+                            continuation,
+                        } => {
+                            let Some(key) = state.plan.keys.get(state.next_key).cloned() else {
+                                let index_id = state.plan.id;
+                                if ordered_index_evaluations.last().copied() != Some(index_id) {
+                                    return Err(Error::InvalidPlan(format!(
+                                        "typed ordered index {} key-evaluation cleanup order is invalid",
+                                        index_id.0
+                                    )));
+                                }
+                                ordered_index_evaluations.pop();
+                                self.evaluating_ordered_indexes.remove(&index_id);
+                                let keys = finish_ordered_index_key_components(
+                                    &state.plan,
+                                    state.components,
+                                )?;
+                                work.metrics.ordered_index_key_evaluation_count = work
+                                    .metrics
+                                    .ordered_index_key_evaluation_count
+                                    .saturating_add(1);
+                                match continuation {
+                                    OrderedIndexKeyContinuation::Full { mut state, row } => {
+                                        let order_token =
+                                            self.ordered_source_token(&state.candidate.plan, row)?;
+                                        state
+                                            .candidate
+                                            .index
+                                            .as_mut()
+                                            .expect(
+                                                "candidate index exists while rows are inserted",
+                                            )
+                                            .insert_many(
+                                                access_row_id(row),
+                                                source_order_token(order_token),
+                                                keys,
+                                            )
+                                            .map_err(|error| {
+                                                if matches!(
+                                                    error,
+                                                    AccessError::ResourceLimitExceeded { .. }
+                                                ) {
+                                                    work.metrics
+                                                        .ordered_index_resource_limit_failure_count =
+                                                        work.metrics
+                                                            .ordered_index_resource_limit_failure_count
+                                                            .saturating_add(1);
+                                                }
+                                                Error::Evaluation(error.to_string())
+                                            })?;
+                                        state.candidate.next_row += 1;
+                                        stack.push_task(ExpressionTask::OrderedIndexFullNext {
+                                            state,
+                                        })?;
+                                    }
+                                    OrderedIndexKeyContinuation::Incremental { state, row } => {
+                                        let order_token = source_order_token(
+                                            self.ordered_source_token(&state.plan, row)?,
+                                        );
+                                        let detached = detached_ordered_indexes
+                                            .get_mut(&state.plan.id)
+                                            .ok_or_else(|| {
+                                                Error::InvalidPlan(format!(
+                                                    "typed list index {} detached image disappeared",
+                                                    state.plan.id.0
+                                                ))
+                                            })?;
+                                        let access_row = access_row_id(row);
+                                        let outcome = if detached.index.contains(access_row) {
+                                            detached.index.update_many(
+                                                access_row,
+                                                order_token,
+                                                keys,
+                                            )
+                                        } else {
+                                            detached.index.insert_many(
+                                                access_row,
+                                                order_token,
+                                                keys,
+                                            )
+                                        }
+                                        .map_err(|error| {
+                                            if matches!(
+                                                error,
+                                                AccessError::ResourceLimitExceeded { .. }
+                                            ) {
+                                                work.metrics
+                                                    .ordered_index_resource_limit_failure_count =
+                                                    work.metrics
+                                                        .ordered_index_resource_limit_failure_count
+                                                        .saturating_add(1);
+                                            }
+                                            Error::Evaluation(error.to_string())
+                                        })?;
+                                        match outcome {
+                                            MutationOutcome::Inserted => {
+                                                work.metrics.ordered_index_insert_count = work
+                                                    .metrics
+                                                    .ordered_index_insert_count
+                                                    .saturating_add(1);
+                                            }
+                                            MutationOutcome::Updated => {
+                                                work.metrics.ordered_index_update_count = work
+                                                    .metrics
+                                                    .ordered_index_update_count
+                                                    .saturating_add(1);
+                                            }
+                                            MutationOutcome::Removed => {
+                                                work.metrics.ordered_index_remove_count = work
+                                                    .metrics
+                                                    .ordered_index_remove_count
+                                                    .saturating_add(1);
+                                            }
+                                            MutationOutcome::Unchanged
+                                            | MutationOutcome::NotFound => {}
+                                        }
+                                        stack.push_task(
+                                            ExpressionTask::OrderedIndexIncrementalNext { state },
+                                        )?;
+                                    }
+                                }
+                                return Ok(());
+                            };
+                            let key_position = state.next_key;
+                            state.next_key += 1;
+                            let context = ExpressionContext {
+                                row: Some(state.row),
+                                event: None,
+                                output: None,
+                                consumer: None,
+                            };
+                            let row = state.row;
+                            let expression = key.expression;
+                            let local = (key.owner, key.row_local);
+                            stack.push_task(ExpressionTask::OrderedIndexKeyAfterValue {
+                                state,
+                                continuation,
+                                key_position,
+                            })?;
+                            schedule_isolated_expression(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                Some((EvalValue::Row(row), local)),
+                                expression,
+                                context,
+                            )?;
+                        }
+                        ExpressionTask::OrderedIndexKeyAfterValue {
+                            mut state,
+                            continuation,
+                            key_position,
+                        } => {
+                            let key = state.plan.keys.get(key_position).ok_or_else(|| {
+                                Error::InvalidPlan(format!(
+                                    "typed ordered index {} lost key component {}",
+                                    state.plan.id.0, key_position
+                                ))
+                            })?;
+                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            let values = match key.multiplicity {
+                                PlanListIndexKeyMultiplicity::One => {
+                                    vec![structural_index_value(key, value).map_err(|error| {
+                                        ordered_index_key_error(
+                                            &state.plan,
+                                            state.row,
+                                            key_position,
+                                            key,
+                                            error,
+                                        )
+                                    })?]
+                                }
+                                PlanListIndexKeyMultiplicity::ListItems { max_items } => {
+                                    let Value::List(values) = value else {
+                                        return Err(ordered_index_key_error(
+                                            &state.plan,
+                                            state.row,
+                                            key_position,
+                                            key,
+                                            Error::Evaluation(
+                                                "expanded typed index key did not evaluate as LIST"
+                                                    .to_owned(),
+                                            ),
+                                        ));
+                                    };
+                                    if values.len() > usize::from(max_items) {
+                                        return Err(ordered_index_key_error(
+                                            &state.plan,
+                                            state.row,
+                                            key_position,
+                                            key,
+                                            Error::Evaluation(format!(
+                                                "expanded typed index key produced {} items; maximum is {max_items}",
+                                                values.len()
+                                            )),
+                                        ));
+                                    }
+                                    values
+                                        .into_iter()
+                                        .map(|value| structural_index_value(key, value))
+                                        .collect::<Result<BTreeSet<_>, _>>()
+                                        .map_err(|error| {
+                                            ordered_index_key_error(
+                                                &state.plan,
+                                                state.row,
+                                                key_position,
+                                                key,
+                                                error,
+                                            )
+                                        })?
+                                        .into_iter()
+                                        .collect()
+                                }
+                            };
+                            state.components.push(values);
+                            stack.push_task(ExpressionTask::OrderedIndexKeyNext {
+                                state,
+                                continuation,
+                            })?;
+                        }
+                        ExpressionTask::FlushListAccessDependencies => {
+                            if self.list_access_flush_in_progress
+                                || !self.evaluating_ordered_indexes.is_empty()
+                                || self.dynamic_dependencies.by_list_access.is_empty()
+                            {
+                                return Ok(());
+                            }
+                            self.list_access_flush_in_progress = true;
+                            list_access_flush_started = true;
+                            stack.push_task(ExpressionTask::FinishListAccessDependenciesFlush)?;
+                            stack.push_task(ExpressionTask::FlushListAccessDependenciesPass {
+                                remaining_passes: metadata.list_indexes.len().saturating_add(1),
+                            })?;
+                        }
+                        ExpressionTask::FlushListAccessDependenciesPass { remaining_passes } => {
+                            if remaining_passes == 0 {
+                                return Err(Error::Evaluation(
+                                    "typed list access dependencies did not converge".to_owned(),
+                                ));
+                            }
+                            let dirty_indexes = self
+                                .dynamic_dependencies
+                                .by_list_access
+                                .keys()
+                                .map(|(index, _)| *index)
+                                .collect::<BTreeSet<_>>()
+                                .into_iter()
+                                .filter(|index| {
+                                    self.dirty_ordered_indexes.contains(index)
+                                        || self
+                                            .dirty_ordered_index_rows
+                                            .get(index)
+                                            .is_some_and(|rows| !rows.is_empty())
+                                })
+                                .collect::<Vec<_>>();
+                            if dirty_indexes.is_empty() {
+                                return Ok(());
+                            }
+                            stack.push_task(ExpressionTask::FlushListAccessDependenciesPass {
+                                remaining_passes: remaining_passes - 1,
+                            })?;
+                            for index in dirty_indexes.into_iter().rev() {
+                                stack.push_task(ExpressionTask::EnsureOrderedIndex {
+                                    index,
+                                    requesting_consumer: None,
+                                })?;
+                            }
+                        }
+                        ExpressionTask::FinishListAccessDependenciesFlush => {
+                            if !list_access_flush_started || !self.list_access_flush_in_progress {
+                                return Err(Error::InvalidPlan(
+                                    "typed list access flush cleanup is not active".to_owned(),
+                                ));
+                            }
+                            self.list_access_flush_in_progress = false;
+                            list_access_flush_started = false;
+                        }
+                        ExpressionTask::FinishWorkLimitCatch => {
+                            catch_frames.pop().ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "page WorkLimit catch continuation disappeared".to_owned(),
+                                )
+                            })?;
+                        }
+                        ExpressionTask::SelectAfterInput {
+                            expression,
+                            context,
+                        } => {
+                            let node = plan
+                                .row_expressions
+                                .node(expression)
+                                .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                            let PlanRowExpressionNode::Select { arms, .. } = node else {
+                                return Err(Error::InvalidPlan(format!(
+                                    "row expression {} lost its select continuation",
+                                    expression.0
+                                )));
+                            };
+                            let input = self.materialize_eval(stack.pop_value()?)?;
+                            let expression = arms
+                                .iter()
+                                .find_map(|arm| {
+                                    select_pattern_matches(&arm.pattern, &input)
+                                        .then_some(arm.value)
+                                })
+                                .ok_or_else(|| {
+                                    Error::Evaluation(format!(
+                                        "select has no matching arm for {input:?}"
+                                    ))
+                                })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::BuiltinAfterOperands {
+                            expression,
+                            value_base,
+                        } => {
+                            let node = plan
+                                .row_expressions
+                                .node(expression)
+                                .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                            let PlanRowExpressionNode::BuiltinCall {
+                                function,
+                                input: compiled_input,
+                                args: compiled_args,
+                            } = node
+                            else {
+                                return Err(Error::InvalidPlan(format!(
+                                    "row expression {} lost its builtin continuation",
+                                    expression.0
+                                )));
+                            };
+                            let function = *function;
+                            if value_base > stack.values.len() {
+                                return Err(Error::InvalidPlan(format!(
+                                    "{} has an invalid value-stack boundary",
+                                    function.function_name()
+                                )));
+                            }
+                            let mut next_value = || {
+                                if value_base >= stack.values.len() {
+                                    return Err(Error::InvalidPlan(format!(
+                                        "{} produced too few evaluated operands",
+                                        function.function_name()
+                                    )));
+                                }
+                                Ok(stack.values.remove(value_base))
+                            };
+                            let mut input = None;
+                            let mut args = EvaluatedBuiltinArgs::new();
+                            if function == PlanRowBuiltin::ListTake {
+                                args.insert("count", next_value()?)?;
+                                input = Some(next_value()?);
+                            } else {
+                                for parameter in function.signature().parameters {
+                                    if parameter.receiver {
+                                        if compiled_input.is_some() {
+                                            input = Some(next_value()?);
+                                        }
+                                    } else if compiled_args
+                                        .iter()
+                                        .any(|argument| argument.name == parameter.name)
+                                    {
+                                        args.insert(parameter.name, next_value()?)?;
+                                    }
+                                }
+                            }
+                            drop(next_value);
+                            if stack.values.len() != value_base {
+                                return Err(Error::InvalidPlan(format!(
+                                    "{} produced extra evaluated operands",
+                                    function.function_name()
+                                )));
+                            }
+                            let value = self.eval_builtin_values(function, input, args, work)?;
+                            stack.push_value(value)?;
+                        }
+                        ExpressionTask::BuiltinBoolAfterLeft {
+                            function,
+                            right,
+                            context,
+                        } => {
+                            let left = eval_to_bool(&stack.pop_value()?)?;
+                            let short_circuit = match function {
+                                PlanRowBuiltin::BoolAnd => !left,
+                                PlanRowBuiltin::BoolOr => left,
+                                _ => {
+                                    return Err(Error::InvalidPlan(
+                                        "non-boolean builtin used a boolean continuation"
+                                            .to_owned(),
+                                    ));
+                                }
+                            };
+                            if short_circuit {
+                                stack.push_value(EvalValue::Value(Value::Bool(left)))?;
+                            } else {
+                                stack.push_task(ExpressionTask::BuiltinBoolAfterRight)?;
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression: right,
+                                    context,
+                                })?;
+                            }
+                        }
+                        ExpressionTask::BuiltinBoolAfterRight => {
+                            let right = eval_to_bool(&stack.pop_value()?)?;
+                            stack.push_value(EvalValue::Value(Value::Bool(right)))?;
+                        }
+                        ExpressionTask::ContextualCollectionAfterSource {
+                            expression,
+                            owner,
+                            operation,
+                            row_local,
                             body,
                             context,
-                        )?;
-                    }
-                    ExpressionTask::IndexedContextualAfterPredicate {
-                        mut state,
-                        candidate,
-                        context,
-                    } => {
-                        let include = eval_to_bool(&stack.pop_value()?)?;
-                        if include {
+                        } => {
+                            let input = stack.pop_value()?;
+                            let input = match work
+                                .active_value_list_authorities
+                                .iter()
+                                .rev()
+                                .find(|authority| authority.owner == owner)
+                                .cloned()
+                            {
+                                Some(authority) => self.reconcile_value_list_authority(
+                                    &authority,
+                                    input,
+                                    context.row,
+                                    context.event,
+                                    context.consumer,
+                                    work,
+                                )?,
+                                None => input,
+                            };
+                            let (items, directions) = eval_to_ordered_items(input)?;
+                            let local = (owner, row_local);
+                            if bindings.contains_key(&local) {
+                                return Err(Error::InvalidPlan(format!(
+                                    "contextual owner {} local {} is already active",
+                                    owner.0, row_local.0
+                                )));
+                            }
+                            if matches!(
+                                operation,
+                                PlanContextualOperationKind::Map
+                                    | PlanContextualOperationKind::Filter
+                                    | PlanContextualOperationKind::Retain
+                                    | PlanContextualOperationKind::Remove
+                            ) {
+                                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                            }
+                            let capacity = items.len();
+                            stack.push_task(ExpressionTask::ContextualCollectionNext {
+                                state: Box::new(ContextualCollectionState {
+                                    expression,
+                                    owner,
+                                    operation,
+                                    local,
+                                    body,
+                                    remaining: items.into_iter(),
+                                    directions,
+                                    output: Vec::with_capacity(capacity),
+                                }),
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::ContextualCollectionNext { mut state, context } => {
+                            let Some(item) = state.remaining.next() else {
+                                let value = match state.operation {
+                                    PlanContextualOperationKind::Map
+                                    | PlanContextualOperationKind::Filter
+                                    | PlanContextualOperationKind::Retain
+                                    | PlanContextualOperationKind::Remove => {
+                                        eval_ordered_items(state.output, state.directions)
+                                    }
+                                    PlanContextualOperationKind::Every => {
+                                        EvalValue::Value(Value::Bool(true))
+                                    }
+                                    PlanContextualOperationKind::Any => {
+                                        EvalValue::Value(Value::Bool(false))
+                                    }
+                                    PlanContextualOperationKind::Find => {
+                                        EvalValue::Record(BTreeMap::from([(
+                                            "$tag".to_owned(),
+                                            EvalValue::Value(Value::Text("NotFound".to_owned())),
+                                        )]))
+                                    }
+                                };
+                                stack.push_value(value)?;
+                                return Ok(());
+                            };
+                            match state.operation {
+                                PlanContextualOperationKind::Map => {
+                                    let origin = eval_row_id(&item.value);
+                                    let local = state.local;
+                                    let body = state.body;
+                                    let binding_value = item.value.clone();
+                                    stack.push_task(
+                                        ExpressionTask::ContextualCollectionAfterMapBody {
+                                            state,
+                                            item: item.clone(),
+                                            origin,
+                                            context,
+                                        },
+                                    )?;
+                                    schedule_bound_expression(
+                                        &mut stack,
+                                        &mut binding_undos,
+                                        bindings,
+                                        (binding_value, local),
+                                        body,
+                                        context,
+                                    )?;
+                                }
+                                PlanContextualOperationKind::Filter
+                                | PlanContextualOperationKind::Retain
+                                | PlanContextualOperationKind::Remove
+                                | PlanContextualOperationKind::Every
+                                | PlanContextualOperationKind::Any
+                                | PlanContextualOperationKind::Find => {
+                                    if matches!(
+                                        state.operation,
+                                        PlanContextualOperationKind::Every
+                                            | PlanContextualOperationKind::Any
+                                            | PlanContextualOperationKind::Find
+                                    ) {
+                                        work.consume(1)?;
+                                    }
+                                    if state.operation == PlanContextualOperationKind::Find {
+                                        work.metrics.list_find_scan_count += 1;
+                                    }
+                                    let local = state.local;
+                                    let body = state.body;
+                                    let binding_value = item.value.clone();
+                                    stack.push_task(
+                                        ExpressionTask::ContextualCollectionAfterPredicate {
+                                            state,
+                                            item: item.clone(),
+                                            context,
+                                        },
+                                    )?;
+                                    schedule_bound_expression(
+                                        &mut stack,
+                                        &mut binding_undos,
+                                        bindings,
+                                        (binding_value, local),
+                                        body,
+                                        context,
+                                    )?;
+                                }
+                            }
+                        }
+                        ExpressionTask::ContextualCollectionAfterPredicate {
+                            mut state,
+                            item,
+                            context,
+                        } => {
+                            let matches = eval_to_bool(&stack.pop_value()?)?;
                             match state.operation {
                                 PlanContextualOperationKind::Filter
                                 | PlanContextualOperationKind::Retain => {
-                                    state.retained.push(EvalValue::Row(candidate));
+                                    if matches {
+                                        state.output.push(item);
+                                    }
                                 }
-                                PlanContextualOperationKind::Any => {
-                                    work.metrics.access_result_count =
-                                        work.metrics.access_result_count.saturating_add(1);
+                                PlanContextualOperationKind::Remove => {
+                                    if !matches {
+                                        state.output.push(item);
+                                    }
+                                }
+                                PlanContextualOperationKind::Every if !matches => {
+                                    stack.push_value(EvalValue::Value(Value::Bool(false)))?;
+                                    return Ok(());
+                                }
+                                PlanContextualOperationKind::Any if matches => {
                                     stack.push_value(EvalValue::Value(Value::Bool(true)))?;
-                                    continue;
+                                    return Ok(());
                                 }
-                                PlanContextualOperationKind::Find => {
-                                    work.metrics.access_result_count =
-                                        work.metrics.access_result_count.saturating_add(1);
+                                PlanContextualOperationKind::Find if matches => {
                                     stack.push_value(EvalValue::Record(BTreeMap::from([
                                         (
                                             "$tag".to_owned(),
                                             EvalValue::Value(Value::Text("Found".to_owned())),
                                         ),
-                                        ("value".to_owned(), EvalValue::Row(candidate)),
+                                        ("value".to_owned(), item.value),
                                     ])))?;
-                                    continue;
+                                    return Ok(());
                                 }
-                                operation => {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "typed contextual access is not valid for {operation:?}"
-                                    )));
+                                PlanContextualOperationKind::Map => {
+                                    return Err(Error::InvalidPlan(
+                                        "map used a predicate continuation".to_owned(),
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            stack.push_task(ExpressionTask::ContextualCollectionNext {
+                                state,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::ContextualCollectionAfterMapBody {
+                            state,
+                            item,
+                            origin,
+                            context,
+                        } => {
+                            let mapped = stack.pop_value()?;
+                            stack.push_task(ExpressionTask::ContextualMapCaptureNext {
+                                state: Box::new(ContextualMapCaptureState {
+                                    collection: state,
+                                    item,
+                                    origin,
+                                    mapped,
+                                    next_capture: 0,
+                                    evaluated_captures: BTreeMap::new(),
+                                }),
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::ContextualMapCaptureNext { mut state, context } => {
+                            let node = plan
+                                .row_expressions
+                                .node(state.collection.expression)
+                                .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                            let PlanRowExpressionNode::ContextualCollection { captures, .. } = node
+                            else {
+                                return Err(Error::InvalidPlan(format!(
+                                    "row expression {} lost its contextual collection continuation",
+                                    state.collection.expression.0
+                                )));
+                            };
+                            let Some(capture) = captures.get(state.next_capture) else {
+                                state.item.value = match (
+                                    state.origin,
+                                    state.mapped,
+                                    state.evaluated_captures,
+                                ) {
+                                    (Some(id), EvalValue::Record(fields), captures) => {
+                                        EvalValue::MappedRow {
+                                            id,
+                                            fields,
+                                            captures,
+                                        }
+                                    }
+                                    (_, value, captures) if captures.is_empty() => value,
+                                    _ => {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "contextual owner {} captures state for a map without a stored source row and typed record result",
+                                            state.collection.owner.0
+                                        )));
+                                    }
+                                };
+                                state.collection.output.push(state.item);
+                                stack.push_task(ExpressionTask::ContextualCollectionNext {
+                                    state: state.collection,
+                                    context,
+                                })?;
+                                return Ok(());
+                            };
+                            let capture_field = capture.field;
+                            let capture_value = capture.value;
+                            if !self.metadata.capture_fields.contains(&capture_field) {
+                                return Err(Error::InvalidPlan(format!(
+                                    "contextual owner {} writes non-capture field {}",
+                                    state.collection.owner.0, capture_field.0
+                                )));
+                            }
+                            state.next_capture += 1;
+                            let binding_value = state.item.value.clone();
+                            let local = state.collection.local;
+                            stack.push_task(ExpressionTask::ContextualMapCaptureAfterValue {
+                                state,
+                                field: capture_field,
+                                context,
+                            })?;
+                            schedule_bound_expression(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                (binding_value, local),
+                                capture_value,
+                                context,
+                            )?;
+                        }
+                        ExpressionTask::ContextualMapCaptureAfterValue {
+                            mut state,
+                            field,
+                            context,
+                        } => {
+                            let captured = stack.pop_value()?;
+                            if state.evaluated_captures.insert(field, captured).is_some() {
+                                return Err(Error::InvalidPlan(format!(
+                                    "contextual owner {} writes capture field {} more than once",
+                                    state.collection.owner.0, field.0
+                                )));
+                            }
+                            stack.push_task(ExpressionTask::ContextualMapCaptureNext {
+                                state,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::ContextualOrderAfterSource {
+                            operation,
+                            owner,
+                            row_local,
+                            key,
+                            direction,
+                            context,
+                        } => {
+                            let (items, directions) = eval_to_ordered_items(stack.pop_value()?)?;
+                            stack.push_task(ExpressionTask::ContextualOrderAfterDirection {
+                                operation,
+                                owner,
+                                row_local,
+                                key,
+                                items,
+                                directions,
+                                context,
+                            })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression: direction,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::ContextualOrderAfterDirection {
+                            operation,
+                            owner,
+                            row_local,
+                            key,
+                            mut items,
+                            mut directions,
+                            context,
+                        } => {
+                            if operation == PlanOrderOperationKind::ThenBy && directions.is_none() {
+                                return Err(Error::InvalidPlan(
+                                "List/then_by requires a compatible preceding typed order chain"
+                                    .to_owned(),
+                            ));
+                            }
+                            if operation == PlanOrderOperationKind::SortBy {
+                                directions = Some(Vec::new());
+                                for item in &mut items {
+                                    item.keys.clear();
                                 }
                             }
+                            let direction = eval_order_direction(&stack.pop_value()?)?;
+                            let local = (owner, row_local);
+                            if bindings.contains_key(&local) {
+                                return Err(Error::InvalidPlan(format!(
+                                    "contextual owner {} local {} is already active",
+                                    owner.0, row_local.0
+                                )));
+                            }
+                            work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                            let mut directions = directions.unwrap_or_default();
+                            directions.push(direction);
+                            let capacity = items.len();
+                            stack.push_task(ExpressionTask::ContextualOrderNext {
+                                state: Box::new(ContextualOrderState {
+                                    local,
+                                    key,
+                                    remaining: items.into_iter(),
+                                    ordered: Vec::with_capacity(capacity),
+                                    directions,
+                                }),
+                                context,
+                            })?;
                         }
-                        stack
-                            .push_task(ExpressionTask::IndexedContextualNext { state, context })?;
-                    }
-                    ExpressionTask::RestoreBinding { undo } => {
-                        if undo + 1 != binding_undos.len() {
-                            return Err(Error::InvalidPlan(
-                                "contextual binding continuation order is invalid".to_owned(),
-                            ));
+                        ExpressionTask::ContextualOrderNext { mut state, context } => {
+                            let Some(item) = state.remaining.next() else {
+                                state.ordered.sort_by(|left, right| {
+                                    compare_ordered_items(left, right, &state.directions)
+                                });
+                                stack.push_value(EvalValue::OrderedList {
+                                    items: state.ordered,
+                                    directions: state.directions,
+                                })?;
+                                return Ok(());
+                            };
+                            let local = state.local;
+                            let key = state.key;
+                            let binding_value = item.value.clone();
+                            stack.push_task(ExpressionTask::ContextualOrderAfterKey {
+                                state,
+                                item: item.clone(),
+                                context,
+                            })?;
+                            schedule_bound_expression(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                (binding_value, local),
+                                key,
+                                context,
+                            )?;
                         }
-                        restore_expression_binding(
-                            bindings,
-                            binding_undos.pop().expect("binding undo checked above"),
-                        );
+                        ExpressionTask::ContextualOrderAfterKey {
+                            mut state,
+                            mut item,
+                            context,
+                        } => {
+                            let evaluated = self.materialize_eval(stack.pop_value()?)?;
+                            item.keys.push(eval_order_key(evaluated)?);
+                            state.ordered.push(item);
+                            stack.push_task(ExpressionTask::ContextualOrderNext {
+                                state,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::IndexedContextualNext { mut state, context } => {
+                            let Some(candidate) = state.remaining.next() else {
+                                let (value, result_count) = match state.operation {
+                                    PlanContextualOperationKind::Filter
+                                    | PlanContextualOperationKind::Retain => {
+                                        let result_count = state.retained.len();
+                                        (EvalValue::List(state.retained), result_count)
+                                    }
+                                    PlanContextualOperationKind::Any => {
+                                        (EvalValue::Value(Value::Bool(false)), 0)
+                                    }
+                                    PlanContextualOperationKind::Find => (
+                                        EvalValue::Record(BTreeMap::from([(
+                                            "$tag".to_owned(),
+                                            EvalValue::Value(Value::Text("NotFound".to_owned())),
+                                        )])),
+                                        0,
+                                    ),
+                                    operation => {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "typed contextual access is not valid for {operation:?}"
+                                        )));
+                                    }
+                                };
+                                work.metrics.access_result_count =
+                                    work.metrics.access_result_count.saturating_add(
+                                        u64::try_from(result_count).unwrap_or(u64::MAX),
+                                    );
+                                stack.push_value(value)?;
+                                return Ok(());
+                            };
+                            let local = state.local;
+                            let body = state.body;
+                            stack.push_task(ExpressionTask::IndexedContextualAfterPredicate {
+                                state,
+                                candidate,
+                                context,
+                            })?;
+                            schedule_bound_expression(
+                                &mut stack,
+                                &mut binding_undos,
+                                bindings,
+                                (EvalValue::Row(candidate), local),
+                                body,
+                                context,
+                            )?;
+                        }
+                        ExpressionTask::IndexedContextualAfterPredicate {
+                            mut state,
+                            candidate,
+                            context,
+                        } => {
+                            let include = eval_to_bool(&stack.pop_value()?)?;
+                            if include {
+                                match state.operation {
+                                    PlanContextualOperationKind::Filter
+                                    | PlanContextualOperationKind::Retain => {
+                                        state.retained.push(EvalValue::Row(candidate));
+                                    }
+                                    PlanContextualOperationKind::Any => {
+                                        work.metrics.access_result_count =
+                                            work.metrics.access_result_count.saturating_add(1);
+                                        stack.push_value(EvalValue::Value(Value::Bool(true)))?;
+                                        return Ok(());
+                                    }
+                                    PlanContextualOperationKind::Find => {
+                                        work.metrics.access_result_count =
+                                            work.metrics.access_result_count.saturating_add(1);
+                                        stack.push_value(EvalValue::Record(BTreeMap::from([
+                                            (
+                                                "$tag".to_owned(),
+                                                EvalValue::Value(Value::Text("Found".to_owned())),
+                                            ),
+                                            ("value".to_owned(), EvalValue::Row(candidate)),
+                                        ])))?;
+                                        return Ok(());
+                                    }
+                                    operation => {
+                                        return Err(Error::InvalidPlan(format!(
+                                            "typed contextual access is not valid for {operation:?}"
+                                        )));
+                                    }
+                                }
+                            }
+                            stack.push_task(ExpressionTask::IndexedContextualNext {
+                                state,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::RestoreBinding { undo } => {
+                            if undo + 1 != binding_undos.len() {
+                                return Err(Error::InvalidPlan(
+                                    "contextual binding continuation order is invalid".to_owned(),
+                                ));
+                            }
+                            restore_expression_binding(
+                                bindings,
+                                binding_undos.pop().expect("binding undo checked above"),
+                            );
+                        }
                     }
+                    Ok(())
+                })();
+                if let Err(error) = task_result {
+                    if matches!(error, Error::WorkBudgetExceeded { .. })
+                        && let Some(frame) = catch_frames.pop()
+                    {
+                        stack.tasks.truncate(frame.task_depth);
+                        stack.values.truncate(frame.value_depth);
+                        while binding_undos.len() > frame.binding_depth {
+                            restore_expression_binding(
+                                bindings,
+                                binding_undos
+                                    .pop()
+                                    .expect("binding depth checked before catch unwind"),
+                            );
+                        }
+                        while currentness_targets.len() > frame.currentness_depth {
+                            self.rollback_expression_currentness(
+                                currentness_targets
+                                    .pop()
+                                    .expect("currentness depth checked before catch unwind"),
+                            );
+                        }
+                        work.active_value_list_authorities
+                            .truncate(frame.authority_depth);
+                        while detached_ordered_index_order.len() > frame.detached_index_depth {
+                            let index_id = detached_ordered_index_order
+                                .pop()
+                                .expect("detached index depth checked before catch unwind");
+                            if let Some(detached) = detached_ordered_indexes.remove(&index_id) {
+                                self.ordered_indexes.insert(index_id, detached.index);
+                                self.dirty_ordered_index_rows
+                                    .entry(index_id)
+                                    .or_default()
+                                    .extend(detached.rollback_dirty_rows);
+                            }
+                        }
+                        while ordered_index_evaluations.len() > frame.ordered_index_evaluation_depth
+                        {
+                            let index = ordered_index_evaluations
+                                .pop()
+                                .expect("ordered index depth checked before catch unwind");
+                            self.evaluating_ordered_indexes.remove(&index);
+                        }
+                        for cleanup in access_cleanups
+                            .drain(frame.access_cleanup_depth..)
+                            .flatten()
+                        {
+                            if matches!(cleanup.kind, AccessCleanupKind::ListAccess) {
+                                record_access_metrics(work, cleanup.metrics, 0);
+                            }
+                        }
+                        if list_access_flush_started && !frame.list_access_flush_started {
+                            self.list_access_flush_in_progress = false;
+                            list_access_flush_started = false;
+                        }
+                        work.metrics.access_work_limit_failure_count = work
+                            .metrics
+                            .access_work_limit_failure_count
+                            .saturating_add(1);
+                        match frame.kind {
+                            WorkLimitCatchKind::Page => {
+                                stack.push_value(page_terminal_variant("PageWorkLimitExceeded"))?;
+                            }
+                        }
+                        continue;
+                    }
+                    return Err(error);
                 }
             }
             if stack.values.len() != 1 {
@@ -19832,6 +24342,26 @@ impl MachineInstance {
         }
         while let Some(target) = currentness_targets.pop() {
             self.rollback_expression_currentness(target);
+        }
+        for cleanup in access_cleanups.into_iter().flatten() {
+            if matches!(cleanup.kind, AccessCleanupKind::ListAccess) {
+                record_access_metrics(work, cleanup.metrics, 0);
+            }
+        }
+        while let Some(index) = ordered_index_evaluations.pop() {
+            self.evaluating_ordered_indexes.remove(&index);
+        }
+        while let Some(index_id) = detached_ordered_index_order.pop() {
+            if let Some(detached) = detached_ordered_indexes.remove(&index_id) {
+                self.ordered_indexes.insert(index_id, detached.index);
+                self.dirty_ordered_index_rows
+                    .entry(index_id)
+                    .or_default()
+                    .extend(detached.rollback_dirty_rows);
+            }
+        }
+        if list_access_flush_started {
+            self.list_access_flush_in_progress = false;
         }
         work.active_value_list_authorities.truncate(authority_depth);
         result
@@ -20092,45 +24622,6 @@ impl MachineInstance {
                         .map_err(|_| Error::Evaluation("List/sum overflow".to_owned()))?,
                 ))
             }
-            PlanRowExpressionNode::Object { fields } => {
-                let mut record = BTreeMap::new();
-                for field in fields {
-                    let value = next()?;
-                    if field.spread {
-                        self.extend_record_from_spread(
-                            &mut record,
-                            value,
-                            context.event,
-                            context.consumer,
-                            work,
-                        )?;
-                    } else {
-                        record.insert(field.name.clone(), value);
-                    }
-                }
-                EvalValue::Record(record)
-            }
-            PlanRowExpressionNode::TaggedObject { tag, fields } => {
-                let mut record = BTreeMap::from([(
-                    "$tag".to_owned(),
-                    EvalValue::Value(Value::Text(tag.clone())),
-                )]);
-                for field in fields {
-                    let value = next()?;
-                    if field.spread {
-                        self.extend_record_from_spread(
-                            &mut record,
-                            value,
-                            context.event,
-                            context.consumer,
-                            work,
-                        )?;
-                    } else {
-                        record.insert(field.name.clone(), value);
-                    }
-                }
-                EvalValue::Record(record)
-            }
             PlanRowExpressionNode::ObjectField { field, .. } => {
                 self.eval_object_field(next()?, field, context.consumer)?
             }
@@ -20150,6 +24641,8 @@ impl MachineInstance {
             | PlanRowExpressionNode::EventRow { .. }
             | PlanRowExpressionNode::ListRowField { .. }
             | PlanRowExpressionNode::BuiltinCall { .. }
+            | PlanRowExpressionNode::Object { .. }
+            | PlanRowExpressionNode::TaggedObject { .. }
             | PlanRowExpressionNode::Select { .. } => {
                 return Err(Error::InvalidPlan(format!(
                     "row expression {} reached an invalid apply continuation",
@@ -20190,427 +24683,6 @@ impl MachineInstance {
             }
         }
         result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_list_access_selection(
-        &mut self,
-        selection: &PlanListAccessSelection,
-        index_plan: &PlanListIndex,
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        bindings: &mut PlanLocalBindings,
-        work: &mut Work,
-    ) -> Result<(EvaluatedListAccessSelection, Vec<Value>), Error> {
-        let mut tasks = vec![ListAccessSelectionTask::Evaluate(selection)];
-        let mut values = Vec::<(EvaluatedListAccessSelection, Vec<Value>)>::new();
-        while let Some(task) = tasks.pop() {
-            match task {
-                ListAccessSelectionTask::Evaluate(selection) => match selection {
-                    PlanListAccessSelection::OrderedStart => {
-                        values.push((EvaluatedListAccessSelection::OrderedStart, Vec::new()))
-                    }
-                    PlanListAccessSelection::KeyPrefix {
-                        values: expressions,
-                    } => {
-                        let mut evaluated = Vec::with_capacity(expressions.len());
-                        let mut captures = Vec::with_capacity(expressions.len());
-                        for (position, expression) in expressions.iter().enumerate() {
-                            let key = index_plan.keys.get(position).ok_or_else(|| {
-                                Error::InvalidPlan(format!(
-                                    "typed list key prefix component {position} exceeds index {} arity",
-                                    index_plan.id.0
-                                ))
-                            })?;
-                            let value = self.eval_row_expression(
-                                expression, row, event, output, consumer, bindings, work,
-                            )?;
-                            let value = self.materialize_eval(value)?;
-                            evaluated.push(structural_index_value(key, value.clone())?);
-                            captures.push(value);
-                        }
-                        values.push((
-                            EvaluatedListAccessSelection::KeyPrefix { values: evaluated },
-                            captures,
-                        ));
-                    }
-                    PlanListAccessSelection::TextPrefix { leading, prefix } => {
-                        let mut evaluated = Vec::with_capacity(leading.len());
-                        let mut captures = Vec::with_capacity(leading.len().saturating_add(1));
-                        for (position, expression) in leading.iter().enumerate() {
-                            let key = index_plan.keys.get(position).ok_or_else(|| {
-                                Error::InvalidPlan(format!(
-                                    "typed list Text prefix component {position} exceeds index {} arity",
-                                    index_plan.id.0
-                                ))
-                            })?;
-                            let value = self.eval_row_expression(
-                                expression, row, event, output, consumer, bindings, work,
-                            )?;
-                            let value = self.materialize_eval(value)?;
-                            evaluated.push(structural_index_value(key, value.clone())?);
-                            captures.push(value);
-                        }
-                        let prefix = self.eval_row_expression(
-                            prefix, row, event, output, consumer, bindings, work,
-                        )?;
-                        let prefix = eval_to_text(&prefix)?;
-                        captures.push(Value::Text(prefix.clone()));
-                        values.push((
-                            EvaluatedListAccessSelection::TextPrefix {
-                                leading: evaluated,
-                                prefix,
-                            },
-                            captures,
-                        ));
-                    }
-                    PlanListAccessSelection::ComponentRange {
-                        leading,
-                        lower,
-                        upper,
-                    } => {
-                        let mut evaluated = Vec::with_capacity(leading.len());
-                        let mut captures = Vec::with_capacity(
-                            leading
-                                .len()
-                                .saturating_add(usize::from(lower.is_some()))
-                                .saturating_add(usize::from(upper.is_some())),
-                        );
-                        for (position, expression) in leading.iter().enumerate() {
-                            let key = index_plan.keys.get(position).ok_or_else(|| {
-                                Error::InvalidPlan(format!(
-                                    "typed list range component {position} exceeds index {} arity",
-                                    index_plan.id.0
-                                ))
-                            })?;
-                            let value = self.eval_row_expression(
-                                expression, row, event, output, consumer, bindings, work,
-                            )?;
-                            let value = self.materialize_eval(value)?;
-                            evaluated.push(structural_index_value(key, value.clone())?);
-                            captures.push(value);
-                        }
-                        let target = index_plan.keys.get(leading.len()).ok_or_else(|| {
-                            Error::InvalidPlan(format!(
-                                "typed list range has no component {} in index {}",
-                                leading.len(),
-                                index_plan.id.0
-                            ))
-                        })?;
-                        let mut evaluate_bound = |bound: &boon_plan::PlanListAccessBound| {
-                            let value = self.eval_row_expression(
-                                &bound.value,
-                                row,
-                                event,
-                                output,
-                                consumer,
-                                bindings,
-                                work,
-                            )?;
-                            let value = self.materialize_eval(value)?;
-                            let structural = structural_index_value(target, value.clone())?;
-                            captures.push(value);
-                            Ok::<_, Error>((structural, bound.inclusive))
-                        };
-                        let lower = lower.as_ref().map(&mut evaluate_bound).transpose()?;
-                        let upper = upper.as_ref().map(&mut evaluate_bound).transpose()?;
-                        values.push((
-                            EvaluatedListAccessSelection::ComponentRange {
-                                leading: evaluated,
-                                lower,
-                                upper,
-                            },
-                            captures,
-                        ));
-                    }
-                    PlanListAccessSelection::Union { branches }
-                    | PlanListAccessSelection::Intersection { branches } => {
-                        let additional = branches.len().saturating_add(1);
-                        if tasks.len().saturating_add(additional)
-                            > MAX_LIST_ACCESS_SELECTION_CONTINUATIONS
-                        {
-                            return Err(Error::InvalidPlan(format!(
-                                "list access selection continuation stack exceeded its checked bound of {}",
-                                MAX_LIST_ACCESS_SELECTION_CONTINUATIONS
-                            )));
-                        }
-                        let kind = match selection {
-                            PlanListAccessSelection::Union { .. } => {
-                                ListAccessSelectionBranchKind::Union
-                            }
-                            PlanListAccessSelection::Intersection { .. } => {
-                                ListAccessSelectionBranchKind::Intersection
-                            }
-                            _ => unreachable!(),
-                        };
-                        tasks.push(ListAccessSelectionTask::FinishBranches {
-                            kind,
-                            value_base: values.len(),
-                            branch_count: branches.len(),
-                        });
-                        for branch in branches.iter().rev() {
-                            tasks.push(ListAccessSelectionTask::Evaluate(branch));
-                        }
-                    }
-                },
-                ListAccessSelectionTask::FinishBranches {
-                    kind,
-                    value_base,
-                    branch_count,
-                } => {
-                    if values.len() != value_base.saturating_add(branch_count) {
-                        return Err(Error::InvalidPlan(
-                            "list access selection branch continuation produced an invalid value count"
-                                .to_owned(),
-                        ));
-                    }
-                    let mut branches = Vec::with_capacity(branch_count);
-                    let mut captures = Vec::new();
-                    for (branch, branch_captures) in values.drain(value_base..) {
-                        branches.push(branch);
-                        captures.extend(branch_captures);
-                    }
-                    let selection = match kind {
-                        ListAccessSelectionBranchKind::Union => {
-                            EvaluatedListAccessSelection::Union { branches }
-                        }
-                        ListAccessSelectionBranchKind::Intersection => {
-                            EvaluatedListAccessSelection::Intersection { branches }
-                        }
-                    };
-                    values.push((selection, captures));
-                }
-            }
-        }
-        if values.len() != 1 {
-            return Err(Error::InvalidPlan(format!(
-                "list access selection evaluation completed with {} values",
-                values.len()
-            )));
-        }
-        values.pop().ok_or_else(|| {
-            Error::InvalidPlan("list access selection evaluation produced no root value".to_owned())
-        })
-    }
-    fn evaluate_bounded_list_page(
-        &mut self,
-        page: &PlanBoundedListPage,
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        bindings: &mut PlanLocalBindings,
-        work: &mut Work,
-    ) -> Result<EvalValue, Error> {
-        match self
-            .evaluate_bounded_list_page_inner(page, row, event, output, consumer, bindings, work)
-        {
-            Err(Error::WorkBudgetExceeded { .. }) => {
-                work.metrics.access_work_limit_failure_count = work
-                    .metrics
-                    .access_work_limit_failure_count
-                    .saturating_add(1);
-                Ok(page_terminal_variant("PageWorkLimitExceeded"))
-            }
-            result => result,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_bounded_list_page_inner(
-        &mut self,
-        page: &PlanBoundedListPage,
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        bindings: &mut PlanLocalBindings,
-        work: &mut Work,
-    ) -> Result<EvalValue, Error> {
-        let size =
-            self.eval_row_expression(&page.size, row, event, output, consumer, bindings, work)?;
-        let Ok(size) = eval_to_integer(&size) else {
-            return Ok(page_terminal_variant("InvalidPageSize"));
-        };
-        if !(1..=10_000).contains(&size) {
-            return Ok(page_terminal_variant("InvalidPageSize"));
-        }
-        let size = usize::try_from(size).expect("positive page size fits usize");
-
-        let view =
-            self.eval_row_expression(&page.view, row, event, output, consumer, bindings, work)?;
-        let evaluated = eval_to_list(view)?;
-        if evaluated.len() > page.max_items as usize {
-            work.metrics.access_work_limit_failure_count = work
-                .metrics
-                .access_work_limit_failure_count
-                .saturating_add(1);
-            return Ok(page_terminal_variant("PageWorkLimitExceeded"));
-        }
-        work.metrics.bounded_page_scan_count =
-            work.metrics.bounded_page_scan_count.saturating_add(1);
-        work.metrics.bounded_page_candidate_count = work
-            .metrics
-            .bounded_page_candidate_count
-            .saturating_add(u64::try_from(evaluated.len()).unwrap_or(u64::MAX));
-        work.consume(evaluated.len().try_into().unwrap_or(u64::MAX))?;
-        let items = evaluated
-            .into_iter()
-            .map(|value| self.materialize_page_value(value, event, work))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let authority_revision = self.bounded_page_authority_revision(page.view)?;
-        let mut captures =
-            self.evaluate_bounded_page_captures(page.view, row, event, output, consumer, work)?;
-        captures.push(Value::List(items.clone()));
-        let owner_scope = row
-            .map(|row| {
-                self.row_owner_ancestors(row).map(|owners| {
-                    owners
-                        .iter()
-                        .map(|owner| RowId {
-                            list: owner.list,
-                            key: owner.key,
-                            generation: owner.generation,
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let principal_scope = self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal);
-        let capture_fingerprint = capture_fingerprint(
-            page.view_fingerprint,
-            self.cursor_ephemeral_launch_epoch,
-            self.options.cursor_scope_fingerprint.as_ref(),
-            &owner_scope,
-            &principal_scope,
-            captures.iter(),
-            self,
-        )
-        .map_err(|_| {
-            Error::InvalidPlan(
-                "bounded page cursor capture has no canonical memory identity".to_owned(),
-            )
-        })?;
-
-        let after =
-            self.eval_row_expression(&page.after, row, event, output, consumer, bindings, work)?;
-        let after = self.materialize_eval(after)?;
-        let accepted_offset = match page_position_bytes(&after) {
-            Ok(None) => 0,
-            Ok(Some(bytes)) => {
-                let cursor = match open_cursor(&self.cursor_sealing_key, &bytes) {
-                    Ok(cursor) => cursor,
-                    Err(_) => return Ok(page_terminal_variant("InvalidPageCursor")),
-                };
-                if cursor.view_fingerprint != page.view_fingerprint
-                    || cursor.capture_fingerprint != capture_fingerprint
-                {
-                    return Ok(page_terminal_variant("InvalidPageCursor"));
-                }
-                if cursor.authority_revision != authority_revision {
-                    return Ok(page_terminal_variant("PageExpired"));
-                }
-                if !cursor.semantic_key.parts().is_empty()
-                    || cursor.accepted_offset == 0
-                    || cursor.accepted_offset > items.len() as u64
-                {
-                    return Ok(page_terminal_variant("InvalidPageCursor"));
-                }
-                let previous = usize::try_from(cursor.accepted_offset - 1)
-                    .map_err(|_| Error::Evaluation("page cursor offset overflow".to_owned()))?;
-                let (source_order, row_id) =
-                    bounded_page_position(cursor.accepted_offset, &items[previous], self).map_err(
-                        |_| {
-                            Error::InvalidPlan(
-                                "bounded page continuation has no canonical memory identity"
-                                    .to_owned(),
-                            )
-                        },
-                    )?;
-                if cursor.source_order != source_order || cursor.row_id != row_id {
-                    return Ok(page_terminal_variant("InvalidPageCursor"));
-                }
-                cursor.accepted_offset
-            }
-            Err(()) => return Ok(page_terminal_variant("InvalidPageCursor")),
-        };
-        let offset = usize::try_from(accepted_offset)
-            .map_err(|_| Error::Evaluation("page cursor offset overflow".to_owned()))?;
-        let end = offset.saturating_add(size).min(items.len());
-        let page_items = items[offset..end].to_vec();
-        let next = if end < items.len() {
-            let accepted_offset = u64::try_from(end).unwrap_or(u64::MAX);
-            let (source_order, row_id) =
-                bounded_page_position(accepted_offset, &items[end - 1], self).map_err(|_| {
-                    Error::InvalidPlan(
-                        "bounded page result has no canonical memory identity".to_owned(),
-                    )
-                })?;
-            let cursor = PageCursor {
-                view_fingerprint: page.view_fingerprint,
-                authority_revision,
-                capture_fingerprint,
-                accepted_offset,
-                semantic_key: StructuralKey::new(Vec::new())
-                    .expect("empty bounded page key is valid"),
-                source_order,
-                row_id,
-            };
-            match seal_cursor(&self.cursor_sealing_key, &cursor) {
-                Ok(cursor) => Some(cursor),
-                Err(CursorError::TooLarge) => {
-                    return Ok(page_terminal_variant("PageWorkLimitExceeded"));
-                }
-                Err(CursorError::Invalid | CursorError::Randomness) => {
-                    return Err(Error::Evaluation(
-                        "failed to seal bounded typed list page cursor".to_owned(),
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-        work.metrics.access_result_count = work
-            .metrics
-            .access_result_count
-            .saturating_add(u64::try_from(page_items.len()).unwrap_or(u64::MAX));
-        Ok(page_result(page_items, next))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_bounded_page_captures(
-        &mut self,
-        view: PlanRowExpressionId,
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        work: &mut Work,
-    ) -> Result<Vec<Value>, Error> {
-        let mut inputs = BTreeSet::new();
-        self.plan
-            .row_expressions
-            .visit_value_refs(view, &mut |input| {
-                let row_field = matches!(
-                    input,
-                    ValueRef::Field(field)
-                        if self.metadata.row_field_owner.contains_key(field)
-                );
-                if !row_field && !matches!(input, ValueRef::Constant(_) | ValueRef::List(_)) {
-                    inputs.insert(input.clone());
-                }
-            })
-            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
-        let mut captures = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let value = self.eval_value_ref(&input, row, event, output, consumer, work)?;
-            captures.push(self.materialize_eval(value)?);
-        }
-        Ok(captures)
     }
 
     fn bounded_page_authority_revision(&self, view: PlanRowExpressionId) -> Result<u64, Error> {
@@ -20679,868 +24751,6 @@ impl MachineInstance {
                 .try_into()
                 .expect("SHA-256 prefix has eight bytes"),
         ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_list_page(
-        &mut self,
-        page: &PlanListPage,
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        bindings: &mut PlanLocalBindings,
-        work: &mut Work,
-    ) -> Result<EvalValue, Error> {
-        match self.evaluate_list_page_inner(page, row, event, output, consumer, bindings, work) {
-            Err(Error::WorkBudgetExceeded { .. }) => {
-                work.metrics.access_work_limit_failure_count = work
-                    .metrics
-                    .access_work_limit_failure_count
-                    .saturating_add(1);
-                Ok(page_terminal_variant("PageWorkLimitExceeded"))
-            }
-            result => result,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_list_page_inner(
-        &mut self,
-        page: &PlanListPage,
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        bindings: &mut PlanLocalBindings,
-        work: &mut Work,
-    ) -> Result<EvalValue, Error> {
-        let metadata = Arc::clone(&self.metadata);
-        let index_plan = metadata
-            .list_indexes
-            .get(&page.access.index)
-            .ok_or_else(|| {
-                Error::InvalidPlan(format!(
-                    "typed list page references missing index {}",
-                    page.access.index.0
-                ))
-            })?;
-
-        let size = self.eval_row_expression(
-            &page.access.limit,
-            row,
-            event,
-            output,
-            consumer,
-            bindings,
-            work,
-        )?;
-        let Ok(size) = eval_to_integer(&size) else {
-            return Ok(page_terminal_variant("InvalidPageSize"));
-        };
-        if !(1..=10_000).contains(&size) {
-            return Ok(page_terminal_variant("InvalidPageSize"));
-        }
-        let size = usize::try_from(size).expect("positive page size fits usize");
-
-        let (view_limit, view_limit_capture) = match &page.view_limit {
-            Some(limit) => {
-                let value =
-                    self.eval_row_expression(limit, row, event, output, consumer, bindings, work)?;
-                let count = u64::try_from(eval_to_integer(&value)?).map_err(|_| {
-                    Error::Evaluation(
-                        "List/take count before List/page must be a non-negative integer"
-                            .to_owned(),
-                    )
-                })?;
-                (count, Some(self.materialize_eval(value)?))
-            }
-            None => (u64::MAX, None),
-        };
-
-        let guard_matches = match &page.access.guard {
-            Some(guard) => {
-                let value =
-                    self.eval_row_expression(guard, row, event, output, consumer, bindings, work)?;
-                eval_to_bool(&value)?
-            }
-            None => true,
-        };
-        let (selection, selection_captures) = self.evaluate_list_access_selection(
-            &page.access.selection,
-            index_plan,
-            row,
-            event,
-            output,
-            consumer,
-            bindings,
-            work,
-        )?;
-
-        self.register_list_dependency(consumer, index_plan.source_list);
-        self.register_list_access_dependency(consumer, page.access.index, &selection);
-        let mut selection_expressions = Vec::new();
-        page.access
-            .selection
-            .visit_expressions(&mut |expression| selection_expressions.push(expression));
-        if selection_expressions.len() != selection_captures.len() {
-            return Err(Error::InvalidPlan(format!(
-                "typed list page selection produced {} captures for {} expressions",
-                selection_captures.len(),
-                selection_expressions.len()
-            )));
-        }
-        let mut captured_filter_expressions = Vec::new();
-        let mut captures = Vec::new();
-        for (expression, value) in selection_expressions.into_iter().zip(selection_captures) {
-            if page
-                .access
-                .filters
-                .iter()
-                .try_fold(false, |found, filter| {
-                    if found {
-                        Ok(true)
-                    } else {
-                        row_expression_contains(
-                            &self.plan.row_expressions,
-                            filter.predicate,
-                            expression,
-                        )
-                    }
-                })?
-            {
-                captured_filter_expressions.push(expression);
-                captures.push(value);
-            }
-        }
-        captures.extend(self.evaluate_page_captures(
-            page,
-            index_plan,
-            &captured_filter_expressions,
-            row,
-            event,
-            output,
-            consumer,
-            bindings,
-            work,
-        )?);
-        if let Some(view_limit) = view_limit_capture {
-            captures.push(view_limit);
-        }
-        let owner_scope = row
-            .map(|row| {
-                self.row_owner_ancestors(row).map(|owners| {
-                    owners
-                        .iter()
-                        .map(|owner| RowId {
-                            list: owner.list,
-                            key: owner.key,
-                            generation: owner.generation,
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let principal_scope = self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal);
-        let capture_fingerprint = capture_fingerprint(
-            page.view_fingerprint,
-            self.cursor_ephemeral_launch_epoch,
-            self.options.cursor_scope_fingerprint.as_ref(),
-            &owner_scope,
-            &principal_scope,
-            captures.iter(),
-            self,
-        )
-        .map_err(|_| {
-            Error::InvalidPlan(
-                "typed list page cursor capture has no canonical memory identity".to_owned(),
-            )
-        })?;
-        let authority_revision = self
-            .lists
-            .get(&index_plan.source_list)
-            .map(|list| list.revision)
-            .ok_or_else(|| {
-                Error::InvalidPlan(format!(
-                    "typed list page source list {} is missing",
-                    index_plan.source_list.0
-                ))
-            })?;
-
-        let after =
-            self.eval_row_expression(&page.after, row, event, output, consumer, bindings, work)?;
-        let after = self.materialize_eval(after)?;
-        let (cursor_payload, accepted_offset) = match page_position_bytes(&after) {
-            Ok(None) => (None, 0),
-            Ok(Some(bytes)) => {
-                let cursor = match open_cursor(&self.cursor_sealing_key, &bytes) {
-                    Ok(cursor) => cursor,
-                    Err(_) => return Ok(page_terminal_variant("InvalidPageCursor")),
-                };
-                if cursor.view_fingerprint != page.view_fingerprint
-                    || cursor.capture_fingerprint != capture_fingerprint
-                {
-                    return Ok(page_terminal_variant("InvalidPageCursor"));
-                }
-                if cursor.authority_revision != authority_revision {
-                    return Ok(page_terminal_variant("PageExpired"));
-                }
-                let accepted_offset = cursor.accepted_offset;
-                (Some(cursor), accepted_offset)
-            }
-            Err(()) => return Ok(page_terminal_variant("InvalidPageCursor")),
-        };
-        if accepted_offset > view_limit {
-            return Ok(page_terminal_variant("InvalidPageCursor"));
-        }
-        if !guard_matches || accepted_offset == view_limit {
-            return Ok(page_result(Vec::new(), None));
-        }
-
-        let remaining = view_limit.saturating_sub(accepted_offset);
-        let requested = u64::try_from(size)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1)
-            .min(remaining);
-        let requested = usize::try_from(requested).unwrap_or(usize::MAX);
-        self.ensure_ordered_index_current(page.access.index, consumer, work)?;
-        let after_cursor = match cursor_payload {
-            Some(payload) => {
-                let Some(index) = self.ordered_indexes.get(&page.access.index) else {
-                    return Ok(page_terminal_variant("InvalidPageCursor"));
-                };
-                let semantic_components = page.access.semantic_order.len();
-                let matching_current_key =
-                    index
-                        .cursor_keys_for(payload.row_id)
-                        .into_iter()
-                        .any(|cursor| {
-                            cursor.source_order() == payload.source_order
-                                && semantic_page_cursor_key(&cursor, semantic_components)
-                                    .is_ok_and(|key| key == payload.semantic_key)
-                        });
-                if !matching_current_key {
-                    return Ok(page_terminal_variant("InvalidPageCursor"));
-                }
-                Some(AccessCursorKey::new(
-                    payload.semantic_key,
-                    payload.source_order,
-                    payload.row_id,
-                ))
-            }
-            None => None,
-        };
-        let index = self
-            .ordered_indexes
-            .remove(&page.access.index)
-            .ok_or_else(|| {
-                Error::InvalidPlan(format!(
-                    "typed list page index {} is not current",
-                    page.access.index.0
-                ))
-            })?;
-        let limits = self.options.list_access_work_limits;
-        let mut tracker = AccessWorkTracker::new(AccessWorkLimits::new(
-            limits.max_index_seeks,
-            limits.max_key_ranges,
-            limits.max_keys_visited,
-            limits.max_candidates_visited,
-            limits.max_rows_returned,
-            limits.max_branch_polls,
-            0,
-        ));
-        let traversal = (|| {
-            let mut stream = open_evaluated_list_access(
-                &index,
-                &selection,
-                after_cursor.as_ref(),
-                page.access.semantic_order.len(),
-            )
-            .map_err(PageTraversalFailure::Access)?;
-            let mut accepted = Vec::with_capacity(requested.min(size.saturating_add(1)));
-            while accepted.len() < requested {
-                let candidate = match stream.next(&mut tracker) {
-                    Ok(Some(candidate)) => candidate,
-                    Ok(None) => break,
-                    Err(AccessError::WorkLimitExceeded(_)) => {
-                        return Err(PageTraversalFailure::WorkLimit);
-                    }
-                    Err(error) => return Err(PageTraversalFailure::Access(error)),
-                };
-                work.consume(1).map_err(PageTraversalFailure::Runtime)?;
-                let candidate_row = runtime_row_id(index_plan.source_list, candidate.row_id());
-                if !self.row_exists(candidate_row) {
-                    return Err(PageTraversalFailure::Runtime(Error::InvalidPlan(format!(
-                        "typed list page on index {} returned stale row {}:{}:{}",
-                        page.access.index.0,
-                        candidate_row.list.0,
-                        candidate_row.key,
-                        candidate_row.generation
-                    ))));
-                }
-                let mut matches_all = true;
-                for filter in &page.access.filters {
-                    let matches = self
-                        .eval_contextual_body(
-                            (filter.owner, filter.row_local),
-                            EvalValue::Row(candidate_row),
-                            &filter.predicate,
-                            Some(candidate_row),
-                            event,
-                            output,
-                            consumer,
-                            bindings,
-                            work,
-                        )
-                        .map_err(PageTraversalFailure::Runtime)?;
-                    if !eval_to_bool(&matches).map_err(PageTraversalFailure::Runtime)? {
-                        matches_all = false;
-                        break;
-                    }
-                }
-                if !matches_all {
-                    continue;
-                }
-                accepted.push((candidate_row, candidate.cursor_key()));
-            }
-            Ok(accepted)
-        })();
-        let metrics = tracker.metrics();
-        self.ordered_indexes.insert(page.access.index, index);
-        let mut accepted = match traversal {
-            Ok(accepted) => accepted,
-            Err(PageTraversalFailure::WorkLimit) => {
-                record_access_metrics(work, metrics, 0);
-                return Ok(page_terminal_variant("PageWorkLimitExceeded"));
-            }
-            Err(PageTraversalFailure::Runtime(error)) => return Err(error),
-            Err(PageTraversalFailure::Access(error)) => {
-                return Err(Error::Evaluation(error.to_string()));
-            }
-        };
-        let has_more = accepted.len() > size;
-        if has_more {
-            accepted.truncate(size);
-        }
-        record_access_metrics(work, metrics, accepted.len());
-        let next = if has_more {
-            let (_, position) = accepted.last().ok_or_else(|| {
-                Error::InvalidPlan("non-empty page lost its continuation position".to_owned())
-            })?;
-            let cursor = PageCursor {
-                view_fingerprint: page.view_fingerprint,
-                authority_revision,
-                capture_fingerprint,
-                accepted_offset: accepted_offset
-                    .saturating_add(u64::try_from(accepted.len()).unwrap_or(u64::MAX)),
-                semantic_key: semantic_page_cursor_key(position, page.access.semantic_order.len())?,
-                source_order: position.source_order(),
-                row_id: position.row_id(),
-            };
-            match seal_cursor(&self.cursor_sealing_key, &cursor) {
-                Ok(cursor) => Some(cursor),
-                Err(CursorError::TooLarge) => {
-                    return Ok(page_terminal_variant("PageWorkLimitExceeded"));
-                }
-                Err(CursorError::Invalid | CursorError::Randomness) => {
-                    return Err(Error::Evaluation(
-                        "failed to seal typed list page cursor".to_owned(),
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-        let mut items = Vec::with_capacity(accepted.len());
-        for (row, _) in accepted {
-            let value = if page.access.maps.is_empty() {
-                EvalValue::Row(row)
-            } else {
-                self.evaluate_list_maps(
-                    &page.access.maps,
-                    EvalValue::Row(row),
-                    row,
-                    event,
-                    output,
-                    consumer,
-                    bindings,
-                    work,
-                )?
-            };
-            items.push(self.materialize_page_value(value, event, work)?);
-        }
-        Ok(page_result(items, next))
-    }
-
-    fn materialize_page_value(
-        &mut self,
-        value: EvalValue,
-        event: Option<&SourceEvent>,
-        work: &mut Work,
-    ) -> Result<Value, Error> {
-        let value = self.materialize_eval(value)?;
-        self.normalize_page_value(value, event, work)
-    }
-
-    fn normalize_page_value(
-        &mut self,
-        value: Value,
-        event: Option<&SourceEvent>,
-        work: &mut Work,
-    ) -> Result<Value, Error> {
-        let mut tasks = vec![PageValueTask::Evaluate(value)];
-        let mut values = Vec::<Value>::new();
-        while let Some(task) = tasks.pop() {
-            match task {
-                PageValueTask::Evaluate(value) => match value {
-                    Value::Row { id, .. } => {
-                        values.push(self.materialize_page_row(id.list, id, event, work)?);
-                    }
-                    Value::MappedRow { fields, .. } | Value::Record(fields) => {
-                        ensure_value_continuation_capacity(&tasks, 1, "page value normalization")?;
-                        tasks.push(PageValueTask::Continue(PageValueCollection::Record {
-                            remaining: fields.into_iter(),
-                            output: BTreeMap::new(),
-                        }));
-                    }
-                    Value::List(items) => {
-                        let capacity = items.len();
-                        ensure_value_continuation_capacity(&tasks, 1, "page value normalization")?;
-                        tasks.push(PageValueTask::Continue(PageValueCollection::List {
-                            remaining: items.into_iter(),
-                            output: Vec::with_capacity(capacity),
-                        }));
-                    }
-                    value => values.push(value),
-                },
-                PageValueTask::Continue(mut collection) => {
-                    let next = match &mut collection {
-                        PageValueCollection::List { remaining, .. } => remaining
-                            .next()
-                            .map(|value| (EvalMaterializationSlot::Item, value)),
-                        PageValueCollection::Record { remaining, .. } => remaining
-                            .next()
-                            .map(|(name, value)| (EvalMaterializationSlot::Field(name), value)),
-                    };
-                    if let Some((slot, value)) = next {
-                        ensure_value_continuation_capacity(&tasks, 2, "page value normalization")?;
-                        tasks.push(PageValueTask::Append { collection, slot });
-                        tasks.push(PageValueTask::Evaluate(value));
-                    } else {
-                        let value = match collection {
-                            PageValueCollection::List { output, .. } => Value::List(output),
-                            PageValueCollection::Record { output, .. } => Value::Record(output),
-                        };
-                        values.push(value);
-                    }
-                }
-                PageValueTask::Append {
-                    mut collection,
-                    slot,
-                } => {
-                    let value = values.pop().ok_or_else(|| {
-                        Error::InvalidPlan(
-                            "page value normalization produced no child value".to_owned(),
-                        )
-                    })?;
-                    match (&mut collection, slot) {
-                        (
-                            PageValueCollection::List { output, .. },
-                            EvalMaterializationSlot::Item,
-                        ) => output.push(value),
-                        (
-                            PageValueCollection::Record { output, .. },
-                            EvalMaterializationSlot::Field(name),
-                        ) => {
-                            output.insert(name, value);
-                        }
-                        _ => {
-                            return Err(Error::InvalidPlan(
-                                "page value normalization continuation type mismatch".to_owned(),
-                            ));
-                        }
-                    }
-                    ensure_value_continuation_capacity(&tasks, 1, "page value normalization")?;
-                    tasks.push(PageValueTask::Continue(collection));
-                }
-            }
-        }
-        if values.len() != 1 {
-            return Err(Error::InvalidPlan(format!(
-                "page value normalization completed with {} values",
-                values.len()
-            )));
-        }
-        values.pop().ok_or_else(|| {
-            Error::InvalidPlan("page value normalization produced no root value".to_owned())
-        })
-    }
-
-    fn materialize_page_row(
-        &mut self,
-        list: ListId,
-        row: RowId,
-        event: Option<&SourceEvent>,
-        work: &mut Work,
-    ) -> Result<Value, Error> {
-        let slot = self
-            .plan
-            .storage_layout
-            .list_slots
-            .iter()
-            .find(|slot| slot.list_id == list)
-            .cloned()
-            .ok_or_else(|| {
-                Error::InvalidPlan(format!(
-                    "typed list page source list {} has no storage slot",
-                    list.0
-                ))
-            })?;
-        let item_type = self
-            .plan
-            .persistence
-            .lists
-            .iter()
-            .find(|memory| memory.runtime_slot == slot.id)
-            .and_then(|memory| match &memory.data_type {
-                boon_plan::DataTypePlan::List { item } => Some(item.as_ref().clone()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                Error::InvalidPlan(format!(
-                    "typed list page source list {} has no declared item type",
-                    list.0
-                ))
-            })?;
-        let output_fields = slot
-            .row_fields
-            .iter()
-            .map(|field| OutputListFieldRef {
-                list_id: list,
-                name: field.name.clone(),
-                field_id: field.field_id,
-            })
-            .collect::<Vec<_>>();
-        if matches!(
-            item_type,
-            boon_plan::DataTypePlan::Record { open: false, .. }
-        ) {
-            return self.materialize_typed_list_item(
-                EvalValue::Row(row),
-                &item_type,
-                &output_fields,
-                event,
-                None,
-                work,
-            );
-        }
-        let value_field = output_list_field(&output_fields, list, "value")?;
-        let value = if self.metadata.row_computations.contains_key(&value_field) {
-            self.ensure_row_field(row, value_field, event, work)?
-        } else {
-            self.row_value(row, value_field)?
-        };
-        normalize_scalar_list_item(value, &item_type)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_page_captures(
-        &mut self,
-        page: &PlanListPage,
-        index_plan: &PlanListIndex,
-        captured_filter_expressions: &[PlanRowExpressionId],
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        bindings: &mut PlanLocalBindings,
-        work: &mut Work,
-    ) -> Result<Vec<Value>, Error> {
-        let mut inputs = BTreeSet::new();
-        let mut intrinsics = BTreeSet::new();
-        for filter in &page.access.filters {
-            collect_uncaptured_page_dependencies(
-                &self.plan.row_expressions,
-                filter.predicate,
-                captured_filter_expressions,
-                index_plan.source_list,
-                &mut inputs,
-                &mut intrinsics,
-            )?;
-        }
-        for map in &page.access.maps {
-            collect_uncaptured_page_dependencies(
-                &self.plan.row_expressions,
-                map.body,
-                captured_filter_expressions,
-                index_plan.source_list,
-                &mut inputs,
-                &mut intrinsics,
-            )?;
-            for capture in &map.captures {
-                collect_uncaptured_page_dependencies(
-                    &self.plan.row_expressions,
-                    capture.value,
-                    captured_filter_expressions,
-                    index_plan.source_list,
-                    &mut inputs,
-                    &mut intrinsics,
-                )?;
-            }
-        }
-
-        let mut captures = Vec::with_capacity(inputs.len() + bindings.len());
-        for input in inputs {
-            let value = self.eval_value_ref(&input, row, event, output, consumer, work)?;
-            captures.push(self.materialize_eval(value)?);
-        }
-        for intrinsic in intrinsics {
-            captures.push(self.eval_intrinsic(intrinsic));
-        }
-        for ((owner, local), value) in bindings.iter() {
-            let referenced = page
-                .access
-                .filters
-                .iter()
-                .map(|filter| filter.predicate)
-                .chain(page.access.maps.iter().flat_map(|map| {
-                    std::iter::once(map.body)
-                        .chain(map.captures.iter().map(|capture| capture.value))
-                }))
-                .try_fold(false, |found, expression| {
-                    if found {
-                        Ok(true)
-                    } else {
-                        uncaptured_expression_references_local(
-                            &self.plan.row_expressions,
-                            expression,
-                            captured_filter_expressions,
-                            *owner,
-                            *local,
-                        )
-                    }
-                })?;
-            if referenced {
-                captures.push(self.materialize_eval(value.clone())?);
-            }
-        }
-        Ok(captures)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_list_maps(
-        &mut self,
-        maps: &[PlanListMap],
-        mut value: EvalValue,
-        source_row: RowId,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        bindings: &mut PlanLocalBindings,
-        work: &mut Work,
-    ) -> Result<EvalValue, Error> {
-        for map in maps {
-            let local = (map.owner, map.row_local);
-            let origin = eval_row_id(&value);
-            let mapped = self.eval_contextual_body(
-                local,
-                value.clone(),
-                &map.body,
-                Some(source_row),
-                event,
-                output,
-                consumer,
-                bindings,
-                work,
-            )?;
-            let mut evaluated_captures = BTreeMap::new();
-            for capture in &map.captures {
-                if !self.metadata.capture_fields.contains(&capture.field) {
-                    return Err(Error::InvalidPlan(format!(
-                        "typed list map owner {} writes non-capture field {}",
-                        map.owner.0, capture.field.0
-                    )));
-                }
-                let captured = self.eval_contextual_body(
-                    local,
-                    value.clone(),
-                    &capture.value,
-                    Some(source_row),
-                    event,
-                    output,
-                    consumer,
-                    bindings,
-                    work,
-                )?;
-                if evaluated_captures.insert(capture.field, captured).is_some() {
-                    return Err(Error::InvalidPlan(format!(
-                        "typed list map owner {} writes capture field {} more than once",
-                        map.owner.0, capture.field.0
-                    )));
-                }
-            }
-            value = match (origin, mapped, evaluated_captures) {
-                (Some(id), EvalValue::Record(fields), captures) => EvalValue::MappedRow {
-                    id,
-                    fields,
-                    captures,
-                },
-                (_, value, captures) if captures.is_empty() => value,
-                _ => {
-                    return Err(Error::InvalidPlan(format!(
-                        "typed list map owner {} captures state without a typed source row and record result",
-                        map.owner.0
-                    )));
-                }
-            };
-        }
-        Ok(value)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_list_access(
-        &mut self,
-        access: &PlanListAccess,
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
-        bindings: &mut PlanLocalBindings,
-        work: &mut Work,
-    ) -> Result<EvalValue, Error> {
-        let metadata = Arc::clone(&self.metadata);
-        let index_plan = metadata.list_indexes.get(&access.index).ok_or_else(|| {
-            Error::InvalidPlan(format!(
-                "typed list access references missing index {}",
-                access.index.0
-            ))
-        })?;
-        if let Some(guard) = &access.guard {
-            let guard =
-                self.eval_row_expression(guard, row, event, output, consumer, bindings, work)?;
-            if !eval_to_bool(&guard)? {
-                return Ok(EvalValue::List(Vec::new()));
-            }
-        }
-        let exhaustive_candidate_limit = access
-            .exhaustive_candidate_limit
-            .map(|limit| limit as usize);
-        let limit = if let Some(limit) = exhaustive_candidate_limit {
-            limit.saturating_add(1)
-        } else {
-            let limit = self.eval_row_expression(
-                &access.limit,
-                row,
-                event,
-                output,
-                consumer,
-                bindings,
-                work,
-            )?;
-            usize::try_from(eval_to_integer(&limit)?).map_err(|_| {
-                Error::Evaluation("List/take count must be a non-negative integer".to_owned())
-            })?
-        };
-        if limit == 0 {
-            return Ok(EvalValue::List(Vec::new()));
-        }
-        let (selection, _) = self.evaluate_list_access_selection(
-            &access.selection,
-            index_plan,
-            row,
-            event,
-            output,
-            consumer,
-            bindings,
-            work,
-        )?;
-        self.register_list_access_dependency(consumer, access.index, &selection);
-        self.ensure_ordered_index_current(access.index, consumer, work)?;
-        let index = self.ordered_indexes.remove(&access.index).ok_or_else(|| {
-            Error::InvalidPlan(format!(
-                "typed list access index {} is not current",
-                access.index.0
-            ))
-        })?;
-        let limits = self.options.list_access_work_limits;
-        let mut tracker = AccessWorkTracker::new(AccessWorkLimits::new(
-            limits.max_index_seeks,
-            limits.max_key_ranges,
-            limits.max_keys_visited,
-            limits.max_candidates_visited,
-            limits.max_rows_returned,
-            limits.max_branch_polls,
-            0,
-        ));
-        let result = (|| {
-            let mut stream =
-                open_evaluated_list_access(&index, &selection, None, access.semantic_order.len())
-                    .map_err(|error| Error::Evaluation(error.to_string()))?;
-            let mut result = Vec::with_capacity(limit);
-            while result.len() < limit {
-                let Some(candidate) = stream
-                    .next(&mut tracker)
-                    .map_err(|error| Error::Evaluation(error.to_string()))?
-                else {
-                    break;
-                };
-                work.consume(1)?;
-                let candidate = runtime_row_id(index_plan.source_list, candidate.row_id());
-                if !self.row_exists(candidate) {
-                    return Err(Error::InvalidPlan(format!(
-                        "typed list access on index {} returned stale row {}:{}:{}",
-                        access.index.0, candidate.list.0, candidate.key, candidate.generation
-                    )));
-                }
-                let mut matches_all = true;
-                for filter in &access.filters {
-                    let matches = self.eval_contextual_body(
-                        (filter.owner, filter.row_local),
-                        EvalValue::Row(candidate),
-                        &filter.predicate,
-                        Some(candidate),
-                        event,
-                        output,
-                        consumer,
-                        bindings,
-                        work,
-                    )?;
-                    if !eval_to_bool(&matches)? {
-                        matches_all = false;
-                        break;
-                    }
-                }
-                if !matches_all {
-                    continue;
-                }
-                result.push(self.evaluate_list_maps(
-                    &access.maps,
-                    EvalValue::Row(candidate),
-                    candidate,
-                    event,
-                    output,
-                    consumer,
-                    bindings,
-                    work,
-                )?);
-            }
-            if exhaustive_candidate_limit.is_some_and(|limit| result.len() > limit) {
-                return Err(Error::WorkBudgetExceeded {
-                    limit: exhaustive_candidate_limit.unwrap_or_default() as u64,
-                    attempted: result.len() as u64,
-                });
-            }
-            Ok(EvalValue::List(result))
-        })();
-        let metrics = tracker.metrics();
-        self.ordered_indexes.insert(access.index, index);
-        let result_count = match &result {
-            Ok(EvalValue::List(items)) => items.len(),
-            _ => 0,
-        };
-        record_access_metrics(work, metrics, result_count);
-        result
     }
 
     fn eval_intrinsic(&self, intrinsic: PlanIntrinsic) -> Value {
@@ -21620,49 +24830,6 @@ impl MachineInstance {
                 "value {other:?} is not an object"
             ))),
         }
-    }
-
-    fn extend_record_from_spread(
-        &mut self,
-        record: &mut BTreeMap<String, EvalValue>,
-        value: EvalValue,
-        event: Option<&SourceEvent>,
-        consumer: Option<Consumer>,
-        work: &mut Work,
-    ) -> Result<(), Error> {
-        match value {
-            EvalValue::Record(fields) | EvalValue::MappedRow { fields, .. } => {
-                record.extend(fields);
-            }
-            EvalValue::Value(Value::Record(fields))
-            | EvalValue::Value(Value::MappedRow { fields, .. }) => {
-                record.extend(
-                    fields
-                        .into_iter()
-                        .map(|(name, value)| (name, EvalValue::Value(value))),
-                );
-            }
-            EvalValue::Row(row) | EvalValue::Value(Value::Row { id: row, .. }) => {
-                let fields = self
-                    .metadata
-                    .row_field_names
-                    .iter()
-                    .filter(|((list, _), _)| *list == row.list)
-                    .map(|((_, field), name)| (*field, name.clone()))
-                    .collect::<Vec<_>>();
-                for (field, name) in fields {
-                    self.register_row_dependency(consumer, row, field);
-                    let value = self.ensure_row_field(row, field, event, work)?;
-                    record.insert(name, EvalValue::Value(value));
-                }
-            }
-            other => {
-                return Err(Error::Evaluation(format!(
-                    "record spread requires a record or typed row, found {other:?}"
-                )));
-            }
-        }
-        Ok(())
     }
 
     fn eval_builtin_values(
@@ -22038,7 +25205,7 @@ impl MachineInstance {
         let mut latest = BTreeMap::<(usize, OwnerInstanceId), PendingListMutation>::new();
         for mutation in staged {
             let (site, owner) = mutation.site_owner();
-            let key = (site, owner.clone());
+            let key = (site, owner);
             match latest.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(mutation);
@@ -22070,7 +25237,8 @@ impl MachineInstance {
                     owner,
                     ..
                 } => {
-                    self.append_row_with_owner_prefix(list, fields, &owner.ancestors, None, work)?;
+                    let owner_ancestry = self.owner_instances.owner_ancestry(owner)?;
+                    self.append_row_with_owner_prefix(list, fields, owner_ancestry, None, work)?;
                 }
                 PendingListMutation::Remove { rows, .. } => {
                     for row in rows {
@@ -22139,7 +25307,11 @@ impl MachineInstance {
                     return Ok(None);
                 }
                 let fields = self.materialize_append_item(list, append, item, event, work)?;
-                let owner = instantiate_plan_owner(&append.owner, &trigger.active)?;
+                let owner = instantiate_plan_owner(
+                    &append.owner,
+                    &trigger.active,
+                    &mut self.owner_instances,
+                )?;
                 Ok(Some(PendingListMutation::Append {
                     site: append.site,
                     ordinal: append.ordinal,
@@ -22153,16 +25325,22 @@ impl MachineInstance {
                 if !Self::trigger_accepts(&remove.trigger, &trigger.active) {
                     return Ok(None);
                 }
-                let owner = instantiate_plan_owner(&remove.owner, &trigger.active)?;
+                let owner = instantiate_plan_owner(
+                    &remove.owner,
+                    &trigger.active,
+                    &mut self.owner_instances,
+                )?;
+                let owner_ancestry = self.owner_instances.owner_ancestry(owner)?;
                 let candidates = self
                     .list_row_ids(list)
                     .into_iter()
                     .filter(|row| {
-                        self.row_owner_ancestors(*row).is_ok_and(|ancestors| {
-                            ancestors == owner.ancestors.as_slice()
-                                || ancestors
-                                    .split_last()
-                                    .is_some_and(|(_, parent)| parent == owner.ancestors.as_slice())
+                        self.row_owner_ancestry(*row).is_ok_and(|ancestry| {
+                            ancestry == owner_ancestry
+                                || self
+                                    .owner_instances
+                                    .ancestry_parent(ancestry)
+                                    .is_ok_and(|parent| parent == owner_ancestry)
                         })
                     })
                     .collect::<Vec<_>>();
@@ -22328,24 +25506,9 @@ impl MachineInstance {
     fn materialize_virtual_projection_row(
         &mut self,
         list_id: ListId,
-        logical_index: u64,
         fields: BTreeMap<FieldId, Value>,
         work: &mut Work,
     ) -> Result<RowId, Error> {
-        let key = logical_index.checked_add(1).ok_or_else(|| {
-            Error::Evaluation(format!(
-                "virtual list {} logical row key overflowed",
-                list_id.0
-            ))
-        })?;
-        let row = RowId {
-            list: list_id,
-            key,
-            generation: 1,
-        };
-        if self.row_exists(row) {
-            return Ok(row);
-        }
         let slot = self
             .plan
             .storage_layout
@@ -22364,17 +25527,20 @@ impl MachineInstance {
                 slot.capacity.unwrap_or_default()
             )));
         }
-        let inserted = self.insert_initial_row(&slot, key, fields, BTreeSet::new(), work)?;
-        debug_assert_eq!(inserted, row);
-        Ok(inserted)
+        let key = self
+            .lists
+            .get(&list_id)
+            .map(|list| list.next_key.max(1))
+            .ok_or_else(|| Error::Evaluation(format!("list {} is missing", list_id.0)))?;
+        self.insert_initial_row(&slot, key, fields, BTreeSet::new(), work)
     }
 
     fn append_row_with_owner_prefix(
         &mut self,
         list_id: ListId,
         fields: BTreeMap<FieldId, Value>,
-        owner_prefix: &[OwnerInstanceRow],
-        materialization_origin: Option<Vec<OwnerInstanceRow>>,
+        owner_prefix: OwnerAncestryId,
+        materialization_origin: Option<OwnerAncestryId>,
         work: &mut Work,
     ) -> Result<RowId, Error> {
         let slot = self
@@ -22405,17 +25571,22 @@ impl MachineInstance {
             key,
             generation: 1,
         };
+        let owner_ancestry = self.owner_instances.intern_ancestry(
+            owner_prefix,
+            OwnerInstanceRow {
+                list: row_id.list,
+                key: row_id.key,
+                generation: row_id.generation,
+            },
+        )?;
+        let mut provenance = self.provenance_for_materialization_origin(materialization_origin)?;
+        if let Some(scope) = slot.scope_id {
+            provenance.insert(scope, row_id);
+        }
         let mut row = Row {
-            owner_ancestors: owner_prefix
-                .iter()
-                .copied()
-                .chain(std::iter::once(OwnerInstanceRow {
-                    list: row_id.list,
-                    key: row_id.key,
-                    generation: row_id.generation,
-                }))
-                .collect(),
+            owner_ancestry,
             materialization_origin,
+            provenance,
             fields,
             ..Row::default()
         };
@@ -22456,7 +25627,7 @@ impl MachineInstance {
             touched_list: was_structurally_touched,
         });
         list.rows.insert(row_id, row);
-        list.index_owner_partition_row(row_id)?;
+        list.index_owner_partition_row(row_id, &self.owner_instances)?;
         record_source_order_maintenance(work, &order_maintenance);
         self.mark_list_semantic_change(list_id, work)?;
         self.touched_lists.insert(list_id);
@@ -22501,8 +25672,13 @@ impl MachineInstance {
                                 "appended authority row has no source-order token".to_owned(),
                             )
                         })?,
-                    owner_ancestors: row_authority.owner_ancestors.clone(),
-                    materialization_origin: row_authority.materialization_origin.clone(),
+                    owner_ancestors: self
+                        .owner_instances
+                        .ancestry_rows(row_authority.owner_ancestry)?,
+                    materialization_origin: row_authority
+                        .materialization_origin
+                        .map(|origin| self.owner_instances.ancestry_rows(origin))
+                        .transpose()?,
                     fields,
                     touched_fields: BTreeSet::new(),
                 },
@@ -22535,6 +25711,7 @@ impl MachineInstance {
             work.deltas.push(Delta::InsertRow {
                 row: RowSnapshot {
                     id: row_id,
+                    provenance: row.provenance.clone(),
                     fields: row.fields.clone(),
                 },
             });
@@ -22574,15 +25751,27 @@ impl MachineInstance {
     }
 
     fn remove_row(&mut self, row: RowId, work: &mut Work) -> Result<(), Error> {
-        let owner = self.row_owner_ancestors(row)?.to_vec();
+        let owner = self.row_owner_ancestry(row)?;
         let mut descendants = self
             .lists
             .values()
             .flat_map(|list| list.rows.iter())
-            .filter_map(|(candidate, state)| {
-                (*candidate != row && state.owner_ancestors.starts_with(&owner))
-                    .then_some((state.owner_ancestors.len(), *candidate))
+            .map(|(candidate, state)| {
+                if *candidate == row
+                    || !self
+                        .owner_instances
+                        .ancestry_descends_from(state.owner_ancestry, owner)?
+                {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    self.owner_instances.ancestry_depth(state.owner_ancestry)?,
+                    *candidate,
+                )))
             })
+            .collect::<Result<Vec<_>, Error>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
         descendants.sort_by(|(left_depth, left), (right_depth, right)| {
             right_depth.cmp(left_depth).then_with(|| left.cmp(right))
@@ -22612,7 +25801,7 @@ impl MachineInstance {
             self.clear_consumer_dependencies(Consumer::Effect(consumer));
             work.pending_effect_reconciliations.remove(&consumer);
         }
-        self.cancel_pending_transient_effects_for_row(row, work);
+        self.cancel_pending_transient_effects_for_row(row, work)?;
         let (removed_value, previous_next_key) = self
             .lists
             .get(&row.list)
@@ -22665,7 +25854,7 @@ impl MachineInstance {
                     row.list.0, row.key, row.generation
                 ))
             })?;
-            list.remove_owner_partition_row(row, &removed);
+            list.remove_owner_partition_row(row, &removed, &mut self.owner_instances)?;
             removed
         };
         self.commit_ordered_index_dirty(prepared_index_dirty);
@@ -24101,6 +27290,7 @@ fn report_authority_deltas(deltas: Vec<AuthorityDelta>) -> Vec<AuthorityDelta> {
 fn report_row_snapshot(row: RowSnapshot) -> RowSnapshot {
     RowSnapshot {
         id: row.id,
+        provenance: row.provenance,
         fields: row
             .fields
             .into_iter()
@@ -24204,6 +27394,52 @@ mod ownership_tests {
     use boon_plan::{ProgramRole, TargetProfile};
 
     #[test]
+    fn owner_instance_interner_is_exact_stable_and_round_trips_routes() {
+        let owner = PlanStaticOwnerId(7);
+        let rows = vec![
+            OwnerInstanceRow {
+                list: ListId(3),
+                key: 11,
+                generation: 2,
+            },
+            OwnerInstanceRow {
+                list: ListId(4),
+                key: 17,
+                generation: 5,
+            },
+        ];
+        let route = OwnerInstanceRoute::new(owner, rows.clone()).unwrap();
+        let mut interner = OwnerInstanceInterner::default();
+
+        let first = interner.intern_route(&route).unwrap();
+        let repeated = interner.intern_rows(owner, rows.iter().copied()).unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(interner.route(first).unwrap(), route);
+
+        let other_owner = interner
+            .intern_rows(PlanStaticOwnerId(8), rows.iter().copied())
+            .unwrap();
+        assert_ne!(first, other_owner);
+
+        let mut other_generation = rows.clone();
+        other_generation[1].generation += 1;
+        let other_generation = interner
+            .intern_rows(owner, other_generation.iter().copied())
+            .unwrap();
+        assert_ne!(first, other_generation);
+
+        let shorter = interner
+            .intern_rows(owner, rows[..1].iter().copied())
+            .unwrap();
+        assert_ne!(first, shorter);
+        assert_eq!(
+            interner.intern_prefix(owner, first, 1).unwrap(),
+            shorter,
+            "prefix identity must reuse the same interned ancestry"
+        );
+    }
+
+    #[test]
     fn transient_effect_call_id_diagnostics_are_opaque() {
         let call_id = TransientEffectCallId {
             launch_epoch: 8_675_309,
@@ -24229,7 +27465,7 @@ mod ownership_tests {
             )]),
             result_route: SourceRouteToken::new(
                 0xb4,
-                OwnerInstanceId::root(),
+                OwnerInstanceRoute::root(),
                 SourceId(0xb5),
                 0xb6,
             )
@@ -24767,24 +28003,30 @@ outputs: [
         let mut work = session.fresh_work();
         work.begin_turn(None, 0);
         let parent = session
-            .append_row_with_owner_prefix(list_ids[0], BTreeMap::new(), &[], None, &mut work)
-            .unwrap();
-        let parent_owner = session.row_owner_ancestors(parent).unwrap().to_vec();
-        let child = session
             .append_row_with_owner_prefix(
-                list_ids[1],
+                list_ids[0],
                 BTreeMap::new(),
-                &parent_owner,
+                OwnerAncestryId::ROOT,
                 None,
                 &mut work,
             )
             .unwrap();
-        let child_owner = session.row_owner_ancestors(child).unwrap().to_vec();
+        let parent_owner = session.row_owner_ancestry(parent).unwrap();
+        let child = session
+            .append_row_with_owner_prefix(
+                list_ids[1],
+                BTreeMap::new(),
+                parent_owner,
+                None,
+                &mut work,
+            )
+            .unwrap();
+        let child_owner = session.row_owner_ancestry(child).unwrap();
         let grandchild = session
             .append_row_with_owner_prefix(
                 list_ids[2],
                 BTreeMap::new(),
-                &child_owner,
+                child_owner,
                 None,
                 &mut work,
             )
@@ -24851,21 +28093,51 @@ store: [
         let mut work = session.fresh_work();
         work.begin_turn(None, 0);
         let parent_a = session
-            .append_row_with_owner_prefix(parent_list, BTreeMap::new(), &[], None, &mut work)
+            .append_row_with_owner_prefix(
+                parent_list,
+                BTreeMap::new(),
+                OwnerAncestryId::ROOT,
+                None,
+                &mut work,
+            )
             .unwrap();
         let parent_b = session
-            .append_row_with_owner_prefix(parent_list, BTreeMap::new(), &[], None, &mut work)
+            .append_row_with_owner_prefix(
+                parent_list,
+                BTreeMap::new(),
+                OwnerAncestryId::ROOT,
+                None,
+                &mut work,
+            )
             .unwrap();
-        let owner_a = session.row_owner_ancestors(parent_a).unwrap().to_vec();
-        let owner_b = session.row_owner_ancestors(parent_b).unwrap().to_vec();
+        let owner_a = session.row_owner_ancestry(parent_a).unwrap();
+        let owner_b = session.row_owner_ancestry(parent_b).unwrap();
         let origin_a1 = session
-            .append_row_with_owner_prefix(origin_list, BTreeMap::new(), &[], None, &mut work)
+            .append_row_with_owner_prefix(
+                origin_list,
+                BTreeMap::new(),
+                OwnerAncestryId::ROOT,
+                None,
+                &mut work,
+            )
             .unwrap();
         let origin_a2 = session
-            .append_row_with_owner_prefix(origin_list, BTreeMap::new(), &[], None, &mut work)
+            .append_row_with_owner_prefix(
+                origin_list,
+                BTreeMap::new(),
+                OwnerAncestryId::ROOT,
+                None,
+                &mut work,
+            )
             .unwrap();
         let origin_b1 = session
-            .append_row_with_owner_prefix(origin_list, BTreeMap::new(), &[], None, &mut work)
+            .append_row_with_owner_prefix(
+                origin_list,
+                BTreeMap::new(),
+                OwnerAncestryId::ROOT,
+                None,
+                &mut work,
+            )
             .unwrap();
 
         session
@@ -24875,15 +28147,13 @@ store: [
                 &child_fields,
                 &[],
                 EvalValue::List(vec![item(origin_a1, "a-1"), item(origin_a2, "a-2")]),
-                &owner_a,
+                owner_a,
                 None,
                 None,
                 &mut work,
             )
             .unwrap();
-        let initial_a = session
-            .list_row_ids_for_owner(child_list, &owner_a)
-            .unwrap();
+        let initial_a = session.list_row_ids_for_owner(child_list, owner_a);
         assert_eq!(initial_a.len(), 2);
         let reordered = session
             .reconcile_materialized_list(
@@ -24892,7 +28162,7 @@ store: [
                 &child_fields,
                 &[],
                 EvalValue::List(vec![item(origin_a2, "a-2"), item(origin_a1, "a-1")]),
-                &owner_a,
+                owner_a,
                 None,
                 None,
                 &mut work,
@@ -24912,15 +28182,13 @@ store: [
                 &child_fields,
                 &[],
                 EvalValue::List(vec![item(origin_b1, "b-1")]),
-                &owner_b,
+                owner_b,
                 None,
                 None,
                 &mut work,
             )
             .unwrap();
-        let rows_b = session
-            .list_row_ids_for_owner(child_list, &owner_b)
-            .unwrap();
+        let rows_b = session.list_row_ids_for_owner(child_list, owner_b);
         assert_eq!(rows_b.len(), 1);
 
         let result = session
@@ -24930,24 +28198,17 @@ store: [
                 &child_fields,
                 &[],
                 EvalValue::List(vec![item(origin_a2, "a-replaced")]),
-                &owner_a,
+                owner_a,
                 None,
                 None,
                 &mut work,
             )
             .unwrap();
-        let rows_a = session
-            .list_row_ids_for_owner(child_list, &owner_a)
-            .unwrap();
+        let rows_a = session.list_row_ids_for_owner(child_list, owner_a);
         assert_eq!(result, EvalValue::List(vec![EvalValue::Row(rows_a[0])]));
         assert_eq!(rows_a.len(), 1);
         assert_eq!(rows_a[0], initial_a[1]);
-        assert_eq!(
-            session
-                .list_row_ids_for_owner(child_list, &owner_b)
-                .unwrap(),
-            rows_b
-        );
+        assert_eq!(session.list_row_ids_for_owner(child_list, owner_b), rows_b);
         assert_eq!(
             session.row_snapshot(rows_a[0]).unwrap().fields[&value_field],
             Value::Text("a-replaced".to_owned())
@@ -24974,16 +28235,14 @@ store: [
             .unwrap()
             .build()
             .unwrap();
+        let restored_owner_a = restored.row_owner_ancestry(parent_a).unwrap();
+        let restored_owner_b = restored.row_owner_ancestry(parent_b).unwrap();
         assert_eq!(
-            restored
-                .list_row_ids_for_owner(child_list, &owner_a)
-                .unwrap(),
+            restored.list_row_ids_for_owner(child_list, restored_owner_a),
             rows_a
         );
         assert_eq!(
-            restored
-                .list_row_ids_for_owner(child_list, &owner_b)
-                .unwrap(),
+            restored.list_row_ids_for_owner(child_list, restored_owner_b),
             rows_b
         );
     }
@@ -25013,7 +28272,7 @@ store: [
             site: 7,
             ordinal,
             sequence: 1,
-            owner: OwnerInstanceId::root(),
+            owner: OwnerInstanceId::ROOT,
             list,
             fields: BTreeMap::new(),
         };

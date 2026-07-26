@@ -42,6 +42,201 @@ store: [
 }
 
 #[test]
+fn checked_resources_use_dense_identity_and_exact_source_reads() {
+    let parsed = boon_parser::parse_source(
+        "checked-resource-identity.bn",
+        r#"
+store: [
+    seed: LIST { [key: TEXT { one }] }
+    rows: seed |> List/map(item, new: selectable_row(seed: item))
+    selected:
+        rows
+        |> List/map(item, new: item.select |> THEN { item.key })
+        |> List/latest()
+]
+
+FUNCTION selectable_row(seed) {
+    [key: seed.key, select: SOURCE]
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid source has a checked program");
+    assert_eq!(
+        program
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| (index as u32, source.id.0))
+            .collect::<Vec<_>>(),
+        vec![(0, 0)]
+    );
+    assert!(
+        program.expressions.iter().all(|expression| {
+            !matches!(
+                expression.kind,
+                CheckedExpressionKind::Read {
+                    source: Some(_),
+                    ..
+                }
+            )
+        }),
+        "a contextual row projection is not a lexical read of its SOURCE template"
+    );
+}
+
+#[test]
+fn checked_timer_source_is_derived_from_the_checked_call_graph() {
+    let parsed = boon_parser::parse_source(
+        "checked-timer-source.bn",
+        r#"
+store: [
+    tick: Duration[seconds: 0.25] |> Timer/interval()
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid timer has a checked program");
+    let [source] = program.sources.as_slice() else {
+        panic!("expected one checked timer source: {:#?}", program.sources)
+    };
+    let expression = program
+        .expressions
+        .get(source.expression.0 as usize)
+        .filter(|expression| expression.id == source.expression)
+        .expect("timer source references its canonical checked expression");
+    let CheckedExpressionKind::Call { call } = expression.kind else {
+        panic!("timer source is not owned by a checked call: {expression:#?}")
+    };
+    assert_eq!(
+        program
+            .calls
+            .iter()
+            .find(|candidate| candidate.id == call)
+            .map(|call| call.function.as_str()),
+        Some("Timer/interval")
+    );
+    assert_eq!(
+        program
+            .result_path_for_call(call)
+            .and_then(|path| program.semantic_path(path))
+            .as_deref(),
+        Some("store.tick")
+    );
+    assert_eq!(source.declaration, expression.declaration.unwrap());
+    assert_eq!(source.owner_scope, expression.scope_id);
+    assert_eq!(source.interval_ms, Some(250));
+    assert_eq!(
+        program.semantic_path(&source.path).as_deref(),
+        Some("store.tick")
+    );
+    assert!(program.statements.iter().any(|statement| {
+        statement.id == source.statement
+            && statement.resources.contains(&CheckedResourceBinding::Source {
+                source: source.id,
+            })
+    }));
+}
+
+#[test]
+fn checked_nested_source_keeps_structural_path_and_exact_payload_read() {
+    let parsed = boon_parser::parse_source(
+        "checked-nested-source-path.bn",
+        r#"
+store: [
+    sources: [
+        station_input: [events: [change: SOURCE]]
+    ]
+    selected:
+        TEXT { initial } |> HOLD selected {
+            sources.station_input.events.change.text
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid source has a checked program");
+    let [source] = program.sources.as_slice() else {
+        panic!("expected one checked source, got {:#?}", program.sources);
+    };
+    assert_eq!(
+        program.semantic_path(&source.path).as_deref(),
+        Some("store.sources.station_input.events.change")
+    );
+    let Type::Object(payload) = &source.payload_type else {
+        panic!("nested source payload is not a record: {:?}", source.payload_type);
+    };
+    assert_eq!(payload.fields.get("text"), Some(&Type::Text));
+    assert!(program.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            CheckedExpressionKind::Read {
+                source: Some(read),
+                ..
+            } if read.source == source.id && read.payload_projection == ["text"]
+        )
+    }));
+}
+
+#[test]
+fn checked_mapped_hold_path_is_relative_to_its_list_row() {
+    let parsed = boon_parser::parse_source(
+        "checked-mapped-hold-path.bn",
+        r#"
+store: [
+    replace: SOURCE
+    rows:
+        LIST { [name: TEXT { initial }] }
+        |> List/map(item, new: [
+            name:
+                item.name |> HOLD name {
+                    replace.text |> THEN { replace.text }
+                }
+        ])
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid source has a checked program");
+    let mapped_state = program
+        .states
+        .iter()
+        .find(|state| state.kind == CheckedStateKind::Hold)
+        .expect("mapped HOLD state");
+    assert_eq!(mapped_state.path.projection, ["name"]);
+    let rows = program
+        .lists
+        .iter()
+        .find(|list| program.semantic_path(&list.path).as_deref() == Some("store.rows"))
+        .expect("rows list authority");
+    assert!(rows.path.projection.is_empty());
+}
+
+#[test]
 fn checked_multiline_then_keeps_the_temporal_statement_root() {
     let parsed = boon_parser::parse_source(
         "checked-multiline-then-root.bn",
@@ -395,7 +590,7 @@ FUNCTION row(initial) {
         trigger: SOURCE
         value:
             initial |> HOLD value {
-                PASSED
+                initial
             }
     ]
 }
@@ -1350,15 +1545,16 @@ result: combine(right: 2, left: 1)
 
 #[test]
 fn checked_program_keeps_pass_outside_function_arity() {
-    let parsed = boon_parser::parse_source(
-        "checked-pass.bn",
-        r#"
+    let source = r#"
 FUNCTION render(value) {
     value
 }
 
 result: render(value: 1, PASS: [store: [count: 2]])
-"#,
+"#;
+    let parsed = boon_parser::parse_source(
+        "checked-pass.bn",
+        source,
     )
     .unwrap();
     let output = check_program(&parsed);
@@ -1369,7 +1565,564 @@ result: render(value: 1, PASS: [store: [count: 2]])
         .find(|call| call.function == "render")
         .expect("render call is checked");
     assert_eq!(call.entries.len(), 1);
-    assert!(call.pass.is_some());
+    let pass = call.pass.expect("explicit PASS clause is preserved");
+    assert_eq!(&source[pass.span.start..pass.span.end], "PASS: [store: [count: 2]]");
+    assert_eq!(
+        program
+            .expressions
+            .iter()
+            .find(|expression| expression.id == pass.value)
+            .map(|expression| &expression.flow_type.ty),
+        Some(&Type::Object(ObjectShape::from_ordered_fields(
+            [(
+                "store".to_owned(),
+                Type::Object(ObjectShape::from_ordered_fields(
+                    [("count".to_owned(), Type::Number)],
+                    false,
+                )),
+            )],
+            false,
+        )))
+    );
+    assert!(
+        !checked_callable(&program, "render").requires_pass(),
+        "an explicit unused PASS must not mutate the callee signature"
+    );
+}
+
+fn checked_pass_requirement_type<'a>(
+    program: &'a CheckedProgram,
+    callable: &str,
+) -> &'a Type {
+    &checked_callable(program, callable)
+        .pass_requirement
+        .as_ref()
+        .unwrap_or_else(|| panic!("`{callable}` does not require PASS"))
+        .scheme
+        .ty
+}
+
+fn assert_pass_count_requirement(program: &CheckedProgram, callable: &str) {
+    let Type::Object(context) = checked_pass_requirement_type(program, callable) else {
+        panic!("`{callable}` PASS scheme is not structural");
+    };
+    let Some(Type::Object(store)) = context.fields.get("store") else {
+        panic!("`{callable}` PASS scheme has no structural `store` field");
+    };
+    assert_eq!(store.fields.get("count"), Some(&Type::Number));
+}
+
+#[test]
+fn checked_program_infers_direct_polymorphic_pass_schemes_lexically() {
+    let parsed = boon_parser::parse_source(
+        "checked-polymorphic-pass.bn",
+        r#"
+FUNCTION contextual_value() {
+    PASSED.value
+}
+
+number: contextual_value(PASS: [value: 1])
+text: contextual_value(PASS: [value: TEXT { one }])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("polymorphic PASS calls are checked");
+    let signature = checked_callable(&program, "contextual_value");
+    assert!(signature.requires_pass());
+    let Type::Object(context) = checked_pass_requirement_type(&program, "contextual_value") else {
+        panic!("direct PASSED projection must infer a structural context");
+    };
+    assert!(
+        matches!(context.fields.get("value"), Some(Type::Var(_))),
+        "unconstrained PASSED leaf must remain polymorphic: {context:?}"
+    );
+
+    let calls = program
+        .calls
+        .iter()
+        .filter(|call| call.function == "contextual_value")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].result.ty, Type::Number);
+    assert_eq!(calls[1].result.ty, Type::Text);
+    assert!(program.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            CheckedExpressionKind::Passed { projection }
+                if projection == &["value".to_owned()]
+        ) && matches!(expression.flow_type.ty, Type::Var(_))
+    }));
+}
+
+#[test]
+fn checked_program_keeps_contextual_pass_list_items_independent() {
+    let parsed = boon_parser::parse_source(
+        "checked-independent-contextual-pass-lists.bn",
+        r#"
+first_rows:
+    LIST {
+        [kind: First, first_value: 1]
+    }
+
+second_rows:
+    LIST {
+        [kind: Second, second_value: TEXT { two }]
+    }
+
+FUNCTION map_first_rows() {
+    PASSED.first_rows
+    |> List/map(item, new: item.kind)
+}
+
+FUNCTION map_second_rows() {
+    PASSED.second_rows
+    |> List/map(item, new: item.kind)
+}
+
+FUNCTION render_rows() {
+    [
+        first: map_first_rows()
+        second: map_second_rows()
+    ]
+}
+
+result:
+    render_rows(PASS: [
+        first_rows: first_rows
+        second_rows: second_rows
+    ])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "unrelated contextual list calls must instantiate independent PASS item types: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output
+        .program
+        .expect("independent contextual PASS lists are checked");
+    let Type::Object(requirement) = checked_pass_requirement_type(&program, "render_rows") else {
+        panic!("render_rows PASS requirement is structural")
+    };
+    let first = requirement
+        .fields
+        .get("first_rows")
+        .expect("first list requirement");
+    let second = requirement
+        .fields
+        .get("second_rows")
+        .expect("second list requirement");
+    assert_ne!(
+        first, second,
+        "independent PASS reads must not reuse a contextual built-in type variable"
+    );
+}
+
+#[test]
+fn checked_program_keeps_fields_independent_when_forwarding_one_pass_object() {
+    let parsed = boon_parser::parse_source(
+        "checked-independent-forwarded-pass-fields.bn",
+        r#"
+FUNCTION leaf() {
+    [
+        count: PASSED.store.count
+        label: PASSED.store.label
+    ]
+}
+
+FUNCTION wrapper() {
+    leaf(PASS: [store: PASSED.store])
+}
+
+result:
+    wrapper(PASS: [
+        store: [
+            count: 2
+            label: TEXT { two }
+        ]
+    ])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "forwarding one PASS object must preserve independent field variables: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output
+        .program
+        .expect("forwarded structural PASS fields are checked");
+    let Type::Object(context) = checked_pass_requirement_type(&program, "wrapper") else {
+        panic!("wrapper PASS requirement is structural")
+    };
+    let Some(Type::Object(store)) = context.fields.get("store") else {
+        panic!("wrapper PASS requirement has a structural store")
+    };
+    assert_ne!(
+        store.fields.get("count"),
+        store.fields.get("label"),
+        "forwarded PASS fields must retain distinct scheme variables"
+    );
+}
+
+#[test]
+fn checked_program_keeps_equality_pass_leaves_polymorphic_for_wider_variant_sets() {
+    let parsed = boon_parser::parse_source(
+        "checked-pass-equality-variants.bn",
+        r#"
+trigger: SOURCE
+validity:
+    Valid |> HOLD validity {
+        trigger |> THEN { Rejected }
+    }
+
+FUNCTION is_rejected() {
+    PASSED.validity == Rejected
+}
+
+result: is_rejected(PASS: [validity: validity])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "equality must require comparable values without narrowing PASS to one variant: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("variant equality PASS is checked");
+    let Type::Object(requirement) = checked_pass_requirement_type(&program, "is_rejected") else {
+        panic!("equality PASS requirement is structural")
+    };
+    assert!(
+        matches!(requirement.fields.get("validity"), Some(Type::Var(_))),
+        "equality must leave the compared PASS leaf polymorphic: {requirement:?}"
+    );
+}
+
+#[test]
+fn checked_program_validates_lexically_passed_style_dimensions_after_instantiation() {
+    let parsed = boon_parser::parse_source(
+        "checked-passed-style-dimension.bn",
+        r#"
+FUNCTION sized_label() {
+    Scene/Element/text(
+        element: []
+        style: [width: PASSED.width, height: 24]
+        text: TEXT { Sized }
+    )
+}
+
+document: Scene/new(root: sized_label(PASS: [width: 120]))
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "numeric PASS must satisfy a deferred style constraint: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn checked_program_validates_passed_style_dimensions_forwarded_through_a_helper() {
+    let parsed = boon_parser::parse_source(
+        "checked-forwarded-passed-style-dimension.bn",
+        r#"
+FUNCTION sized_label(width_value) {
+    Scene/Element/text(
+        element: []
+        style: [width: width_value, height: 24]
+        text: TEXT { Sized }
+    )
+}
+
+FUNCTION panel() {
+    sized_label(width_value: PASSED.width)
+}
+
+document: Scene/new(root: panel(PASS: [width: 120]))
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "numeric PASS forwarded through a helper must satisfy its style constraint: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn checked_program_rejects_invalid_instantiated_passed_style_dimensions() {
+    let parsed = boon_parser::parse_source(
+        "checked-invalid-passed-style-dimension.bn",
+        r#"
+FUNCTION sized_label() {
+    Scene/Element/text(
+        element: []
+        style: [width: PASSED.width, height: 24]
+        text: TEXT { Sized }
+    )
+}
+
+document: Scene/new(root:
+    sized_label(PASS: [width: TEXT { too wide }])
+)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        output.report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("style field `width` must be a number")
+        }),
+        "text PASS must fail the instantiated style constraint: {:#?}",
+        output.report.diagnostics
+    );
+    assert!(output.program.is_none());
+}
+
+#[test]
+fn checked_program_propagates_pass_requirements_through_order_independent_wrappers() {
+    let parsed = boon_parser::parse_source(
+        "checked-inherited-pass.bn",
+        r#"
+FUNCTION outer() {
+    middle()
+}
+
+FUNCTION middle() {
+    leaf()
+}
+
+result: outer(PASS: [store: [count: 2]])
+
+FUNCTION leaf() {
+    PASSED.store.count + 1
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output
+        .program
+        .expect("order-independent wrapper chain is checked");
+    for callable in ["leaf", "middle", "outer"] {
+        assert!(
+            checked_callable(&program, callable).requires_pass(),
+            "`{callable}` must inherit the PASS requirement"
+        );
+        assert_pass_count_requirement(&program, callable);
+    }
+    assert!(program.calls.iter().any(|call| {
+        call.function == "middle" && call.owner_callable.is_some() && call.pass.is_none()
+    }));
+    assert!(program.calls.iter().any(|call| {
+        call.function == "leaf" && call.owner_callable.is_some() && call.pass.is_none()
+    }));
+    assert!(program.calls.iter().any(|call| {
+        call.function == "outer" && call.owner_callable.is_none() && call.pass.is_some()
+    }));
+}
+
+#[test]
+fn checked_program_explicit_pass_cuts_inherited_requirements() {
+    let parsed = boon_parser::parse_source(
+        "checked-explicit-pass-cut.bn",
+        r#"
+FUNCTION wrapper() {
+    leaf(PASS: [store: [count: 1]])
+}
+
+FUNCTION leaf() {
+    PASSED.store.count + 1
+}
+
+result: wrapper()
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("explicit PASS cut is checked");
+    assert!(checked_callable(&program, "leaf").requires_pass());
+    assert!(
+        !checked_callable(&program, "wrapper").requires_pass(),
+        "an explicit PASS must cut requirement propagation"
+    );
+    assert!(program.calls.iter().any(|call| {
+        call.function == "leaf" && call.owner_callable.is_some() && call.pass.is_some()
+    }));
+}
+
+#[test]
+fn checked_program_rejects_a_missing_root_pass() {
+    let parsed = boon_parser::parse_source(
+        "checked-missing-root-pass.bn",
+        r#"
+FUNCTION leaf() {
+    PASSED.store.count + 1
+}
+
+result: leaf()
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.program.is_none());
+    assert_eq!(
+        output
+            .report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("root call to `FUNCTION leaf` requires a final `PASS:` clause")
+            })
+            .count(),
+        1,
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn checked_program_rejects_passed_outside_a_user_callable() {
+    let parsed = boon_parser::parse_source(
+        "checked-passed-outside-callable.bn",
+        "result: PASSED.store.count\n",
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.program.is_none());
+    assert_eq!(
+        output
+            .report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.message == "`PASSED` is only available inside a user callable"
+            })
+            .count(),
+        1,
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn checked_program_rejects_pass_on_builtin_calls() {
+    let parsed = boon_parser::parse_source(
+        "checked-builtin-pass.bn",
+        "result: 1 |> Number/ceil(PASS: [])\n",
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.program.is_none());
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message
+            == "`PASS:` is only valid on user callable calls; `Number/ceil` is a built-in callable"
+    }));
+}
+
+#[test]
+fn checked_program_rejects_pass_on_external_calls() {
+    let parsed = boon_parser::parse_source(
+        "checked-external-pass.bn",
+        "result: Server/read(PASS: [])\n",
+    )
+    .unwrap();
+    let mut environment = ExternalTypeEnvironment::empty(ProgramRole::Session);
+    environment.functions.insert(
+        "Server/read".to_owned(),
+        ExternalFunctionType {
+            args: Vec::new(),
+            result: continuous_flow_type(Type::Number),
+            effect: CheckedEffectSummary::default(),
+        },
+    );
+    let output = check_program_with_external_types(&parsed, &environment);
+    assert!(output.program.is_none());
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message
+            == "`PASS:` is only valid on user callable calls; `Server/read` is an external callable"
+    }));
+}
+
+#[test]
+fn checked_program_rejects_structurally_incompatible_pass_contexts() {
+    let parsed = boon_parser::parse_source(
+        "checked-pass-structural-mismatch.bn",
+        r#"
+FUNCTION leaf() {
+    PASSED.store.count + 1
+}
+
+result: leaf(PASS: [store: [count: TEXT { wrong }]])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.program.is_none());
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("`FUNCTION leaf` PASS context field `store.count` has an incompatible type")
+            && diagnostic.message.contains("count: NUMBER")
+            && diagnostic.message.contains("found:")
+    }), "diagnostics: {:#?}", output.report.diagnostics);
+}
+
+#[test]
+fn checked_callable_contexts_do_not_imply_pass_requirements() {
+    let parsed = boon_parser::parse_source(
+        "checked-call-context-is-not-pass.bn",
+        r#"
+FUNCTION button(element) {
+    Element/button(
+        element: element
+        style: []
+        label: TEXT { Test }
+    )
+}
+
+document: Document/new(root: button(element: []))
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("element context wrapper is checked");
+    assert!(!checked_callable(&program, "Element/button").contexts.is_empty());
+    assert!(!checked_callable(&program, "Element/button").requires_pass());
+    assert!(!checked_callable(&program, "button").requires_pass());
 }
 
 #[test]
@@ -3228,4 +3981,79 @@ FUNCTION preserve(value) {
     )
     .expect("first event field");
     assert_ne!(completed, &events, "unrelated projections share one type variable");
+}
+
+#[test]
+fn stateful_mapped_function_result_preserves_projected_field_type() {
+    let parsed = boon_parser::parse_source(
+        "stateful-mapped-function-result.bn",
+        r#"
+store: [
+    rows:
+        LIST { [completed: False] }
+        |> List/map(item, new: stateful_row(row: item))
+    active:
+        rows
+        |> List/retain(item, if: item.completed |> Bool/not())
+]
+
+FUNCTION stateful_row(row) {
+    [
+        completed:
+            row.completed |> HOLD completed {
+                SOURCE |> THEN { completed |> Bool/not() }
+            }
+    ]
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    let projected = parsed
+        .expressions
+        .iter()
+        .find(|expression| {
+            matches!(
+                &expression.kind,
+                boon_parser::AstExprKind::Path(parts)
+                    if parts == &["item".to_owned(), "completed".to_owned()]
+            )
+        })
+        .expect("mapped completed projection");
+    let projected_type = output
+        .report
+        .expr_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.expr_id == projected.id)
+        .map(|entry| &entry.flow_type.ty);
+    assert_eq!(projected_type, Some(&true_false_type()));
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn todomvc_stateful_rows_typecheck_without_parser_state_metadata() {
+    let parsed = boon_parser::parse_source(
+        "todomvc-stateful-row-types.bn",
+        include_str!("../../../../examples/todomvc.bn"),
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("TodoMVC has a checked program");
+    let completed = program
+        .callables
+        .iter()
+        .find(|callable| callable.name == "new_todo")
+        .and_then(|callable| type_for_nested_path(&callable.result.ty, &["completed".to_owned()]));
+    assert_eq!(completed, Some(true_false_type()));
 }

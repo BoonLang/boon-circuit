@@ -81,6 +81,7 @@ pub fn distributed_event_source_path(canonical_path: &str) -> String {
 pub struct DistributedCall {
     pub expression: ExecutableExprId,
     pub owner: Option<StaticOwnerId>,
+    pub occurrence_path: String,
     pub canonical_function: String,
     pub producer_role: boon_typecheck::ProgramRole,
     pub result: boon_typecheck::FlowType,
@@ -135,6 +136,310 @@ pub struct ProducerFunctionLoweringRequest {
     pub mode: ProducerFunctionMode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DistributedCallOccurrenceRoot {
+    Program,
+    Producer([u8; 32]),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DistributedCallOccurrence {
+    pub root: DistributedCallOccurrenceRoot,
+    pub occurrence_path: String,
+    pub canonical_function: String,
+    pub producer_role: boon_typecheck::ProgramRole,
+    pub mode: ProducerFunctionMode,
+}
+
+#[derive(Clone)]
+struct DistributedCallAnalysisFrame {
+    owner_callable: Option<boon_typecheck::DeclId>,
+    root: DistributedCallOccurrenceRoot,
+    path: String,
+    active_callables: Vec<boon_typecheck::DeclId>,
+    invocation_context: bool,
+}
+
+pub fn distributed_call_occurrences(
+    program: &boon_typecheck::CheckedProgram,
+    producer_requests: &[ProducerFunctionLoweringRequest],
+) -> Result<Vec<DistributedCallOccurrence>, String> {
+    let mut requests = producer_requests.to_vec();
+    requests.sort();
+    requests.dedup();
+    for request in &requests {
+        if request.identity.iter().all(|byte| *byte == 0) {
+            return Err("producer function lowering request identity must be nonzero".to_owned());
+        }
+    }
+    for pair in requests.windows(2) {
+        if pair[0].identity == pair[1].identity {
+            return Err(format!(
+                "producer function identity {} is requested for both `{}` and `{}`",
+                producer_identity_text(pair[0].identity),
+                pair[0].local_function,
+                pair[1].local_function,
+            ));
+        }
+    }
+
+    let mut calls_by_owner =
+        BTreeMap::<Option<boon_typecheck::DeclId>, Vec<&boon_typecheck::CheckedCall>>::new();
+    for call in &program.calls {
+        calls_by_owner
+            .entry(call.owner_callable)
+            .or_default()
+            .push(call);
+    }
+    for calls in calls_by_owner.values_mut() {
+        calls.sort_by_key(|call| (call.span.line, call.span.start, call.span.end, call.id));
+    }
+
+    let mut frames = vec![DistributedCallAnalysisFrame {
+        owner_callable: None,
+        root: DistributedCallOccurrenceRoot::Program,
+        path: "program".to_owned(),
+        active_callables: Vec::new(),
+        invocation_context: false,
+    }];
+    for request in requests.into_iter().rev() {
+        let callable = exact_producer_callable(program, &request.local_function)?;
+        frames.push(DistributedCallAnalysisFrame {
+            owner_callable: Some(callable.decl_id),
+            root: DistributedCallOccurrenceRoot::Producer(request.identity),
+            path: format!("producer:{}", producer_identity_text(request.identity)),
+            active_callables: vec![callable.decl_id],
+            invocation_context: request.mode == ProducerFunctionMode::Invocation,
+        });
+    }
+
+    let expressions = program
+        .expressions
+        .iter()
+        .map(|expression| (expression.id, expression))
+        .collect::<BTreeMap<_, _>>();
+    let callables = program
+        .callables
+        .iter()
+        .map(|callable| (callable.decl_id, callable))
+        .collect::<BTreeMap<_, _>>();
+    let temporally_gated = temporally_gated_checked_expressions(program);
+    let mut occurrences = BTreeMap::<String, DistributedCallOccurrence>::new();
+    while let Some(frame) = frames.pop() {
+        let calls = calls_by_owner
+            .get(&frame.owner_callable)
+            .cloned()
+            .unwrap_or_default();
+        for call in calls.into_iter().rev() {
+            let callable = callables.get(&call.callable).copied().ok_or_else(|| {
+                format!(
+                    "checked call {} references missing callable {}",
+                    call.id.0, call.callable.0
+                )
+            })?;
+            let segment = out_net::checked_call_occurrence_segment(program, call.id)?;
+            let path = format!("{}/{}", frame.path, segment);
+            let invocation_context =
+                frame.invocation_context || temporally_gated.contains(&call.expression);
+            match callable.kind {
+                boon_typecheck::CheckedCallableKind::User => {
+                    if frame.active_callables.contains(&callable.decl_id) {
+                        return Err(format!(
+                            "distributed call analysis encountered recursive callable `{}`",
+                            callable.name
+                        ));
+                    }
+                    let mut active_callables = frame.active_callables.clone();
+                    active_callables.push(callable.decl_id);
+                    frames.push(DistributedCallAnalysisFrame {
+                        owner_callable: Some(callable.decl_id),
+                        root: frame.root,
+                        path,
+                        active_callables,
+                        invocation_context,
+                    });
+                }
+                boon_typecheck::CheckedCallableKind::External => {
+                    let Some(producer_role) = distributed_function_role(&call.function) else {
+                        continue;
+                    };
+                    let current_capable = !invocation_context
+                        && call.result.mode == boon_typecheck::FlowMode::Continuous
+                        && call.entries.iter().all(|entry| match entry {
+                            boon_typecheck::CheckedCallEntry::Input { value, .. } => {
+                                expressions.get(value).is_some_and(|expression| {
+                                    expression.flow_type.mode
+                                        == boon_typecheck::FlowMode::Continuous
+                                })
+                            }
+                            _ => false,
+                        })
+                        && !callable.effect.emits_source
+                        && !callable.effect.invokes_host;
+                    let occurrence = DistributedCallOccurrence {
+                        root: frame.root,
+                        occurrence_path: path.clone(),
+                        canonical_function: call.function.clone(),
+                        producer_role,
+                        mode: if current_capable {
+                            ProducerFunctionMode::Current
+                        } else {
+                            ProducerFunctionMode::Invocation
+                        },
+                    };
+                    if let Some(previous) = occurrences.insert(path.clone(), occurrence.clone())
+                        && previous != occurrence
+                    {
+                        return Err(format!(
+                            "distributed occurrence `{path}` resolves to conflicting call contracts"
+                        ));
+                    }
+                }
+                boon_typecheck::CheckedCallableKind::Builtin => {}
+            }
+        }
+    }
+    Ok(occurrences.into_values().collect())
+}
+
+fn temporally_gated_checked_expressions(
+    program: &boon_typecheck::CheckedProgram,
+) -> BTreeSet<boon_typecheck::CheckedExprId> {
+    let expressions = program
+        .expressions
+        .iter()
+        .map(|expression| (expression.id, expression))
+        .collect::<BTreeMap<_, _>>();
+    let calls = program
+        .calls
+        .iter()
+        .map(|call| (call.id, call))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = Vec::new();
+    for expression in &program.expressions {
+        match &expression.kind {
+            boon_typecheck::CheckedExpressionKind::Then {
+                output: Some(output),
+                ..
+            } => {
+                pending.push(*output);
+            }
+            boon_typecheck::CheckedExpressionKind::When { input, arms }
+            | boon_typecheck::CheckedExpressionKind::While { input, arms }
+                if expressions.get(input).is_some_and(|input| {
+                    input.flow_type.mode != boon_typecheck::FlowMode::Continuous
+                }) =>
+            {
+                pending.extend(arms.iter().copied());
+            }
+            _ => {}
+        }
+    }
+    let mut gated = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        if !gated.insert(expression) {
+            continue;
+        }
+        let Some(expression) = expressions.get(&expression) else {
+            continue;
+        };
+        pending.extend(checked_expression_children_for_call_analysis(
+            &expression.kind,
+            &calls,
+        ));
+    }
+    gated
+}
+
+fn checked_expression_children_for_call_analysis(
+    kind: &boon_typecheck::CheckedExpressionKind,
+    calls: &BTreeMap<boon_typecheck::CheckedCallId, &boon_typecheck::CheckedCall>,
+) -> Vec<boon_typecheck::CheckedExprId> {
+    use boon_typecheck::CheckedExpressionKind as Kind;
+    match kind {
+        Kind::TextTemplate { segments } => segments
+            .iter()
+            .filter_map(|segment| match segment {
+                boon_typecheck::CheckedTextSegment::Dynamic { value } => Some(*value),
+                boon_typecheck::CheckedTextSegment::Static { .. } => None,
+            })
+            .collect(),
+        Kind::TaggedObject { fields, .. } | Kind::Object { fields } | Kind::Record { fields } => {
+            fields.iter().map(|field| field.value).collect()
+        }
+        Kind::Call { call } => calls
+            .get(call)
+            .into_iter()
+            .flat_map(|call| {
+                call.entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        boon_typecheck::CheckedCallEntry::Input { value, .. } => Some(*value),
+                        _ => None,
+                    })
+                    .chain(call.pass.map(|pass| pass.value))
+            })
+            .collect(),
+        Kind::Draining { input } => vec![*input],
+        Kind::Hold { initial, .. } => vec![*initial],
+        Kind::Latest { branches } => branches.clone(),
+        Kind::When { input, arms } | Kind::While { input, arms } => {
+            let mut children = vec![*input];
+            children.extend(arms.iter().copied());
+            children
+        }
+        Kind::Then { input, output } => {
+            let mut children = vec![*input];
+            children.extend(*output);
+            children
+        }
+        Kind::Infix { left, right, .. } => vec![*left, *right],
+        Kind::MatchArm { output, .. } => output.iter().copied().collect(),
+        Kind::Block { bindings, result } => bindings
+            .iter()
+            .map(|binding| binding.value)
+            .chain(result.iter().copied())
+            .collect(),
+        Kind::List { items, .. } | Kind::Bytes { items, .. } => items.clone(),
+        Kind::Read { .. }
+        | Kind::Passed { .. }
+        | Kind::ExternalRead { .. }
+        | Kind::Drain { .. }
+        | Kind::Text { .. }
+        | Kind::Number { .. }
+        | Kind::BytesByte { .. }
+        | Kind::Bool { .. }
+        | Kind::Tag { .. }
+        | Kind::Source
+        | Kind::Delimiter
+        | Kind::Invalid { .. } => Vec::new(),
+    }
+}
+
+fn exact_producer_callable<'a>(
+    program: &'a boon_typecheck::CheckedProgram,
+    local_function: &str,
+) -> Result<&'a boon_typecheck::CheckedCallableSignature, String> {
+    let matches = program
+        .callables
+        .iter()
+        .filter(|callable| {
+            callable.kind == boon_typecheck::CheckedCallableKind::User
+                && callable.name == local_function
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [callable] => Ok(*callable),
+        [] => Err(format!(
+            "producer function `{local_function}` does not resolve to a user function"
+        )),
+        _ => Err(format!(
+            "producer function `{local_function}` resolves ambiguously to {} user functions",
+            matches.len()
+        )),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingDistributedReferences {
     value_references: Vec<DistributedValueReference>,
@@ -182,6 +487,7 @@ macro_rules! typed_usize_ids {
 typed_usize_ids!(
     ExprId,
     ExecutableExprId,
+    ExecutableLocalBindingId,
     ExecutableStatementId,
     ExecutableSourceId,
     ExecutableStateId,
@@ -723,11 +1029,121 @@ pub struct ExecutableExpression {
     pub effect: boon_typecheck::CheckedEffectSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
+    #[serde(
+        default,
+        skip_serializing_if = "ExecutableValueProvenance::is_runtime_only"
+    )]
+    pub provenance: ExecutableValueProvenance,
     /// Exact semantic resource path after contextual call expansion. This is
     /// diagnostic/addressing metadata, never runtime ownership identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_binding_path: Option<String>,
     pub kind: ExecutableExpressionKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableValueProvenance {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<ExecutableValueMember>,
+}
+
+impl Default for ExecutableValueProvenance {
+    fn default() -> Self {
+        Self {
+            members: vec![ExecutableValueMember {
+                path: Vec::new(),
+                origin: ExecutableValueOrigin::Runtime,
+            }],
+        }
+    }
+}
+
+impl ExecutableValueProvenance {
+    fn is_runtime_only(&self) -> bool {
+        self.members.as_slice()
+            == [ExecutableValueMember {
+                path: Vec::new(),
+                origin: ExecutableValueOrigin::Runtime,
+            }]
+    }
+
+    fn projected(&self, projection: &[String]) -> Self {
+        if projection.is_empty() {
+            return self.clone();
+        }
+        let mut members = Vec::new();
+        for member in &self.members {
+            if let Some(suffix) = member.path.strip_prefix(projection) {
+                let mut projected = member.clone();
+                projected.path = suffix.to_vec();
+                members.push(projected);
+                continue;
+            }
+            let Some(suffix) = projection.strip_prefix(member.path.as_slice()) else {
+                continue;
+            };
+            let mut projected = member.clone();
+            projected.path.clear();
+            match &mut projected.origin {
+                ExecutableValueOrigin::MaterializationLocal {
+                    projection: local_projection,
+                    ..
+                } => local_projection.extend_from_slice(suffix),
+                ExecutableValueOrigin::Source { .. }
+                | ExecutableValueOrigin::ProducerSource { .. }
+                    if !suffix.is_empty() =>
+                {
+                    projected.origin = ExecutableValueOrigin::Runtime;
+                }
+                ExecutableValueOrigin::Runtime
+                | ExecutableValueOrigin::Source { .. }
+                | ExecutableValueOrigin::ProducerSource { .. }
+                | ExecutableValueOrigin::State { .. } => {}
+            }
+            members.push(projected);
+        }
+        if members.is_empty() {
+            Self::default()
+        } else {
+            members.sort();
+            members.dedup();
+            Self { members }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ExecutableValueMember {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    pub origin: ExecutableValueOrigin,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutableValueOrigin {
+    Runtime,
+    Source {
+        source: boon_typecheck::CheckedSourceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<StaticOwnerId>,
+    },
+    ProducerSource {
+        function: FunctionId,
+        identity: [u8; 32],
+        owner: StaticOwnerId,
+    },
+    State {
+        state: boon_typecheck::CheckedStateId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<StaticOwnerId>,
+    },
+    MaterializationLocal {
+        owner: StaticOwnerId,
+        local: MaterializationLocalId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -737,12 +1153,11 @@ pub struct ExecutableRecordField {
     pub name: String,
     pub value: ExecutableExprId,
     pub spread: bool,
-    #[serde(default)]
-    pub resource_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableBlockBinding {
+    pub id: ExecutableLocalBindingId,
     pub declaration: boon_typecheck::DeclId,
     pub value: ExecutableExprId,
 }
@@ -795,6 +1210,7 @@ pub enum ExecutableExpressionKind {
         source: Option<boon_typecheck::CheckedSourceRead>,
     },
     LocalRead {
+        binding: ExecutableLocalBindingId,
         declaration: boon_typecheck::DeclId,
         projection: Vec<String>,
     },
@@ -828,6 +1244,7 @@ pub enum ExecutableExpressionKind {
     Call {
         callable_kind: ExecutableCallableKind,
         name: String,
+        instance: usize,
         arguments: Vec<ExecutableCallArgument>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         contexts: Vec<ExecutableCallContextId>,
@@ -929,6 +1346,7 @@ pub struct ExecutableProgram {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableSourceDef {
     pub id: ExecutableSourceId,
+    pub origin: ExecutableSourceOrigin,
     pub declaration: boon_typecheck::DeclId,
     pub expression: ExecutableExprId,
     pub binding_path: String,
@@ -936,9 +1354,31 @@ pub struct ExecutableSourceDef {
     pub owner: Option<StaticOwnerId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutableSourceOrigin {
+    Checked {
+        source: boon_typecheck::CheckedSourceId,
+    },
+    ProducerInvocation {
+        function: FunctionId,
+        identity: [u8; 32],
+    },
+}
+
+impl ExecutableSourceOrigin {
+    fn checked_source(self) -> Option<boon_typecheck::CheckedSourceId> {
+        match self {
+            Self::Checked { source } => Some(source),
+            Self::ProducerInvocation { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableStateDef {
     pub id: ExecutableStateId,
+    pub checked_state: boon_typecheck::CheckedStateId,
     pub declaration: boon_typecheck::DeclId,
     pub expression: ExecutableExprId,
     pub initial: ExecutableExprId,
@@ -963,10 +1403,13 @@ pub struct ExecutableFunctionParameter {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableFunction {
     pub id: FunctionId,
+    pub identity: [u8; 32],
     pub name: String,
     pub parameters: Vec<ExecutableFunctionParameter>,
     pub result_type: boon_typecheck::FlowType,
     pub root: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_source: Option<ExecutableExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1061,7 +1504,7 @@ pub struct ErasedLocalMember {
     pub forwarded_from: Option<ErasedLocalMemberForwarding>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ErasedLocalMemberForwarding {
     pub owner: StaticOwnerId,
     pub local: MaterializationLocalId,
@@ -1211,6 +1654,7 @@ pub enum ErasedReadTarget {
         projection: Vec<String>,
     },
     Local {
+        binding: ExecutableLocalBindingId,
         declaration: boon_typecheck::DeclId,
         value: ExecutableExprId,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1242,6 +1686,8 @@ pub struct ErasedScopeIndex {
     pub reads: Vec<ErasedReadBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub row_values: Vec<ErasedRowValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_source_projections: Vec<ErasedRowSourceProjection>,
     pub dependencies: Vec<ErasedDependencyUse>,
 }
 
@@ -1278,6 +1724,13 @@ pub struct ErasedRowValue {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projection: Vec<String>,
     pub row: ErasedRowBinding,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ErasedRowSourceProjection {
+    pub row: ErasedRowBinding,
+    pub path: Vec<String>,
+    pub source: SourceId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1318,11 +1771,22 @@ pub enum ErasedBindingTarget {
     },
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContextualRowPredecessor {
+    Value,
+    Stored { row: ErasedRowBinding },
+    Materialized { materialization: usize },
+    Provenance { materialization: usize },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContextualMaterialization {
     pub id: usize,
     pub operation: ContextualOperationKind,
     pub source: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_row_predecessors: Vec<ContextualRowPredecessor>,
     pub body: ExecutableExprId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<ExecutableExprId>,
@@ -1476,55 +1940,10 @@ fn producer_identity_text(identity: [u8; 32]) -> String {
     identity.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn next_synthetic_checked_id(next: &mut u32, kind: &str) -> Result<u32, String> {
-    let id = *next;
-    *next = next
-        .checked_add(1)
-        .ok_or_else(|| format!("checked {kind} IDs are exhausted"))?;
-    Ok(id)
-}
-
-fn checked_scope_is_within(
+fn resolve_producer_function_roots(
     program: &boon_typecheck::CheckedProgram,
-    mut scope: boon_typecheck::LexicalScopeId,
-    ancestor: boon_typecheck::LexicalScopeId,
-) -> bool {
-    let mut visited = BTreeSet::new();
-    while visited.insert(scope) {
-        if scope == ancestor {
-            return true;
-        }
-        let Some(parent) = program
-            .scopes
-            .iter()
-            .find(|candidate| candidate.id == scope)
-            .and_then(|scope| scope.parent)
-        else {
-            break;
-        };
-        scope = parent;
-    }
-    false
-}
-
-fn checked_function_requires_pass(
-    program: &boon_typecheck::CheckedProgram,
-    callable: &boon_typecheck::CheckedCallableSignature,
-) -> bool {
-    !callable.contexts.is_empty()
-        || program.expressions.iter().any(|expression| {
-            checked_scope_is_within(program, expression.scope_id, callable.scope_id)
-                && matches!(
-                    expression.kind,
-                    boon_typecheck::CheckedExpressionKind::Passed { .. }
-                )
-        })
-}
-
-fn elaborate_producer_function_roots(
-    program: &mut boon_typecheck::CheckedProgram,
     requests: &[ProducerFunctionLoweringRequest],
-) -> Result<Vec<out_net::ProducerRoot>, String> {
+) -> Result<Vec<out_net::ProducerRootSpec>, String> {
     let mut requests = requests.to_vec();
     requests.sort();
     requests.dedup();
@@ -1543,299 +1962,99 @@ fn elaborate_producer_function_roots(
             ));
         }
     }
-
-    let mut resolved = Vec::with_capacity(requests.len());
-    for request in requests {
-        let matches = program
-            .callables
-            .iter()
-            .filter(|callable| {
-                callable.kind == boon_typecheck::CheckedCallableKind::User
-                    && callable.name == request.local_function
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let callable = match matches.as_slice() {
-            [callable] => callable.clone(),
-            [] => {
+    let first_statement = program
+        .statements
+        .iter()
+        .map(|statement| statement.id.0 as usize)
+        .max()
+        .map_or(0, |id| id.saturating_add(1));
+    requests
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, request)| {
+            let callable = exact_producer_callable(program, &request.local_function)?;
+            if callable.result.mode != boon_typecheck::FlowMode::Continuous {
                 return Err(format!(
-                    "producer function `{}` does not resolve to a user function",
+                    "producer function `{}` result must be continuous, found {:?}",
+                    request.local_function, callable.result.mode
+                ));
+            }
+            let out_parameters = callable
+                .parameters
+                .iter()
+                .filter(|parameter| parameter.kind != boon_typecheck::CheckedParameterKind::Value)
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>();
+            if !out_parameters.is_empty() {
+                return Err(format!(
+                    "producer function `{}` has unsupported OUT parameter(s): {}",
+                    request.local_function,
+                    out_parameters.join(", ")
+                ));
+            }
+            if callable.requires_pass() {
+                return Err(format!(
+                    "producer function `{}` has an unsupported PASS-in-signature requirement",
                     request.local_function
                 ));
             }
-            _ => {
+            if callable.result_expression.is_none() {
                 return Err(format!(
-                    "producer function `{}` resolves ambiguously to {} user functions",
-                    request.local_function,
-                    matches.len()
+                    "producer function `{}` has no checked result expression",
+                    request.local_function
                 ));
             }
-        };
-        if callable.result.mode != boon_typecheck::FlowMode::Continuous {
-            return Err(format!(
-                "producer function `{}` result must be continuous, found {:?}",
-                request.local_function, callable.result.mode
-            ));
-        }
-        let out_parameters = callable
-            .parameters
-            .iter()
-            .filter(|parameter| parameter.kind != boon_typecheck::CheckedParameterKind::Value)
-            .map(|parameter| parameter.name.as_str())
-            .collect::<Vec<_>>();
-        if !out_parameters.is_empty() {
-            return Err(format!(
-                "producer function `{}` has unsupported OUT parameter(s): {}",
-                request.local_function,
-                out_parameters.join(", ")
-            ));
-        }
-        if checked_function_requires_pass(program, &callable) {
-            return Err(format!(
-                "producer function `{}` has an unsupported PASS-in-signature requirement",
-                request.local_function
-            ));
-        }
-        if callable.result_expression.is_none() {
-            return Err(format!(
-                "producer function `{}` has no checked result expression",
-                request.local_function
-            ));
-        }
-        let span = program
-            .declarations
-            .iter()
-            .find(|declaration| declaration.id == callable.decl_id)
-            .map(|declaration| declaration.span)
-            .unwrap_or_default();
-        resolved.push((request, callable, span));
-    }
-
-    let mut next_declaration = program
-        .declarations
-        .iter()
-        .map(|declaration| declaration.id.0)
-        .max()
-        .map_or(0, |id| id.saturating_add(1));
-    let mut next_expression = program
-        .expressions
-        .iter()
-        .map(|expression| expression.id.0)
-        .max()
-        .map_or(0, |id| id.saturating_add(1));
-    let mut next_call = program
-        .calls
-        .iter()
-        .map(|call| call.id.0)
-        .max()
-        .map_or(0, |id| id.saturating_add(1));
-    let mut next_statement = program
-        .statements
-        .iter()
-        .map(|statement| statement.id.0)
-        .max()
-        .map_or(0, |id| id.saturating_add(1));
-    let mut roots = Vec::with_capacity(resolved.len());
-
-    for (function_ordinal, (request, callable, span)) in resolved.into_iter().enumerate() {
-        let function = FunctionId(function_ordinal);
-        let identity_text = producer_identity_text(request.identity);
-        let result_path = format!("@producer/{identity_text}/result");
-        let invocation = request.mode == ProducerFunctionMode::Invocation;
-        let invocation_flow = boon_typecheck::FlowType {
-            mode: boon_typecheck::FlowMode::PresentOrAbsent,
-            ty: callable.result.ty.clone(),
-        };
-        let invocation_source = if invocation {
-            let declaration = boon_typecheck::DeclId(next_synthetic_checked_id(
-                &mut next_declaration,
-                "declaration",
-            )?);
-            let expression = boon_typecheck::CheckedExprId(next_synthetic_checked_id(
-                &mut next_expression,
-                "expression",
-            )?);
-            let source_flow = boon_typecheck::FlowType {
-                mode: boon_typecheck::FlowMode::PresentOrAbsent,
-                ty: boon_typecheck::Type::Unknown,
-            };
-            program
-                .declarations
-                .push(boon_typecheck::CheckedDeclaration {
-                    id: declaration,
-                    scope_id: program.root_scope,
-                    name: format!("__producer_{identity_text}_invoke"),
-                    kind: boon_typecheck::CheckedDeclarationKind::Source,
-                    flow_type: source_flow.clone(),
-                    value: Some(expression),
-                    body_scope: None,
-                    span,
-                });
-            program.expressions.push(boon_typecheck::CheckedExpression {
-                id: expression,
-                scope_id: program.root_scope,
-                declaration: Some(declaration),
-                flow_type: source_flow,
-                effect: boon_typecheck::CheckedEffectSummary {
-                    emits_source: true,
-                    ..boon_typecheck::CheckedEffectSummary::default()
-                },
-                kind: boon_typecheck::CheckedExpressionKind::Source,
-                span,
-            });
-            Some(expression)
-        } else {
-            None
-        };
-        let result_declaration = boon_typecheck::DeclId(next_synthetic_checked_id(
-            &mut next_declaration,
-            "declaration",
-        )?);
-        let mut parameters = callable.parameters.clone();
-        parameters.sort_by_key(|parameter| parameter.ordinal);
-        let mut root_parameters = Vec::with_capacity(parameters.len());
-        let mut entries = Vec::with_capacity(parameters.len());
-        for parameter in parameters {
-            let checked_expression = boon_typecheck::CheckedExprId(next_synthetic_checked_id(
-                &mut next_expression,
-                "expression",
-            )?);
-            let executable_parameter = ExecutableParameterId {
+            if callable
+                .parameters
+                .iter()
+                .any(|parameter| runtime_type_contains_var(&parameter.flow_type.ty))
+                || runtime_type_contains_var(&callable.result.ty)
+            {
+                return Err(format!(
+                    "producer function `{}` has no concrete distributed boundary specialization",
+                    request.local_function
+                ));
+            }
+            let function = FunctionId(ordinal);
+            let mut parameters = callable.parameters.clone();
+            parameters.sort_by_key(|parameter| parameter.ordinal);
+            let parameters = parameters
+                .into_iter()
+                .map(|parameter| out_net::ProducerRootParameter {
+                    formal: parameter.decl_id,
+                    parameter: ExecutableParameterId {
+                        function,
+                        ordinal: parameter.ordinal,
+                    },
+                    name: parameter.name,
+                    flow_type: parameter.flow_type,
+                })
+                .collect();
+            let invocation = request.mode == ProducerFunctionMode::Invocation;
+            Ok(out_net::ProducerRootSpec {
+                identity: request.identity,
+                mode: request.mode,
+                callable: callable.decl_id,
                 function,
-                ordinal: parameter.ordinal,
-            };
-            program.expressions.push(boon_typecheck::CheckedExpression {
-                id: checked_expression,
-                scope_id: program.root_scope,
-                declaration: None,
-                flow_type: parameter.flow_type.clone(),
-                effect: boon_typecheck::CheckedEffectSummary::default(),
-                kind: boon_typecheck::CheckedExpressionKind::Read {
-                    target: parameter.decl_id,
-                    projection: Vec::new(),
-                    source: None,
-                },
-                span,
-            });
-            entries.push(boon_typecheck::CheckedCallEntry::Input {
-                formal: parameter.decl_id,
-                name: parameter.name.clone(),
-                value: checked_expression,
-                from_pipe: false,
-                evaluation_scope: parameter.evaluation_scope,
-            });
-            root_parameters.push(out_net::ProducerRootParameter {
-                checked_expression,
-                parameter: executable_parameter,
-                name: parameter.name,
-                flow_type: parameter.flow_type,
-            });
-        }
-
-        let call =
-            boon_typecheck::CheckedCallId(next_synthetic_checked_id(&mut next_call, "call")?);
-        let call_expression = boon_typecheck::CheckedExprId(next_synthetic_checked_id(
-            &mut next_expression,
-            "expression",
-        )?);
-        let result_expression = if invocation {
-            boon_typecheck::CheckedExprId(next_synthetic_checked_id(
-                &mut next_expression,
-                "expression",
-            )?)
-        } else {
-            call_expression
-        };
-        let result_statement = boon_typecheck::CheckedStatementId(next_synthetic_checked_id(
-            &mut next_statement,
-            "statement",
-        )?);
-        program
-            .declarations
-            .push(boon_typecheck::CheckedDeclaration {
-                id: result_declaration,
-                scope_id: program.root_scope,
-                name: format!("__producer_{identity_text}_result"),
-                kind: boon_typecheck::CheckedDeclarationKind::Field,
-                flow_type: if invocation {
-                    invocation_flow.clone()
+                function_name: callable.name.clone(),
+                result_statement: ExecutableStatementId(first_statement.saturating_add(ordinal)),
+                result_declaration: callable.decl_id,
+                result_path: format!(
+                    "@producer/{}/result",
+                    producer_identity_text(request.identity)
+                ),
+                result_type: if invocation {
+                    boon_typecheck::FlowType {
+                        mode: boon_typecheck::FlowMode::PresentOrAbsent,
+                        ty: callable.result.ty.clone(),
+                    }
                 } else {
                     callable.result.clone()
                 },
-                value: Some(result_expression),
-                body_scope: None,
-                span,
-            });
-        program.calls.push(boon_typecheck::CheckedCall {
-            id: call,
-            expression: call_expression,
-            callable: callable.decl_id,
-            owner_callable: None,
-            function: callable.name.clone(),
-            entries,
-            contexts: Vec::new(),
-            pass: None,
-            type_substitutions: Vec::new(),
-            result: callable.result.clone(),
-            role: callable.role,
-            span,
-        });
-        program.expressions.push(boon_typecheck::CheckedExpression {
-            id: call_expression,
-            scope_id: program.root_scope,
-            declaration: (!invocation).then_some(result_declaration),
-            flow_type: callable.result.clone(),
-            effect: callable.effect,
-            kind: boon_typecheck::CheckedExpressionKind::Call { call },
-            span,
-        });
-        if let Some(source_expression) = invocation_source {
-            program.expressions.push(boon_typecheck::CheckedExpression {
-                id: result_expression,
-                scope_id: program.root_scope,
-                declaration: Some(result_declaration),
-                flow_type: invocation_flow.clone(),
-                effect: boon_typecheck::CheckedEffectSummary {
-                    emits_source: true,
-                    ..callable.effect
-                },
-                kind: boon_typecheck::CheckedExpressionKind::Then {
-                    input: source_expression,
-                    output: Some(call_expression),
-                },
-                span,
-            });
-        }
-        program.statements.push(boon_typecheck::CheckedStatement {
-            id: result_statement,
-            scope_id: program.root_scope,
-            kind: boon_typecheck::CheckedStatementKind::Field {
-                declaration: result_declaration,
-            },
-            value: Some(result_expression),
-            value_use: boon_typecheck::CheckedValueUse::RuntimeValue,
-            children: Vec::new(),
-            span,
-        });
-        roots.push(out_net::ProducerRoot {
-            identity: request.identity,
-            mode: request.mode,
-            call,
-            function,
-            function_name: callable.name,
-            result_statement,
-            result_declaration,
-            result_path,
-            result_type: if invocation {
-                invocation_flow
-            } else {
-                callable.result
-            },
-            invocation_source_expression: invocation_source,
-            parameters: root_parameters,
-        });
-    }
-    Ok(roots)
+                parameters,
+            })
+        })
+        .collect()
 }
 
 fn lower_with_typecheck(
@@ -1922,7 +2141,7 @@ fn lower_with_typecheck(
 }
 
 pub fn lower_checked(
-    mut checked_program: boon_typecheck::CheckedProgram,
+    checked_program: boon_typecheck::CheckedProgram,
     producer_requests: &[ProducerFunctionLoweringRequest],
 ) -> Result<ErasedProgram, String> {
     let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
@@ -1935,8 +2154,7 @@ pub fn lower_checked(
     let source_expression_count = checked_program
         .lowering_metadata
         .original_source_expression_count;
-    let producer_roots =
-        elaborate_producer_function_roots(&mut checked_program, producer_requests)?;
+    let producer_roots = resolve_producer_function_roots(&checked_program, producer_requests)?;
     let out_net = out_net::OutNet::build_with_producer_roots(&checked_program, producer_roots);
     if out_net.has_errors() {
         return Err(out_net
@@ -1962,22 +2180,28 @@ pub fn lower_checked(
         .sources
         .iter()
         .enumerate()
-        .map(|(id, source)| SourcePort {
-            id: SourceId(id),
-            binding_path: source.binding_path.clone(),
-            executable_source_id: None,
-            static_owner: None,
-            source_expr_id: source
-                .expression
-                .map(|expression| ExprId(expression.0 as usize)),
-            source_line: source.line,
-            scoped: source.scoped,
-            scope_id: None,
-            interval_ms: source.interval_ms,
-            payload_schema: source_payload_schema(&checked_program.lowering_metadata, &source.path),
-            path: source.path.clone(),
+        .map(|(id, source)| {
+            let path = checked_program.semantic_path(&source.path).ok_or_else(|| {
+                format!(
+                    "checked source {} has no canonical semantic path",
+                    source.id.0
+                )
+            })?;
+            Ok(SourcePort {
+                id: SourceId(id),
+                binding_path: path.clone(),
+                executable_source_id: None,
+                static_owner: None,
+                source_expr_id: Some(ExprId(source.expression.0 as usize)),
+                source_line: source.span.line,
+                scoped: source.owner_scope != checked_program.root_scope,
+                scope_id: None,
+                interval_ms: source.interval_ms,
+                payload_schema: source_payload_schema_from_type(&source.payload_type),
+                path,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     let mut source_paths = sources
         .iter()
         .map(|source| source.path.clone())
@@ -2027,7 +2251,7 @@ pub fn lower_checked(
         lower_elapsed_ms(contextual_materializations_started),
     );
     let executable_started = Instant::now();
-    let mut executable = contextual_expansion::derive_executable_program(
+    let executable = contextual_expansion::derive_executable_program(
         &checked_program,
         &out_net.graph,
         &materializations,
@@ -2039,6 +2263,8 @@ pub fn lower_checked(
         lower_elapsed_ms(executable_started),
     );
     distributed_references.calls = concrete_distributed_calls(
+        &checked_program,
+        &out_net.graph,
         &executable,
         &materializations,
         &pending_distributed_references.calls,
@@ -2098,27 +2324,6 @@ pub fn lower_checked(
     )?;
     merge_resource_aliases(&mut resource_aliases, source_aliases)?;
     resource_aliases.bind_owner_parents(&out_net.graph.static_owners)?;
-    bind_contextual_materialization_storage(
-        &executable,
-        &out_net.graph.static_owners,
-        &derived_list_storage,
-        &row_scopes,
-        &lists,
-        &sources,
-        &state_cells,
-        &mut materializations,
-    )?;
-    let list_mutations_started = Instant::now();
-    let list_mutations = exact_list_mutations(
-        &executable,
-        &out_net.graph.static_owners,
-        &derived_list_storage,
-        &row_scopes,
-        &sources,
-        &state_cells,
-        &materializations,
-    )?;
-    trace_phase("list_mutations", lower_elapsed_ms(list_mutations_started));
     let producer_result_owners = producer_result_owners(&out_net.graph)?;
     bind_producer_invocation_source_owners(
         &out_net.graph,
@@ -2126,20 +2331,24 @@ pub fn lower_checked(
         &producer_result_owners,
         &mut sources,
     )?;
-    let mut erased_fields = build_erased_fields(
+    bind_contextual_materialization_storage(
+        &executable,
+        &derived_list_storage,
+        &lists,
+        &mut materializations,
+    )?;
+    bind_contextual_materialization_lineage(
+        &executable,
+        &derived_list_storage,
+        &mut materializations,
+    )?;
+    let mut erased_fields = build_erased_value_fields(
         &checked_program,
         &executable,
         &lists,
         &derived_list_storage,
         &materializations,
-        &list_mutations,
         &producer_result_owners,
-    )?;
-    let producer_function_instances = concrete_producer_function_instances(
-        &out_net.graph,
-        &executable,
-        &erased_fields,
-        &sources,
     )?;
     bind_indexed_state_fields(
         &checked_program,
@@ -2148,38 +2357,96 @@ pub fn lower_checked(
         &state_cells,
         &mut erased_fields,
     )?;
+    let mut erased_locals = build_erased_locals(
+        &executable,
+        &out_net.graph.static_owners,
+        &materializations,
+        &erased_fields,
+        &sources,
+        &state_cells,
+        &lists,
+    )?;
+    resolve_executable_source_provenance(
+        &executable,
+        &out_net.graph.static_owners,
+        &sources,
+        &state_cells,
+        &materializations,
+        &mut erased_fields,
+        &mut erased_locals,
+    )?;
+    let source_authority = ExecutableSourceAuthorityIndex::build(
+        &executable,
+        &out_net.graph.static_owners,
+        &sources,
+        &state_cells,
+        &materializations,
+        &erased_fields,
+        &erased_locals,
+    )?;
+    let list_mutations_started = Instant::now();
+    let list_mutations = exact_list_mutations(
+        &executable,
+        &derived_list_storage,
+        &sources,
+        &state_cells,
+        &materializations,
+        &source_authority,
+    )?;
+    trace_phase("list_mutations", lower_elapsed_ms(list_mutations_started));
+    append_erased_list_authority_fields(
+        &executable,
+        &lists,
+        &derived_list_storage,
+        &materializations,
+        &list_mutations,
+        &source_authority,
+        &mut erased_fields,
+    )?;
+    erased_locals = build_erased_locals(
+        &executable,
+        &out_net.graph.static_owners,
+        &materializations,
+        &erased_fields,
+        &sources,
+        &state_cells,
+        &lists,
+    )?;
+    source_authority.apply_local_resources(&mut erased_locals)?;
+    let producer_function_instances = concrete_producer_function_instances(
+        &out_net.graph,
+        &executable,
+        &erased_fields,
+        &sources,
+    )?;
     let derived_values_started = Instant::now();
     let mut derived_values = derived_values(
         &checked_program,
         &executable,
         &out_net.graph.static_owners,
-        &row_scopes,
         &derived_list_storage,
         &erased_fields,
         &state_cells,
         &sources,
         &materializations,
+        &source_authority,
         &producer_function_instances,
         &distributed_references.value_references,
     )?;
     derived_values.extend(producer_derived_values(
         &executable,
-        &out_net.graph.static_owners,
-        &row_scopes,
         &derived_list_storage,
         &state_cells,
         &sources,
         &materializations,
+        &source_authority,
         &producer_function_instances,
     )?);
     let state_update_arms = state_update_arms(
         &executable,
-        &out_net.graph.static_owners,
-        &row_scopes,
-        &derived_list_storage,
-        &sources,
         &state_cells,
         &materializations,
+        &source_authority,
     )?;
     let dependencies_started = Instant::now();
     let mut dependencies = exact_dependency_edges(&state_update_arms, &sources, &state_cells)?;
@@ -2200,7 +2467,6 @@ pub fn lower_checked(
     let derived_values_ms = lower_elapsed_ms(derived_values_started);
     trace_phase("derived_values", derived_values_ms);
     bind_derived_field_ids(&mut derived_values, &erased_fields)?;
-    let semantic_fields = semantic_field_entries(&erased_fields, &derived_values, &state_cells);
     let mut scope_index = build_erased_scope_index(
         &executable,
         &out_net.graph.static_owners,
@@ -2209,9 +2475,18 @@ pub fn lower_checked(
         &state_cells,
         &lists,
         &derived_list_storage,
+        erased_locals,
         std::mem::take(&mut erased_fields),
+        source_authority.row_source_projections.clone(),
     )?;
-    mark_forwarded_executable_resource_fields(&mut executable, &scope_index)?;
+    derived_values.retain(|value| {
+        scope_index
+            .fields
+            .get(value.id.as_usize())
+            .is_some_and(|field| field.id == value.id && !field.resource_only)
+    });
+    let semantic_fields =
+        semantic_field_entries(&scope_index.fields, &derived_values, &state_cells);
     bind_detached_state_captures(
         &executable,
         &materializations,
@@ -2245,12 +2520,8 @@ pub fn lower_checked(
     )?;
     bind_distributed_call_invocation_arms(
         &executable,
-        &out_net.graph.static_owners,
         &scope_index,
-        &derived_list_storage,
-        &row_scopes,
-        &sources,
-        &state_cells,
+        &source_authority,
         &materializations,
         &mut distributed_references.calls,
     )?;
@@ -2266,13 +2537,12 @@ pub fn lower_checked(
     let view_bindings_started = Instant::now();
     let view_bindings = view_bindings(
         &executable,
-        &out_net.graph.static_owners,
         &scope_index,
+        &source_authority,
         &derived_list_storage,
         &output_values,
         &row_scopes,
         &sources,
-        &state_cells,
         &materializations,
     )?;
     let view_bindings_ms = lower_elapsed_ms(view_bindings_started);
@@ -2370,14 +2640,7 @@ fn producer_result_owners(
         .producer_roots()
         .iter()
         .map(|root| {
-            let call = out_net
-                .producer_root_for_identity(root.identity)
-                .ok_or_else(|| {
-                    format!(
-                        "producer function identity {} has no concrete root call frame",
-                        producer_identity_text(root.identity)
-                    )
-                })?;
+            let call = root.call;
             let instance = out_net
                 .call_instances
                 .get(call.as_usize())
@@ -2385,19 +2648,16 @@ fn producer_result_owners(
                 .ok_or_else(|| {
                     format!(
                         "producer function identity {} root frame is not static",
-                        producer_identity_text(root.identity)
+                        producer_identity_text(root.spec.identity)
                     )
                 })?;
             let owner = instance.owner.ok_or_else(|| {
                 format!(
                     "producer function identity {} root frame has no static owner",
-                    producer_identity_text(root.identity)
+                    producer_identity_text(root.spec.identity)
                 )
             })?;
-            Ok((
-                ExecutableStatementId(root.result_statement.0 as usize),
-                owner,
-            ))
+            Ok((root.spec.result_statement, owner))
         })
         .collect()
 }
@@ -2407,20 +2667,30 @@ fn producer_invocation_source_id(
     executable: &ExecutableProgram,
     sources: &[SourcePort],
 ) -> Result<Option<SourceId>, String> {
-    let Some(checked_expression) = producer.invocation_source_expression else {
+    let function = executable
+        .functions
+        .iter()
+        .find(|function| function.id == producer.spec.function)
+        .ok_or_else(|| {
+            format!(
+                "producer function identity {} has no executable function",
+                producer_identity_text(producer.spec.identity)
+            )
+        })?;
+    let Some(expression_id) = function.invocation_source else {
         return Ok(None);
     };
     let expression = executable
         .expressions
-        .iter()
-        .find(|expression| {
-            expression.checked_expr_id == checked_expression
+        .get(expression_id.as_usize())
+        .filter(|expression| {
+            expression.id == expression_id
                 && matches!(expression.kind, ExecutableExpressionKind::Source { .. })
         })
         .ok_or_else(|| {
             format!(
                 "producer function identity {} has no executable invocation SOURCE",
-                producer_identity_text(producer.identity)
+                producer_identity_text(producer.spec.identity)
             )
         })?;
     let executable_source = executable
@@ -2430,7 +2700,7 @@ fn producer_invocation_source_id(
         .ok_or_else(|| {
             format!(
                 "producer function identity {} invocation expression has no source definition",
-                producer_identity_text(producer.identity)
+                producer_identity_text(producer.spec.identity)
             )
         })?;
     sources
@@ -2440,7 +2710,7 @@ fn producer_invocation_source_id(
         .ok_or_else(|| {
             format!(
                 "producer function identity {} invocation SOURCE has no runtime source",
-                producer_identity_text(producer.identity)
+                producer_identity_text(producer.spec.identity)
             )
         })
 }
@@ -2455,11 +2725,11 @@ fn bind_producer_invocation_source_owners(
         let Some(source_id) = producer_invocation_source_id(producer, executable, sources)? else {
             continue;
         };
-        let statement = ExecutableStatementId(producer.result_statement.0 as usize);
+        let statement = producer.spec.result_statement;
         let owner = result_owners.get(&statement).copied().ok_or_else(|| {
             format!(
                 "producer function identity {} invocation SOURCE has no call-site owner",
-                producer_identity_text(producer.identity)
+                producer_identity_text(producer.spec.identity)
             )
         })?;
         let source = sources
@@ -2480,7 +2750,8 @@ fn concrete_producer_function_instances(
     let result_owners = producer_result_owners(out_net)?;
     let mut instances = Vec::with_capacity(out_net.producer_roots().len());
     for producer in out_net.producer_roots() {
-        let statement_id = ExecutableStatementId(producer.result_statement.0 as usize);
+        let spec = &producer.spec;
+        let statement_id = spec.result_statement;
         let statement = executable
             .statements
             .iter()
@@ -2488,14 +2759,14 @@ fn concrete_producer_function_instances(
             .ok_or_else(|| {
                 format!(
                     "producer function identity {} has no executable result statement {}",
-                    producer_identity_text(producer.identity),
+                    producer_identity_text(spec.identity),
                     statement_id
                 )
             })?;
         let root = statement.value.ok_or_else(|| {
             format!(
                 "producer function identity {} result statement {} has no value",
-                producer_identity_text(producer.identity),
+                producer_identity_text(spec.identity),
                 statement_id
             )
         })?;
@@ -2504,8 +2775,8 @@ fn concrete_producer_function_instances(
             .iter()
             .filter(|field| {
                 field.statement == Some(statement_id)
-                    && field.declaration == Some(producer.result_declaration)
-                    && field.diagnostic_path == producer.result_path
+                    && field.declaration == Some(spec.result_declaration)
+                    && field.diagnostic_path == spec.result_path
                     && field.static_owner == Some(owner)
             })
             .collect::<Vec<_>>();
@@ -2514,7 +2785,7 @@ fn concrete_producer_function_instances(
             _ => {
                 return Err(format!(
                     "producer function identity {} result has {} exact erased fields",
-                    producer_identity_text(producer.identity),
+                    producer_identity_text(spec.identity),
                     result_fields.len()
                 ));
             }
@@ -2522,21 +2793,21 @@ fn concrete_producer_function_instances(
         let function = executable
             .functions
             .iter()
-            .find(|function| function.id == producer.function)
+            .find(|function| function.id == spec.function)
             .ok_or_else(|| {
                 format!(
                     "producer function identity {} has no concrete function {}",
-                    producer_identity_text(producer.identity),
-                    producer.function
+                    producer_identity_text(spec.identity),
+                    spec.function
                 )
             })?;
-        if function.root != root || function.name != producer.function_name {
+        if function.root != root || function.name != spec.function_name {
             return Err(format!(
                 "producer function identity {} concrete function metadata differs from its root",
-                producer_identity_text(producer.identity)
+                producer_identity_text(spec.identity)
             ));
         }
-        let arguments = producer
+        let arguments = spec
             .parameters
             .iter()
             .map(|parameter| {
@@ -2562,14 +2833,14 @@ fn concrete_producer_function_instances(
             })
             .collect();
         instances.push(ProducerFunctionInstance {
-            identity: producer.identity,
+            identity: spec.identity,
             owner,
-            function: producer.function,
-            function_name: producer.function_name.clone(),
+            function: spec.function,
+            function_name: spec.function_name.clone(),
             result_field,
-            result_path: producer.result_path.clone(),
+            result_path: spec.result_path.clone(),
             root,
-            mode: producer.mode,
+            mode: spec.mode,
             invocation_source: producer_invocation_source_id(producer, executable, sources)?,
             arguments,
         });
@@ -2578,13 +2849,12 @@ fn concrete_producer_function_instances(
     Ok(instances)
 }
 
-fn build_erased_fields(
+fn build_erased_value_fields(
     checked: &boon_typecheck::CheckedProgram,
     executable: &ExecutableProgram,
     lists: &[ListMemory],
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
     materializations: &[ContextualMaterialization],
-    list_mutations: &[ListMutation],
     producer_result_owners: &BTreeMap<ExecutableStatementId, StaticOwnerId>,
 ) -> Result<Vec<ErasedFieldDef>, String> {
     let owner_rows = materializations
@@ -2713,10 +2983,28 @@ fn build_erased_fields(
             boon_typecheck::Type::Object(shape) => Some(shape),
             _ => None,
         };
+        let mut item_field_types = BTreeMap::new();
         for name in &storage.item_fields {
+            item_field_types.insert(name.clone(), boon_typecheck::Type::Unknown);
+        }
+        if let Some(shape) = item_shape {
+            for (name, ty) in &shape.fields {
+                merge_authority_field_type(&mut item_field_types, name, ty.clone())?;
+            }
+        }
+        if let ListInitializer::RecordLiteral { rows } = &list.initializer {
+            for field in rows.iter().flat_map(|row| &row.fields) {
+                merge_authority_field_type(
+                    &mut item_field_types,
+                    &field.name,
+                    initial_value_checked_type(&field.value),
+                )?;
+            }
+        }
+        for (name, item_field_type) in item_field_types {
             if fields
                 .iter()
-                .any(|field| field.row == Some(row) && field.name == *name)
+                .any(|field| field.row == Some(row) && field.name == name)
             {
                 continue;
             }
@@ -2725,17 +3013,14 @@ fn build_erased_fields(
                 materializations,
                 storage.list_id,
                 *statement,
-                name,
+                &name,
             )?;
-            let (declaration, producer, field_owner, resource_only) = match candidates.as_slice() {
-                [] => (None, None, owner, false),
-                [(declaration, producer, field_owner, resource_only)] => (
-                    Some(*declaration),
-                    Some(*producer),
-                    field_owner.or(owner),
-                    *resource_only,
-                ),
-                _ => (None, None, owner, false),
+            let (declaration, producer, field_owner) = match candidates.as_slice() {
+                [] => (None, None, owner),
+                [(declaration, producer, field_owner)] => {
+                    (Some(*declaration), Some(*producer), field_owner.or(owner))
+                }
+                _ => (None, None, owner),
             };
             if executable.sources.iter().any(|source| {
                 Some(source.declaration) == declaration
@@ -2746,10 +3031,7 @@ fn build_erased_fields(
             }
             let flow_type = boon_typecheck::FlowType {
                 mode: boon_typecheck::FlowMode::Continuous,
-                ty: item_shape
-                    .and_then(|shape| shape.fields.get(name))
-                    .cloned()
-                    .unwrap_or(boon_typecheck::Type::Unknown),
+                ty: item_field_type,
             };
             fields.push(ErasedFieldDef {
                 id: FieldId(fields.len()),
@@ -2762,12 +3044,104 @@ fn build_erased_fields(
                 diagnostic_path: format!("{}.{}", list.name, name),
                 statement: Some(*statement),
                 producer,
-                resource_only,
+                resource_only: false,
                 flow_type,
             });
         }
     }
 
+    let mut parent_index = 0;
+    while parent_index < fields.len() {
+        let parent = fields[parent_index].clone();
+        parent_index += 1;
+        let Some(producer) = parent.producer else {
+            continue;
+        };
+        let expression = executable
+            .expressions
+            .get(producer.as_usize())
+            .filter(|expression| expression.id == producer)
+            .ok_or_else(|| {
+                format!(
+                    "erased field {} references missing record producer {producer}",
+                    parent.id
+                )
+            })?;
+        let record_fields = match &expression.kind {
+            ExecutableExpressionKind::Object(record_fields)
+            | ExecutableExpressionKind::Record(record_fields)
+            | ExecutableExpressionKind::TaggedObject {
+                fields: record_fields,
+                ..
+            } => record_fields,
+            _ => continue,
+        };
+        for record_field in record_fields.iter().filter(|field| !field.spread) {
+            if fields.iter().any(|field| {
+                field.parent == Some(parent.id)
+                    && field.name == record_field.name
+                    && field.producer == Some(record_field.value)
+            }) {
+                continue;
+            }
+            let value = executable
+                .expressions
+                .get(record_field.value.as_usize())
+                .filter(|expression| expression.id == record_field.value)
+                .ok_or_else(|| {
+                    format!(
+                        "erased record field `{}.{}` references missing producer {}",
+                        parent.diagnostic_path, record_field.name, record_field.value
+                    )
+                })?;
+            fields.push(ErasedFieldDef {
+                id: FieldId(fields.len()),
+                role: ErasedFieldRole::Value,
+                declaration: record_field.declaration,
+                static_owner: value.owner.or(parent.static_owner),
+                parent: Some(parent.id),
+                row: None,
+                name: record_field.name.clone(),
+                diagnostic_path: format!("{}.{}", parent.diagnostic_path, record_field.name),
+                statement: None,
+                producer: Some(record_field.value),
+                resource_only: false,
+                flow_type: value.flow_type.clone(),
+            });
+        }
+    }
+
+    for field in &fields {
+        if let Some(declaration) = field.declaration
+            && !checked
+                .declarations
+                .iter()
+                .any(|candidate| candidate.id == declaration)
+        {
+            return Err(format!(
+                "erased FieldId {} references missing checked declaration {}",
+                field.id, declaration.0
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+fn append_erased_list_authority_fields(
+    executable: &ExecutableProgram,
+    lists: &[ListMemory],
+    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    materializations: &[ContextualMaterialization],
+    list_mutations: &[ListMutation],
+    source_authority: &ExecutableSourceAuthorityIndex,
+    fields: &mut Vec<ErasedFieldDef>,
+) -> Result<(), String> {
+    let mut statement_fields = BTreeMap::new();
+    for field in fields.iter().filter(|field| field.statement.is_some()) {
+        statement_fields
+            .entry(field.statement.expect("filtered statement"))
+            .or_insert(field.id);
+    }
     let indexed_state_fields = fields
         .iter()
         .filter(|field| field.row.is_some())
@@ -2822,13 +3196,40 @@ fn build_erased_fields(
                         materialization,
                     ))
         }) {
-            if let boon_typecheck::Type::Object(shape) = &materialization.item_type {
-                for (name, ty) in shape.fields.iter().filter(|(name, ty)| {
-                    distributed_type_is_closed(ty)
-                        && !row_field_contains_source(executable, &fields, row, name)
-                }) {
+            let body = executable
+                .expressions
+                .get(materialization.body.as_usize())
+                .filter(|expression| expression.id == materialization.body)
+                .ok_or_else(|| {
+                    format!(
+                        "materialization {} references missing body {}",
+                        materialization.id, materialization.body
+                    )
+                })?;
+            if let (
+                boon_typecheck::Type::Object(input_shape),
+                boon_typecheck::Type::Object(output_shape),
+            ) = (&materialization.item_type, &body.flow_type.ty)
+            {
+                for (name, input_type) in &input_shape.fields {
+                    let Some(output_type) = output_shape.fields.get(name) else {
+                        continue;
+                    };
+                    let Some(ty) = compatible_storage_type(input_type, output_type) else {
+                        continue;
+                    };
+                    if !distributed_type_is_closed(&ty) {
+                        continue;
+                    }
+                    let projection = [name.clone()];
+                    if source_authority
+                        .projected_value(materialization.body, &projection)?
+                        .is_source_only()
+                    {
+                        continue;
+                    }
                     direct_constructor_fields.insert(name.clone());
-                    merge_authority_field_type(&mut authority_types, name, ty.clone())?;
+                    merge_authority_field_type(&mut authority_types, name, ty)?;
                 }
             }
         }
@@ -2841,10 +3242,41 @@ fn build_erased_fields(
         });
         if derives_distinct_map_rows && let boon_typecheck::Type::Object(shape) = &storage.item_type
         {
-            for (name, ty) in shape.fields.iter().filter(|(name, ty)| {
-                distributed_type_is_closed(ty)
-                    && !row_field_contains_source(executable, &fields, row, name)
-            }) {
+            for (name, ty) in &shape.fields {
+                if !distributed_type_is_closed(ty) {
+                    continue;
+                }
+                let mut map_count = 0_usize;
+                let mut every_map_is_source_only = true;
+                for materialization in materializations.iter().filter(|materialization| {
+                    materialization.operation == ContextualOperationKind::Map
+                        && materialization.target_list_id == Some(storage.list_id)
+                }) {
+                    let body = executable
+                        .expressions
+                        .get(materialization.body.as_usize())
+                        .filter(|expression| expression.id == materialization.body)
+                        .ok_or_else(|| {
+                            format!(
+                                "materialization {} references missing body {}",
+                                materialization.id, materialization.body
+                            )
+                        })?;
+                    let boon_typecheck::Type::Object(item_shape) = &body.flow_type.ty else {
+                        continue;
+                    };
+                    if !item_shape.fields.contains_key(name) {
+                        continue;
+                    }
+                    map_count += 1;
+                    let projection = [name.clone()];
+                    every_map_is_source_only &= source_authority
+                        .projected_value(materialization.body, &projection)?
+                        .is_source_only();
+                }
+                if map_count == 0 || every_map_is_source_only {
+                    continue;
+                }
                 merge_authority_field_type(&mut authority_types, name, ty.clone())?;
             }
         }
@@ -2922,81 +3354,7 @@ fn build_erased_fields(
         }
     }
 
-    let mut parent_index = 0;
-    while parent_index < fields.len() {
-        let parent = fields[parent_index].clone();
-        parent_index += 1;
-        let Some(producer) = parent.producer else {
-            continue;
-        };
-        let expression = executable
-            .expressions
-            .get(producer.as_usize())
-            .filter(|expression| expression.id == producer)
-            .ok_or_else(|| {
-                format!(
-                    "erased field {} references missing record producer {producer}",
-                    parent.id
-                )
-            })?;
-        let record_fields = match &expression.kind {
-            ExecutableExpressionKind::Object(record_fields)
-            | ExecutableExpressionKind::Record(record_fields)
-            | ExecutableExpressionKind::TaggedObject {
-                fields: record_fields,
-                ..
-            } => record_fields,
-            _ => continue,
-        };
-        for record_field in record_fields.iter().filter(|field| !field.spread) {
-            if fields.iter().any(|field| {
-                field.parent == Some(parent.id)
-                    && field.name == record_field.name
-                    && field.producer == Some(record_field.value)
-            }) {
-                continue;
-            }
-            let value = executable
-                .expressions
-                .get(record_field.value.as_usize())
-                .filter(|expression| expression.id == record_field.value)
-                .ok_or_else(|| {
-                    format!(
-                        "erased record field `{}.{}` references missing producer {}",
-                        parent.diagnostic_path, record_field.name, record_field.value
-                    )
-                })?;
-            fields.push(ErasedFieldDef {
-                id: FieldId(fields.len()),
-                role: ErasedFieldRole::Value,
-                declaration: record_field.declaration,
-                static_owner: value.owner.or(parent.static_owner),
-                parent: Some(parent.id),
-                row: None,
-                name: record_field.name.clone(),
-                diagnostic_path: format!("{}.{}", parent.diagnostic_path, record_field.name),
-                statement: None,
-                producer: Some(record_field.value),
-                resource_only: record_field.resource_only,
-                flow_type: value.flow_type.clone(),
-            });
-        }
-    }
-
-    for field in &fields {
-        if let Some(declaration) = field.declaration
-            && !checked
-                .declarations
-                .iter()
-                .any(|candidate| candidate.id == declaration)
-        {
-            return Err(format!(
-                "erased FieldId {} references missing checked declaration {}",
-                field.id, declaration.0
-            ));
-        }
-    }
-    Ok(fields)
+    Ok(())
 }
 
 fn contextual_materialization_transfers_list_authority(
@@ -3168,44 +3526,6 @@ fn direct_erased_storage_statements(
         .collect()
 }
 
-fn row_field_contains_source(
-    executable: &ExecutableProgram,
-    fields: &[ErasedFieldDef],
-    row: ErasedRowBinding,
-    name: &str,
-) -> bool {
-    fields
-        .iter()
-        .filter(|field| field.row == Some(row) && field.name == name && field.role.is_value())
-        .filter_map(|field| field.producer)
-        .any(|producer| executable_expression_contains_source(executable, producer))
-}
-
-fn executable_expression_contains_source(
-    executable: &ExecutableProgram,
-    root: ExecutableExprId,
-) -> bool {
-    let mut pending = vec![root];
-    let mut visited = BTreeSet::new();
-    while let Some(expression) = pending.pop() {
-        if !visited.insert(expression) {
-            continue;
-        }
-        let Some(expression) = executable
-            .expressions
-            .get(expression.as_usize())
-            .filter(|candidate| candidate.id == expression)
-        else {
-            continue;
-        };
-        if matches!(&expression.kind, ExecutableExpressionKind::Source { .. }) {
-            return true;
-        }
-        pending.extend(executable_expression_children(&expression.kind));
-    }
-    false
-}
-
 fn exact_record_field_candidates(
     executable: &ExecutableProgram,
     materializations: &[ContextualMaterialization],
@@ -3217,7 +3537,6 @@ fn exact_record_field_candidates(
         boon_typecheck::DeclId,
         ExecutableExprId,
         Option<StaticOwnerId>,
-        bool,
     )>,
     String,
 > {
@@ -3255,12 +3574,7 @@ fn exact_record_field_candidates(
                         && field.name == name
                         && let Some(declaration) = field.declaration
                     {
-                        candidates.insert((
-                            declaration,
-                            field.value,
-                            expression.owner,
-                            field.resource_only,
-                        ));
+                        candidates.insert((declaration, field.value, expression.owner));
                     }
                 }
             }
@@ -3596,560 +3910,1068 @@ fn erased_local_members(
         .collect())
 }
 
-fn materialization_local_projection(
-    executable: &ExecutableProgram,
-    expression: ExecutableExprId,
-) -> Result<Option<(StaticOwnerId, MaterializationLocalId, Vec<String>)>, String> {
-    fn resolve(
-        executable: &ExecutableProgram,
-        expression: ExecutableExprId,
-        visiting: &mut BTreeSet<ExecutableExprId>,
-    ) -> Result<Option<(StaticOwnerId, MaterializationLocalId, Vec<String>)>, String> {
-        if !visiting.insert(expression) {
-            return Err(format!(
-                "materialization-local projection contains a cycle at expression {expression}"
-            ));
-        }
-        let value = executable
-            .expressions
-            .get(expression.as_usize())
-            .filter(|candidate| candidate.id == expression)
-            .ok_or_else(|| {
-                format!("materialization-local projection references missing {expression}")
-            })?;
-        let result = match &value.kind {
-            ExecutableExpressionKind::MaterializationLocal {
-                owner,
-                local,
-                projection,
-            } => Some((*owner, *local, projection.clone())),
-            ExecutableExpressionKind::Project { input, fields } => {
-                resolve(executable, *input, visiting)?.map(|(owner, local, mut projection)| {
-                    projection.extend(fields.iter().cloned());
-                    (owner, local, projection)
-                })
-            }
-            ExecutableExpressionKind::Block { result, .. } => {
-                resolve(executable, *result, visiting)?
-            }
-            _ => None,
-        };
-        visiting.remove(&expression);
-        Ok(result)
-    }
-
-    resolve(executable, expression, &mut BTreeSet::new())
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ResolvedSourceMember {
+    path: Vec<String>,
+    source: SourceId,
+    forwarded_from: Option<ErasedLocalMemberForwarding>,
 }
 
-fn executable_expression_is_source_group(
-    executable: &ExecutableProgram,
-    expression: ExecutableExprId,
-) -> Result<bool, String> {
-    fn check(
-        executable: &ExecutableProgram,
-        expression: ExecutableExprId,
-        visiting: &mut BTreeSet<ExecutableExprId>,
-    ) -> Result<bool, String> {
-        if !visiting.insert(expression) {
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ResolvedStateMember {
+    path: Vec<String>,
+    state: StateId,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedFieldProvenance {
+    has_runtime_value: bool,
+    sources: Vec<ResolvedSourceMember>,
+    states: Vec<ResolvedStateMember>,
+}
+
+impl ResolvedFieldProvenance {
+    fn runtime() -> Self {
+        Self {
+            has_runtime_value: true,
+            sources: Vec::new(),
+            states: Vec::new(),
+        }
+    }
+
+    fn normalize(&mut self) {
+        self.sources.sort();
+        self.sources.dedup();
+        self.states.sort();
+        self.states.dedup();
+    }
+
+    fn is_source_only(&self) -> bool {
+        !self.has_runtime_value && !self.sources.is_empty() && self.states.is_empty()
+    }
+}
+
+struct ExecutableSourceProvenanceResolver<'a> {
+    executable: &'a ExecutableProgram,
+    static_owners: &'a [StaticOwnerDef],
+    sources: &'a [SourcePort],
+    states: &'a [StateCell],
+    materializations: &'a [ContextualMaterialization],
+    fields: &'a [ErasedFieldDef],
+    locals: &'a [ErasedLocalDef],
+    field_cache: BTreeMap<FieldId, ResolvedFieldProvenance>,
+    local_cache: BTreeMap<(StaticOwnerId, MaterializationLocalId), Vec<ErasedLocalMember>>,
+    materialization_output_cache: BTreeMap<usize, Vec<ErasedLocalMember>>,
+    field_visiting: BTreeSet<FieldId>,
+    local_visiting: BTreeSet<(StaticOwnerId, MaterializationLocalId)>,
+    materialization_output_visiting: BTreeSet<usize>,
+}
+
+fn merge_erased_source_member(
+    members: &mut BTreeMap<Vec<String>, ErasedLocalMember>,
+    incoming: ErasedLocalMember,
+    context: &str,
+) -> Result<(), String> {
+    use std::collections::btree_map::Entry;
+
+    match members.entry(incoming.path.clone()) {
+        Entry::Vacant(entry) => {
+            entry.insert(incoming);
+        }
+        Entry::Occupied(mut entry) if entry.get().target == incoming.target => {
+            if entry.get().forwarded_from.is_none() && incoming.forwarded_from.is_some() {
+                entry.get_mut().forwarded_from = incoming.forwarded_from;
+            }
+        }
+        Entry::Occupied(mut entry)
+            if matches!(entry.get().target, ErasedLocalMemberTarget::Field(_))
+                && matches!(incoming.target, ErasedLocalMemberTarget::Source(_)) =>
+        {
+            entry.insert(incoming);
+        }
+        Entry::Occupied(entry) => {
             return Err(format!(
-                "source-group expression contains a cycle at {expression}"
+                "{context} source member `{}` resolves to both {:?} and {:?}",
+                incoming.path.join("."),
+                entry.get().target,
+                incoming.target
             ));
         }
-        let value = executable
-            .expressions
-            .get(expression.as_usize())
-            .filter(|candidate| candidate.id == expression)
-            .ok_or_else(|| format!("source-group check references missing {expression}"))?;
-        let result = match &value.kind {
-            ExecutableExpressionKind::Source { .. } => true,
-            ExecutableExpressionKind::Object(fields)
-            | ExecutableExpressionKind::Record(fields)
-            | ExecutableExpressionKind::TaggedObject { fields, .. } => {
-                if fields.is_empty() {
-                    false
-                } else {
-                    let mut all_sources = true;
-                    for field in fields {
-                        if !check(executable, field.value, visiting)? {
-                            all_sources = false;
-                            break;
+    }
+    Ok(())
+}
+
+impl<'a> ExecutableSourceProvenanceResolver<'a> {
+    fn new(
+        executable: &'a ExecutableProgram,
+        static_owners: &'a [StaticOwnerDef],
+        sources: &'a [SourcePort],
+        states: &'a [StateCell],
+        materializations: &'a [ContextualMaterialization],
+        fields: &'a [ErasedFieldDef],
+        locals: &'a [ErasedLocalDef],
+    ) -> Self {
+        Self {
+            executable,
+            static_owners,
+            sources,
+            states,
+            materializations,
+            fields,
+            locals,
+            field_cache: BTreeMap::new(),
+            local_cache: BTreeMap::new(),
+            materialization_output_cache: BTreeMap::new(),
+            field_visiting: BTreeSet::new(),
+            local_visiting: BTreeSet::new(),
+            materialization_output_visiting: BTreeSet::new(),
+        }
+    }
+
+    fn lexical_owner_distance(
+        &self,
+        use_owner: Option<StaticOwnerId>,
+        definition_owner: Option<StaticOwnerId>,
+    ) -> Result<Option<usize>, String> {
+        let mut current = use_owner;
+        let mut distance = 0;
+        let mut visiting = BTreeSet::new();
+        loop {
+            if current == definition_owner {
+                return Ok(Some(distance));
+            }
+            let Some(owner) = current else {
+                return Ok(None);
+            };
+            if !visiting.insert(owner) {
+                return Err(format!(
+                    "resource provenance owner ancestry contains a cycle at {owner}"
+                ));
+            }
+            current = self
+                .static_owners
+                .get(owner.as_usize())
+                .filter(|definition| definition.id == owner)
+                .ok_or_else(|| {
+                    format!("resource provenance references missing static owner {owner}")
+                })?
+                .parent;
+            distance += 1;
+        }
+    }
+
+    fn source_id(&self, origin: &ExecutableValueOrigin) -> Result<Option<SourceId>, String> {
+        let use_owner = match origin {
+            ExecutableValueOrigin::Source { owner, .. } => *owner,
+            ExecutableValueOrigin::ProducerSource { owner, .. } => Some(*owner),
+            _ => return Ok(None),
+        };
+        let mut definitions = self
+            .executable
+            .sources
+            .iter()
+            .filter_map(|definition| {
+                let same_origin = match (origin, definition.origin) {
+                    (
+                        ExecutableValueOrigin::Source { source, .. },
+                        ExecutableSourceOrigin::Checked { source: candidate },
+                    ) => *source == candidate,
+                    (
+                        ExecutableValueOrigin::ProducerSource {
+                            function, identity, ..
+                        },
+                        ExecutableSourceOrigin::ProducerInvocation {
+                            function: candidate_function,
+                            identity: candidate_identity,
+                        },
+                    ) => *function == candidate_function && *identity == candidate_identity,
+                    _ => false,
+                };
+                if !same_origin {
+                    return None;
+                }
+                match self.lexical_owner_distance(use_owner, definition.owner) {
+                    Ok(Some(distance)) => Some(Ok((distance, definition))),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        definitions.sort_by_key(|(distance, definition)| (*distance, definition.id));
+        let Some(nearest_distance) = definitions.first().map(|(distance, _)| *distance) else {
+            return Err(format!(
+                "executable value origin {origin:?} has no lexical source definition"
+            ));
+        };
+        let definitions = definitions
+            .into_iter()
+            .take_while(|(distance, _)| *distance == nearest_distance)
+            .map(|(_, definition)| definition)
+            .collect::<Vec<_>>();
+        let [definition] = definitions.as_slice() else {
+            return Err(format!(
+                "executable value origin {origin:?} resolves to {} equally-near lexical source definitions",
+                definitions.len()
+            ));
+        };
+        let runtime = self
+            .sources
+            .iter()
+            .filter(|source| source.executable_source_id == Some(definition.id))
+            .collect::<Vec<_>>();
+        let [runtime] = runtime.as_slice() else {
+            return Err(format!(
+                "executable source {} resolves to {} runtime sources",
+                definition.id,
+                runtime.len()
+            ));
+        };
+        Ok(Some(runtime.id))
+    }
+
+    fn state_id(&self, origin: &ExecutableValueOrigin) -> Result<Option<StateId>, String> {
+        let ExecutableValueOrigin::State {
+            state: checked,
+            owner,
+        } = origin
+        else {
+            return Ok(None);
+        };
+        let mut definitions = self
+            .executable
+            .states
+            .iter()
+            .filter_map(|definition| {
+                if definition.checked_state != *checked {
+                    return None;
+                }
+                match self.lexical_owner_distance(*owner, definition.owner) {
+                    Ok(Some(distance)) => Some(Ok((distance, definition))),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        definitions.sort_by_key(|(distance, definition)| (*distance, definition.id));
+        let Some(nearest_distance) = definitions.first().map(|(distance, _)| *distance) else {
+            return Err(format!(
+                "executable value origin {origin:?} has no lexical state definition"
+            ));
+        };
+        let definitions = definitions
+            .into_iter()
+            .take_while(|(distance, _)| *distance == nearest_distance)
+            .map(|(_, definition)| definition)
+            .collect::<Vec<_>>();
+        let [definition] = definitions.as_slice() else {
+            return Err(format!(
+                "executable value origin {origin:?} resolves to {} equally-near lexical state definitions",
+                definitions.len()
+            ));
+        };
+        let runtime = self
+            .states
+            .iter()
+            .filter(|state| state.executable_state_id == Some(definition.id))
+            .collect::<Vec<_>>();
+        let [runtime] = runtime.as_slice() else {
+            return Err(format!(
+                "executable state {} resolves to {} runtime states",
+                definition.id,
+                runtime.len()
+            ));
+        };
+        Ok(Some(runtime.id))
+    }
+
+    fn resolve_value_provenance(
+        &mut self,
+        provenance: &ExecutableValueProvenance,
+    ) -> Result<ResolvedFieldProvenance, String> {
+        let mut resolved = ResolvedFieldProvenance {
+            has_runtime_value: false,
+            sources: Vec::new(),
+            states: Vec::new(),
+        };
+        for member in &provenance.members {
+            match &member.origin {
+                ExecutableValueOrigin::Runtime => {
+                    resolved.has_runtime_value = true;
+                }
+                ExecutableValueOrigin::State { .. } => {
+                    resolved.has_runtime_value = true;
+                    let state = self
+                        .state_id(&member.origin)?
+                        .expect("state origins always resolve to a state");
+                    resolved.states.push(ResolvedStateMember {
+                        path: member.path.clone(),
+                        state,
+                    });
+                }
+                ExecutableValueOrigin::Source { .. }
+                | ExecutableValueOrigin::ProducerSource { .. } => {
+                    let source = self
+                        .source_id(&member.origin)?
+                        .expect("source origins always resolve to a source");
+                    resolved.sources.push(ResolvedSourceMember {
+                        path: member.path.clone(),
+                        source,
+                        forwarded_from: None,
+                    });
+                }
+                ExecutableValueOrigin::MaterializationLocal {
+                    owner,
+                    local,
+                    projection,
+                } => {
+                    let local_members = self.resolve_local(*owner, *local)?;
+                    let mut matched = false;
+                    for local_member in local_members {
+                        if let Some(suffix) = local_member.path.strip_prefix(projection.as_slice())
+                        {
+                            matched = true;
+                            match local_member.target {
+                                ErasedLocalMemberTarget::Source(source) => {
+                                    let mut path = member.path.clone();
+                                    path.extend_from_slice(suffix);
+                                    resolved.sources.push(ResolvedSourceMember {
+                                        path,
+                                        source,
+                                        forwarded_from: Some(ErasedLocalMemberForwarding {
+                                            owner: *owner,
+                                            local: *local,
+                                            path: local_member.path.clone(),
+                                        }),
+                                    });
+                                }
+                                ErasedLocalMemberTarget::Field(_) => {
+                                    resolved.has_runtime_value = true;
+                                }
+                                ErasedLocalMemberTarget::State(state) => {
+                                    let mut path = member.path.clone();
+                                    path.extend_from_slice(suffix);
+                                    resolved.states.push(ResolvedStateMember { path, state });
+                                    resolved.has_runtime_value = true;
+                                }
+                            }
+                            continue;
+                        }
+                        if projection.starts_with(local_member.path.as_slice())
+                            && matches!(
+                                local_member.target,
+                                ErasedLocalMemberTarget::Field(_)
+                                    | ErasedLocalMemberTarget::State(_)
+                            )
+                        {
+                            matched = true;
+                            resolved.has_runtime_value = true;
                         }
                     }
-                    all_sources
+                    if !matched {
+                        resolved.has_runtime_value = true;
+                    }
                 }
             }
-            ExecutableExpressionKind::Block { result, .. } => check(executable, *result, visiting)?,
-            _ => false,
-        };
-        visiting.remove(&expression);
-        Ok(result)
-    }
-
-    check(executable, expression, &mut BTreeSet::new())
-}
-
-fn resource_members_for_projection<'a>(
-    local: &'a ErasedLocalDef,
-    projection: &[String],
-    fields: &[ErasedFieldDef],
-) -> Option<Vec<&'a ErasedLocalMember>> {
-    let exact_sources = local
-        .members
-        .iter()
-        .filter(|member| {
-            member.path == projection && matches!(member.target, ErasedLocalMemberTarget::Source(_))
-        })
-        .collect::<Vec<_>>();
-    if !exact_sources.is_empty() {
-        return Some(exact_sources);
-    }
-
-    let covering_fields = local
-        .members
-        .iter()
-        .filter_map(|member| match member.target {
-            ErasedLocalMemberTarget::Field(field) if projection.starts_with(&member.path) => {
-                Some((member.path.len(), field))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if let Some((_, field)) = covering_fields.iter().max_by_key(|(len, _)| *len) {
-        let resource_only = fields
-            .get(field.as_usize())
-            .filter(|candidate| candidate.id == *field)
-            .is_some_and(|field| field.resource_only);
-        if !resource_only {
-            return None;
         }
+        if provenance.members.is_empty() {
+            resolved.has_runtime_value = true;
+        }
+        resolved.normalize();
+        Ok(resolved)
     }
 
-    let resources = local
-        .members
-        .iter()
-        .filter(|member| {
-            member.path.starts_with(projection)
-                && matches!(member.target, ErasedLocalMemberTarget::Source(_))
-        })
-        .collect::<Vec<_>>();
-    (!resources.is_empty()).then_some(resources)
-}
-
-fn resource_field_local_projection(
-    executable: &ExecutableProgram,
-    field: &ErasedFieldDef,
-    fields: &[ErasedFieldDef],
-    materializations: &[ContextualMaterialization],
-    locals: &[ErasedLocalDef],
-) -> Result<Option<(StaticOwnerId, MaterializationLocalId, Vec<String>)>, String> {
-    if let Some(producer) = field.producer
-        && let Some(projection) = materialization_local_projection(executable, producer)?
-    {
-        return Ok(Some(projection));
+    fn resolve_field(&mut self, field: FieldId) -> Result<ResolvedFieldProvenance, String> {
+        if let Some(cached) = self.field_cache.get(&field) {
+            return Ok(cached.clone());
+        }
+        if !self.field_visiting.insert(field) {
+            // List authority can feed a mapped value back into the same row
+            // field. That temporal storage cycle carries an ordinary runtime
+            // value unless another acyclic provenance edge proves it is a
+            // forwarded source.
+            return Ok(ResolvedFieldProvenance::runtime());
+        }
+        let definition = self
+            .fields
+            .get(field.as_usize())
+            .filter(|candidate| candidate.id == field)
+            .ok_or_else(|| format!("source provenance references missing FieldId {field}"))?;
+        let mut resolved = if let Some(producer) = definition.producer {
+            let expression = self
+                .executable
+                .expressions
+                .get(producer.as_usize())
+                .filter(|candidate| candidate.id == producer)
+                .ok_or_else(|| {
+                    format!(
+                        "source provenance FieldId {field} references missing producer {producer}"
+                    )
+                })?;
+            self.resolve_value_provenance(&expression.provenance)?
+        } else {
+            ResolvedFieldProvenance::runtime()
+        };
+        resolved.normalize();
+        self.field_visiting.remove(&field);
+        self.field_cache.insert(field, resolved.clone());
+        Ok(resolved)
     }
-    let mut candidates = BTreeSet::new();
-    if field.role.is_authority() {
-        candidates.extend(
-            fields
+
+    fn resolve_materialization_output(
+        &mut self,
+        materialization: usize,
+    ) -> Result<Vec<ErasedLocalMember>, String> {
+        if let Some(cached) = self.materialization_output_cache.get(&materialization) {
+            return Ok(cached.clone());
+        }
+        if !self.materialization_output_visiting.insert(materialization) {
+            return Err(format!(
+                "source provenance materialization output {materialization} forms a cycle"
+            ));
+        }
+        let definition = self
+            .materializations
+            .get(materialization)
+            .filter(|candidate| candidate.id == materialization)
+            .cloned()
+            .ok_or_else(|| {
+                format!("source provenance references missing materialization {materialization}")
+            })?;
+        let mut members = BTreeMap::new();
+        match definition.operation {
+            ContextualOperationKind::Map => {
+                let provenance = self
+                    .executable
+                    .expressions
+                    .get(definition.body.as_usize())
+                    .filter(|candidate| candidate.id == definition.body)
+                    .map(|expression| expression.provenance.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "source provenance materialization {materialization} references missing body {}",
+                            definition.body
+                        )
+                    })?;
+                let provenance = self.resolve_value_provenance(&provenance)?;
+                for source in provenance.sources {
+                    let member = ErasedLocalMember {
+                        path: source.path,
+                        target: ErasedLocalMemberTarget::Source(source.source),
+                        forwarded_from: source.forwarded_from,
+                    };
+                    merge_erased_source_member(
+                        &mut members,
+                        member,
+                        &format!("materialization {materialization} output"),
+                    )?;
+                }
+            }
+            ContextualOperationKind::Filter
+            | ContextualOperationKind::Retain
+            | ContextualOperationKind::Remove
+            | ContextualOperationKind::SortBy
+            | ContextualOperationKind::ThenBy => {
+                for member in self
+                    .resolve_local(definition.owner, definition.row_local)?
+                    .into_iter()
+                    .filter(|member| matches!(member.target, ErasedLocalMemberTarget::Source(_)))
+                {
+                    merge_erased_source_member(
+                        &mut members,
+                        member,
+                        &format!("materialization {materialization} pass-through"),
+                    )?;
+                }
+            }
+            ContextualOperationKind::Every
+            | ContextualOperationKind::Any
+            | ContextualOperationKind::Find => {
+                self.materialization_output_visiting
+                    .remove(&materialization);
+                return Err(format!(
+                    "scalar contextual materialization {materialization} cannot provide row source provenance"
+                ));
+            }
+        }
+        let resolved = members.into_values().collect::<Vec<_>>();
+        self.materialization_output_visiting
+            .remove(&materialization);
+        self.materialization_output_cache
+            .insert(materialization, resolved.clone());
+        Ok(resolved)
+    }
+
+    fn resolve_local(
+        &mut self,
+        owner: StaticOwnerId,
+        local: MaterializationLocalId,
+    ) -> Result<Vec<ErasedLocalMember>, String> {
+        let key = (owner, local);
+        if let Some(cached) = self.local_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+        if !self.local_visiting.insert(key) {
+            return self
+                .locals
                 .iter()
-                .filter(|candidate| {
-                    candidate.id != field.id
-                        && candidate.row == field.row
-                        && candidate.name == field.name
-                        && candidate.role.is_value()
-                        && candidate.resource_only
-                })
-                .filter_map(|candidate| candidate.producer)
-                .map(|producer| materialization_local_projection(executable, producer))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten(),
-        );
-    }
-    if let Some(row) = field.row {
-        for materialization in materializations
+                .find(|candidate| candidate.owner == owner && candidate.local == local)
+                .map(|local| local.members.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "source provenance references missing cyclic local {owner}:{}",
+                        local.0
+                    )
+                });
+        }
+        let base = self
+            .locals
             .iter()
-            .filter(|materialization| materialization.target_list_id == Some(row.list))
-        {
-            let Some(local) = locals.iter().find(|local| {
-                local.owner == materialization.owner && local.local == materialization.row_local
-            }) else {
+            .find(|candidate| candidate.owner == owner && candidate.local == local)
+            .ok_or_else(|| {
+                format!(
+                    "source provenance references missing materialization local {owner}:{}",
+                    local.0
+                )
+            })?
+            .members
+            .clone();
+        let mut members = BTreeMap::<Vec<String>, ErasedLocalMember>::new();
+        for member in base {
+            let ErasedLocalMemberTarget::Field(field) = member.target else {
+                members.insert(member.path.clone(), member);
                 continue;
             };
-            let projection = vec![field.name.clone()];
-            if resource_members_for_projection(local, &projection, fields).is_some() {
-                candidates.insert((local.owner, local.local, projection));
+            let field_provenance = self.resolve_field(field)?;
+            if field_provenance.has_runtime_value || field_provenance.sources.is_empty() {
+                members.insert(member.path.clone(), member.clone());
+            }
+            for source in field_provenance.sources {
+                let mut path = member.path.clone();
+                path.extend(source.path);
+                let forwarded = ErasedLocalMember {
+                    path: path.clone(),
+                    target: ErasedLocalMemberTarget::Source(source.source),
+                    forwarded_from: source.forwarded_from,
+                };
+                merge_erased_source_member(
+                    &mut members,
+                    forwarded,
+                    &format!("owner {owner} local {}", local.0),
+                )?;
             }
         }
-    }
-    let candidates = candidates.into_iter().collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [] => Ok(None),
-        [candidate] => Ok(Some(candidate.clone())),
-        _ => {
-            let signatures = candidates
-                .iter()
-                .map(|(owner, local, projection)| {
-                    let local = locals
-                        .iter()
-                        .find(|candidate| candidate.owner == *owner && candidate.local == *local)?;
-                    let members = resource_members_for_projection(local, projection, fields)?;
-                    let mut signature = members
-                        .into_iter()
-                        .filter_map(|member| {
-                            let ErasedLocalMemberTarget::Source(source) = member.target else {
-                                return None;
-                            };
-                            let suffix = member.path.strip_prefix(projection.as_slice())?;
-                            Some((suffix.to_vec(), source))
-                        })
-                        .collect::<Vec<_>>();
-                    signature
-                        .sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-                    Some(signature)
-                })
-                .collect::<Option<Vec<_>>>();
-            if signatures
-                .as_ref()
-                .is_some_and(|signatures| signatures.windows(2).all(|pair| pair[0] == pair[1]))
-            {
-                return Ok(candidates.first().cloned());
+        let definition = self
+            .materializations
+            .iter()
+            .find(|candidate| candidate.owner == owner && candidate.row_local == local)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "source provenance references missing materialization for local {owner}:{}",
+                    local.0
+                )
+            })?;
+        let local_row = self
+            .locals
+            .iter()
+            .find(|candidate| candidate.owner == owner && candidate.local == local)
+            .and_then(|local| local.row);
+        for predecessor in definition.source_row_predecessors {
+            let input = match predecessor {
+                ContextualRowPredecessor::Value => {
+                    if local_row.is_some() {
+                        return Err(format!(
+                            "owner {owner} local {} value predecessor unexpectedly has keyed row {local_row:?}",
+                            local.0
+                        ));
+                    }
+                    continue;
+                }
+                ContextualRowPredecessor::Stored { row } => {
+                    if local_row != Some(row) {
+                        return Err(format!(
+                            "owner {owner} local {} stored predecessor {row:?} differs from local row {local_row:?}",
+                            local.0
+                        ));
+                    }
+                    continue;
+                }
+                ContextualRowPredecessor::Materialized { materialization }
+                | ContextualRowPredecessor::Provenance { materialization } => materialization,
+            };
+            let input_definition = self
+                .materializations
+                .get(input)
+                .filter(|candidate| candidate.id == input)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "owner {owner} local {} references missing input materialization {input}",
+                        local.0
+                    )
+                })?;
+            for mut source_member in self.resolve_materialization_output(input)? {
+                if matches!(
+                    input_definition.operation,
+                    ContextualOperationKind::Filter
+                        | ContextualOperationKind::Retain
+                        | ContextualOperationKind::Remove
+                        | ContextualOperationKind::SortBy
+                        | ContextualOperationKind::ThenBy
+                ) {
+                    source_member.forwarded_from = Some(ErasedLocalMemberForwarding {
+                        owner: input_definition.owner,
+                        local: input_definition.row_local,
+                        path: source_member.path.clone(),
+                    });
+                }
+                merge_erased_source_member(
+                    &mut members,
+                    source_member,
+                    &format!("owner {owner} local {} input {input}", local.0),
+                )?;
             }
-            let details = candidates
-                .iter()
-                .map(|(owner, local, projection)| {
-                    let operation = materializations
-                        .iter()
-                        .find(|materialization| {
-                            materialization.owner == *owner && materialization.row_local == *local
-                        })
-                        .map(|materialization| materialization.operation);
-                    let members = locals
-                        .iter()
-                        .find(|candidate| candidate.owner == *owner && candidate.local == *local)
-                        .and_then(|candidate| {
-                            resource_members_for_projection(candidate, projection, fields)
-                        })
-                        .map(|members| {
-                            members
-                                .into_iter()
-                                .map(|member| {
-                                    (
-                                        member.path.clone(),
-                                        member.target,
-                                        member.forwarded_from.clone(),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        });
-                    (owner, local, projection, operation, members)
-                })
-                .collect::<Vec<_>>();
-            Err(format!(
-                "resource FieldId {} has {} forwarding producers: {:?}",
-                field.id,
-                candidates.len(),
-                details
-            ))
         }
+        let resolved = members.into_values().collect::<Vec<_>>();
+        self.local_visiting.remove(&key);
+        self.local_cache.insert(key, resolved.clone());
+        Ok(resolved)
     }
 }
 
-fn propagate_forwarded_local_resources(
+fn resolve_executable_source_provenance(
     executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    sources: &[SourcePort],
+    states: &[StateCell],
     materializations: &[ContextualMaterialization],
     fields: &mut [ErasedFieldDef],
     locals: &mut [ErasedLocalDef],
 ) -> Result<(), String> {
-    let iteration_limit = fields.len().saturating_add(locals.len()).saturating_add(1);
-    for _ in 0..iteration_limit {
-        let locals_snapshot = locals.to_vec();
-        let fields_snapshot = fields.to_vec();
-        let mut changed = false;
+    let fields_snapshot = fields.to_vec();
+    let locals_snapshot = locals.to_vec();
+    let mut resolver = ExecutableSourceProvenanceResolver::new(
+        executable,
+        static_owners,
+        sources,
+        states,
+        materializations,
+        &fields_snapshot,
+        &locals_snapshot,
+    );
+    let field_provenance = fields
+        .iter()
+        .map(|field| resolver.resolve_field(field.id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let local_members = locals
+        .iter()
+        .map(|local| resolver.resolve_local(local.owner, local.local))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (field, provenance) in fields.iter_mut().zip(field_provenance) {
+        field.resource_only = provenance.is_source_only();
+    }
+    for (local, members) in locals.iter_mut().zip(local_members) {
+        local.members = members;
+    }
+    Ok(())
+}
 
-        let mut newly_resource_only = Vec::new();
-        for field in fields_snapshot.iter().filter(|field| !field.resource_only) {
-            if field.role.is_authority() {
-                let value_fields = fields_snapshot
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.id != field.id
-                            && candidate.row == field.row
-                            && candidate.name == field.name
-                            && candidate.role.is_value()
-                    })
-                    .collect::<Vec<_>>();
-                if !value_fields.is_empty()
-                    && value_fields.iter().all(|candidate| candidate.resource_only)
-                {
-                    newly_resource_only.push(field.id);
-                    continue;
-                }
-            }
-            if let Some(row) = field.row
-                && materializations
-                    .iter()
-                    .filter(|materialization| materialization.target_list_id == Some(row.list))
-                    .filter_map(|materialization| {
-                        locals_snapshot.iter().find(|local| {
-                            local.owner == materialization.owner
-                                && local.local == materialization.row_local
-                        })
-                    })
-                    .any(|local| {
-                        resource_members_for_projection(
-                            local,
-                            std::slice::from_ref(&field.name),
-                            &fields_snapshot,
-                        )
-                        .is_some()
-                    })
-            {
-                newly_resource_only.push(field.id);
-                continue;
-            }
-            let Some(producer) = field.producer else {
+#[derive(Clone, Debug)]
+struct ExecutableSourceAuthorityIndex {
+    values_by_expression: Vec<ResolvedFieldProvenance>,
+    projected_values: BTreeMap<(ExecutableExprId, Vec<String>), ResolvedFieldProvenance>,
+    event_causes_by_expression: Vec<Vec<EventCause>>,
+    local_members: BTreeMap<(StaticOwnerId, MaterializationLocalId), Vec<ErasedLocalMember>>,
+    row_source_projections: Vec<ErasedRowSourceProjection>,
+}
+
+fn insert_exact_row_source_projection(
+    projections: &mut BTreeMap<(ErasedRowBinding, Vec<String>), SourceId>,
+    row: ErasedRowBinding,
+    path: &[String],
+    source: SourceId,
+    context: &str,
+) -> Result<(), String> {
+    if path.is_empty() {
+        return Err(format!("{context} has an empty row source projection"));
+    }
+    match projections.insert((row, path.to_vec()), source) {
+        Some(existing) if existing != source => Err(format!(
+            "{context} row {:?} projection `{}` resolves to both source {existing} and {source}",
+            row,
+            path.join(".")
+        )),
+        _ => Ok(()),
+    }
+}
+
+impl ExecutableSourceAuthorityIndex {
+    fn build(
+        executable: &ExecutableProgram,
+        static_owners: &[StaticOwnerDef],
+        sources: &[SourcePort],
+        states: &[StateCell],
+        materializations: &[ContextualMaterialization],
+        fields: &[ErasedFieldDef],
+        locals: &[ErasedLocalDef],
+    ) -> Result<Self, String> {
+        let mut resolver = ExecutableSourceProvenanceResolver::new(
+            executable,
+            static_owners,
+            sources,
+            states,
+            materializations,
+            fields,
+            locals,
+        );
+        let values_by_expression = executable
+            .expressions
+            .iter()
+            .map(|expression| resolver.resolve_value_provenance(&expression.provenance))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut projected_values = BTreeMap::new();
+        for expression in &executable.expressions {
+            let boon_typecheck::Type::Object(shape) = &expression.flow_type.ty else {
                 continue;
             };
-            if executable_expression_is_source_group(executable, producer)? {
-                newly_resource_only.push(field.id);
+            for name in shape.fields.keys() {
+                let projection = vec![name.clone()];
+                let authority = resolver
+                    .resolve_value_provenance(&expression.provenance.projected(&projection))?;
+                projected_values.insert((expression.id, projection), authority);
+            }
+        }
+
+        let runtime_source_by_executable = sources
+            .iter()
+            .filter_map(|source| {
+                source
+                    .executable_source_id
+                    .map(|executable| (executable, source.id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let distributed_source_by_path = sources
+            .iter()
+            .filter(|source| source.executable_source_id.is_none())
+            .map(|source| (source.path.clone(), source.id))
+            .collect::<BTreeMap<_, _>>();
+        let runtime_source_by_expression = executable
+            .sources
+            .iter()
+            .filter_map(|source| {
+                runtime_source_by_executable
+                    .get(&source.id)
+                    .copied()
+                    .map(|runtime| (source.expression, runtime))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let runtime_state_by_executable = states
+            .iter()
+            .filter_map(|state| {
+                state
+                    .executable_state_id
+                    .map(|executable| (executable, state.id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let runtime_state_by_declaration_owner = executable
+            .states
+            .iter()
+            .filter_map(|state| {
+                runtime_state_by_executable
+                    .get(&state.id)
+                    .copied()
+                    .map(|runtime| ((state.declaration, state.owner), runtime))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let local_members = locals
+            .iter()
+            .map(|local| ((local.owner, local.local), local.members.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut row_source_projections =
+            BTreeMap::<(ErasedRowBinding, Vec<String>), SourceId>::new();
+        for local in locals {
+            let Some(row) = local.row else {
+                continue;
+            };
+            let members = local_members
+                .get(&(local.owner, local.local))
+                .ok_or_else(|| {
+                    format!(
+                        "source authority has no exact local {}:{}",
+                        local.owner, local.local.0
+                    )
+                })?;
+            for member in members {
+                let ErasedLocalMemberTarget::Source(source) = member.target else {
+                    continue;
+                };
+                insert_exact_row_source_projection(
+                    &mut row_source_projections,
+                    row,
+                    &member.path,
+                    source,
+                    &format!("owner {} local {}", local.owner, local.local.0),
+                )?;
+            }
+        }
+        let consumed_materializations = materializations
+            .iter()
+            .flat_map(|materialization| {
+                materialization
+                    .source_row_predecessors
+                    .iter()
+                    .filter_map(|predecessor| match predecessor {
+                        ContextualRowPredecessor::Materialized { materialization }
+                        | ContextualRowPredecessor::Provenance { materialization } => {
+                            Some(*materialization)
+                        }
+                        ContextualRowPredecessor::Value
+                        | ContextualRowPredecessor::Stored { .. } => None,
+                    })
+                    .filter(|predecessor| {
+                        materializations.get(*predecessor).is_some_and(|input| {
+                            input.target_list_id == materialization.target_list_id
+                                && input.target_scope_id == materialization.target_scope_id
+                        })
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        for materialization in materializations {
+            if consumed_materializations.contains(&materialization.id) {
                 continue;
             }
-            let Some((owner, local, projection)) =
-                materialization_local_projection(executable, producer)?
+            if !matches!(
+                materialization.operation,
+                ContextualOperationKind::Map
+                    | ContextualOperationKind::Filter
+                    | ContextualOperationKind::Retain
+                    | ContextualOperationKind::Remove
+                    | ContextualOperationKind::SortBy
+                    | ContextualOperationKind::ThenBy
+            ) {
+                continue;
+            }
+            let Some(row) = paired_row_binding(
+                materialization.target_list_id,
+                materialization.target_scope_id,
+                "target",
+                materialization.owner,
+            )?
             else {
                 continue;
             };
-            let source = locals_snapshot
-                .iter()
-                .find(|candidate| candidate.owner == owner && candidate.local == local)
-                .ok_or_else(|| {
-                    format!(
-                        "field {} forwards missing materialization local {}:{}",
-                        field.id, owner, local.0
-                    )
-                })?;
-            if resource_members_for_projection(source, &projection, &fields_snapshot).is_some() {
-                newly_resource_only.push(field.id);
+            for member in resolver.resolve_materialization_output(materialization.id)? {
+                let ErasedLocalMemberTarget::Source(source) = member.target else {
+                    continue;
+                };
+                insert_exact_row_source_projection(
+                    &mut row_source_projections,
+                    row,
+                    &member.path,
+                    source,
+                    &format!("materialization {} output", materialization.id),
+                )?;
             }
         }
-        for field in newly_resource_only {
-            let target = fields
-                .get_mut(field.as_usize())
-                .filter(|candidate| candidate.id == field)
-                .ok_or_else(|| format!("missing forwarded resource FieldId {field}"))?;
-            target.resource_only = true;
-            changed = true;
-        }
+        let row_source_projections = row_source_projections
+            .into_iter()
+            .map(|((row, path), source)| ErasedRowSourceProjection { row, path, source })
+            .collect();
 
-        let fields_snapshot = fields.to_vec();
-        let locals_snapshot = locals.to_vec();
-        for local in locals.iter_mut() {
-            let mut members = local
-                .members
-                .iter()
-                .cloned()
-                .map(|member| (member.path.clone(), member))
-                .collect::<BTreeMap<_, _>>();
-            let field_members = local
-                .members
-                .iter()
-                .filter_map(|member| match member.target {
-                    ErasedLocalMemberTarget::Field(field) => Some((member.clone(), field)),
-                    ErasedLocalMemberTarget::Source(_) | ErasedLocalMemberTarget::State(_) => None,
-                })
-                .collect::<Vec<_>>();
-            for (member, field_id) in field_members {
-                let field = fields_snapshot
-                    .get(field_id.as_usize())
-                    .filter(|candidate| candidate.id == field_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "owner {} local {} member `{}` references missing FieldId {field_id}",
-                            local.owner,
-                            local.local.0,
-                            member.path.join(".")
-                        )
-                    })?;
-                if !field.resource_only {
-                    continue;
+        let mut event_causes_by_expression = Vec::with_capacity(executable.expressions.len());
+        for (expression, authority) in executable.expressions.iter().zip(&values_by_expression) {
+            let mut causes = BTreeSet::new();
+            match &expression.kind {
+                ExecutableExpressionKind::CanonicalRead {
+                    source: Some(read), ..
+                } => {
+                    let source = resolver
+                        .source_id(&ExecutableValueOrigin::Source {
+                            source: read.source,
+                            owner: expression.owner,
+                        })?
+                        .expect("checked source origins always resolve to a source");
+                    causes.insert(EventCause::Source(source));
                 }
-
-                if members.remove(&member.path).is_some() {
-                    changed = true;
+                ExecutableExpressionKind::CanonicalRead {
+                    target,
+                    projection,
+                    source: None,
+                    ..
                 }
-
-                if let Some((source_owner, source_local, projection)) =
-                    resource_field_local_projection(
-                        executable,
-                        field,
-                        &fields_snapshot,
-                        materializations,
-                        &locals_snapshot,
-                    )?
-                {
-                    let source = locals_snapshot
-                        .iter()
-                        .find(|candidate| {
-                            candidate.owner == source_owner && candidate.local == source_local
-                        })
+                | ExecutableExpressionKind::Drain {
+                    target, projection, ..
+                } => {
+                    if let Some(state) = runtime_state_by_declaration_owner
+                        .get(&(*target, expression.owner))
+                        .or_else(|| runtime_state_by_declaration_owner.get(&(*target, None)))
+                        .copied()
+                    {
+                        causes.insert(EventCause::State(state));
+                    }
+                    if !projection.is_empty() {
+                        causes.extend(
+                            authority
+                                .sources
+                                .iter()
+                                .map(|member| EventCause::Source(member.source)),
+                        );
+                        causes.extend(
+                            authority
+                                .states
+                                .iter()
+                                .map(|member| EventCause::State(member.state)),
+                        );
+                    }
+                }
+                ExecutableExpressionKind::ExternalRead { canonical_path } => {
+                    let path = distributed_event_source_path(canonical_path);
+                    if let Some(source) = distributed_source_by_path.get(&path).copied() {
+                        causes.insert(EventCause::Source(source));
+                    }
+                }
+                ExecutableExpressionKind::Source { .. } => {
+                    let source = runtime_source_by_expression
+                        .get(&expression.id)
+                        .copied()
                         .ok_or_else(|| {
                             format!(
-                                "resource field {} forwards missing materialization local {}:{}",
-                                field.id, source_owner, source_local.0
+                                "SOURCE expression {} has no exact runtime source",
+                                expression.id
                             )
                         })?;
-                    let resources =
-                        resource_members_for_projection(source, &projection, &fields_snapshot)
-                            .ok_or_else(|| {
-                                format!(
-                                    "resource field {} producer {} has no source members at `{}`",
-                                    field.id,
-                                    field.producer.map_or_else(
-                                        || "authority".to_owned(),
-                                        |id| id.to_string()
-                                    ),
-                                    projection.join(".")
-                                )
-                            })?;
-                    for resource in resources {
-                        let suffix = resource
-                            .path
-                            .strip_prefix(projection.as_slice())
-                            .ok_or_else(|| {
-                                format!(
-                                    "resource member `{}` is outside forwarded projection `{}`",
-                                    resource.path.join("."),
-                                    projection.join(".")
-                                )
-                            })?;
-                        let mut path = member.path.clone();
-                        path.extend_from_slice(suffix);
-                        let forwarded = ErasedLocalMember {
-                            path: path.clone(),
-                            target: resource.target,
-                            forwarded_from: Some(ErasedLocalMemberForwarding {
-                                owner: source_owner,
-                                local: source_local,
-                                path: resource.path.clone(),
-                            }),
-                        };
-                        match members.entry(path.clone()) {
-                            std::collections::btree_map::Entry::Vacant(entry) => {
-                                entry.insert(forwarded);
+                    causes.insert(EventCause::Source(source));
+                }
+                ExecutableExpressionKind::MaterializationLocal {
+                    owner,
+                    local,
+                    projection,
+                } => {
+                    let members = local_members.get(&(*owner, *local)).ok_or_else(|| {
+                        format!(
+                            "event expression {} references missing local {}:{}",
+                            expression.id, owner, local.0
+                        )
+                    })?;
+                    for member in members
+                        .iter()
+                        .filter(|member| projection.starts_with(member.path.as_slice()))
+                    {
+                        match member.target {
+                            ErasedLocalMemberTarget::Source(source) => {
+                                causes.insert(EventCause::Source(source));
                             }
-                            std::collections::btree_map::Entry::Occupied(entry)
-                                if entry.get().target == forwarded.target
-                                    || (matches!(
-                                        entry.get().target,
-                                        ErasedLocalMemberTarget::Source(_)
-                                    ) && entry.get().forwarded_from.is_none()) => {}
-                            std::collections::btree_map::Entry::Occupied(entry) => {
-                                return Err(format!(
-                                    "owner {} local {} forwarded resource `{}` conflicts with {:?}",
-                                    local.owner,
-                                    local.local.0,
-                                    path.join("."),
-                                    entry.get().target
-                                ));
+                            ErasedLocalMemberTarget::State(state) => {
+                                causes.insert(EventCause::State(state));
                             }
+                            ErasedLocalMemberTarget::Field(_) => {}
                         }
                     }
                 }
-            }
-            local.members = members.into_values().collect();
-        }
-
-        if !changed {
-            for local in locals.iter() {
-                for member in &local.members {
-                    if let ErasedLocalMemberTarget::Field(field) = member.target
-                        && fields
-                            .get(field.as_usize())
-                            .filter(|candidate| candidate.id == field)
-                            .is_some_and(|field| field.resource_only)
-                    {
-                        return Err(format!(
-                            "owner {} local {} retains resource-only FieldId {} at `{}`",
-                            local.owner,
-                            local.local.0,
-                            field,
-                            member.path.join(".")
-                        ));
-                    }
+                ExecutableExpressionKind::Project { .. } => {
+                    causes.extend(
+                        authority
+                            .sources
+                            .iter()
+                            .map(|member| EventCause::Source(member.source)),
+                    );
+                    causes.extend(
+                        authority
+                            .states
+                            .iter()
+                            .map(|member| EventCause::State(member.state)),
+                    );
                 }
+                _ => {}
             }
-            return Ok(());
+            event_causes_by_expression.push(causes.into_iter().collect());
         }
+        Ok(Self {
+            values_by_expression,
+            projected_values,
+            event_causes_by_expression,
+            local_members,
+            row_source_projections,
+        })
     }
-    Err("forwarded materialization resources did not reach a fixed point".to_owned())
-}
 
-fn mark_forwarded_executable_resource_fields(
-    executable: &mut ExecutableProgram,
-    scope_index: &ErasedScopeIndex,
-) -> Result<(), String> {
-    let mut forwarded = Vec::new();
-    for (expression_index, expression) in executable.expressions.iter().enumerate() {
-        let fields = match &expression.kind {
-            ExecutableExpressionKind::Object(fields)
-            | ExecutableExpressionKind::Record(fields)
-            | ExecutableExpressionKind::TaggedObject { fields, .. } => fields,
-            _ => continue,
-        };
-        for (field_index, field) in fields.iter().enumerate() {
-            if field.resource_only {
-                continue;
-            }
-            if executable_expression_is_source_group(executable, field.value)? {
-                forwarded.push((expression_index, field_index));
-                continue;
-            }
-            let Some((owner, local, projection)) =
-                materialization_local_projection(executable, field.value)?
-            else {
-                continue;
-            };
-            let source = scope_index
-                .locals
-                .iter()
-                .find(|candidate| candidate.owner == owner && candidate.local == local)
-                .ok_or_else(|| {
-                    format!(
-                        "record field `{}` forwards missing materialization local {}:{}",
-                        field.name, owner, local.0
-                    )
-                })?;
-            if resource_members_for_projection(source, &projection, &scope_index.fields).is_some() {
-                forwarded.push((expression_index, field_index));
-            }
+    fn value(&self, expression: ExecutableExprId) -> Result<&ResolvedFieldProvenance, String> {
+        self.values_by_expression
+            .get(expression.as_usize())
+            .ok_or_else(|| format!("source authority references missing expression {expression}"))
+    }
+
+    fn projected_value(
+        &self,
+        expression: ExecutableExprId,
+        projection: &[String],
+    ) -> Result<&ResolvedFieldProvenance, String> {
+        if projection.is_empty() {
+            return self.value(expression);
         }
+        self.projected_values
+            .get(&(expression, projection.to_vec()))
+            .ok_or_else(|| {
+                format!(
+                    "source authority expression {expression} has no exact projection `{}`",
+                    projection.join(".")
+                )
+            })
     }
-    for (expression_index, field_index) in forwarded {
-        let expression = executable
-            .expressions
-            .get_mut(expression_index)
-            .ok_or_else(|| format!("missing executable expression index {expression_index}"))?;
-        let fields = match &mut expression.kind {
-            ExecutableExpressionKind::Object(fields)
-            | ExecutableExpressionKind::Record(fields)
-            | ExecutableExpressionKind::TaggedObject { fields, .. } => fields,
-            _ => {
-                return Err(format!(
-                    "executable expression {} stopped being a record",
-                    expression.id
-                ));
+
+    fn event_causes(&self, expression: ExecutableExprId) -> Result<&[EventCause], String> {
+        self.event_causes_by_expression
+            .get(expression.as_usize())
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                format!("source authority references missing event expression {expression}")
+            })
+    }
+
+    fn apply_local_resources(&self, locals: &mut [ErasedLocalDef]) -> Result<(), String> {
+        for local in locals {
+            let key = (local.owner, local.local);
+            let authoritative = self.local_members.get(&key).ok_or_else(|| {
+                format!(
+                    "source authority has no exact local {}:{}",
+                    local.owner, local.local.0
+                )
+            })?;
+            let resource_paths = authoritative
+                .iter()
+                .filter(|member| {
+                    matches!(
+                        member.target,
+                        ErasedLocalMemberTarget::Source(_) | ErasedLocalMemberTarget::State(_)
+                    )
+                })
+                .map(|member| member.path.as_slice())
+                .collect::<Vec<_>>();
+            let mut merged = local
+                .members
+                .drain(..)
+                .filter(|member| {
+                    !resource_paths.iter().any(|resource| {
+                        resource.starts_with(member.path.as_slice())
+                            && !authoritative
+                                .iter()
+                                .any(|candidate| candidate.path == member.path)
+                    })
+                })
+                .map(|member| (member.path.clone(), member))
+                .collect::<BTreeMap<_, _>>();
+            for member in authoritative.iter().filter(|member| {
+                matches!(
+                    member.target,
+                    ErasedLocalMemberTarget::Source(_) | ErasedLocalMemberTarget::State(_)
+                )
+            }) {
+                merged.insert(member.path.clone(), member.clone());
             }
-        };
-        let field = fields.get_mut(field_index).ok_or_else(|| {
-            format!(
-                "executable expression {} is missing record field index {field_index}",
-                expression.id
-            )
-        })?;
-        field.resource_only = true;
+            local.members = merged.into_values().collect();
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn bind_derived_field_ids(
@@ -4195,6 +5017,47 @@ fn bind_derived_field_ids(
     Ok(())
 }
 
+fn build_erased_locals(
+    executable: &ExecutableProgram,
+    static_owners: &[StaticOwnerDef],
+    materializations: &[ContextualMaterialization],
+    fields: &[ErasedFieldDef],
+    sources: &[SourcePort],
+    states: &[StateCell],
+    lists: &[ListMemory],
+) -> Result<Vec<ErasedLocalDef>, String> {
+    materializations
+        .iter()
+        .map(|materialization| {
+            let row = paired_row_binding(
+                materialization.source_list_id,
+                materialization.source_scope_id,
+                "source",
+                materialization.owner,
+            )?;
+            Ok(ErasedLocalDef {
+                owner: materialization.owner,
+                local: materialization.row_local,
+                row,
+                source: materialization.source,
+                item_type: materialization.item_type.clone(),
+                members: erased_local_members(
+                    executable,
+                    static_owners,
+                    materializations,
+                    fields,
+                    sources,
+                    states,
+                    lists,
+                    materialization,
+                    row,
+                )?,
+                captures: Vec::new(),
+            })
+        })
+        .collect()
+}
+
 fn build_erased_scope_index(
     executable: &ExecutableProgram,
     static_owners: &[StaticOwnerDef],
@@ -4203,7 +5066,9 @@ fn build_erased_scope_index(
     states: &[StateCell],
     lists: &[ListMemory],
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    locals: Vec<ErasedLocalDef>,
     fields: Vec<ErasedFieldDef>,
+    row_source_projections: Vec<ErasedRowSourceProjection>,
 ) -> Result<ErasedScopeIndex, String> {
     let mut bindings = Vec::new();
     let direct_storage_statements = direct_erased_storage_statements(executable);
@@ -4582,38 +5447,19 @@ fn build_erased_scope_index(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let mut fields = fields;
-    let mut locals = materializations
+    let resource_fields = fields
         .iter()
-        .map(|materialization| {
-            let row = paired_row_binding(
-                materialization.source_list_id,
-                materialization.source_scope_id,
-                "source",
-                materialization.owner,
-            )?;
-            Ok(ErasedLocalDef {
-                owner: materialization.owner,
-                local: materialization.row_local,
-                row,
-                source: materialization.source,
-                item_type: materialization.item_type.clone(),
-                members: erased_local_members(
-                    executable,
-                    static_owners,
-                    materializations,
-                    &fields,
-                    sources,
-                    states,
-                    lists,
-                    materialization,
-                    row,
-                )?,
-                captures: Vec::new(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    propagate_forwarded_local_resources(executable, materializations, &mut fields, &mut locals)?;
+        .filter(|field| field.resource_only)
+        .map(|field| field.id)
+        .collect::<BTreeSet<_>>();
+    for binding in &mut bindings {
+        let ErasedBindingTarget::Value { field, .. } = &mut binding.target else {
+            continue;
+        };
+        if field.is_some_and(|field| resource_fields.contains(&field)) {
+            *field = None;
+        }
+    }
     Ok(ErasedScopeIndex {
         owners,
         locals,
@@ -4622,6 +5468,7 @@ fn build_erased_scope_index(
         sources: erased_sources,
         reads: Vec::new(),
         row_values: Vec::new(),
+        row_source_projections,
         dependencies: Vec::new(),
     })
 }
@@ -5566,11 +6413,7 @@ fn erased_exact_source_read_target(
                     .sources
                     .get(source.as_usize())
                     .filter(|definition| definition.id == source)?;
-                let producer = executable
-                    .expressions
-                    .get(definition.expression.as_usize())
-                    .filter(|producer| producer.id == definition.expression)?;
-                (producer.checked_expr_id == source_read.expression)
+                (definition.origin.checked_source() == Some(source_read.source))
                     .then_some((binding.id, runtime))
             })
             .collect::<Vec<_>>();
@@ -5592,8 +6435,8 @@ fn erased_exact_source_read_target(
             }
             _ => {
                 return Err(format!(
-                    "checked SOURCE expression {} owner {:?} resolves to {} exact source bindings",
-                    source_read.expression.0,
+                    "checked source {} owner {:?} resolves to {} exact source bindings",
+                    source_read.source.0,
                     lexical_owner,
                     candidates.len()
                 ));
@@ -5601,8 +6444,8 @@ fn erased_exact_source_read_target(
         }
     }
     Err(format!(
-        "checked SOURCE expression {} read from owner {:?} has no lexical source binding",
-        source_read.expression.0, owner
+        "checked source {} read from owner {:?} has no lexical source binding",
+        source_read.source.0, owner
     ))
 }
 
@@ -6101,6 +6944,48 @@ fn merge_erased_row_values(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableLocalBindingValue {
+    declaration: boon_typecheck::DeclId,
+    value: ExecutableExprId,
+}
+
+fn executable_local_binding_values(
+    executable: &ExecutableProgram,
+) -> Result<BTreeMap<ExecutableLocalBindingId, ExecutableLocalBindingValue>, String> {
+    let mut values = BTreeMap::new();
+    for binding in executable
+        .expressions
+        .iter()
+        .filter_map(|expression| match &expression.kind {
+            ExecutableExpressionKind::Block { bindings, .. } => Some(bindings.as_slice()),
+            _ => None,
+        })
+        .flatten()
+    {
+        let value = ExecutableLocalBindingValue {
+            declaration: binding.declaration,
+            value: binding.value,
+        };
+        if let Some(previous) = values.insert(binding.id, value)
+            && previous != value
+        {
+            return Err(format!(
+                "executable local binding {} has conflicting values {previous:?} and {value:?}",
+                binding.id
+            ));
+        }
+    }
+    for (index, binding) in values.keys().copied().enumerate() {
+        if binding != ExecutableLocalBindingId(index) {
+            return Err(format!(
+                "executable local binding at index {index} has non-dense ID {binding}"
+            ));
+        }
+    }
+    Ok(values)
+}
+
 fn build_erased_read_bindings(
     executable: &ExecutableProgram,
     static_owners: &[StaticOwnerDef],
@@ -6110,8 +6995,8 @@ fn build_erased_read_bindings(
     distributed: &DistributedReferences,
     read_roots: &BTreeMap<ExecutableExprId, ErasedBindingId>,
 ) -> Result<Vec<ErasedReadBinding>, String> {
-    let roots = executable_expression_roots(executable);
     let reachable = reachable_executable_expression_ids(executable, materializations)?;
+    let local_bindings = executable_local_binding_values(executable)?;
     let mut targets = BTreeMap::<ExecutableExprId, ErasedReadTarget>::new();
     for expression in executable
         .expressions
@@ -6215,6 +7100,30 @@ fn build_erased_read_bindings(
                 parameter: *parameter,
                 projection: projection.clone(),
             }),
+            ExecutableExpressionKind::LocalRead {
+                binding,
+                declaration,
+                projection,
+            } => {
+                let local = local_bindings.get(binding).ok_or_else(|| {
+                    format!(
+                        "local read {} references missing executable binding {binding}",
+                        expression.id
+                    )
+                })?;
+                if local.declaration != *declaration {
+                    return Err(format!(
+                        "local read {} declaration {} differs from binding {binding} declaration {}",
+                        expression.id, declaration.0, local.declaration.0
+                    ));
+                }
+                Some(ErasedReadTarget::Local {
+                    binding: *binding,
+                    declaration: *declaration,
+                    value: local.value,
+                    projection: projection.clone(),
+                })
+            }
             _ => None,
         };
         if let Some(target) = target {
@@ -6222,50 +7131,6 @@ fn build_erased_read_bindings(
         }
     }
 
-    for root in roots {
-        collect_local_read_targets(
-            executable,
-            root,
-            &BTreeMap::new(),
-            &mut BTreeSet::new(),
-            &mut targets,
-        )?;
-    }
-    for materialization in materializations.iter().filter(|materialization| {
-        reachable.contains(&materialization.source)
-            || reachable.contains(&materialization.body)
-            || materialization
-                .direction
-                .is_some_and(|direction| reachable.contains(&direction))
-            || materialization
-                .inherited_order
-                .iter()
-                .any(|key| reachable.contains(&key.body) || reachable.contains(&key.direction))
-    }) {
-        for root in materialization.expression_roots() {
-            collect_local_read_targets(
-                executable,
-                root,
-                &BTreeMap::new(),
-                &mut BTreeSet::new(),
-                &mut targets,
-            )?;
-        }
-    }
-    for expression in executable
-        .expressions
-        .iter()
-        .filter(|expression| reachable.contains(&expression.id))
-    {
-        if matches!(expression.kind, ExecutableExpressionKind::LocalRead { .. })
-            && !targets.contains_key(&expression.id)
-        {
-            return Err(format!(
-                "local read {} is not reachable from an exact erased BLOCK",
-                expression.id
-            ));
-        }
-    }
     Ok(targets
         .into_iter()
         .enumerate()
@@ -6554,66 +7419,6 @@ fn executable_expression_distance(
     best.get(&target).copied()
 }
 
-fn collect_local_read_targets(
-    executable: &ExecutableProgram,
-    expression_id: ExecutableExprId,
-    locals: &BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
-    active: &mut BTreeSet<ExecutableExprId>,
-    targets: &mut BTreeMap<ExecutableExprId, ErasedReadTarget>,
-) -> Result<(), String> {
-    if !active.insert(expression_id) {
-        return Ok(());
-    }
-    let expression = executable
-        .expressions
-        .get(expression_id.as_usize())
-        .filter(|expression| expression.id == expression_id)
-        .ok_or_else(|| {
-            format!("read binding traversal reaches missing expression {expression_id}")
-        })?;
-    match &expression.kind {
-        ExecutableExpressionKind::LocalRead {
-            declaration,
-            projection,
-        } => {
-            let Some(value) = locals.get(declaration).copied() else {
-                active.remove(&expression_id);
-                return Ok(());
-            };
-            let target = ErasedReadTarget::Local {
-                declaration: *declaration,
-                value,
-                projection: projection.clone(),
-            };
-            if let Some(previous) = targets.insert(expression.id, target.clone())
-                && previous != target
-            {
-                return Err(format!(
-                    "local read {} resolves to incompatible erased bindings",
-                    expression.id
-                ));
-            }
-        }
-        ExecutableExpressionKind::Block { bindings, result } => {
-            let mut nested = locals.clone();
-            for binding in bindings {
-                nested.insert(binding.declaration, binding.value);
-            }
-            for binding in bindings {
-                collect_local_read_targets(executable, binding.value, &nested, active, targets)?;
-            }
-            collect_local_read_targets(executable, *result, &nested, active, targets)?;
-        }
-        _ => {
-            for child in executable_expression_children(&expression.kind) {
-                collect_local_read_targets(executable, child, locals, active, targets)?;
-            }
-        }
-    }
-    active.remove(&expression_id);
-    Ok(())
-}
-
 fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
     for (index, owner) in program.scope_index.owners.iter().enumerate() {
         if owner.id != StaticOwnerId(index) {
@@ -6840,48 +7645,6 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                                 upstream_members.len()
                             ));
                         }
-                        let Some(root_name) = member.path.first() else {
-                            unreachable!("empty member paths were rejected above");
-                        };
-                        let mut forwarding_paths = BTreeSet::new();
-                        for field in program.scope_index.fields.iter().filter(|field| {
-                            field.row == local.row
-                                && field.name == *root_name
-                                && field.resource_only
-                        }) {
-                            let Some((owner, source_local, projection)) =
-                                resource_field_local_projection(
-                                    &program.executable,
-                                    field,
-                                    &program.scope_index.fields,
-                                    &program.materializations,
-                                    &program.scope_index.locals,
-                                )?
-                            else {
-                                continue;
-                            };
-                            if owner != forwarding.owner || source_local != forwarding.local {
-                                continue;
-                            }
-                            let Some(suffix) = forwarding.path.strip_prefix(projection.as_slice())
-                            else {
-                                continue;
-                            };
-                            let mut expected = vec![field.name.clone()];
-                            expected.extend_from_slice(suffix);
-                            if expected == member.path {
-                                forwarding_paths.insert((owner, source_local, projection));
-                            }
-                        }
-                        if forwarding_paths.len() != 1 {
-                            return Err(format!(
-                                "owner {} local {} member `{}` has {} exact resource forwarding paths",
-                                local.owner,
-                                local.local.0,
-                                member.path.join("."),
-                                forwarding_paths.len()
-                            ));
-                        }
                     } else if source.scope_id != local.row.map(|row| row.scope)
                         || relative_path(&source.path).is_none_or(|path| path != member.path)
                     {
@@ -6992,17 +7755,24 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
         }
         match binding.target {
             ErasedBindingTarget::Value { field, row } => {
-                if let Some(field) = field
-                    && !program
+                if let Some(field) = field {
+                    let field = program
                         .scope_index
                         .fields
                         .iter()
-                        .any(|value| value.id == field)
-                {
-                    return Err(format!(
-                        "erased binding {} references missing FieldId {field}",
-                        binding.id
-                    ));
+                        .find(|value| value.id == field)
+                        .ok_or_else(|| {
+                            format!(
+                                "erased binding {} references missing FieldId {field}",
+                                binding.id
+                            )
+                        })?;
+                    if field.resource_only {
+                        return Err(format!(
+                            "erased value binding {} targets resource-only FieldId {}",
+                            binding.id, field.id
+                        ));
+                    }
                 }
                 if let Some(row) = row {
                     verify_erased_row(program, row, &format!("binding {}", binding.id))?;
@@ -7551,35 +8321,137 @@ fn validate_checked_program_for_lowering(
         .iter()
         .map(|call| call.id)
         .collect::<BTreeSet<_>>();
-    for source in &program.sources {
-        let expression = source.expression.ok_or_else(|| {
-            format!(
-                "checked source `{}` has no exact expression ownership",
-                source.path
+    let mut resource_requirement_expressions = BTreeSet::new();
+    for requirement in &program.resource_projection_requirements {
+        let expression = program
+            .expressions
+            .get(requirement.expression.0 as usize)
+            .filter(|candidate| candidate.id == requirement.expression)
+            .ok_or_else(|| {
+                format!(
+                    "checked resource projection requirement references missing expression {}",
+                    requirement.expression.0
+                )
+            })?;
+        if !resource_requirement_expressions.insert(requirement.expression)
+            || !matches!(
+                &expression.kind,
+                boon_typecheck::CheckedExpressionKind::Read {
+                    target,
+                    projection,
+                    source: None,
+                } | boon_typecheck::CheckedExpressionKind::Drain {
+                    target,
+                    projection,
+                } if *target == requirement.target && *projection == requirement.projection
             )
-        })?;
-        let declaration = source.declaration.ok_or_else(|| {
-            format!(
-                "checked source `{}` has no exact declaration ownership",
-                source.path
-            )
-        })?;
+            || requirement
+                .source_origins
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || requirement.source_origins.iter().any(|origin| {
+                program
+                    .sources
+                    .get(origin.source.0 as usize)
+                    .is_none_or(|source| source.id != origin.source)
+            })
+        {
+            return Err(format!(
+                "checked resource projection requirement {} is not canonical or does not match its exact unresolved read",
+                requirement.expression.0
+            ));
+        }
+    }
+    let mut previous_call_path = None;
+    for result_path in &program.call_result_paths {
+        if previous_call_path.is_some_and(|previous| previous >= result_path.call) {
+            return Err(format!(
+                "checked call result path {} is duplicated or not in canonical call order",
+                result_path.call.0
+            ));
+        }
+        previous_call_path = Some(result_path.call);
+        let call = program
+            .calls
+            .iter()
+            .find(|call| call.id == result_path.call)
+            .ok_or_else(|| {
+                format!(
+                    "checked call result path references missing call {}",
+                    result_path.call.0
+                )
+            })?;
+        let expression = program
+            .expressions
+            .get(call.expression.0 as usize)
+            .filter(|expression| expression.id == call.expression)
+            .ok_or_else(|| {
+                format!(
+                    "checked call result path {} references missing expression {}",
+                    result_path.call.0, call.expression.0
+                )
+            })?;
+        if expression.declaration != Some(result_path.path.anchor)
+            || !declarations.contains(&result_path.path.anchor)
+        {
+            return Err(format!(
+                "checked call result path {} does not use its expression's exact lexical declaration",
+                result_path.call.0
+            ));
+        }
+    }
+    for (index, source) in program.sources.iter().enumerate() {
+        if source.id.0 as usize != index {
+            return Err(format!(
+                "checked source arena index {index} contains id {}",
+                source.id.0
+            ));
+        }
+        let expression = source.expression;
+        let declaration = source.declaration;
         let checked_expression = program
             .expressions
             .iter()
             .find(|candidate| candidate.id == expression)
             .ok_or_else(|| {
                 format!(
-                    "checked source `{}` references missing expression {}",
-                    source.path, expression.0
+                    "checked source {} references missing expression {}",
+                    source.id.0, expression.0
                 )
             })?;
         if checked_expression.declaration != Some(declaration)
             || !declarations.contains(&declaration)
+            || source.path.anchor != declaration
+            || !statements.contains(&source.statement)
         {
             return Err(format!(
-                "checked source `{}` expression {} and declaration {} disagree",
-                source.path, expression.0, declaration.0
+                "checked source {} expression {}, declaration {}, statement {}, and semantic path disagree",
+                source.id.0, expression.0, declaration.0, source.statement.0
+            ));
+        }
+    }
+    for (index, state) in program.states.iter().enumerate() {
+        if state.id.0 as usize != index
+            || !expressions.contains(&state.expression)
+            || !expressions.contains(&state.initial)
+            || !declarations.contains(&state.declaration)
+            || !statements.contains(&state.statement)
+            || state.path.anchor != state.declaration
+        {
+            return Err(format!(
+                "checked state arena entry {index} has inconsistent semantic ownership"
+            ));
+        }
+    }
+    for (index, list) in program.lists.iter().enumerate() {
+        if list.id.0 as usize != index
+            || !expressions.contains(&list.producer)
+            || !declarations.contains(&list.declaration)
+            || !statements.contains(&list.statement)
+            || list.path.anchor != list.declaration
+        {
+            return Err(format!(
+                "checked list arena entry {index} has inconsistent semantic ownership"
             ));
         }
     }
@@ -7655,6 +8527,36 @@ fn validate_checked_program_for_lowering(
                 "checked statement {} references a missing declaration",
                 statement.id.0
             ));
+        }
+        for resource in &statement.resources {
+            let valid = match resource {
+                boon_typecheck::CheckedResourceBinding::Source { source } => program
+                    .sources
+                    .get(source.0 as usize)
+                    .is_some_and(|candidate| {
+                        candidate.id == *source && candidate.statement == statement.id
+                    }),
+                boon_typecheck::CheckedResourceBinding::State { state } => program
+                    .states
+                    .get(state.0 as usize)
+                    .is_some_and(|candidate| {
+                        candidate.id == *state && candidate.statement == statement.id
+                    }),
+                boon_typecheck::CheckedResourceBinding::ListAuthority { list } => {
+                    program.lists.get(list.0 as usize).is_some_and(|candidate| {
+                        candidate.id == *list && candidate.statement == statement.id
+                    })
+                }
+                boon_typecheck::CheckedResourceBinding::ListAlias { target } => {
+                    declarations.contains(target)
+                }
+            };
+            if !valid {
+                return Err(format!(
+                    "checked statement {} contains an invalid semantic resource binding",
+                    statement.id.0
+                ));
+            }
         }
     }
     let callables = program
@@ -7746,11 +8648,47 @@ fn validate_checked_program_for_lowering(
                 }
             }
         }
-        if call.pass.is_some_and(|pass| !expressions.contains(&pass)) {
-            return Err(format!(
-                "checked call {} has a missing PASS expression",
-                call.id.0
-            ));
+        let callable = program
+            .callables
+            .iter()
+            .find(|callable| callable.decl_id == call.callable)
+            .expect("callable membership was checked above");
+        if let Some(pass) = call.pass {
+            if callable.kind != boon_typecheck::CheckedCallableKind::User {
+                return Err(format!(
+                    "checked call {} supplies PASS to non-user callable `{}`",
+                    call.id.0, callable.name
+                ));
+            }
+            if !expressions.contains(&pass.value) {
+                return Err(format!(
+                    "checked call {} has a missing PASS expression",
+                    call.id.0
+                ));
+            }
+        } else if callable.requires_pass() {
+            let Some(owner) = call.owner_callable else {
+                return Err(format!(
+                    "checked root call {} to `{}` requires PASS",
+                    call.id.0, callable.name
+                ));
+            };
+            let owner = program
+                .callables
+                .iter()
+                .find(|candidate| candidate.decl_id == owner)
+                .ok_or_else(|| {
+                    format!(
+                        "checked call {} inherits PASS from missing owner callable {}",
+                        call.id.0, owner.0
+                    )
+                })?;
+            if !owner.requires_pass() {
+                return Err(format!(
+                    "checked call {} to `{}` requires PASS but owner callable `{}` does not",
+                    call.id.0, callable.name, owner.name
+                ));
+            }
         }
     }
     for expression in &program.expressions {
@@ -7905,6 +8843,8 @@ fn distributed_references(
 }
 
 fn concrete_distributed_calls(
+    checked: &boon_typecheck::CheckedProgram,
+    out_net: &out_net::OutNet,
     executable: &ExecutableProgram,
     materializations: &[ContextualMaterialization],
     pending: &[PendingDistributedCall],
@@ -7918,6 +8858,7 @@ fn concrete_distributed_calls(
         let ExecutableExpressionKind::Call {
             callable_kind: ExecutableCallableKind::External,
             name,
+            instance,
             arguments,
             ..
         } = &expression.kind
@@ -8010,9 +8951,14 @@ fn concrete_distributed_calls(
                 call.arguments.len()
             ));
         }
+        let (_, occurrence_path) = out_net.distributed_call_occurrence(
+            checked,
+            out_net::OutCallInstanceId::from_usize(*instance),
+        )?;
         calls.push(DistributedCall {
             expression: expression.id,
             owner: expression.owner,
+            occurrence_path,
             canonical_function: call.canonical_function.clone(),
             producer_role: call.producer_role,
             result: expression.flow_type.clone(),
@@ -8971,14 +9917,20 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                 value.path, value.id
             ));
         }
-        if !program
+        let field = program
             .scope_index
             .fields
             .iter()
-            .any(|field| field.id == value.id)
-        {
+            .find(|field| field.id == value.id)
+            .ok_or_else(|| {
+                format!(
+                    "derived value `{}` references missing FieldId {}",
+                    value.path, value.id
+                )
+            })?;
+        if field.resource_only {
             return Err(format!(
-                "derived value `{}` references missing FieldId {}",
+                "derived value `{}` targets resource-only FieldId {}",
                 value.path, value.id
             ));
         }
@@ -10230,15 +11182,7 @@ fn exact_list_item_field_types(
         .iter()
         .filter_map(|statement| Some((statement.declaration?, statement.value?)))
         .collect::<BTreeMap<_, _>>();
-    let local_values = executable
-        .expressions
-        .iter()
-        .flat_map(|expression| match &expression.kind {
-            ExecutableExpressionKind::Block { bindings, .. } => bindings.as_slice(),
-            _ => &[],
-        })
-        .map(|binding| (binding.declaration, binding.value))
-        .collect::<BTreeMap<_, _>>();
+    let local_values = executable_local_binding_values(executable)?;
     let mut fields = BTreeMap::new();
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
@@ -10326,12 +11270,13 @@ fn exact_list_item_field_types(
                 }
             }
             ExecutableExpressionKind::LocalRead {
-                declaration,
+                binding,
                 projection,
+                ..
             } => {
                 if projection.is_empty() {
-                    if let Some(value) = local_values.get(declaration) {
-                        pending.push(*value);
+                    if let Some(local) = local_values.get(binding) {
+                        pending.push(local.value);
                     }
                 } else if let boon_typecheck::Type::Object(shape) = &expression.flow_type.ty {
                     for (name, ty) in &shape.fields {
@@ -10701,7 +11646,7 @@ fn executable_root_initial_path(
 fn executable_static_data(
     executable: &ExecutableProgram,
     expression_id: ExecutableExprId,
-    locals: &BTreeMap<boon_typecheck::DeclId, boon_data::Value>,
+    locals: &BTreeMap<ExecutableLocalBindingId, boon_data::Value>,
     visiting: &mut BTreeSet<ExecutableExprId>,
 ) -> Result<boon_data::Value, String> {
     if !visiting.insert(expression_id) {
@@ -10789,16 +11734,20 @@ fn executable_static_data(
                 for binding in bindings {
                     let value =
                         executable_static_data(executable, binding.value, &scoped, visiting)?;
-                    scoped.insert(binding.declaration, value);
+                    scoped.insert(binding.id, value);
                 }
                 executable_static_data(executable, *result, &scoped, visiting)
             }
             ExecutableExpressionKind::LocalRead {
+                binding,
                 declaration,
                 projection,
             } => {
-                let value = locals.get(declaration).cloned().ok_or_else(|| {
-                    format!("local declaration {} has no static binding", declaration.0)
+                let value = locals.get(binding).cloned().ok_or_else(|| {
+                    format!(
+                        "local declaration {} binding {binding} has no static value",
+                        declaration.0
+                    )
                 })?;
                 executable_static_projection(value, projection)
             }
@@ -10840,7 +11789,7 @@ fn executable_static_data(
 fn executable_static_record(
     executable: &ExecutableProgram,
     fields: &[ExecutableRecordField],
-    locals: &BTreeMap<boon_typecheck::DeclId, boon_data::Value>,
+    locals: &BTreeMap<ExecutableLocalBindingId, boon_data::Value>,
     visiting: &mut BTreeSet<ExecutableExprId>,
 ) -> Result<BTreeMap<String, boon_data::Value>, String> {
     let mut result = BTreeMap::new();
@@ -11041,17 +11990,6 @@ fn canonicalize_runtime_resource_metadata(
     Ok(())
 }
 
-fn source_metadata_matches_checked_expression(
-    source: &SourcePort,
-    checked_expression: ExprId,
-    checked_span: boon_typecheck::CheckedSpan,
-) -> bool {
-    source.source_expr_id.map_or_else(
-        || source.source_line == checked_span.line,
-        |expression| expression == checked_expression,
-    )
-}
-
 fn is_canonical_resource_path(path: &str) -> bool {
     !path.is_empty()
         && path.split('.').all(|segment| {
@@ -11068,64 +12006,20 @@ fn bind_executable_source_resources(
     executable: &ExecutableProgram,
     materialization_targets: &BTreeMap<StaticOwnerId, ListId>,
     lists: &[ListMemory],
-    parser_source_count: usize,
+    checked_source_count: usize,
     sources: &mut Vec<SourcePort>,
 ) -> Result<RuntimeResourceAliases, String> {
-    fn merge_metadata(
-        source: ExecutableSourceId,
-        records: &[&SourcePort],
-    ) -> Result<(Option<u64>, SourcePayloadSchema), String> {
-        let mut interval_ms = None;
-        let mut fields = BTreeSet::new();
-        let mut typed_fields = BTreeMap::new();
-        for record in records {
-            if let Some(interval) = record.interval_ms {
-                if let Some(existing) = interval_ms
-                    && existing != interval
-                {
-                    return Err(format!(
-                        "executable source {source} has conflicting interval metadata {existing} and {interval}"
-                    ));
-                }
-                interval_ms = Some(interval);
-            }
-            fields.extend(record.payload_schema.fields.iter().cloned());
-            for descriptor in &record.payload_schema.typed_fields {
-                if let Some(existing) =
-                    typed_fields.insert(descriptor.field.clone(), descriptor.data_type.clone())
-                    && existing != descriptor.data_type
-                {
-                    return Err(format!(
-                        "executable source {source} has conflicting payload types for `{}`",
-                        descriptor.field.name()
-                    ));
-                }
-            }
-        }
-        fields.extend(typed_fields.keys().cloned());
-        Ok((
-            interval_ms,
-            SourcePayloadSchema {
-                fields: fields.into_iter().collect(),
-                typed_fields: typed_fields
-                    .into_iter()
-                    .map(|(field, data_type)| SourcePayloadDescriptor { field, data_type })
-                    .collect(),
-            },
-        ))
-    }
-
-    let parser_sources = sources
-        .get(..parser_source_count)
+    let checked_sources = sources
+        .get(..checked_source_count)
         .ok_or_else(|| {
             format!(
-                "parser source count {parser_source_count} exceeds {} runtime source records",
+                "checked source count {checked_source_count} exceeds {} runtime source records",
                 sources.len()
             )
         })?
         .to_vec();
     let distributed_sources = sources
-        .get(parser_source_count..)
+        .get(checked_source_count..)
         .unwrap_or_default()
         .to_vec();
     let mut bound = Vec::with_capacity(executable.sources.len() + distributed_sources.len());
@@ -11141,64 +12035,95 @@ fn bind_executable_source_resources(
                     executable_source.id
                 )
             })?;
-        let checked_expression = ExprId(executable_expression.checked_expr_id.0 as usize);
-        let checked_span = checked
-            .expressions
-            .get(executable_expression.checked_expr_id.0 as usize)
-            .filter(|expression| expression.id == executable_expression.checked_expr_id)
-            .map(|expression| expression.span)
-            .ok_or_else(|| {
-                format!(
-                    "executable source {} has no checked expression provenance",
-                    executable_source.id
-                )
-            })?;
+        let (alias_paths, source_expr_id, source_line, interval_ms, payload_schema) =
+            match executable_source.origin {
+                ExecutableSourceOrigin::Checked {
+                    source: checked_source_id,
+                } => {
+                    let checked_source = checked
+                        .sources
+                        .get(checked_source_id.0 as usize)
+                        .filter(|source| source.id == checked_source_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "executable source {} references missing checked source {}",
+                                executable_source.id, checked_source_id.0
+                            )
+                        })?;
+                    if executable_expression.checked_expr_id != checked_source.expression {
+                        return Err(format!(
+                            "executable source {} expression provenance {} differs from checked source {} expression {}",
+                            executable_source.id,
+                            executable_expression.checked_expr_id.0,
+                            checked_source.id.0,
+                            checked_source.expression.0
+                        ));
+                    }
+                    let metadata = checked_sources
+                        .get(checked_source.id.0 as usize)
+                        .filter(|source| source.id.0 == checked_source.id.0 as usize)
+                        .ok_or_else(|| {
+                            format!(
+                                "checked source {} has no direct runtime metadata",
+                                checked_source.id.0
+                            )
+                        })?;
+                    (
+                        vec![metadata.path.clone(), metadata.binding_path.clone()],
+                        Some(ExprId(checked_source.expression.0 as usize)),
+                        checked_source.span.line,
+                        metadata.interval_ms,
+                        metadata.payload_schema.clone(),
+                    )
+                }
+                ExecutableSourceOrigin::ProducerInvocation { function, identity } => {
+                    let producer = executable
+                        .functions
+                        .iter()
+                        .find(|candidate| {
+                            candidate.id == function
+                                && candidate.identity == identity
+                                && candidate.invocation_source
+                                    == Some(executable_source.expression)
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "producer invocation source {} has no exact executable producer function",
+                                executable_source.id
+                            )
+                        })?;
+                    if !matches!(
+                        executable_expression.kind,
+                        ExecutableExpressionKind::Source { .. }
+                    ) || executable_expression.owner != executable_source.owner
+                    {
+                        return Err(format!(
+                            "producer function `{}` invocation source {} has invalid executable ownership",
+                            producer.name, executable_source.id
+                        ));
+                    }
+                    let source_line = checked
+                        .declarations
+                        .iter()
+                        .find(|declaration| declaration.id == executable_source.declaration)
+                        .map_or(0, |declaration| declaration.span.line);
+                    (
+                        vec![executable_source.binding_path.clone()],
+                        None,
+                        source_line,
+                        None,
+                        SourcePayloadSchema {
+                            fields: Vec::new(),
+                            typed_fields: Vec::new(),
+                        },
+                    )
+                }
+            };
         let target = executable_source
             .owner
             .and_then(|owner| materialization_targets.get(&owner))
             .and_then(|list| lists.get(list.as_usize()))
             .map(|list| (list.name.as_str(), list));
-        let matches = parser_sources
-            .iter()
-            .filter(|source| {
-                source_metadata_matches_checked_expression(source, checked_expression, checked_span)
-            })
-            .collect::<Vec<_>>();
-        let payload_projections = executable
-            .expressions
-            .iter()
-            .filter_map(|expression| match &expression.kind {
-                ExecutableExpressionKind::CanonicalRead {
-                    target,
-                    path,
-                    projection,
-                    ..
-                } if *target == executable_source.declaration && !projection.is_empty() => {
-                    let payload = executable_source_payload_projection(
-                        &executable_source.binding_path,
-                        path,
-                        projection,
-                    );
-                    (!payload.is_empty()).then_some(payload)
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        if matches.is_empty() && !payload_projections.is_empty() {
-            return Err(format!(
-                "executable source {} (`{}` owner {:?}) has projected payload reads {:?} but no typed payload metadata; available parser metadata {:?}",
-                executable_source.id,
-                executable_source.binding_path,
-                executable_source.owner,
-                payload_projections,
-                parser_sources
-                    .iter()
-                    .map(|source| (&source.path, &source.binding_path, source.scope_id))
-                    .collect::<Vec<_>>()
-            ));
-        }
-        let (interval_ms, payload_schema) =
-            merge_metadata(executable_source.id, matches.as_slice())?;
         let expanded_path = executable_expression.resource_binding_path.as_deref();
         let canonical_path = match (target, expanded_path) {
             (Some((target, _)), Some(path))
@@ -11211,17 +12136,11 @@ fn bind_executable_source_resources(
             (None, None) => executable_source.binding_path.clone(),
         };
         let source_id = SourceId(bound.len());
-        for metadata in matches {
+        for alias_path in alias_paths {
             insert_resource_alias(
                 &mut aliases,
                 executable_source.owner,
-                &metadata.path,
-                RuntimeResourceAliasTarget::Source(source_id),
-            )?;
-            insert_resource_alias(
-                &mut aliases,
-                executable_source.owner,
-                &metadata.binding_path,
+                &alias_path,
                 RuntimeResourceAliasTarget::Source(source_id),
             )?;
         }
@@ -11232,8 +12151,8 @@ fn bind_executable_source_resources(
             binding_path: canonical_path,
             executable_source_id: Some(executable_source.id),
             static_owner: executable_source.owner,
-            source_expr_id: Some(checked_expression),
-            source_line: checked_span.line,
+            source_expr_id,
+            source_line,
             scoped: scope_id.is_some(),
             scope_id,
             interval_ms,
@@ -11246,30 +12165,6 @@ fn bind_executable_source_resources(
     }
     *sources = bound;
     Ok(aliases)
-}
-
-fn executable_source_payload_projection(
-    binding_path: &str,
-    declaration_path: &str,
-    projection: &[String],
-) -> Vec<String> {
-    if binding_path == declaration_path {
-        return projection.to_vec();
-    }
-    let Some(relative_source) = binding_path
-        .strip_prefix(declaration_path)
-        .and_then(|suffix| suffix.strip_prefix('.'))
-    else {
-        return projection.to_vec();
-    };
-    let structural = relative_source
-        .split('.')
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    projection
-        .strip_prefix(structural.as_slice())
-        .unwrap_or(projection)
-        .to_vec()
 }
 
 fn bind_distributed_reference_aliases(
@@ -11493,66 +12388,60 @@ fn executable_state_statement<'a>(
     executable: &'a ExecutableProgram,
     state: &ExecutableStateDef,
 ) -> Result<ExecutableStateStatement<'a>, String> {
-    let checked_candidates = checked
+    let checked_state = checked
+        .states
+        .get(state.checked_state.0 as usize)
+        .filter(|candidate| candidate.id == state.checked_state)
+        .ok_or_else(|| {
+            format!(
+                "executable state {} references missing checked state {}",
+                state.id, state.checked_state.0
+            )
+        })?;
+    let checked_statement = checked
         .statements
         .iter()
-        .filter(|statement| {
-            checked_statement_declaration(&statement.kind) == Some(state.declaration)
-        })
-        .collect::<Vec<_>>();
-    let [checked_statement] = checked_candidates.as_slice() else {
-        return Err(format!(
-            "executable state {} declaration {} has {} checked statements",
-            state.id,
-            state.declaration.0,
-            checked_candidates.len()
-        ));
-    };
-    let executable_candidates = executable
+        .find(|statement| statement.id == checked_state.statement)
+        .ok_or_else(|| {
+            format!(
+                "executable state {} checked state {} references missing statement {}",
+                state.id, state.checked_state.0, checked_state.statement.0
+            )
+        })?;
+    let exact = executable
         .statements
         .iter()
-        .filter(|statement| statement.declaration == Some(state.declaration))
-        .collect::<Vec<_>>();
-    let executable_statement = match executable_candidates.as_slice() {
-        [] => None,
-        [statement] => Some(*statement),
-        _ => {
-            return Err(format!(
-                "executable state {} declaration {} has {} executable statements",
-                state.id,
-                state.declaration.0,
-                executable_candidates.len()
-            ));
+        .find(|statement| statement.id.as_usize() == checked_statement.id.0 as usize);
+    let executable_statement = if exact.is_some() {
+        exact
+    } else {
+        let candidates = executable
+            .statements
+            .iter()
+            .filter(|statement| {
+                statement.value.is_some_and(|root| {
+                    executable_expression_reaches(executable, root, state.expression)
+                })
+            })
+            .collect::<Vec<_>>();
+        match candidates.as_slice() {
+            [] => None,
+            [statement] => Some(*statement),
+            _ => {
+                return Err(format!(
+                    "executable state {} checked state {} belongs to {} executable statements",
+                    state.id,
+                    state.checked_state.0,
+                    candidates.len()
+                ));
+            }
         }
     };
-    if let Some(executable_statement) = executable_statement
-        && executable_statement.id.as_usize() != checked_statement.id.0 as usize
-    {
-        return Err(format!(
-            "executable state {} declaration {} statement identity differs between checked {} and executable {}",
-            state.id, state.declaration.0, checked_statement.id.0, executable_statement.id
-        ));
-    }
     Ok(ExecutableStateStatement {
         id: checked_statement.id.0 as usize,
         checked: checked_statement,
         executable: executable_statement,
     })
-}
-
-fn checked_statement_declaration(
-    kind: &boon_typecheck::CheckedStatementKind,
-) -> Option<boon_typecheck::DeclId> {
-    match kind {
-        boon_typecheck::CheckedStatementKind::Function { declaration }
-        | boon_typecheck::CheckedStatementKind::Field { declaration } => Some(*declaration),
-        boon_typecheck::CheckedStatementKind::Source { declaration, .. }
-        | boon_typecheck::CheckedStatementKind::Hold { declaration, .. }
-        | boon_typecheck::CheckedStatementKind::List { declaration, .. } => *declaration,
-        boon_typecheck::CheckedStatementKind::Block
-        | boon_typecheck::CheckedStatementKind::Spread
-        | boon_typecheck::CheckedStatementKind::Expression => None,
-    }
 }
 
 fn executable_state_declared_path(
@@ -11779,46 +12668,38 @@ fn bind_contextual_materialization_targets(
     Ok(())
 }
 
-fn source_payload_schema(
-    typecheck_report: &boon_typecheck::CheckedProgramLoweringMetadata,
-    source: &str,
-) -> SourcePayloadSchema {
-    let typed_payload_fields = typecheck_report
-        .source_payload_shape_table
-        .iter()
-        .find(|entry| entry.source_path == source)
-        .into_iter()
-        .flat_map(|entry| &entry.fields)
-        .filter_map(|field| {
-            let data_type = semantic_data_type(&field.ty);
-            (!matches!(data_type, SemanticDataType::Unknown { .. }))
-                .then(|| (SourcePayloadField::from_name(&field.name), data_type))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let payload_fields = typed_payload_fields.keys().cloned().collect::<Vec<_>>();
-    SourcePayloadSchema {
-        fields: payload_fields.clone(),
-        typed_fields: payload_fields
-            .into_iter()
-            .map(|field| SourcePayloadDescriptor {
-                data_type: typed_payload_fields
-                    .get(&field)
-                    .cloned()
-                    .unwrap_or_else(|| source_payload_data_type(&field)),
-                field,
-            })
-            .collect(),
-    }
-}
-
-fn source_payload_data_type(field: &SourcePayloadField) -> SemanticDataType {
-    match field {
-        SourcePayloadField::Bytes => SemanticDataType::Bytes { fixed_len: None },
-        SourcePayloadField::Named(name) if name == "press" => SemanticDataType::Bool,
-        SourcePayloadField::Address | SourcePayloadField::Key | SourcePayloadField::Text => {
-            SemanticDataType::Text
+fn source_payload_schema_from_type(payload: &boon_typecheck::Type) -> SourcePayloadSchema {
+    let boon_typecheck::Type::Object(shape) = payload else {
+        return SourcePayloadSchema {
+            fields: Vec::new(),
+            typed_fields: Vec::new(),
+        };
+    };
+    let mut ordered = shape.field_order.clone();
+    for field in shape.fields.keys() {
+        if !ordered.contains(field) {
+            ordered.push(field.clone());
         }
-        SourcePayloadField::Named(_) => SemanticDataType::Text,
+    }
+    let typed_fields = ordered
+        .into_iter()
+        .filter_map(|name| {
+            let ty = shape.fields.get(&name)?;
+            let data_type = semantic_data_type(ty);
+            (!matches!(data_type, SemanticDataType::Unknown { .. })).then(|| {
+                SourcePayloadDescriptor {
+                    field: SourcePayloadField::from_name(&name),
+                    data_type,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    SourcePayloadSchema {
+        fields: typed_fields
+            .iter()
+            .map(|field| field.field.clone())
+            .collect(),
+        typed_fields,
     }
 }
 
@@ -11860,23 +12741,21 @@ fn contextual_materializations(
 
 fn view_bindings(
     executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
     storage: &ErasedScopeIndex,
+    source_authority: &ExecutableSourceAuthorityIndex,
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
     output_values: &[OutputRootValue],
     row_scopes: &[RowScope],
     sources: &[SourcePort],
-    states: &[StateCell],
     materializations: &[ContextualMaterialization],
 ) -> Result<Vec<ViewBinding>, String> {
     let mut collector = ExecutableViewBindingCollector::new(
         executable,
-        static_owners,
-        Some(storage),
+        storage,
+        source_authority,
         list_storage,
         row_scopes,
         sources,
-        states,
         materializations,
     )?;
     collector.collect_output_roots(output_values)?;
@@ -11885,28 +12764,15 @@ fn view_bindings(
     Ok(bindings)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn bind_distributed_call_invocation_arms(
     executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
     storage: &ErasedScopeIndex,
-    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    row_scopes: &[RowScope],
-    sources: &[SourcePort],
-    states: &[StateCell],
+    source_authority: &ExecutableSourceAuthorityIndex,
     materializations: &[ContextualMaterialization],
     calls: &mut [DistributedCall],
 ) -> Result<(), String> {
-    let mut collector = ExecutableViewBindingCollector::new(
-        executable,
-        static_owners,
-        Some(storage),
-        list_storage,
-        row_scopes,
-        sources,
-        states,
-        materializations,
-    )?;
+    let mut triggers =
+        ExecutableTriggerResolver::new(executable, source_authority, materializations)?;
     for (reference, call) in calls.iter_mut().enumerate() {
         let current_capable = call.result.mode == boon_typecheck::FlowMode::Continuous
             && call
@@ -11936,9 +12802,9 @@ fn bind_distributed_call_invocation_arms(
         let mut arms = Vec::new();
         for root in dependent_roots {
             let root_arms = if current_capable {
-                collector.trigger_owned_arms_before_expression(root, call.expression)?
+                triggers.trigger_owned_arms_before_expression(root, call.expression)?
             } else {
-                collector.trigger_owned_arms_for_expression(root)?
+                triggers.trigger_owned_arms_for_expression(root)?
             };
             for arm in root_arms {
                 if executable_expression_distance(
@@ -11976,25 +12842,13 @@ fn bind_distributed_call_invocation_arms(
 
 fn bind_contextual_materialization_storage(
     executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    row_scopes: &[RowScope],
     lists: &[ListMemory],
-    sources: &[SourcePort],
-    states: &[StateCell],
     materializations: &mut [ContextualMaterialization],
 ) -> Result<(), String> {
     let storage = {
-        let mut resolver = ExecutableViewBindingCollector::new(
-            executable,
-            static_owners,
-            None,
-            list_storage,
-            row_scopes,
-            sources,
-            states,
-            materializations,
-        )?;
+        let mut resolver =
+            ContextualStorageScopeResolver::new(executable, list_storage, materializations)?;
         materializations
             .iter()
             .map(|materialization| {
@@ -12058,6 +12912,714 @@ fn bind_contextual_materialization_storage(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ContextualRowLineageLeaf {
+    InputValue,
+    Stored(ErasedRowBinding),
+    Materialized(usize),
+    Provenance(usize),
+}
+
+fn bind_contextual_materialization_lineage(
+    executable: &ExecutableProgram,
+    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    materializations: &mut [ContextualMaterialization],
+) -> Result<(), String> {
+    let statement_values = executable
+        .statements
+        .iter()
+        .filter_map(|statement| Some((statement.declaration?, statement.value?)))
+        .collect::<BTreeMap<_, _>>();
+    let statement_rows = executable
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let declaration = statement.declaration?;
+            let storage = list_storage.get(&statement.id)?;
+            Some((
+                declaration,
+                ErasedRowBinding {
+                    list: storage.list_id,
+                    scope: storage.row_scope_id,
+                },
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let local_values = executable_local_binding_values(executable)?;
+    let known = materializations
+        .iter()
+        .map(|materialization| materialization.id)
+        .collect::<BTreeSet<_>>();
+    let rows = materializations
+        .iter()
+        .map(|materialization| {
+            let source = paired_row_binding(
+                materialization.source_list_id,
+                materialization.source_scope_id,
+                "source",
+                materialization.owner,
+            )?;
+            let target = paired_row_binding(
+                materialization.target_list_id,
+                materialization.target_scope_id,
+                "target",
+                materialization.owner,
+            )?;
+            Ok((source, target))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let operations = materializations
+        .iter()
+        .map(|materialization| materialization.operation)
+        .collect::<Vec<_>>();
+    for materialization in materializations.iter_mut() {
+        let mut leaves = BTreeSet::new();
+        collect_input_materializations(
+            executable,
+            materialization.source,
+            &statement_values,
+            &statement_rows,
+            &local_values,
+            &mut BTreeSet::new(),
+            &mut leaves,
+        )?;
+        if leaves.remove(&ContextualRowLineageLeaf::Materialized(materialization.id)) {
+            return Err(format!(
+                "contextual materialization {} directly consumes its own output",
+                materialization.id
+            ));
+        }
+        if leaves.is_empty() {
+            return Err(format!(
+                "contextual materialization {} has no exact source-row predecessor",
+                materialization.id
+            ));
+        }
+        let source_row = rows
+            .get(materialization.id)
+            .map(|(source, _)| *source)
+            .ok_or_else(|| {
+                format!(
+                    "contextual materialization {} has no row-contract entry",
+                    materialization.id
+                )
+            })?;
+        let mut predecessors = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            match leaf {
+                ContextualRowLineageLeaf::InputValue => {
+                    predecessors.push(match source_row {
+                        Some(row) => ContextualRowPredecessor::Stored { row },
+                        None => ContextualRowPredecessor::Value,
+                    });
+                }
+                ContextualRowLineageLeaf::Stored(row) => {
+                    if source_row != Some(row) {
+                        return Err(format!(
+                            "contextual materialization {} source row {source_row:?} differs from stored predecessor {row:?}",
+                            materialization.id
+                        ));
+                    }
+                    predecessors.push(ContextualRowPredecessor::Stored { row });
+                }
+                ContextualRowLineageLeaf::Materialized(input) => {
+                    if !known.contains(&input) {
+                        return Err(format!(
+                            "contextual materialization {} references missing input materialization {input}",
+                            materialization.id
+                        ));
+                    }
+                    let input_operation = operations
+                        .get(input)
+                        .copied()
+                        .ok_or_else(|| format!("missing input materialization {input}"))?;
+                    let (input_source, input_target) =
+                        rows.get(input).copied().ok_or_else(|| {
+                            format!(
+                                "input materialization {input} has no exact row contract for consumer {}",
+                                materialization.id
+                            )
+                        })?;
+                    let compatible = match input_operation {
+                        ContextualOperationKind::Map => match source_row {
+                            Some(source_row) => input_target.or(input_source) == Some(source_row),
+                            None => input_source.is_none() && input_target.is_none(),
+                        },
+                        ContextualOperationKind::Filter
+                        | ContextualOperationKind::Retain
+                        | ContextualOperationKind::Remove
+                        | ContextualOperationKind::SortBy
+                        | ContextualOperationKind::ThenBy => match source_row {
+                            Some(source_row) => {
+                                input_source == Some(source_row) || input_target == Some(source_row)
+                            }
+                            None => input_source.is_none() && input_target.is_none(),
+                        },
+                        ContextualOperationKind::Every
+                        | ContextualOperationKind::Any
+                        | ContextualOperationKind::Find => false,
+                    };
+                    if !compatible {
+                        let source_expression = executable
+                            .expressions
+                            .get(materialization.source.as_usize())
+                            .filter(|candidate| candidate.id == materialization.source)
+                            .map(|expression| &expression.kind);
+                        return Err(format!(
+                            "contextual materialization {} operation={:?} source={source_expression:?} source row {source_row:?} differs from input materialization {input} operation={input_operation:?} rows source={input_source:?} target={input_target:?}",
+                            materialization.id, materialization.operation,
+                        ));
+                    }
+                    predecessors.push(ContextualRowPredecessor::Materialized {
+                        materialization: input,
+                    });
+                }
+                ContextualRowLineageLeaf::Provenance(input) => {
+                    if !known.contains(&input) {
+                        return Err(format!(
+                            "contextual materialization {} references missing provenance materialization {input}",
+                            materialization.id
+                        ));
+                    }
+                    predecessors.push(ContextualRowPredecessor::Provenance {
+                        materialization: input,
+                    });
+                }
+            }
+        }
+        predecessors.sort();
+        predecessors.dedup();
+        materialization.source_row_predecessors = predecessors;
+    }
+    verify_contextual_materialization_lineage(materializations)
+}
+
+fn collect_input_materializations(
+    executable: &ExecutableProgram,
+    expression_id: ExecutableExprId,
+    statement_values: &BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
+    statement_rows: &BTreeMap<boon_typecheck::DeclId, ErasedRowBinding>,
+    local_values: &BTreeMap<ExecutableLocalBindingId, ExecutableLocalBindingValue>,
+    visited: &mut BTreeSet<(ExecutableExprId, Vec<String>, bool)>,
+    inputs: &mut BTreeSet<ContextualRowLineageLeaf>,
+) -> Result<(), String> {
+    collect_input_materializations_at_projection(
+        executable,
+        expression_id,
+        &[],
+        true,
+        statement_values,
+        statement_rows,
+        local_values,
+        visited,
+        inputs,
+    )
+}
+
+fn collect_input_materializations_at_projection(
+    executable: &ExecutableProgram,
+    expression_id: ExecutableExprId,
+    projection: &[String],
+    row_identity: bool,
+    statement_values: &BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
+    statement_rows: &BTreeMap<boon_typecheck::DeclId, ErasedRowBinding>,
+    local_values: &BTreeMap<ExecutableLocalBindingId, ExecutableLocalBindingValue>,
+    visited: &mut BTreeSet<(ExecutableExprId, Vec<String>, bool)>,
+    inputs: &mut BTreeSet<ContextualRowLineageLeaf>,
+) -> Result<(), String> {
+    if !visited.insert((expression_id, projection.to_vec(), row_identity)) {
+        return Ok(());
+    }
+    let expression = executable
+        .expressions
+        .get(expression_id.as_usize())
+        .filter(|candidate| candidate.id == expression_id)
+        .ok_or_else(|| {
+            format!("materialization lineage reaches missing expression {expression_id}")
+        })?;
+
+    if !projection.is_empty() {
+        match &expression.kind {
+            ExecutableExpressionKind::CanonicalRead {
+                target,
+                projection: read_projection,
+                ..
+            } => {
+                let mut combined = read_projection.clone();
+                combined.extend_from_slice(projection);
+                if let Some(value) = statement_values.get(target) {
+                    return collect_input_materializations_at_projection(
+                        executable,
+                        *value,
+                        &combined,
+                        row_identity,
+                        statement_values,
+                        statement_rows,
+                        local_values,
+                        visited,
+                        inputs,
+                    );
+                }
+                if row_identity {
+                    inputs.insert(ContextualRowLineageLeaf::InputValue);
+                }
+                return Ok(());
+            }
+            ExecutableExpressionKind::LocalRead {
+                binding,
+                declaration,
+                projection: read_projection,
+            } => {
+                let local = local_values.get(binding).ok_or_else(|| {
+                    format!(
+                        "materialization lineage cannot resolve local binding {binding} from expression {expression_id}"
+                    )
+                })?;
+                if local.declaration != *declaration {
+                    return Err(format!(
+                        "materialization lineage local expression {expression_id} declaration {} differs from binding {binding} declaration {}",
+                        declaration.0, local.declaration.0
+                    ));
+                }
+                let mut combined = read_projection.clone();
+                combined.extend_from_slice(projection);
+                return collect_input_materializations_at_projection(
+                    executable,
+                    local.value,
+                    &combined,
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                );
+            }
+            ExecutableExpressionKind::Project { input, fields } => {
+                let mut combined = fields.clone();
+                combined.extend_from_slice(projection);
+                return collect_input_materializations_at_projection(
+                    executable,
+                    *input,
+                    &combined,
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                );
+            }
+            ExecutableExpressionKind::Object(_)
+            | ExecutableExpressionKind::Record(_)
+            | ExecutableExpressionKind::TaggedObject { .. } => {
+                let (projected, remaining) =
+                    exact_executable_record_projection(executable, expression_id, projection)?;
+                if projected == expression_id {
+                    return Err(format!(
+                        "materialization lineage expression {expression_id} has no exact field `{}`",
+                        projection[0]
+                    ));
+                }
+                return collect_input_materializations_at_projection(
+                    executable,
+                    projected,
+                    remaining,
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                );
+            }
+            ExecutableExpressionKind::Draining { input } => {
+                return collect_input_materializations_at_projection(
+                    executable,
+                    *input,
+                    projection,
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                );
+            }
+            ExecutableExpressionKind::Block { result, .. } => {
+                return collect_input_materializations_at_projection(
+                    executable,
+                    *result,
+                    projection,
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                );
+            }
+            ExecutableExpressionKind::Latest { branches } => {
+                for branch in branches {
+                    collect_input_materializations_at_projection(
+                        executable,
+                        *branch,
+                        projection,
+                        row_identity,
+                        statement_values,
+                        statement_rows,
+                        local_values,
+                        visited,
+                        inputs,
+                    )?;
+                }
+                return Ok(());
+            }
+            ExecutableExpressionKind::When { arms, .. } => {
+                for arm in arms {
+                    collect_input_materializations_at_projection(
+                        executable,
+                        arm.output,
+                        projection,
+                        row_identity,
+                        statement_values,
+                        statement_rows,
+                        local_values,
+                        visited,
+                        inputs,
+                    )?;
+                }
+                return Ok(());
+            }
+            ExecutableExpressionKind::Then { output, .. }
+            | ExecutableExpressionKind::MatchArm { output, .. } => {
+                let output = output.ok_or_else(|| {
+                    format!(
+                        "materialization lineage expression {expression_id} has no projected output"
+                    )
+                })?;
+                return collect_input_materializations_at_projection(
+                    executable,
+                    output,
+                    projection,
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                );
+            }
+            ExecutableExpressionKind::Source { .. }
+            | ExecutableExpressionKind::Call { .. }
+            | ExecutableExpressionKind::Hold { .. }
+            | ExecutableExpressionKind::ExternalRead { .. }
+            | ExecutableExpressionKind::Drain { .. }
+            | ExecutableExpressionKind::FunctionParameter { .. }
+            | ExecutableExpressionKind::MaterializationLocal { .. }
+            | ExecutableExpressionKind::ElementState { .. } => {
+                if row_identity {
+                    inputs.insert(ContextualRowLineageLeaf::InputValue);
+                }
+                return Ok(());
+            }
+            ExecutableExpressionKind::Materialize { materialization } => {
+                if matches!(expression.flow_type.ty, boon_typecheck::Type::List(_)) {
+                    return Err(format!(
+                        "materialization lineage cannot project `{}` from list-valued materialization {materialization}",
+                        projection.join(".")
+                    ));
+                }
+                // Scalar materializations such as List/find return ordinary
+                // values. A nested list projected from that returned row has
+                // its own value rows rather than the searched list's row
+                // identity.
+                if row_identity {
+                    inputs.insert(ContextualRowLineageLeaf::InputValue);
+                }
+                return Ok(());
+            }
+            ExecutableExpressionKind::Text(_)
+            | ExecutableExpressionKind::TextTemplate { .. }
+            | ExecutableExpressionKind::Number(_)
+            | ExecutableExpressionKind::BytesByte(_)
+            | ExecutableExpressionKind::Bool(_)
+            | ExecutableExpressionKind::Tag(_)
+            | ExecutableExpressionKind::Infix { .. }
+            | ExecutableExpressionKind::List { .. }
+            | ExecutableExpressionKind::Bytes { .. }
+            | ExecutableExpressionKind::Delimiter => {
+                return Err(format!(
+                    "materialization lineage cannot project `{}` from expression {expression_id}: {:?}",
+                    projection.join("."),
+                    expression.kind
+                ));
+            }
+        }
+    }
+
+    match &expression.kind {
+        ExecutableExpressionKind::Materialize { materialization } => {
+            inputs.insert(if row_identity {
+                ContextualRowLineageLeaf::Materialized(*materialization)
+            } else {
+                ContextualRowLineageLeaf::Provenance(*materialization)
+            });
+        }
+        ExecutableExpressionKind::CanonicalRead {
+            target, projection, ..
+        } => {
+            if projection.is_empty() {
+                if let Some(row) = statement_rows.get(target) {
+                    if row_identity {
+                        inputs.insert(ContextualRowLineageLeaf::Stored(*row));
+                    }
+                    if let Some(value) = statement_values.get(target) {
+                        collect_input_materializations_at_projection(
+                            executable,
+                            *value,
+                            projection,
+                            false,
+                            statement_values,
+                            statement_rows,
+                            local_values,
+                            visited,
+                            inputs,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
+            if let Some(value) = statement_values.get(target) {
+                collect_input_materializations_at_projection(
+                    executable,
+                    *value,
+                    projection,
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                )?;
+            } else {
+                if row_identity {
+                    inputs.insert(ContextualRowLineageLeaf::InputValue);
+                }
+            }
+        }
+        ExecutableExpressionKind::LocalRead {
+            binding,
+            declaration,
+            projection,
+        } => {
+            let local = local_values.get(binding).ok_or_else(|| {
+                format!(
+                    "materialization lineage cannot resolve local binding {binding} from expression {expression_id}"
+                )
+            })?;
+            if local.declaration != *declaration {
+                return Err(format!(
+                    "materialization lineage local expression {expression_id} declaration {} differs from binding {binding} declaration {}",
+                    declaration.0, local.declaration.0
+                ));
+            }
+            collect_input_materializations_at_projection(
+                executable,
+                local.value,
+                projection,
+                row_identity,
+                statement_values,
+                statement_rows,
+                local_values,
+                visited,
+                inputs,
+            )?;
+        }
+        ExecutableExpressionKind::Draining { input } => {
+            collect_input_materializations_at_projection(
+                executable,
+                *input,
+                &[],
+                row_identity,
+                statement_values,
+                statement_rows,
+                local_values,
+                visited,
+                inputs,
+            )?;
+        }
+        ExecutableExpressionKind::Project { input, fields } => {
+            collect_input_materializations_at_projection(
+                executable,
+                *input,
+                fields,
+                row_identity,
+                statement_values,
+                statement_rows,
+                local_values,
+                visited,
+                inputs,
+            )?;
+        }
+        ExecutableExpressionKind::Block { result, .. } => {
+            collect_input_materializations_at_projection(
+                executable,
+                *result,
+                &[],
+                row_identity,
+                statement_values,
+                statement_rows,
+                local_values,
+                visited,
+                inputs,
+            )?;
+        }
+        ExecutableExpressionKind::Latest { branches } => {
+            for branch in branches {
+                collect_input_materializations_at_projection(
+                    executable,
+                    *branch,
+                    &[],
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                )?;
+            }
+        }
+        ExecutableExpressionKind::When { arms, .. } => {
+            for arm in arms {
+                collect_input_materializations_at_projection(
+                    executable,
+                    arm.output,
+                    &[],
+                    row_identity,
+                    statement_values,
+                    statement_rows,
+                    local_values,
+                    visited,
+                    inputs,
+                )?;
+            }
+        }
+        ExecutableExpressionKind::Then { output, .. }
+        | ExecutableExpressionKind::MatchArm { output, .. } => {
+            let output = output.ok_or_else(|| {
+                format!(
+                    "materialization lineage expression {expression_id} has no list-valued output"
+                )
+            })?;
+            collect_input_materializations_at_projection(
+                executable,
+                output,
+                &[],
+                row_identity,
+                statement_values,
+                statement_rows,
+                local_values,
+                visited,
+                inputs,
+            )?;
+        }
+        ExecutableExpressionKind::Call { .. }
+            if matches!(expression.flow_type.ty, boon_typecheck::Type::List(_)) =>
+        {
+            // Builtin and external calls produce a new typed value. Contextual
+            // user functions have already been expanded, so inheriting every
+            // list argument here would incorrectly make shape-changing calls
+            // such as List/chunk row-preserving.
+            if row_identity {
+                inputs.insert(ContextualRowLineageLeaf::InputValue);
+            }
+        }
+        ExecutableExpressionKind::ExternalRead { .. }
+        | ExecutableExpressionKind::Drain { .. }
+        | ExecutableExpressionKind::List { .. }
+        | ExecutableExpressionKind::Hold { .. }
+        | ExecutableExpressionKind::FunctionParameter { .. }
+        | ExecutableExpressionKind::MaterializationLocal { .. } => {
+            if row_identity {
+                inputs.insert(ContextualRowLineageLeaf::InputValue);
+            }
+        }
+        ExecutableExpressionKind::ElementState { .. }
+        | ExecutableExpressionKind::Text(_)
+        | ExecutableExpressionKind::TextTemplate { .. }
+        | ExecutableExpressionKind::Number(_)
+        | ExecutableExpressionKind::BytesByte(_)
+        | ExecutableExpressionKind::Bool(_)
+        | ExecutableExpressionKind::Tag(_)
+        | ExecutableExpressionKind::TaggedObject { .. }
+        | ExecutableExpressionKind::Source { .. }
+        | ExecutableExpressionKind::Call { .. }
+        | ExecutableExpressionKind::Infix { .. }
+        | ExecutableExpressionKind::Object(_)
+        | ExecutableExpressionKind::Record(_)
+        | ExecutableExpressionKind::Bytes { .. }
+        | ExecutableExpressionKind::Delimiter => {
+            return Err(format!(
+                "materialization lineage reaches non-list expression {expression_id}: {:?}",
+                expression.kind
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_contextual_materialization_lineage(
+    materializations: &[ContextualMaterialization],
+) -> Result<(), String> {
+    fn visit(
+        id: usize,
+        materializations: &[ContextualMaterialization],
+        visiting: &mut BTreeSet<usize>,
+        visited: &mut BTreeSet<usize>,
+    ) -> Result<(), String> {
+        if visited.contains(&id) {
+            return Ok(());
+        }
+        if !visiting.insert(id) {
+            return Err(format!(
+                "contextual materialization lineage contains a cycle through {id}"
+            ));
+        }
+        let materialization = materializations
+            .get(id)
+            .filter(|candidate| candidate.id == id)
+            .ok_or_else(|| format!("missing contextual materialization {id}"))?;
+        for predecessor in &materialization.source_row_predecessors {
+            match predecessor {
+                ContextualRowPredecessor::Materialized {
+                    materialization: input,
+                }
+                | ContextualRowPredecessor::Provenance {
+                    materialization: input,
+                } => {
+                    visit(*input, materializations, visiting, visited)?;
+                }
+                ContextualRowPredecessor::Value | ContextualRowPredecessor::Stored { .. } => {}
+            }
+        }
+        visiting.remove(&id);
+        visited.insert(id);
+        Ok(())
+    }
+
+    let mut visited = BTreeSet::new();
+    for materialization in materializations {
+        visit(
+            materialization.id,
+            materializations,
+            &mut BTreeSet::new(),
+            &mut visited,
+        )?;
+    }
+    Ok(())
+}
+
 fn normalize_view_binding_ids(bindings: &mut Vec<ViewBinding>) {
     let mut seen = BTreeSet::new();
     bindings.retain(|binding| {
@@ -12091,82 +13653,21 @@ struct ExecutableViewRead {
     scope_id: Option<ScopeId>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum ExecutableEventReference {
-    Canonical {
-        declaration: Option<boon_typecheck::DeclId>,
-        owner: Option<StaticOwnerId>,
-        path: String,
-        projection: Vec<String>,
-        expression: ExecutableExprId,
-        source_expression: Option<boon_typecheck::CheckedExprId>,
-    },
-    Local {
-        owner: StaticOwnerId,
-        local: MaterializationLocalId,
-        projection: Vec<String>,
-    },
-}
-
-fn executable_local_read_values(
-    executable: &ExecutableProgram,
-) -> Result<BTreeMap<ExecutableExprId, ExecutableExprId>, String> {
-    let mut targets = BTreeMap::new();
-    for expression in executable
-        .expressions
-        .iter()
-        .filter(|expression| matches!(expression.kind, ExecutableExpressionKind::Block { .. }))
-    {
-        collect_local_read_targets(
-            executable,
-            expression.id,
-            &BTreeMap::new(),
-            &mut BTreeSet::new(),
-            &mut targets,
-        )?;
-    }
-    Ok(targets
-        .into_iter()
-        .filter_map(|(read, target)| match target {
-            ErasedReadTarget::Local { value, .. } => Some((read, value)),
-            _ => None,
-        })
-        .collect())
-}
-
-struct ExecutableViewBindingCollector<'a> {
+struct ContextualStorageScopeResolver<'a> {
     executable: &'a ExecutableProgram,
-    static_owners: &'a [StaticOwnerDef],
-    storage: Option<&'a ErasedScopeIndex>,
-    row_scopes: &'a [RowScope],
-    sources: &'a [SourcePort],
     materializations: &'a [ContextualMaterialization],
     statement_values: BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
-    local_values_by_read: BTreeMap<ExecutableExprId, ExecutableExprId>,
     list_scopes_by_declaration: BTreeMap<boon_typecheck::DeclId, ScopeId>,
     list_scopes_by_path: BTreeMap<String, ScopeId>,
     materializations_by_local: BTreeMap<(StaticOwnerId, MaterializationLocalId), usize>,
-    reads_by_expression: Vec<Option<ErasedReadId>>,
-    states_by_declaration: BTreeMap<(boon_typecheck::DeclId, Option<StaticOwnerId>), StateId>,
     local_scope_cache: BTreeMap<(StaticOwnerId, MaterializationLocalId), Option<ScopeId>>,
     local_scope_visiting: BTreeSet<(StaticOwnerId, MaterializationLocalId)>,
-    event_causes_cache: BTreeMap<ExecutableExprId, Vec<EventCause>>,
-    source_candidates_cache:
-        BTreeMap<ExecutableEventReference, Vec<(String, SourceId, Option<ScopeId>)>>,
-    view_reads_cache: BTreeMap<ExecutableExprId, Vec<ExecutableViewRead>>,
-    render_visited: BTreeSet<ExecutableExprId>,
-    bindings: Vec<ViewBinding>,
 }
 
-impl<'a> ExecutableViewBindingCollector<'a> {
+impl<'a> ContextualStorageScopeResolver<'a> {
     fn new(
         executable: &'a ExecutableProgram,
-        static_owners: &'a [StaticOwnerDef],
-        storage: Option<&'a ErasedScopeIndex>,
         list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-        row_scopes: &'a [RowScope],
-        sources: &'a [SourcePort],
-        states: &[StateCell],
         materializations: &'a [ContextualMaterialization],
     ) -> Result<Self, String> {
         let statement_values = executable
@@ -12187,8 +13688,8 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             .collect();
         let mut list_scopes_by_path = BTreeMap::new();
         for storage in list_storage.values() {
-            if let Some(previous) = list_scopes_by_path
-                .insert(storage.path.clone(), storage.row_scope_id)
+            if let Some(previous) =
+                list_scopes_by_path.insert(storage.path.clone(), storage.row_scope_id)
                 && previous != storage.row_scope_id
             {
                 return Err(format!(
@@ -12197,54 +13698,274 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 ));
             }
         }
-        let materializations_by_local = materializations
-            .iter()
-            .map(|materialization| {
-                (
-                    (materialization.owner, materialization.row_local),
-                    materialization.id,
-                )
-            })
-            .collect();
-        let states_by_declaration = states
-            .iter()
-            .filter(|state| state.published)
-            .filter_map(|state| {
-                let executable_state = state
-                    .executable_state_id
-                    .and_then(|id| executable.states.get(id.as_usize()))?;
-                Some(((executable_state.declaration, state.static_owner), state.id))
-            })
-            .collect();
-        let mut reads_by_expression = vec![None; executable.expressions.len()];
-        if let Some(storage) = storage {
-            for read in &storage.reads {
-                if let Some(slot) = reads_by_expression.get_mut(read.expression.as_usize()) {
-                    *slot = Some(read.id);
-                }
-            }
-        }
         Ok(Self {
             executable,
-            static_owners,
-            storage,
-            row_scopes,
-            sources,
             materializations,
             statement_values,
-            local_values_by_read: executable_local_read_values(executable)?,
             list_scopes_by_declaration,
             list_scopes_by_path,
-            materializations_by_local,
-            reads_by_expression,
-            states_by_declaration,
+            materializations_by_local: materializations
+                .iter()
+                .map(|materialization| {
+                    (
+                        (materialization.owner, materialization.row_local),
+                        materialization.id,
+                    )
+                })
+                .collect(),
             local_scope_cache: BTreeMap::new(),
             local_scope_visiting: BTreeSet::new(),
+        })
+    }
+
+    fn expression(&self, id: ExecutableExprId) -> Result<&ExecutableExpression, String> {
+        self.executable
+            .expressions
+            .get(id.as_usize())
+            .filter(|expression| expression.id == id)
+            .ok_or_else(|| format!("storage-scope resolver references missing expression {id}"))
+    }
+
+    fn materialization(&self, id: usize) -> Result<&ContextualMaterialization, String> {
+        self.materializations
+            .get(id)
+            .filter(|materialization| materialization.id == id)
+            .ok_or_else(|| {
+                format!("storage-scope resolver references missing materialization {id}")
+            })
+    }
+
+    fn local_scope(
+        &mut self,
+        owner: StaticOwnerId,
+        local: MaterializationLocalId,
+    ) -> Result<Option<ScopeId>, String> {
+        let key = (owner, local);
+        if let Some(cached) = self.local_scope_cache.get(&key).copied() {
+            return Ok(cached);
+        }
+        if !self.local_scope_visiting.insert(key) {
+            return Err(format!(
+                "contextual owner {owner} local {} forms a storage-scope cycle",
+                local.0
+            ));
+        }
+        let materialization = self
+            .materializations_by_local
+            .get(&key)
+            .copied()
+            .map(|id| self.materialization(id))
+            .transpose()?
+            .ok_or_else(|| {
+                format!(
+                    "contextual owner {owner} local {} has no typed materialization",
+                    local.0
+                )
+            })?;
+        let source = materialization.source;
+        let result =
+            self.storage_scope_for_expression(source, &mut BTreeSet::new(), &mut BTreeSet::new())?;
+        self.local_scope_visiting.remove(&key);
+        self.local_scope_cache.insert(key, result);
+        Ok(result)
+    }
+
+    fn scope_for_declaration(&self, declaration: boon_typecheck::DeclId) -> Option<ScopeId> {
+        self.list_scopes_by_declaration.get(&declaration).copied()
+    }
+
+    fn storage_scope_for_expression(
+        &mut self,
+        id: ExecutableExprId,
+        visited_expressions: &mut BTreeSet<ExecutableExprId>,
+        visited_paths: &mut BTreeSet<String>,
+    ) -> Result<Option<ScopeId>, String> {
+        if !visited_expressions.insert(id) {
+            return Ok(None);
+        }
+        let expression = self.expression(id)?.clone();
+        match expression.kind {
+            ExecutableExpressionKind::CanonicalRead {
+                target,
+                path,
+                projection,
+                ..
+            }
+            | ExecutableExpressionKind::Drain {
+                target,
+                path,
+                projection,
+            } => {
+                let projected_path = canonical_read_path(&path, &projection);
+                if let Some(scope) = self.list_scopes_by_path.get(&projected_path).copied() {
+                    return Ok(Some(scope));
+                }
+                if let Some(scope) = self.list_scopes_by_declaration.get(&target).copied() {
+                    return Ok(Some(scope));
+                }
+                if visited_paths.insert(format!("decl:{}", target.0))
+                    && let Some(value) = self.statement_values.get(&target).copied()
+                    && value != id
+                {
+                    return self.storage_scope_for_expression(
+                        value,
+                        visited_expressions,
+                        visited_paths,
+                    );
+                }
+                Ok(None)
+            }
+            ExecutableExpressionKind::Materialize { materialization } => {
+                let source = self.materialization(materialization)?.source;
+                self.storage_scope_for_expression(source, visited_expressions, visited_paths)
+            }
+            ExecutableExpressionKind::MaterializationLocal {
+                owner,
+                local,
+                projection,
+            } => {
+                let scope = self.local_scope(owner, local)?;
+                match projection.first().map(String::as_str) {
+                    None => Ok(scope),
+                    Some("items") => match scope {
+                        Some(scope) => self.chunk_items_storage_scope_for_scope(scope),
+                        None => Ok(None),
+                    },
+                    Some(_) => Ok(None),
+                }
+            }
+            ExecutableExpressionKind::Project { input, fields } => {
+                match fields.first().map(String::as_str) {
+                    None => {
+                        self.storage_scope_for_expression(input, visited_expressions, visited_paths)
+                    }
+                    Some("items") => Ok(self.chunk_items_storage_scope(input)?),
+                    Some(_) => Ok(None),
+                }
+            }
+            ExecutableExpressionKind::Draining { input } => {
+                self.storage_scope_for_expression(input, visited_expressions, visited_paths)
+            }
+            ExecutableExpressionKind::Call { arguments, .. } => self.unique_child_storage_scope(
+                arguments.into_iter().map(|argument| argument.value),
+                visited_expressions,
+                visited_paths,
+            ),
+            ExecutableExpressionKind::Then { input, output } => self.unique_child_storage_scope(
+                std::iter::once(input).chain(output),
+                visited_expressions,
+                visited_paths,
+            ),
+            ExecutableExpressionKind::Latest { branches } => {
+                self.unique_child_storage_scope(branches, visited_expressions, visited_paths)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn chunk_items_storage_scope(
+        &mut self,
+        projected_row: ExecutableExprId,
+    ) -> Result<Option<ScopeId>, String> {
+        let Some(chunk_scope) = self.storage_scope_for_expression(
+            projected_row,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.chunk_items_storage_scope_for_scope(chunk_scope)
+    }
+
+    fn chunk_items_storage_scope_for_scope(
+        &mut self,
+        chunk_scope: ScopeId,
+    ) -> Result<Option<ScopeId>, String> {
+        let declarations = self
+            .list_scopes_by_declaration
+            .iter()
+            .filter_map(|(declaration, scope)| (*scope == chunk_scope).then_some(*declaration))
+            .collect::<Vec<_>>();
+        let [declaration] = declarations.as_slice() else {
+            return if declarations.is_empty() {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "row scope {chunk_scope} belongs to multiple typed list declarations {declarations:?}"
+                ))
+            };
+        };
+        let Some(producer) = self.statement_values.get(declaration).copied() else {
+            return Ok(None);
+        };
+        let expression = self.expression(producer)?.clone();
+        let ExecutableExpressionKind::Call {
+            name, arguments, ..
+        } = expression.kind
+        else {
+            return Ok(None);
+        };
+        if name != "List/chunk" {
+            return Ok(None);
+        }
+        let Some(source) = call_argument(&arguments, "list") else {
+            return Err(format!(
+                "typed List/chunk producer {producer} has no canonical `list` argument"
+            ));
+        };
+        self.storage_scope_for_expression(source, &mut BTreeSet::new(), &mut BTreeSet::new())
+    }
+
+    fn unique_child_storage_scope(
+        &mut self,
+        children: impl IntoIterator<Item = ExecutableExprId>,
+        visited_expressions: &mut BTreeSet<ExecutableExprId>,
+        visited_paths: &mut BTreeSet<String>,
+    ) -> Result<Option<ScopeId>, String> {
+        let mut scopes = BTreeSet::new();
+        for child in children {
+            if let Some(scope) =
+                self.storage_scope_for_expression(child, visited_expressions, visited_paths)?
+            {
+                scopes.insert(scope);
+            }
+        }
+        if scopes.len() > 1 {
+            return Err(format!(
+                "contextual source reaches ambiguous storage scopes {scopes:?}"
+            ));
+        }
+        Ok(scopes.pop_first())
+    }
+}
+
+struct ExecutableTriggerResolver<'a> {
+    executable: &'a ExecutableProgram,
+    source_authority: &'a ExecutableSourceAuthorityIndex,
+    materializations: &'a [ContextualMaterialization],
+    statement_values: BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
+    local_values_by_binding: BTreeMap<ExecutableLocalBindingId, ExecutableLocalBindingValue>,
+    event_causes_cache: BTreeMap<ExecutableExprId, Vec<EventCause>>,
+}
+
+impl<'a> ExecutableTriggerResolver<'a> {
+    fn new(
+        executable: &'a ExecutableProgram,
+        source_authority: &'a ExecutableSourceAuthorityIndex,
+        materializations: &'a [ContextualMaterialization],
+    ) -> Result<Self, String> {
+        Ok(Self {
+            executable,
+            source_authority,
+            materializations,
+            statement_values: executable
+                .statements
+                .iter()
+                .filter_map(|statement| Some((statement.declaration?, statement.value?)))
+                .collect(),
+            local_values_by_binding: executable_local_binding_values(executable)?,
             event_causes_cache: BTreeMap::new(),
-            source_candidates_cache: BTreeMap::new(),
-            view_reads_cache: BTreeMap::new(),
-            render_visited: BTreeSet::new(),
-            bindings: Vec::new(),
         })
     }
 
@@ -12520,12 +14241,11 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             ExecutableExpressionKind::CanonicalRead {
                 target, projection, ..
             } => {
-                if let Some(cause) = self
-                    .direct_event_reference(id)?
-                    .as_ref()
-                    .and_then(|read| self.state_event_cause(read))
-                {
-                    self.insert_trigger_owned_arm(cause, id, id, arms)?;
+                let direct_causes = self.source_authority.event_causes(id)?.to_vec();
+                if !direct_causes.is_empty() {
+                    for cause in direct_causes {
+                        self.insert_trigger_owned_arm(cause, id, id, arms)?;
+                    }
                     return Ok(());
                 }
                 if let Some(producer) = self.statement_values.get(&target).copied()
@@ -12563,10 +14283,15 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                     }
                 }
             }
-            ExecutableExpressionKind::LocalRead { projection, .. } => {
-                if let Some(producer) = self.local_values_by_read.get(&id).copied()
-                    && producer != id
+            ExecutableExpressionKind::LocalRead {
+                binding,
+                projection,
+                ..
+            } => {
+                if let Some(local) = self.local_values_by_binding.get(&binding).copied()
+                    && local.value != id
                 {
+                    let producer = local.value;
                     let mut producer_arms = Vec::new();
                     self.collect_trigger_owned_arms_until(
                         producer,
@@ -12649,50 +14374,49 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         if !visited_expressions.insert(id) {
             return Ok(());
         }
-        if let Some(producer) = self.local_values_by_read.get(&id).copied()
-            && producer != id
-        {
-            self.collect_event_causes(
-                producer,
-                causes,
-                visited_expressions,
-                visited_paths,
-            )?;
-            return Ok(());
+        let expression = self.expression(id)?.clone();
+        if let ExecutableExpressionKind::LocalRead { binding, .. } = &expression.kind {
+            let producer = self
+                .local_values_by_binding
+                .get(binding)
+                .ok_or_else(|| {
+                    format!("local event read {id} references missing executable binding {binding}")
+                })?
+                .value;
+            if producer != id {
+                self.collect_event_causes(producer, causes, visited_expressions, visited_paths)?;
+                return Ok(());
+            }
         }
-        if let Some(read) = self.direct_event_reference(id)? {
-            let candidates = self.source_candidates(&read)?;
-            if !candidates.is_empty() {
-                causes.extend(
-                    candidates
-                        .into_iter()
-                        .map(|(_, source_id, _)| EventCause::Source(source_id)),
-                );
+        if matches!(
+            expression.kind,
+            ExecutableExpressionKind::CanonicalRead { .. }
+                | ExecutableExpressionKind::Drain { .. }
+                | ExecutableExpressionKind::ExternalRead { .. }
+                | ExecutableExpressionKind::Source { .. }
+                | ExecutableExpressionKind::MaterializationLocal { .. }
+                | ExecutableExpressionKind::Project { .. }
+        ) {
+            let direct = self.source_authority.event_causes(id)?;
+            if !direct.is_empty() {
+                causes.extend(direct.iter().copied());
                 return Ok(());
             }
-            if let Some(cause) = self.state_event_cause(&read) {
-                causes.insert(cause);
-                return Ok(());
-            }
-            if let ExecutableEventReference::Canonical {
-                declaration,
-                owner: _,
-                path: _,
-                ..
-            } = read
+            let declaration = match expression.kind {
+                ExecutableExpressionKind::CanonicalRead { target, .. }
+                | ExecutableExpressionKind::Drain { target, .. } => Some(target),
+                _ => None,
+            };
+            if let Some(declaration) = declaration
+                && visited_paths.insert(format!("decl:{}", declaration.0))
+                && let Some(value) = self.statement_values.get(&declaration).copied()
+                && value != id
             {
-                if let Some(declaration) = declaration
-                    && visited_paths.insert(format!("decl:{}", declaration.0))
-                    && let Some(value) = self.statement_values.get(&declaration).copied()
-                    && value != id
-                {
-                    self.collect_event_causes(value, causes, visited_expressions, visited_paths)?;
-                }
+                self.collect_event_causes(value, causes, visited_expressions, visited_paths)?;
                 return Ok(());
             }
         }
 
-        let expression = self.expression(id)?.clone();
         let children = match expression.kind {
             ExecutableExpressionKind::Then { input, .. }
             | ExecutableExpressionKind::When { input, .. }
@@ -12728,17 +14452,7 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                     ExecutableTextSegment::Dynamic { value } => Some(value),
                 })
                 .collect(),
-            ExecutableExpressionKind::ExternalRead { canonical_path } => {
-                let source_path = distributed_event_source_path(&canonical_path);
-                if let Some(source) = self
-                    .sources
-                    .iter()
-                    .find(|source| source.path == source_path)
-                {
-                    causes.insert(EventCause::Source(source.id));
-                }
-                Vec::new()
-            }
+            ExecutableExpressionKind::ExternalRead { .. } => Vec::new(),
             ExecutableExpressionKind::CanonicalRead { .. }
             | ExecutableExpressionKind::LocalRead { .. }
             | ExecutableExpressionKind::ElementState { .. }
@@ -12759,20 +14473,74 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         Ok(())
     }
 
-    fn state_event_cause(&self, read: &ExecutableEventReference) -> Option<EventCause> {
-        let ExecutableEventReference::Canonical {
-            declaration: Some(declaration),
-            owner,
-            ..
-        } = read
-        else {
-            return None;
-        };
-        self.states_by_declaration
-            .get(&(*declaration, *owner))
-            .or_else(|| self.states_by_declaration.get(&(*declaration, None)))
-            .copied()
-            .map(EventCause::State)
+    fn expression(&self, id: ExecutableExprId) -> Result<&ExecutableExpression, String> {
+        self.executable
+            .expressions
+            .get(id.as_usize())
+            .filter(|expression| expression.id == id)
+            .ok_or_else(|| format!("trigger resolver reaches missing executable expression {id}"))
+    }
+
+    fn materialization(&self, id: usize) -> Result<&ContextualMaterialization, String> {
+        self.materializations
+            .get(id)
+            .filter(|materialization| materialization.id == id)
+            .ok_or_else(|| format!("trigger resolver reaches missing materialization {id}"))
+    }
+}
+
+struct ExecutableViewBindingCollector<'a> {
+    executable: &'a ExecutableProgram,
+    storage: &'a ErasedScopeIndex,
+    source_authority: &'a ExecutableSourceAuthorityIndex,
+    row_scopes: &'a [RowScope],
+    sources: &'a [SourcePort],
+    materializations: &'a [ContextualMaterialization],
+    statement_values: BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
+    storage_scopes: ContextualStorageScopeResolver<'a>,
+    reads_by_expression: Vec<Option<ErasedReadId>>,
+    view_reads_cache: BTreeMap<ExecutableExprId, Vec<ExecutableViewRead>>,
+    render_visited: BTreeSet<ExecutableExprId>,
+    bindings: Vec<ViewBinding>,
+}
+
+impl<'a> ExecutableViewBindingCollector<'a> {
+    fn new(
+        executable: &'a ExecutableProgram,
+        storage: &'a ErasedScopeIndex,
+        source_authority: &'a ExecutableSourceAuthorityIndex,
+        list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+        row_scopes: &'a [RowScope],
+        sources: &'a [SourcePort],
+        materializations: &'a [ContextualMaterialization],
+    ) -> Result<Self, String> {
+        let statement_values = executable
+            .statements
+            .iter()
+            .filter_map(|statement| Some((statement.declaration?, statement.value?)))
+            .collect();
+        let storage_scopes =
+            ContextualStorageScopeResolver::new(executable, list_storage, materializations)?;
+        let mut reads_by_expression = vec![None; executable.expressions.len()];
+        for read in &storage.reads {
+            if let Some(slot) = reads_by_expression.get_mut(read.expression.as_usize()) {
+                *slot = Some(read.id);
+            }
+        }
+        Ok(Self {
+            executable,
+            storage,
+            source_authority,
+            row_scopes,
+            sources,
+            materializations,
+            statement_values,
+            storage_scopes,
+            reads_by_expression,
+            view_reads_cache: BTreeMap::new(),
+            render_visited: BTreeSet::new(),
+            bindings: Vec::new(),
+        })
     }
 
     fn collect_output_roots(&mut self, outputs: &[OutputRootValue]) -> Result<(), String> {
@@ -13132,14 +14900,36 @@ impl<'a> ExecutableViewBindingCollector<'a> {
         attr: Option<&str>,
         id: ExecutableExprId,
     ) -> Result<usize, String> {
-        let Some(read) = self.direct_event_reference(id)? else {
-            return Ok(0);
-        };
-        let candidates = self.source_candidates(&read)?;
+        let candidates = self
+            .source_authority
+            .value(id)?
+            .sources
+            .iter()
+            .filter_map(|member| {
+                let source_id = member.source;
+                self.sources
+                    .get(source_id.as_usize())
+                    .filter(|source| source.id == source_id)
+                    .map(|source| {
+                        (
+                            member.path.clone(),
+                            source.path.clone(),
+                            source.id,
+                            source.scope_id,
+                        )
+                    })
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let multiple = candidates.len() > 1;
-        for (path, source_id, scope_id) in &candidates {
+        for (member_path, path, source_id, scope_id) in &candidates {
             let source_attr = if multiple || attr.is_none() {
-                path.rsplit('.').next().unwrap_or("event")
+                member_path
+                    .last()
+                    .map(String::as_str)
+                    .or_else(|| path.rsplit('.').next())
+                    .unwrap_or("event")
             } else {
                 attr.expect("checked above")
             };
@@ -13154,351 +14944,6 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             });
         }
         Ok(candidates.len())
-    }
-
-    fn source_candidates(
-        &mut self,
-        read: &ExecutableEventReference,
-    ) -> Result<Vec<(String, SourceId, Option<ScopeId>)>, String> {
-        if let Some(cached) = self.source_candidates_cache.get(read) {
-            return Ok(cached.clone());
-        }
-        let candidates = self.resolve_source_candidates(read)?;
-        self.source_candidates_cache
-            .insert(read.clone(), candidates.clone());
-        Ok(candidates)
-    }
-
-    fn resolve_source_candidates(
-        &mut self,
-        read: &ExecutableEventReference,
-    ) -> Result<Vec<(String, SourceId, Option<ScopeId>)>, String> {
-        let mut exact = Vec::new();
-        let mut grouped = Vec::new();
-        match read {
-            ExecutableEventReference::Canonical {
-                declaration,
-                owner,
-                path,
-                projection,
-                expression,
-                source_expression,
-            } => {
-                if let Some(source_id) = self.exact_source_id_for_expression(*expression)? {
-                    let source = self
-                        .sources
-                        .get(source_id.as_usize())
-                        .filter(|source| source.id == source_id)
-                        .ok_or_else(|| {
-                            format!("event reference points to missing source {source_id}")
-                        })?;
-                    return Ok(vec![(source.path.clone(), source.id, source.scope_id)]);
-                }
-                if let Some(declaration) = declaration {
-                    let owner_sources = self
-                        .sources
-                        .iter()
-                        .filter(|source| {
-                            source
-                                .executable_source_id
-                                .and_then(|id| self.executable.sources.get(id.as_usize()))
-                                .is_some_and(|definition| {
-                                    definition.declaration == *declaration
-                                        && source_expression.as_ref().is_none_or(
-                                            |source_expression| {
-                                                self.executable
-                                                    .expressions
-                                                    .get(definition.expression.as_usize())
-                                                    .is_some_and(|expression| {
-                                                        expression.id == definition.expression
-                                                            && expression.checked_expr_id
-                                                                == *source_expression
-                                                    })
-                                            },
-                                        )
-                                })
-                        })
-                        .collect::<Vec<_>>();
-                    if !owner_sources.is_empty() {
-                        for lexical_owner in [*owner, None] {
-                            let candidates = owner_sources
-                                .iter()
-                                .filter(|source| source.static_owner == lexical_owner)
-                                .map(|source| (source.path.clone(), source.id, source.scope_id))
-                                .collect::<Vec<_>>();
-                            match candidates.as_slice() {
-                                [] => continue,
-                                [_] => return Ok(candidates),
-                                _ => {
-                                    return Err(format!(
-                                        "SOURCE declaration {} owner {:?} resolves to {} executable sources",
-                                        declaration.0,
-                                        lexical_owner,
-                                        candidates.len()
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    if let Some(source_expression) = source_expression {
-                        return Err(format!(
-                            "checked SOURCE expression {} declaration {} read `{}` owner {:?} has no executable source",
-                            source_expression.0,
-                            declaration.0,
-                            canonical_read_path(path, projection),
-                            owner
-                        ));
-                    }
-                }
-                let path = canonical_read_path(path, projection);
-                let distributed_path = distributed_event_source_path(&path);
-                let paths = [path, distributed_path];
-                let mut projected = Vec::new();
-                for source in self.sources {
-                    let candidate = (source.path.clone(), source.id, source.scope_id);
-                    if paths.iter().any(|path| source.path == *path) {
-                        exact.push(candidate);
-                    } else if paths.iter().any(|path| {
-                        path.strip_prefix(&source.path)
-                            .is_some_and(|suffix| suffix.starts_with('.'))
-                    }) {
-                        projected.push(candidate);
-                    } else if paths
-                        .iter()
-                        .any(|path| source.path.starts_with(&format!("{path}.")))
-                    {
-                        grouped.push(candidate);
-                    }
-                }
-                if !projected.is_empty() {
-                    return Ok(projected);
-                }
-            }
-            ExecutableEventReference::Local {
-                owner,
-                local,
-                projection,
-                ..
-            } => {
-                let projection = projection.join(".");
-                let prefix = format!("{projection}.");
-                self.local_scope(*owner, *local)?;
-                let mut pending = vec![*owner];
-                let mut visited = BTreeSet::new();
-                while let Some(candidate_owner) = pending.pop() {
-                    if !visited.insert(candidate_owner) {
-                        continue;
-                    }
-                    let mut owner_exact = Vec::new();
-                    let mut owner_grouped = Vec::new();
-                    for source in self.sources.iter().filter(|source| {
-                        source.static_owner.is_some_and(|source_owner| {
-                            self.owner_is_descendant_or_same(source_owner, candidate_owner)
-                        })
-                    }) {
-                        let binding = source
-                            .executable_source_id
-                            .and_then(|id| self.executable.sources.get(id.as_usize()))
-                            .filter(|definition| {
-                                definition.id == source.executable_source_id.expect("checked above")
-                            })
-                            .map(|definition| definition.binding_path.as_str())
-                            .ok_or_else(|| {
-                                format!(
-                                    "source {} has no exact executable source definition",
-                                    source.id
-                                )
-                            })?;
-                        let candidate = (source.path.clone(), source.id, source.scope_id);
-                        if binding == projection {
-                            owner_exact.push(candidate);
-                        } else if projection
-                            .strip_prefix(binding)
-                            .is_some_and(|suffix| suffix.starts_with('.'))
-                        {
-                            owner_exact.push(candidate);
-                        } else if projection.is_empty() || binding.starts_with(&prefix) {
-                            owner_grouped.push(candidate);
-                        }
-                    }
-                    if !owner_exact.is_empty() {
-                        return Ok(owner_exact);
-                    }
-                    if !owner_grouped.is_empty() {
-                        return Ok(owner_grouped);
-                    }
-                    pending.extend(self.materialization_predecessor_owners(candidate_owner)?);
-                }
-            }
-        }
-        if exact.is_empty() {
-            Ok(grouped)
-        } else {
-            Ok(exact)
-        }
-    }
-
-    fn owner_is_descendant_or_same(
-        &self,
-        mut candidate: StaticOwnerId,
-        ancestor: StaticOwnerId,
-    ) -> bool {
-        loop {
-            if candidate == ancestor {
-                return true;
-            }
-            let Some(parent) = self
-                .static_owners
-                .get(candidate.as_usize())
-                .filter(|owner| owner.id == candidate)
-                .and_then(|owner| owner.parent)
-            else {
-                return false;
-            };
-            candidate = parent;
-        }
-    }
-
-    fn exact_source_id_for_expression(
-        &self,
-        expression: ExecutableExprId,
-    ) -> Result<Option<SourceId>, String> {
-        let definitions = self
-            .executable
-            .sources
-            .iter()
-            .filter(|source| source.expression == expression)
-            .collect::<Vec<_>>();
-        if definitions.len() > 1 {
-            return Err(format!(
-                "executable expression {expression} owns {} source definitions",
-                definitions.len()
-            ));
-        }
-        if let Some(definition) = definitions.first() {
-            let sources = self
-                .sources
-                .iter()
-                .filter(|source| source.executable_source_id == Some(definition.id))
-                .collect::<Vec<_>>();
-            return match sources.as_slice() {
-                [source] => Ok(Some(source.id)),
-                _ => Err(format!(
-                    "executable source {} has {} runtime sources",
-                    definition.id,
-                    sources.len()
-                )),
-            };
-        }
-
-        let Some(storage) = self.storage else {
-            return Ok(None);
-        };
-        let Some(read_id) = self
-            .reads_by_expression
-            .get(expression.as_usize())
-            .copied()
-            .flatten()
-        else {
-            return Ok(None);
-        };
-        let read = storage
-            .reads
-            .get(read_id.as_usize())
-            .filter(|read| read.id == read_id && read.expression == expression)
-            .ok_or_else(|| {
-                format!(
-                    "event expression {expression} references inconsistent erased read {read_id}"
-                )
-            })?;
-        match read.target {
-            ErasedReadTarget::Binding { binding, .. } => {
-                let binding = storage
-                    .bindings
-                    .get(binding.as_usize())
-                    .filter(|candidate| candidate.id == binding)
-                    .ok_or_else(|| {
-                        format!("event erased read {read_id} references missing {binding}")
-                    })?;
-                match binding.target {
-                    ErasedBindingTarget::Source { runtime, .. } => Ok(Some(runtime)),
-                    ErasedBindingTarget::Value { .. } | ErasedBindingTarget::State { .. } => {
-                        Ok(None)
-                    }
-                }
-            }
-            ErasedReadTarget::SourcePayload { source, .. } => Ok(Some(source)),
-            ErasedReadTarget::StateProjection { .. }
-            | ErasedReadTarget::Expression { .. }
-            | ErasedReadTarget::Local { .. }
-            | ErasedReadTarget::ExternalValue { .. }
-            | ErasedReadTarget::MaterializationLocal { .. }
-            | ErasedReadTarget::FunctionParameter { .. } => Ok(None),
-        }
-    }
-
-    fn materialization_predecessor_owners(
-        &self,
-        owner: StaticOwnerId,
-    ) -> Result<Vec<StaticOwnerId>, String> {
-        let materialization = self
-            .materializations
-            .iter()
-            .find(|materialization| materialization.owner == owner)
-            .ok_or_else(|| format!("static owner {owner} has no contextual materialization"))?;
-        let mut owners = BTreeSet::new();
-        self.collect_expression_owners(
-            materialization.source,
-            &mut owners,
-            &mut BTreeSet::new(),
-            &mut BTreeSet::new(),
-        )?;
-        owners.remove(&owner);
-        Ok(owners.into_iter().collect())
-    }
-
-    fn collect_expression_owners(
-        &self,
-        id: ExecutableExprId,
-        owners: &mut BTreeSet<StaticOwnerId>,
-        visited_expressions: &mut BTreeSet<ExecutableExprId>,
-        visited_paths: &mut BTreeSet<String>,
-    ) -> Result<(), String> {
-        if !visited_expressions.insert(id) {
-            return Ok(());
-        }
-        let expression = self.expression(id)?;
-        match &expression.kind {
-            ExecutableExpressionKind::Materialize { materialization } => {
-                owners.insert(self.materialization(*materialization)?.owner);
-            }
-            ExecutableExpressionKind::MaterializationLocal { owner, .. } => {
-                owners.insert(*owner);
-            }
-            ExecutableExpressionKind::CanonicalRead { target, .. } => {
-                if visited_paths.insert(format!("decl:{}", target.0))
-                    && let Some(value) = self.statement_values.get(target).copied()
-                {
-                    self.collect_expression_owners(
-                        value,
-                        owners,
-                        visited_expressions,
-                        visited_paths,
-                    )?;
-                }
-            }
-            kind => {
-                for child in executable_expression_children(kind) {
-                    self.collect_expression_owners(
-                        child,
-                        owners,
-                        visited_expressions,
-                        visited_paths,
-                    )?;
-                }
-            }
-        }
-        Ok(())
     }
 
     fn collect_style_bindings(
@@ -13622,9 +15067,8 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 }
                 let diagnostic_path = canonical_read_path(&path, &projection);
                 let scope_id = self
-                    .list_scopes_by_declaration
-                    .get(&target)
-                    .copied()
+                    .storage_scopes
+                    .scope_for_declaration(target)
                     .or_else(|| scope_id_for_path(self.row_scopes, &diagnostic_path));
                 Ok(Some(ExecutableViewRead {
                     read,
@@ -13649,7 +15093,7 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 if projection.is_empty() {
                     return Ok(None);
                 }
-                let Some(scope_id) = self.local_scope(owner, local)? else {
+                let Some(scope_id) = self.storage_scopes.local_scope(owner, local)? else {
                     return Ok(None);
                 };
                 let row_scope = self
@@ -13691,95 +15135,10 @@ impl<'a> ExecutableViewBindingCollector<'a> {
 
     fn erased_read(&self, read: ErasedReadId) -> Result<&ErasedReadBinding, String> {
         self.storage
-            .and_then(|storage| storage.reads.get(read.as_usize()))
+            .reads
+            .get(read.as_usize())
             .filter(|candidate| candidate.id == read)
             .ok_or_else(|| format!("view references missing erased read {read}"))
-    }
-
-    fn direct_event_reference(
-        &self,
-        id: ExecutableExprId,
-    ) -> Result<Option<ExecutableEventReference>, String> {
-        let expression = self.expression(id)?;
-        let mut source_definitions = self
-            .executable
-            .sources
-            .iter()
-            .filter(|source| source.expression == id);
-        if let Some(source) = source_definitions.next() {
-            if source_definitions.next().is_some() {
-                return Err(format!(
-                    "executable expression {id} owns more than one source definition"
-                ));
-            }
-            return Ok(Some(ExecutableEventReference::Canonical {
-                declaration: Some(source.declaration),
-                owner: source.owner,
-                path: source.binding_path.clone(),
-                projection: Vec::new(),
-                expression: id,
-                source_expression: Some(expression.checked_expr_id),
-            }));
-        }
-        match &expression.kind {
-            ExecutableExpressionKind::CanonicalRead {
-                target,
-                path,
-                projection,
-                source,
-            } => Ok(Some(ExecutableEventReference::Canonical {
-                declaration: Some(*target),
-                owner: expression.owner,
-                path: path.clone(),
-                projection: projection.clone(),
-                expression: id,
-                source_expression: source.as_ref().map(|source| source.expression),
-            })),
-            ExecutableExpressionKind::Drain {
-                target,
-                path,
-                projection,
-            } => Ok(Some(ExecutableEventReference::Canonical {
-                declaration: Some(*target),
-                owner: expression.owner,
-                path: path.clone(),
-                projection: projection.clone(),
-                expression: id,
-                source_expression: None,
-            })),
-            ExecutableExpressionKind::ExternalRead { canonical_path } => {
-                Ok(Some(ExecutableEventReference::Canonical {
-                    declaration: None,
-                    owner: expression.owner,
-                    path: canonical_path.clone(),
-                    projection: Vec::new(),
-                    expression: id,
-                    source_expression: None,
-                }))
-            }
-            ExecutableExpressionKind::MaterializationLocal {
-                owner,
-                local,
-                projection,
-            } => Ok(Some(ExecutableEventReference::Local {
-                owner: *owner,
-                local: *local,
-                projection: projection.clone(),
-            })),
-            ExecutableExpressionKind::Project { input, fields } => {
-                let Some(mut read) = self.direct_event_reference(*input)? else {
-                    return Ok(None);
-                };
-                match &mut read {
-                    ExecutableEventReference::Canonical { projection, .. }
-                    | ExecutableEventReference::Local { projection, .. } => {
-                        projection.extend(fields.iter().cloned());
-                    }
-                }
-                Ok(Some(read))
-            }
-            _ => Ok(None),
-        }
     }
 
     fn view_read_binding(
@@ -13795,209 +15154,6 @@ impl<'a> ExecutableViewBindingCollector<'a> {
                 additional_projection: read.additional_projection.clone(),
             },
         ))
-    }
-
-    fn local_scope(
-        &mut self,
-        owner: StaticOwnerId,
-        local: MaterializationLocalId,
-    ) -> Result<Option<ScopeId>, String> {
-        let key = (owner, local);
-        if let Some(cached) = self.local_scope_cache.get(&key).copied() {
-            return Ok(cached);
-        }
-        if !self.local_scope_visiting.insert(key) {
-            return Err(format!(
-                "contextual view owner {owner} local {:?} forms a storage-scope cycle",
-                local
-            ));
-        }
-        let result = if let Some(materialization) = self
-            .materializations_by_local
-            .get(&key)
-            .copied()
-            .map(|id| self.materialization(id))
-            .transpose()?
-        {
-            self.storage_scope_for_expression(
-                materialization.source,
-                &mut BTreeSet::new(),
-                &mut BTreeSet::new(),
-            )?
-        } else {
-            return Err(format!(
-                "contextual view owner {owner} local {:?} has no typed materialization",
-                local
-            ));
-        };
-        self.local_scope_visiting.remove(&key);
-        self.local_scope_cache.insert(key, result);
-        Ok(result)
-    }
-
-    fn storage_scope_for_expression(
-        &mut self,
-        id: ExecutableExprId,
-        visited_expressions: &mut BTreeSet<ExecutableExprId>,
-        visited_paths: &mut BTreeSet<String>,
-    ) -> Result<Option<ScopeId>, String> {
-        if !visited_expressions.insert(id) {
-            return Ok(None);
-        }
-        let expression = self.expression(id)?.clone();
-        match expression.kind {
-            ExecutableExpressionKind::CanonicalRead {
-                target,
-                path,
-                projection,
-                ..
-            }
-            | ExecutableExpressionKind::Drain {
-                target,
-                path,
-                projection,
-            } => {
-                let projected_path = canonical_read_path(&path, &projection);
-                if let Some(scope) = self.list_scopes_by_path.get(&projected_path).copied() {
-                    return Ok(Some(scope));
-                }
-                if let Some(scope) = self.list_scopes_by_declaration.get(&target).copied() {
-                    return Ok(Some(scope));
-                }
-                if visited_paths.insert(format!("decl:{}", target.0))
-                    && let Some(value) = self.statement_values.get(&target).copied()
-                    && value != id
-                {
-                    return self.storage_scope_for_expression(
-                        value,
-                        visited_expressions,
-                        visited_paths,
-                    );
-                }
-                Ok(None)
-            }
-            ExecutableExpressionKind::Materialize { materialization } => {
-                let source = self.materialization(materialization)?.source;
-                self.storage_scope_for_expression(source, visited_expressions, visited_paths)
-            }
-            ExecutableExpressionKind::MaterializationLocal {
-                owner,
-                local,
-                projection,
-            } => {
-                let scope = self.local_scope(owner, local)?;
-                match projection.first().map(String::as_str) {
-                    None => Ok(scope),
-                    Some("items") => match scope {
-                        Some(scope) => self.chunk_items_storage_scope_for_scope(scope),
-                        None => Ok(None),
-                    },
-                    Some(_) => Ok(None),
-                }
-            }
-            ExecutableExpressionKind::Project { input, fields } => {
-                match fields.first().map(String::as_str) {
-                    None => {
-                        self.storage_scope_for_expression(input, visited_expressions, visited_paths)
-                    }
-                    Some("items") => Ok(self.chunk_items_storage_scope(input)?),
-                    Some(_) => Ok(None),
-                }
-            }
-            ExecutableExpressionKind::Draining { input } => {
-                self.storage_scope_for_expression(input, visited_expressions, visited_paths)
-            }
-            ExecutableExpressionKind::Call { arguments, .. } => self.unique_child_storage_scope(
-                arguments.into_iter().map(|argument| argument.value),
-                visited_expressions,
-                visited_paths,
-            ),
-            ExecutableExpressionKind::Then { input, output } => self.unique_child_storage_scope(
-                std::iter::once(input).chain(output),
-                visited_expressions,
-                visited_paths,
-            ),
-            ExecutableExpressionKind::Latest { branches } => {
-                self.unique_child_storage_scope(branches, visited_expressions, visited_paths)
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn chunk_items_storage_scope(
-        &mut self,
-        projected_row: ExecutableExprId,
-    ) -> Result<Option<ScopeId>, String> {
-        let Some(chunk_scope) = self.storage_scope_for_expression(
-            projected_row,
-            &mut BTreeSet::new(),
-            &mut BTreeSet::new(),
-        )?
-        else {
-            return Ok(None);
-        };
-        self.chunk_items_storage_scope_for_scope(chunk_scope)
-    }
-
-    fn chunk_items_storage_scope_for_scope(
-        &mut self,
-        chunk_scope: ScopeId,
-    ) -> Result<Option<ScopeId>, String> {
-        let declarations = self
-            .list_scopes_by_declaration
-            .iter()
-            .filter_map(|(declaration, scope)| (*scope == chunk_scope).then_some(*declaration))
-            .collect::<Vec<_>>();
-        let [declaration] = declarations.as_slice() else {
-            return if declarations.is_empty() {
-                Ok(None)
-            } else {
-                Err(format!(
-                    "row scope {chunk_scope} belongs to multiple typed list declarations {declarations:?}"
-                ))
-            };
-        };
-        let Some(producer) = self.statement_values.get(declaration).copied() else {
-            return Ok(None);
-        };
-        let expression = self.expression(producer)?.clone();
-        let ExecutableExpressionKind::Call {
-            name, arguments, ..
-        } = expression.kind
-        else {
-            return Ok(None);
-        };
-        if name != "List/chunk" {
-            return Ok(None);
-        }
-        let Some(source) = call_argument(&arguments, "list") else {
-            return Err(format!(
-                "typed List/chunk producer {producer} has no canonical `list` argument"
-            ));
-        };
-        self.storage_scope_for_expression(source, &mut BTreeSet::new(), &mut BTreeSet::new())
-    }
-
-    fn unique_child_storage_scope(
-        &mut self,
-        children: impl IntoIterator<Item = ExecutableExprId>,
-        visited_expressions: &mut BTreeSet<ExecutableExprId>,
-        visited_paths: &mut BTreeSet<String>,
-    ) -> Result<Option<ScopeId>, String> {
-        let mut scopes = BTreeSet::new();
-        for child in children {
-            if let Some(scope) =
-                self.storage_scope_for_expression(child, visited_expressions, visited_paths)?
-            {
-                scopes.insert(scope);
-            }
-        }
-        if scopes.len() > 1 {
-            return Err(format!(
-                "contextual view source reaches ambiguous storage scopes {scopes:?}"
-            ));
-        }
-        Ok(scopes.pop_first())
     }
 
     fn static_tag(&self, id: ExecutableExprId) -> Option<String> {
@@ -14074,68 +15230,6 @@ fn render_record_field_can_contain_nodes(field: &str) -> bool {
 
 fn canonical_event_attr(attr: &str) -> &str {
     if attr == "key_down" { "submit" } else { attr }
-}
-
-#[cfg(test)]
-fn normalized_view_source_path(path: &str) -> String {
-    path.split('.')
-        .filter(|part| *part != "PASSED")
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-#[cfg(test)]
-fn view_source_path_candidates(path: &str) -> Vec<String> {
-    let normalized = normalized_view_source_path(path);
-    let without_event_groups = normalized
-        .split('.')
-        .filter(|part| *part != "events")
-        .collect::<Vec<_>>()
-        .join(".");
-    if normalized == without_event_groups {
-        vec![normalized]
-    } else {
-        vec![normalized, without_event_groups]
-    }
-}
-
-#[cfg(test)]
-fn canonical_view_source_path<'a>(
-    source_paths: &'a [(&'a str, SourceId)],
-    value: &str,
-) -> Option<(&'a str, SourceId)> {
-    view_source_path_candidates(value)
-        .into_iter()
-        .find_map(|candidate| canonical_view_source_path_candidate(source_paths, &candidate))
-}
-
-#[cfg(test)]
-fn canonical_view_source_path_candidate<'a>(
-    source_paths: &'a [(&'a str, SourceId)],
-    value: &str,
-) -> Option<(&'a str, SourceId)> {
-    if let Some((path, source_id)) = source_paths
-        .iter()
-        .find(|(source_path, _)| *source_path == value)
-    {
-        return Some((*path, *source_id));
-    }
-    let suffix = format!(".{}", value.split_once('.')?.1);
-    let mut matches = source_paths
-        .iter()
-        .filter(|(source_path, _)| source_path.ends_with(&suffix));
-    if let Some(first) = matches.next()
-        && matches.next().is_none()
-    {
-        return Some((first.0, first.1));
-    }
-
-    let source_suffix = value.find(".sources.").map(|offset| &value[offset..])?;
-    let mut matches = source_paths
-        .iter()
-        .filter(|(source_path, _)| source_path.ends_with(source_suffix));
-    let first = matches.next()?;
-    matches.next().is_none().then_some((first.0, first.1))
 }
 
 fn attr_can_bind_data(attr: &str) -> bool {
@@ -14567,11 +15661,7 @@ fn verify_executable_host_effect_calls_scheduled(
     state_update_arms: &[StateUpdateArm],
 ) -> Result<(), String> {
     let mut calls = BTreeMap::<
-        (
-            boon_typecheck::CheckedExprId,
-            Option<StaticOwnerId>,
-            String,
-        ),
+        (boon_typecheck::CheckedExprId, Option<StaticOwnerId>, String),
         Vec<ExecutableExprId>,
     >::new();
     for expression in &executable.expressions {
@@ -14589,11 +15679,7 @@ fn verify_executable_host_effect_calls_scheduled(
         if !state_update_arms.iter().any(|arm| {
             arm.owner == owner
                 && expressions.iter().any(|expression| {
-                    executable_expression_reaches(
-                        executable,
-                        arm.output_expression_id,
-                        *expression,
-                    )
+                    executable_expression_reaches(executable, arm.output_expression_id, *expression)
                 })
         }) {
             return Err(format!(
@@ -14607,23 +15693,14 @@ fn verify_executable_host_effect_calls_scheduled(
 
 fn exact_list_mutations(
     executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
     list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    row_scopes: &[RowScope],
     sources: &[SourcePort],
     states: &[StateCell],
     materializations: &[ContextualMaterialization],
+    source_authority: &ExecutableSourceAuthorityIndex,
 ) -> Result<Vec<ListMutation>, String> {
-    let mut collector = ExecutableViewBindingCollector::new(
-        executable,
-        static_owners,
-        None,
-        list_storage,
-        row_scopes,
-        sources,
-        states,
-        materializations,
-    )?;
+    let mut triggers =
+        ExecutableTriggerResolver::new(executable, source_authority, materializations)?;
     let mut mutations = Vec::new();
     for (statement_id, storage) in list_storage {
         let root = executable
@@ -14637,7 +15714,7 @@ fn exact_list_mutations(
         collect_exact_list_mutations(
             executable,
             materializations,
-            &mut collector,
+            &mut triggers,
             storage.list_id,
             root,
             &mut BTreeSet::new(),
@@ -14656,7 +15733,7 @@ fn exact_list_mutations(
 fn collect_exact_list_mutations(
     executable: &ExecutableProgram,
     materializations: &[ContextualMaterialization],
-    collector: &mut ExecutableViewBindingCollector<'_>,
+    triggers: &mut ExecutableTriggerResolver<'_>,
     list_id: ListId,
     root: ExecutableExprId,
     visited: &mut BTreeSet<ExecutableExprId>,
@@ -14680,7 +15757,7 @@ fn collect_exact_list_mutations(
             collect_exact_list_mutations(
                 executable,
                 materializations,
-                collector,
+                triggers,
                 list_id,
                 materialization.source,
                 visited,
@@ -14698,7 +15775,7 @@ fn collect_exact_list_mutations(
                 | ContextualOperationKind::ThenBy => None,
             };
             if let Some(remove_when) = remove_when {
-                for arm in collector.trigger_owned_arms_for_expression(materialization.body)? {
+                for arm in triggers.trigger_owned_arms_for_expression(materialization.body)? {
                     mutations.push(ListMutation {
                         list_id,
                         site: root,
@@ -14736,13 +15813,13 @@ fn collect_exact_list_mutations(
             collect_exact_list_mutations(
                 executable,
                 materializations,
-                collector,
+                triggers,
                 list_id,
                 list,
                 visited,
                 mutations,
             )?;
-            for arm in collector.trigger_owned_arms_for_expression(item)? {
+            for arm in triggers.trigger_owned_arms_for_expression(item)? {
                 mutations.push(ListMutation {
                     list_id,
                     site: root,
@@ -14765,7 +15842,7 @@ fn collect_exact_list_mutations(
                 collect_exact_list_mutations(
                     executable,
                     materializations,
-                    collector,
+                    triggers,
                     list_id,
                     list,
                     visited,
@@ -14778,7 +15855,7 @@ fn collect_exact_list_mutations(
             collect_exact_list_mutations(
                 executable,
                 materializations,
-                collector,
+                triggers,
                 list_id,
                 *input,
                 visited,
@@ -14794,7 +15871,7 @@ fn collect_exact_list_mutations(
                 collect_exact_list_mutations(
                     executable,
                     materializations,
-                    collector,
+                    triggers,
                     list_id,
                     value,
                     visited,
@@ -14807,7 +15884,7 @@ fn collect_exact_list_mutations(
                 collect_exact_list_mutations(
                     executable,
                     materializations,
-                    collector,
+                    triggers,
                     list_id,
                     arm.output,
                     visited,
@@ -14820,7 +15897,7 @@ fn collect_exact_list_mutations(
                 collect_exact_list_mutations(
                     executable,
                     materializations,
-                    collector,
+                    triggers,
                     list_id,
                     *branch,
                     visited,
@@ -14873,6 +15950,7 @@ fn executable_list_projections(
                 .map(|declaration| (declaration, storage.list_id))
         })
         .collect::<BTreeMap<_, _>>();
+    let local_bindings = executable_local_binding_values(executable)?;
     let mut projections = Vec::new();
     let mut targets = BTreeSet::new();
     for (statement_id, target) in list_storage {
@@ -14923,6 +16001,7 @@ fn executable_list_projections(
             executable,
             materializations,
             &lists_by_declaration,
+            &local_bindings,
             list_argument.value,
             &mut BTreeSet::new(),
         )?
@@ -15035,6 +16114,7 @@ fn executable_list_id(
     executable: &ExecutableProgram,
     materializations: &[ContextualMaterialization],
     lists_by_declaration: &BTreeMap<boon_typecheck::DeclId, ListId>,
+    local_bindings: &BTreeMap<ExecutableLocalBindingId, ExecutableLocalBindingValue>,
     expression: ExecutableExprId,
     visiting: &mut BTreeSet<ExecutableExprId>,
 ) -> Result<Option<ListId>, String> {
@@ -15051,11 +16131,26 @@ fn executable_list_id(
     let result = match &candidate.kind {
         ExecutableExpressionKind::CanonicalRead {
             target, projection, ..
-        }
-        | ExecutableExpressionKind::LocalRead {
-            declaration: target,
-            projection,
         } if projection.is_empty() => lists_by_declaration.get(target).copied(),
+        ExecutableExpressionKind::LocalRead {
+            binding,
+            projection,
+            ..
+        } if projection.is_empty() => {
+            let local = local_bindings.get(binding).ok_or_else(|| {
+                format!(
+                    "list provenance expression {expression} references missing local binding {binding}"
+                )
+            })?;
+            executable_list_id(
+                executable,
+                materializations,
+                lists_by_declaration,
+                local_bindings,
+                local.value,
+                visiting,
+            )?
+        }
         ExecutableExpressionKind::Materialize { materialization } => materializations
             .get(*materialization)
             .filter(|candidate| candidate.id == *materialization)
@@ -15068,6 +16163,7 @@ fn executable_list_id(
             executable,
             materializations,
             lists_by_declaration,
+            local_bindings,
             *result,
             visiting,
         )?,
@@ -15076,6 +16172,7 @@ fn executable_list_id(
                 executable,
                 materializations,
                 lists_by_declaration,
+                local_bindings,
                 *input,
                 visiting,
             )?
@@ -15084,6 +16181,7 @@ fn executable_list_id(
             executable,
             materializations,
             lists_by_declaration,
+            local_bindings,
             *input,
             visiting,
         )?,
@@ -15098,6 +16196,7 @@ fn executable_list_id(
             executable,
             materializations,
             lists_by_declaration,
+            local_bindings,
             *output,
             visiting,
         )?,
@@ -15125,6 +16224,7 @@ fn executable_list_id(
                 executable,
                 materializations,
                 lists_by_declaration,
+                local_bindings,
                 *input,
                 visiting,
             )?
@@ -15137,23 +16237,12 @@ fn executable_list_id(
 
 fn state_update_arms(
     executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
-    row_scopes: &[RowScope],
-    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    sources: &[SourcePort],
     state_cells: &[StateCell],
     materializations: &[ContextualMaterialization],
+    source_authority: &ExecutableSourceAuthorityIndex,
 ) -> Result<Vec<StateUpdateArm>, String> {
-    let mut collector = ExecutableViewBindingCollector::new(
-        executable,
-        static_owners,
-        None,
-        derived_list_storage,
-        row_scopes,
-        sources,
-        state_cells,
-        materializations,
-    )?;
+    let mut triggers =
+        ExecutableTriggerResolver::new(executable, source_authority, materializations)?;
     let mut result = Vec::new();
     for state in state_cells {
         let Some(executable_state_id) = state.executable_state_id else {
@@ -15169,7 +16258,22 @@ fn state_update_arms(
                     state.path, executable_state_id
                 )
             })?;
-        for arm in collector.trigger_owned_arms_for_expression(executable_state.expression)? {
+        for arm in triggers.trigger_owned_arms_for_expression(executable_state.expression)? {
+            let same_state_family = match arm.cause {
+                EventCause::State(cause) => state_cells
+                    .get(cause.as_usize())
+                    .filter(|candidate| candidate.id == cause)
+                    .and_then(|candidate| candidate.executable_state_id)
+                    .and_then(|candidate| executable.states.get(candidate.as_usize()))
+                    .is_some_and(|candidate| {
+                        candidate.declaration == executable_state.declaration
+                            && candidate.owner == executable_state.owner
+                    }),
+                EventCause::Source(_) => false,
+            };
+            if same_state_family {
+                continue;
+            }
             result.push(StateUpdateArm {
                 state: state.id,
                 cause: arm.cause,
@@ -15196,25 +16300,17 @@ fn derived_values(
     checked: &boon_typecheck::CheckedProgram,
     executable: &ExecutableProgram,
     static_owners: &[StaticOwnerDef],
-    row_scopes: &[RowScope],
     derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
     erased_fields: &[ErasedFieldDef],
     state_cells: &[StateCell],
     sources: &[SourcePort],
     materializations: &[ContextualMaterialization],
+    source_authority: &ExecutableSourceAuthorityIndex,
     producer_function_instances: &[ProducerFunctionInstance],
     distributed_value_references: &[DistributedValueReference],
 ) -> Result<Vec<DerivedValue>, String> {
-    let mut event_source_collector = ExecutableViewBindingCollector::new(
-        executable,
-        static_owners,
-        None,
-        derived_list_storage,
-        row_scopes,
-        sources,
-        state_cells,
-        materializations,
-    )?;
+    let mut triggers =
+        ExecutableTriggerResolver::new(executable, source_authority, materializations)?;
     let output_roots = output_root_declarations(checked, &checked.lowering_metadata);
     let retained_output_root_statements = output_roots
         .iter()
@@ -15230,6 +16326,11 @@ fn derived_values(
         .iter()
         .filter(|output| matches!(output.contract, SemanticOutputContractKind::HostValue))
         .map(|output| ExecutableStatementId(output.statement_id))
+        .collect::<BTreeSet<_>>();
+    let checked_source_paths = checked
+        .sources
+        .iter()
+        .filter_map(|source| checked.semantic_path(&source.path))
         .collect::<BTreeSet<_>>();
     let hold_body_statements = executable_hold_body_statement_ids(executable);
     let candidates = executable
@@ -15288,7 +16389,7 @@ fn derived_values(
                             .and_then(|state| executable.states.get(state.as_usize()))
                             .is_some_and(|state| state.expression == value)
                 })
-                || checked.sources.iter().any(|source| source.path == path)
+                || checked_source_paths.contains(path)
                 || distributed_value_references.iter().any(|reference| {
                     matches!(
                         reference.flow_mode,
@@ -15329,7 +16430,7 @@ fn derived_values(
         let (trigger_arms, default_roots) = if structural_group || materialized_storage.is_some() {
             (Vec::new(), Vec::new())
         } else {
-            event_source_collector.trigger_owned_arms_for_statement(statement.id)?
+            triggers.trigger_owned_arms_for_statement(statement.id)?
         };
         let causes = trigger_arms
             .iter()
@@ -15442,27 +16543,17 @@ fn executable_expression_contains_exact_call(
     }
     false
 }
-#[allow(clippy::too_many_arguments)]
 fn producer_derived_values(
     executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
-    row_scopes: &[RowScope],
     derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
     state_cells: &[StateCell],
     sources: &[SourcePort],
     materializations: &[ContextualMaterialization],
+    source_authority: &ExecutableSourceAuthorityIndex,
     instances: &[ProducerFunctionInstance],
 ) -> Result<Vec<DerivedValue>, String> {
-    let mut event_source_collector = ExecutableViewBindingCollector::new(
-        executable,
-        static_owners,
-        None,
-        derived_list_storage,
-        row_scopes,
-        sources,
-        state_cells,
-        materializations,
-    )?;
+    let mut triggers =
+        ExecutableTriggerResolver::new(executable, source_authority, materializations)?;
     let mut values = Vec::with_capacity(instances.len());
     for instance in instances {
         let field = executable
@@ -15487,7 +16578,7 @@ fn producer_derived_values(
         let (trigger_arms, default_roots) = if structural_group || materialized_storage.is_some() {
             (Vec::new(), Vec::new())
         } else {
-            event_source_collector.trigger_owned_arms_for_statement(field.id)?
+            triggers.trigger_owned_arms_for_statement(field.id)?
         };
         let causes = trigger_arms
             .iter()
@@ -16060,13 +17151,6 @@ store: [
 ]
 "#;
         let parsed = boon_parser::parse_source("typed-derived-chunks.bn", source).unwrap();
-        assert!(
-            !parsed
-                .list_memories
-                .iter()
-                .any(|list| list.name == "wrapped_chunks"),
-            "the test must exercise a wrapper that parser list heuristics do not publish"
-        );
         let first = lower(&parsed).expect("typed chunk views must lower");
         let second = lower(&parsed).expect("repeated lowering must be deterministic");
         let first_ids = [

@@ -4293,7 +4293,7 @@ fn capability_error(error: boon_runtime::HostCapabilityError) -> WebHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_plan::{EffectInvocationId, OwnerInstanceId};
+    use boon_plan::{EffectInvocationId, OwnerInstanceRoute};
     use idb::Factory;
     use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -4321,7 +4321,7 @@ mod tests {
             effect_id,
             trigger_sequence: sequence,
             authority_turn_sequence: sequence,
-            owner: OwnerInstanceId::root(),
+            owner: OwnerInstanceRoute::root(),
             target: None,
             intent,
             delivery,

@@ -738,6 +738,7 @@ fn session_producer_plan_with_owned_resources(graph: &DistributedGraphPlan) -> M
         path: "producer.source".to_owned(),
         scoped: false,
         scope_id: None,
+        row_projections: Vec::new(),
         interval_ms: None,
         payload_schema: SourcePayloadSchema {
             fields: Vec::new(),
@@ -781,6 +782,7 @@ fn session_producer_plan_with_owned_resources(graph: &DistributedGraphPlan) -> M
             kind: PlanOpKind::DerivedValue {
                 derived_kind: PlanDerivedKind::Pure,
                 startup_recompute: true,
+                materialization: None,
                 expression: None,
             },
             inputs: vec![ValueRef::DistributedImport(argument_import)],
@@ -2160,6 +2162,10 @@ fn event_row_requires_the_exact_source_owner_list() {
         path: "rows.controls.select".to_owned(),
         scoped: true,
         scope_id: Some(ScopeId(0)),
+        row_projections: vec![SourceRowProjection {
+            list: ListId(0),
+            path: vec!["controls".to_owned(), "select".to_owned()],
+        }],
         interval_ms: None,
         payload_schema: SourcePayloadSchema {
             fields: Vec::new(),
@@ -2190,6 +2196,52 @@ fn event_row_requires_the_exact_source_owner_list() {
         &plan,
         wrong_list_event,
     ));
+}
+
+#[test]
+fn verifier_rejects_conflicting_row_source_projection_prefixes() {
+    let mut plan = empty_plan();
+    plan.storage_layout.list_slots.push(ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_fields: Vec::new(),
+        capacity: None,
+        hidden_key_type: "u64".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Empty,
+        range: None,
+        initial_rows: Vec::new(),
+    });
+    let route = |id, source, path: &[&str]| SourceRoute {
+        id: PlanSourceRouteId(id),
+        source_id: SourceId(source),
+        owner: PlanOwner::root(),
+        path: format!("source-{source}"),
+        scoped: false,
+        scope_id: None,
+        row_projections: vec![SourceRowProjection {
+            list: ListId(0),
+            path: path.iter().map(|segment| (*segment).to_owned()).collect(),
+        }],
+        interval_ms: None,
+        payload_schema: SourcePayloadSchema {
+            fields: Vec::new(),
+            typed_fields: Vec::new(),
+        },
+    };
+    plan.source_routes = vec![
+        route(0, 0, &["controls"]),
+        route(1, 1, &["controls", "select"]),
+    ];
+
+    let verification = verify_plan(&plan).unwrap();
+    assert!(
+        verification
+            .checks
+            .iter()
+            .any(|check| { check.id == "source-routes-have-structural-owners" && !check.pass })
+    );
 }
 
 #[test]

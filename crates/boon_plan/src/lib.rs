@@ -10,7 +10,7 @@ mod host;
 
 pub use boon_data::{FiniteReal, FiniteRealError};
 pub use boon_document_model::{
-    ListId, OwnerInstanceId, OwnerInstanceRow, PlanStaticOwnerId, ProgramRole, SourceId,
+    ListId, OwnerInstanceRoute, OwnerInstanceRow, PlanStaticOwnerId, ProgramRole, SourceId,
     SourceRouteToken,
 };
 pub use document::*;
@@ -562,6 +562,7 @@ pub struct DistributedCallRowBindingPlan {
     pub owner: PlanStaticOwnerId,
     pub local: PlanLocalId,
     pub list: ListId,
+    pub ancestor_index: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1969,9 +1970,20 @@ fn distributed_call_contextual_bindings(
         .iter()
         .map(|binding| (binding.owner, binding.local))
         .collect::<BTreeMap<_, _>>();
+    let exact_owner_coordinates = call.row_bindings.iter().all(|binding| {
+        usize::try_from(binding.ancestor_index)
+            .ok()
+            .and_then(|index| call.owner.ancestors.get(index))
+            .is_some_and(|ancestor| {
+                ancestor.static_owner == binding.owner
+                    && (call.mode != DistributedCallMode::Invocation
+                        || ancestor.list == binding.list)
+            })
+    });
     if owner_lists.len() != call.row_bindings.len()
         || bindings.len() != call.row_bindings.len()
         || !call.row_bindings.windows(2).all(|pair| pair[0] < pair[1])
+        || !exact_owner_coordinates
     {
         return None;
     }
@@ -4953,13 +4965,13 @@ impl DistributedCallInstanceId {
 
     pub fn from_owner(
         call_site_id: RemoteCallSiteId,
-        owner: &OwnerInstanceId,
+        owner: &OwnerInstanceRoute,
     ) -> Result<Self, PlanError> {
         #[derive(Serialize)]
         struct Input<'a> {
             namespace: &'static str,
             call_site_id: RemoteCallSiteId,
-            owner: &'a OwnerInstanceId,
+            owner: &'a OwnerInstanceRoute,
         }
         owner
             .validate()
@@ -5245,9 +5257,17 @@ pub struct SourceRoute {
     pub path: String,
     pub scoped: bool,
     pub scope_id: Option<ScopeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_projections: Vec<SourceRowProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_ms: Option<u64>,
     pub payload_schema: SourcePayloadSchema,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SourceRowProjection {
+    pub list: ListId,
+    pub path: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -5520,6 +5540,8 @@ pub enum PlanOpKind {
         #[serde(default = "default_derived_startup_recompute")]
         startup_recompute: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        materialization: Option<PlanListMaterialization>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         expression: Option<PlanDerivedExpression>,
     },
     StateUpdate {
@@ -5561,26 +5583,27 @@ pub enum PlanDerivedKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanListMaterialization {
+    pub target_list: ListId,
+    /// When present, the derived view is backed by authoritative target rows
+    /// whose key and generation come from this logical source list.
+    /// Reconciliation updates fields and order without creating a second row
+    /// authority.
+    pub authority_source_list: Option<ListId>,
+    pub fields: BTreeMap<String, FieldId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_field_copies: Vec<PlanMaterializedRowFieldCopy>,
+    /// Non-keyed typed LIST values are promoted to this keyed authority before
+    /// row-preserving contextual operators evaluate. The authority survives
+    /// filtering so hidden row identity and row-owned state do not depend on
+    /// output position.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_list_authorities: Vec<PlanValueListAuthority>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanDerivedExpression {
-    MaterializeList {
-        target_list: ListId,
-        /// When present, the derived view is backed by authoritative target
-        /// rows whose key and generation come from this logical source list.
-        /// Reconciliation updates fields and order without creating a second
-        /// row authority.
-        authority_source_list: Option<ListId>,
-        fields: BTreeMap<String, FieldId>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        row_field_copies: Vec<PlanMaterializedRowFieldCopy>,
-        /// Non-keyed typed LIST values are promoted to this keyed authority
-        /// before row-preserving contextual operators evaluate. The authority
-        /// survives filtering so hidden row identity and row-owned state do
-        /// not depend on output position.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        value_list_authorities: Vec<PlanValueListAuthority>,
-        expression: Box<PlanDerivedExpression>,
-    },
     SourceKeyTextTrimNonEmpty {
         source_id: SourceId,
         key_field: SourcePayloadField,
@@ -5606,13 +5629,6 @@ pub enum PlanDerivedExpression {
         left: ValueRef,
         op: PlanInfixOp,
         right: ValueRef,
-    },
-    BoolAnd {
-        left: Box<PlanDerivedExpression>,
-        right: Box<PlanDerivedExpression>,
-    },
-    BoolNotExpression {
-        input: Box<PlanDerivedExpression>,
     },
     RowExpression {
         expression: PlanRowExpressionId,
@@ -5655,9 +5671,6 @@ impl PlanDerivedExpression {
         visitor: &mut impl FnMut(ValueRef),
     ) -> Result<(), PlanError> {
         match self {
-            Self::MaterializeList { expression, .. } => {
-                expression.visit_inputs(arena, visitor)?;
-            }
             Self::SourceKeyTextTrimNonEmpty {
                 source_id,
                 key_field,
@@ -5684,11 +5697,6 @@ impl PlanDerivedExpression {
                 visitor(left.clone());
                 visitor(right.clone());
             }
-            Self::BoolAnd { left, right } => {
-                left.visit_inputs(arena, visitor)?;
-                right.visit_inputs(arena, visitor)?;
-            }
-            Self::BoolNotExpression { input } => input.visit_inputs(arena, visitor)?,
             Self::RowExpression { expression } | Self::MaterializedRowField { expression, .. } => {
                 arena.visit_inputs(*expression, visitor)?;
             }
@@ -5702,20 +5710,12 @@ impl PlanDerivedExpression {
         visitor: &mut impl FnMut(PlanIntrinsic),
     ) -> Result<(), PlanError> {
         match self {
-            Self::MaterializeList { expression, .. } => {
-                expression.visit_intrinsics(arena, visitor)?;
-            }
             Self::SourceEventTransform { default, arms, .. } => {
                 arena.visit_intrinsics(*default, visitor)?;
                 for arm in arms {
                     arena.visit_intrinsics(arm.value, visitor)?;
                 }
             }
-            Self::BoolAnd { left, right } => {
-                left.visit_intrinsics(arena, visitor)?;
-                right.visit_intrinsics(arena, visitor)?;
-            }
-            Self::BoolNotExpression { input } => input.visit_intrinsics(arena, visitor)?,
             Self::RowExpression { expression } | Self::MaterializedRowField { expression, .. } => {
                 arena.visit_intrinsics(*expression, visitor)?;
             }
@@ -9193,9 +9193,22 @@ fn producer_function_plan_static_owners(plan: &MachinePlan) -> BTreeSet<PlanStat
     for op in plan.regions.iter().flat_map(|region| &region.ops) {
         match &op.kind {
             PlanOpKind::DerivedValue {
-                expression: Some(expression),
+                materialization,
+                expression,
                 ..
-            } => collect_derived_expression_static_owners(expression, &mut owners),
+            } => {
+                if let Some(materialization) = materialization {
+                    owners.extend(
+                        materialization
+                            .value_list_authorities
+                            .iter()
+                            .map(|authority| authority.owner),
+                    );
+                }
+                if let Some(expression) = expression {
+                    collect_derived_expression_static_owners(expression, &mut owners);
+                }
+            }
             PlanOpKind::StateUpdate {
                 effect: Some(effect),
                 ..
@@ -9210,9 +9223,6 @@ fn producer_function_plan_static_owners(plan: &MachinePlan) -> BTreeSet<PlanStat
                 }
             },
             PlanOpKind::SourceRoute
-            | PlanOpKind::DerivedValue {
-                expression: None, ..
-            }
             | PlanOpKind::StateUpdate { effect: None, .. }
             | PlanOpKind::ListProjection { .. }
             | PlanOpKind::DependencyEdge => {}
@@ -9248,14 +9258,6 @@ fn collect_derived_expression_static_owners(
     owners: &mut BTreeSet<PlanStaticOwnerId>,
 ) {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. }
-        | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-            collect_derived_expression_static_owners(expression, owners);
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            collect_derived_expression_static_owners(left, owners);
-            collect_derived_expression_static_owners(right, owners);
-        }
         PlanDerivedExpression::MaterializedRowField {
             local: Some(local), ..
         } => {
@@ -10877,10 +10879,11 @@ fn visit_plan_row_expressions(
     }
     for op in plan.regions.iter().flat_map(|region| &region.ops) {
         match &op.kind {
-            PlanOpKind::DerivedValue {
-                expression: Some(expression),
-                ..
-            } => collect_derived_row_expression_roots(expression, &mut roots),
+            PlanOpKind::DerivedValue { expression, .. } => {
+                if let Some(expression) = expression {
+                    collect_derived_row_expression_roots(expression, &mut roots);
+                }
+            }
             PlanOpKind::StateUpdate { value, effect, .. } => {
                 if let Some(value) = value {
                     roots.push(*value);
@@ -10903,9 +10906,6 @@ fn visit_plan_row_expressions(
                 }
             },
             PlanOpKind::SourceRoute
-            | PlanOpKind::DerivedValue {
-                expression: None, ..
-            }
             | PlanOpKind::ListProjection { .. }
             | PlanOpKind::DependencyEdge => {}
         }
@@ -10935,32 +10935,19 @@ fn collect_derived_row_expression_roots(
     expression: &PlanDerivedExpression,
     roots: &mut Vec<PlanRowExpressionId>,
 ) {
-    let mut stack = vec![expression];
-    while let Some(expression) = stack.pop() {
-        match expression {
-            PlanDerivedExpression::MaterializeList { expression, .. } => {
-                stack.push(expression);
-            }
-            PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
-                roots.push(*default);
-                roots.extend(arms.iter().map(|arm| arm.value));
-            }
-            PlanDerivedExpression::BoolAnd { left, right } => {
-                stack.push(right);
-                stack.push(left);
-            }
-            PlanDerivedExpression::BoolNotExpression { input } => {
-                stack.push(input);
-            }
-            PlanDerivedExpression::RowExpression { expression }
-            | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
-                roots.push(*expression);
-            }
-            PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
-            | PlanDerivedExpression::BoolNot { .. }
-            | PlanDerivedExpression::NumberCompareConst { .. }
-            | PlanDerivedExpression::ValueCompare { .. } => {}
+    match expression {
+        PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+            roots.push(*default);
+            roots.extend(arms.iter().map(|arm| arm.value));
         }
+        PlanDerivedExpression::RowExpression { expression }
+        | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
+            roots.push(*expression);
+        }
+        PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
+        | PlanDerivedExpression::BoolNot { .. }
+        | PlanDerivedExpression::NumberCompareConst { .. }
+        | PlanDerivedExpression::ValueCompare { .. } => {}
     }
 }
 
@@ -11401,6 +11388,33 @@ fn effect_result_route_matches(
 }
 
 fn source_route_owners_resolve(plan: &MachinePlan) -> bool {
+    let mut row_projections = BTreeMap::<(ListId, Vec<String>), SourceId>::new();
+    for route in &plan.source_routes {
+        for projection in &route.row_projections {
+            if projection.path.is_empty()
+                || !plan
+                    .storage_layout
+                    .list_slots
+                    .iter()
+                    .any(|slot| slot.list_id == projection.list)
+            {
+                return false;
+            }
+            if row_projections.iter().any(|((list, path), source)| {
+                *list == projection.list
+                    && *source != route.source_id
+                    && (path.starts_with(&projection.path) || projection.path.starts_with(path))
+            }) {
+                return false;
+            }
+            if row_projections
+                .insert((projection.list, projection.path.clone()), route.source_id)
+                .is_some_and(|source| source != route.source_id)
+            {
+                return false;
+            }
+        }
+    }
     plan.source_routes.iter().all(|route| {
         if route.scoped != route.scope_id.is_some() {
             return false;
@@ -12177,15 +12191,12 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
     match &op.kind {
         PlanOpKind::SourceRoute | PlanOpKind::DependencyEdge => true,
         PlanOpKind::DerivedValue {
-            expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+            materialization: Some(_),
+            expression: Some(PlanDerivedExpression::RowExpression { expression }),
             ..
         } if matches!(
-            expression.as_ref(),
-            PlanDerivedExpression::RowExpression { expression }
-                if matches!(
-                    arena.get(*expression),
-                    Some(PlanRowExpressionNode::ListAccess { .. })
-                )
+            arena.get(*expression),
+            Some(PlanRowExpressionNode::ListAccess { .. })
         ) =>
         {
             op.unresolved_executable_ref_count == 0
@@ -12358,6 +12369,7 @@ fn cpu_plan_executor_supports_derived_value_op(
     };
     let PlanOpKind::DerivedValue {
         derived_kind,
+        materialization,
         expression,
         ..
     } = &op.kind
@@ -12365,6 +12377,7 @@ fn cpu_plan_executor_supports_derived_value_op(
         return false;
     };
     if matches!(derived_kind, PlanDerivedKind::ListView)
+        && materialization.is_none()
         && expression.is_none()
         && op.unresolved_executable_ref_count == 0
     {
@@ -12376,8 +12389,8 @@ fn cpu_plan_executor_supports_derived_value_op(
     let Some(expression) = expression else {
         return false;
     };
-    if let PlanDerivedExpression::MaterializeList { expression, .. } = expression {
-        return match expression.as_ref() {
+    if materialization.is_some() {
+        return match expression {
             PlanDerivedExpression::RowExpression { expression }
                 if matches!(
                     arena.get(*expression),
@@ -12393,9 +12406,6 @@ fn cpu_plan_executor_supports_derived_value_op(
             _ => false,
         };
     }
-    let expression = match expression {
-        expression => expression,
-    };
     match (op.indexed, derived_kind, expression) {
         (
             false,
@@ -12476,17 +12486,13 @@ fn cpu_plan_executor_supports_derived_value_op(
                 && root_row_expression_cpu_evaluable(arena, *expression)
         }
         (false, PlanDerivedKind::Pure, expression) => {
-            root_bool_expression_cpu_supported(arena, op, expression)
+            root_bool_expression_cpu_supported(op, expression)
         }
         _ => false,
     }
 }
 
-fn root_bool_expression_cpu_supported(
-    arena: &PlanRowExpressionArena,
-    op: &PlanOp,
-    expression: &PlanDerivedExpression,
-) -> bool {
+fn root_bool_expression_cpu_supported(op: &PlanOp, expression: &PlanDerivedExpression) -> bool {
     match expression {
         PlanDerivedExpression::NumberCompareConst {
             left, op: op_name, ..
@@ -12502,13 +12508,6 @@ fn root_bool_expression_cpu_supported(
             op: op_name,
             right,
         } => op_name.is_comparison() && op.inputs.contains(left) && op.inputs.contains(right),
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            root_bool_expression_cpu_supported(arena, op, left)
-                && root_bool_expression_cpu_supported(arena, op, right)
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            root_bool_expression_cpu_supported(arena, op, input)
-        }
         _ => false,
     }
 }
@@ -13076,76 +13075,53 @@ fn derived_expression_refs_resolve(plan: &MachinePlan) -> bool {
         .flat_map(|region| &region.ops)
         .all(|op| {
             let PlanOpKind::DerivedValue {
-                expression: Some(expression),
+                materialization,
+                expression,
                 ..
             } = &op.kind
             else {
                 return true;
             };
-            match expression {
-                PlanDerivedExpression::MaterializeList {
-                    target_list,
-                    fields,
-                    row_field_copies,
-                    expression,
-                    ..
-                } => {
-                    plan.storage_layout
-                        .list_slots
-                        .iter()
-                        .any(|slot| slot.list_id == *target_list)
-                        && fields
-                            .values()
-                            .all(|field| list_has_row_field(plan, *target_list, *field))
-                        && row_field_copies.iter().all(|copy| {
-                            list_has_row_field(plan, copy.source_list, copy.source_field)
-                                && list_has_row_field(plan, *target_list, copy.target_field)
-                        })
-                        && derived_expression_refs_resolve_for_op(
-                            &plan.row_expressions,
-                            op,
-                            expression,
-                        )
-                }
-                PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
-                    source_id,
-                    key_field,
-                    state,
-                    ..
-                } => {
-                    op.inputs.contains(&ValueRef::SourcePayload {
-                        source_id: *source_id,
-                        field: key_field.clone(),
-                    }) && op.inputs.contains(state)
-                }
-                PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
-                    row_expression_refs_resolve(&plan.row_expressions, op, *default)
-                        && arms.iter().all(|arm| {
-                            matches!(&arm.trigger, ValueRef::Source(_) | ValueRef::State(_))
-                                && op.inputs.contains(&arm.trigger)
-                                && row_expression_refs_resolve(&plan.row_expressions, op, arm.value)
-                        })
-                }
-                PlanDerivedExpression::BoolNot { input } => op.inputs.contains(input),
-                PlanDerivedExpression::NumberCompareConst { left, .. } => op.inputs.contains(left),
-                PlanDerivedExpression::ValueCompare { left, right, .. } => {
-                    op.inputs.contains(left) && op.inputs.contains(right)
-                }
-                PlanDerivedExpression::BoolAnd { left, right } => {
-                    derived_expression_refs_resolve_for_op(&plan.row_expressions, op, left)
-                        && derived_expression_refs_resolve_for_op(&plan.row_expressions, op, right)
-                }
-                PlanDerivedExpression::BoolNotExpression { input } => {
-                    derived_expression_refs_resolve_for_op(&plan.row_expressions, op, input)
-                }
-                PlanDerivedExpression::RowExpression { expression } => {
-                    row_expression_refs_resolve(&plan.row_expressions, op, *expression)
-                }
-                PlanDerivedExpression::MaterializedRowField { expression, .. } => {
-                    row_expression_refs_resolve(&plan.row_expressions, op, *expression)
-                }
-            }
+            materialization.as_ref().is_none_or(|materialization| {
+                expression.is_some() && list_materialization_refs_resolve(plan, materialization)
+            }) && expression.as_ref().is_none_or(|expression| {
+                derived_expression_refs_resolve_for_op(&plan.row_expressions, op, expression)
+            })
         })
+}
+
+fn list_materialization_refs_resolve(
+    plan: &MachinePlan,
+    materialization: &PlanListMaterialization,
+) -> bool {
+    let list_exists = |list_id| {
+        plan.storage_layout
+            .list_slots
+            .iter()
+            .any(|slot| slot.list_id == list_id)
+    };
+    list_exists(materialization.target_list)
+        && materialization
+            .authority_source_list
+            .is_none_or(|source_list| list_exists(source_list))
+        && materialization
+            .fields
+            .values()
+            .all(|field| list_has_row_field(plan, materialization.target_list, *field))
+        && materialization.row_field_copies.iter().all(|copy| {
+            list_has_row_field(plan, copy.source_list, copy.source_field)
+                && list_has_row_field(plan, materialization.target_list, copy.target_field)
+        })
+        && materialization
+            .value_list_authorities
+            .iter()
+            .all(|authority| {
+                list_exists(authority.list_id)
+                    && authority
+                        .fields
+                        .values()
+                        .all(|field| list_has_row_field(plan, authority.list_id, *field))
+            })
 }
 
 fn derived_expression_refs_resolve_for_op(
@@ -13154,9 +13130,6 @@ fn derived_expression_refs_resolve_for_op(
     expression: &PlanDerivedExpression,
 ) -> bool {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => {
-            derived_expression_refs_resolve_for_op(arena, op, expression)
-        }
         PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
             source_id,
             key_field,
@@ -13180,13 +13153,6 @@ fn derived_expression_refs_resolve_for_op(
         PlanDerivedExpression::NumberCompareConst { left, .. } => op.inputs.contains(left),
         PlanDerivedExpression::ValueCompare { left, right, .. } => {
             op.inputs.contains(left) && op.inputs.contains(right)
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            derived_expression_refs_resolve_for_op(arena, op, left)
-                && derived_expression_refs_resolve_for_op(arena, op, right)
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            derived_expression_refs_resolve_for_op(arena, op, input)
         }
         PlanDerivedExpression::RowExpression { expression } => {
             row_expression_refs_resolve(arena, op, *expression)
@@ -13328,21 +13294,11 @@ fn derived_expression_contextual_locals_resolve(
     expression: &PlanDerivedExpression,
 ) -> bool {
     match expression {
-        PlanDerivedExpression::MaterializeList { expression, .. } => {
-            derived_expression_contextual_locals_resolve(arena, expression)
-        }
         PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
             arena.contextual_locals_resolve(*default).unwrap_or(false)
                 && arms
                     .iter()
                     .all(|arm| arena.contextual_locals_resolve(arm.value).unwrap_or(false))
-        }
-        PlanDerivedExpression::BoolAnd { left, right } => {
-            derived_expression_contextual_locals_resolve(arena, left)
-                && derived_expression_contextual_locals_resolve(arena, right)
-        }
-        PlanDerivedExpression::BoolNotExpression { input } => {
-            derived_expression_contextual_locals_resolve(arena, input)
         }
         PlanDerivedExpression::RowExpression { expression } => arena
             .contextual_locals_resolve(*expression)

@@ -5,7 +5,7 @@ use boon_document::{
     RenderVisualPrimitiveKind, RetainedDocument, RetainedDocumentUpdate,
 };
 use boon_host::Viewport;
-use boon_plan::{OwnerInstanceId, SourceRouteToken};
+use boon_plan::{OwnerInstanceRoute, SourceRouteToken};
 
 pub(crate) const OPERATOR_CURSOR_LIGHT: [u8; 4] = [255, 255, 255, 255];
 pub(crate) const OPERATOR_CURSOR_DARK: [u8; 4] = [24, 28, 36, 255];
@@ -390,7 +390,7 @@ fn action_source_intent(action: Option<&str>) -> Option<&str> {
 fn entry_matches_owner_text(
     frame: &DocumentFrame,
     hits: &boon_document::HitSideTable,
-    owner: &OwnerInstanceId,
+    owner: &OwnerInstanceRoute,
     entry: &boon_document::HitSideTableEntry,
     expected: &str,
 ) -> bool {

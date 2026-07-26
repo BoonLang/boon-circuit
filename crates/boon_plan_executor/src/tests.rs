@@ -310,6 +310,7 @@ fn route(source: usize, scope: Option<usize>) -> SourceRoute {
         path: format!("source.{source}"),
         scoped: scope.is_some(),
         scope_id: scope.map(ScopeId),
+        row_projections: Vec::new(),
         interval_ms: None,
         payload_schema: SourcePayloadSchema {
             fields: Vec::new(),
@@ -329,6 +330,7 @@ fn derived(
         kind: PlanOpKind::DerivedValue {
             derived_kind: PlanDerivedKind::Pure,
             startup_recompute: true,
+            materialization: None,
             expression: expression
                 .map(|expression| PlanDerivedExpression::RowExpression { expression }),
         },
@@ -489,6 +491,7 @@ fn root_value_comparison_tracks_both_state_inputs() {
         kind: PlanOpKind::DerivedValue {
             derived_kind: PlanDerivedKind::Pure,
             startup_recompute: true,
+            materialization: None,
             expression: Some(PlanDerivedExpression::ValueCompare {
                 left: ValueRef::State(StateId(0)),
                 op: PlanInfixOp::Equal,
@@ -1268,6 +1271,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
         path: "source.select".into(),
         scoped: true,
         scope_id: Some(ScopeId(0)),
+        row_projections: Vec::new(),
         interval_ms: None,
         payload_schema: SourcePayloadSchema {
             fields: Vec::new(),
@@ -1300,6 +1304,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
         kind: PlanOpKind::DerivedValue {
             derived_kind: PlanDerivedKind::Pure,
             startup_recompute: true,
+            materialization: None,
             expression: Some(PlanDerivedExpression::RowExpression {
                 expression: projected_expression,
             }),
@@ -2372,7 +2377,7 @@ document: Document/new(
 }
 
 #[test]
-fn chunk_windows_keep_logical_length_sparse_and_preserve_overlapping_row_identity() {
+fn chunk_windows_keep_logical_length_sparse_and_refresh_evicted_row_identity() {
     let compiled = boon_compiler::compile_source_text_to_machine_plan(
         "virtual-chunk-window-runtime.bn",
         r#"
@@ -2459,9 +2464,13 @@ document: Document/new(
         .list_row_snapshots_window_current(sheet_rows, 2..3)
         .unwrap();
     assert_eq!(returned.len(), 1);
-    assert_eq!(
+    assert_ne!(
         first[2].id, returned[0].id,
-        "virtual row identity must not depend on cache residency"
+        "an evicted virtual row must receive a fresh identity when rematerialized"
+    );
+    assert!(
+        session.row_snapshot(first[2].id).is_err(),
+        "the evicted virtual row route must stay invalid"
     );
     assert_eq!(session.list_row_snapshots(sheet_rows).unwrap().len(), 1);
 
@@ -2555,9 +2564,18 @@ document: Document/new(
     let (_, returned) = session
         .list_row_snapshots_window_current(chunks, 0..2)
         .unwrap();
-    assert_eq!(
-        returned.iter().map(|row| row.id).collect::<Vec<_>>(),
-        initial.iter().map(|row| row.id).collect::<Vec<_>>()
+    assert!(
+        returned
+            .iter()
+            .zip(&initial)
+            .all(|(returned, initial)| returned.id != initial.id),
+        "evicted chunk rows must receive fresh identities after source changes"
+    );
+    assert!(
+        initial
+            .iter()
+            .all(|row| session.row_snapshot(row.id).is_err()),
+        "stale chunk row routes must remain invalid"
     );
     assert_eq!(session.list_row_snapshots(chunks).unwrap().len(), 2);
 }
@@ -3407,10 +3425,10 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     let mut access_indexes = Vec::new();
     for op in compiled.plan.regions.iter().flat_map(|region| &region.ops) {
         if let PlanOpKind::DerivedValue {
-            expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+            materialization: Some(_),
+            expression: Some(PlanDerivedExpression::RowExpression { expression }),
             ..
         } = &op.kind
-            && let PlanDerivedExpression::RowExpression { expression } = expression.as_ref()
             && let PlanRowExpressionNode::ListAccess { access } =
                 compiled.plan.row_expression(*expression).unwrap()
         {
@@ -3509,17 +3527,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .flat_map(|region| &region.ops)
         .filter_map(|op| match &op.kind {
             PlanOpKind::DerivedValue {
-                expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+                materialization: Some(_),
+                expression: Some(PlanDerivedExpression::RowExpression { expression }),
                 ..
-            } => match expression.as_ref() {
-                PlanDerivedExpression::RowExpression { expression } => {
-                    match compiled.plan.row_expression(*expression).unwrap() {
-                        PlanRowExpressionNode::ListAccess { access } => {
-                            Some(access.selection.clone())
-                        }
-                        _ => None,
-                    }
-                }
+            } => match compiled.plan.row_expression(*expression).unwrap() {
+                PlanRowExpressionNode::ListAccess { access } => Some(access.selection.clone()),
                 _ => None,
             },
             _ => None,
@@ -5469,27 +5481,306 @@ fn deep_acyclic_dependency_plan(depth: usize) -> MachinePlan {
     )
 }
 
-#[test]
-fn deep_acyclic_dependency_chain_uses_the_default_test_thread_stack() {
-    const DEPTH: usize = 4_096;
-    let mut session = MachineInstance::new(
-        deep_acyclic_dependency_plan(DEPTH),
-        SessionOptions::default(),
+fn state_backed_deep_dependency_plan(depth: usize) -> MachinePlan {
+    assert!(depth > 0);
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let mut ops = Vec::with_capacity(depth + 1);
+    for field in 0..depth {
+        let input = if field == 0 {
+            ValueRef::State(StateId(0))
+        } else {
+            ValueRef::Field(FieldId(field - 1))
+        };
+        let expression = row_field(&mut row_expressions, input.clone());
+        ops.push(derived(field, field, vec![input], Some(expression)));
+    }
+    ops.push(const_update(&mut row_expressions, depth, 0, 0, 1));
+    let labels = (0..depth)
+        .map(|field| format!("chain.{field}"))
+        .collect::<Vec<_>>();
+    let field_labels = labels
+        .iter()
+        .enumerate()
+        .map(|(field, label)| (FieldId(field), label.as_str()))
+        .collect();
+    plan(
+        RootOutputDemand::Selected(Vec::new()),
+        row_expressions,
+        vec![
+            constant(0, number_constant(7)),
+            constant(1, number_constant(11)),
+        ],
+        vec![route(0, None)],
+        vec![number_slot(0, 0)],
+        Vec::new(),
+        ops,
+        vec![(StateId(0), "chain.state")],
+        Vec::new(),
+        field_labels,
     )
-    .unwrap();
-
-    assert_eq!(
-        session
-            .root_value_current(&format!("chain.{}", DEPTH - 1))
-            .unwrap(),
-        number(7)
-    );
 }
 
 #[test]
-fn deep_work_budget_failure_cleans_currentness_for_later_demands() {
-    const DEPTH: usize = 512;
+fn default_stack_state_backed_dependency_chain_survives_dirty_and_redemand() {
+    const DEPTH: usize = 4_096;
     let mut session = MachineInstance::new(
+        state_backed_deep_dependency_plan(DEPTH),
+        SessionOptions::default(),
+    )
+    .unwrap();
+    let deepest = format!("chain.{}", DEPTH - 1);
+
+    let (initial, initial_metrics) = session.root_value_current_with_metrics(&deepest).unwrap();
+    assert_eq!(initial, number(7));
+    assert_eq!(initial_metrics.recomputed_field_count, DEPTH);
+
+    let turn = session.apply(event(&session, 1, 0, None)).unwrap();
+    assert_eq!(turn.metrics.recomputed_field_count, 0);
+    assert_eq!(session.snapshot().unwrap().states[&StateId(0)], number(11));
+
+    let (updated, updated_metrics) = session.root_value_current_with_metrics(&deepest).unwrap();
+    assert_eq!(updated, number(11));
+    assert_eq!(updated_metrics.recomputed_field_count, DEPTH);
+}
+
+fn deep_typed_list_page_plan(depth: usize) -> MachinePlan {
+    assert!(depth > 0);
+    let mut source = format!(
+        r#"
+store: [
+    items:
+        List/range(from: 0, to: {depth})
+        |> List/map(item, new: [rank: item])
+"#,
+    );
+    for page in 0..depth {
+        let after = if page == 0 {
+            "Start".to_owned()
+        } else {
+            format!("page_{}.next", page - 1)
+        };
+        source.push_str(&format!(
+            r#"    page_{page}:
+        items
+        |> List/sort_by(item, key: item.rank, direction: Ascending)
+        |> List/page(size: 1, after: {after})
+"#
+        ));
+    }
+    source.push_str("]\n");
+    let plan = compile_server_source(
+        "deep-typed-list-page-currentness.bn",
+        &source,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    let page_count = plan
+        .row_expressions
+        .iter()
+        .filter(|(_, node)| matches!(node, PlanRowExpressionNode::ListPage { .. }))
+        .count();
+    assert_eq!(page_count, depth);
+    assert_eq!(
+        plan.list_indexes.len(),
+        1,
+        "equivalent typed pages must share one ordered index"
+    );
+    plan
+}
+
+#[test]
+fn default_stack_deep_typed_list_pages_do_not_nest_evaluator_transactions() {
+    const DEPTH: usize = 512;
+    let mut session =
+        MachineInstance::new(deep_typed_list_page_plan(DEPTH), SessionOptions::default()).unwrap();
+
+    let (items, next) = page_parts(
+        session
+            .root_value_current(&format!("store.page_{}", DEPTH - 1))
+            .unwrap(),
+    );
+    let [Value::Record(item)] = items.as_slice() else {
+        panic!("deep typed page must contain one materialized record");
+    };
+    assert_eq!(item["rank"], number((DEPTH - 1) as i64));
+    assert!(matches!(next, Value::Record(_)));
+}
+
+fn projected_chunk_slot(list: usize, label_field: usize, items_field: usize) -> ListStorageSlot {
+    ListStorageSlot {
+        id: PlanStorageId(list),
+        list_id: ListId(list),
+        scope_id: Some(ScopeId(list)),
+        row_fields: vec![
+            PlanListRowField {
+                field_id: FieldId(label_field),
+                name: "label".to_owned(),
+                role: PlanListRowFieldRole::Value,
+            },
+            PlanListRowField {
+                field_id: FieldId(items_field),
+                name: "items".to_owned(),
+                role: PlanListRowFieldRole::Value,
+            },
+        ],
+        capacity: None,
+        hidden_key_type: "Key".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Empty,
+        range: None,
+        initial_rows: Vec::new(),
+    }
+}
+
+fn chunk_projection_op(id: usize, list: usize, source_list: usize) -> PlanOp {
+    PlanOp {
+        id: PlanOpId(id),
+        kind: PlanOpKind::ListProjection {
+            projection: PlanListProjection::Chunk {
+                source_list: ListId(source_list),
+                size: 1,
+            },
+        },
+        inputs: vec![ValueRef::List(ListId(source_list))],
+        output: Some(ValueRef::List(ListId(list))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    }
+}
+
+fn deep_chunk_chain_plan(depth: usize) -> MachinePlan {
+    assert!(depth > 0);
+    let mut list_slots = Vec::with_capacity(depth + 1);
+    list_slots.push(ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_fields: vec![PlanListRowField {
+            field_id: FieldId(0),
+            name: "value".to_owned(),
+            role: PlanListRowFieldRole::Authority,
+        }],
+        capacity: None,
+        hidden_key_type: "Key".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![PlanInitialListRow {
+            fields: vec![PlanInitialListField {
+                name: "value".to_owned(),
+                field_id: Some(FieldId(0)),
+                initializer: initial(number_constant(1)),
+            }],
+        }],
+    });
+    let mut ops = Vec::with_capacity(depth);
+    for list in 1..=depth {
+        list_slots.push(projected_chunk_slot(list, list * 2 - 1, list * 2));
+        ops.push(chunk_projection_op(list - 1, list, list - 1));
+    }
+
+    let list_label_storage = (0..=depth)
+        .map(|list| {
+            if list == 0 {
+                "chunks.base".to_owned()
+            } else {
+                format!("chunks.level_{list}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let list_labels = list_label_storage
+        .iter()
+        .enumerate()
+        .map(|(list, label)| (ListId(list), label.as_str()))
+        .collect();
+    let mut field_label_storage = vec![(FieldId(0), "chunks.base.value".to_owned())];
+    for list in 1..=depth {
+        field_label_storage.push((FieldId(list * 2 - 1), format!("chunks.level_{list}.label")));
+        field_label_storage.push((FieldId(list * 2), format!("chunks.level_{list}.items")));
+    }
+    let field_labels = field_label_storage
+        .iter()
+        .map(|(field, label)| (*field, label.as_str()))
+        .collect();
+
+    plan(
+        RootOutputDemand::Selected(Vec::new()),
+        PlanRowExpressionArena::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        list_slots,
+        ops,
+        Vec::new(),
+        list_labels,
+        field_labels,
+    )
+}
+
+#[test]
+fn default_stack_deep_acyclic_chunk_length_and_window_chain_is_iterative() {
+    const DEPTH: usize = 1_024;
+    let deepest = ListId(DEPTH);
+    let mut session =
+        MachineInstance::new(deep_chunk_chain_plan(DEPTH), SessionOptions::default()).unwrap();
+
+    assert_eq!(session.list_logical_len_current(deepest).unwrap(), 1);
+    assert!(
+        session.list_row_snapshots(deepest).unwrap().is_empty(),
+        "logical-length demand must not materialize the deepest chunk row"
+    );
+
+    let (logical_len, rows) = session
+        .list_row_snapshots_window_current(deepest, 0..1)
+        .unwrap();
+    assert_eq!(logical_len, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.list, deepest);
+    let Value::List(items) = &rows[0].fields[&FieldId(DEPTH * 2)] else {
+        panic!("deepest chunk items must remain a typed list");
+    };
+    assert!(matches!(
+        items.as_slice(),
+        [Value::Row { id, .. }] if id.list == ListId(DEPTH - 1)
+    ));
+}
+
+fn cyclic_chunk_plan() -> MachinePlan {
+    let list_label_storage = ["cycle.left".to_owned(), "cycle.right".to_owned()];
+    let list_labels = list_label_storage
+        .iter()
+        .enumerate()
+        .map(|(list, label)| (ListId(list), label.as_str()))
+        .collect();
+    let field_label_storage = [
+        (FieldId(0), "cycle.left.label".to_owned()),
+        (FieldId(1), "cycle.left.items".to_owned()),
+        (FieldId(2), "cycle.right.label".to_owned()),
+        (FieldId(3), "cycle.right.items".to_owned()),
+    ];
+    let field_labels = field_label_storage
+        .iter()
+        .map(|(field, label)| (*field, label.as_str()))
+        .collect();
+    plan(
+        RootOutputDemand::Selected(Vec::new()),
+        PlanRowExpressionArena::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![projected_chunk_slot(0, 0, 1), projected_chunk_slot(1, 2, 3)],
+        vec![chunk_projection_op(0, 0, 1), chunk_projection_op(1, 1, 0)],
+        Vec::new(),
+        list_labels,
+        field_labels,
+    )
+}
+
+#[test]
+fn default_stack_worklist_failures_clean_currentness_for_retry() {
+    const DEPTH: usize = 512;
+    let mut budgeted = MachineInstance::new(
         deep_acyclic_dependency_plan(DEPTH),
         SessionOptions {
             max_work_units_per_transaction: Some(32),
@@ -5501,10 +5792,19 @@ fn deep_work_budget_failure_cleans_currentness_for_later_demands() {
 
     for _ in 0..2 {
         assert!(matches!(
-            session.root_value_current(&deepest),
+            budgeted.root_value_current(&deepest),
             Err(Error::WorkBudgetExceeded { limit: 32, .. })
         ));
-        assert_eq!(session.root_value_current("chain.0").unwrap(), number(7));
+        assert_eq!(budgeted.root_value_current("chain.0").unwrap(), number(7));
+    }
+
+    let mut cyclic = MachineInstance::new(cyclic_chunk_plan(), SessionOptions::default()).unwrap();
+    for entry in [ListId(0), ListId(1), ListId(0)] {
+        assert_eq!(
+            cyclic.list_logical_len_current(entry),
+            Err(Error::ListCycle { list: entry }),
+            "cycle cleanup must let each fresh entry discover its own back-edge"
+        );
     }
 }
 
@@ -5644,6 +5944,7 @@ fn materializing_a_row_field_does_not_invalidate_list_structure_consumers() {
         kind: PlanOpKind::DerivedValue {
             derived_kind: PlanDerivedKind::Pure,
             startup_recompute: false,
+            materialization: None,
             expression: Some(PlanDerivedExpression::RowExpression {
                 expression: copy_expression,
             }),
@@ -5695,6 +5996,7 @@ fn source_transform_captures_event_before_later_demand() {
         kind: PlanOpKind::DerivedValue {
             derived_kind: PlanDerivedKind::SourceEventTransform,
             startup_recompute: false,
+            materialization: None,
             expression: Some(PlanDerivedExpression::SourceEventTransform {
                 default,
                 arms: vec![PlanSourceEventTransformArm {
@@ -5756,6 +6058,7 @@ fn source_transform_keeps_precommit_state_for_the_event_turn() {
         kind: PlanOpKind::DerivedValue {
             derived_kind: PlanDerivedKind::SourceEventTransform,
             startup_recompute: true,
+            materialization: None,
             expression: Some(PlanDerivedExpression::SourceEventTransform {
                 default,
                 arms: vec![PlanSourceEventTransformArm {
@@ -7733,24 +8036,30 @@ store: [
         .and_then(|id| id.parse::<usize>().ok())
         .map(ListId)
         .expect("twice-forwarded materialized rows list");
-    let remove = machine
+    let (remove, remove_owner_list) = machine
         .source_routes
         .iter()
         .find(|route| route.path.ends_with(".controls.remove"))
-        .map(|route| route.source_id)
+        .and_then(|route| {
+            route
+                .owner
+                .ancestors
+                .last()
+                .map(|owner| (route.source_id, owner.list))
+        })
         .expect("row-scoped remove source");
     let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
 
     let materialized = session.list_rows_current(consumed).unwrap();
     assert_eq!(materialized.len(), 2);
     assert_ne!(materialized[0], materialized[1]);
+    let source_rows = session.list_rows_current(remove_owner_list).unwrap();
+    assert_eq!(source_rows.len(), 2);
+    let left_owner = session.structural_owner_rows(source_rows[0]).unwrap();
+    let right_owner = session.structural_owner_rows(source_rows[1]).unwrap();
     assert_ne!(
-        session
-            .source_route_token_for_descendant_row(remove, materialized[0])
-            .unwrap(),
-        session
-            .source_route_token_for_descendant_row(remove, materialized[1])
-            .unwrap()
+        session.source_route_token(remove, &left_owner).unwrap(),
+        session.source_route_token(remove, &right_owner).unwrap()
     );
 }
 
@@ -13464,14 +13773,14 @@ fn detached_capture_materialization_plan(declaration: DetachedCaptureDeclaration
         kind: PlanOpKind::DerivedValue {
             derived_kind: PlanDerivedKind::ListView,
             startup_recompute: true,
-            expression: Some(PlanDerivedExpression::MaterializeList {
+            materialization: Some(PlanListMaterialization {
                 target_list: ListId(1),
                 authority_source_list: None,
                 fields: BTreeMap::from([("seed".to_owned(), FieldId(20))]),
                 row_field_copies: Vec::new(),
                 value_list_authorities: Vec::new(),
-                expression: Box::new(PlanDerivedExpression::RowExpression { expression: map }),
             }),
+            expression: Some(PlanDerivedExpression::RowExpression { expression: map }),
         },
         inputs: vec![ValueRef::List(ListId(0))],
         output: Some(ValueRef::List(ListId(1))),

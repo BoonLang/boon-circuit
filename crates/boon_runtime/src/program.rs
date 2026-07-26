@@ -2673,8 +2673,11 @@ impl ProgramDocumentHost {
         parent: &DocumentFrame,
         parent_patches: Vec<DocumentPatch>,
     ) -> ProgramHostUpdate {
-        if !parent_patches.iter().all(parent_patch_is_nonstructural) {
-            return self.reconcile_full(parent);
+        if parent_patches
+            .iter()
+            .any(|patch| !parent_patch_is_nonstructural(patch))
+        {
+            return self.reconcile_structural_parent_patches(parent, parent_patches);
         }
         self.stats.scoped_parent_patch_count = self
             .stats
@@ -2741,6 +2744,119 @@ impl ProgramDocumentHost {
             rejections,
             bootstrap: false,
         }
+    }
+
+    fn reconcile_structural_parent_patches(
+        &mut self,
+        parent: &DocumentFrame,
+        parent_patches: Vec<DocumentPatch>,
+    ) -> ProgramHostUpdate {
+        if self.structural_patches_touch_projection(&parent_patches) {
+            return self.reconcile_full(parent);
+        }
+        self.stats.scoped_parent_patch_count = self
+            .stats
+            .scoped_parent_patch_count
+            .saturating_add(parent_patches.len().try_into().unwrap_or(u64::MAX));
+
+        let mut touched = BTreeSet::new();
+        let mut removed_roots = Vec::new();
+        for patch in &parent_patches {
+            match patch {
+                DocumentPatch::UpsertNode(node) => {
+                    touched.insert(node.id.clone());
+                    if let Some(parent) = node.parent.as_ref() {
+                        touched.insert(parent.clone());
+                    }
+                }
+                DocumentPatch::RemoveNode { id } => {
+                    removed_roots.push(id.clone());
+                    if let Some(parent) = self
+                        .frame
+                        .nodes
+                        .get(id)
+                        .and_then(|node| node.parent.clone())
+                    {
+                        touched.insert(parent);
+                    }
+                }
+                DocumentPatch::InsertChild { parent, child, .. }
+                | DocumentPatch::RemoveChild { parent, child } => {
+                    touched.insert(parent.clone());
+                    touched.insert(child.clone());
+                }
+                DocumentPatch::MoveChild {
+                    child, new_parent, ..
+                } => {
+                    if let Some(previous_parent) = self
+                        .frame
+                        .nodes
+                        .get(child)
+                        .and_then(|node| node.parent.clone())
+                    {
+                        touched.insert(previous_parent);
+                    }
+                    touched.insert(new_parent.clone());
+                    touched.insert(child.clone());
+                }
+                patch => {
+                    if let Some(id) = parent_patch_target(patch) {
+                        touched.insert(id.clone());
+                    }
+                }
+            }
+        }
+
+        for root in removed_roots {
+            for node in frame_subtree_nodes(&self.frame, &root) {
+                self.frame.nodes.remove(&node);
+            }
+        }
+        for id in touched {
+            match parent.nodes.get(&id).cloned() {
+                Some(mut node) => {
+                    if let Some(projection) = self.projections.get(&id) {
+                        node.children.extend(projected_root_children(projection));
+                    }
+                    self.frame.nodes.insert(id, node);
+                }
+                None => {
+                    self.frame.nodes.remove(&id);
+                }
+            }
+        }
+        self.parent_focus.clone_from(&parent.focus);
+        self.parent_scroll_roots.clone_from(&parent.scroll_roots);
+        self.frame.focus.clone_from(&parent.focus);
+        self.frame.scroll_roots.clone_from(&parent.scroll_roots);
+        self.parent_materializations = frame_materializations(parent);
+        self.refresh_metadata_and_routes();
+        ProgramHostUpdate {
+            patches: parent_patches,
+            requests: Vec::new(),
+            rejections: Vec::new(),
+            bootstrap: false,
+        }
+    }
+
+    fn structural_patches_touch_projection(&self, patches: &[DocumentPatch]) -> bool {
+        patches.iter().any(|patch| match patch {
+            DocumentPatch::UpsertNode(node) => {
+                node.kind == DocumentNodeKind::EmbeddedProgram
+                    || self.projections.contains_key(&node.id)
+            }
+            DocumentPatch::RemoveNode { id } => frame_subtree_nodes(&self.frame, id)
+                .iter()
+                .any(|node| self.projections.contains_key(node)),
+            DocumentPatch::InsertChild { parent, child, .. }
+            | DocumentPatch::RemoveChild { parent, child } => {
+                self.projections.contains_key(parent) || self.projections.contains_key(child)
+            }
+            DocumentPatch::MoveChild {
+                child, new_parent, ..
+            } => self.projections.contains_key(child) || self.projections.contains_key(new_parent),
+            patch => parent_patch_target(patch).is_some_and(|id| self.projections.contains_key(id)),
+        })
     }
 
     fn reconcile_full(&mut self, parent: &DocumentFrame) -> ProgramHostUpdate {
@@ -3387,6 +3503,20 @@ fn frame_materializations(frame: &DocumentFrame) -> BTreeSet<u64> {
         .flat_map(|node| node.materialized.iter())
         .filter_map(|range| range.materialization)
         .collect()
+}
+
+fn frame_subtree_nodes(frame: &DocumentFrame, root: &DocumentNodeId) -> BTreeSet<DocumentNodeId> {
+    let mut nodes = BTreeSet::new();
+    let mut pending = vec![root.clone()];
+    while let Some(node) = pending.pop() {
+        if !nodes.insert(node.clone()) {
+            continue;
+        }
+        if let Some(node) = frame.nodes.get(&node) {
+            pending.extend(node.children.iter().rev().cloned());
+        }
+    }
+    nodes
 }
 
 fn parent_patch_is_nonstructural(patch: &DocumentPatch) -> bool {
@@ -4892,6 +5022,75 @@ scene: Scene/Element/program(
             stats_after
                 .scoped_projection_refresh_count
                 .saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn structural_parent_splice_stays_scoped_without_full_host_reconciliation() {
+        let mut first = DocumentFrame::empty("parent");
+        for label in ["a", "b"] {
+            let mut node = DocumentNode::new(label, DocumentNodeKind::Text);
+            node.parent = Some(first.root.clone());
+            node.text = Some(TextValue {
+                text: label.to_owned(),
+            });
+            first
+                .nodes
+                .get_mut(&first.root)
+                .unwrap()
+                .children
+                .push(node.id.clone());
+            first.nodes.insert(node.id.clone(), node);
+        }
+        let mut next = first.clone();
+        next.nodes
+            .get_mut(&next.root)
+            .unwrap()
+            .children
+            .retain(|child| child.0 != "b");
+        next.nodes.remove(&DocumentNodeId("b".to_owned()));
+        let mut c = DocumentNode::new("c", DocumentNodeKind::Text);
+        c.parent = Some(next.root.clone());
+        c.text = Some(TextValue {
+            text: "c".to_owned(),
+        });
+        next.nodes
+            .get_mut(&next.root)
+            .unwrap()
+            .children
+            .push(c.id.clone());
+        next.nodes.insert(c.id.clone(), c);
+
+        let patches = crate::document::diff_frames(&first, &next);
+        assert!(
+            patches
+                .iter()
+                .any(|patch| matches!(patch, DocumentPatch::RemoveNode { .. }))
+        );
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "structural-splice", "local"),
+            &first,
+        );
+        assert!(requests.is_empty());
+        let stats_before = host.stats();
+        let previous = host.frame().clone();
+        let update = host.reconcile_with_parent_patches(&next, patches.clone());
+
+        assert!(update.requests.is_empty());
+        assert!(update.rejections.is_empty());
+        assert_eq!(update.patches, patches);
+        assert_eq!(replay_patches(previous, update.patches), *host.frame());
+        assert_eq!(*host.frame(), next);
+        let stats_after = host.stats();
+        assert_eq!(
+            stats_after.full_reconcile_count,
+            stats_before.full_reconcile_count
+        );
+        assert_eq!(
+            stats_after.scoped_parent_patch_count,
+            stats_before
+                .scoped_parent_patch_count
+                .saturating_add(patches.len() as u64)
         );
     }
 

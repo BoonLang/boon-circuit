@@ -1,30 +1,6 @@
 // Included by `../tests.rs`; kept in the parent test module for private IR helper access.
 
 #[test]
-fn nested_source_structural_projection_is_not_payload() {
-    assert!(
-        executable_source_payload_projection(
-            "controls.select",
-            "controls",
-            &["select".to_owned()],
-        )
-        .is_empty()
-    );
-    assert_eq!(
-        executable_source_payload_projection(
-            "controls.select",
-            "controls",
-            &["select".to_owned(), "text".to_owned()],
-        ),
-        ["text"]
-    );
-    assert_eq!(
-        executable_source_payload_projection("submit", "submit", &["text".to_owned()]),
-        ["text"]
-    );
-}
-
-#[test]
 fn structural_group_is_erased_without_losing_child_event_flow() {
     let parsed = boon_parser::parse_source(
         "structural-group-event-flow.bn",
@@ -57,6 +33,50 @@ store: [
         &ir,
         "store.results.child",
         exact_source_cause(&ir, "store.trigger"),
+    );
+}
+
+#[test]
+fn source_only_group_has_no_scalar_binding_or_derived_output() {
+    let parsed = boon_parser::parse_source(
+        "source-only-group.bn",
+        r#"
+store: [
+    events: [
+        press: SOURCE
+        release: SOURCE
+    ]
+    active:
+        False |> HOLD active {
+            events.press |> THEN { True }
+            events.release |> THEN { False }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let ir = lower(&parsed).expect("source-only groups are structural authority");
+    assert!(
+        ir.derived_values
+            .iter()
+            .all(|derived| derived.path != "store.events"),
+        "source-only groups cannot become runtime scalar outputs"
+    );
+    let binding = ir
+        .scope_index
+        .bindings
+        .iter()
+        .find(|binding| binding.diagnostic_path == "store.events")
+        .expect("structural source-group binding");
+    assert!(
+        matches!(
+            binding.target,
+            ErasedBindingTarget::Value {
+                field: None,
+                row: None
+            }
+        ),
+        "source-only groups must project through their expression without scalar FieldId authority: {binding:#?}"
     );
 }
 
@@ -321,63 +341,6 @@ FUNCTION selectable_row(row) {
             .any(|source| source == "store.clear"),
         "changing list membership must not masquerade as a row selection event: {:?}",
         selected.sources
-    );
-}
-
-#[test]
-fn press_payload_fields_are_bool_typed() {
-    assert_eq!(
-        source_payload_data_type(&SourcePayloadField::Named("press".to_owned())),
-        SemanticDataType::Bool
-    );
-    assert_eq!(
-        source_payload_data_type(&SourcePayloadField::Named("pointer_x".to_owned())),
-        SemanticDataType::Text
-    );
-}
-
-#[test]
-fn view_row_source_alias_resolves_to_unique_canonical_source_path() {
-    let sources = [
-        ("file_tree_row.file_row_elements.select_file", SourceId(0)),
-        ("file_tree_row.scope_row_elements.select_scope", SourceId(1)),
-    ];
-    assert_eq!(
-        canonical_view_source_path(&sources, "row.file_row_elements.select_file")
-            .map(|(path, source_id)| (path, source_id.as_usize())),
-        Some(("file_tree_row.file_row_elements.select_file", 0))
-    );
-
-    let ambiguous = [
-        ("left.file_row_elements.select_file", SourceId(0)),
-        ("right.file_row_elements.select_file", SourceId(1)),
-    ];
-    assert!(
-        canonical_view_source_path(&ambiguous, "row.file_row_elements.select_file").is_none(),
-        "view row aliases must not guess when suffixes are ambiguous"
-    );
-}
-
-#[test]
-fn selected_row_source_projection_resolves_by_unique_source_suffix() {
-    let sources = [
-        ("item.sources.editor.change", SourceId(0)),
-        ("item.sources.editor.commit", SourceId(1)),
-    ];
-    assert_eq!(
-        canonical_view_source_path(&sources, "store.selected_input.sources.editor.change")
-            .map(|(path, source_id)| (path, source_id.as_usize())),
-        Some(("item.sources.editor.change", 0))
-    );
-
-    let ambiguous = [
-        ("left.sources.editor.change", SourceId(0)),
-        ("right.sources.editor.change", SourceId(1)),
-    ];
-    assert!(
-        canonical_view_source_path(&ambiguous, "store.selected_input.sources.editor.change")
-            .is_none(),
-        "selected-row source aliases must remain ambiguity-safe"
     );
 }
 
@@ -1056,6 +1019,381 @@ FUNCTION selectable_row(seed) {
     );
 }
 
+#[test]
+fn pure_wrapper_calls_keep_source_record_provenance_disjoint() {
+    let source = r#"
+store: [
+    left: SOURCE
+    right: SOURCE
+    left_wrapped:
+        identity(value: [events: [press: left]])
+    right_wrapped:
+        identity(value: [events: [press: right]])
+]
+
+FUNCTION identity(value) {
+    value
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: LIST {
+            Element/button(
+                element: [events: store.left_wrapped.events]
+                style: []
+                label: TEXT { Left }
+            )
+            Element/button(
+                element: [events: store.right_wrapped.events]
+                style: []
+                label: TEXT { Right }
+            )
+        }
+    )
+)
+"#;
+    let parsed = boon_parser::parse_source("disjoint-source-wrapper-calls.bn", source).unwrap();
+    let ir = lower(&parsed).expect("pure wrapper calls must retain exact source provenance");
+
+    let button_sources = ir
+        .view_bindings
+        .iter()
+        .filter_map(|binding| {
+            (binding.node_kind == "Button" && binding.attr == "press").then_some((
+                binding.path.as_str(),
+                binding.target.clone(),
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        button_sources,
+        BTreeSet::from([
+            (
+                "store.left",
+                ViewBindingTarget::Source {
+                    source: SourceId(0),
+                },
+            ),
+            (
+                "store.right",
+                ViewBindingTarget::Source {
+                    source: SourceId(1),
+                },
+            ),
+        ]),
+        "independent wrapper calls must not union their source leaves"
+    );
+}
+
+#[test]
+fn mapped_source_group_forwarding_uses_exact_upstream_local_provenance() {
+    let source = r#"
+store: [
+    seed: LIST { [key: TEXT { one }] }
+    rows:
+        seed |> List/map(item, new: selectable_row(row: item))
+    forwarded:
+        rows |> List/map(item, new: [
+            key: item.key
+            controls: identity(value: item.controls)
+        ])
+]
+
+FUNCTION identity(value) {
+    value
+}
+
+FUNCTION selectable_row(row) {
+    [key: row.key, controls: [select: SOURCE]]
+}
+
+FUNCTION render_row(row) {
+    Element/button(
+        element: [events: [press: row.controls.select]]
+        style: []
+        label: row.key
+    )
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: store.forwarded |> List/map(item, new: render_row(row: item))
+    )
+)
+"#;
+    let parsed = boon_parser::parse_source("forwarded-source-group-wrapper.bn", source).unwrap();
+    let ir = lower(&parsed).expect("mapped source groups must use executable provenance");
+    let source = ir
+        .sources
+        .iter()
+        .find(|source| source.path == "store.rows.controls.select")
+        .expect("upstream row source");
+    assert_eq!(
+        ir.sources
+            .iter()
+            .filter(|candidate| candidate.path.ends_with(".controls.select"))
+            .count(),
+        1,
+        "forwarding must not allocate a second source"
+    );
+    assert!(ir.view_bindings.iter().any(|binding| {
+        binding.node_kind == "Button"
+            && binding.attr == "press"
+            && binding.target == ViewBindingTarget::Source { source: source.id }
+    }));
+    assert!(ir.scope_index.locals.iter().any(|local| {
+        local.members.iter().any(|member| {
+            member.path == ["controls", "select"]
+                && member.target == ErasedLocalMemberTarget::Source(source.id)
+                && member.forwarded_from.is_some()
+        })
+    }));
+}
+
+#[test]
+fn mapped_source_forwards_but_mapped_state_remains_an_ordinary_value() {
+    let source = r#"
+store: [
+    seed: LIST { [key: TEXT { one }, value: 1] }
+    rows:
+        seed |> List/map(item, new: stateful_row(row: item))
+    forwarded:
+        rows |> List/map(item, new: [
+            key: item.key
+            controls: item.controls
+            current: item.current
+        ])
+]
+
+FUNCTION stateful_row(row) {
+    [
+        key: row.key
+        controls: [press: SOURCE]
+        current:
+            row.value |> HOLD current {
+                controls.press |> THEN { current + 1 }
+            }
+    ]
+}
+
+FUNCTION render_row(row) {
+    Element/button(
+        element: [events: [press: row.controls.press]]
+        style: []
+        label: row.key
+    )
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: store.forwarded |> List/map(item, new: render_row(row: item))
+    )
+)
+"#;
+    let parsed = boon_parser::parse_source("forwarded-source-and-state.bn", source).unwrap();
+    let ir = lower(&parsed).expect("source forwarding must not create a state alias");
+    let forwarded = ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.forwarded")
+        .expect("forwarded list");
+    let local_members = ir
+        .scope_index
+        .locals
+        .iter()
+        .filter(|local| local.row.map(|row| row.list) == Some(forwarded.id))
+        .flat_map(|local| local.members.iter())
+        .collect::<Vec<_>>();
+    assert!(local_members.iter().any(|member| {
+        member.path == ["controls", "press"]
+            && matches!(member.target, ErasedLocalMemberTarget::Source(_))
+            && member.forwarded_from.is_some()
+    }));
+    let current = local_members
+        .iter()
+        .find(|member| member.path == ["current"])
+        .expect("forwarded current value");
+    let ErasedLocalMemberTarget::Field(current_field) = current.target else {
+        panic!("forwarded state value became a resource alias: {current:?}");
+    };
+    assert!(
+        !ir.scope_index.fields[current_field.as_usize()].resource_only,
+        "forwarded state value must remain materialized"
+    );
+}
+
+#[test]
+fn conditional_row_wrappers_preserve_nested_source_leaves_beside_runtime_fields() {
+    let source = r#"
+store: [
+    seed: LIST {
+        [key: TEXT { one }, kind: Selectable]
+    }
+    rows:
+        seed |> List/map(item, new: wrapped_row(row: item))
+    selectable:
+        rows
+        |> List/filter(item, if: item.kind == Selectable)
+        |> List/filter(item, if: item.key == TEXT { one })
+    forwarded:
+        selectable |> List/map(item, new: [
+            key: item.key
+            controls: item.controls
+            selected: item.selected
+        ])
+]
+
+FUNCTION wrapped_row(row) {
+    row.kind |> WHEN {
+        Selectable => selectable_row(row: row)
+        __ => row
+    }
+}
+
+FUNCTION selectable_row(row) {
+    [
+        key: row.key
+        kind: Selectable
+        controls: [remove: SOURCE]
+        selected:
+            True |> HOLD selected {
+                controls.remove |> THEN { False }
+            }
+    ]
+}
+
+FUNCTION render_row(row) {
+    Element/button(
+        element: [events: [press: row.controls.remove]]
+        style: []
+        label: row.key
+    )
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: store.forwarded |> List/map(item, new: render_row(row: item))
+    )
+)
+"#;
+    let parsed =
+        boon_parser::parse_source("conditional-nested-source-provenance.bn", source).unwrap();
+    let ir = lower(&parsed).expect("conditional row source leaves must stay structurally exact");
+    let remove = ir
+        .sources
+        .iter()
+        .find(|source| source.path.ends_with(".controls.remove"))
+        .unwrap_or_else(|| panic!("conditional row remove source: {:#?}", ir.sources));
+
+    assert!(ir.scope_index.locals.iter().any(|local| {
+        local.members.iter().any(|member| {
+            member.path == ["controls", "remove"]
+                && member.target == ErasedLocalMemberTarget::Source(remove.id)
+        }) && local.members.iter().any(|member| {
+            member.path == ["controls"]
+                && matches!(member.target, ErasedLocalMemberTarget::Field(_))
+        })
+    }));
+    assert!(ir.view_bindings.iter().any(|binding| {
+        binding.node_kind == "Button"
+            && binding.attr == "press"
+            && binding.target == ViewBindingTarget::Source { source: remove.id }
+    }));
+}
+
+#[test]
+fn filtered_output_rows_publish_source_projections_without_a_later_contextual_consumer() {
+    let source = r#"
+FUNCTION selectable_row(row) {
+    [
+        key: row.key
+        controls: [select: SOURCE]
+    ]
+}
+
+store: [
+    seed: LIST {
+        [key: TEXT { one }]
+        [key: TEXT { two }]
+    }
+    rows:
+        seed |> List/map(item, new: selectable_row(row: item))
+    filtered:
+        rows |> List/filter(item, if: True)
+    chunks:
+        filtered |> List/chunk(size: 1)
+]
+"#;
+    let parsed =
+        boon_parser::parse_source("filtered-output-source-projections.bn", source).unwrap();
+    let ir = lower(&parsed).expect("filtered output must retain exact source authority");
+    let filtered = ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.filtered")
+        .expect("filtered storage");
+    let select = ir
+        .sources
+        .iter()
+        .find(|source| source.path.ends_with(".controls.select"))
+        .expect("row select source");
+
+    assert!(
+        ir.scope_index
+            .row_source_projections
+            .iter()
+            .any(|projection| {
+                projection.row.list == filtered.id
+                    && projection.path == ["controls", "select"]
+                    && projection.source == select.id
+            }),
+        "stored output row authority must not depend on a later List/map consumer: {:#?}",
+        ir.scope_index.row_source_projections
+    );
+}
+
+#[test]
+fn one_row_path_cannot_alias_two_distinct_sources() {
+    let mut members = BTreeMap::new();
+    merge_erased_source_member(
+        &mut members,
+        ErasedLocalMember {
+            path: vec!["controls".to_owned(), "press".to_owned()],
+            target: ErasedLocalMemberTarget::Source(SourceId(3)),
+            forwarded_from: None,
+        },
+        "test row",
+    )
+    .unwrap();
+
+    let error = merge_erased_source_member(
+        &mut members,
+        ErasedLocalMember {
+            path: vec!["controls".to_owned(), "press".to_owned()],
+            target: ErasedLocalMemberTarget::Source(SourceId(4)),
+            forwarded_from: None,
+        },
+        "test row",
+    )
+    .expect_err("one row path must have exactly one source identity");
+
+    assert!(error.contains("controls.press"), "{error}");
+    assert!(error.contains("SourceId(3)"), "{error}");
+    assert!(error.contains("SourceId(4)"), "{error}");
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum TestRuntimeResourceIdentity {
     Source(SourceId),
@@ -1345,6 +1683,62 @@ seed: 0
 }
 
 #[test]
+fn invocation_producer_uses_explicit_origin_without_a_fabricated_checked_source() {
+    let parsed = boon_parser::parse_source(
+        "invocation-producer-origin.bn",
+        r#"
+FUNCTION identity(value) {
+    value + 0
+}
+
+seed: 0
+"#,
+    )
+    .unwrap();
+    let identity = [7; 32];
+    let program = lower_runtime_with_external_types_and_producer_functions(
+        &parsed,
+        &boon_typecheck::ExternalTypeEnvironment::default(),
+        &[ProducerFunctionLoweringRequest {
+            identity,
+            local_function: "identity".to_owned(),
+            mode: ProducerFunctionMode::Invocation,
+        }],
+    )
+    .unwrap();
+    let [instance] = program.producer_function_instances.as_slice() else {
+        panic!(
+            "expected one invocation producer, got {:#?}",
+            program.producer_function_instances
+        );
+    };
+    let invocation_source = instance
+        .invocation_source
+        .expect("invocation producer owns one source");
+    let runtime_source = &program.sources[invocation_source.as_usize()];
+    assert_eq!(runtime_source.source_expr_id, None);
+    let executable_source = program
+        .executable
+        .sources
+        .iter()
+        .find(|source| source.id == runtime_source.executable_source_id.unwrap())
+        .expect("runtime source retains its executable definition");
+    assert_eq!(
+        executable_source.origin,
+        ExecutableSourceOrigin::ProducerInvocation {
+            function: instance.function,
+            identity,
+        }
+    );
+    assert!(program.executable.sources.iter().all(|source| {
+        matches!(
+            source.origin,
+            ExecutableSourceOrigin::ProducerInvocation { .. }
+        )
+    }));
+}
+
+#[test]
 fn hold_backed_producer_is_resource_bound_before_final_ir_verification() {
     let parsed = boon_parser::parse_source(
         "hold-backed-producer.bn",
@@ -1352,9 +1746,10 @@ fn hold_backed_producer_is_resource_bound_before_final_ir_verification() {
 FUNCTION local_resource(initial) {
     [
         change: SOURCE
+        normalized: initial + 0
         current:
-            initial |> HOLD current {
-                change |> THEN { initial }
+            normalized |> HOLD current {
+                change |> THEN { normalized }
             }
     ]
 }
@@ -1969,6 +2364,147 @@ FUNCTION place(id, name, x, y) {
             value: boon_data::Value::Record(fields),
         } if fields.len() == 2
     ));
+}
+
+#[test]
+fn erased_local_reads_keep_call_site_binding_identity() {
+    let parsed = boon_parser::parse_source(
+        "call-site-local-bindings.bn",
+        r#"
+FUNCTION wrapped(value) {
+    BLOCK {
+        local: value
+        local
+    }
+}
+
+store: [
+    first: wrapped(value: 1)
+    second: wrapped(value: 2)
+]
+"#,
+    )
+    .unwrap();
+    let ir = lower(&parsed).expect("call-site locals must erase with exact binding identities");
+    let locals = ir
+        .scope_index
+        .reads
+        .iter()
+        .filter_map(|read| match read.target {
+            ErasedReadTarget::Local {
+                binding,
+                declaration,
+                ..
+            } => Some((binding, declaration)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let declarations = locals
+        .iter()
+        .map(|(_, declaration)| *declaration)
+        .collect::<BTreeSet<_>>();
+    let bindings = locals
+        .iter()
+        .map(|(binding, _)| *binding)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        declarations.len(),
+        1,
+        "the repeated calls should originate from one checked declaration: {locals:?}"
+    );
+    assert_eq!(
+        bindings.len(),
+        2,
+        "the repeated calls require two exact erased call-site bindings: {locals:?}"
+    );
+}
+
+fn resource_only_row_program() -> ErasedProgram {
+    let parsed = boon_parser::parse_source(
+        "resource-only-row.bn",
+        r#"
+store: [
+    inputs: LIST { [label: TEXT { one }, kind: Selectable] }
+    rows:
+        inputs
+        |> List/map(item, new: new_row(input: item))
+    forwarded:
+        rows
+        |> List/map(item, new: [
+            controls: item.controls
+            label: item.label
+            selected: item.selected
+        ])
+]
+
+FUNCTION new_row(input) {
+    [
+        controls: [select: SOURCE]
+        label: input.label
+        selected:
+            True |> HOLD selected {
+                controls.select |> THEN { False }
+            }
+    ]
+}
+"#,
+    )
+    .unwrap();
+    lower(&parsed).expect("generic mapped resource row")
+}
+
+#[test]
+fn erased_value_binding_rejects_resource_only_field_authority() {
+    let mut ir = resource_only_row_program();
+    let resource = ir
+        .scope_index
+        .fields
+        .iter()
+        .find(|field| field.resource_only)
+        .map(|field| field.id)
+        .expect("nested SOURCE structural field");
+    let binding = ir
+        .scope_index
+        .bindings
+        .iter_mut()
+        .find(|binding| {
+            matches!(
+                binding.target,
+                ErasedBindingTarget::Value {
+                    field: Some(_),
+                    ..
+                }
+            )
+        })
+        .expect("ordinary scalar value binding");
+    let ErasedBindingTarget::Value { field, .. } = &mut binding.target else {
+        unreachable!();
+    };
+    *field = Some(resource);
+
+    let error = verify_erased_scope_index(&ir)
+        .expect_err("resource-only fields cannot become scalar value bindings");
+    assert!(error.contains("resource-only FieldId"), "{error}");
+}
+
+#[test]
+fn derived_value_rejects_resource_only_field_authority() {
+    let mut ir = resource_only_row_program();
+    let resource = ir
+        .scope_index
+        .fields
+        .iter()
+        .find(|field| field.resource_only)
+        .map(|field| field.id)
+        .expect("nested SOURCE structural field");
+    ir.derived_values
+        .first_mut()
+        .expect("mapped rows derived value")
+        .id = resource;
+
+    let error = verify_static_schedule(&ir)
+        .expect_err("resource-only fields cannot become derived scalar outputs");
+    assert!(error.contains("resource-only FieldId"), "{error}");
 }
 
 #[test]

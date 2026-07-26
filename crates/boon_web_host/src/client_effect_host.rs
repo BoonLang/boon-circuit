@@ -271,7 +271,7 @@ fn invalid_policy(reason: impl ToString) -> WebHostError {
 mod tests {
     use super::*;
     use boon_plan::{
-        EffectDeliveryCardinality, EffectId, EffectInvocationId, OwnerInstanceId,
+        EffectDeliveryCardinality, EffectId, EffectInvocationId, OwnerInstanceRoute,
         builtin_effect_contract,
     };
     use boon_runtime::{
@@ -308,7 +308,7 @@ mod tests {
             effect_id,
             trigger_sequence: sequence,
             authority_turn_sequence: sequence,
-            owner: OwnerInstanceId::root(),
+            owner: OwnerInstanceRoute::root(),
             target: None,
             intent: Value::Record(BTreeMap::from([(
                 "byte_count".to_owned(),

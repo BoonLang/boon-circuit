@@ -140,6 +140,7 @@ pub struct DocumentMaterializationStats {
     pub materialized_nodes: usize,
     pub full_evaluation_count: u64,
     pub retained_scalar_evaluation_count: u64,
+    pub retained_window_evaluation_count: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -151,7 +152,7 @@ pub(crate) struct DocumentRuntime {
     field_state_aliases: BTreeMap<FieldId, boon_plan::StateId>,
     field_owners: BTreeMap<FieldId, ListId>,
     list_scopes: BTreeMap<ListId, ScopeId>,
-    row_sources: BTreeMap<ListId, Vec<(String, SourceId)>>,
+    row_sources: RowSourceIndex,
     windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand>,
     last_nonempty_windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand>,
     empty_source_windows: BTreeSet<DocumentMaterializationId>,
@@ -160,7 +161,11 @@ pub(crate) struct DocumentRuntime {
     structural_dependencies: BTreeSet<DocumentDependency>,
     structural_lists: BTreeSet<ListId>,
     structural_list_fields: BTreeSet<(ListId, FieldId)>,
+    root_structural_dependencies: BTreeSet<DocumentDependency>,
+    root_structural_lists: BTreeSet<ListId>,
+    root_structural_list_fields: BTreeSet<(ListId, FieldId)>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
+    retained_materializations: BTreeMap<RetainedMaterializationKey, RetainedMaterialization>,
     scalar_dependents: BTreeMap<DocumentDependency, BTreeSet<RetainedBindingKey>>,
     scalar_guarded_dependents: BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
     scalar_guard_values: BTreeMap<(ValueTarget, Value), BTreeSet<RetainedBindingKey>>,
@@ -168,8 +173,11 @@ pub(crate) struct DocumentRuntime {
     scoped_materialization_identities: ScopedMaterializationIdentities,
     full_evaluation_count: u64,
     retained_scalar_evaluation_count: u64,
+    retained_window_evaluation_count: u64,
     stats: DocumentMaterializationStats,
 }
+
+type RowSourceIndex = BTreeMap<ListId, BTreeMap<Vec<String>, SourceId>>;
 
 pub(crate) struct DocumentRollback(DocumentRollbackKind);
 
@@ -258,26 +266,7 @@ impl DocumentRuntime {
             .iter()
             .filter_map(|slot| slot.scope_id.map(|scope| (slot.list_id, scope)))
             .collect();
-        let row_sources = machine
-            .source_routes
-            .iter()
-            .filter_map(|route| {
-                let scope = route.scope_id?;
-                let list = machine
-                    .storage_layout
-                    .list_slots
-                    .iter()
-                    .find(|slot| slot.scope_id == Some(scope))?
-                    .list_id;
-                Some((list, (route.path.clone(), route.source_id)))
-            })
-            .fold(
-                BTreeMap::<ListId, Vec<(String, SourceId)>>::new(),
-                |mut sources, (list, source)| {
-                    sources.entry(list).or_default().push(source);
-                    sources
-                },
-            );
+        let row_sources = compiled_row_source_index(&machine)?;
         let windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand> = plan
             .materializations
             .iter()
@@ -313,7 +302,11 @@ impl DocumentRuntime {
             structural_dependencies: BTreeSet::new(),
             structural_lists: BTreeSet::new(),
             structural_list_fields: BTreeSet::new(),
+            root_structural_dependencies: BTreeSet::new(),
+            root_structural_lists: BTreeSet::new(),
+            root_structural_list_fields: BTreeSet::new(),
             retained_nodes: BTreeMap::new(),
+            retained_materializations: BTreeMap::new(),
             scalar_dependents: BTreeMap::new(),
             scalar_guarded_dependents: BTreeMap::new(),
             scalar_guard_values: BTreeMap::new(),
@@ -321,6 +314,7 @@ impl DocumentRuntime {
             scoped_materialization_identities: ScopedMaterializationIdentities::default(),
             full_evaluation_count: 0,
             retained_scalar_evaluation_count: 0,
+            retained_window_evaluation_count: 0,
             stats: DocumentMaterializationStats::default(),
         };
         let evaluated = runtime.evaluate(session)?;
@@ -345,11 +339,6 @@ impl DocumentRuntime {
         source: SourceId,
         env: &EvalEnv,
     ) -> Result<boon_plan::SourceRouteToken, DocumentError> {
-        if let Some(row) = env.active_row {
-            return session
-                .source_route_token_for_descendant_row(source, row)
-                .map_err(|error| DocumentError::Evaluation(error.to_string()));
-        }
         let route = self
             .machine_plan
             .source_routes
@@ -387,6 +376,7 @@ impl DocumentRuntime {
         DocumentMaterializationStats {
             full_evaluation_count: self.full_evaluation_count,
             retained_scalar_evaluation_count: self.retained_scalar_evaluation_count,
+            retained_window_evaluation_count: self.retained_window_evaluation_count,
             ..self.stats
         }
     }
@@ -415,26 +405,8 @@ impl DocumentRuntime {
         mount_patches(&self.frame)
     }
 
-    fn resolve_row_source(&self, list: ListId, suffix: &str) -> Option<EvalValue> {
-        let mut exact = None;
-        let mut group = BTreeMap::new();
-        for (path, source) in self.row_sources.get(&list)? {
-            let Some(remainder) = row_source_remainder(path, suffix) else {
-                continue;
-            };
-            if remainder.is_empty() {
-                if exact.replace(*source).is_some() {
-                    return None;
-                }
-            } else if !insert_row_source(&mut group, remainder, *source) {
-                return None;
-            }
-        }
-        match (exact, group.is_empty()) {
-            (Some(source), true) => Some(EvalValue::Source(source)),
-            (None, false) => Some(EvalValue::Record(group)),
-            _ => None,
-        }
+    fn resolve_row_source(&self, list: ListId, path: &[&str]) -> Option<EvalValue> {
+        resolve_row_source_index(&self.row_sources, list, path)
     }
 
     pub(crate) fn apply_turn(
@@ -550,6 +522,11 @@ impl DocumentRuntime {
                     && range.logical_item_count == 0
             })
         });
+        let previous_last_nonempty = self
+            .last_nonempty_windows
+            .get(&demand.materialization)
+            .cloned();
+        let was_empty_source = self.empty_source_windows.contains(&demand.materialization);
         if demand.overscan.start < demand.overscan.end {
             self.last_nonempty_windows
                 .insert(demand.materialization, demand.clone());
@@ -559,19 +536,428 @@ impl DocumentRuntime {
         } else {
             self.empty_source_windows.remove(&demand.materialization);
         }
-        self.windows.insert(demand.materialization, demand);
-        self.rebuild(session)
+        let materialization = demand.materialization;
+        let previous_window = self.windows.insert(materialization, demand);
+        let result = self.patch_materialization_window(session, materialization);
+        if result.is_err() {
+            match previous_window {
+                Some(previous) => {
+                    self.windows.insert(materialization, previous);
+                }
+                None => {
+                    self.windows.remove(&materialization);
+                }
+            }
+            match previous_last_nonempty {
+                Some(previous) => {
+                    self.last_nonempty_windows.insert(materialization, previous);
+                }
+                None => {
+                    self.last_nonempty_windows.remove(&materialization);
+                }
+            }
+            if was_empty_source {
+                self.empty_source_windows.insert(materialization);
+            } else {
+                self.empty_source_windows.remove(&materialization);
+            }
+        }
+        result
     }
 
-    fn rebuild(
+    fn patch_materialization_window(
         &mut self,
         session: &mut MachineInstance,
+        materialization: DocumentMaterializationId,
     ) -> Result<Vec<DocumentPatch>, DocumentError> {
-        let evaluated = self.evaluate(session)?;
-        let patches = diff_frames(&self.frame, &evaluated.frame);
-        self.install_evaluated(evaluated);
-        self.full_evaluation_count = self.full_evaluation_count.saturating_add(1);
+        let candidates = self
+            .retained_materializations
+            .keys()
+            .filter(|key| key.materialization == materialization)
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let candidate_subtrees = candidates
+            .iter()
+            .filter_map(|key| {
+                self.retained_materializations.get(key).map(|retained| {
+                    (
+                        key.clone(),
+                        document_subtree_nodes_for_roots(&self.frame, &retained.roots),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut roots = candidates
+            .into_iter()
+            .filter(|candidate| {
+                let Some(parent) = self
+                    .retained_materializations
+                    .get(candidate)
+                    .map(|retained| &retained.parent)
+                else {
+                    return false;
+                };
+                !candidate_subtrees
+                    .iter()
+                    .any(|(other, nodes)| other != candidate && nodes.contains(parent))
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by(|left, right| {
+            let left = self.retained_materializations.get(left);
+            let right = self.retained_materializations.get(right);
+            left.map(|retained| (&retained.parent, std::cmp::Reverse(retained.child_index)))
+                .cmp(
+                    &right.map(|retained| {
+                        (&retained.parent, std::cmp::Reverse(retained.child_index))
+                    }),
+                )
+        });
+
+        let mut patches = Vec::new();
+        let mut undos = Vec::new();
+        for key in roots {
+            match self.patch_materialization_instance(session, &key) {
+                Ok((next_patches, undo)) => {
+                    patches.extend(next_patches);
+                    undos.push(undo);
+                }
+                Err(error) => {
+                    for undo in undos.into_iter().rev() {
+                        self.rollback_materialization_patch(undo);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.rebuild_retained_dependency_indexes();
+        self.retain_active_scoped_materialization_identities();
+        self.refresh_materialization_stats(session);
+        self.retained_window_evaluation_count = self
+            .retained_window_evaluation_count
+            .saturating_add(undos.len() as u64);
         Ok(patches)
+    }
+
+    fn patch_materialization_instance(
+        &mut self,
+        session: &mut MachineInstance,
+        key: &RetainedMaterializationKey,
+    ) -> Result<(Vec<DocumentPatch>, MaterializationPatchUndo), DocumentError> {
+        let previous = self
+            .retained_materializations
+            .get(key)
+            .cloned()
+            .ok_or_else(|| {
+                DocumentError::Evaluation(format!(
+                    "materialization {} retained instance disappeared",
+                    key.materialization.0
+                ))
+            })?;
+        let previous_parent = self
+            .frame
+            .nodes
+            .get(&previous.parent)
+            .cloned()
+            .ok_or_else(|| {
+                DocumentError::InvalidPlan(format!(
+                    "materialization {} retained parent {} disappeared",
+                    key.materialization.0, previous.parent.0
+                ))
+            })?;
+        let previous_nodes = document_subtree_nodes_for_roots(&self.frame, &previous.roots);
+        let removed_materializations = self
+            .retained_materializations
+            .iter()
+            .filter_map(|(candidate, retained)| {
+                (candidate == key || previous_nodes.contains(&retained.parent))
+                    .then_some(candidate.clone())
+            })
+            .collect::<BTreeSet<_>>();
+
+        let mut evaluated = {
+            let evaluator = Evaluator::new_materialization_fragment(
+                self,
+                session,
+                previous_parent.clone(),
+                key.materialization,
+            );
+            evaluator.evaluate_materialization_fragment(key, previous.environment.clone())?
+        };
+        let next_target = evaluated
+            .retained_materializations
+            .get_mut(key)
+            .ok_or_else(|| {
+                DocumentError::InvalidPlan(format!(
+                    "materialization {} fragment lost its target",
+                    key.materialization.0
+                ))
+            })?;
+        let next_roots = next_target.roots.clone();
+        let old_root_set = previous.roots.iter().cloned().collect::<BTreeSet<_>>();
+        let insertion_index = previous
+            .roots
+            .iter()
+            .filter_map(|root| {
+                previous_parent
+                    .children
+                    .iter()
+                    .position(|child| child == root)
+            })
+            .min()
+            .unwrap_or(previous.child_index)
+            .min(previous_parent.children.len());
+        next_target.child_index = insertion_index;
+
+        let mut next_parent = previous_parent.clone();
+        next_parent
+            .children
+            .retain(|child| !old_root_set.contains(child));
+        let insertion_index = insertion_index.min(next_parent.children.len());
+        for (offset, root) in next_roots.iter().cloned().enumerate() {
+            next_parent
+                .children
+                .insert(insertion_index.saturating_add(offset), root);
+        }
+        let materialized_index = next_parent
+            .materialized
+            .iter()
+            .position(|range| range.materialization == Some(key.materialization.0))
+            .unwrap_or(next_parent.materialized.len());
+        next_parent
+            .materialized
+            .retain(|range| range.materialization != Some(key.materialization.0));
+        let next_ranges = evaluated
+            .frame
+            .nodes
+            .get(&previous.parent)
+            .map(|parent| {
+                parent
+                    .materialized
+                    .iter()
+                    .filter(|range| range.materialization == Some(key.materialization.0))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (offset, range) in next_ranges.into_iter().enumerate() {
+            let index = materialized_index
+                .saturating_add(offset)
+                .min(next_parent.materialized.len());
+            next_parent.materialized.insert(index, range);
+        }
+        evaluated
+            .frame
+            .nodes
+            .insert(previous.parent.clone(), next_parent.clone());
+
+        let mut previous_fragment = DocumentFrame::empty(previous.parent.0.clone());
+        previous_fragment
+            .nodes
+            .insert(previous.parent.clone(), previous_parent.clone());
+        for node in &previous_nodes {
+            if let Some(value) = self.frame.nodes.get(node).cloned() {
+                previous_fragment.nodes.insert(node.clone(), value);
+            }
+        }
+        let patches = diff_frames(&previous_fragment, &evaluated.frame);
+        let frame_node_keys = previous_nodes
+            .iter()
+            .cloned()
+            .chain(evaluated.frame.nodes.keys().cloned())
+            .chain(std::iter::once(previous.parent.clone()))
+            .collect::<BTreeSet<_>>();
+        let retained_node_keys = previous_nodes
+            .iter()
+            .cloned()
+            .chain(evaluated.retained_nodes.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        let sibling_materializations = self
+            .retained_materializations
+            .iter()
+            .filter_map(|(candidate, retained)| {
+                (candidate != key
+                    && retained.parent == previous.parent
+                    && retained.child_index > insertion_index)
+                    .then_some(candidate.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let retained_materialization_keys = removed_materializations
+            .iter()
+            .cloned()
+            .chain(evaluated.retained_materializations.keys().cloned())
+            .chain(sibling_materializations)
+            .collect::<BTreeSet<_>>();
+        let undo = MaterializationPatchUndo {
+            frame_nodes: frame_node_keys
+                .into_iter()
+                .map(|node| {
+                    let previous = self.frame.nodes.get(&node).cloned();
+                    (node, previous)
+                })
+                .collect(),
+            retained_nodes: retained_node_keys
+                .into_iter()
+                .map(|node| {
+                    let previous = self.retained_nodes.get(&node).cloned();
+                    (node, previous)
+                })
+                .collect(),
+            retained_materializations: retained_materialization_keys
+                .into_iter()
+                .map(|materialization| {
+                    let previous = self
+                        .retained_materializations
+                        .get(&materialization)
+                        .cloned();
+                    (materialization, previous)
+                })
+                .collect(),
+            target_values: evaluated
+                .target_values
+                .keys()
+                .map(|dependency| (*dependency, self.target_values.get(dependency).cloned()))
+                .collect(),
+            scoped_materialization_identities: self.scoped_materialization_identities.clone(),
+        };
+
+        for node in &previous_nodes {
+            self.frame.nodes.remove(node);
+            self.retained_nodes.remove(node);
+        }
+        for removed in &removed_materializations {
+            self.retained_materializations.remove(removed);
+        }
+        for (node, value) in evaluated.frame.nodes {
+            self.frame.nodes.insert(node, value);
+        }
+        self.retained_nodes.extend(evaluated.retained_nodes);
+        self.retained_materializations
+            .extend(evaluated.retained_materializations);
+        self.target_values.extend(evaluated.target_values);
+        self.scoped_materialization_identities = evaluated.scoped_materialization_identities;
+        self.adjust_sibling_materialization_indexes(
+            &previous.parent,
+            insertion_index,
+            previous.roots.len(),
+            next_roots.len(),
+            key,
+        );
+        Ok((patches, undo))
+    }
+
+    fn rollback_materialization_patch(&mut self, undo: MaterializationPatchUndo) {
+        for (node, previous) in undo.frame_nodes {
+            match previous {
+                Some(previous) => {
+                    self.frame.nodes.insert(node, previous);
+                }
+                None => {
+                    self.frame.nodes.remove(&node);
+                }
+            }
+        }
+        for (node, previous) in undo.retained_nodes {
+            match previous {
+                Some(previous) => {
+                    self.retained_nodes.insert(node, previous);
+                }
+                None => {
+                    self.retained_nodes.remove(&node);
+                }
+            }
+        }
+        for (materialization, previous) in undo.retained_materializations {
+            match previous {
+                Some(previous) => {
+                    self.retained_materializations
+                        .insert(materialization, previous);
+                }
+                None => {
+                    self.retained_materializations.remove(&materialization);
+                }
+            }
+        }
+        for (dependency, previous) in undo.target_values {
+            match previous {
+                Some(previous) => {
+                    self.target_values.insert(dependency, previous);
+                }
+                None => {
+                    self.target_values.remove(&dependency);
+                }
+            }
+        }
+        self.scoped_materialization_identities = undo.scoped_materialization_identities;
+    }
+
+    fn adjust_sibling_materialization_indexes(
+        &mut self,
+        parent: &FrameNodeId,
+        replaced_index: usize,
+        previous_len: usize,
+        next_len: usize,
+        replaced: &RetainedMaterializationKey,
+    ) {
+        for (key, retained) in &mut self.retained_materializations {
+            if key == replaced
+                || &retained.parent != parent
+                || retained.child_index <= replaced_index
+            {
+                continue;
+            }
+            retained.child_index = if next_len >= previous_len {
+                retained
+                    .child_index
+                    .saturating_add(next_len.saturating_sub(previous_len))
+            } else {
+                retained
+                    .child_index
+                    .saturating_sub(previous_len.saturating_sub(next_len))
+            };
+        }
+    }
+
+    fn rebuild_retained_dependency_indexes(&mut self) {
+        self.structural_dependencies = self.root_structural_dependencies.clone();
+        self.structural_lists = self.root_structural_lists.clone();
+        self.structural_list_fields = self.root_structural_list_fields.clone();
+        for retained in self.retained_materializations.values() {
+            self.structural_dependencies
+                .extend(retained.structural_dependencies.iter().copied());
+            self.structural_lists
+                .extend(retained.structural_lists.iter().copied());
+            self.structural_list_fields
+                .extend(retained.structural_list_fields.iter().copied());
+        }
+        self.rebuild_scalar_dependency_indexes();
+        self.target_values
+            .retain(|dependency, _| self.dependencies.contains(dependency));
+    }
+
+    fn retain_active_scoped_materialization_identities(&mut self) {
+        let active = self
+            .retained_materializations
+            .values()
+            .filter_map(|retained| retained.scoped_owner.clone())
+            .collect::<BTreeSet<_>>();
+        self.scoped_materialization_identities
+            .retain_active(&active);
+    }
+
+    fn refresh_materialization_stats(&mut self, session: &MachineInstance) {
+        let materialized_rows = self
+            .retained_materializations
+            .values()
+            .flat_map(|retained| retained.item_identities.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .len();
+        self.stats.logical_rows = session.logical_row_count();
+        self.stats.materialized_rows = materialized_rows;
+        self.stats.materialized_nodes = self.frame.nodes.len().saturating_sub(1);
     }
 
     fn rebuild_transactional(
@@ -643,7 +1029,23 @@ impl DocumentRuntime {
                 &mut self.structural_list_fields,
                 evaluated.structural_list_fields,
             ),
+            root_structural_dependencies: std::mem::replace(
+                &mut self.root_structural_dependencies,
+                evaluated.root_structural_dependencies,
+            ),
+            root_structural_lists: std::mem::replace(
+                &mut self.root_structural_lists,
+                evaluated.root_structural_lists,
+            ),
+            root_structural_list_fields: std::mem::replace(
+                &mut self.root_structural_list_fields,
+                evaluated.root_structural_list_fields,
+            ),
             retained_nodes: std::mem::replace(&mut self.retained_nodes, evaluated.retained_nodes),
+            retained_materializations: std::mem::replace(
+                &mut self.retained_materializations,
+                evaluated.retained_materializations,
+            ),
             target_values: std::mem::replace(&mut self.target_values, evaluated.target_values),
             scoped_materialization_identities: std::mem::replace(
                 &mut self.scoped_materialization_identities,
@@ -1030,10 +1432,31 @@ struct EvaluatedDocument {
     structural_dependencies: BTreeSet<DocumentDependency>,
     structural_lists: BTreeSet<ListId>,
     structural_list_fields: BTreeSet<(ListId, FieldId)>,
+    root_structural_dependencies: BTreeSet<DocumentDependency>,
+    root_structural_lists: BTreeSet<ListId>,
+    root_structural_list_fields: BTreeSet<(ListId, FieldId)>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
+    retained_materializations: BTreeMap<RetainedMaterializationKey, RetainedMaterialization>,
     target_values: BTreeMap<DocumentDependency, Value>,
     scoped_materialization_identities: ScopedMaterializationIdentities,
     stats: DocumentMaterializationStats,
+}
+
+struct EvaluatedMaterializationFragment {
+    frame: DocumentFrame,
+    retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
+    retained_materializations: BTreeMap<RetainedMaterializationKey, RetainedMaterialization>,
+    target_values: BTreeMap<DocumentDependency, Value>,
+    scoped_materialization_identities: ScopedMaterializationIdentities,
+}
+
+struct MaterializationPatchUndo {
+    frame_nodes: BTreeMap<FrameNodeId, Option<DocumentNode>>,
+    retained_nodes: BTreeMap<FrameNodeId, Option<RetainedNode>>,
+    retained_materializations:
+        BTreeMap<RetainedMaterializationKey, Option<RetainedMaterialization>>,
+    target_values: BTreeMap<DocumentDependency, Option<Value>>,
+    scoped_materialization_identities: ScopedMaterializationIdentities,
 }
 
 fn delta_dependency(delta: &Delta) -> Option<(DocumentDependency, &Value)> {
@@ -1071,6 +1494,7 @@ enum EvalValue {
     Row {
         id: Option<RowId>,
         fields: BTreeMap<FieldId, Value>,
+        provenance: BTreeMap<ScopeId, RowId>,
     },
     Source(SourceId),
     Nodes(Vec<FrameNodeId>),
@@ -1094,6 +1518,37 @@ struct RetainedNode {
     parent: Option<FrameNodeId>,
     environment: EvalEnv,
     arguments: Vec<RetainedArgument>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RetainedMaterializationKey {
+    materialization: DocumentMaterializationId,
+    parent_instance: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RetainedMaterialization {
+    parent: FrameNodeId,
+    environment: EvalEnv,
+    roots: Vec<FrameNodeId>,
+    child_index: usize,
+    structural_dependencies: BTreeSet<DocumentDependency>,
+    structural_lists: BTreeSet<ListId>,
+    structural_list_fields: BTreeSet<(ListId, FieldId)>,
+    item_identities: BTreeSet<DocumentItemIdentity>,
+    scoped_owner: Option<ScopedMaterializationOwner>,
+}
+
+struct MaterializationCapture {
+    key: RetainedMaterializationKey,
+    parent: FrameNodeId,
+    environment: EvalEnv,
+    child_index: usize,
+    structural_dependencies: BTreeSet<DocumentDependency>,
+    structural_lists: BTreeSet<ListId>,
+    structural_list_fields: BTreeSet<(ListId, FieldId)>,
+    item_identities: BTreeSet<DocumentItemIdentity>,
+    scoped_owner: Option<ScopedMaterializationOwner>,
 }
 
 #[derive(Clone, Debug)]
@@ -1155,7 +1610,12 @@ struct Evaluator<'a> {
     dependency_capture: Option<BTreeSet<DocumentDependency>>,
     structural_lists: BTreeSet<ListId>,
     structural_list_fields: BTreeSet<(ListId, FieldId)>,
+    root_structural_dependencies: BTreeSet<DocumentDependency>,
+    root_structural_lists: BTreeSet<ListId>,
+    root_structural_list_fields: BTreeSet<(ListId, FieldId)>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
+    retained_materializations: BTreeMap<RetainedMaterializationKey, RetainedMaterialization>,
+    materialization_stack: Vec<MaterializationCapture>,
     materialized_items: BTreeSet<DocumentItemIdentity>,
     scoped_materialization_identities: ScopedMaterializationIdentities,
     active_scoped_materialization_owners: BTreeSet<ScopedMaterializationOwner>,
@@ -1176,12 +1636,62 @@ impl<'a> Evaluator<'a> {
             dependency_capture: None,
             structural_lists: BTreeSet::new(),
             structural_list_fields: BTreeSet::new(),
+            root_structural_dependencies: BTreeSet::new(),
+            root_structural_lists: BTreeSet::new(),
+            root_structural_list_fields: BTreeSet::new(),
             retained_nodes: BTreeMap::new(),
+            retained_materializations: BTreeMap::new(),
+            materialization_stack: Vec::new(),
             materialized_items: BTreeSet::new(),
             scoped_materialization_identities: runtime.scoped_materialization_identities.clone(),
             active_scoped_materialization_owners: BTreeSet::new(),
             call_depth: 0,
         }
+    }
+
+    fn new_materialization_fragment(
+        runtime: &'a DocumentRuntime,
+        session: &'a mut MachineInstance,
+        mut parent: DocumentNode,
+        materialization: DocumentMaterializationId,
+    ) -> Self {
+        parent.children.clear();
+        parent
+            .materialized
+            .retain(|range| range.materialization != Some(materialization.0));
+        let root = parent.id.clone();
+        let mut evaluator = Self::new(runtime, session);
+        evaluator.frame = DocumentFrame::empty(root.0.clone());
+        evaluator.frame.nodes.insert(root, parent);
+        evaluator
+    }
+
+    fn evaluate_materialization_fragment(
+        mut self,
+        key: &RetainedMaterializationKey,
+        mut environment: EvalEnv,
+    ) -> Result<EvaluatedMaterializationFragment, DocumentError> {
+        let value = self.materialize(key.materialization, &mut environment)?;
+        let roots = value.node_ids();
+        let retained = self.retained_materializations.get(key).ok_or_else(|| {
+            DocumentError::InvalidPlan(format!(
+                "materialization {} fragment did not retain its target instance",
+                key.materialization.0
+            ))
+        })?;
+        if retained.roots != roots {
+            return Err(DocumentError::InvalidPlan(format!(
+                "materialization {} fragment roots are inconsistent",
+                key.materialization.0
+            )));
+        }
+        Ok(EvaluatedMaterializationFragment {
+            frame: self.frame,
+            retained_nodes: self.retained_nodes,
+            retained_materializations: self.retained_materializations,
+            target_values: self.projection_cache,
+            scoped_materialization_identities: self.scoped_materialization_identities,
+        })
     }
 
     fn evaluate(mut self) -> Result<EvaluatedDocument, DocumentError> {
@@ -1218,7 +1728,11 @@ impl<'a> Evaluator<'a> {
             structural_dependencies: self.structural_dependencies,
             structural_lists: self.structural_lists,
             structural_list_fields: self.structural_list_fields,
+            root_structural_dependencies: self.root_structural_dependencies,
+            root_structural_lists: self.root_structural_lists,
+            root_structural_list_fields: self.root_structural_list_fields,
             retained_nodes: self.retained_nodes,
+            retained_materializations: self.retained_materializations,
             target_values: self.projection_cache,
             scoped_materialization_identities: self.scoped_materialization_identities,
             stats,
@@ -1493,6 +2007,7 @@ impl<'a> Evaluator<'a> {
         Ok(EvalValue::Row {
             id: Some(row.id),
             fields: row.fields,
+            provenance: row.provenance,
         })
     }
 
@@ -1518,7 +2033,7 @@ impl<'a> Evaluator<'a> {
                     self.record_dependency(DocumentDependency::Value(target));
                 }
                 ValueRef::List(list) => {
-                    self.structural_lists.insert(list);
+                    self.record_structural_list(list);
                 }
                 ValueRef::DistributedImport(import) => {
                     self.record_dependency(DocumentDependency::DistributedImport(import));
@@ -1529,7 +2044,7 @@ impl<'a> Evaluator<'a> {
         machine_plan
             .row_expressions
             .visit_list_fields(expression, &mut |list, field| {
-                self.structural_list_fields.insert((list, field));
+                self.record_structural_list_field(list, field);
             })
             .map_err(|error| DocumentError::InvalidPlan(error.to_string()))?;
 
@@ -1645,7 +2160,7 @@ impl<'a> Evaluator<'a> {
             }
             DocumentRead::DistributedImport { import } => self.read_distributed_import(import),
             DocumentRead::List { list } => {
-                self.structural_lists.insert(list);
+                self.record_structural_list(list);
                 let logical_len = self
                     .session
                     .list_logical_len_current(list)
@@ -1700,6 +2215,7 @@ impl<'a> Evaluator<'a> {
                         .map(|snapshot| EvalValue::Row {
                             id: Some(row),
                             fields: snapshot.fields.clone(),
+                            provenance: snapshot.provenance,
                         })
                         .unwrap_or(EvalValue::Null);
                     Ok(self.project(snapshot, &projection))
@@ -1765,6 +2281,29 @@ impl<'a> Evaluator<'a> {
             capture.insert(dependency);
         } else {
             self.structural_dependencies.insert(dependency);
+            if let Some(materialization) = self.materialization_stack.last_mut() {
+                materialization.structural_dependencies.insert(dependency);
+            } else {
+                self.root_structural_dependencies.insert(dependency);
+            }
+        }
+    }
+
+    fn record_structural_list(&mut self, list: ListId) {
+        self.structural_lists.insert(list);
+        if let Some(materialization) = self.materialization_stack.last_mut() {
+            materialization.structural_lists.insert(list);
+        } else {
+            self.root_structural_lists.insert(list);
+        }
+    }
+
+    fn record_structural_list_field(&mut self, list: ListId, field: FieldId) {
+        self.structural_list_fields.insert((list, field));
+        if let Some(materialization) = self.materialization_stack.last_mut() {
+            materialization.structural_list_fields.insert((list, field));
+        } else {
+            self.root_structural_list_fields.insert((list, field));
         }
     }
 
@@ -2106,9 +2645,8 @@ impl<'a> Evaluator<'a> {
                 .filter_map(|name| self.name(*name).ok())
                 .filter(|name| *name != "events")
                 .collect::<Vec<_>>();
-            let suffix = names.join(".");
-            if !suffix.is_empty()
-                && let Some(source) = self.runtime.resolve_row_source(row.list, &suffix)
+            if !names.is_empty()
+                && let Some(source) = self.runtime.resolve_row_source(row.list, &names)
             {
                 return source;
             }
@@ -2124,7 +2662,7 @@ impl<'a> Evaluator<'a> {
                 EvalValue::MappedRow { mut fields, .. } => {
                     fields.remove(&name).unwrap_or(EvalValue::Null)
                 }
-                EvalValue::Row { id, fields } => {
+                EvalValue::Row { id, fields, .. } => {
                     let field = fields.keys().find(|field| {
                         self.runtime
                             .field_names
@@ -2179,7 +2717,7 @@ impl<'a> Evaluator<'a> {
                 .and_then(|names| names.last())
                 .and_then(|name| fields.remove(name))
                 .unwrap_or(EvalValue::Null),
-            EvalValue::Row { id, fields } => id
+            EvalValue::Row { id, fields, .. } => id
                 .and_then(|row| self.read_target(ValueTarget::RowField { row, field }).ok())
                 .or_else(|| fields.get(&field).cloned().map(|value| self.value(value)))
                 .unwrap_or(EvalValue::Null),
@@ -2288,13 +2826,42 @@ impl<'a> Evaluator<'a> {
             .ok_or_else(|| {
                 DocumentError::InvalidPlan(format!("materialization {} is missing", id.0))
             })?;
+        let parent = env.parent.clone().ok_or_else(|| {
+            DocumentError::InvalidPlan(format!("materialization {} has no retained parent", id.0))
+        })?;
+        let key = RetainedMaterializationKey {
+            materialization: id,
+            parent_instance: env.instance.as_ref().clone(),
+        };
+        let child_index = self
+            .frame
+            .nodes
+            .get(&parent)
+            .map(|node| node.children.len())
+            .ok_or_else(|| {
+                DocumentError::InvalidPlan(format!(
+                    "materialization {} parent {} is missing",
+                    id.0, parent.0
+                ))
+            })?;
+        self.materialization_stack.push(MaterializationCapture {
+            key: key.clone(),
+            parent: parent.clone(),
+            environment: env.clone(),
+            child_index,
+            structural_dependencies: BTreeSet::new(),
+            structural_lists: BTreeSet::new(),
+            structural_list_fields: BTreeSet::new(),
+            item_identities: BTreeSet::new(),
+            scoped_owner: None,
+        });
         enum MaterializationSourceRows {
             DirectList(ListId),
             Values(Vec<EvalValue>),
         }
         let (source, logical_item_count) = match materialization.source.clone() {
             DocumentMaterializationSource::List { list } => {
-                self.structural_lists.insert(list);
+                self.record_structural_list(list);
                 let logical_item_count = self
                     .session
                     .list_logical_len_current(list)
@@ -2308,7 +2875,7 @@ impl<'a> Evaluator<'a> {
                 let source = self.materialization_source(&materialization, env)?;
                 match source {
                     EvalValue::RuntimeList { list, logical_len } => {
-                        self.structural_lists.insert(list);
+                        self.record_structural_list(list);
                         (MaterializationSourceRows::DirectList(list), logical_len)
                     }
                     EvalValue::List(items) => {
@@ -2370,6 +2937,7 @@ impl<'a> Evaluator<'a> {
                             EvalValue::Row {
                                 id: Some(row.id),
                                 fields: row.fields,
+                                provenance: row.provenance,
                             },
                         )
                     })
@@ -2416,6 +2984,10 @@ impl<'a> Evaluator<'a> {
                 };
                 self.active_scoped_materialization_owners
                     .insert(owner.clone());
+                self.materialization_stack
+                    .last_mut()
+                    .expect("materialization capture was installed")
+                    .scoped_owner = Some(owner.clone());
                 Some(
                     self.scoped_materialization_identities
                         .reconcile(owner, logical_item_count_usize)?,
@@ -2425,6 +2997,7 @@ impl<'a> Evaluator<'a> {
         let mut nodes = Vec::new();
         for (logical_index, item) in items {
             let row = self.materialization_row(&item);
+            let provenance = self.materialization_provenance(&item)?;
             let identity = match materialization.row_identity {
                 DocumentRowIdentity::ListHiddenKeyAndGeneration { list } => {
                     let row = row.ok_or_else(|| {
@@ -2459,21 +3032,20 @@ impl<'a> Evaluator<'a> {
                 },
             };
             self.materialized_items.insert(identity.clone());
+            self.materialization_stack
+                .last_mut()
+                .expect("materialization capture was installed")
+                .item_identities
+                .insert(identity.clone());
             let mut parameters = static_arguments.clone();
             parameters.insert(materialization.item_parameter, item);
             let mut row_env = env.clone();
+            if !provenance.is_empty() {
+                let rows = Arc::make_mut(&mut row_env.rows);
+                rows.extend(provenance);
+            }
             if let Some(row) = row {
                 let rows = Arc::make_mut(&mut row_env.rows);
-                let structural_rows = self
-                    .session
-                    .structural_owner_rows(row)
-                    .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
-                for structural_row in structural_rows {
-                    if let Some(scope) = self.runtime.list_scopes.get(&structural_row.list).copied()
-                    {
-                        rows.insert(scope, structural_row);
-                    }
-                }
                 rows.insert(materialization.item_scope, row);
                 row_env.active_row = Some(row);
             }
@@ -2485,6 +3057,39 @@ impl<'a> Evaluator<'a> {
             )?;
             let created = value.node_ids();
             nodes.extend(created);
+        }
+        let capture = self.materialization_stack.pop().ok_or_else(|| {
+            DocumentError::InvalidPlan(format!(
+                "materialization {} lost its retained capture",
+                id.0
+            ))
+        })?;
+        if capture.key != key {
+            return Err(DocumentError::InvalidPlan(format!(
+                "materialization {} retained capture stack is inconsistent",
+                id.0
+            )));
+        }
+        let retained = RetainedMaterialization {
+            parent: capture.parent,
+            environment: capture.environment,
+            roots: nodes.clone(),
+            child_index: capture.child_index,
+            structural_dependencies: capture.structural_dependencies,
+            structural_lists: capture.structural_lists,
+            structural_list_fields: capture.structural_list_fields,
+            item_identities: capture.item_identities,
+            scoped_owner: capture.scoped_owner,
+        };
+        if self
+            .retained_materializations
+            .insert(key, retained)
+            .is_some()
+        {
+            return Err(DocumentError::InvalidPlan(format!(
+                "materialization {} produced duplicate retained instance identity",
+                id.0
+            )));
         }
         Ok(EvalValue::Nodes(nodes))
     }
@@ -2550,6 +3155,30 @@ impl<'a> Evaluator<'a> {
                 Some(*row)
             }
             _ => None,
+        }
+    }
+
+    fn materialization_provenance(
+        &self,
+        item: &EvalValue,
+    ) -> Result<BTreeMap<ScopeId, RowId>, DocumentError> {
+        match item {
+            EvalValue::Row {
+                id: Some(id),
+                provenance,
+                ..
+            } if provenance.is_empty() => self
+                .session
+                .row_snapshot(*id)
+                .map(|snapshot| snapshot.provenance)
+                .map_err(|error| DocumentError::Evaluation(error.to_string())),
+            EvalValue::Row { provenance, .. } => Ok(provenance.clone()),
+            EvalValue::MappedRow { id, .. } => self
+                .session
+                .row_snapshot(*id)
+                .map(|snapshot| snapshot.provenance)
+                .map_err(|error| DocumentError::Evaluation(error.to_string())),
+            _ => Ok(BTreeMap::new()),
         }
     }
 
@@ -3081,6 +3710,7 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
         EvalValue::Row {
             id: Some(id),
             fields,
+            ..
         } => Some(Value::Row {
             id: *id,
             fields: fields.clone(),
@@ -3139,6 +3769,7 @@ fn machine_value_to_eval(value: Value) -> EvalValue {
         Value::Row { id, fields } => EvalValue::Row {
             id: Some(id),
             fields,
+            provenance: BTreeMap::new(),
         },
         Value::Error { code } => EvalValue::Text(code),
         Value::HostBound { visible, .. } => machine_value_to_eval(*visible),
@@ -4486,36 +5117,90 @@ fn collect_sources(
     }
 }
 
-fn row_source_remainder<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
-    if path == suffix {
-        return Some("");
+fn compiled_row_source_index(machine: &MachinePlan) -> Result<RowSourceIndex, DocumentError> {
+    let mut row_sources = RowSourceIndex::new();
+    for route in &machine.source_routes {
+        for projection in &route.row_projections {
+            if projection.path.is_empty() {
+                return Err(DocumentError::InvalidPlan(format!(
+                    "source {} has an empty compiled row projection",
+                    route.source_id.0
+                )));
+            }
+            let sources = row_sources.entry(projection.list).or_default();
+            if sources.iter().any(|(path, source)| {
+                *source != route.source_id
+                    && (path.starts_with(&projection.path) || projection.path.starts_with(path))
+            }) {
+                return Err(DocumentError::InvalidPlan(format!(
+                    "source {} row projection `{}` conflicts in list {}",
+                    route.source_id.0,
+                    projection.path.join("."),
+                    projection.list.0
+                )));
+            }
+            if sources
+                .insert(projection.path.clone(), route.source_id)
+                .is_some_and(|source| source != route.source_id)
+            {
+                return Err(DocumentError::InvalidPlan(format!(
+                    "row projection `{}` resolves to multiple sources in list {}",
+                    projection.path.join("."),
+                    projection.list.0
+                )));
+            }
+        }
     }
-    let qualified = format!(".{suffix}");
-    let offset = path.rfind(&qualified)?;
-    let remainder = &path[offset + qualified.len()..];
-    if remainder.is_empty() {
-        Some("")
-    } else {
-        remainder.strip_prefix('.')
+    Ok(row_sources)
+}
+
+fn resolve_row_source_index(
+    row_sources: &RowSourceIndex,
+    list: ListId,
+    path: &[&str],
+) -> Option<EvalValue> {
+    let mut exact = None;
+    let mut group = BTreeMap::new();
+    for (candidate, source) in row_sources.get(&list)? {
+        if candidate.len() < path.len()
+            || !candidate
+                .iter()
+                .zip(path)
+                .all(|(candidate, requested)| candidate == requested)
+        {
+            continue;
+        }
+        let remainder = &candidate[path.len()..];
+        if remainder.is_empty() {
+            if exact.replace(*source).is_some() {
+                return None;
+            }
+        } else if !insert_row_source(&mut group, remainder, *source) {
+            return None;
+        }
+    }
+    match (exact, group.is_empty()) {
+        (Some(source), true) => Some(EvalValue::Source(source)),
+        (None, false) => Some(EvalValue::Record(group)),
+        _ => None,
     }
 }
 
 fn insert_row_source(
     fields: &mut BTreeMap<String, EvalValue>,
-    path: &str,
+    path: &[String],
     source: SourceId,
 ) -> bool {
-    let mut parts = path.splitn(2, '.');
-    let Some(head) = parts.next().filter(|part| !part.is_empty()) else {
+    let Some((head, tail)) = path.split_first() else {
         return false;
     };
-    let Some(tail) = parts.next() else {
+    if tail.is_empty() {
         return fields
-            .insert(head.to_owned(), EvalValue::Source(source))
+            .insert(head.clone(), EvalValue::Source(source))
             .is_none();
-    };
+    }
     let value = fields
-        .entry(head.to_owned())
+        .entry(head.clone())
         .or_insert_with(|| EvalValue::Record(BTreeMap::new()));
     let EvalValue::Record(children) = value else {
         return false;
@@ -4672,6 +5357,23 @@ fn scalar_dependent_indexes(nodes: &BTreeMap<FrameNodeId, RetainedNode>) -> Scal
         }
     }
     (index, guarded, guard_values)
+}
+
+fn document_subtree_nodes_for_roots(
+    frame: &DocumentFrame,
+    roots: &[FrameNodeId],
+) -> BTreeSet<FrameNodeId> {
+    let mut nodes = BTreeSet::new();
+    let mut pending = roots.iter().rev().cloned().collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        if !nodes.insert(node.clone()) {
+            continue;
+        }
+        if let Some(value) = frame.nodes.get(&node) {
+            pending.extend(value.children.iter().rev().cloned());
+        }
+    }
+    nodes
 }
 
 fn diff_node(previous: &DocumentNode, next: &DocumentNode) -> Vec<DocumentPatch> {
@@ -4920,6 +5622,46 @@ mod tests {
 
         assert_eq!(machine_value_to_eval(value.clone()), expected);
         assert_eq!(guard_value(&expected), Some(value));
+    }
+
+    #[test]
+    fn row_sources_resolve_only_from_compiled_list_and_field_prefixes() {
+        let index = BTreeMap::from([(
+            ListId(7),
+            BTreeMap::from([
+                (
+                    vec!["controls".to_owned(), "select".to_owned()],
+                    SourceId(11),
+                ),
+                (
+                    vec![
+                        "admin".to_owned(),
+                        "controls".to_owned(),
+                        "select".to_owned(),
+                    ],
+                    SourceId(12),
+                ),
+            ]),
+        )]);
+
+        assert_eq!(
+            resolve_row_source_index(&index, ListId(7), &["controls", "select"]),
+            Some(EvalValue::Source(SourceId(11)))
+        );
+        assert_eq!(
+            resolve_row_source_index(&index, ListId(7), &["admin", "controls", "select"]),
+            Some(EvalValue::Source(SourceId(12)))
+        );
+        assert_eq!(
+            resolve_row_source_index(&index, ListId(7), &["select"]),
+            None,
+            "a matching field suffix is not source identity"
+        );
+        assert_eq!(
+            resolve_row_source_index(&index, ListId(8), &["controls", "select"]),
+            None,
+            "the same field path in another list is not source identity"
+        );
     }
 
     #[test]

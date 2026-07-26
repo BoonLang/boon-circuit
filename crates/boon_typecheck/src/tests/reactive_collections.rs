@@ -177,6 +177,91 @@ FUNCTION selected_row(row) {
         })
         .expect("mapped row event projection");
     assert_eq!(projected.flow_type.mode, FlowMode::PresentOrAbsent);
+    assert!(matches!(
+        &projected.kind,
+        CheckedExpressionKind::Read { source: None, .. }
+    ));
+    let requirement = checked
+        .resource_projection_requirements
+        .iter()
+        .find(
+            |requirement| {
+            requirement.expression == projected.id
+                && requirement.projection == ["controls", "select"]
+            },
+        )
+        .expect("mapped source projection has checked provenance");
+    assert_eq!(
+        requirement
+            .source_origins
+            .iter()
+            .map(|origin| origin.source)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2,
+        "both conditional source templates must be explicit before IR lowering"
+    );
+    assert!(
+        requirement
+            .source_origins
+            .iter()
+            .all(|origin| origin.payload_projection.is_empty())
+    );
+}
+
+#[test]
+fn mapped_source_payload_is_typed_from_checked_provenance_before_lowering() {
+    let parsed = boon_parser::parse_source(
+        "mapped-source-payload.bn",
+        r#"
+store: [
+    rows:
+        LIST { [name: TEXT { one }] }
+        |> List/map(item, new: selectable_row(row: item))
+    selected_addresses:
+        rows
+        |> List/map(item, new:
+            item.controls.select.address
+                |> THEN { item.controls.select.address }
+        )
+]
+
+FUNCTION selectable_row(row) {
+    [controls: [select: SOURCE], name: row.name]
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "mapped source payload diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let checked = output.program.expect("mapped source payload is checked");
+    let requirement = checked
+        .resource_projection_requirements
+        .iter()
+        .find(|requirement| {
+            requirement.projection == ["controls", "select", "address"]
+                && requirement
+                    .source_origins
+                    .iter()
+                    .any(|origin| origin.payload_projection == ["address"])
+        })
+        .expect("mapped source payload has exact checked provenance");
+    let [origin] = requirement.source_origins.as_slice() else {
+        panic!("one source template must own the mapped payload requirement")
+    };
+    let source = checked
+        .sources
+        .get(origin.source.0 as usize)
+        .filter(|source| source.id == origin.source)
+        .expect("payload origin references a checked source");
+    let Type::Object(payload) = &source.payload_type else {
+        panic!("source payload is a closed record")
+    };
+    assert_eq!(payload.fields.get("address"), Some(&Type::Text));
 }
 
 #[test]

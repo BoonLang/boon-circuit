@@ -2565,7 +2565,6 @@ FUNCTION main() {
             selected,
             std::collections::BTreeSet::from(["one".to_owned(), "two".to_owned()])
         );
-
     }
 
     #[test]
@@ -2576,10 +2575,17 @@ FUNCTION main() {
 store: [
     rows: LIST {
         [
-            label: TEXT { parent }
+            label: TEXT { first parent }
             segments: LIST {
                 [label: TEXT { first }]
                 [label: TEXT { second }]
+            }
+        ]
+        [
+            label: TEXT { second parent }
+            segments: LIST {
+                [label: TEXT { third }]
+                [label: TEXT { fourth }]
             }
         ]
     }
@@ -2647,17 +2653,85 @@ document: Document/new(
         };
 
         let initial = scoped_nodes(&runtime);
-        assert_eq!(initial.len(), 2);
+        assert_eq!(initial.len(), 4);
+        let initial_stats = runtime.document_materialization_stats();
+        assert_eq!(initial_stats.full_evaluation_count, 1);
+        assert_eq!(initial_stats.retained_window_evaluation_count, 0);
         runtime
             .demand_document_window_by_id(scoped.0, 0..1, 0..1)
             .unwrap();
         let narrowed = scoped_nodes(&runtime);
-        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed.len(), 2);
         assert!(narrowed.is_subset(&initial));
+        let narrowed_stats = runtime.document_materialization_stats();
+        assert_eq!(
+            narrowed_stats.full_evaluation_count, 1,
+            "window narrowing must not reevaluate the full document"
+        );
+        assert_eq!(narrowed_stats.retained_window_evaluation_count, 2);
 
         runtime
             .demand_document_window_by_id(scoped.0, 0..2, 0..2)
             .unwrap();
         assert_eq!(scoped_nodes(&runtime), initial);
+        let widened_stats = runtime.document_materialization_stats();
+        assert_eq!(
+            widened_stats.full_evaluation_count, 1,
+            "window widening must not reevaluate the full document"
+        );
+        assert_eq!(widened_stats.retained_window_evaluation_count, 4);
+    }
+
+    #[test]
+    fn cells_sheet_window_patches_retained_subtree_without_full_document_evaluation() {
+        let units = source_units_for_path(std::path::Path::new("../../examples/cells.bn")).unwrap();
+        let mut runtime = LiveRuntime::from_project("cells-retained-window.bn", &units).unwrap();
+        let sheet_rows = runtime
+            .session
+            .plan()
+            .debug_map
+            .list_slots
+            .iter()
+            .find(|entry| entry.label.ends_with("store.sheet_rows"))
+            .and_then(|entry| entry.id.strip_prefix("list:"))
+            .and_then(|id| id.parse::<usize>().ok())
+            .map(boon_plan::ListId)
+            .expect("Cells sheet_rows ListId");
+        let materialization = runtime
+            .session
+            .document_plan()
+            .unwrap()
+            .materializations
+            .iter()
+            .find_map(|materialization| {
+                matches!(
+                    materialization.source,
+                    boon_plan::DocumentMaterializationSource::List { list }
+                        if list == sheet_rows
+                )
+                .then_some(materialization.id)
+            })
+            .expect("Cells sheet_rows document materialization");
+        let initial = runtime.document_materialization_stats();
+        assert_eq!(initial.full_evaluation_count, 1);
+
+        let patches = runtime
+            .demand_document_window_by_id(materialization.0, 0..4, 0..6)
+            .unwrap();
+        assert!(!patches.is_empty());
+        let narrowed = runtime.document_materialization_stats();
+        assert_eq!(
+            narrowed.full_evaluation_count, 1,
+            "Cells scrolling must not reevaluate the full document"
+        );
+        assert_eq!(narrowed.retained_window_evaluation_count, 1);
+        assert!(narrowed.materialized_rows < initial.materialized_rows);
+
+        runtime
+            .demand_document_window_by_id(materialization.0, 2..8, 0..10)
+            .unwrap();
+        let shifted = runtime.document_materialization_stats();
+        assert_eq!(shifted.full_evaluation_count, 1);
+        assert_eq!(shifted.retained_window_evaluation_count, 2);
     }
 }

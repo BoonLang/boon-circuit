@@ -2,8 +2,8 @@ use boon_data::MAX_NUMBER_TEXT_DIGITS;
 pub use boon_document_model::ProgramRole;
 use boon_parser::{
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
-    AstParameterKind, AstRecordField, AstStatement, AstStatementKind, AstTextSegment,
-    BytesSizeSyntax, ParsedProgram,
+    AstParameterKind, AstPassContext, AstRecordField, AstStatement, AstStatementKind,
+    AstTextSegment, BytesSizeSyntax, ParsedProgram,
 };
 use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
@@ -438,6 +438,21 @@ pub struct CheckedStatementId(pub u32);
 )]
 pub struct CheckedCallId(pub u32);
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+pub struct CheckedSourceId(pub u32);
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+pub struct CheckedStateId(pub u32);
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+pub struct CheckedListId(pub u32);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckedSpan {
     pub line: usize,
@@ -684,7 +699,7 @@ pub enum CheckedExpressionKind {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CheckedSourceRead {
-    pub expression: CheckedExprId,
+    pub source: CheckedSourceId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub payload_projection: Vec<String>,
 }
@@ -732,6 +747,8 @@ pub struct CheckedStatement {
     pub id: CheckedStatementId,
     pub scope_id: LexicalScopeId,
     pub kind: CheckedStatementKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<CheckedResourceBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<CheckedExprId>,
     #[serde(default)]
@@ -746,6 +763,15 @@ pub enum CheckedValueUse {
     #[default]
     RuntimeValue,
     RenderSlot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckedResourceBinding {
+    Source { source: CheckedSourceId },
+    State { state: CheckedStateId },
+    ListAuthority { list: CheckedListId },
+    ListAlias { target: DeclId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -793,6 +819,11 @@ pub struct CheckedCallContext {
     pub declaration: DeclId,
     pub signature: usize,
     pub scope_id: LexicalScopeId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedPassRequirement {
+    pub scheme: FlowType,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -914,6 +945,8 @@ pub struct CheckedCallableSignature {
     pub parameters: Vec<CheckedParameter>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contexts: Vec<CheckedCallableContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_requirement: Option<CheckedPassRequirement>,
     pub result: FlowType,
     pub role: ProgramRole,
     pub effect: CheckedEffectSummary,
@@ -923,6 +956,12 @@ pub struct CheckedCallableSignature {
     pub result_expression: Option<CheckedExprId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contextual_operation: Option<CheckedContextualOperation>,
+}
+
+impl CheckedCallableSignature {
+    pub fn requires_pass(&self) -> bool {
+        self.pass_requirement.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -949,6 +988,12 @@ pub enum CheckedCallEntry {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedPassClause {
+    pub value: CheckedExprId,
+    pub span: CheckedSpan,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckedCall {
     pub id: CheckedCallId,
@@ -961,12 +1006,18 @@ pub struct CheckedCall {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contexts: Vec<CheckedCallContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pass: Option<CheckedExprId>,
+    pub pass: Option<CheckedPassClause>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_substitutions: Vec<CheckedTypeSubstitution>,
     pub result: FlowType,
     pub role: ProgramRole,
     pub span: CheckedSpan,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CheckedCallResultPath {
+    pub call: CheckedCallId,
+    pub path: CheckedSemanticPath,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1001,12 +1052,27 @@ pub struct CheckedProgram {
     pub callables: Vec<CheckedCallableSignature>,
     pub calls: Vec<CheckedCall>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_result_paths: Vec<CheckedCallResultPath>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order_chains: Vec<CheckedCallOrderChain>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pattern_bindings: Vec<CheckedPatternBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sources: Vec<CheckedSourceMetadata>,
+    pub resource_projection_requirements: Vec<CheckedResourceProjectionRequirement>,
+    pub sources: Vec<CheckedSource>,
+    pub states: Vec<CheckedState>,
+    pub lists: Vec<CheckedList>,
     pub occurrences: Vec<SemanticOccurrence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedResourceProjectionRequirement {
+    pub expression: CheckedExprId,
+    pub target: DeclId,
+    pub projection: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_origins: Vec<CheckedSourceRead>,
+    pub required_type: Type,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1050,6 +1116,69 @@ impl CheckedProgram {
             .find(|candidate| candidate.call == call)
             .map(|candidate| candidate.chain.clone())
     }
+
+    pub fn result_path_for_call(&self, call: CheckedCallId) -> Option<&CheckedSemanticPath> {
+        self.call_result_paths
+            .iter()
+            .find(|candidate| candidate.call == call)
+            .map(|candidate| &candidate.path)
+    }
+
+    fn source_expression(&self, read: &CheckedSourceRead) -> Option<CheckedExprId> {
+        self.sources
+            .get(read.source.0 as usize)
+            .filter(|source| source.id == read.source)
+            .map(|source| source.expression)
+    }
+
+    pub fn declaration_path(&self, declaration: DeclId) -> Option<String> {
+        self.declarations
+            .iter()
+            .find(|candidate| candidate.id == declaration)
+            .and_then(|declaration| checked_declaration_canonical_path(self, declaration))
+    }
+
+    pub fn semantic_path(&self, path: &CheckedSemanticPath) -> Option<String> {
+        let declaration = self
+            .declarations
+            .iter()
+            .find(|candidate| candidate.id == path.anchor)?;
+        if declaration.kind == CheckedDeclarationKind::Function {
+            return (!path.projection.is_empty()).then(|| path.projection.join("."));
+        }
+        let mut segments = vec![declaration.name.clone()];
+        let mut scope = declaration.scope_id;
+        let mut visited = BTreeSet::new();
+        while scope != self.root_scope && visited.insert(scope) {
+            let current = self.scopes.iter().find(|candidate| candidate.id == scope)?;
+            if current.kind == CheckedScopeKind::Function {
+                break;
+            }
+            if let Some(owner) = current.owner
+                && let Some(owner) = self
+                    .declarations
+                    .iter()
+                    .find(|candidate| candidate.id == owner)
+                && matches!(
+                    owner.kind,
+                    CheckedDeclarationKind::Field
+                        | CheckedDeclarationKind::Source
+                        | CheckedDeclarationKind::Hold
+                        | CheckedDeclarationKind::List
+                )
+            {
+                segments.push(owner.name.clone());
+            }
+            scope = current.parent?;
+        }
+        segments.reverse();
+        let mut result = segments.join(".");
+        if !path.projection.is_empty() {
+            result.push('.');
+            result.push_str(&path.projection.join("."));
+        }
+        Some(result)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1060,18 +1189,67 @@ pub struct CheckedPatternBinding {
     pub projection: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CheckedSemanticPath {
+    pub anchor: DeclId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projection: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckedSourceMetadata {
-    pub path: String,
-    pub binding_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expression: Option<CheckedExprId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub declaration: Option<DeclId>,
-    pub line: usize,
-    pub scoped: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+pub struct CheckedSource {
+    pub id: CheckedSourceId,
+    pub declaration: DeclId,
+    pub statement: CheckedStatementId,
+    pub expression: CheckedExprId,
+    pub owner_scope: LexicalScopeId,
+    pub path: CheckedSemanticPath,
     pub interval_ms: Option<u64>,
+    pub payload_type: Type,
+    pub span: CheckedSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckedStateKind {
+    Hold,
+    InitialLatest,
+    StatefulCall,
+    StatementHold,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedState {
+    pub id: CheckedStateId,
+    pub declaration: DeclId,
+    pub statement: CheckedStatementId,
+    pub expression: CheckedExprId,
+    pub initial: CheckedExprId,
+    pub owner_scope: LexicalScopeId,
+    pub path: CheckedSemanticPath,
+    pub kind: CheckedStateKind,
+    pub flow_type: FlowType,
+    pub span: CheckedSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckedListKeyPolicy {
+    GeneratedOccurrenceU64 { has_generation: bool },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedList {
+    pub id: CheckedListId,
+    pub declaration: DeclId,
+    pub statement: CheckedStatementId,
+    pub producer: CheckedExprId,
+    pub owner_scope: LexicalScopeId,
+    pub path: CheckedSemanticPath,
+    pub item_type: Type,
+    pub capacity: Option<usize>,
+    pub key_policy: CheckedListKeyPolicy,
+    pub span: CheckedSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1180,7 +1358,6 @@ struct CheckedProgramBuilder<'a> {
     checked_flow_inference_epoch: u64,
     checked_flow_inference_cache: BTreeMap<usize, (u64, FlowType)>,
     source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
-    source_payload_lookup: SourcePayloadPathLookup,
     diagnostics: Vec<TypeDiagnostic>,
 }
 
@@ -1472,13 +1649,6 @@ impl<'a> CheckedProgramBuilder<'a> {
             checked_flow_inference_epoch: 0,
             checked_flow_inference_cache: BTreeMap::new(),
             source_payload_shape_table: source_payload_shape_table.to_vec(),
-            source_payload_lookup: SourcePayloadPathLookup::new(
-                &program
-                    .source_ports
-                    .iter()
-                    .map(|source| source.path.clone())
-                    .collect(),
-            ),
             diagnostics: Vec::new(),
         };
         let exact_pipeline_inputs_valid = checked_program_phase!(
@@ -1540,6 +1710,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             builder.infer_contextual_callable_schemes()
         );
         checked_program_phase!("infer_checked_types", builder.infer_checked_types());
+        checked_program_phase!("validate_pass_calls", builder.validate_pass_calls());
         checked_program_phase!(
             "validate_user_call_arguments",
             builder.validate_user_call_arguments()
@@ -1548,7 +1719,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             builder.calls.sort_by_key(|call| call.expression);
             builder.rebuild_call_indexes();
         });
-        let (statements, expressions) = checked_program_phase!(
+        let (mut statements, mut expressions) = checked_program_phase!(
             "lower_checked_tree",
             builder.lower_checked_tree(render_slot_table)
         );
@@ -1563,35 +1734,33 @@ impl<'a> CheckedProgramBuilder<'a> {
             "checked_pattern_bindings",
             builder.checked_pattern_bindings()
         );
-        let declarations_by_expression = expressions
-            .iter()
-            .filter_map(|expression| {
-                expression
-                    .declaration
-                    .map(|declaration| (expression.id, declaration))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let sources = builder
-            .program
-            .source_ports
-            .iter()
-            .map(|source| {
-                let expression = source
-                    .expr_id
-                    .map(|expression| CheckedExprId(expression as u32));
-                CheckedSourceMetadata {
-                    path: source.path.clone(),
-                    binding_path: source.binding_path.clone(),
-                    declaration: expression.and_then(|expression| {
-                        declarations_by_expression.get(&expression).copied()
-                    }),
-                    expression,
-                    line: source.line,
-                    scoped: source.scoped,
-                    interval_ms: source.interval_ms,
-                }
-            })
-            .collect();
+        let (mut sources, states, lists) = checked_program_phase!(
+            "derive_checked_resources",
+            builder.derive_checked_resources(&mut statements, &mut expressions)
+        );
+        let call_result_paths = checked_program_phase!(
+            "checked_call_result_paths",
+            checked_call_result_paths(
+                &builder.declarations,
+                &builder.signatures,
+                &expressions,
+                &builder.calls,
+            )
+        );
+        let resource_projection_requirements = checked_program_phase!(
+            "resolve_checked_resource_projections",
+            checked_resource_projection_requirements(
+                &builder.declarations,
+                &builder.signatures,
+                &builder.calls,
+                &expressions,
+                &sources,
+            )
+        );
+        refine_checked_source_payload_types_from_requirements(
+            &mut sources,
+            &resource_projection_requirements,
+        );
         let mut checked = CheckedProgram {
             role: builder.role,
             external_types: ExternalTypeEnvironment::default(),
@@ -1603,9 +1772,13 @@ impl<'a> CheckedProgramBuilder<'a> {
             expressions,
             callables: builder.signatures,
             calls: builder.calls,
+            call_result_paths,
             order_chains: Vec::new(),
             pattern_bindings,
+            resource_projection_requirements,
             sources,
+            states,
+            lists,
             occurrences: builder.occurrences,
         };
         let (order_chains, order_diagnostics) = derive_checked_order_chains(&checked);
@@ -1833,6 +2006,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     name: name.clone(),
                     parameters: checked_parameters.clone(),
                     contexts: Vec::new(),
+                    pass_requirement: None,
                     result: unknown_flow_type(),
                     role: self.role,
                     effect: CheckedEffectSummary::default(),
@@ -2231,6 +2405,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             name: name.to_owned(),
             parameters: checked_parameters.clone(),
             contexts: checked_contexts,
+            pass_requirement: None,
             result: result.clone(),
             role: self.role,
             effect,
@@ -2328,17 +2503,29 @@ impl<'a> CheckedProgramBuilder<'a> {
         let pipe_input = raw_pipe_input.and_then(|input| self.exact_pipeline_input(expr, input));
 
         let mut nested_outputs = available_outputs.clone();
+        if let (Some(function), Some(pass)) = (function, pass)
+            && external_function_role(function).is_some()
+            && self.signature(function).is_none()
+        {
+            self.diagnostics.push(TypeDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                line: self
+                    .program
+                    .expressions
+                    .get(pass.value)
+                    .map_or(expr.line, |value| value.line),
+                start: pass.start,
+                end: pass.end,
+                message: format!(
+                    "`PASS:` is only valid on user callable calls; `{function}` is an external callable"
+                ),
+            });
+        }
         if let Some(function) = function
             && let Some(signature) = self.signature(function).cloned()
         {
-            let (call, fresh_outputs) = self.bind_call(
-                expr,
-                &signature,
-                pipe_input,
-                args,
-                pass.map(|pass| pass.value),
-                &available_outputs,
-            );
+            let (call, fresh_outputs) =
+                self.bind_call(expr, &signature, pipe_input, args, pass, &available_outputs);
             for (name, output) in fresh_outputs {
                 nested_outputs.insert(name, output);
             }
@@ -2376,7 +2563,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         signature: &CheckedCallableSignature,
         pipe_input: Option<usize>,
         args: &[AstCallArg],
-        pass_expr_id: Option<usize>,
+        pass: Option<&AstPassContext>,
         available_outputs: &BTreeMap<String, DeclId>,
     ) -> (Option<CheckedCall>, Vec<(String, DeclId)>) {
         let piped_parameter = pipe_input.and_then(|_| {
@@ -2393,6 +2580,38 @@ impl<'a> CheckedProgramBuilder<'a> {
         let mut entries = Vec::new();
         let mut fresh_outputs = Vec::new();
         let mut valid = true;
+        let pass = pass.map(|pass| CheckedPassClause {
+            value: CheckedExprId(pass.value as u32),
+            span: CheckedSpan {
+                line: self
+                    .program
+                    .expressions
+                    .get(pass.value)
+                    .map_or(expr.line, |value| value.line),
+                start: pass.start,
+                end: pass.end,
+            },
+        });
+        if let Some(pass) = pass
+            && signature.kind != CheckedCallableKind::User
+        {
+            self.diagnostics.push(TypeDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                line: pass.span.line,
+                start: pass.span.start,
+                end: pass.span.end,
+                message: format!(
+                    "`PASS:` is only valid on user callable calls; `{}` is {}",
+                    signature.name,
+                    match signature.kind {
+                        CheckedCallableKind::Builtin => "a built-in callable",
+                        CheckedCallableKind::External => "an external callable",
+                        CheckedCallableKind::User => unreachable!(),
+                    }
+                ),
+            });
+            valid = false;
+        }
         if let (Some(input), Some(parameter)) = (pipe_input, piped_parameter) {
             entries.push(CheckedCallEntry::Input {
                 formal: parameter.decl_id,
@@ -2576,11 +2795,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                 kind: SemanticOccurrenceKind::Call,
                 span: checked_expr_span(expr),
             });
-            if pass_expr_id.is_some() {
+            if let Some(pass) = pass {
                 self.occurrences.push(SemanticOccurrence {
                     target: signature.decl_id,
                     kind: SemanticOccurrenceKind::Pass,
-                    span: checked_expr_span(expr),
+                    span: pass.span,
                 });
             }
             CheckedCall {
@@ -2595,7 +2814,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 function: signature.name.clone(),
                 entries,
                 contexts,
-                pass: pass_expr_id.map(|expr_id| CheckedExprId(expr_id as u32)),
+                pass,
                 type_substitutions: Vec::new(),
                 result: signature.result.clone(),
                 role: signature.role,
@@ -2954,6 +3173,14 @@ impl<'a> CheckedProgramBuilder<'a> {
                 typecheck_elapsed_ms(projected_started)
             );
         }
+        let pass_started = Instant::now();
+        self.infer_pass_requirements();
+        if trace {
+            eprintln!(
+                "boon_typecheck checked_program.infer_contextual_callable_schemes.pass: {:.3}ms",
+                typecheck_elapsed_ms(pass_started)
+            );
+        }
         let structural_started = Instant::now();
         self.infer_structural_user_result_schemes();
         if trace {
@@ -3174,6 +3401,495 @@ impl<'a> CheckedProgramBuilder<'a> {
         self.sync_signature_declaration_types();
     }
 
+    fn infer_pass_requirements(&mut self) {
+        let passed_reads = self
+            .program
+            .expressions
+            .iter()
+            .filter_map(|expression| {
+                checked_passed_projection(expression).map(|projection| (expression.id, projection))
+            })
+            .collect::<Vec<_>>();
+        let mut reads_by_owner = BTreeMap::<DeclId, Vec<(usize, Vec<String>)>>::new();
+        for (expression, projection) in passed_reads {
+            let owner = self
+                .expression_owner
+                .get(&expression)
+                .and_then(|name| self.signature(name))
+                .filter(|signature| signature.kind == CheckedCallableKind::User)
+                .map(|signature| signature.decl_id);
+            if let Some(owner) = owner {
+                reads_by_owner
+                    .entry(owner)
+                    .or_default()
+                    .push((expression, projection));
+            } else {
+                self.contextual_type_diagnostic(
+                    expression,
+                    "`PASSED` is only available inside a user callable".to_owned(),
+                );
+            }
+        }
+
+        let mut existing_vars = BTreeSet::new();
+        for signature in &self.signatures {
+            for parameter in &signature.parameters {
+                collect_type_vars(&parameter.flow_type.ty, &mut existing_vars);
+            }
+            collect_type_vars(&signature.result.ty, &mut existing_vars);
+        }
+        let mut next_var = existing_vars
+            .iter()
+            .map(|variable| variable.0)
+            .max()
+            .unwrap_or(CONTEXTUAL_RESULT_VAR.0)
+            .saturating_add(1);
+        let leaf_vars = reads_by_owner
+            .values()
+            .flatten()
+            .map(|(expression, _)| {
+                let variable = TypeVar(next_var);
+                next_var = next_var.saturating_add(1);
+                (*expression, variable)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut call_scheme_vars = BTreeMap::<(CheckedCallId, TypeVar), TypeVar>::new();
+
+        let user_callables = self
+            .signatures
+            .iter()
+            .filter(|signature| signature.kind == CheckedCallableKind::User)
+            .map(|signature| signature.decl_id)
+            .collect::<Vec<_>>();
+        let mut requirements = user_callables
+            .iter()
+            .map(|callable| (*callable, None))
+            .collect::<BTreeMap<_, Option<CheckedPassRequirement>>>();
+        let iteration_limit = user_callables
+            .len()
+            .saturating_add(self.calls.len())
+            .saturating_add(leaf_vars.len())
+            .saturating_add(2);
+        let mut converged = false;
+
+        for _ in 0..iteration_limit {
+            let mut next = user_callables
+                .iter()
+                .map(|callable| (*callable, None))
+                .collect::<BTreeMap<_, Option<CheckedPassRequirement>>>();
+
+            for (owner, reads) in &reads_by_owner {
+                let target = next
+                    .get_mut(owner)
+                    .expect("PASSED owner is a user callable");
+                for (expression, projection) in reads {
+                    let leaf = Type::Var(
+                        *leaf_vars
+                            .get(expression)
+                            .expect("PASSED read owns a stable scheme variable"),
+                    );
+                    merge_checked_pass_requirement(
+                        target,
+                        continuous_flow_type(forwarded_parameter_requirement(projection, leaf)),
+                    );
+                }
+
+                let mut active = BTreeSet::new();
+                for root in self.owned_expression_roots(*owner) {
+                    self.collect_passed_requirement_constraints(
+                        *owner,
+                        root,
+                        None,
+                        &requirements,
+                        &leaf_vars,
+                        &mut call_scheme_vars,
+                        &mut next_var,
+                        target,
+                        &mut active,
+                    );
+                }
+            }
+
+            for call in &self.calls {
+                if call.pass.is_some() {
+                    continue;
+                }
+                let Some(owner) = call.owner_callable else {
+                    continue;
+                };
+                let Some(callee) = self.signature_by_declaration(call.callable) else {
+                    continue;
+                };
+                if callee.kind != CheckedCallableKind::User {
+                    continue;
+                }
+                let Some(requirement) = requirements.get(&callee.decl_id).and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                let target = next
+                    .get_mut(&owner)
+                    .expect("user-call owner has a requirement slot");
+                let scheme = FlowType {
+                    mode: requirement.scheme.mode,
+                    ty: instantiate_checked_type_scheme_for_call(
+                        &requirement.scheme.ty,
+                        call.id,
+                        &mut call_scheme_vars,
+                        &mut next_var,
+                    ),
+                };
+                merge_checked_pass_requirement(target, scheme);
+            }
+
+            if next == requirements {
+                requirements = next;
+                converged = true;
+                break;
+            }
+            requirements = next;
+        }
+
+        if !converged {
+            self.diagnostics.push(TypeDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                line: 0,
+                start: 0,
+                end: 0,
+                message: "checked PASS requirement inference did not converge".to_owned(),
+            });
+        }
+
+        for signature in self
+            .signatures
+            .iter_mut()
+            .filter(|signature| signature.kind == CheckedCallableKind::User)
+        {
+            signature.pass_requirement =
+                requirements.remove(&signature.decl_id).unwrap_or_default();
+        }
+
+        let lexical_passed_types = reads_by_owner
+            .into_iter()
+            .flat_map(|(owner, reads)| {
+                let requirement = self
+                    .signature_by_declaration(owner)
+                    .and_then(|signature| signature.pass_requirement.as_ref())
+                    .map(|requirement| requirement.scheme.clone());
+                reads
+                    .into_iter()
+                    .filter_map(move |(expression, projection)| {
+                        let scheme = requirement.as_ref()?;
+                        let ty = type_for_nested_path(&scheme.ty, &projection)?;
+                        Some((
+                            expression,
+                            FlowType {
+                                mode: scheme.mode,
+                                ty,
+                            },
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+        for (expression, flow_type) in lexical_passed_types {
+            self.set_inferred_expr_flow(expression, flow_type);
+        }
+        self.begin_checked_flow_inference_epoch();
+    }
+
+    fn owned_expression_roots(&self, owner: DeclId) -> Vec<usize> {
+        let Some(signature) = self.signature_by_declaration(owner) else {
+            return Vec::new();
+        };
+        let owned = self
+            .expressions_by_owner
+            .get(&signature.name)
+            .cloned()
+            .unwrap_or_default();
+        let owned_set = owned.iter().copied().collect::<BTreeSet<_>>();
+        let children = owned
+            .iter()
+            .filter_map(|expression| self.program.expressions.get(*expression))
+            .flat_map(direct_expression_children)
+            .filter(|child| owned_set.contains(child))
+            .collect::<BTreeSet<_>>();
+        owned
+            .into_iter()
+            .filter(|expression| !children.contains(expression))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_passed_requirement_constraints(
+        &self,
+        owner: DeclId,
+        expression: usize,
+        expected: Option<Type>,
+        requirements: &BTreeMap<DeclId, Option<CheckedPassRequirement>>,
+        leaf_vars: &BTreeMap<usize, TypeVar>,
+        call_scheme_vars: &mut BTreeMap<(CheckedCallId, TypeVar), TypeVar>,
+        next_var: &mut u32,
+        target: &mut Option<CheckedPassRequirement>,
+        active: &mut BTreeSet<usize>,
+    ) {
+        if !active.insert(expression) {
+            return;
+        }
+        let owned_by_callable = self
+            .expression_owner
+            .get(&expression)
+            .and_then(|name| self.signature(name))
+            .is_some_and(|signature| signature.decl_id == owner);
+        if !owned_by_callable {
+            active.remove(&expression);
+            return;
+        }
+        let Some(expr) = self.program.expressions.get(expression) else {
+            active.remove(&expression);
+            return;
+        };
+        if let Some(projection) = checked_passed_projection(expr) {
+            let leaf = leaf_vars
+                .get(&expression)
+                .copied()
+                .map(Type::Var)
+                .unwrap_or(Type::Unknown);
+            let expected = expected
+                .map(|expected| pass_scheme_type_with_fallback(&expected, &leaf))
+                .unwrap_or(leaf);
+            merge_checked_pass_requirement(
+                target,
+                continuous_flow_type(forwarded_parameter_requirement(&projection, expected)),
+            );
+            active.remove(&expression);
+            return;
+        }
+
+        if let Some(call) = self.call_for_expression(CheckedExprId(expression as u32))
+            && let Some(signature) = self.signature_by_declaration(call.callable)
+        {
+            let mut handled = BTreeSet::new();
+            for entry in &call.entries {
+                let CheckedCallEntry::Input { formal, value, .. } = entry else {
+                    continue;
+                };
+                let expected = signature
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.decl_id == *formal)
+                    .map(|parameter| {
+                        instantiate_checked_type_scheme_for_call(
+                            &parameter.flow_type.ty,
+                            call.id,
+                            call_scheme_vars,
+                            next_var,
+                        )
+                    });
+                handled.insert(value.0 as usize);
+                self.collect_passed_requirement_constraints(
+                    owner,
+                    value.0 as usize,
+                    expected,
+                    requirements,
+                    leaf_vars,
+                    call_scheme_vars,
+                    next_var,
+                    target,
+                    active,
+                );
+            }
+            if let Some(pass) = call.pass {
+                handled.insert(pass.value.0 as usize);
+                let expected = (signature.kind == CheckedCallableKind::User)
+                    .then(|| {
+                        requirements
+                            .get(&signature.decl_id)
+                            .and_then(Option::as_ref)
+                            .map(|requirement| {
+                                instantiate_checked_type_scheme_for_call(
+                                    &requirement.scheme.ty,
+                                    call.id,
+                                    call_scheme_vars,
+                                    next_var,
+                                )
+                            })
+                    })
+                    .flatten();
+                self.collect_passed_requirement_constraints(
+                    owner,
+                    pass.value.0 as usize,
+                    expected,
+                    requirements,
+                    leaf_vars,
+                    call_scheme_vars,
+                    next_var,
+                    target,
+                    active,
+                );
+            }
+            for child in direct_expression_children(expr) {
+                if handled.insert(child) {
+                    self.collect_passed_requirement_constraints(
+                        owner,
+                        child,
+                        None,
+                        requirements,
+                        leaf_vars,
+                        call_scheme_vars,
+                        next_var,
+                        target,
+                        active,
+                    );
+                }
+            }
+            active.remove(&expression);
+            return;
+        }
+
+        let mut recurse = |child: usize,
+                           expected: Option<Type>,
+                           target: &mut Option<CheckedPassRequirement>,
+                           active: &mut BTreeSet<usize>| {
+            self.collect_passed_requirement_constraints(
+                owner,
+                child,
+                expected,
+                requirements,
+                leaf_vars,
+                call_scheme_vars,
+                next_var,
+                target,
+                active,
+            );
+        };
+        match &expr.kind {
+            AstExprKind::Infix { left, op, right } => {
+                let expected = infix_requires_number_operands(op).then_some(Type::Number);
+                recurse(*left, expected.clone(), target, active);
+                recurse(*right, expected, target, active);
+            }
+            AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
+                let expected_shape = expected.as_ref().and_then(|expected| match expected {
+                    Type::Object(shape) => Some(shape),
+                    _ => None,
+                });
+                for field in fields {
+                    recurse(
+                        field.value,
+                        expected_shape
+                            .and_then(|shape| shape.fields.get(&field.name))
+                            .cloned(),
+                        target,
+                        active,
+                    );
+                }
+            }
+            AstExprKind::TaggedObject { tag, fields } => {
+                let expected_shape = expected.as_ref().and_then(|expected| match expected {
+                    Type::VariantSet(variants) => {
+                        variants.iter().find_map(|variant| match variant {
+                            Variant::Tagged {
+                                tag: expected_tag,
+                                fields,
+                            } if expected_tag == tag => Some(fields),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                });
+                for field in fields {
+                    recurse(
+                        field.value,
+                        expected_shape
+                            .and_then(|shape| shape.fields.get(&field.name))
+                            .cloned(),
+                        target,
+                        active,
+                    );
+                }
+            }
+            AstExprKind::ListLiteral { items, .. } => {
+                let expected_item = expected.as_ref().and_then(|expected| match expected {
+                    Type::List(item) => Some((**item).clone()),
+                    _ => None,
+                });
+                for item in items {
+                    recurse(*item, expected_item.clone(), target, active);
+                }
+            }
+            AstExprKind::Then { input, output } => {
+                recurse(expr.linked_input.unwrap_or(*input), None, target, active);
+                if let Some(output) = output {
+                    recurse(*output, expected, target, active);
+                }
+            }
+            AstExprKind::When { input, arms } => {
+                recurse(expr.linked_input.unwrap_or(*input), None, target, active);
+                for arm in arms {
+                    recurse(*arm, expected.clone(), target, active);
+                }
+            }
+            AstExprKind::Latest { branches } => {
+                for branch in branches {
+                    recurse(*branch, expected.clone(), target, active);
+                }
+            }
+            AstExprKind::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    recurse(*output, expected, target, active);
+                }
+            }
+            AstExprKind::Block { bindings, result } => {
+                for binding in bindings {
+                    recurse(binding.value, None, target, active);
+                }
+                if let Some(result) = result {
+                    recurse(*result, expected, target, active);
+                }
+            }
+            AstExprKind::Hold { initial, .. } | AstExprKind::Draining { input: initial } => {
+                recurse(
+                    expr.linked_input.unwrap_or(*initial),
+                    expected,
+                    target,
+                    active,
+                );
+            }
+            AstExprKind::TextTemplate { segments } => {
+                for value in segments.iter().filter_map(|segment| match segment {
+                    AstTextSegment::Static { .. } => None,
+                    AstTextSegment::Dynamic { value } => Some(*value),
+                }) {
+                    recurse(value, None, target, active);
+                }
+            }
+            AstExprKind::BytesLiteral { items, .. } => {
+                for item in items {
+                    recurse(*item, None, target, active);
+                }
+            }
+            AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
+                for child in direct_expression_children(expr) {
+                    recurse(child, None, target, active);
+                }
+            }
+            AstExprKind::Identifier(_)
+            | AstExprKind::Path(_)
+            | AstExprKind::Drain { .. }
+            | AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::Number(_)
+            | AstExprKind::ByteLiteral { .. }
+            | AstExprKind::Bool(_)
+            | AstExprKind::Enum(_)
+            | AstExprKind::Tag(_)
+            | AstExprKind::Source
+            | AstExprKind::Delimiter
+            | AstExprKind::Unknown(_) => {}
+        }
+        active.remove(&expression);
+    }
+
     fn infer_structural_user_result_schemes(&mut self) {
         self.begin_checked_flow_inference_epoch();
         let roots = self.program.ast.statements.clone();
@@ -3378,6 +4094,84 @@ impl<'a> CheckedProgramBuilder<'a> {
         });
     }
 
+    fn validate_pass_calls(&mut self) {
+        let calls = self.calls.clone();
+        for call in calls {
+            let Some(signature) = self.signature_by_declaration(call.callable).cloned() else {
+                continue;
+            };
+            if signature.kind != CheckedCallableKind::User {
+                if let Some(pass) = call.pass {
+                    self.diagnostics.push(TypeDiagnostic {
+                        severity: DiagnosticSeverity::Error,
+                        line: pass.span.line,
+                        start: pass.span.start,
+                        end: pass.span.end,
+                        message: format!(
+                            "`PASS:` is only valid on user callable calls; `{}` is {}",
+                            signature.name,
+                            match signature.kind {
+                                CheckedCallableKind::Builtin => "a built-in callable",
+                                CheckedCallableKind::External => "an external callable",
+                                CheckedCallableKind::User => unreachable!(),
+                            }
+                        ),
+                    });
+                }
+                continue;
+            }
+            let Some(requirement) = signature.pass_requirement.as_ref() else {
+                continue;
+            };
+            let Some(pass) = call.pass else {
+                if call.owner_callable.is_none() {
+                    self.diagnostics.push(TypeDiagnostic {
+                        severity: DiagnosticSeverity::Error,
+                        line: call.span.line,
+                        start: call.span.start,
+                        end: call.span.end,
+                        message: format!(
+                            "root call to `FUNCTION {}` requires a final `PASS:` clause",
+                            signature.name
+                        ),
+                    });
+                }
+                continue;
+            };
+            let substitutions = call
+                .type_substitutions
+                .iter()
+                .map(|substitution| (substitution.variable, substitution.value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let actual = self
+                .infer_checked_expr_flow(pass.value.0 as usize, &mut BTreeSet::new())
+                .ty;
+            let expected = substitute_checked_type(&requirement.scheme.ty, &substitutions);
+            if type_is_assignable_to(&actual, &expected) {
+                continue;
+            }
+            let detail = if let Some(field) = missing_field_name(&actual, &expected) {
+                format!("missing required field `{field}`")
+            } else if let Some(field) = incompatible_field_name(&actual, &expected) {
+                format!("field `{field}` has an incompatible type")
+            } else {
+                "context value has an incompatible type".to_owned()
+            };
+            self.diagnostics.push(TypeDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                line: pass.span.line,
+                start: pass.span.start,
+                end: pass.span.end,
+                message: format!(
+                    "`FUNCTION {}` PASS context {detail}\nexpected: {}\nfound: {}",
+                    signature.name,
+                    boon_facing_type_label(&expected),
+                    boon_facing_type_label(&actual)
+                ),
+            });
+        }
+    }
+
     fn validate_user_call_arguments(&mut self) {
         let calls = self.calls.clone();
         for call in calls {
@@ -3533,6 +4327,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
                 .ty;
             unify_checked_type_pattern(&parameter.flow_type.ty, &actual, &mut substitutions);
+        }
+        if let (Some(requirement), Some(pass)) = (signature.pass_requirement.as_ref(), call.pass) {
+            let actual = self
+                .infer_checked_expr_flow(pass.value.0 as usize, &mut BTreeSet::new())
+                .ty;
+            unify_checked_type_pattern(&requirement.scheme.ty, &actual, &mut substitutions);
         }
 
         let mut changed = false;
@@ -4279,6 +5079,11 @@ impl<'a> CheckedProgramBuilder<'a> {
         parts: &[String],
         active: &mut BTreeSet<usize>,
     ) -> Option<FlowMode> {
+        if parts.first().is_some_and(|part| part == "PASSED") {
+            return self
+                .checked_passed_flow_type(expr_id, &parts[1..])
+                .map(|flow_type| flow_type.mode);
+        }
         let scope_id = self
             .expression_scopes
             .get(&expr_id)
@@ -4705,6 +5510,12 @@ impl<'a> CheckedProgramBuilder<'a> {
         let Some(name) = parts.first() else {
             return fallback;
         };
+        if name == "PASSED" {
+            return self
+                .checked_passed_flow_type(expr_id, &parts[1..])
+                .map(|flow_type| flow_type.ty)
+                .unwrap_or(fallback);
+        }
         let scope_id = self
             .expression_scopes
             .get(&expr_id)
@@ -4720,6 +5531,15 @@ impl<'a> CheckedProgramBuilder<'a> {
             .map(|declaration| declaration.flow_type.ty.clone())
             .unwrap_or(Type::Unknown);
         self.project_checked_type(expr_id, base, &parts[1..])
+    }
+
+    fn checked_passed_flow_type(&self, expr_id: usize, projection: &[String]) -> Option<FlowType> {
+        let owner = self.expression_owner.get(&expr_id)?;
+        let requirement = self.signature(owner)?.pass_requirement.as_ref()?;
+        Some(FlowType {
+            mode: requirement.scheme.mode,
+            ty: type_for_nested_path(&requirement.scheme.ty, projection)?,
+        })
     }
 
     fn project_checked_type(&mut self, expr_id: usize, mut ty: Type, fields: &[String]) -> Type {
@@ -5157,21 +5977,9 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn checked_source_statement_flow_type(&self, statement: &AstStatement) -> FlowType {
-        let payload = statement
-            .expr
-            .and_then(|expr_id| {
-                self.program
-                    .source_ports
-                    .iter()
-                    .find(|source| source.expr_id == Some(expr_id))
-            })
-            .and_then(|source| {
-                self.source_payload_shape_table
-                    .iter()
-                    .find(|entry| entry.source_path == source.path)
-            })
-            .map(|entry| entry.payload_type.clone())
-            .unwrap_or_else(exact_empty_object_type);
+        let payload =
+            source_payload_type_for_statement(statement, &self.source_payload_shape_table)
+                .unwrap_or_else(exact_empty_object_type);
         let ty = match &statement.kind {
             AstStatementKind::Source {
                 event: Some(event), ..
@@ -5660,6 +6468,471 @@ impl<'a> CheckedProgramBuilder<'a> {
         (statements, expressions)
     }
 
+    fn derive_checked_resources(
+        &mut self,
+        statements: &mut [CheckedStatement],
+        expressions: &mut [CheckedExpression],
+    ) -> (Vec<CheckedSource>, Vec<CheckedState>, Vec<CheckedList>) {
+        let statement_indexes = statements
+            .iter()
+            .enumerate()
+            .map(|(index, statement)| (statement.id, index))
+            .collect::<BTreeMap<_, _>>();
+        let declaration_statements = statements
+            .iter()
+            .filter_map(|statement| {
+                checked_statement_declaration(&statement.kind)
+                    .map(|declaration| (declaration, statement.id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let declaration_values = self
+            .declarations
+            .iter()
+            .filter_map(|declaration| {
+                declaration
+                    .value
+                    .map(|value| (declaration.id, (value, declaration.flow_type.clone())))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let builtin_source_call_expressions = self
+            .calls
+            .iter()
+            .filter(|call| {
+                self.signature_by_declaration(call.callable)
+                    .is_some_and(|signature| {
+                        signature.kind == CheckedCallableKind::Builtin
+                            && signature.effect.emits_source
+                    })
+            })
+            .map(|call| call.expression)
+            .collect::<BTreeSet<_>>();
+        let mut sources = Vec::new();
+        for checked_expression in expressions.iter().filter(|expression| {
+            matches!(expression.kind, CheckedExpressionKind::Source)
+                || builtin_source_call_expressions.contains(&expression.id)
+        }) {
+            let expression = checked_expression.id;
+            let Some(declaration) = checked_expression.declaration else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: checked_expression.span.line,
+                    start: checked_expression.span.start,
+                    end: checked_expression.span.end,
+                    message: format!(
+                        "SOURCE expression {} has no lexical checked declaration",
+                        expression.0
+                    ),
+                });
+                continue;
+            };
+            let Some(statement) = declaration_statements.get(&declaration).copied() else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: checked_expression.span.line,
+                    start: checked_expression.span.start,
+                    end: checked_expression.span.end,
+                    message: format!(
+                        "source-emitting expression {} has no owning checked statement",
+                        expression.0
+                    ),
+                });
+                continue;
+            };
+            let Some(statement_index) = statement_indexes.get(&statement).copied() else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: checked_expression.span.line,
+                    start: checked_expression.span.start,
+                    end: checked_expression.span.end,
+                    message: format!(
+                        "source-emitting expression {} belongs to missing checked statement {}",
+                        expression.0, statement.0
+                    ),
+                });
+                continue;
+            };
+            let interval_ms = match &checked_expression.kind {
+                CheckedExpressionKind::Call { call } => self
+                    .call_by_checked_id(*call)
+                    .and_then(|call| checked_call_input(call, "duration"))
+                    .and_then(|duration| checked_duration_milliseconds(duration, expressions)),
+                CheckedExpressionKind::Source => None,
+                _ => unreachable!("filtered checked source expression"),
+            };
+            let source = CheckedSource {
+                id: CheckedSourceId(sources.len() as u32),
+                declaration,
+                statement,
+                expression,
+                owner_scope: checked_expression.scope_id,
+                path: CheckedSemanticPath {
+                    anchor: declaration,
+                    projection: checked_declaration_resource_projection(
+                        &self.signatures,
+                        &declaration_values,
+                        expressions,
+                        &self.calls,
+                        declaration,
+                        checked_expression.id,
+                    )
+                    .unwrap_or_default(),
+                },
+                interval_ms,
+                payload_type: exact_empty_object_type(),
+                span: checked_expression.span,
+            };
+            statements[statement_index]
+                .resources
+                .push(CheckedResourceBinding::Source { source: source.id });
+            sources.push(source);
+        }
+        let explicit_source_expressions = sources
+            .iter()
+            .map(|source| source.expression)
+            .collect::<BTreeSet<_>>();
+        let host_source_call_expressions = self
+            .calls
+            .iter()
+            .filter(|call| host_effect_signature(&call.function).is_some())
+            .map(|call| call.expression)
+            .collect::<BTreeSet<_>>();
+        for expression in expressions.iter().filter(|expression| {
+            expression.effect.emits_source
+                && host_source_call_expressions.contains(&expression.id)
+                && !explicit_source_expressions.contains(&expression.id)
+        }) {
+            let Some(declaration) = expression.declaration else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.span.line,
+                    start: expression.span.start,
+                    end: expression.span.end,
+                    message: format!(
+                        "source-emitting expression {} has no lexical checked declaration",
+                        expression.id.0
+                    ),
+                });
+                continue;
+            };
+            let Some(statement) = declaration_statements.get(&declaration).copied() else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.span.line,
+                    start: expression.span.start,
+                    end: expression.span.end,
+                    message: format!(
+                        "source-emitting expression {} has no owning checked statement",
+                        expression.id.0
+                    ),
+                });
+                continue;
+            };
+            let projection = checked_declaration_resource_projection(
+                &self.signatures,
+                &declaration_values,
+                expressions,
+                &self.calls,
+                declaration,
+                expression.id,
+            )
+            .unwrap_or_default();
+            let source = CheckedSource {
+                id: CheckedSourceId(sources.len() as u32),
+                declaration,
+                statement,
+                expression: expression.id,
+                owner_scope: expression.scope_id,
+                path: CheckedSemanticPath {
+                    anchor: declaration,
+                    projection,
+                },
+                interval_ms: None,
+                payload_type: exact_empty_object_type(),
+                span: expression.span,
+            };
+            if let Some(statement_index) = statement_indexes.get(&statement).copied() {
+                statements[statement_index]
+                    .resources
+                    .push(CheckedResourceBinding::Source { source: source.id });
+            }
+            sources.push(source);
+        }
+
+        for expression in expressions.iter_mut() {
+            let CheckedExpressionKind::Read {
+                target,
+                projection,
+                source,
+            } = &mut expression.kind
+            else {
+                continue;
+            };
+            *source = exact_checked_source_read(*target, projection, &sources);
+        }
+        refine_checked_source_payload_types(&mut sources, expressions);
+
+        let hold_update_mergers = checked_hold_update_mergers(
+            statements,
+            expressions,
+            &declaration_statements,
+            &self.calls,
+        );
+        let mut states = Vec::<CheckedState>::new();
+        for expression in expressions.iter() {
+            let state = match &expression.kind {
+                CheckedExpressionKind::Hold { initial, .. } => {
+                    Some((CheckedStateKind::Hold, *initial))
+                }
+                CheckedExpressionKind::Latest { branches }
+                    if !hold_update_mergers.contains(&expression.id)
+                        && branches.first().is_some_and(|branch| {
+                            expressions
+                                .get(branch.0 as usize)
+                                .is_some_and(|branch| branch.flow_type.mode == FlowMode::Continuous)
+                        }) =>
+                {
+                    branches
+                        .first()
+                        .copied()
+                        .map(|initial| (CheckedStateKind::InitialLatest, initial))
+                }
+                CheckedExpressionKind::Call { call } if expression.effect.writes_state => {
+                    self.call_by_checked_id(*call)
+                        .and_then(|call| {
+                            self.signature_by_declaration(call.callable)
+                                .filter(|signature| signature.kind == CheckedCallableKind::Builtin)
+                                .and_then(|signature| {
+                                    signature
+                                        .parameters
+                                        .iter()
+                                        .filter(|parameter| {
+                                            parameter.kind == CheckedParameterKind::Value
+                                        })
+                                        .min_by_key(|parameter| parameter.ordinal)
+                                        .and_then(|parameter| {
+                                            call.entries.iter().find_map(|entry| match entry {
+                                                CheckedCallEntry::Input {
+                                                    formal, value, ..
+                                                } if *formal == parameter.decl_id => Some(*value),
+                                                CheckedCallEntry::Input { .. }
+                                                | CheckedCallEntry::FreshOut { .. }
+                                                | CheckedCallEntry::ForwardOut { .. } => None,
+                                            })
+                                        })
+                                })
+                        })
+                        .map(|initial| (CheckedStateKind::StatefulCall, initial))
+                }
+                _ => None,
+            };
+            let Some((kind, initial)) = state else {
+                continue;
+            };
+            let Some(declaration) = expression.declaration else {
+                let message = if kind == CheckedStateKind::Hold {
+                    "anonymous line-based state requires a named lexical declaration".to_owned()
+                } else {
+                    format!(
+                        "stateful expression {} has no lexical checked declaration",
+                        expression.id.0
+                    )
+                };
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.span.line,
+                    start: expression.span.start,
+                    end: expression.span.end,
+                    message,
+                });
+                continue;
+            };
+            let Some(statement) = declaration_statements.get(&declaration).copied() else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.span.line,
+                    start: expression.span.start,
+                    end: expression.span.end,
+                    message: format!(
+                        "stateful expression {} has no owning checked statement",
+                        expression.id.0
+                    ),
+                });
+                continue;
+            };
+            let mut projection = checked_declaration_resource_projection(
+                &self.signatures,
+                &declaration_values,
+                expressions,
+                &self.calls,
+                declaration,
+                expression.id,
+            )
+            .unwrap_or_default();
+            if projection.is_empty()
+                && self
+                    .declarations
+                    .iter()
+                    .find(|candidate| candidate.id == declaration)
+                    .is_some_and(|declaration| declaration.kind == CheckedDeclarationKind::Function)
+            {
+                projection = vec![format!(
+                    "state_{}",
+                    states
+                        .iter()
+                        .filter(|state| state.declaration == declaration)
+                        .count()
+                )];
+            }
+            let state = CheckedState {
+                id: CheckedStateId(states.len() as u32),
+                declaration,
+                statement,
+                expression: expression.id,
+                initial,
+                owner_scope: expression.scope_id,
+                path: CheckedSemanticPath {
+                    anchor: declaration,
+                    projection,
+                },
+                kind,
+                flow_type: expression.flow_type.clone(),
+                span: expression.span,
+            };
+            if let Some(statement_index) = statement_indexes.get(&statement).copied() {
+                statements[statement_index]
+                    .resources
+                    .push(CheckedResourceBinding::State { state: state.id });
+            }
+            states.push(state);
+        }
+        let state_declarations = states
+            .iter()
+            .map(|state| state.declaration)
+            .collect::<BTreeSet<_>>();
+        for statement in statements
+            .iter_mut()
+            .filter(|statement| matches!(statement.kind, CheckedStatementKind::Hold { .. }))
+        {
+            let Some(declaration) = checked_statement_declaration(&statement.kind) else {
+                continue;
+            };
+            if state_declarations.contains(&declaration) {
+                continue;
+            }
+            let Some(initial) = statement.value else {
+                continue;
+            };
+            let Some(expression) = expressions.get(initial.0 as usize) else {
+                continue;
+            };
+            let state = CheckedState {
+                id: CheckedStateId(states.len() as u32),
+                declaration,
+                statement: statement.id,
+                expression: initial,
+                initial,
+                owner_scope: statement.scope_id,
+                path: CheckedSemanticPath {
+                    anchor: declaration,
+                    projection: Vec::new(),
+                },
+                kind: CheckedStateKind::StatementHold,
+                flow_type: declaration_values
+                    .get(&declaration)
+                    .map(|(_, flow_type)| flow_type.clone())
+                    .unwrap_or_else(|| expression.flow_type.clone()),
+                span: statement.span,
+            };
+            statement
+                .resources
+                .push(CheckedResourceBinding::State { state: state.id });
+            states.push(state);
+        }
+
+        let mut lists = Vec::new();
+        for expression in expressions
+            .iter()
+            .filter(|expression| matches!(expression.kind, CheckedExpressionKind::List { .. }))
+        {
+            let Some(declaration) = expression.declaration else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.span.line,
+                    start: expression.span.start,
+                    end: expression.span.end,
+                    message: format!(
+                        "LIST expression {} has no lexical checked declaration",
+                        expression.id.0
+                    ),
+                });
+                continue;
+            };
+            let Some(statement) = declaration_statements.get(&declaration).copied() else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.span.line,
+                    start: expression.span.start,
+                    end: expression.span.end,
+                    message: format!(
+                        "LIST expression {} has no owning checked statement",
+                        expression.id.0
+                    ),
+                });
+                continue;
+            };
+            let CheckedExpressionKind::List { capacity, .. } = &expression.kind else {
+                unreachable!()
+            };
+            let Type::List(item_type) = &expression.flow_type.ty else {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.span.line,
+                    start: expression.span.start,
+                    end: expression.span.end,
+                    message: format!(
+                        "LIST expression {} has non-list checked type {:?}",
+                        expression.id.0, expression.flow_type.ty
+                    ),
+                });
+                continue;
+            };
+            let projection = checked_declaration_resource_projection(
+                &self.signatures,
+                &declaration_values,
+                expressions,
+                &self.calls,
+                declaration,
+                expression.id,
+            )
+            .unwrap_or_default();
+            let list = CheckedList {
+                id: CheckedListId(lists.len() as u32),
+                declaration,
+                statement,
+                producer: expression.id,
+                owner_scope: expression.scope_id,
+                path: CheckedSemanticPath {
+                    anchor: declaration,
+                    projection,
+                },
+                item_type: item_type.as_ref().clone(),
+                capacity: *capacity,
+                key_policy: CheckedListKeyPolicy::GeneratedOccurrenceU64 {
+                    has_generation: true,
+                },
+                span: expression.span,
+            };
+            if let Some(statement_index) = statement_indexes.get(&statement).copied() {
+                statements[statement_index]
+                    .resources
+                    .push(CheckedResourceBinding::ListAuthority { list: list.id });
+            }
+            lists.push(list);
+        }
+
+        (sources, states, lists)
+    }
+
     fn validate_checked_temporal_contracts(&mut self, expressions: &[CheckedExpression]) {
         let expression_by_id = expressions
             .iter()
@@ -6025,7 +7298,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                             None
                         }
                     })
-                    .chain(call.pass)
+                    .chain(call.pass.map(|pass| pass.value))
                     .chain(
                         self.signature_by_declaration(call.callable)
                             .filter(|signature| {
@@ -6137,6 +7410,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .copied()
                     .unwrap_or(LexicalScopeId(0)),
                 kind,
+                resources: Vec::new(),
                 value: canonical_checked_statement_value_expression(
                     statement,
                     &self.program.expressions,
@@ -6383,39 +7657,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                 |(target, projection)| CheckedExpressionKind::Read {
                     target,
                     projection,
-                    source: self.checked_source_read(parts),
+                    source: None,
                 },
             )
-    }
-
-    fn checked_source_read(&self, parts: &[String]) -> Option<CheckedSourceRead> {
-        let source_paths = self.source_payload_lookup.source_paths_for_parts(parts);
-        let mut expressions = source_paths
-            .iter()
-            .flat_map(|path| {
-                self.program
-                    .source_ports
-                    .iter()
-                    .filter(move |source| source.path == *path)
-            })
-            .filter_map(|source| source.expr_id)
-            .map(|expression| CheckedExprId(expression as u32))
-            .collect::<Vec<_>>();
-        expressions.sort_unstable();
-        expressions.dedup();
-        let [expression] = expressions.as_slice() else {
-            return None;
-        };
-        let payload_projection = match self.source_payload_lookup.access_for_parts(parts)? {
-            SourcePayloadAccess::Direct(_) => Vec::new(),
-            SourcePayloadAccess::Field(field) | SourcePayloadAccess::UnknownField(field) => {
-                vec![field]
-            }
-        };
-        Some(CheckedSourceRead {
-            expression: *expression,
-            payload_projection,
-        })
     }
 
     fn resolve_checked_read_path(
@@ -6432,38 +7676,18 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .find(|declaration| declaration.id == target)
                 .and_then(|declaration| declaration.body_scope)
             else {
-                return Some((
-                    target,
-                    self.canonical_checked_projection(target, &parts[index..]),
-                ));
+                return Some((target, parts[index..].to_vec()));
             };
             let Some(child) = self
                 .scope_declarations
                 .get(&(body_scope, part.clone()))
                 .copied()
             else {
-                return Some((
-                    target,
-                    self.canonical_checked_projection(target, &parts[index..]),
-                ));
+                return Some((target, parts[index..].to_vec()));
             };
             target = child;
         }
         Some((target, Vec::new()))
-    }
-
-    fn canonical_checked_projection(&self, target: DeclId, projection: &[String]) -> Vec<String> {
-        if !self.declarations.iter().any(|declaration| {
-            declaration.id == target && declaration.kind == CheckedDeclarationKind::Source
-        }) {
-            return projection.to_vec();
-        }
-        match source_payload_access_for_suffix(&projection.join(".")) {
-            SourcePayloadAccess::Field(field) => vec![field],
-            SourcePayloadAccess::Direct(_) | SourcePayloadAccess::UnknownField(_) => {
-                projection.to_vec()
-            }
-        }
     }
 
     fn resolve_checked_read_name(
@@ -6882,7 +8106,11 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                         .iter()
                         .find(|declaration| declaration.id == *target)
                         .and_then(|declaration| declaration.value)
-                        .or(source.as_ref().map(|source| source.expression))
+                        .or_else(|| {
+                            source
+                                .as_ref()
+                                .and_then(|source| self.program.source_expression(source))
+                        })
                     {
                         self.expression_state(value, frames)
                     } else if self
@@ -7149,7 +8377,11 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                     } else {
                         let declared_value = declaration
                             .and_then(|declaration| declaration.value)
-                            .or(source.as_ref().map(|source| source.expression));
+                            .or_else(|| {
+                                source
+                                    .as_ref()
+                                    .and_then(|source| self.program.source_expression(source))
+                            });
                         let expanded = declared_value.and_then(|value| {
                             self.semantic_expression(value, frames, active)
                                 .map(|value| project(value, projection))
@@ -7252,7 +8484,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                         if let Some(pass) = call.pass {
                             inputs.push((
                                 "PASS".to_owned(),
-                                self.semantic_expression(pass, frames, active)?,
+                                self.semantic_expression(pass.value, frames, active)?,
                             ));
                         }
                         Some(CheckedOrderSemanticExpression::Call {
@@ -7359,7 +8591,11 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                         .iter()
                         .find(|declaration| declaration.id == *target)
                         .and_then(|declaration| declaration.value)
-                        .or(source.as_ref().map(|source| source.expression))
+                        .or_else(|| {
+                            source
+                                .as_ref()
+                                .and_then(|source| self.program.source_expression(source))
+                        })
                         .is_none_or(|value| self.expression_is_total(value, frames, active))
                 }
             }
@@ -7416,7 +8652,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                         })
                         && call
                             .pass
-                            .is_none_or(|pass| self.expression_is_total(pass, frames, active))
+                            .is_none_or(|pass| self.expression_is_total(pass.value, frames, active))
                 }
             }
             CheckedExpressionKind::TextTemplate { segments } => {
@@ -7551,7 +8787,11 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                     .iter()
                     .find(|declaration| declaration.id == *target)
                     .and_then(|declaration| declaration.value)
-                    .or(source.as_ref().map(|source| source.expression))
+                    .or_else(|| {
+                        source
+                            .as_ref()
+                            .and_then(|source| self.program.source_expression(source))
+                    })
                     .into_iter()
                     .collect()
             }
@@ -7568,7 +8808,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                             CheckedCallEntry::FreshOut { .. }
                             | CheckedCallEntry::ForwardOut { .. } => None,
                         })
-                        .chain(call.pass)
+                        .chain(call.pass.map(|pass| pass.value))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -7864,6 +9104,84 @@ fn checked_read_path_parts(expression: &AstExpr) -> Option<Vec<String>> {
     }
 }
 
+fn checked_passed_projection(expression: &AstExpr) -> Option<Vec<String>> {
+    let parts = checked_read_path_parts(expression)?;
+    parts
+        .first()
+        .is_some_and(|part| part == "PASSED")
+        .then(|| parts.into_iter().skip(1).collect())
+}
+
+fn merge_checked_pass_requirement(
+    requirement: &mut Option<CheckedPassRequirement>,
+    incoming: FlowType,
+) {
+    match requirement {
+        Some(requirement) => {
+            requirement.scheme = FlowType {
+                mode: merge_flow_modes(requirement.scheme.mode, incoming.mode),
+                ty: merge_forwarded_parameter_type(&requirement.scheme.ty, &incoming.ty),
+            };
+        }
+        None => *requirement = Some(CheckedPassRequirement { scheme: incoming }),
+    }
+}
+
+fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {
+    match ty {
+        Type::Unknown | Type::UnresolvedShape { .. } => fallback.clone(),
+        Type::Object(shape) if shape.open && shape.fields.is_empty() => fallback.clone(),
+        Type::Object(shape) => Type::Object(ObjectShape {
+            fields: shape
+                .fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), pass_scheme_type_with_fallback(ty, fallback)))
+                .collect(),
+            field_order: shape.field_order.clone(),
+            open: shape.open,
+        }),
+        Type::List(item) => Type::List(Box::new(pass_scheme_type_with_fallback(item, fallback))),
+        Type::Function { args, result } => Type::Function {
+            args: args
+                .iter()
+                .map(|arg| pass_scheme_type_with_fallback(arg, fallback))
+                .collect(),
+            result: Box::new(FlowType {
+                mode: result.mode,
+                ty: pass_scheme_type_with_fallback(&result.ty, fallback),
+            }),
+        },
+        Type::VariantSet(variants) => Type::VariantSet(
+            variants
+                .iter()
+                .map(|variant| match variant {
+                    Variant::Tag(tag) => Variant::Tag(tag.clone()),
+                    Variant::Tagged { tag, fields } => Variant::Tagged {
+                        tag: tag.clone(),
+                        fields: ObjectShape {
+                            fields: fields
+                                .fields
+                                .iter()
+                                .map(|(name, ty)| {
+                                    (name.clone(), pass_scheme_type_with_fallback(ty, fallback))
+                                })
+                                .collect(),
+                            field_order: fields.field_order.clone(),
+                            open: fields.open,
+                        },
+                    },
+                })
+                .collect(),
+        ),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Skip
+        | Type::RenderContract
+        | Type::Var(_) => ty.clone(),
+    }
+}
+
 fn fresh_checked_scheme_var(next_var: &mut u32) -> Type {
     let variable = TypeVar(*next_var);
     *next_var = next_var.saturating_add(1);
@@ -7923,6 +9241,86 @@ fn freshen_checked_scheme_type(ty: &Type, next_var: &mut u32) -> Type {
         Type::Text | Type::Number | Type::Bytes(_) | Type::Skip | Type::RenderContract => {
             ty.clone()
         }
+    }
+}
+
+fn instantiate_checked_type_scheme_for_call(
+    ty: &Type,
+    call: CheckedCallId,
+    call_vars: &mut BTreeMap<(CheckedCallId, TypeVar), TypeVar>,
+    next_var: &mut u32,
+) -> Type {
+    match ty {
+        Type::Var(variable) => {
+            Type::Var(*call_vars.entry((call, *variable)).or_insert_with(|| {
+                let instantiated = TypeVar(*next_var);
+                *next_var = next_var.saturating_add(1);
+                instantiated
+            }))
+        }
+        Type::List(item) => Type::List(Box::new(instantiate_checked_type_scheme_for_call(
+            item, call, call_vars, next_var,
+        ))),
+        Type::Function { args, result } => Type::Function {
+            args: args
+                .iter()
+                .map(|argument| {
+                    instantiate_checked_type_scheme_for_call(argument, call, call_vars, next_var)
+                })
+                .collect(),
+            result: Box::new(FlowType {
+                mode: result.mode,
+                ty: instantiate_checked_type_scheme_for_call(&result.ty, call, call_vars, next_var),
+            }),
+        },
+        Type::Object(shape) => Type::Object(ObjectShape {
+            fields: shape
+                .fields
+                .iter()
+                .map(|(name, ty)| {
+                    (
+                        name.clone(),
+                        instantiate_checked_type_scheme_for_call(ty, call, call_vars, next_var),
+                    )
+                })
+                .collect(),
+            field_order: shape.field_order.clone(),
+            open: shape.open,
+        }),
+        Type::VariantSet(variants) => Type::VariantSet(
+            variants
+                .iter()
+                .map(|variant| match variant {
+                    Variant::Tag(tag) => Variant::Tag(tag.clone()),
+                    Variant::Tagged { tag, fields } => Variant::Tagged {
+                        tag: tag.clone(),
+                        fields: ObjectShape {
+                            fields: fields
+                                .fields
+                                .iter()
+                                .map(|(name, ty)| {
+                                    (
+                                        name.clone(),
+                                        instantiate_checked_type_scheme_for_call(
+                                            ty, call, call_vars, next_var,
+                                        ),
+                                    )
+                                })
+                                .collect(),
+                            field_order: fields.field_order.clone(),
+                            open: fields.open,
+                        },
+                    },
+                })
+                .collect(),
+        ),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Skip
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => ty.clone(),
     }
 }
 
@@ -9016,10 +10414,9 @@ pub struct TypeCheckProfile {
     pub object_bindings_ms: f64,
     pub function_param_requirements_ms: f64,
     pub name_bindings_ms: f64,
-    pub passed_context_ms: f64,
     pub flow_bindings_ms: f64,
     pub render_contracts_ms: f64,
-    pub refresh_static_row_scope_bindings_ms: f64,
+    pub refresh_static_list_bindings_ms: f64,
     pub recursive_functions_ms: f64,
     pub check_statements_ms: f64,
     pub ensure_all_expressions_ms: f64,
@@ -9039,10 +10436,9 @@ struct CheckerInitProfile {
     object_bindings_ms: f64,
     function_param_requirements_ms: f64,
     name_bindings_ms: f64,
-    passed_context_ms: f64,
     flow_bindings_ms: f64,
     render_contracts_ms: f64,
-    refresh_static_row_scope_bindings_ms: f64,
+    refresh_static_list_bindings_ms: f64,
 }
 
 struct Checker<'a> {
@@ -9078,8 +10474,23 @@ struct Checker<'a> {
     function_type_table: FunctionTypeTable,
     collect_type_hints: bool,
     render_slot_table: RenderSlotTable,
+    deferred_style_constraints: Vec<DeferredStyleConstraint>,
     constraints: Vec<Constraint>,
     diagnostics: Vec<TypeDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DeferredStyleExpectation {
+    Dimension,
+    Number,
+    Color,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DeferredStyleConstraint {
+    expression: CheckedExprId,
+    field_name: String,
+    expectation: DeferredStyleExpectation,
 }
 
 #[derive(Clone, Debug)]
@@ -9147,8 +10558,7 @@ impl<'a> Checker<'a> {
     ) -> (Self, CheckerInitProfile) {
         let checker_init_started = Instant::now();
         let source_paths_started = Instant::now();
-        let source_paths = program
-            .source_ports
+        let source_paths = syntax_source_sites(program)
             .iter()
             .map(|source| source.path.clone())
             .collect();
@@ -9202,11 +10612,6 @@ impl<'a> Checker<'a> {
             &mut name_bindings,
         );
         let name_bindings_ms = typecheck_elapsed_ms(name_bindings_started);
-        let passed_context_started = Instant::now();
-        if let Some(passed_type) = passed_context_type(program, &name_bindings) {
-            name_bindings.insert("PASSED".to_owned(), passed_type);
-        }
-        let passed_context_ms = typecheck_elapsed_ms(passed_context_started);
         let flow_bindings_started = Instant::now();
         let flow_bindings = flow_bindings(program, external_types);
         let flow_bindings_ms = typecheck_elapsed_ms(flow_bindings_started);
@@ -9264,6 +10669,7 @@ impl<'a> Checker<'a> {
             function_type_table: FunctionTypeTable::default(),
             collect_type_hints: true,
             render_slot_table: RenderSlotTable::default(),
+            deferred_style_constraints: Vec::new(),
             constraints: Vec::new(),
             diagnostics: external_type_environment_diagnostics(external_types)
                 .into_iter()
@@ -9272,7 +10678,7 @@ impl<'a> Checker<'a> {
         };
         let refresh_started = Instant::now();
         checker.refresh_static_list_bindings();
-        let refresh_static_row_scope_bindings_ms = typecheck_elapsed_ms(refresh_started);
+        let refresh_static_list_bindings_ms = typecheck_elapsed_ms(refresh_started);
         let init_profile = CheckerInitProfile {
             checker_init_ms: typecheck_elapsed_ms(checker_init_started),
             source_paths_ms,
@@ -9282,10 +10688,9 @@ impl<'a> Checker<'a> {
             object_bindings_ms,
             function_param_requirements_ms,
             name_bindings_ms,
-            passed_context_ms,
             flow_bindings_ms,
             render_contracts_ms,
-            refresh_static_row_scope_bindings_ms,
+            refresh_static_list_bindings_ms,
         };
         (checker, init_profile)
     }
@@ -9389,7 +10794,7 @@ impl<'a> Checker<'a> {
             .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
             .count();
         let unresolved_type_variable_count = self.unresolved_type_variable_count();
-        let source_payload_shape_table = self.source_payload_shape_table.clone();
+        let mut source_payload_shape_table = self.source_payload_shape_table.clone();
         let report_counts_ms = typecheck_elapsed_ms(report_counts_started);
         trace_phase("report_counts", report_counts_ms);
         let type_hint_table_started = Instant::now();
@@ -9435,7 +10840,7 @@ impl<'a> Checker<'a> {
             eprintln!("boon_typecheck checked_program:start");
         }
         let checked_program_started = Instant::now();
-        let (checked_program, call_diagnostics, exact_pipeline_inputs_valid) =
+        let (mut checked_program, call_diagnostics, exact_pipeline_inputs_valid) =
             CheckedProgramBuilder::build(
                 self.program,
                 &self.external_types,
@@ -9447,6 +10852,11 @@ impl<'a> Checker<'a> {
                 &self.builtins,
                 &self.render_contracts,
             );
+        refine_checked_host_port_source_payload_types(&mut checked_program, &self.host_port_table);
+        let deferred_style_diagnostics =
+            validate_deferred_style_constraints(&checked_program, &self.deferred_style_constraints);
+        self.diagnostics.extend(deferred_style_diagnostics);
+        source_payload_shape_table = checked_source_payload_shape_table(&checked_program);
         refresh_named_value_types_from_checked_program(
             &mut named_value_type_table,
             &checked_program,
@@ -9486,14 +10896,30 @@ impl<'a> Checker<'a> {
                 )
             })
             .collect::<BTreeSet<_>>();
+        let checked_passed_reads = checked_program
+            .expressions
+            .iter()
+            .filter(|expression| matches!(expression.kind, CheckedExpressionKind::Passed { .. }))
+            .map(|expression| {
+                (
+                    expression.span.line,
+                    expression.span.start,
+                    expression.span.end,
+                )
+            })
+            .collect::<BTreeSet<_>>();
         self.diagnostics.retain(|diagnostic| {
             (!diagnostic.message.starts_with("unknown path `")
                 && !diagnostic.message.starts_with("unknown identifier `"))
-                || !resolved_checked_reads.contains(&(
+                || (!resolved_checked_reads.contains(&(
                     diagnostic.line,
                     diagnostic.start,
                     diagnostic.end,
-                ))
+                )) && !checked_passed_reads.contains(&(
+                    diagnostic.line,
+                    diagnostic.start,
+                    diagnostic.end,
+                )))
         });
         self.diagnostics.extend(call_diagnostics);
         trace_phase(
@@ -9577,11 +11003,9 @@ impl<'a> Checker<'a> {
             render_slot_count,
             render_slot_failure_count,
             builtin_signature_coverage: builtin_signature_coverage(self.program),
-            source_payload_shape_coverage: self
-                .program
-                .source_ports
+            source_payload_shape_coverage: source_payload_shape_table
                 .iter()
-                .map(|source| source.path.clone())
+                .map(|source| source.source_path.clone())
                 .collect(),
             source_payload_shape_table,
             host_port_table: self.host_port_table.clone(),
@@ -9644,11 +11068,9 @@ impl<'a> Checker<'a> {
                 object_bindings_ms: init_profile.object_bindings_ms,
                 function_param_requirements_ms: init_profile.function_param_requirements_ms,
                 name_bindings_ms: init_profile.name_bindings_ms,
-                passed_context_ms: init_profile.passed_context_ms,
                 flow_bindings_ms: init_profile.flow_bindings_ms,
                 render_contracts_ms: init_profile.render_contracts_ms,
-                refresh_static_row_scope_bindings_ms: init_profile
-                    .refresh_static_row_scope_bindings_ms,
+                refresh_static_list_bindings_ms: init_profile.refresh_static_list_bindings_ms,
                 recursive_functions_ms,
                 check_statements_ms,
                 ensure_all_expressions_ms,
@@ -11510,21 +12932,6 @@ impl<'a> Checker<'a> {
         if let Some(ty) = type_from_longest_binding_prefix(&self.name_bindings, parts) {
             return ty;
         }
-        if parts.first().is_some_and(|part| part == "PASSED") && parts.len() > 1 {
-            let passed_path = parts[1..].join(".");
-            if let Some(ty) = self.name_bindings.get(&passed_path) {
-                return ty.clone();
-            }
-            if let Some(base) = parts.get(1).and_then(|part| self.name_bindings.get(part))
-                && parts.len() > 2
-                && let Some(ty) = type_for_nested_path(base, &parts[2..])
-            {
-                return ty;
-            }
-            if let Some(ty) = parts.last().and_then(|field| self.name_bindings.get(field)) {
-                return ty.clone();
-            }
-        }
         if parts.len() >= 2
             && let Some(shape) = self.object_bindings.get(&parts[0])
         {
@@ -11741,23 +13148,7 @@ impl<'a> Checker<'a> {
         {
             return Some(ty);
         }
-        type_from_longest_binding_prefix(&self.name_bindings, parts).or_else(|| {
-            if parts.first().is_some_and(|part| part == "PASSED") && parts.len() > 1 {
-                let passed_path = parts[1..].join(".");
-                if let Some(ty) = self.name_bindings.get(&passed_path) {
-                    return Some(ty.clone());
-                }
-                if let Some(base) = parts.get(1).and_then(|part| self.name_bindings.get(part))
-                    && parts.len() > 2
-                {
-                    return type_for_nested_path(base, &parts[2..]);
-                }
-                if let Some(ty) = parts.last().and_then(|field| self.name_bindings.get(field)) {
-                    return Some(ty.clone());
-                }
-            }
-            None
-        })
+        type_from_longest_binding_prefix(&self.name_bindings, parts)
     }
 
     fn type_for_call(&self, function: &str) -> Type {
@@ -13226,10 +14617,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_true_false_input(&mut self, expr: &AstExpr, operator: &str, input_flow: &FlowType) {
-        if matches!(input_flow.ty, Type::Unknown)
-            || is_open_object_type(&input_flow.ty)
-            || type_accepts_true_false(&input_flow.ty)
-        {
+        if is_value_placeholder_type(&input_flow.ty) || type_accepts_true_false(&input_flow.ty) {
             return;
         }
         self.diagnostics.push(self.diagnostic_for_expr(
@@ -13766,7 +15154,14 @@ impl<'a> Checker<'a> {
         match field_name {
             "width" | "height" | "padding" | "gap" => {
                 let ty = self.ensure_expr(value_expr_id).ty;
-                if !style_dimension_accepts_type(&ty) {
+                if style_type_requires_instantiation(&ty) {
+                    self.deferred_style_constraints
+                        .push(DeferredStyleConstraint {
+                            expression: CheckedExprId(value_expr_id as u32),
+                            field_name: field_name.to_owned(),
+                            expectation: DeferredStyleExpectation::Dimension,
+                        });
+                } else if !style_dimension_accepts_type(&ty) {
                     self.diagnostics.push(self.diagnostic_for_expr(
                         value_expr_id,
                         format!(
@@ -13781,7 +15176,15 @@ impl<'a> Checker<'a> {
             {
                 "size" => {
                     let ty = checker.ensure_expr(nested.value).ty;
-                    if !matches!(ty, Type::Number) {
+                    if style_type_requires_instantiation(&ty) {
+                        checker
+                            .deferred_style_constraints
+                            .push(DeferredStyleConstraint {
+                                expression: CheckedExprId(nested.value as u32),
+                                field_name: "font.size".to_owned(),
+                                expectation: DeferredStyleExpectation::Number,
+                            });
+                    } else if !matches!(ty, Type::Number) {
                         checker.diagnostics.push(checker.diagnostic_for_expr(
                             nested.value,
                             "style field `font.size` must be a number".to_owned(),
@@ -13835,7 +15238,14 @@ impl<'a> Checker<'a> {
 
     fn check_style_color_field(&mut self, field_name: &str, expr_id: usize) {
         let ty = self.ensure_expr(expr_id).ty;
-        if !style_color_accepts_type(&ty) {
+        if style_type_requires_instantiation(&ty) {
+            self.deferred_style_constraints
+                .push(DeferredStyleConstraint {
+                    expression: CheckedExprId(expr_id as u32),
+                    field_name: field_name.to_owned(),
+                    expectation: DeferredStyleExpectation::Color,
+                });
+        } else if !style_color_accepts_type(&ty) {
             self.diagnostics.push(self.diagnostic_for_expr(
                 expr_id,
                 format!(
@@ -16571,6 +17981,13 @@ fn style_dimension_accepts_type(ty: &Type) -> bool {
     )
 }
 
+fn style_type_requires_instantiation(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+    )
+}
+
 fn style_color_accepts_type(ty: &Type) -> bool {
     if matches!(ty, Type::Text) {
         return true;
@@ -16582,6 +17999,245 @@ fn style_color_accepts_type(ty: &Type) -> bool {
                 matches!(variant, Variant::Tagged { tag, .. } if tag == "Oklch")
             })
     )
+}
+
+fn validate_deferred_style_constraints(
+    program: &CheckedProgram,
+    constraints: &[DeferredStyleConstraint],
+) -> Vec<TypeDiagnostic> {
+    fn expression_owner(
+        program: &CheckedProgram,
+        expression: &CheckedExpression,
+    ) -> Option<DeclId> {
+        let mut scope = Some(expression.scope_id);
+        let mut visited = BTreeSet::new();
+        while let Some(scope_id) = scope {
+            if !visited.insert(scope_id) {
+                return None;
+            }
+            let current = program.scopes.iter().find(|scope| scope.id == scope_id)?;
+            if current.kind == CheckedScopeKind::Function {
+                return current.owner;
+            }
+            scope = current.parent;
+        }
+        None
+    }
+
+    fn compose_substitutions(
+        inherited: &BTreeMap<TypeVar, Type>,
+        local: &[CheckedTypeSubstitution],
+    ) -> BTreeMap<TypeVar, Type> {
+        let mut combined = inherited.clone();
+        for substitution in local {
+            combined.insert(
+                substitution.variable,
+                substitute_checked_type(&substitution.value, &combined),
+            );
+        }
+        normalize_substitutions(&mut combined);
+        combined
+    }
+
+    fn normalize_substitutions(substitutions: &mut BTreeMap<TypeVar, Type>) {
+        for _ in 0..substitutions.len().saturating_add(1) {
+            let next = substitutions
+                .iter()
+                .map(|(variable, value)| (*variable, substitute_checked_type(value, substitutions)))
+                .collect::<BTreeMap<_, _>>();
+            if next == *substitutions {
+                break;
+            }
+            *substitutions = next;
+        }
+    }
+
+    fn accepts(expectation: DeferredStyleExpectation, ty: &Type) -> bool {
+        match expectation {
+            DeferredStyleExpectation::Dimension => style_dimension_accepts_type(ty),
+            DeferredStyleExpectation::Number => matches!(ty, Type::Number),
+            DeferredStyleExpectation::Color => style_color_accepts_type(ty),
+        }
+    }
+
+    fn diagnostic(
+        expression: &CheckedExpression,
+        constraint: &DeferredStyleConstraint,
+        ty: &Type,
+    ) -> TypeDiagnostic {
+        let message = match constraint.expectation {
+            DeferredStyleExpectation::Dimension => format!(
+                "style field `{}` must be a number, `Fill` tag, or `Auto` tag",
+                constraint.field_name
+            ),
+            DeferredStyleExpectation::Number => {
+                format!("style field `{}` must be a number", constraint.field_name)
+            }
+            DeferredStyleExpectation::Color => format!(
+                "style field `{}` must be `Oklch[...]` or CSS hex text, found `{}`",
+                constraint.field_name,
+                boon_facing_type_label(ty)
+            ),
+        };
+        TypeDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            line: expression.span.line,
+            start: expression.span.start,
+            end: expression.span.end,
+            message,
+        }
+    }
+
+    fn validate_owner(
+        program: &CheckedProgram,
+        owner: Option<DeclId>,
+        substitutions: &BTreeMap<TypeVar, Type>,
+        constraints_by_owner: &BTreeMap<Option<DeclId>, Vec<&DeferredStyleConstraint>>,
+        diagnostics: &mut Vec<TypeDiagnostic>,
+    ) {
+        for constraint in constraints_by_owner
+            .get(&owner)
+            .into_iter()
+            .flatten()
+            .copied()
+        {
+            let Some(expression) = program
+                .expressions
+                .get(constraint.expression.0 as usize)
+                .filter(|expression| expression.id == constraint.expression)
+            else {
+                continue;
+            };
+            let ty = substitute_checked_type(&expression.flow_type.ty, substitutions);
+            if !accepts(constraint.expectation, &ty) {
+                diagnostics.push(diagnostic(expression, constraint, &ty));
+            }
+        }
+    }
+
+    fn visit_call(
+        program: &CheckedProgram,
+        call: &CheckedCall,
+        inherited: &BTreeMap<TypeVar, Type>,
+        constraints_by_owner: &BTreeMap<Option<DeclId>, Vec<&DeferredStyleConstraint>>,
+        calls_by_owner: &BTreeMap<Option<DeclId>, Vec<&CheckedCall>>,
+        active: &mut BTreeSet<DeclId>,
+        diagnostics: &mut Vec<TypeDiagnostic>,
+    ) {
+        let mut substitutions = compose_substitutions(inherited, &call.type_substitutions);
+        if call.pass.is_none()
+            && let Some(owner_requirement) = call
+                .owner_callable
+                .and_then(|owner| {
+                    program
+                        .callables
+                        .iter()
+                        .find(|signature| signature.decl_id == owner)
+                })
+                .and_then(|signature| signature.pass_requirement.as_ref())
+            && let Some(callee_requirement) = program
+                .callables
+                .iter()
+                .find(|signature| signature.decl_id == call.callable)
+                .and_then(|signature| signature.pass_requirement.as_ref())
+        {
+            let inherited_pass = substitute_checked_type(&owner_requirement.scheme.ty, inherited);
+            unify_checked_type_pattern(
+                &callee_requirement.scheme.ty,
+                &inherited_pass,
+                &mut substitutions,
+            );
+            normalize_substitutions(&mut substitutions);
+        }
+        validate_owner(
+            program,
+            Some(call.callable),
+            &substitutions,
+            constraints_by_owner,
+            diagnostics,
+        );
+        let Some(signature) = program
+            .callables
+            .iter()
+            .find(|signature| signature.decl_id == call.callable)
+            .filter(|signature| signature.kind == CheckedCallableKind::User)
+        else {
+            return;
+        };
+        if !active.insert(signature.decl_id) {
+            return;
+        }
+        for nested in calls_by_owner
+            .get(&Some(signature.decl_id))
+            .into_iter()
+            .flatten()
+            .copied()
+        {
+            visit_call(
+                program,
+                nested,
+                &substitutions,
+                constraints_by_owner,
+                calls_by_owner,
+                active,
+                diagnostics,
+            );
+        }
+        active.remove(&signature.decl_id);
+    }
+
+    let mut constraints = constraints.to_vec();
+    constraints.sort();
+    constraints.dedup();
+    let mut constraints_by_owner = BTreeMap::<Option<DeclId>, Vec<&DeferredStyleConstraint>>::new();
+    for constraint in &constraints {
+        let owner = program
+            .expressions
+            .get(constraint.expression.0 as usize)
+            .filter(|expression| expression.id == constraint.expression)
+            .and_then(|expression| expression_owner(program, expression));
+        constraints_by_owner
+            .entry(owner)
+            .or_default()
+            .push(constraint);
+    }
+    let mut calls_by_owner = BTreeMap::<Option<DeclId>, Vec<&CheckedCall>>::new();
+    for call in &program.calls {
+        calls_by_owner
+            .entry(call.owner_callable)
+            .or_default()
+            .push(call);
+    }
+
+    let mut diagnostics = Vec::new();
+    validate_owner(
+        program,
+        None,
+        &BTreeMap::new(),
+        &constraints_by_owner,
+        &mut diagnostics,
+    );
+    for call in calls_by_owner.get(&None).into_iter().flatten().copied() {
+        visit_call(
+            program,
+            call,
+            &BTreeMap::new(),
+            &constraints_by_owner,
+            &calls_by_owner,
+            &mut BTreeSet::new(),
+            &mut diagnostics,
+        );
+    }
+    diagnostics.sort_by(|left, right| {
+        (left.line, left.start, left.end, left.message.as_str()).cmp(&(
+            right.line,
+            right.start,
+            right.end,
+            right.message.as_str(),
+        ))
+    });
+    diagnostics.dedup();
+    diagnostics
 }
 
 fn infix_returns_bool(op: &str) -> bool {
@@ -18947,16 +20603,6 @@ fn collect_state_cell_path_bindings(
     program: &ParsedProgram,
     bindings: &mut BTreeMap<String, Type>,
 ) {
-    for cell in &program.state_cells {
-        let ty = bindings
-            .get(cell.hold_name.as_str())
-            .cloned()
-            .unwrap_or_else(open_object_type);
-        bindings.insert(cell.path.clone(), ty.clone());
-        if let Some(last) = cell.path.rsplit('.').next() {
-            bindings.entry(last.to_owned()).or_insert(ty);
-        }
-    }
     for item in &program.ast.items {
         let (Some(field), Some(hold_name)) = (item.field.as_ref(), item.hold.as_ref()) else {
             continue;
@@ -18967,43 +20613,6 @@ fn collect_state_cell_path_bindings(
             .unwrap_or_else(open_object_type);
         bindings.entry(field.clone()).or_insert(ty);
     }
-}
-
-fn passed_context_type(program: &ParsedProgram, bindings: &BTreeMap<String, Type>) -> Option<Type> {
-    let mut context: Option<Type> = None;
-    for expr in &program.expressions {
-        let pass = match &expr.kind {
-            AstExprKind::Call { pass, .. } | AstExprKind::Pipe { pass, .. } => pass.as_ref(),
-            _ => continue,
-        };
-        let Some(value_expr) = pass.and_then(|pass| program.expressions.get(pass.value)) else {
-            continue;
-        };
-        let Some(arg_type) =
-            static_expr_type_from_bindings(value_expr, &program.expressions, bindings)
-        else {
-            continue;
-        };
-        for context_type in passed_context_candidates(arg_type) {
-            context = Some(match context {
-                Some(existing) => widen_structural_type(&existing, &context_type),
-                None => context_type,
-            });
-        }
-    }
-    context
-}
-
-fn passed_context_candidates(ty: Type) -> Vec<Type> {
-    let mut candidates = vec![ty.clone()];
-    if let Type::Object(shape) = ty {
-        for field_ty in shape.fields.values() {
-            if matches!(field_ty, Type::Object(_)) {
-                candidates.push(field_ty.clone());
-            }
-        }
-    }
-    candidates
 }
 
 fn static_expr_type_from_bindings(
@@ -20054,6 +21663,1187 @@ enum SourcePayloadAccess {
     UnknownField(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SyntaxSourceSite {
+    statement: usize,
+    expression: usize,
+    path: String,
+    projection: Vec<String>,
+    interval_ms: Option<u64>,
+}
+
+fn syntax_source_sites(program: &ParsedProgram) -> Vec<SyntaxSourceSite> {
+    fn collect_statements(
+        statements: &[AstStatement],
+        expressions: &[AstExpr],
+        scope: &mut Vec<String>,
+        sources: &mut Vec<SyntaxSourceSite>,
+    ) {
+        for statement in statements {
+            let scope_len = scope.len();
+            match &statement.kind {
+                AstStatementKind::Function { name, .. } => {
+                    scope.push(format!("FUNCTION:{name}"));
+                }
+                AstStatementKind::Field { name }
+                | AstStatementKind::Source {
+                    field: Some(name), ..
+                }
+                | AstStatementKind::Hold {
+                    field: Some(name), ..
+                }
+                | AstStatementKind::List {
+                    field: Some(name), ..
+                } => scope.push(name.clone()),
+                AstStatementKind::Source { field: None, .. }
+                | AstStatementKind::Hold { field: None, .. }
+                | AstStatementKind::List { field: None, .. }
+                | AstStatementKind::Block
+                | AstStatementKind::Spread
+                | AstStatementKind::Expression => {}
+            }
+            if let Some(expression) = statement.expr {
+                collect_source_expressions(
+                    expression,
+                    statement.id,
+                    expressions,
+                    scope,
+                    &mut Vec::new(),
+                    sources,
+                );
+            }
+            collect_statements(&statement.children, expressions, scope, sources);
+            scope.truncate(scope_len);
+        }
+    }
+
+    fn collect_source_expressions(
+        expression: usize,
+        statement: usize,
+        expressions: &[AstExpr],
+        scope: &[String],
+        projection: &mut Vec<String>,
+        sources: &mut Vec<SyntaxSourceSite>,
+    ) {
+        let Some(expr) = expressions.get(expression) else {
+            return;
+        };
+        let interval_ms = match &expr.kind {
+            AstExprKind::Source => None,
+            AstExprKind::Pipe { input, op, .. } if op == "Timer/interval" => {
+                duration_milliseconds(*input, expressions)
+            }
+            _ => {
+                match &expr.kind {
+                    AstExprKind::Object(fields)
+                    | AstExprKind::Record(fields)
+                    | AstExprKind::TaggedObject { fields, .. } => {
+                        for field in fields {
+                            let projection_len = projection.len();
+                            if !field.spread {
+                                projection.push(field.name.clone());
+                            }
+                            collect_source_expressions(
+                                field.value,
+                                statement,
+                                expressions,
+                                scope,
+                                projection,
+                                sources,
+                            );
+                            projection.truncate(projection_len);
+                        }
+                    }
+                    _ => {
+                        for child in direct_expression_children(expr) {
+                            collect_source_expressions(
+                                child,
+                                statement,
+                                expressions,
+                                scope,
+                                projection,
+                                sources,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        };
+        let path = scope
+            .iter()
+            .chain(projection.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(".");
+        if path.is_empty() {
+            return;
+        }
+        let source = SyntaxSourceSite {
+            statement,
+            expression,
+            path,
+            projection: projection.clone(),
+            interval_ms,
+        };
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+
+    let mut sources = Vec::new();
+    collect_statements(
+        &program.ast.statements,
+        &program.expressions,
+        &mut Vec::new(),
+        &mut sources,
+    );
+    sources.sort_by_key(|source| {
+        (
+            source.expression,
+            source.projection.len(),
+            source.path.clone(),
+            source.statement,
+        )
+    });
+    sources.dedup_by_key(|source| source.expression);
+    sources
+}
+
+fn duration_milliseconds(expression: usize, expressions: &[AstExpr]) -> Option<u64> {
+    let AstExprKind::TaggedObject { tag, fields } = &expressions.get(expression)?.kind else {
+        return None;
+    };
+    if tag != "Duration" {
+        return None;
+    }
+    let (scale, value) = fields.iter().find_map(|field| {
+        let scale = match field.name.as_str() {
+            "milliseconds" => 1.0,
+            "seconds" => 1_000.0,
+            _ => return None,
+        };
+        let AstExprKind::Number(value) = &expressions.get(field.value)?.kind else {
+            return None;
+        };
+        value.parse::<f64>().ok().map(|value| (scale, value))
+    })?;
+    let milliseconds = value * scale;
+    (milliseconds.is_finite() && milliseconds >= 0.0 && milliseconds <= u64::MAX as f64)
+        .then(|| milliseconds.round() as u64)
+}
+
+fn checked_duration_milliseconds(
+    expression: CheckedExprId,
+    expressions: &[CheckedExpression],
+) -> Option<u64> {
+    let CheckedExpressionKind::TaggedObject { tag, fields } = &expressions
+        .get(expression.0 as usize)
+        .filter(|candidate| candidate.id == expression)?
+        .kind
+    else {
+        return None;
+    };
+    if tag != "Duration" {
+        return None;
+    }
+    let (scale, value) = fields.iter().find_map(|field| {
+        let scale = match field.name.as_str() {
+            "milliseconds" => 1.0,
+            "seconds" => 1_000.0,
+            _ => return None,
+        };
+        let CheckedExpressionKind::Number { value } = &expressions
+            .get(field.value.0 as usize)
+            .filter(|candidate| candidate.id == field.value)?
+            .kind
+        else {
+            return None;
+        };
+        value.parse::<f64>().ok().map(|value| (scale, value))
+    })?;
+    let milliseconds = value * scale;
+    (milliseconds.is_finite() && milliseconds >= 0.0 && milliseconds <= u64::MAX as f64)
+        .then(|| milliseconds.round() as u64)
+}
+
+fn exact_checked_source_read(
+    target: DeclId,
+    projection: &[String],
+    sources: &[CheckedSource],
+) -> Option<CheckedSourceRead> {
+    let mut matches = sources
+        .iter()
+        .filter(|source| source.path.anchor == target)
+        .filter_map(|source| {
+            projection
+                .strip_prefix(source.path.projection.as_slice())
+                .map(|payload| (source, payload))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(source, _)| std::cmp::Reverse(source.path.projection.len()));
+    let (source, payload) = matches.first().copied()?;
+    if matches.get(1).is_some_and(|(candidate, _)| {
+        candidate.path.projection.len() == source.path.projection.len()
+    }) {
+        return None;
+    }
+    Some(CheckedSourceRead {
+        source: source.id,
+        payload_projection: canonical_checked_source_payload_projection(payload),
+    })
+}
+
+fn canonical_checked_source_payload_projection(projection: &[String]) -> Vec<String> {
+    if projection.is_empty() {
+        return Vec::new();
+    }
+    let suffix = projection.join(".");
+    match source_payload_access_for_suffix(&suffix) {
+        SourcePayloadAccess::Field(field) => vec![field],
+        SourcePayloadAccess::Direct(_) | SourcePayloadAccess::UnknownField(_) => projection
+            .strip_prefix(&["event".to_owned()])
+            .or_else(|| projection.strip_prefix(&["events".to_owned()]))
+            .unwrap_or(projection)
+            .to_vec(),
+    }
+}
+
+fn refine_checked_source_payload_types(
+    sources: &mut [CheckedSource],
+    expressions: &[CheckedExpression],
+) {
+    let mut requirements = BTreeMap::<CheckedSourceId, BTreeMap<Vec<String>, Type>>::new();
+    for expression in expressions {
+        let CheckedExpressionKind::Read {
+            source: Some(source),
+            ..
+        } = &expression.kind
+        else {
+            continue;
+        };
+        let Some(field) = source.payload_projection.first() else {
+            continue;
+        };
+        let leaf_type = if matches!(
+            expression.flow_type.ty,
+            Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_)
+        ) {
+            source_payload_field_type(field)
+        } else {
+            expression.flow_type.ty.clone()
+        };
+        requirements
+            .entry(source.source)
+            .or_default()
+            .entry(source.payload_projection.clone())
+            .and_modify(|existing| {
+                *existing = merge_source_payload_structural_requirement(existing, &leaf_type);
+            })
+            .or_insert(leaf_type);
+    }
+
+    for source in sources {
+        let mut shape = match &source.payload_type {
+            Type::Object(shape) => shape.clone(),
+            _ => ObjectShape {
+                fields: BTreeMap::new(),
+                field_order: Vec::new(),
+                open: false,
+            },
+        };
+        for (path, ty) in requirements.remove(&source.id).unwrap_or_default() {
+            insert_source_payload_requirement_path(&mut shape, &path, &ty);
+        }
+        source.payload_type = Type::Object(shape);
+    }
+}
+
+fn checked_resource_projection_requirements(
+    declarations: &[CheckedDeclaration],
+    callables: &[CheckedCallableSignature],
+    calls: &[CheckedCall],
+    expressions: &[CheckedExpression],
+    sources: &[CheckedSource],
+) -> Vec<CheckedResourceProjectionRequirement> {
+    let resolver =
+        CheckedSourceProvenanceResolver::new(declarations, callables, calls, expressions, sources);
+    expressions
+        .iter()
+        .filter_map(|expression| {
+            let (target, projection) = match &expression.kind {
+                CheckedExpressionKind::Read {
+                    target,
+                    projection,
+                    source: None,
+                }
+                | CheckedExpressionKind::Drain { target, projection } => (*target, projection),
+                _ => return None,
+            };
+            let required_type = if !is_specific_type(&expression.flow_type.ty) {
+                projection
+                    .last()
+                    .map_or(Type::Unknown, |field| source_payload_field_type(field))
+            } else {
+                expression.flow_type.ty.clone()
+            };
+            (!projection.is_empty()).then(|| CheckedResourceProjectionRequirement {
+                expression: expression.id,
+                target,
+                projection: projection.clone(),
+                source_origins: resolver.sources_for_declaration(target, projection),
+                required_type,
+            })
+        })
+        .collect()
+}
+
+fn refine_checked_source_payload_types_from_requirements(
+    sources: &mut [CheckedSource],
+    requirements: &[CheckedResourceProjectionRequirement],
+) {
+    let mut payloads = BTreeMap::<CheckedSourceId, BTreeMap<Vec<String>, Type>>::new();
+    for requirement in requirements {
+        for origin in &requirement.source_origins {
+            if origin.payload_projection.is_empty() {
+                continue;
+            }
+            payloads
+                .entry(origin.source)
+                .or_default()
+                .entry(origin.payload_projection.clone())
+                .and_modify(|existing| {
+                    *existing = merge_source_payload_structural_requirement(
+                        existing,
+                        &requirement.required_type,
+                    );
+                })
+                .or_insert_with(|| requirement.required_type.clone());
+        }
+    }
+    for source in sources {
+        let mut shape = match &source.payload_type {
+            Type::Object(shape) => shape.clone(),
+            _ => ObjectShape {
+                fields: BTreeMap::new(),
+                field_order: Vec::new(),
+                open: false,
+            },
+        };
+        for (path, ty) in payloads.remove(&source.id).unwrap_or_default() {
+            insert_source_payload_requirement_path(&mut shape, &path, &ty);
+        }
+        source.payload_type = Type::Object(shape);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CheckedSourceResolution {
+    Declaration(DeclId, Vec<String>),
+    Expression(CheckedExprId, Vec<String>),
+    ListItem(CheckedExprId, Vec<String>),
+    Output(DeclId, Vec<String>),
+}
+
+struct CheckedSourceProvenanceResolver<'a> {
+    declarations: BTreeMap<DeclId, &'a CheckedDeclaration>,
+    callables: BTreeMap<DeclId, &'a CheckedCallableSignature>,
+    calls: BTreeMap<CheckedCallId, &'a CheckedCall>,
+    expressions: BTreeMap<CheckedExprId, &'a CheckedExpression>,
+    sources: &'a [CheckedSource],
+    source_expressions: BTreeMap<CheckedExprId, Vec<CheckedSourceId>>,
+}
+
+impl<'a> CheckedSourceProvenanceResolver<'a> {
+    fn new(
+        declarations: &'a [CheckedDeclaration],
+        callables: &'a [CheckedCallableSignature],
+        calls: &'a [CheckedCall],
+        expressions: &'a [CheckedExpression],
+        sources: &'a [CheckedSource],
+    ) -> Self {
+        let mut source_expressions = BTreeMap::<CheckedExprId, Vec<CheckedSourceId>>::new();
+        for source in sources {
+            source_expressions
+                .entry(source.expression)
+                .or_default()
+                .push(source.id);
+        }
+        Self {
+            declarations: declarations
+                .iter()
+                .map(|declaration| (declaration.id, declaration))
+                .collect(),
+            callables: callables
+                .iter()
+                .map(|callable| (callable.decl_id, callable))
+                .collect(),
+            calls: calls.iter().map(|call| (call.id, call)).collect(),
+            expressions: expressions
+                .iter()
+                .map(|expression| (expression.id, expression))
+                .collect(),
+            sources,
+            source_expressions,
+        }
+    }
+
+    fn sources_for_declaration(
+        &self,
+        target: DeclId,
+        projection: &[String],
+    ) -> Vec<CheckedSourceRead> {
+        self.declaration_sources(target, projection, &mut BTreeSet::new())
+            .into_iter()
+            .collect()
+    }
+
+    fn declaration_sources(
+        &self,
+        target: DeclId,
+        projection: &[String],
+        visiting: &mut BTreeSet<CheckedSourceResolution>,
+    ) -> BTreeSet<CheckedSourceRead> {
+        let key = CheckedSourceResolution::Declaration(target, projection.to_vec());
+        if !visiting.insert(key.clone()) {
+            return BTreeSet::new();
+        }
+        let mut resolved = BTreeSet::new();
+        if let Some(source) = exact_checked_source_read(target, projection, self.sources) {
+            resolved.insert(source);
+        }
+        let Some(declaration) = self.declarations.get(&target).copied() else {
+            visiting.remove(&key);
+            return resolved;
+        };
+        if declaration.kind == CheckedDeclarationKind::ValueParameter {
+            for call in self.calls.values() {
+                if let Some(actual) = checked_call_formal_input(*call, target) {
+                    resolved.extend(self.expression_sources(actual, projection, visiting));
+                }
+            }
+        }
+        if matches!(
+            declaration.kind,
+            CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
+        ) {
+            resolved.extend(self.output_sources(target, projection, visiting));
+        }
+        if let Some(value) = declaration.value {
+            resolved.extend(self.expression_sources(value, projection, visiting));
+        }
+        if let Some(result) = self
+            .callables
+            .get(&target)
+            .and_then(|callable| callable.result_expression)
+        {
+            resolved.extend(self.expression_sources(result, projection, visiting));
+        }
+        visiting.remove(&key);
+        resolved
+    }
+
+    fn expression_sources(
+        &self,
+        expression_id: CheckedExprId,
+        projection: &[String],
+        visiting: &mut BTreeSet<CheckedSourceResolution>,
+    ) -> BTreeSet<CheckedSourceRead> {
+        let key = CheckedSourceResolution::Expression(expression_id, projection.to_vec());
+        if !visiting.insert(key.clone()) {
+            return BTreeSet::new();
+        }
+        let mut resolved = BTreeSet::new();
+        if let Some(sources) = self.source_expressions.get(&expression_id) {
+            resolved.extend(sources.iter().map(|source| CheckedSourceRead {
+                source: *source,
+                payload_projection: canonical_checked_source_payload_projection(projection),
+            }));
+            visiting.remove(&key);
+            return resolved;
+        }
+        let Some(expression) = self.expressions.get(&expression_id).copied() else {
+            visiting.remove(&key);
+            return resolved;
+        };
+        match &expression.kind {
+            CheckedExpressionKind::Read {
+                target,
+                projection: read_projection,
+                ..
+            }
+            | CheckedExpressionKind::Drain {
+                target,
+                projection: read_projection,
+            } => {
+                let mut combined = read_projection.clone();
+                combined.extend_from_slice(projection);
+                resolved.extend(self.declaration_sources(*target, &combined, visiting));
+            }
+            CheckedExpressionKind::TaggedObject { fields, .. }
+            | CheckedExpressionKind::Object { fields }
+            | CheckedExpressionKind::Record { fields } => {
+                if let Some((field, rest)) = projection.split_first() {
+                    for candidate in fields.iter().filter(|candidate| candidate.name == *field) {
+                        resolved.extend(self.expression_sources(candidate.value, rest, visiting));
+                    }
+                } else {
+                    for field in fields {
+                        resolved.extend(self.expression_sources(field.value, &[], visiting));
+                    }
+                }
+            }
+            CheckedExpressionKind::Call { call } => {
+                if let Some(call) = self.calls.get(call).copied()
+                    && let Some(callable) = self.callables.get(&call.callable).copied()
+                {
+                    if callable.kind == CheckedCallableKind::User {
+                        if let Some(result) = callable.result_expression {
+                            resolved.extend(self.expression_sources(result, projection, visiting));
+                        }
+                    } else if matches!(
+                        callable.contextual_operation,
+                        Some(CheckedContextualOperation::Find { .. })
+                    ) || matches!(
+                        call.function.as_str(),
+                        "List/get" | "List/latest" | "List/find"
+                    ) {
+                        if let Some(list) = checked_call_input(call, "list") {
+                            resolved.extend(self.list_item_sources(list, projection, visiting));
+                        }
+                    }
+                }
+            }
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. } => {
+                resolved.extend(self.expression_sources(*input, projection, visiting));
+            }
+            CheckedExpressionKind::Latest { branches } => {
+                for branch in branches {
+                    resolved.extend(self.expression_sources(*branch, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::When { arms, .. }
+            | CheckedExpressionKind::While { arms, .. } => {
+                for arm in arms {
+                    resolved.extend(self.expression_sources(*arm, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::Then { output, .. }
+            | CheckedExpressionKind::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    resolved.extend(self.expression_sources(*output, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::Block { result, .. } => {
+                if let Some(result) = result {
+                    resolved.extend(self.expression_sources(*result, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::List { .. }
+            | CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::TextTemplate { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Bool { .. }
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => {}
+        }
+        visiting.remove(&key);
+        resolved
+    }
+
+    fn list_item_sources(
+        &self,
+        expression_id: CheckedExprId,
+        projection: &[String],
+        visiting: &mut BTreeSet<CheckedSourceResolution>,
+    ) -> BTreeSet<CheckedSourceRead> {
+        let key = CheckedSourceResolution::ListItem(expression_id, projection.to_vec());
+        if !visiting.insert(key.clone()) {
+            return BTreeSet::new();
+        }
+        let mut resolved = BTreeSet::new();
+        let Some(expression) = self.expressions.get(&expression_id).copied() else {
+            visiting.remove(&key);
+            return resolved;
+        };
+        match &expression.kind {
+            CheckedExpressionKind::List { items, .. } => {
+                for item in items {
+                    resolved.extend(self.expression_sources(*item, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::Read {
+                target,
+                projection: list_projection,
+                ..
+            } => {
+                if list_projection.is_empty() {
+                    if let Some(declaration) = self.declarations.get(target).copied() {
+                        if declaration.kind == CheckedDeclarationKind::ValueParameter {
+                            for call in self.calls.values() {
+                                if let Some(actual) = checked_call_formal_input(*call, *target) {
+                                    resolved.extend(
+                                        self.list_item_sources(actual, projection, visiting),
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(value) = declaration.value {
+                            resolved.extend(self.list_item_sources(value, projection, visiting));
+                        }
+                    }
+                }
+            }
+            CheckedExpressionKind::Call { call } => {
+                if let Some(call) = self.calls.get(call).copied()
+                    && let Some(callable) = self.callables.get(&call.callable).copied()
+                {
+                    if callable.kind == CheckedCallableKind::User {
+                        if let Some(result) = callable.result_expression {
+                            resolved.extend(self.list_item_sources(result, projection, visiting));
+                        }
+                    } else {
+                        match callable.contextual_operation {
+                            Some(CheckedContextualOperation::Map { body, .. }) => {
+                                if let Some(body) = checked_call_formal_input(call, body) {
+                                    resolved.extend(
+                                        self.expression_sources(body, projection, visiting),
+                                    );
+                                }
+                            }
+                            Some(
+                                CheckedContextualOperation::Filter { list, .. }
+                                | CheckedContextualOperation::Retain { list, .. }
+                                | CheckedContextualOperation::Remove { list, .. }
+                                | CheckedContextualOperation::SortBy { list, .. }
+                                | CheckedContextualOperation::ThenBy { list, .. },
+                            ) => {
+                                if let Some(list) = checked_call_formal_input(call, list) {
+                                    resolved
+                                        .extend(self.list_item_sources(list, projection, visiting));
+                                }
+                            }
+                            Some(
+                                CheckedContextualOperation::Every { .. }
+                                | CheckedContextualOperation::Any { .. }
+                                | CheckedContextualOperation::Find { .. },
+                            )
+                            | None => {
+                                if matches!(call.function.as_str(), "List/take" | "List/page")
+                                    && let Some(list) = checked_call_input(call, "list")
+                                {
+                                    resolved
+                                        .extend(self.list_item_sources(list, projection, visiting));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. } => {
+                resolved.extend(self.list_item_sources(*input, projection, visiting));
+            }
+            CheckedExpressionKind::Latest { branches } => {
+                for branch in branches {
+                    resolved.extend(self.list_item_sources(*branch, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::When { arms, .. }
+            | CheckedExpressionKind::While { arms, .. } => {
+                for arm in arms {
+                    resolved.extend(self.list_item_sources(*arm, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::Then { output, .. }
+            | CheckedExpressionKind::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    resolved.extend(self.list_item_sources(*output, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::Block { result, .. } => {
+                if let Some(result) = result {
+                    resolved.extend(self.list_item_sources(*result, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::TaggedObject { .. }
+            | CheckedExpressionKind::Object { .. }
+            | CheckedExpressionKind::Record { .. }
+            | CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Drain { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::TextTemplate { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Bool { .. }
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => {}
+        }
+        visiting.remove(&key);
+        resolved
+    }
+
+    fn output_sources(
+        &self,
+        target: DeclId,
+        projection: &[String],
+        visiting: &mut BTreeSet<CheckedSourceResolution>,
+    ) -> BTreeSet<CheckedSourceRead> {
+        let key = CheckedSourceResolution::Output(target, projection.to_vec());
+        if !visiting.insert(key.clone()) {
+            return BTreeSet::new();
+        }
+        let mut resolved = BTreeSet::new();
+        for call in self.calls.values().copied() {
+            let Some(callable) = self.callables.get(&call.callable).copied() else {
+                continue;
+            };
+            for entry in &call.entries {
+                let formal = match entry {
+                    CheckedCallEntry::FreshOut { formal, output, .. } if *output == target => {
+                        Some(*formal)
+                    }
+                    CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } if *output == target => Some(*formal),
+                    _ => None,
+                };
+                let Some(formal) = formal else {
+                    continue;
+                };
+                if let Some(operation) = callable.contextual_operation
+                    && let Some((list, row, _)) = checked_contextual_operation_formals(operation)
+                    && formal == row
+                    && let Some(list) = checked_call_formal_input(call, list)
+                {
+                    resolved.extend(self.list_item_sources(list, projection, visiting));
+                }
+            }
+            for entry in &call.entries {
+                let output = match entry {
+                    CheckedCallEntry::FreshOut { formal, output, .. } if *formal == target => {
+                        Some(*output)
+                    }
+                    CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } if *formal == target => Some(*output),
+                    _ => None,
+                };
+                if let Some(output) = output {
+                    resolved.extend(self.output_sources(output, projection, visiting));
+                }
+            }
+        }
+        visiting.remove(&key);
+        resolved
+    }
+}
+
+fn checked_call_formal_input(call: &CheckedCall, formal: DeclId) -> Option<CheckedExprId> {
+    call.entries.iter().find_map(|entry| match entry {
+        CheckedCallEntry::Input {
+            formal: candidate,
+            value,
+            ..
+        } if *candidate == formal => Some(*value),
+        CheckedCallEntry::Input { .. }
+        | CheckedCallEntry::FreshOut { .. }
+        | CheckedCallEntry::ForwardOut { .. } => None,
+    })
+}
+
+fn checked_source_payload_shape_table(program: &CheckedProgram) -> Vec<SourcePayloadShapeEntry> {
+    let mut payloads = BTreeMap::<String, Type>::new();
+    for source in &program.sources {
+        let Some(path) = program.semantic_path(&source.path) else {
+            continue;
+        };
+        payloads
+            .entry(path)
+            .and_modify(|existing| {
+                *existing =
+                    merge_source_payload_structural_requirement(existing, &source.payload_type);
+            })
+            .or_insert_with(|| source.payload_type.clone());
+    }
+    payloads
+        .into_iter()
+        .map(|(source_path, payload_type)| {
+            let fields = match &payload_type {
+                Type::Object(shape) => shape
+                    .field_order
+                    .iter()
+                    .filter_map(|name| {
+                        shape.fields.get(name).map(|ty| SourcePayloadShapeField {
+                            name: name.clone(),
+                            ty: ty.clone(),
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            SourcePayloadShapeEntry {
+                source_path,
+                payload_type,
+                fields,
+            }
+        })
+        .collect()
+}
+
+fn refine_checked_host_port_source_payload_types(
+    program: &mut CheckedProgram,
+    host_ports: &HostPortTable,
+) {
+    let host_payloads = host_port_payload_types(host_ports);
+    let source_paths = program
+        .sources
+        .iter()
+        .filter_map(|source| {
+            program
+                .semantic_path(&source.path)
+                .map(|path| (source.id, path))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for source in &mut program.sources {
+        let Some(fields) = source_paths
+            .get(&source.id)
+            .and_then(|path| host_payloads.get(path))
+        else {
+            continue;
+        };
+        let contract = Type::Object(ObjectShape::from_ordered_fields(
+            fields.iter().map(|(name, ty)| (name.clone(), ty.clone())),
+            false,
+        ));
+        source.payload_type =
+            merge_source_payload_structural_requirement(&source.payload_type, &contract);
+    }
+}
+
+fn checked_statement_declaration(kind: &CheckedStatementKind) -> Option<DeclId> {
+    match kind {
+        CheckedStatementKind::Function { declaration }
+        | CheckedStatementKind::Field { declaration } => Some(*declaration),
+        CheckedStatementKind::Source { declaration, .. }
+        | CheckedStatementKind::Hold { declaration, .. }
+        | CheckedStatementKind::List { declaration, .. } => *declaration,
+        CheckedStatementKind::Block
+        | CheckedStatementKind::Spread
+        | CheckedStatementKind::Expression => None,
+    }
+}
+
+fn checked_call_result_paths(
+    declarations: &[CheckedDeclaration],
+    callables: &[CheckedCallableSignature],
+    expressions: &[CheckedExpression],
+    calls: &[CheckedCall],
+) -> Vec<CheckedCallResultPath> {
+    let declaration_values = declarations
+        .iter()
+        .filter_map(|declaration| {
+            declaration
+                .value
+                .map(|value| (declaration.id, (value, declaration.flow_type.clone())))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = calls
+        .iter()
+        .filter_map(|call| {
+            let expression = expressions
+                .get(call.expression.0 as usize)
+                .filter(|expression| expression.id == call.expression)?;
+            let anchor = expression.declaration?;
+            checked_declaration_resource_projection(
+                callables,
+                &declaration_values,
+                expressions,
+                calls,
+                anchor,
+                call.expression,
+            )
+            .map(|projection| CheckedCallResultPath {
+                call: call.id,
+                path: CheckedSemanticPath { anchor, projection },
+            })
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| path.call);
+    paths
+}
+
+fn checked_declaration_resource_projection(
+    callables: &[CheckedCallableSignature],
+    declaration_values: &BTreeMap<DeclId, (CheckedExprId, FlowType)>,
+    expressions: &[CheckedExpression],
+    calls: &[CheckedCall],
+    declaration: DeclId,
+    target: CheckedExprId,
+) -> Option<Vec<String>> {
+    let root = declaration_values
+        .get(&declaration)
+        .map(|(root, _)| *root)
+        .or_else(|| {
+            callables
+                .iter()
+                .find(|callable| callable.decl_id == declaration)
+                .and_then(|callable| callable.result_expression)
+        })?;
+    checked_projection_to_expression(expressions, calls, root, target)
+}
+
+fn checked_projection_to_expression(
+    expressions: &[CheckedExpression],
+    calls: &[CheckedCall],
+    root: CheckedExprId,
+    target: CheckedExprId,
+) -> Option<Vec<String>> {
+    fn visit(
+        expressions: &[CheckedExpression],
+        calls: &[CheckedCall],
+        current: CheckedExprId,
+        target: CheckedExprId,
+        visiting: &mut BTreeSet<CheckedExprId>,
+    ) -> Option<Vec<String>> {
+        if current == target {
+            return Some(Vec::new());
+        }
+        if !visiting.insert(current) {
+            return None;
+        }
+        let expression = expressions
+            .get(current.0 as usize)
+            .filter(|expression| expression.id == current)?;
+        let direct =
+            |child, visiting: &mut BTreeSet<_>| visit(expressions, calls, child, target, visiting);
+        let result = match &expression.kind {
+            CheckedExpressionKind::TaggedObject { fields, .. }
+            | CheckedExpressionKind::Object { fields }
+            | CheckedExpressionKind::Record { fields } => fields.iter().find_map(|field| {
+                let mut projection = direct(field.value, visiting)?;
+                projection.insert(0, field.name.clone());
+                Some(projection)
+            }),
+            CheckedExpressionKind::Call { call } => calls
+                .iter()
+                .find(|candidate| candidate.id == *call)
+                .into_iter()
+                .flat_map(|call| &call.entries)
+                .find_map(|entry| match entry {
+                    CheckedCallEntry::Input { value, .. } => direct(*value, visiting),
+                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+                }),
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. } => direct(*input, visiting),
+            CheckedExpressionKind::When { input, arms }
+            | CheckedExpressionKind::While { input, arms } => direct(*input, visiting)
+                .or_else(|| arms.iter().find_map(|arm| direct(*arm, visiting))),
+            CheckedExpressionKind::Then { input, output } => direct(*input, visiting)
+                .or_else(|| output.and_then(|output| direct(output, visiting))),
+            CheckedExpressionKind::Infix { left, right, .. } => {
+                direct(*left, visiting).or_else(|| direct(*right, visiting))
+            }
+            CheckedExpressionKind::MatchArm { output, .. } => {
+                output.and_then(|output| direct(output, visiting))
+            }
+            CheckedExpressionKind::Block { bindings, result } => bindings
+                .iter()
+                .find_map(|binding| direct(binding.value, visiting))
+                .or_else(|| result.and_then(|result| direct(result, visiting))),
+            CheckedExpressionKind::List { items, .. }
+            | CheckedExpressionKind::Bytes { items, .. }
+            | CheckedExpressionKind::Latest { branches: items } => {
+                items.iter().find_map(|item| direct(*item, visiting))
+            }
+            CheckedExpressionKind::TextTemplate { segments } => {
+                segments.iter().find_map(|segment| match segment {
+                    CheckedTextSegment::Static { .. } => None,
+                    CheckedTextSegment::Dynamic { value } => direct(*value, visiting),
+                })
+            }
+            CheckedExpressionKind::Read { .. }
+            | CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Drain { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Bool { .. }
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => None,
+        };
+        visiting.remove(&current);
+        result
+    }
+
+    visit(expressions, calls, root, target, &mut BTreeSet::new())
+}
+
+fn checked_hold_update_mergers(
+    statements: &[CheckedStatement],
+    expressions: &[CheckedExpression],
+    declaration_statements: &BTreeMap<DeclId, CheckedStatementId>,
+    checked_calls: &[CheckedCall],
+) -> BTreeSet<CheckedExprId> {
+    let statement_by_id = statements
+        .iter()
+        .map(|statement| (statement.id, statement))
+        .collect::<BTreeMap<_, _>>();
+    let calls = checked_calls
+        .iter()
+        .map(|call| (call.id, call))
+        .collect::<BTreeMap<_, _>>();
+    let mut roots = Vec::new();
+    for expression in expressions
+        .iter()
+        .filter(|expression| matches!(expression.kind, CheckedExpressionKind::Hold { .. }))
+    {
+        if let Some(statement) = expression
+            .declaration
+            .and_then(|declaration| declaration_statements.get(&declaration))
+            .and_then(|statement| statement_by_id.get(statement))
+        {
+            roots.extend(checked_statement_child_values(statement, &statement_by_id));
+        }
+    }
+    for statement in statements
+        .iter()
+        .filter(|statement| matches!(statement.kind, CheckedStatementKind::Hold { .. }))
+    {
+        roots.extend(checked_statement_child_values(statement, &statement_by_id));
+    }
+
+    let mut mergers = BTreeSet::new();
+    let mut pending = roots;
+    let mut visited = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        if !visited.insert(expression) {
+            continue;
+        }
+        let Some(expression) = expressions
+            .get(expression.0 as usize)
+            .filter(|candidate| candidate.id == expression)
+        else {
+            continue;
+        };
+        if matches!(expression.kind, CheckedExpressionKind::Hold { .. })
+            || matches!(expression.kind, CheckedExpressionKind::Call { .. })
+                && expression.effect.writes_state
+        {
+            continue;
+        }
+        if matches!(expression.kind, CheckedExpressionKind::Latest { .. }) {
+            mergers.insert(expression.id);
+        }
+        pending.extend(checked_expression_children(&expression.kind, &calls));
+    }
+    mergers
+}
+
+fn checked_statement_child_values(
+    statement: &CheckedStatement,
+    statements: &BTreeMap<CheckedStatementId, &CheckedStatement>,
+) -> Vec<CheckedExprId> {
+    let mut values = Vec::new();
+    let mut pending = statement.children.iter().rev().copied().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(statement) = pending.pop() {
+        if !visited.insert(statement) {
+            continue;
+        }
+        let Some(statement) = statements.get(&statement) else {
+            continue;
+        };
+        if let Some(value) = statement.value {
+            values.push(value);
+        } else {
+            pending.extend(statement.children.iter().rev().copied());
+        }
+    }
+    values
+}
+
+fn checked_expression_children(
+    kind: &CheckedExpressionKind,
+    calls: &BTreeMap<CheckedCallId, &CheckedCall>,
+) -> Vec<CheckedExprId> {
+    match kind {
+        CheckedExpressionKind::Call { call } => calls
+            .get(call)
+            .into_iter()
+            .flat_map(|call| &call.entries)
+            .filter_map(|entry| match entry {
+                CheckedCallEntry::Input { value, .. } => Some(*value),
+                CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+            })
+            .collect(),
+        CheckedExpressionKind::TaggedObject { fields, .. }
+        | CheckedExpressionKind::Object { fields }
+        | CheckedExpressionKind::Record { fields } => {
+            fields.iter().map(|field| field.value).collect()
+        }
+        CheckedExpressionKind::Draining { input } => vec![*input],
+        CheckedExpressionKind::Hold { initial, .. } => vec![*initial],
+        CheckedExpressionKind::Latest { branches } => branches.clone(),
+        CheckedExpressionKind::When { input, arms }
+        | CheckedExpressionKind::While { input, arms } => std::iter::once(*input)
+            .chain(arms.iter().copied())
+            .collect(),
+        CheckedExpressionKind::Then { input, output } => std::iter::once(*input)
+            .chain(output.iter().copied())
+            .collect(),
+        CheckedExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        CheckedExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
+        CheckedExpressionKind::Block { bindings, result } => bindings
+            .iter()
+            .map(|binding| binding.value)
+            .chain(result.iter().copied())
+            .collect(),
+        CheckedExpressionKind::List { items, .. } | CheckedExpressionKind::Bytes { items, .. } => {
+            items.clone()
+        }
+        CheckedExpressionKind::TextTemplate { segments } => segments
+            .iter()
+            .filter_map(|segment| match segment {
+                CheckedTextSegment::Static { .. } => None,
+                CheckedTextSegment::Dynamic { value } => Some(*value),
+            })
+            .collect(),
+        CheckedExpressionKind::Read { .. }
+        | CheckedExpressionKind::Passed { .. }
+        | CheckedExpressionKind::ExternalRead { .. }
+        | CheckedExpressionKind::Drain { .. }
+        | CheckedExpressionKind::Text { .. }
+        | CheckedExpressionKind::Number { .. }
+        | CheckedExpressionKind::BytesByte { .. }
+        | CheckedExpressionKind::Bool { .. }
+        | CheckedExpressionKind::Tag { .. }
+        | CheckedExpressionKind::Source
+        | CheckedExpressionKind::Delimiter
+        | CheckedExpressionKind::Invalid { .. } => Vec::new(),
+    }
+}
+
 fn source_path_part_candidates(parts: &[String]) -> Vec<Vec<String>> {
     let mut candidates = Vec::new();
     for (strip_event, strip_events) in [(false, false), (true, false), (false, true), (true, true)]
@@ -20241,12 +23031,11 @@ fn source_payload_shape_table(
             fields.insert(name, ty);
         }
     }
-    program
-        .source_ports
+    source_paths
         .iter()
-        .map(|source| {
+        .map(|source_path| {
             let fields = fields_by_source
-                .get(&source.path)
+                .get(source_path)
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
@@ -20259,7 +23048,7 @@ fn source_payload_shape_table(
                 false,
             ));
             SourcePayloadShapeEntry {
-                source_path: source.path.clone(),
+                source_path: source_path.clone(),
                 payload_type,
                 fields,
             }

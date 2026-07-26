@@ -4,10 +4,12 @@
 //! provenance for diagnostics and later structural-owner interning, but it is
 //! not a runtime value and is not serializable.
 
-use super::{ExecutableParameterId, FunctionId, StaticOwnerDef, StaticOwnerId};
+use super::{
+    ExecutableParameterId, ExecutableStatementId, FunctionId, StaticOwnerDef, StaticOwnerId,
+};
 use boon_typecheck::{
     CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedCallableSignature,
-    CheckedEvaluationScope, CheckedExprId, CheckedProgram, CheckedScopeKind, CheckedStatementId,
+    CheckedEvaluationScope, CheckedExprId, CheckedProgram, CheckedScopeKind,
     CheckedTypeSubstitution, DeclId, FlowType, LexicalScopeId, apply_checked_type_substitutions,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,27 +38,38 @@ macro_rules! typed_out_id {
 
 typed_out_id!(OutCallInstanceId, OutPortId, OutNetId);
 
+impl OutCallInstanceId {
+    pub(crate) const fn from_usize(value: usize) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProducerRootParameter {
-    pub(crate) checked_expression: CheckedExprId,
+    pub(crate) formal: DeclId,
     pub(crate) parameter: ExecutableParameterId,
     pub(crate) name: String,
     pub(crate) flow_type: FlowType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerRoot {
+pub(crate) struct ProducerRootSpec {
     pub(crate) identity: [u8; 32],
     pub(crate) mode: crate::ProducerFunctionMode,
-    pub(crate) call: CheckedCallId,
+    pub(crate) callable: DeclId,
     pub(crate) function: FunctionId,
     pub(crate) function_name: String,
-    pub(crate) result_statement: CheckedStatementId,
+    pub(crate) result_statement: ExecutableStatementId,
     pub(crate) result_declaration: DeclId,
     pub(crate) result_path: String,
     pub(crate) result_type: FlowType,
-    pub(crate) invocation_source_expression: Option<CheckedExprId>,
     pub(crate) parameters: Vec<ProducerRootParameter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProducerRoot {
+    pub(crate) spec: ProducerRootSpec,
+    pub(crate) call: OutCallInstanceId,
 }
 
 /// Stable checked-program coordinates for one static call site.
@@ -65,7 +78,7 @@ pub(crate) struct ProducerRoot {
 /// not part of executable ownership.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct OutCallProvenance {
-    pub(crate) call_id: CheckedCallId,
+    pub(crate) call_id: Option<CheckedCallId>,
     pub(crate) expression: CheckedExprId,
     pub(crate) owner_callable: Option<DeclId>,
     pub(crate) callable: DeclId,
@@ -74,7 +87,7 @@ pub(crate) struct OutCallProvenance {
 impl From<&CheckedCall> for OutCallProvenance {
     fn from(call: &CheckedCall) -> Self {
         Self {
-            call_id: call.id,
+            call_id: Some(call.id),
             expression: call.expression,
             owner_callable: call.owner_callable,
             callable: call.callable,
@@ -116,10 +129,28 @@ pub(crate) struct ScopedCheckedExpr {
     pub(crate) value_frame: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OutInputBinding {
     pub(crate) formal: DeclId,
-    pub(crate) value: ScopedCheckedExpr,
+    pub(crate) value: OutInputValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OutInputValue {
+    Checked(ScopedCheckedExpr),
+    ProducerParameter {
+        parameter: ExecutableParameterId,
+        flow_type: FlowType,
+    },
+}
+
+impl OutInputBinding {
+    pub(crate) fn checked_value(&self) -> Option<ScopedCheckedExpr> {
+        match &self.value {
+            OutInputValue::Checked(value) => Some(*value),
+            OutInputValue::ProducerParameter { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,7 +209,6 @@ pub(crate) struct OutNet<Contract = ()> {
     producer_roots: Vec<ProducerRoot>,
     producer_root_by_identity: BTreeMap<[u8; 32], OutCallInstanceId>,
     producer_root_calls: BTreeSet<OutCallInstanceId>,
-    producer_parameter_by_expression: BTreeMap<CheckedExprId, ExecutableParameterId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +220,13 @@ pub(crate) struct ConcreteOutProducer {
 }
 
 impl<Contract> OutNet<Contract> {
+    pub(crate) fn producer_root_result_path(&self, call: OutCallInstanceId) -> Option<&str> {
+        self.producer_roots
+            .iter()
+            .find(|root| root.call == call)
+            .map(|root| root.spec.result_path.as_str())
+    }
+
     pub(crate) fn call_instance_for_checked_call(
         &self,
         call_id: CheckedCallId,
@@ -243,6 +280,59 @@ impl<Contract> OutNet<Contract> {
         }
     }
 
+    pub(crate) fn distributed_call_occurrence(
+        &self,
+        program: &CheckedProgram,
+        instance: OutCallInstanceId,
+    ) -> Result<(crate::DistributedCallOccurrenceRoot, String), String> {
+        let mut ancestry = Vec::new();
+        let mut next = Some(instance);
+        let mut remaining = self.call_instances.len().saturating_add(1);
+        while let Some(call) = next {
+            if remaining == 0 {
+                return Err(format!(
+                    "OUT call instance {instance} has cyclic concrete ancestry"
+                ));
+            }
+            remaining -= 1;
+            let concrete = self
+                .call_instances
+                .get(call.as_usize())
+                .filter(|candidate| candidate.id == call)
+                .ok_or_else(|| format!("OUT call instance {call} is missing"))?;
+            ancestry.push(call);
+            next = concrete.parent;
+        }
+        ancestry.reverse();
+
+        let producer_root = ancestry.first().and_then(|root| {
+            self.producer_root_by_identity
+                .iter()
+                .find_map(|(identity, candidate)| (*candidate == *root).then_some(*identity))
+        });
+        let root = producer_root
+            .map(crate::DistributedCallOccurrenceRoot::Producer)
+            .unwrap_or(crate::DistributedCallOccurrenceRoot::Program);
+        let mut path = match root {
+            crate::DistributedCallOccurrenceRoot::Program => "program".to_owned(),
+            crate::DistributedCallOccurrenceRoot::Producer(identity) => {
+                format!("producer:{}", crate::producer_identity_text(identity))
+            }
+        };
+        let first_static = usize::from(producer_root.is_some());
+        for call in ancestry.into_iter().skip(first_static) {
+            let checked = self.call_instances[call.as_usize()]
+                .provenance
+                .call_id
+                .ok_or_else(|| {
+                    format!("non-root OUT call instance {call} has no checked call provenance")
+                })?;
+            path.push('/');
+            path.push_str(&checked_call_occurrence_segment(program, checked)?);
+        }
+        Ok((root, path))
+    }
+
     pub(crate) fn owner_scope_for_net(&self, net: OutNetId) -> Option<LexicalScopeId> {
         let anchor = self.nets[net.as_usize()].owner_anchor?;
         match self.ports[anchor.as_usize()].binding {
@@ -275,31 +365,86 @@ impl<Contract> OutNet<Contract> {
     pub(crate) fn producer_roots(&self) -> &[ProducerRoot] {
         &self.producer_roots
     }
+}
 
-    pub(crate) fn producer_root_for_identity(
-        &self,
-        identity: [u8; 32],
-    ) -> Option<OutCallInstanceId> {
-        self.producer_root_by_identity.get(&identity).copied()
-    }
+pub(crate) fn checked_call_occurrence_segment(
+    program: &CheckedProgram,
+    call_id: CheckedCallId,
+) -> Result<String, String> {
+    let call = program
+        .calls
+        .iter()
+        .find(|candidate| candidate.id == call_id)
+        .ok_or_else(|| format!("checked call {} is missing", call_id.0))?;
+    let owner = checked_call_owner_key(program, call);
+    let mut peers = program
+        .calls
+        .iter()
+        .filter(|candidate| {
+            candidate.owner_callable == call.owner_callable
+                && candidate.function == call.function
+                && checked_call_owner_key(program, candidate) == owner
+        })
+        .collect::<Vec<_>>();
+    peers.sort_by_key(|candidate| {
+        (
+            candidate.span.line,
+            candidate.span.start,
+            candidate.span.end,
+            candidate.id,
+        )
+    });
+    let ordinal = peers
+        .iter()
+        .position(|candidate| candidate.id == call.id)
+        .ok_or_else(|| format!("checked call {} has no static occurrence", call.id.0))?;
+    Ok(format!(
+        "{}:{}|{}:{}|{ordinal}",
+        owner.len(),
+        owner,
+        call.function.len(),
+        call.function
+    ))
+}
 
-    pub(crate) fn producer_parameter_for_expression(
-        &self,
-        expression: CheckedExprId,
-    ) -> Option<ExecutableParameterId> {
-        self.producer_parameter_by_expression
-            .get(&expression)
-            .copied()
-    }
-
-    pub(crate) fn producer_root_for_statement(
-        &self,
-        statement: CheckedStatementId,
-    ) -> Option<&ProducerRoot> {
-        self.producer_roots
+fn checked_call_owner_key(program: &CheckedProgram, call: &CheckedCall) -> String {
+    if let Some(owner) = call.owner_callable
+        && let Some(callable) = program
+            .callables
             .iter()
-            .find(|root| root.result_statement == statement)
+            .find(|candidate| candidate.decl_id == owner)
+    {
+        return format!("function:{}", callable.name);
     }
+    let Some(expression) = program
+        .expressions
+        .iter()
+        .find(|candidate| candidate.id == call.expression)
+    else {
+        return "root".to_owned();
+    };
+    if let Some(declaration) = expression.declaration
+        && let Some(path) = program.declaration_path(declaration)
+    {
+        return format!("declaration:{path}");
+    }
+    let mut scope = Some(expression.scope_id);
+    let mut visited = BTreeSet::new();
+    while let Some(id) = scope {
+        if !visited.insert(id) {
+            break;
+        }
+        let Some(current) = program.scopes.iter().find(|candidate| candidate.id == id) else {
+            break;
+        };
+        if let Some(owner) = current.owner
+            && let Some(path) = program.declaration_path(owner)
+        {
+            return format!("scope:{path}");
+        }
+        scope = current.parent;
+    }
+    "root".to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -355,6 +500,10 @@ pub(crate) enum OutNetDiagnostic {
         formal: DeclId,
     },
     MissingCallable {
+        call: OutCallInstanceId,
+        callable: DeclId,
+    },
+    MissingPassedContext {
         call: OutCallInstanceId,
         callable: DeclId,
     },
@@ -422,6 +571,11 @@ impl fmt::Display for OutNetDiagnostic {
                 "OUT call instance {call} references missing callable declaration {}",
                 callable.0
             ),
+            Self::MissingPassedContext { call, callable } => write!(
+                formatter,
+                "OUT call instance {call} requires PASS for callable declaration {} but has no explicit or inherited context",
+                callable.0
+            ),
             Self::RecursiveContextualCall { call, callable } => write!(
                 formatter,
                 "OUT call instance {call} recursively expands callable declaration {}",
@@ -458,7 +612,7 @@ impl OutNet<()> {
 
     pub(crate) fn build_with_producer_roots(
         program: &CheckedProgram,
-        producer_roots: Vec<ProducerRoot>,
+        producer_roots: Vec<ProducerRootSpec>,
     ) -> OutNetBuild {
         Self::build_with(
             program,
@@ -475,7 +629,7 @@ impl<Contract> OutNet<Contract> {
     /// current `CheckedProgram` adapter.
     pub(crate) fn build_with<MakeContract, IsProducer>(
         program: &CheckedProgram,
-        producer_roots: Vec<ProducerRoot>,
+        producer_roots: Vec<ProducerRootSpec>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> OutNetBuild<Contract>
@@ -536,8 +690,9 @@ struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     signature_by_id: BTreeMap<DeclId, &'program CheckedCallableSignature>,
     calls_by_owner: BTreeMap<Option<DeclId>, Vec<usize>>,
     resource_owning_callables: BTreeSet<DeclId>,
+    producer_root_specs: Vec<ProducerRootSpec>,
     producer_roots: Vec<ProducerRoot>,
-    producer_identity_by_call: BTreeMap<CheckedCallId, [u8; 32]>,
+    producer_identity_by_call: BTreeMap<OutCallInstanceId, [u8; 32]>,
     make_contract: MakeContract,
     is_structural_producer: IsProducer,
     call_instances: Vec<OutCallInstance>,
@@ -556,7 +711,7 @@ where
 {
     fn new(
         program: &'program CheckedProgram,
-        producer_roots: Vec<ProducerRoot>,
+        producer_root_specs: Vec<ProducerRootSpec>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> Self {
@@ -580,17 +735,14 @@ where
         }
 
         let resource_owning_callables = resource_owning_callables(program, &signature_by_id);
-        let producer_identity_by_call = producer_roots
-            .iter()
-            .map(|root| (root.call, root.identity))
-            .collect();
         Self {
             program,
             signature_by_id,
             calls_by_owner,
             resource_owning_callables,
-            producer_roots,
-            producer_identity_by_call,
+            producer_root_specs,
+            producer_roots: Vec::new(),
+            producer_identity_by_call: BTreeMap::new(),
             make_contract,
             is_structural_producer,
             call_instances: Vec::new(),
@@ -603,7 +755,58 @@ where
 
     fn build(mut self) -> OutNetBuild<Contract> {
         self.instantiate_frame(None, None, BTreeMap::new(), &mut Vec::new());
+        let producer_roots = std::mem::take(&mut self.producer_root_specs);
+        for producer in producer_roots {
+            self.instantiate_producer_root(producer);
+        }
         self.finish()
+    }
+
+    fn instantiate_producer_root(&mut self, spec: ProducerRootSpec) {
+        let Some(signature) = self.signature_by_id.get(&spec.callable).copied() else {
+            return;
+        };
+        let Some(result_expression) = signature.result_expression else {
+            return;
+        };
+        let call = OutCallInstanceId(self.call_instances.len());
+        let inputs = spec
+            .parameters
+            .iter()
+            .map(|parameter| OutInputBinding {
+                formal: parameter.formal,
+                value: OutInputValue::ProducerParameter {
+                    parameter: parameter.parameter,
+                    flow_type: parameter.flow_type.clone(),
+                },
+            })
+            .collect();
+        self.call_instances.push(OutCallInstance {
+            id: call,
+            parent: None,
+            provenance: OutCallProvenance {
+                call_id: None,
+                expression: result_expression,
+                owner_callable: None,
+                callable: spec.callable,
+            },
+            parent_output: None,
+            parent_output_node: None,
+            inputs,
+            passed: None,
+            ports: Vec::new(),
+            type_substitutions: Vec::new(),
+            result: signature.result.clone(),
+            owner: None,
+        });
+        self.producer_identity_by_call.insert(call, spec.identity);
+        self.producer_roots.push(ProducerRoot { spec, call });
+        self.instantiate_frame(
+            Some(signature.decl_id),
+            Some(call),
+            BTreeMap::new(),
+            &mut vec![signature.decl_id],
+        );
     }
 
     fn instantiate_frame(
@@ -628,22 +831,33 @@ where
             let checked_call = self.program.calls[static_call_index].clone();
             let provenance = OutCallProvenance::from(&checked_call);
             let instance = OutCallInstanceId(self.call_instances.len());
+            let signature = self.signature_by_id.get(&checked_call.callable).copied();
             let inherited_parent_output_node =
                 parent.and_then(|parent| self.call_instances[parent.as_usize()].parent_output_node);
-            let passed = checked_call
-                .pass
-                .map(|expression| PassedBinding {
+            let inherited_passed =
+                parent.and_then(|parent| self.call_instances[parent.as_usize()].passed);
+            let passed = if let Some(pass) = checked_call.pass {
+                Some(PassedBinding {
                     value: ScopedCheckedExpr {
-                        expression,
+                        expression: pass.value,
                         frame: parent,
                         evaluation_port: None,
                         value_frame: None,
                     },
                     evaluation_call: instance,
                 })
-                .or_else(|| {
-                    parent.and_then(|parent| self.call_instances[parent.as_usize()].passed)
-                });
+            } else if signature.is_some_and(CheckedCallableSignature::requires_pass) {
+                if inherited_passed.is_none() {
+                    self.diagnostics
+                        .push(OutNetDiagnostic::MissingPassedContext {
+                            call: instance,
+                            callable: checked_call.callable,
+                        });
+                }
+                inherited_passed
+            } else {
+                None
+            };
             let inherited_substitutions = parent
                 .map(|parent| {
                     self.call_instances[parent.as_usize()]
@@ -665,9 +879,7 @@ where
                 .into_iter()
                 .map(|(variable, value)| CheckedTypeSubstitution { variable, value })
                 .collect::<Vec<_>>();
-            let result_scheme = self
-                .signature_by_id
-                .get(&checked_call.callable)
+            let result_scheme = signature
                 .map(|signature| &signature.result)
                 .unwrap_or(&checked_call.result);
             let result = FlowType {
@@ -688,10 +900,7 @@ where
                 owner: None,
             });
 
-            let kind = self
-                .signature_by_id
-                .get(&checked_call.callable)
-                .map(|signature| signature.kind);
+            let kind = signature.map(|signature| signature.kind);
             if kind.is_none() {
                 self.diagnostics.push(OutNetDiagnostic::MissingCallable {
                     call: instance,
@@ -805,12 +1014,12 @@ where
                     };
                     Some(OutInputBinding {
                         formal: *formal,
-                        value: ScopedCheckedExpr {
+                        value: OutInputValue::Checked(ScopedCheckedExpr {
                             expression: *value,
                             frame: parent,
                             evaluation_port,
                             value_frame: None,
-                        },
+                        }),
                     })
                 })
                 .collect();
@@ -978,9 +1187,7 @@ where
             .filter(|call| {
                 self.resource_owning_callables
                     .contains(&call.provenance.callable)
-                    || self
-                        .producer_identity_by_call
-                        .contains_key(&call.provenance.call_id)
+                    || self.producer_identity_by_call.contains_key(&call.id)
             })
             .map(|call| call.id)
             .collect::<BTreeSet<_>>();
@@ -1045,10 +1252,9 @@ where
         for siblings in children.values_mut() {
             siblings.sort_by_key(|node| {
                 let producer_identity = match *node {
-                    StaticOwnerNode::Call(call) => self
-                        .producer_identity_by_call
-                        .get(&self.call_instances[call.as_usize()].provenance.call_id)
-                        .copied(),
+                    StaticOwnerNode::Call(call) => {
+                        self.producer_identity_by_call.get(&call).copied()
+                    }
                     StaticOwnerNode::Net(_) => None,
                 };
                 let (scope_span, expression_span, expression, kind, ordinal) = match *node {
@@ -1217,11 +1423,13 @@ where
         let mut concrete_producers_by_checked =
             BTreeMap::<CheckedCallId, Vec<ConcreteOutProducer>>::new();
         for call in &call_instances {
-            insert_unique_index(
-                &mut call_instance_by_checked_frame,
-                (call.provenance.call_id, call.parent),
-                call.id,
-            );
+            if let Some(checked_call) = call.provenance.call_id {
+                insert_unique_index(
+                    &mut call_instance_by_checked_frame,
+                    (checked_call, call.parent),
+                    call.id,
+                );
+            }
             for port_id in &call.ports {
                 let port = &ports[port_id.as_usize()];
                 insert_unique_index(
@@ -1243,15 +1451,17 @@ where
                     .any(|producer| producer.port == *port_id)
                     && let Some(owner) = net.owner
                 {
-                    concrete_producers_by_checked
-                        .entry(call.provenance.call_id)
-                        .or_default()
-                        .push(ConcreteOutProducer {
-                            call: call.id,
-                            port: *port_id,
-                            net: net.id,
-                            owner,
-                        });
+                    if let Some(checked_call) = call.provenance.call_id {
+                        concrete_producers_by_checked
+                            .entry(checked_call)
+                            .or_default()
+                            .push(ConcreteOutProducer {
+                                call: call.id,
+                                port: *port_id,
+                                net: net.id,
+                                owner,
+                            });
+                    }
                 }
             }
         }
@@ -1262,23 +1472,9 @@ where
         let producer_root_by_identity = self
             .producer_roots
             .iter()
-            .filter_map(|root| {
-                call_instances
-                    .iter()
-                    .find(|call| call.provenance.call_id == root.call && call.parent.is_none())
-                    .map(|call| (root.identity, call.id))
-            })
+            .map(|root| (root.spec.identity, root.call))
             .collect::<BTreeMap<_, _>>();
         let producer_root_calls = producer_root_by_identity.values().copied().collect();
-        let producer_parameter_by_expression = self
-            .producer_roots
-            .iter()
-            .flat_map(|root| {
-                root.parameters
-                    .iter()
-                    .map(|parameter| (parameter.checked_expression, parameter.parameter))
-            })
-            .collect();
 
         OutNetBuild {
             graph: OutNet {
@@ -1292,7 +1488,6 @@ where
                 producer_roots: self.producer_roots,
                 producer_root_by_identity,
                 producer_root_calls,
-                producer_parameter_by_expression,
             },
             diagnostics: self.diagnostics,
         }
@@ -1551,6 +1746,7 @@ mod tests {
                 end: 0,
             }],
             contexts: Vec::new(),
+            pass_requirement: None,
             result: unknown_flow_type(),
             role: ProgramRole::Client,
             effect: CheckedEffectSummary::default(),
@@ -1906,6 +2102,7 @@ mod tests {
                 },
             ],
             contexts: Vec::new(),
+            pass_requirement: None,
             result: unknown_flow_type(),
             role: ProgramRole::Client,
             effect: CheckedEffectSummary::default(),

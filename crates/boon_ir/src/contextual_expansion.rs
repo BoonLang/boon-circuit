@@ -1,48 +1,26 @@
-use super::out_net::{OutCallInstanceId, OutNet, OutNetId, ScopedCheckedExpr};
+use super::out_net::{OutCallInstanceId, OutInputValue, OutNet, OutNetId, ScopedCheckedExpr};
 use super::{
     ContextualMaterialization as ConcreteMaterialization,
     ContextualOperationKind as ConcreteContextualOperation,
     ExecutableBlockBinding as ConcreteBlockBinding, ExecutableCallArgument as ConcreteCallArgument,
     ExecutableCallContextId, ExecutableCallableKind, ExecutableExprId as ConcreteExprId,
     ExecutableExpression as ConcreteExpression, ExecutableExpressionKind as ConcreteExpressionKind,
-    ExecutableFunction, ExecutableFunctionParameter, ExecutablePatternBinding, ExecutableProgram,
-    ExecutableRecordField as ConcreteRecordField, ExecutableSelectArm, ExecutableSourceDef,
-    ExecutableSourceId, ExecutableStateDef, ExecutableStateId, ExecutableStatement,
-    ExecutableStatementId, ExecutableStatementKind, ExecutableTextSegment as ConcreteTextSegment,
-    MaterializationLocalId, MaterializationResultKind, StaticOwnerId,
-    executable_expression_children,
+    ExecutableFunction, ExecutableFunctionParameter, ExecutableLocalBindingId,
+    ExecutablePatternBinding, ExecutableProgram, ExecutableRecordField as ConcreteRecordField,
+    ExecutableSelectArm, ExecutableSourceDef, ExecutableSourceId, ExecutableSourceOrigin,
+    ExecutableStateDef, ExecutableStateId, ExecutableStatement, ExecutableStatementId,
+    ExecutableStatementKind, ExecutableTextSegment as ConcreteTextSegment, ExecutableValueMember,
+    ExecutableValueOrigin, ExecutableValueProvenance, MaterializationLocalId,
+    MaterializationResultKind, StaticOwnerId,
 };
 use boon_typecheck::{
     CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextualOperation,
-    CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedProgram, CheckedTextSegment,
-    CheckedValueUse, DeclId, FlowMode, Type, apply_checked_type_substitutions, is_renderable_type,
+    CheckedDeclarationKind, CheckedExprId, CheckedExpression, CheckedExpressionKind,
+    CheckedProgram, CheckedTextSegment, CheckedValueUse, DeclId, FlowMode, Type,
+    apply_checked_type_substitutions, is_renderable_type,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-
-fn checked_statement_is_source_group(
-    program: &CheckedProgram,
-    statement: boon_typecheck::CheckedStatementId,
-    visiting: &mut BTreeSet<boon_typecheck::CheckedStatementId>,
-) -> bool {
-    if !visiting.insert(statement) {
-        return false;
-    }
-    let result = checked_statement(program, statement).is_some_and(|statement| {
-        !statement.children.is_empty()
-            && statement.children.iter().all(|child| {
-                checked_statement(program, *child).is_some_and(|child| match child.kind {
-                    boon_typecheck::CheckedStatementKind::Source { .. } => true,
-                    boon_typecheck::CheckedStatementKind::Field { .. } => {
-                        checked_statement_is_source_group(program, child.id, visiting)
-                    }
-                    _ => false,
-                })
-            })
-    });
-    visiting.remove(&statement);
-    result
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExpansionError {
@@ -62,7 +40,7 @@ pub(crate) enum ExpansionError {
         formal: DeclId,
     },
     MissingFunctionResult(DeclId),
-    MissingProducerStatement(boon_typecheck::CheckedStatementId),
+    MissingProducerOwner([u8; 32]),
     MissingPassedContext(CheckedExprId),
     UnboundOutput {
         expression: CheckedExprId,
@@ -103,6 +81,7 @@ pub(crate) enum ExpansionError {
         expression: CheckedExprId,
         path: String,
     },
+    InvalidLocalBindings(String),
 }
 
 impl fmt::Display for ExpansionError {
@@ -152,10 +131,13 @@ impl fmt::Display for ExpansionError {
                 "contextual callable {} has no canonical result expression",
                 callable.0
             ),
-            Self::MissingProducerStatement(statement) => write!(
+            Self::MissingProducerOwner(identity) => write!(
                 formatter,
-                "producer root statement {} has no executable result",
-                statement.0
+                "producer root {} has no static owner",
+                identity
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
             ),
             Self::MissingPassedContext(expression) => write!(
                 formatter,
@@ -239,6 +221,9 @@ impl fmt::Display for ExpansionError {
                 "function expression {} cannot resolve ambient read `{path}` without a concrete call frame",
                 expression.0
             ),
+            Self::InvalidLocalBindings(message) => {
+                write!(formatter, "invalid executable local bindings: {message}")
+            }
         }
     }
 }
@@ -255,7 +240,6 @@ struct CheckedProgramLookup {
     pattern_bindings_by_declaration: BTreeMap<DeclId, Option<usize>>,
     statements_by_value: BTreeMap<CheckedExprId, Vec<usize>>,
     element_contexts_by_declaration: BTreeMap<DeclId, Option<(usize, usize)>>,
-    source_group_declarations: BTreeSet<DeclId>,
 }
 
 impl CheckedProgramLookup {
@@ -333,22 +317,6 @@ impl CheckedProgramLookup {
                     .or_insert(Some((call_index, context_index)));
             }
         }
-        let source_group_declarations = program
-            .statements
-            .iter()
-            .filter_map(|statement| match statement.kind {
-                boon_typecheck::CheckedStatementKind::Field { declaration }
-                    if checked_statement_is_source_group(
-                        program,
-                        statement.id,
-                        &mut BTreeSet::new(),
-                    ) =>
-                {
-                    Some(declaration)
-                }
-                _ => None,
-            })
-            .collect();
         Self {
             expressions_by_id,
             declarations_by_id,
@@ -360,7 +328,6 @@ impl CheckedProgramLookup {
             pattern_bindings_by_declaration,
             statements_by_value,
             element_contexts_by_declaration,
-            source_group_declarations,
         }
     }
 
@@ -491,10 +458,6 @@ impl CheckedProgramLookup {
         let context = call.contexts.get(context)?;
         (context.declaration == declaration).then_some((call, context))
     }
-
-    fn declaration_is_source_group(&self, declaration: DeclId) -> bool {
-        self.source_group_declarations.contains(&declaration)
-    }
 }
 
 #[derive(Clone)]
@@ -525,7 +488,7 @@ fn call_instance_matches_checked_path(
         let Some(current) = out_net.call_instances.get(instance.as_usize()) else {
             return false;
         };
-        if current.provenance.call_id != *call {
+        if current.provenance.call_id != Some(*call) {
             return false;
         }
         if position + 1 < call_path.len() {
@@ -580,6 +543,7 @@ fn push_default_order_direction(
         },
         effect: boon_typecheck::CheckedEffectSummary::default(),
         owner,
+        provenance: runtime_value_provenance(),
         resource_binding_path: None,
         kind: ConcreteExpressionKind::Tag("Ascending".to_owned()),
     });
@@ -611,7 +575,7 @@ pub(crate) fn derive_contextual_materializations(
                     .inputs
                     .iter()
                     .find(|binding| binding.formal == formal)
-                    .map(|binding| binding.value)
+                    .and_then(|binding| binding.checked_value())
                     .ok_or(ExpansionError::MissingOperationInput {
                         call: checked_call.id,
                         formal,
@@ -624,7 +588,7 @@ pub(crate) fn derive_contextual_materializations(
                     .inputs
                     .iter()
                     .find(|binding| binding.formal == formal)
-                    .map(|binding| binding.value)
+                    .and_then(|binding| binding.checked_value())
             });
             out_net
                 .owner_scope_for_net(producer.net)
@@ -849,6 +813,7 @@ pub(crate) fn derive_contextual_materializations(
             operation: candidate.operation,
             result_kind,
             source,
+            source_row_predecessors: Vec::new(),
             body,
             direction,
             inherited_order,
@@ -1054,12 +1019,6 @@ pub(crate) fn derive_executable_program(
         .iter()
         .filter(|statement| included.contains(&statement.id))
     {
-        let producer_root = out_net.producer_root_for_statement(statement.id);
-        let producer_owner = producer_root.and_then(|producer| {
-            out_net
-                .call_instance_for_checked_call(producer.call, None)
-                .and_then(|instance| out_net.owner_for_call(instance))
-        });
         let declaration = match &statement.kind {
             boon_typecheck::CheckedStatementKind::Function { declaration }
             | boon_typecheck::CheckedStatementKind::Field { declaration } => Some(*declaration),
@@ -1080,7 +1039,7 @@ pub(crate) fn derive_executable_program(
                         evaluation_port: None,
                         value_frame: None,
                     },
-                    producer_owner,
+                    None,
                 )
             })
             .transpose()?;
@@ -1095,57 +1054,48 @@ pub(crate) fn derive_executable_program(
                 })
                 .unzip()
         };
-        let kind = if let Some(root) = producer_root {
-            ExecutableStatementKind::Field {
-                name: "result".to_owned(),
-                path: root.result_path.clone(),
-            }
-        } else {
-            match &statement.kind {
-                boon_typecheck::CheckedStatementKind::Function { .. } => unreachable!(),
-                boon_typecheck::CheckedStatementKind::Field { declaration } => {
-                    let (name, path) = declaration_parts(Some(*declaration));
-                    ExecutableStatementKind::Field {
-                        name: name.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
-                        path: path.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
-                    }
-                }
-                boon_typecheck::CheckedStatementKind::Source { declaration, event } => {
-                    let (name, path) = declaration_parts(*declaration);
-                    ExecutableStatementKind::Source {
-                        name,
-                        path,
-                        event: event.clone(),
-                    }
-                }
-                boon_typecheck::CheckedStatementKind::Hold {
-                    declaration,
-                    name: hold_name,
-                } => {
-                    let (name, path) = declaration_parts(*declaration);
-                    ExecutableStatementKind::Hold {
-                        name,
-                        path,
-                        hold_name: hold_name.clone(),
-                    }
-                }
-                boon_typecheck::CheckedStatementKind::List {
-                    declaration,
-                    capacity,
-                } => {
-                    let (name, path) = declaration_parts(*declaration);
-                    ExecutableStatementKind::List {
-                        name,
-                        path,
-                        capacity: *capacity,
-                    }
-                }
-                boon_typecheck::CheckedStatementKind::Block => ExecutableStatementKind::Block,
-                boon_typecheck::CheckedStatementKind::Spread => ExecutableStatementKind::Spread,
-                boon_typecheck::CheckedStatementKind::Expression => {
-                    ExecutableStatementKind::Expression
+        let kind = match &statement.kind {
+            boon_typecheck::CheckedStatementKind::Function { .. } => unreachable!(),
+            boon_typecheck::CheckedStatementKind::Field { declaration } => {
+                let (name, path) = declaration_parts(Some(*declaration));
+                ExecutableStatementKind::Field {
+                    name: name.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
+                    path: path.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
                 }
             }
+            boon_typecheck::CheckedStatementKind::Source { declaration, event } => {
+                let (name, path) = declaration_parts(*declaration);
+                ExecutableStatementKind::Source {
+                    name,
+                    path,
+                    event: event.clone(),
+                }
+            }
+            boon_typecheck::CheckedStatementKind::Hold {
+                declaration,
+                name: hold_name,
+            } => {
+                let (name, path) = declaration_parts(*declaration);
+                ExecutableStatementKind::Hold {
+                    name,
+                    path,
+                    hold_name: hold_name.clone(),
+                }
+            }
+            boon_typecheck::CheckedStatementKind::List {
+                declaration,
+                capacity,
+            } => {
+                let (name, path) = declaration_parts(*declaration);
+                ExecutableStatementKind::List {
+                    name,
+                    path,
+                    capacity: *capacity,
+                }
+            }
+            boon_typecheck::CheckedStatementKind::Block => ExecutableStatementKind::Block,
+            boon_typecheck::CheckedStatementKind::Spread => ExecutableStatementKind::Spread,
+            boon_typecheck::CheckedStatementKind::Expression => ExecutableStatementKind::Expression,
         };
         statements.push(ExecutableStatement {
             id: ExecutableStatementId(statement.id.0 as usize),
@@ -1167,6 +1117,31 @@ pub(crate) fn derive_executable_program(
                 .collect(),
         });
     }
+    let mut producer_bodies = Vec::with_capacity(out_net.producer_roots().len());
+    for producer in out_net.producer_roots() {
+        let callable = lookup
+            .callable(program, producer.spec.callable)
+            .ok_or(ExpansionError::MissingCallable(producer.spec.callable))?;
+        let result = callable
+            .result_expression
+            .ok_or(ExpansionError::MissingFunctionResult(
+                producer.spec.callable,
+            ))?;
+        let owner = out_net
+            .owner_for_call(producer.call)
+            .ok_or(ExpansionError::MissingProducerOwner(producer.spec.identity))?;
+        let body = builder.expand_with_inherited_owner(
+            ScopedCheckedExpr {
+                expression: result,
+                frame: Some(producer.call),
+                evaluation_port: None,
+                value_frame: None,
+            },
+            Some(owner),
+        )?;
+        producer_bodies.push((producer, result, owner, body));
+    }
+
     statements.sort_by_key(|statement| statement.id);
     let roots = Vec::new();
     let offset = expressions.len();
@@ -1177,122 +1152,178 @@ pub(crate) fn derive_executable_program(
         }
     }
     append_expression_arena_without_roots(&mut expressions, local_expressions);
-
-    let functions = out_net
-        .producer_roots()
-        .iter()
-        .map(|producer| {
-            let root = statements
+    let mut functions = Vec::with_capacity(producer_bodies.len());
+    let mut producer_sources = Vec::new();
+    for (producer, checked_result, owner, body) in producer_bodies {
+        let body = rebase_expr_id(body, offset);
+        let invocation_source = if producer.spec.mode == crate::ProducerFunctionMode::Invocation {
+            let identity = crate::producer_identity_text(producer.spec.identity);
+            let binding_path = format!("_producer_{identity}_invoke");
+            let source = ConcreteExprId(expressions.len());
+            expressions.push(ConcreteExpression {
+                id: source,
+                checked_expr_id: checked_result,
+                flow_type: boon_typecheck::FlowType {
+                    mode: FlowMode::PresentOrAbsent,
+                    ty: Type::Unknown,
+                },
+                effect: boon_typecheck::CheckedEffectSummary {
+                    emits_source: true,
+                    ..boon_typecheck::CheckedEffectSummary::default()
+                },
+                owner: Some(owner),
+                provenance: ExecutableValueProvenance {
+                    members: vec![ExecutableValueMember {
+                        path: Vec::new(),
+                        origin: ExecutableValueOrigin::ProducerSource {
+                            function: producer.spec.function,
+                            identity: producer.spec.identity,
+                            owner,
+                        },
+                    }],
+                },
+                resource_binding_path: Some(binding_path.clone()),
+                kind: ConcreteExpressionKind::Source {
+                    binding_path: binding_path.clone(),
+                },
+            });
+            producer_sources.push((
+                producer.spec.function,
+                producer.spec.identity,
+                producer.spec.result_declaration,
+                source,
+                binding_path,
+                owner,
+            ));
+            Some(source)
+        } else {
+            None
+        };
+        let root = if let Some(source) = invocation_source {
+            let root = ConcreteExprId(expressions.len());
+            expressions.push(ConcreteExpression {
+                id: root,
+                checked_expr_id: checked_result,
+                flow_type: producer.spec.result_type.clone(),
+                effect: boon_typecheck::CheckedEffectSummary {
+                    emits_source: true,
+                    ..lookup
+                        .callable(program, producer.spec.callable)
+                        .map(|callable| callable.effect)
+                        .unwrap_or_default()
+                },
+                owner: Some(owner),
+                provenance: expressions[body.as_usize()].provenance.clone(),
+                resource_binding_path: None,
+                kind: ConcreteExpressionKind::Then {
+                    input: source,
+                    output: Some(body),
+                },
+            });
+            root
+        } else {
+            body
+        };
+        statements.push(ExecutableStatement {
+            id: producer.spec.result_statement,
+            declaration: Some(producer.spec.result_declaration),
+            flow_type: Some(producer.spec.result_type.clone()),
+            kind: ExecutableStatementKind::Field {
+                name: "result".to_owned(),
+                path: producer.spec.result_path.clone(),
+            },
+            value: Some(root),
+            value_use: MaterializationResultKind::RuntimeValue,
+            children: Vec::new(),
+        });
+        functions.push(ExecutableFunction {
+            id: producer.spec.function,
+            identity: producer.spec.identity,
+            name: producer.spec.function_name.clone(),
+            parameters: producer
+                .spec
+                .parameters
                 .iter()
-                .find(|statement| {
-                    statement.id == ExecutableStatementId(producer.result_statement.0 as usize)
+                .map(|parameter| ExecutableFunctionParameter {
+                    id: parameter.parameter,
+                    name: parameter.name.clone(),
+                    flow_type: parameter.flow_type.clone(),
                 })
-                .and_then(|statement| statement.value)
-                .ok_or(ExpansionError::MissingProducerStatement(
-                    producer.result_statement,
-                ))?;
-            Ok(ExecutableFunction {
-                id: producer.function,
-                name: producer.function_name.clone(),
-                parameters: producer
-                    .parameters
-                    .iter()
-                    .map(|parameter| ExecutableFunctionParameter {
-                        id: parameter.parameter,
-                        name: parameter.name.clone(),
-                        flow_type: parameter.flow_type.clone(),
-                    })
-                    .collect(),
-                result_type: producer.result_type.clone(),
-                root,
-            })
-        })
-        .collect::<Result<Vec<_>, ExpansionError>>()?;
+                .collect(),
+            result_type: producer.spec.result_type.clone(),
+            root,
+            invocation_source,
+        });
+    }
+    statements.sort_by_key(|statement| statement.id);
     synthesize_statement_owned_states(program, &lookup, &mut expressions, &mut statements)?;
-    let sources = expressions
-        .iter()
-        .filter_map(|expression| {
-            let fallback = match &expression.kind {
-                ConcreteExpressionKind::Source { binding_path } => Some(binding_path.clone()),
-                ConcreteExpressionKind::Call { .. } if expression.effect.emits_source => {
-                    resource_binding_path(program, &lookup, expression.checked_expr_id)
-                }
-                _ => return None,
-            };
-            let binding_path = fallback?;
-            Some((expression, binding_path))
-        })
-        .map(|(expression, binding_path)| {
-            Ok(ExecutableSourceDef {
-                id: ExecutableSourceId(0),
-                declaration: resource_declaration(program, &lookup, expression.checked_expr_id)
-                    .ok_or(ExpansionError::MissingSourceDeclaration(
-                        expression.checked_expr_id,
-                    ))?,
+    resolve_executable_local_provenance(&mut expressions, &statements)?;
+    let mut sources = Vec::new();
+    let mut source_instances = BTreeSet::new();
+    for checked_source in &program.sources {
+        let fallback_path = program.semantic_path(&checked_source.path).ok_or(
+            ExpansionError::MissingSourceDeclaration(checked_source.expression),
+        )?;
+        for expression in expressions.iter().filter(|expression| {
+            expression.checked_expr_id == checked_source.expression
+                && (matches!(expression.kind, ConcreteExpressionKind::Source { .. })
+                    || expression.effect.emits_source)
+        }) {
+            if !source_instances.insert((checked_source.id, expression.owner)) {
+                continue;
+            }
+            sources.push(ExecutableSourceDef {
+                id: ExecutableSourceId(sources.len()),
+                origin: ExecutableSourceOrigin::Checked {
+                    source: checked_source.id,
+                },
+                declaration: checked_source.declaration,
                 expression: expression.id,
-                binding_path,
+                binding_path: fallback_path.clone(),
                 owner: expression.owner,
-            })
-        })
-        .collect::<Result<Vec<_>, ExpansionError>>()?
-        .into_iter()
-        .enumerate()
-        .map(|(id, mut source)| {
-            source.id = ExecutableSourceId(id);
-            source
-        })
-        .collect();
-    let hold_update_mergers = hold_update_latest_mergers(&expressions, &statements);
-    let states = expressions
-        .iter()
-        .filter_map(|expression| {
-            let fallback = match &expression.kind {
-                ConcreteExpressionKind::Hold { binding_path, .. } => Some(binding_path.clone()),
-                ConcreteExpressionKind::Latest { branches }
-                    if executable_latest_has_initial(&expressions, branches)
-                        && !hold_update_mergers.contains(&expression.id) =>
-                {
-                    resource_binding_path(program, &lookup, expression.checked_expr_id)
-                }
-                ConcreteExpressionKind::Call {
-                    callable_kind: ExecutableCallableKind::Builtin,
-                    ..
-                } if expression.effect.writes_state => {
-                    resource_binding_path(program, &lookup, expression.checked_expr_id)
-                }
-                _ => return None,
-            };
-            let binding_path = fallback?;
+            });
+        }
+    }
+    for (function, identity, declaration, expression, binding_path, owner) in producer_sources {
+        sources.push(ExecutableSourceDef {
+            id: ExecutableSourceId(sources.len()),
+            origin: ExecutableSourceOrigin::ProducerInvocation { function, identity },
+            declaration,
+            expression,
+            binding_path,
+            owner: Some(owner),
+        });
+    }
+    let mut states = Vec::new();
+    let mut state_instances = BTreeSet::new();
+    for checked_state in &program.states {
+        let fallback_path = program.semantic_path(&checked_state.path).ok_or(
+            ExpansionError::MissingStateDeclaration(checked_state.expression),
+        )?;
+        for expression in expressions.iter().filter(|expression| {
+            expression.checked_expr_id == checked_state.expression
+                && (matches!(
+                    expression.kind,
+                    ConcreteExpressionKind::Hold { .. } | ConcreteExpressionKind::Latest { .. }
+                ) || expression.effect.writes_state)
+        }) {
+            if !state_instances.insert((checked_state.id, expression.owner)) {
+                continue;
+            }
             let initial = concrete_state_initial_expression(&expressions, expression.id).ok_or(
-                ExpansionError::MissingStateInitializer(expression.checked_expr_id),
-            );
-            Some((
-                expression,
-                binding_path,
-                resource_declaration(program, &lookup, expression.checked_expr_id),
-                initial,
-            ))
-        })
-        .map(|(expression, binding_path, declaration, initial)| {
-            Ok(ExecutableStateDef {
-                id: ExecutableStateId(0),
-                declaration: declaration.ok_or(ExpansionError::MissingStateDeclaration(
-                    expression.checked_expr_id,
-                ))?,
+                ExpansionError::MissingStateInitializer(checked_state.expression),
+            )?;
+            states.push(ExecutableStateDef {
+                id: ExecutableStateId(states.len()),
+                checked_state: checked_state.id,
+                declaration: checked_state.declaration,
                 expression: expression.id,
-                initial: initial?,
-                binding_path,
+                initial,
+                binding_path: fallback_path.clone(),
                 owner: expression.owner,
-            })
-        })
-        .collect::<Result<Vec<_>, ExpansionError>>()?
-        .into_iter()
-        .enumerate()
-        .map(|(id, mut state)| {
-            state.id = ExecutableStateId(id);
-            state
-        })
-        .collect();
+            });
+        }
+    }
     Ok(ExecutableProgram {
         expressions,
         statements,
@@ -1301,72 +1332,6 @@ pub(crate) fn derive_executable_program(
         roots,
         functions,
     })
-}
-
-fn hold_update_latest_mergers(
-    expressions: &[ConcreteExpression],
-    statements: &[ExecutableStatement],
-) -> BTreeSet<ConcreteExprId> {
-    let mut pending = expressions
-        .iter()
-        .filter_map(|expression| match &expression.kind {
-            ConcreteExpressionKind::Hold { updates, .. } => Some(updates.as_slice()),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
-    let statements_by_id = statements
-        .iter()
-        .map(|statement| (statement.id, statement))
-        .collect::<BTreeMap<_, _>>();
-    for hold in statements
-        .iter()
-        .filter(|statement| matches!(statement.kind, ExecutableStatementKind::Hold { .. }))
-    {
-        let mut descendants = hold.children.clone();
-        let mut visited_statements = BTreeSet::new();
-        while let Some(id) = descendants.pop() {
-            if !visited_statements.insert(id) {
-                continue;
-            }
-            let Some(statement) = statements_by_id.get(&id).copied() else {
-                continue;
-            };
-            if matches!(statement.kind, ExecutableStatementKind::Hold { .. }) {
-                continue;
-            }
-            pending.extend(statement.value);
-            descendants.extend(statement.children.iter().copied());
-        }
-    }
-    let mut visited = BTreeSet::new();
-    let mut mergers = BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
-            continue;
-        }
-        let Some(expression) = expressions
-            .get(id.as_usize())
-            .filter(|expression| expression.id == id)
-        else {
-            continue;
-        };
-        match &expression.kind {
-            ConcreteExpressionKind::Hold { .. }
-            | ConcreteExpressionKind::Call { .. }
-                if expression.effect.writes_state =>
-            {
-                continue;
-            }
-            ConcreteExpressionKind::Latest { .. } => {
-                mergers.insert(id);
-            }
-            _ => {}
-        }
-        pending.extend(executable_expression_children(&expression.kind));
-    }
-    mergers
 }
 
 fn concrete_state_initial_expression(
@@ -1495,6 +1460,24 @@ fn synthesize_statement_owned_states(
             .or_else(|| name.clone())
             .unwrap_or_else(|| binding_path.clone());
         let id = ConcreteExprId(expressions.len());
+        let provenance = program
+            .states
+            .iter()
+            .find(|state| {
+                state.declaration == declaration
+                    && state.expression == initial_expression.checked_expr_id
+            })
+            .map_or_else(runtime_value_provenance, |state| {
+                ExecutableValueProvenance {
+                    members: vec![ExecutableValueMember {
+                        path: Vec::new(),
+                        origin: ExecutableValueOrigin::State {
+                            state: state.id,
+                            owner: initial_expression.owner,
+                        },
+                    }],
+                }
+            });
         expressions.push(ConcreteExpression {
             id,
             checked_expr_id: initial_expression.checked_expr_id,
@@ -1508,6 +1491,7 @@ fn synthesize_statement_owned_states(
                 ..boon_typecheck::CheckedEffectSummary::default()
             },
             owner: initial_expression.owner,
+            provenance,
             resource_binding_path: Some(binding_path.clone()),
             kind: ConcreteExpressionKind::Hold {
                 initial,
@@ -1526,9 +1510,20 @@ fn append_expression_arena_without_roots(
     mut source: Vec<ConcreteExpression>,
 ) {
     let offset = target.len();
+    let local_binding_offset = target
+        .iter()
+        .flat_map(|expression| match &expression.kind {
+            ConcreteExpressionKind::Block { bindings, .. } => {
+                bindings.iter().map(|binding| binding.id).collect()
+            }
+            _ => Vec::new(),
+        })
+        .map(ExecutableLocalBindingId::as_usize)
+        .max()
+        .map_or(0, |maximum| maximum + 1);
     for expression in &mut source {
         expression.id = rebase_expr_id(expression.id, offset);
-        rebase_expression_kind(&mut expression.kind, offset);
+        rebase_expression_kind(&mut expression.kind, offset, local_binding_offset);
     }
     target.extend(source);
 }
@@ -1537,13 +1532,16 @@ fn rebase_expr_id(expression: ConcreteExprId, offset: usize) -> ConcreteExprId {
     ConcreteExprId(expression.as_usize() + offset)
 }
 
-fn rebase_expression_kind(kind: &mut ConcreteExpressionKind, offset: usize) {
+fn rebase_expression_kind(
+    kind: &mut ConcreteExpressionKind,
+    offset: usize,
+    local_binding_offset: usize,
+) {
     let rebase = |expression: &mut ConcreteExprId| {
         *expression = rebase_expr_id(*expression, offset);
     };
     match kind {
         ConcreteExpressionKind::CanonicalRead { .. }
-        | ConcreteExpressionKind::LocalRead { .. }
         | ConcreteExpressionKind::ExternalRead { .. }
         | ConcreteExpressionKind::ElementState { .. }
         | ConcreteExpressionKind::Drain { .. }
@@ -1557,6 +1555,9 @@ fn rebase_expression_kind(kind: &mut ConcreteExpressionKind, offset: usize) {
         | ConcreteExpressionKind::Delimiter
         | ConcreteExpressionKind::MaterializationLocal { .. }
         | ConcreteExpressionKind::FunctionParameter { .. } => {}
+        ConcreteExpressionKind::LocalRead { binding, .. } => {
+            *binding = ExecutableLocalBindingId(binding.as_usize() + local_binding_offset);
+        }
         ConcreteExpressionKind::TextTemplate { segments } => {
             for value in segments.iter_mut().filter_map(|segment| match segment {
                 ConcreteTextSegment::Static { .. } => None,
@@ -1574,6 +1575,7 @@ fn rebase_expression_kind(kind: &mut ConcreteExpressionKind, offset: usize) {
         }
         ConcreteExpressionKind::Block { bindings, result } => {
             for binding in bindings {
+                binding.id = ExecutableLocalBindingId(binding.id.as_usize() + local_binding_offset);
                 rebase(&mut binding.value);
             }
             rebase(result);
@@ -1728,16 +1730,6 @@ fn contextual_operation_formals(
     }
 }
 
-fn checked_statement(
-    program: &CheckedProgram,
-    statement: boon_typecheck::CheckedStatementId,
-) -> Option<&boon_typecheck::CheckedStatement> {
-    program
-        .statements
-        .iter()
-        .find(|candidate| candidate.id == statement)
-}
-
 fn checked_scope(
     program: &CheckedProgram,
     scope: boon_typecheck::LexicalScopeId,
@@ -1824,178 +1816,12 @@ fn canonical_declaration_path(
     Some(segments.join("."))
 }
 
-fn resource_binding_path(
-    program: &CheckedProgram,
-    lookup: &CheckedProgramLookup,
-    expression: CheckedExprId,
-) -> Option<String> {
-    if let Some(declaration) = lookup
-        .expression(program, expression)
-        .and_then(|expression| expression.declaration)
-        .and_then(|declaration| lookup.declaration(program, declaration))
-        .filter(|declaration| {
-            matches!(
-                declaration.kind,
-                boon_typecheck::CheckedDeclarationKind::Field
-                    | boon_typecheck::CheckedDeclarationKind::Source
-                    | boon_typecheck::CheckedDeclarationKind::Hold
-                    | boon_typecheck::CheckedDeclarationKind::List
-            )
-        })
-    {
-        let mut path = canonical_declaration_path(program, lookup, declaration.id)?;
-        if let Some(root) = declaration.value
-            && let Some(projection) =
-                checked_projection_to_expression(program, lookup, root, expression)
-            && !projection.is_empty()
-        {
-            path.push('.');
-            path.push_str(&projection.join("."));
-        }
-        return Some(path);
-    }
-    let mut candidates = BTreeSet::new();
-    for declaration in &program.declarations {
-        let Some(root) = declaration.value else {
-            continue;
-        };
-        let Some(projection) = checked_projection_to_expression(program, lookup, root, expression)
-        else {
-            continue;
-        };
-        let mut path = canonical_declaration_path(program, lookup, declaration.id)?;
-        if !projection.is_empty() {
-            path.push('.');
-            path.push_str(&projection.join("."));
-        }
-        candidates.insert(path);
-    }
-    for callable in &program.callables {
-        let Some(root) = callable.result_expression else {
-            continue;
-        };
-        let Some(projection) = checked_projection_to_expression(program, lookup, root, expression)
-        else {
-            continue;
-        };
-        if !projection.is_empty() {
-            candidates.insert(projection.join("."));
-        }
-    }
-    for path in program.statements.iter().filter_map(|statement| {
-        if statement.value != Some(expression) {
-            return None;
-        }
-        let boon_typecheck::CheckedStatementKind::Source {
-            declaration: Some(declaration),
-            ..
-        } = &statement.kind
-        else {
-            return None;
-        };
-        canonical_declaration_path(program, lookup, *declaration)
-    }) {
-        candidates.insert(path);
-    }
-    let candidates = candidates.into_iter().collect::<Vec<_>>();
-    let [path] = candidates.as_slice() else {
-        return None;
-    };
-    Some(path.clone())
-}
-
 fn resource_declaration(
     program: &CheckedProgram,
     lookup: &CheckedProgramLookup,
     expression: CheckedExprId,
 ) -> Option<DeclId> {
     lookup.expression(program, expression)?.declaration
-}
-
-fn checked_projection_to_expression(
-    program: &CheckedProgram,
-    lookup: &CheckedProgramLookup,
-    root: CheckedExprId,
-    target: CheckedExprId,
-) -> Option<Vec<String>> {
-    fn visit(
-        program: &CheckedProgram,
-        lookup: &CheckedProgramLookup,
-        current: CheckedExprId,
-        target: CheckedExprId,
-        visiting: &mut BTreeSet<CheckedExprId>,
-    ) -> Option<Vec<String>> {
-        if current == target {
-            return Some(Vec::new());
-        }
-        if !visiting.insert(current) {
-            return None;
-        }
-        let expression = lookup.expression(program, current)?;
-        let direct =
-            |child, visiting: &mut BTreeSet<_>| visit(program, lookup, child, target, visiting);
-        let result = match &expression.kind {
-            CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields }
-            | CheckedExpressionKind::Record { fields } => fields.iter().find_map(|field| {
-                let mut projection = direct(field.value, visiting)?;
-                projection.insert(0, field.name.clone());
-                Some(projection)
-            }),
-            CheckedExpressionKind::Call { call } => lookup
-                .call(program, *call)
-                .into_iter()
-                .flat_map(|call| &call.entries)
-                .find_map(|entry| match entry {
-                    CheckedCallEntry::Input { value, .. } => direct(*value, visiting),
-                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
-                }),
-            CheckedExpressionKind::Draining { input }
-            | CheckedExpressionKind::Hold { initial: input, .. } => direct(*input, visiting),
-            CheckedExpressionKind::When { input, arms }
-            | CheckedExpressionKind::While { input, arms } => direct(*input, visiting)
-                .or_else(|| arms.iter().find_map(|arm| direct(*arm, visiting))),
-            CheckedExpressionKind::Then { input, output } => direct(*input, visiting)
-                .or_else(|| output.and_then(|output| direct(output, visiting))),
-            CheckedExpressionKind::Infix { left, right, .. } => {
-                direct(*left, visiting).or_else(|| direct(*right, visiting))
-            }
-            CheckedExpressionKind::MatchArm { output, .. } => {
-                output.and_then(|output| direct(output, visiting))
-            }
-            CheckedExpressionKind::Block { bindings, result } => bindings
-                .iter()
-                .find_map(|binding| direct(binding.value, visiting))
-                .or_else(|| result.and_then(|result| direct(result, visiting))),
-            CheckedExpressionKind::List { items, .. }
-            | CheckedExpressionKind::Bytes { items, .. } => {
-                items.iter().find_map(|item| direct(*item, visiting))
-            }
-            CheckedExpressionKind::TextTemplate { segments } => {
-                segments.iter().find_map(|segment| match segment {
-                    CheckedTextSegment::Static { .. } => None,
-                    CheckedTextSegment::Dynamic { value } => direct(*value, visiting),
-                })
-            }
-            CheckedExpressionKind::Read { .. }
-            | CheckedExpressionKind::Passed { .. }
-            | CheckedExpressionKind::ExternalRead { .. }
-            | CheckedExpressionKind::Drain { .. }
-            | CheckedExpressionKind::Text { .. }
-            | CheckedExpressionKind::Number { .. }
-            | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Bool { .. }
-            | CheckedExpressionKind::Tag { .. }
-            | CheckedExpressionKind::Source
-            | CheckedExpressionKind::Latest { .. }
-            | CheckedExpressionKind::Delimiter
-            | CheckedExpressionKind::Invalid { .. } => None,
-        };
-        visiting.remove(&current);
-        result
-    }
-
-    visit(program, lookup, root, target, &mut BTreeSet::new())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2008,8 +1834,267 @@ struct ExpansionKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConcreteValueBinding {
-    Local(DeclId),
+    Local(ExecutableLocalBindingId),
     Expression(ConcreteExprId),
+}
+
+fn runtime_value_provenance() -> ExecutableValueProvenance {
+    ExecutableValueProvenance {
+        members: vec![ExecutableValueMember {
+            path: Vec::new(),
+            origin: ExecutableValueOrigin::Runtime,
+        }],
+    }
+}
+
+fn normalize_value_provenance(
+    mut provenance: ExecutableValueProvenance,
+) -> ExecutableValueProvenance {
+    provenance.members.sort();
+    provenance.members.dedup();
+    provenance
+}
+
+fn record_value_provenance(
+    expressions: &[ConcreteExpression],
+    fields: &[ConcreteRecordField],
+) -> ExecutableValueProvenance {
+    if fields.is_empty() {
+        return runtime_value_provenance();
+    }
+    let mut members = Vec::new();
+    for field in fields {
+        let Some(value) = expressions.get(field.value.as_usize()) else {
+            continue;
+        };
+        for mut member in value.provenance.members.clone() {
+            if !field.spread {
+                member.path.insert(0, field.name.clone());
+            }
+            members.push(member);
+        }
+    }
+    normalize_value_provenance(ExecutableValueProvenance { members })
+}
+
+struct LocalProvenanceResolver<'a> {
+    expressions: &'a [ConcreteExpression],
+    bindings: BTreeMap<ExecutableLocalBindingId, (DeclId, ConcreteExprId)>,
+    declarations: BTreeMap<(DeclId, Option<StaticOwnerId>), ConcreteExprId>,
+    cache: BTreeMap<ConcreteExprId, ExecutableValueProvenance>,
+    visiting: BTreeSet<ConcreteExprId>,
+    stack: Vec<ConcreteExprId>,
+}
+
+impl<'a> LocalProvenanceResolver<'a> {
+    fn resolve(
+        &mut self,
+        expression_id: ConcreteExprId,
+    ) -> Result<ExecutableValueProvenance, ExpansionError> {
+        if let Some(cached) = self.cache.get(&expression_id) {
+            return Ok(cached.clone());
+        }
+        if !self.visiting.insert(expression_id) {
+            let start = self
+                .stack
+                .iter()
+                .position(|candidate| *candidate == expression_id)
+                .unwrap_or(0);
+            let mut cycle = self.stack[start..]
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            cycle.push(expression_id.to_string());
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "provenance cycle {}",
+                cycle.join(" -> ")
+            )));
+        }
+        self.stack.push(expression_id);
+        let expression = self
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|candidate| candidate.id == expression_id)
+            .cloned()
+            .ok_or_else(|| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "provenance references missing expression {expression_id}"
+                ))
+            })?;
+        let owner = expression.owner;
+        let resolved = match expression.kind {
+            ConcreteExpressionKind::LocalRead {
+                binding,
+                declaration,
+                projection,
+            } => {
+                let (bound_declaration, value) =
+                    self.bindings.get(&binding).copied().ok_or_else(|| {
+                        ExpansionError::InvalidLocalBindings(format!(
+                            "expression {expression_id} references missing local binding {binding}"
+                        ))
+                    })?;
+                if bound_declaration != declaration {
+                    return Err(ExpansionError::InvalidLocalBindings(format!(
+                        "expression {expression_id} declaration {} differs from binding {binding} declaration {}",
+                        declaration.0, bound_declaration.0
+                    )));
+                }
+                self.resolve(value)?.projected(&projection)
+            }
+            ConcreteExpressionKind::Object(fields)
+            | ConcreteExpressionKind::Record(fields)
+            | ConcreteExpressionKind::TaggedObject { fields, .. } => {
+                if fields.is_empty() {
+                    runtime_value_provenance()
+                } else {
+                    let mut members = Vec::new();
+                    for field in fields {
+                        for mut member in self.resolve(field.value)?.members {
+                            if !field.spread {
+                                member.path.insert(0, field.name.clone());
+                            }
+                            members.push(member);
+                        }
+                    }
+                    normalize_value_provenance(ExecutableValueProvenance { members })
+                }
+            }
+            ConcreteExpressionKind::Block { result, .. } => self.resolve(result)?,
+            ConcreteExpressionKind::Project { input, fields } => {
+                self.resolve(input)?.projected(&fields)
+            }
+            ConcreteExpressionKind::CanonicalRead {
+                target,
+                projection,
+                source: _,
+                ..
+            } => match self
+                .declarations
+                .get(&(target, owner))
+                .or_else(|| self.declarations.get(&(target, None)))
+                .copied()
+            {
+                Some(value) if value != expression_id => {
+                    self.resolve(value)?.projected(&projection)
+                }
+                _ => expression.provenance,
+            },
+            ConcreteExpressionKind::Drain {
+                target, projection, ..
+            } => match self
+                .declarations
+                .get(&(target, owner))
+                .or_else(|| self.declarations.get(&(target, None)))
+                .copied()
+            {
+                Some(value) if value != expression_id => {
+                    self.resolve(value)?.projected(&projection)
+                }
+                _ => expression.provenance,
+            },
+            ConcreteExpressionKind::Draining { input } => self.resolve(input)?,
+            ConcreteExpressionKind::Latest { branches } => {
+                let mut members = Vec::new();
+                for branch in branches {
+                    members.extend(self.resolve(branch)?.members);
+                }
+                normalize_value_provenance(ExecutableValueProvenance { members })
+            }
+            ConcreteExpressionKind::When { arms, .. } => {
+                let mut members = Vec::new();
+                for arm in arms {
+                    members.extend(self.resolve(arm.output)?.members);
+                }
+                if members.is_empty() {
+                    runtime_value_provenance()
+                } else {
+                    normalize_value_provenance(ExecutableValueProvenance { members })
+                }
+            }
+            ConcreteExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | ConcreteExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => self.resolve(output)?,
+            _ => expression.provenance,
+        };
+        self.stack.pop();
+        self.visiting.remove(&expression_id);
+        self.cache.insert(expression_id, resolved.clone());
+        Ok(resolved)
+    }
+}
+
+fn resolve_executable_local_provenance(
+    expressions: &mut [ConcreteExpression],
+    statements: &[ExecutableStatement],
+) -> Result<(), ExpansionError> {
+    let mut bindings = BTreeMap::new();
+    for binding in expressions
+        .iter()
+        .filter_map(|expression| match &expression.kind {
+            ConcreteExpressionKind::Block { bindings, .. } => Some(bindings.as_slice()),
+            _ => None,
+        })
+        .flatten()
+    {
+        let value = (binding.declaration, binding.value);
+        if let Some(previous) = bindings.insert(binding.id, value)
+            && previous != value
+        {
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "binding {} has conflicting values {previous:?} and {value:?}",
+                binding.id
+            )));
+        }
+    }
+    for (index, binding) in bindings.keys().copied().enumerate() {
+        if binding != ExecutableLocalBindingId(index) {
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "binding at index {index} has non-dense ID {binding}"
+            )));
+        }
+    }
+    let mut declarations = BTreeMap::new();
+    for statement in statements {
+        let (Some(declaration), Some(value)) = (statement.declaration, statement.value) else {
+            continue;
+        };
+        let owner = expressions
+            .get(value.as_usize())
+            .filter(|candidate| candidate.id == value)
+            .and_then(|expression| expression.owner);
+        let key = (declaration, owner);
+        if let Some(previous) = declarations.insert(key, value)
+            && previous != value
+        {
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "declaration {} owner {owner:?} has conflicting provenance values {previous} and {value}",
+                declaration.0
+            )));
+        }
+    }
+    let snapshot = expressions.to_vec();
+    let mut resolver = LocalProvenanceResolver {
+        expressions: &snapshot,
+        bindings,
+        declarations,
+        cache: BTreeMap::new(),
+        visiting: BTreeSet::new(),
+        stack: Vec::new(),
+    };
+    let provenances = snapshot
+        .iter()
+        .map(|expression| resolver.resolve(expression.id))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (expression, provenance) in expressions.iter_mut().zip(provenances) {
+        expression.provenance = provenance;
+    }
+    Ok(())
 }
 
 pub(crate) struct ConcreteExpressionBuilder<'a> {
@@ -2027,6 +2112,7 @@ pub(crate) struct ConcreteExpressionBuilder<'a> {
     owner_stack: Vec<Option<StaticOwnerId>>,
     frame_stack: Vec<Option<OutCallInstanceId>>,
     value_frames: Vec<BTreeMap<DeclId, ConcreteValueBinding>>,
+    next_local_binding: usize,
 }
 
 impl<'a> ConcreteExpressionBuilder<'a> {
@@ -2057,11 +2143,155 @@ impl<'a> ConcreteExpressionBuilder<'a> {
             owner_stack: Vec::new(),
             frame_stack: Vec::new(),
             value_frames: Vec::new(),
+            next_local_binding: 0,
         }
     }
 
     fn set_local_type(&mut self, owner: StaticOwnerId, local: MaterializationLocalId, ty: Type) {
         self.local_types.insert((owner, local), ty);
+    }
+
+    fn direct_resource_provenance(
+        &self,
+        expression: CheckedExprId,
+        owner: Option<StaticOwnerId>,
+    ) -> Option<ExecutableValueProvenance> {
+        if let Some(source) = self
+            .program
+            .sources
+            .iter()
+            .find(|source| source.expression == expression)
+        {
+            return Some(ExecutableValueProvenance {
+                members: vec![ExecutableValueMember {
+                    path: Vec::new(),
+                    origin: ExecutableValueOrigin::Source {
+                        source: source.id,
+                        owner,
+                    },
+                }],
+            });
+        }
+        self.program
+            .states
+            .iter()
+            .find(|state| state.expression == expression)
+            .map(|state| ExecutableValueProvenance {
+                members: vec![ExecutableValueMember {
+                    path: Vec::new(),
+                    origin: ExecutableValueOrigin::State {
+                        state: state.id,
+                        owner,
+                    },
+                }],
+            })
+    }
+
+    fn value_provenance(
+        &self,
+        expression: &CheckedExpression,
+        owner: Option<StaticOwnerId>,
+        kind: &ConcreteExpressionKind,
+    ) -> ExecutableValueProvenance {
+        if let Some(provenance) = self.direct_resource_provenance(expression.id, owner) {
+            return provenance;
+        }
+        let child = |id: ConcreteExprId| {
+            self.expressions
+                .get(id.as_usize())
+                .map(|expression| expression.provenance.clone())
+                .unwrap_or_else(runtime_value_provenance)
+        };
+        match kind {
+            ConcreteExpressionKind::Object(fields)
+            | ConcreteExpressionKind::Record(fields)
+            | ConcreteExpressionKind::TaggedObject { fields, .. } => {
+                record_value_provenance(&self.expressions, fields)
+            }
+            ConcreteExpressionKind::Block { result, .. } => child(*result),
+            ConcreteExpressionKind::Project { input, fields } => child(*input).projected(fields),
+            ConcreteExpressionKind::MaterializationLocal {
+                owner,
+                local,
+                projection,
+            } => ExecutableValueProvenance {
+                members: vec![ExecutableValueMember {
+                    path: Vec::new(),
+                    origin: ExecutableValueOrigin::MaterializationLocal {
+                        owner: *owner,
+                        local: *local,
+                        projection: projection.clone(),
+                    },
+                }],
+            },
+            ConcreteExpressionKind::Draining { input } => child(*input),
+            ConcreteExpressionKind::Latest { branches } => {
+                let members = branches
+                    .iter()
+                    .flat_map(|branch| child(*branch).members)
+                    .collect();
+                normalize_value_provenance(ExecutableValueProvenance { members })
+            }
+            ConcreteExpressionKind::When { arms, .. } => {
+                let members = arms
+                    .iter()
+                    .flat_map(|arm| child(arm.output).members)
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    runtime_value_provenance()
+                } else {
+                    normalize_value_provenance(ExecutableValueProvenance { members })
+                }
+            }
+            ConcreteExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | ConcreteExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => child(*output),
+            ConcreteExpressionKind::Source { .. } => {
+                debug_assert!(
+                    false,
+                    "checked SOURCE expression has no CheckedSource provenance"
+                );
+                ExecutableValueProvenance::default()
+            }
+            ConcreteExpressionKind::CanonicalRead {
+                source: Some(source),
+                ..
+            } if source.payload_projection.is_empty() => ExecutableValueProvenance {
+                members: vec![ExecutableValueMember {
+                    path: Vec::new(),
+                    origin: ExecutableValueOrigin::Source {
+                        source: source.source,
+                        owner,
+                    },
+                }],
+            },
+            ConcreteExpressionKind::CanonicalRead { .. }
+            | ConcreteExpressionKind::LocalRead { .. }
+            | ConcreteExpressionKind::ExternalRead { .. }
+            | ConcreteExpressionKind::ElementState { .. }
+            | ConcreteExpressionKind::Drain { .. }
+            | ConcreteExpressionKind::Text(_)
+            | ConcreteExpressionKind::TextTemplate { .. }
+            | ConcreteExpressionKind::Number(_)
+            | ConcreteExpressionKind::BytesByte(_)
+            | ConcreteExpressionKind::Bool(_)
+            | ConcreteExpressionKind::Tag(_)
+            | ConcreteExpressionKind::Call { .. }
+            | ConcreteExpressionKind::Materialize { .. }
+            | ConcreteExpressionKind::Hold { .. }
+            | ConcreteExpressionKind::Then { output: None, .. }
+            | ConcreteExpressionKind::Infix { .. }
+            | ConcreteExpressionKind::MatchArm { output: None, .. }
+            | ConcreteExpressionKind::List { .. }
+            | ConcreteExpressionKind::Bytes { .. }
+            | ConcreteExpressionKind::Delimiter
+            | ConcreteExpressionKind::FunctionParameter { .. } => runtime_value_provenance(),
+        }
     }
 
     pub(crate) fn expand(
@@ -2220,23 +2450,6 @@ impl<'a> ConcreteExpressionBuilder<'a> {
             .expression(self.program, scoped.expression)
             .cloned()
             .ok_or(ExpansionError::MissingExpression(scoped.expression))?;
-        if let Some(parameter) = self
-            .out_net
-            .producer_parameter_for_expression(scoped.expression)
-        {
-            let projection = match &expression.kind {
-                CheckedExpressionKind::Read { projection, .. } => projection.clone(),
-                _ => Vec::new(),
-            };
-            return Ok(self.push(
-                &expression,
-                owner,
-                ConcreteExpressionKind::FunctionParameter {
-                    parameter,
-                    projection,
-                },
-            ));
-        }
         let kind = match expression.kind.clone() {
             CheckedExpressionKind::Read {
                 target,
@@ -2280,11 +2493,12 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                     .copied()
                 {
                     return match binding {
-                        ConcreteValueBinding::Local(declaration) => Ok(self.push(
+                        ConcreteValueBinding::Local(binding) => Ok(self.push(
                             &expression,
                             owner,
                             ConcreteExpressionKind::LocalRead {
-                                declaration,
+                                binding,
+                                declaration: target,
                                 projection,
                             },
                         )),
@@ -2329,15 +2543,40 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                         .iter()
                         .find(|binding| binding.formal == target)
                         .map(|binding| {
-                            (binding.value, self.out_net.owner_for_call_evaluation(frame))
+                            (
+                                binding.value.clone(),
+                                self.out_net.owner_for_call_evaluation(frame),
+                            )
                         })
                 }) {
-                    let actual = ScopedCheckedExpr {
-                        value_frame: actual.value_frame.or(scoped.value_frame),
-                        ..actual
-                    };
-                    let expanded = self.expand_with_inherited_owner(actual, argument_owner)?;
-                    return self.project(&expression, owner, expanded, projection);
+                    match actual {
+                        OutInputValue::Checked(actual) => {
+                            let actual = ScopedCheckedExpr {
+                                value_frame: actual.value_frame.or(scoped.value_frame),
+                                ..actual
+                            };
+                            let expanded =
+                                self.expand_with_inherited_owner(actual, argument_owner)?;
+                            return self.project(&expression, owner, expanded, projection);
+                        }
+                        OutInputValue::ProducerParameter {
+                            parameter,
+                            mut flow_type,
+                        } => {
+                            flow_type.ty = project_concrete_type(flow_type.ty, &projection)
+                                .unwrap_or(Type::Unknown);
+                            let parameter = self.push(
+                                &expression,
+                                owner,
+                                ConcreteExpressionKind::FunctionParameter {
+                                    parameter,
+                                    projection,
+                                },
+                            );
+                            self.expressions[parameter.as_usize()].flow_type = flow_type;
+                            return Ok(parameter);
+                        }
+                    }
                 }
                 let declaration = self
                     .lookup
@@ -2452,7 +2691,8 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                 }
             }
             CheckedExpressionKind::Source => ConcreteExpressionKind::Source {
-                binding_path: resource_binding_path(self.program, self.lookup, scoped.expression)
+                binding_path: self
+                    .concrete_resource_binding_path(scoped.expression, scoped.frame, owner)
                     .ok_or(ExpansionError::MissingSourceDeclaration(scoped.expression))?,
             },
             CheckedExpressionKind::Call { call } => {
@@ -2463,7 +2703,8 @@ impl<'a> ConcreteExpressionBuilder<'a> {
             },
             CheckedExpressionKind::Hold { initial, name } => ConcreteExpressionKind::Hold {
                 initial: self.expand_in_frame(initial, scoped.frame, scoped.value_frame)?,
-                binding_path: resource_binding_path(self.program, self.lookup, scoped.expression)
+                binding_path: self
+                    .concrete_resource_binding_path(scoped.expression, scoped.frame, owner)
                     .unwrap_or_else(|| name.clone()),
                 name,
                 updates: self.expand_statement_child_values(scoped)?,
@@ -2505,10 +2746,18 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                     .and_then(|frame| self.value_frames.get(frame))
                     .cloned()
                     .unwrap_or_default();
+                let binding_ids = bindings
+                    .iter()
+                    .map(|binding| {
+                        let id = ExecutableLocalBindingId(self.next_local_binding);
+                        self.next_local_binding += 1;
+                        (binding.declaration, id)
+                    })
+                    .collect::<BTreeMap<_, _>>();
                 for binding in &bindings {
                     values.insert(
                         binding.declaration,
-                        ConcreteValueBinding::Local(binding.declaration),
+                        ConcreteValueBinding::Local(binding_ids[&binding.declaration]),
                     );
                 }
                 self.value_frames.push(values);
@@ -2517,6 +2766,7 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                     .into_iter()
                     .map(|binding| {
                         Ok(ConcreteBlockBinding {
+                            id: binding_ids[&binding.declaration],
                             declaration: binding.declaration,
                             value: self.expand(ScopedCheckedExpr {
                                 expression: binding.value,
@@ -2650,7 +2900,13 @@ impl<'a> ConcreteExpressionBuilder<'a> {
             arguments.push(ConcreteCallArgument {
                 ordinal: parameter.ordinal,
                 name: parameter.name.clone(),
-                value: self.expand_with_inherited_owner(input.value, argument_owner)?,
+                value: self.expand_with_inherited_owner(
+                    input.checked_value().ok_or(ExpansionError::MissingFormal {
+                        callable: callable.decl_id,
+                        formal: input.formal,
+                    })?,
+                    argument_owner,
+                )?,
                 from_pipe: checked_call.entries.iter().any(|entry| {
                     matches!(
                         entry,
@@ -2682,6 +2938,7 @@ impl<'a> ConcreteExpressionBuilder<'a> {
             ConcreteExpressionKind::Call {
                 callable_kind: kind,
                 name: callable.name.clone(),
+                instance: instance.as_usize(),
                 arguments,
                 contexts,
             },
@@ -2723,15 +2980,11 @@ impl<'a> ConcreteExpressionBuilder<'a> {
         fields
             .into_iter()
             .map(|field| {
-                let resource_only = field.declaration.is_some_and(|declaration| {
-                    self.lookup.declaration_is_source_group(declaration)
-                });
                 Ok(ConcreteRecordField {
                     declaration: field.declaration,
                     name: field.name,
                     value: self.expand_in_frame(field.value, frame, value_frame)?,
                     spread: field.spread,
-                    resource_only,
                 })
             })
             .collect()
@@ -2880,15 +3133,11 @@ impl<'a> ConcreteExpressionBuilder<'a> {
         let fields = structural_fields
             .into_iter()
             .map(|(declaration, name, value, spread)| {
-                let resource_only = declaration.is_some_and(|declaration| {
-                    self.lookup.declaration_is_source_group(declaration)
-                });
                 Ok(ConcreteRecordField {
                     declaration,
                     name,
                     value: self.expand_in_frame(value, frame, value_frame)?,
                     spread,
-                    resource_only,
                 })
             })
             .collect::<Result<Vec<_>, ExpansionError>>()?;
@@ -3050,66 +3299,56 @@ impl<'a> ConcreteExpressionBuilder<'a> {
         None
     }
 
-    fn concrete_call_result_path(&self, mut frame: OutCallInstanceId) -> Option<String> {
-        let mut nested_projections = Vec::<Vec<String>>::new();
-        loop {
-            let instance = self.out_net.call_instances.get(frame.as_usize())?;
-            if let Some(parent) = instance.parent {
-                let parent_instance = self.out_net.call_instances.get(parent.as_usize())?;
-                let parent_callable = self
-                    .lookup
-                    .callable(self.program, parent_instance.provenance.callable)?;
-                let root = parent_callable.result_expression?;
-                let projection = checked_projection_to_expression(
-                    self.program,
-                    self.lookup,
-                    root,
-                    instance.provenance.expression,
-                )?;
-                nested_projections.push(projection);
-                frame = parent;
+    fn concrete_call_result_path(&self, frame: OutCallInstanceId) -> Option<String> {
+        let mut ancestry = Vec::new();
+        let mut next = Some(frame);
+        let mut remaining = self.out_net.call_instances.len().saturating_add(1);
+        while let Some(instance) = next {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            let instance = self.out_net.call_instances.get(instance.as_usize())?;
+            ancestry.push(instance.id);
+            next = instance.parent;
+        }
+        ancestry.reverse();
+
+        let mut result: Option<String> = None;
+        for instance_id in ancestry {
+            let instance = self.out_net.call_instances.get(instance_id.as_usize())?;
+            let local = if let Some(call) = instance.provenance.call_id {
+                let checked_path = self.program.result_path_for_call(call)?;
+                self.program.semantic_path(checked_path).or_else(|| {
+                    self.lookup
+                        .declaration(self.program, checked_path.anchor)
+                        .is_some_and(|declaration| {
+                            declaration.kind == CheckedDeclarationKind::Function
+                                && checked_path.projection.is_empty()
+                        })
+                        .then(String::new)
+                })?
+            } else {
+                self.out_net
+                    .producer_root_result_path(instance_id)?
+                    .to_owned()
+            };
+            if local.is_empty() {
                 continue;
             }
-
-            let mut candidates = BTreeSet::new();
-            for declaration in &self.program.declarations {
-                let Some(root) = declaration.value else {
-                    continue;
-                };
-                let Some(projection) = checked_projection_to_expression(
-                    self.program,
-                    self.lookup,
-                    root,
-                    instance.provenance.expression,
-                ) else {
-                    continue;
-                };
-                let Some(mut path) =
-                    canonical_declaration_path(self.program, self.lookup, declaration.id)
-                else {
-                    continue;
-                };
-                if !projection.is_empty() {
-                    path.push('.');
-                    path.push_str(&projection.join("."));
+            result = Some(match result {
+                None => local,
+                Some(prefix) if local == prefix || local.starts_with(&(prefix.clone() + ".")) => {
+                    local
                 }
-                candidates.insert(path);
-            }
-            let mut candidates = candidates.into_iter();
-            let Some(mut path) = candidates.next() else {
-                return None;
-            };
-            if candidates.next().is_some() {
-                return None;
-            }
-            for projection in nested_projections.iter().rev() {
-                if !projection.is_empty() {
-                    path.push('.');
-                    path.push_str(&projection.join("."));
+                Some(mut prefix) => {
+                    prefix.push('.');
+                    prefix.push_str(&local);
+                    prefix
                 }
-            }
-            return Some(path.clone());
+            });
         }
+        result
     }
 
     fn concrete_resource_binding_path(
@@ -3118,7 +3357,19 @@ impl<'a> ConcreteExpressionBuilder<'a> {
         frame: Option<OutCallInstanceId>,
         _owner: Option<StaticOwnerId>,
     ) -> Option<String> {
-        let local = resource_binding_path(self.program, self.lookup, expression);
+        let local = self
+            .program
+            .sources
+            .iter()
+            .find(|source| source.expression == expression)
+            .and_then(|source| self.program.semantic_path(&source.path))
+            .or_else(|| {
+                self.program
+                    .states
+                    .iter()
+                    .find(|state| state.expression == expression)
+                    .and_then(|state| self.program.semantic_path(&state.path))
+            });
         let prefix = frame.and_then(|frame| self.concrete_call_result_path(frame));
         match (prefix, local) {
             (Some(prefix), Some(local))
@@ -3169,14 +3420,25 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                 self.concrete_resource_binding_path(expression.id, frame, owner)
             }
             CheckedExpressionKind::Call { .. }
-                if expression.effect.writes_state
+                if (expression.effect.writes_state
                     || expression.effect.emits_source
-                    || expression.effect.invokes_host =>
+                    || expression.effect.invokes_host)
+                    && (self
+                        .program
+                        .sources
+                        .iter()
+                        .any(|source| source.expression == expression.id)
+                        || self
+                            .program
+                            .states
+                            .iter()
+                            .any(|state| state.expression == expression.id)) =>
             {
                 self.concrete_resource_binding_path(expression.id, frame, owner)
             }
             _ => None,
         };
+        let provenance = self.value_provenance(expression, owner, &kind);
         let id = ConcreteExprId(self.expressions.len());
         self.expressions.push(ConcreteExpression {
             id,
@@ -3184,6 +3446,7 @@ impl<'a> ConcreteExpressionBuilder<'a> {
             flow_type,
             effect: expression.effect,
             owner,
+            provenance,
             resource_binding_path,
             kind,
         });
@@ -3284,6 +3547,89 @@ mod tests {
             derive_executable_program(&checked, &out_net.graph, &materializations, expressions)
                 .unwrap();
         (checked, executable)
+    }
+
+    #[test]
+    fn repeated_function_blocks_receive_distinct_local_binding_ids() {
+        let (_, executable) = executable_program(
+            r#"
+FUNCTION wrapped(value) {
+    BLOCK {
+        local: value
+        local
+    }
+}
+
+first: wrapped(value: 1)
+second: wrapped(value: 2)
+"#,
+        );
+        let bindings = executable
+            .expressions
+            .iter()
+            .filter_map(|expression| match &expression.kind {
+                ConcreteExpressionKind::Block { bindings, .. } if bindings.len() == 1 => {
+                    Some(&bindings[0])
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 2, "{executable:#?}");
+        assert_eq!(
+            bindings[0].declaration, bindings[1].declaration,
+            "both call sites originate from the same checked function declaration"
+        );
+        assert_ne!(
+            bindings[0].id, bindings[1].id,
+            "each expanded call site must own a distinct lexical binding"
+        );
+
+        let read_bindings = executable
+            .expressions
+            .iter()
+            .filter_map(|expression| match expression.kind {
+                ConcreteExpressionKind::LocalRead { binding, .. } => Some(binding),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| read_bindings.contains(&binding.id)),
+            "local reads must retain the exact call-site binding IDs: {executable:#?}"
+        );
+    }
+
+    #[test]
+    fn forward_local_alias_preserves_nested_source_provenance() {
+        let (_, executable) = executable_program(
+            r#"
+row:
+    BLOCK {
+        forwarded: base
+        base: [control: SOURCE]
+        forwarded
+    }
+"#,
+        );
+        let forward_value = executable
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                ConcreteExpressionKind::Block { bindings, .. } if bindings.len() == 2 => {
+                    Some(bindings[0].value)
+                }
+                _ => None,
+            })
+            .expect("two-binding forward-alias block");
+        let provenance = &executable.expressions[forward_value.as_usize()].provenance;
+        assert!(
+            provenance.members.iter().any(|member| {
+                member.path == ["control"]
+                    && matches!(member.origin, ExecutableValueOrigin::Source { .. })
+            }),
+            "forward alias lost nested SOURCE provenance: {provenance:#?}"
+        );
     }
 
     #[test]
@@ -3473,6 +3819,164 @@ result: outer(PASS: [value: 42])
                 .expect("nested user calls inherit the outer PASS context");
         assert!(executable.expressions.iter().any(|expression| {
             matches!(&expression.kind, ConcreteExpressionKind::Number(value) if value == "42")
+        }));
+    }
+
+    #[test]
+    fn explicit_nested_pass_replaces_the_inherited_context() {
+        let parsed = boon_parser::parse_source(
+            "nested-passed-context-override.bn",
+            r#"
+FUNCTION outer() {
+    inner(PASS: [value: 2])
+}
+
+FUNCTION inner() {
+    PASSED.value
+}
+
+result: outer(PASS: [value: 1])
+"#,
+        )
+        .unwrap();
+        let output = boon_typecheck::check_program(&parsed);
+        assert!(
+            !output.report.has_errors(),
+            "diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        let checked = output.program.expect("valid source has a checked program");
+        let outer_call = checked
+            .calls
+            .iter()
+            .find(|call| call.function == "outer")
+            .expect("outer call");
+        let inner_call = checked
+            .calls
+            .iter()
+            .find(|call| call.function == "inner")
+            .expect("inner call");
+        let inner_pass = inner_call.pass.expect("inner call has an explicit PASS");
+        assert_ne!(
+            outer_call.pass.expect("outer call has PASS").value,
+            inner_pass.value
+        );
+
+        let out_net = OutNet::build(&checked);
+        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let outer_instance = out_net
+            .graph
+            .call_instance_for_checked_call(outer_call.id, None)
+            .expect("outer instance");
+        let inner_instance = out_net
+            .graph
+            .call_instance_for_checked_call(inner_call.id, Some(outer_instance))
+            .expect("inner instance");
+        let passed = out_net.graph.call_instances[inner_instance.as_usize()]
+            .passed
+            .expect("inner instance owns PASS");
+        assert_eq!(passed.value.expression, inner_pass.value);
+        assert_eq!(passed.value.frame, Some(outer_instance));
+        assert_eq!(passed.evaluation_call, inner_instance);
+    }
+
+    #[test]
+    fn nonrequiring_nested_call_does_not_receive_ambient_pass() {
+        let parsed = boon_parser::parse_source(
+            "nested-passed-context-isolation.bn",
+            r#"
+FUNCTION outer() {
+    BLOCK {
+        observed: PASSED.value
+        passthrough(value: 7)
+    }
+}
+
+FUNCTION passthrough(value) {
+    value
+}
+
+result: outer(PASS: [value: 42])
+"#,
+        )
+        .unwrap();
+        let output = boon_typecheck::check_program(&parsed);
+        assert!(
+            !output.report.has_errors(),
+            "diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        let checked = output.program.expect("valid source has a checked program");
+        let outer_call = checked
+            .calls
+            .iter()
+            .find(|call| call.function == "outer")
+            .expect("outer call");
+        let nested_call = checked
+            .calls
+            .iter()
+            .find(|call| call.function == "passthrough")
+            .expect("nested passthrough call");
+        assert!(
+            !checked
+                .callables
+                .iter()
+                .find(|callable| callable.decl_id == nested_call.callable)
+                .expect("passthrough callable")
+                .requires_pass()
+        );
+
+        let out_net = OutNet::build(&checked);
+        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let outer_instance = out_net
+            .graph
+            .call_instance_for_checked_call(outer_call.id, None)
+            .expect("outer instance");
+        let nested_instance = out_net
+            .graph
+            .call_instance_for_checked_call(nested_call.id, Some(outer_instance))
+            .expect("nested passthrough instance");
+        assert!(
+            out_net.graph.call_instances[nested_instance.as_usize()]
+                .passed
+                .is_none(),
+            "ambient PASS leaked into a callable without a checked requirement"
+        );
+    }
+
+    #[test]
+    fn malformed_checked_root_requirement_fails_without_ambient_pass() {
+        let parsed = boon_parser::parse_source(
+            "missing-root-passed-context.bn",
+            r#"
+FUNCTION contextual() {
+    PASSED.value
+}
+
+result: contextual(PASS: [value: 42])
+"#,
+        )
+        .unwrap();
+        let output = boon_typecheck::check_program(&parsed);
+        assert!(
+            !output.report.has_errors(),
+            "diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        let mut checked = output.program.expect("valid source has a checked program");
+        checked
+            .calls
+            .iter_mut()
+            .find(|call| call.function == "contextual")
+            .expect("contextual call")
+            .pass = None;
+
+        let out_net = OutNet::build(&checked);
+        assert!(out_net.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                crate::out_net::OutNetDiagnostic::MissingPassedContext { .. }
+            )
         }));
     }
 

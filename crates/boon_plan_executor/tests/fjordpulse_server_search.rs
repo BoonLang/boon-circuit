@@ -191,18 +191,11 @@ fn fjordpulse_server_search_executes_the_typed_pipeline() {
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
             boon_plan::PlanOpKind::DerivedValue {
-                expression:
-                    Some(boon_plan::PlanDerivedExpression::MaterializeList { expression, .. }),
+                materialization: Some(_),
+                expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
                 ..
-            } => match expression.as_ref() {
-                boon_plan::PlanDerivedExpression::RowExpression { expression } => {
-                    match compiled.plan.row_expressions.node(*expression).ok()? {
-                        boon_plan::PlanRowExpressionNode::ListAccess { access } => {
-                            Some(access.as_ref())
-                        }
-                        _ => None,
-                    }
-                }
+            } => match compiled.plan.row_expressions.node(*expression).ok()? {
+                boon_plan::PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -323,18 +316,11 @@ fn fjordpulse_scale_access_matrix_is_bounded_across_58_500_rows() {
         .flat_map(|region| &region.ops)
         .filter_map(|op| match &op.kind {
             boon_plan::PlanOpKind::DerivedValue {
-                expression:
-                    Some(boon_plan::PlanDerivedExpression::MaterializeList { expression, .. }),
+                materialization: Some(_),
+                expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
                 ..
-            } => match expression.as_ref() {
-                boon_plan::PlanDerivedExpression::RowExpression { expression } => {
-                    match compiled.plan.row_expressions.node(*expression).ok()? {
-                        boon_plan::PlanRowExpressionNode::ListAccess { access } => {
-                            Some(&access.selection)
-                        }
-                        _ => None,
-                    }
-                }
+            } => match compiled.plan.row_expressions.node(*expression).ok()? {
+                boon_plan::PlanRowExpressionNode::ListAccess { access } => Some(&access.selection),
                 _ => None,
             },
             _ => None,

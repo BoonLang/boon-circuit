@@ -73,18 +73,18 @@ impl Debug for OwnerInstanceRow {
 }
 
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct OwnerInstanceId {
+pub struct OwnerInstanceRoute {
     pub static_owner: PlanStaticOwnerId,
     pub ancestors: Vec<OwnerInstanceRow>,
 }
 
-impl Debug for OwnerInstanceId {
+impl Debug for OwnerInstanceRoute {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str("OwnerInstanceId(..)")
+        formatter.write_str("OwnerInstanceRoute(..)")
     }
 }
 
-impl OwnerInstanceId {
+impl OwnerInstanceRoute {
     pub fn new(
         static_owner: PlanStaticOwnerId,
         ancestors: impl IntoIterator<Item = OwnerInstanceRow>,
@@ -127,7 +127,7 @@ impl OwnerInstanceId {
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SourceRouteToken {
     pub program_revision: u64,
-    pub owner: OwnerInstanceId,
+    pub owner: OwnerInstanceRoute,
     pub source: SourceId,
     /// Zero denotes a non-row route; a row route repeats its leaf generation.
     pub row_generation: u64,
@@ -143,7 +143,7 @@ impl Debug for SourceRouteToken {
 impl SourceRouteToken {
     pub fn new(
         program_revision: u64,
-        owner: OwnerInstanceId,
+        owner: OwnerInstanceRoute,
         source: SourceId,
         binding_epoch: u64,
     ) -> Result<Self, &'static str> {

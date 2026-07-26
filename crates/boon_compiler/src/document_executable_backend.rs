@@ -65,7 +65,7 @@ struct CompileContext {
     owner_function: Option<DocumentFunctionId>,
     materialization_locals:
         BTreeMap<(ir::StaticOwnerId, ir::MaterializationLocalId), DocumentParameterId>,
-    locals: BTreeMap<boon_typecheck::DeclId, DocumentLocalId>,
+    locals: BTreeMap<ir::ExecutableLocalBindingId, DocumentLocalId>,
     pattern_bindings: BTreeMap<String, PatternBindingContext>,
 }
 
@@ -467,13 +467,14 @@ impl<'a> DocumentCompiler<'a> {
                             final_class,
                         ),
                     ir::ExecutableExpressionKind::LocalRead {
+                        binding,
                         declaration,
                         projection: existing,
                     } => {
-                        let local = context.locals.get(declaration).copied().ok_or_else(|| {
+                        let local = context.locals.get(binding).copied().ok_or_else(|| {
                             PlanError::new(format!(
-                                "executable expression {} reads inactive lexical declaration {}",
-                                expression_id.0, declaration.0
+                                "executable expression {} reads inactive lexical binding {} for declaration {}",
+                                expression_id.0, binding.0, declaration.0
                             ))
                         })?;
                         let projection = existing
@@ -617,13 +618,14 @@ impl<'a> DocumentCompiler<'a> {
                 value_class_for_type(&expression.flow_type.ty),
             ),
             ir::ExecutableExpressionKind::LocalRead {
+                binding,
                 declaration,
                 projection,
             } => {
-                let local = context.locals.get(declaration).copied().ok_or_else(|| {
+                let local = context.locals.get(binding).copied().ok_or_else(|| {
                     PlanError::new(format!(
-                        "executable expression {compiler_id} reads inactive lexical declaration {}",
-                        declaration.0
+                        "executable expression {compiler_id} reads inactive lexical binding {} for declaration {}",
+                        binding.0, declaration.0
                     ))
                 })?;
                 let projection = projection
@@ -746,6 +748,7 @@ impl<'a> DocumentCompiler<'a> {
                 name,
                 arguments,
                 contexts,
+                ..
             } => self.compile_call(
                 expression,
                 *callable_kind,
@@ -1013,12 +1016,12 @@ impl<'a> DocumentCompiler<'a> {
         for binding in bindings {
             if context
                 .locals
-                .insert(binding.declaration, DocumentLocalId(self.next_local))
+                .insert(binding.id, DocumentLocalId(self.next_local))
                 .is_some()
             {
                 return Err(PlanError::new(format!(
-                    "erased BLOCK expression {} repeats lexical declaration {}",
-                    expression.id, binding.declaration.0
+                    "erased BLOCK expression {} repeats lexical binding {} for declaration {}",
+                    expression.id, binding.id.0, binding.declaration.0
                 )));
             }
             self.next_local += 1;
@@ -1026,7 +1029,7 @@ impl<'a> DocumentCompiler<'a> {
 
         let mut lowered = Vec::with_capacity(bindings.len());
         for binding in exact_block_binding_order(self.program, bindings)? {
-            let local = context.locals[&binding.declaration];
+            let local = context.locals[&binding.id];
             let value = self.compile_expression(binding.value, &context, None)?;
             lowered.push(DocumentLocalBinding { local, value });
         }
@@ -2077,8 +2080,61 @@ impl<'a> DocumentCompiler<'a> {
                 .map(|candidate| candidate.id)
                 .collect::<Vec<_>>();
             let [next] = nested.as_slice() else {
+                let field_definition = self
+                    .program
+                    .scope_index
+                    .fields
+                    .iter()
+                    .find(|candidate| candidate.id == field);
+                let child_fields = self
+                    .program
+                    .scope_index
+                    .fields
+                    .iter()
+                    .filter(|candidate| candidate.parent == Some(field))
+                    .map(|candidate| {
+                        (
+                            candidate.id,
+                            candidate.name.as_str(),
+                            candidate.resource_only,
+                            candidate.producer,
+                            candidate.static_owner,
+                            candidate.row,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let authority_siblings = field_definition
+                    .map(|field_definition| {
+                        self.program
+                            .scope_index
+                            .fields
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.row == field_definition.row
+                                    && candidate.name == field_definition.name
+                            })
+                            .map(|candidate| {
+                                (
+                                    candidate.id,
+                                    candidate.role,
+                                    candidate.resource_only,
+                                    candidate.producer,
+                                    candidate.static_owner,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let relevant_members = definition
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.path.starts_with(&projection[..1])
+                            || projection.starts_with(member.path.as_slice())
+                    })
+                    .collect::<Vec<_>>();
                 return Err(PlanError::new(format!(
-                    "view binding {binding_id} materialization field {} projection `{}` resolves to {} exact child fields",
+                    "view binding {binding_id} materialization field {} projection `{}` resolves to {} exact child fields; field={field_definition:?}; children={child_fields:?}; siblings={authority_siblings:?}; local_members={relevant_members:?}",
                     field.0,
                     projection.join("."),
                     nested.len()
@@ -2447,9 +2503,9 @@ fn exact_block_binding_order<'a>(
     program: &ErasedProgram,
     bindings: &'a [ir::ExecutableBlockBinding],
 ) -> Result<Vec<&'a ir::ExecutableBlockBinding>, PlanError> {
-    let declarations = bindings
+    let binding_ids = bindings
         .iter()
-        .map(|binding| binding.declaration)
+        .map(|binding| binding.id)
         .collect::<BTreeSet<_>>();
     let mut dependencies = BTreeMap::new();
     for binding in bindings {
@@ -2471,35 +2527,35 @@ fn exact_block_binding_order<'a>(
                         binding.declaration.0
                     ))
                 })?;
-            if let ir::ExecutableExpressionKind::LocalRead { declaration, .. } = expression.kind
-                && declarations.contains(&declaration)
+            if let ir::ExecutableExpressionKind::LocalRead { binding, .. } = expression.kind
+                && binding_ids.contains(&binding)
             {
-                local_dependencies.insert(declaration);
+                local_dependencies.insert(binding);
             }
             pending.extend(ir::executable_expression_children(&expression.kind));
         }
-        dependencies.insert(binding.declaration, local_dependencies);
+        dependencies.insert(binding.id, local_dependencies);
     }
 
     let mut emitted = BTreeSet::new();
     let mut ordered = Vec::with_capacity(bindings.len());
     while ordered.len() < bindings.len() {
         let Some(binding) = bindings.iter().find(|binding| {
-            !emitted.contains(&binding.declaration)
-                && dependencies[&binding.declaration]
+            !emitted.contains(&binding.id)
+                && dependencies[&binding.id]
                     .iter()
                     .all(|dependency| emitted.contains(dependency))
         }) else {
             let remaining = bindings
                 .iter()
-                .filter(|binding| !emitted.contains(&binding.declaration))
-                .map(|binding| binding.declaration.0)
+                .filter(|binding| !emitted.contains(&binding.id))
+                .map(|binding| (binding.id.0, binding.declaration.0))
                 .collect::<Vec<_>>();
             return Err(PlanError::new(format!(
-                "erased BLOCK contains a lexical value cycle across declarations {remaining:?}"
+                "erased BLOCK contains a lexical value cycle across bindings and declarations {remaining:?}"
             )));
         };
-        emitted.insert(binding.declaration);
+        emitted.insert(binding.id);
         ordered.push(binding);
     }
     Ok(ordered)

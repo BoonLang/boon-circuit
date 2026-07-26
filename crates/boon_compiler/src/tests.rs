@@ -720,18 +720,14 @@ fn todo_v2_nested_mapped_rows_keep_typed_document_projections() {
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
             PlanOpKind::DerivedValue {
-                expression:
-                    Some(PlanDerivedExpression::MaterializeList {
-                        target_list,
-                        expression,
-                        ..
-                    }),
+                expression: Some(expression),
+                materialization: Some(boon_plan::PlanListMaterialization { target_list, .. }),
                 ..
             } if *target_list == boon_plan::ListId(tasks.id.as_usize()) => Some(expression),
             _ => None,
         })
         .expect("tasks materialization expression");
-    let PlanDerivedExpression::RowExpression { expression } = expression.as_ref() else {
+    let PlanDerivedExpression::RowExpression { expression } = expression else {
         panic!("tasks materialization must use a row expression: {expression:#?}");
     };
     let PlanRowExpressionNode::ContextualCollection { captures, .. } =
@@ -803,9 +799,10 @@ use boon_plan::{
     EffectResultRoute, FieldId, ListId, MemoryId, MemoryKind, MigrationExpressionPlan,
     MigrationPredecessorBinding, MigrationTransferKindPlan, MigrationTransformPlan,
     OutputContractKind, OutputDemandPolicy, OutputValueRef, PLAN_MAJOR_VERSION, PlanConstantValue,
-    PlanContextualOperationKind, PlanDerivedExpression, PlanLocalId, PlanOpKind,
-    PlanRowExpressionArena, PlanRowExpressionId, PlanRowExpressionNode, PlanRowSelectPattern,
-    PlanStaticOwnerId, RootOutputDemand, ValueRef, plan_binary, plan_sha256, verify_plan,
+    PlanContextualOperationKind, PlanDerivedExpression, PlanListMaterialization, PlanLocalId,
+    PlanOpKind, PlanRowExpressionArena, PlanRowExpressionId, PlanRowExpressionNode,
+    PlanRowSelectPattern, PlanStaticOwnerId, RootOutputDemand, ValueRef, plan_binary, plan_sha256,
+    verify_plan,
 };
 
 fn row_node(
@@ -822,33 +819,19 @@ fn row_node(
 }
 
 fn derived_row_expression_ids(expression: &PlanDerivedExpression) -> Vec<PlanRowExpressionId> {
-    let mut roots = Vec::new();
-    let mut stack = vec![expression];
-    while let Some(expression) = stack.pop() {
-        match expression {
-            PlanDerivedExpression::MaterializeList { expression, .. }
-            | PlanDerivedExpression::BoolNotExpression { input: expression } => {
-                stack.push(expression);
-            }
-            PlanDerivedExpression::BoolAnd { left, right } => {
-                stack.push(right);
-                stack.push(left);
-            }
-            PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
-                roots.push(*default);
-                roots.extend(arms.iter().map(|arm| arm.value));
-            }
-            PlanDerivedExpression::RowExpression { expression }
-            | PlanDerivedExpression::MaterializedRowField { expression, .. } => {
-                roots.push(*expression);
-            }
-            PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
-            | PlanDerivedExpression::BoolNot { .. }
-            | PlanDerivedExpression::NumberCompareConst { .. }
-            | PlanDerivedExpression::ValueCompare { .. } => {}
+    match expression {
+        PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+            std::iter::once(*default)
+                .chain(arms.iter().map(|arm| arm.value))
+                .collect()
         }
+        PlanDerivedExpression::RowExpression { expression }
+        | PlanDerivedExpression::MaterializedRowField { expression, .. } => vec![*expression],
+        PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
+        | PlanDerivedExpression::BoolNot { .. }
+        | PlanDerivedExpression::NumberCompareConst { .. }
+        | PlanDerivedExpression::ValueCompare { .. } => Vec::new(),
     }
-    roots
 }
 
 fn visit_derived_row_nodes(
@@ -1461,15 +1444,11 @@ fn fjordpulse_server_host_boundary_is_cpu_executable() {
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
             PlanOpKind::DerivedValue {
-                expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+                expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                materialization: Some(_),
                 ..
-            } => match expression.as_ref() {
-                PlanDerivedExpression::RowExpression { expression } => {
-                    match row_node(&compiled.plan.row_expressions, *expression) {
-                        PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
-                        _ => None,
-                    }
-                }
+            } => match row_node(&compiled.plan.row_expressions, *expression) {
+                PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -1805,15 +1784,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
             PlanOpKind::DerivedValue {
-                expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+                expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                materialization: Some(_),
                 ..
-            } => match expression.as_ref() {
-                PlanDerivedExpression::RowExpression { expression } => {
-                    match row_node(&compiled.plan.row_expressions, *expression) {
-                        PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
-                        _ => None,
-                    }
-                }
+            } => match row_node(&compiled.plan.row_expressions, *expression) {
+                PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -1880,15 +1855,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .flat_map(|region| &region.ops)
         .find_map(|op| match &op.kind {
             PlanOpKind::DerivedValue {
-                expression: Some(PlanDerivedExpression::MaterializeList { expression, .. }),
+                expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                materialization: Some(_),
                 ..
-            } => match expression.as_ref() {
-                PlanDerivedExpression::RowExpression { expression } => {
-                    match row_node(&compiled.plan.row_expressions, *expression) {
-                        PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
-                        _ => None,
-                    }
-                }
+            } => match row_node(&compiled.plan.row_expressions, *expression) {
+                PlanRowExpressionNode::ListAccess { access } => Some(access.as_ref()),
                 _ => None,
             },
             _ => None,
@@ -3692,8 +3663,8 @@ FUNCTION new_todo(todo) {
         .flat_map(|region| &region.ops)
         .filter_map(|op| match &op.kind {
             PlanOpKind::DerivedValue {
-                expression:
-                    Some(PlanDerivedExpression::MaterializeList {
+                materialization:
+                    Some(PlanListMaterialization {
                         target_list,
                         authority_source_list: Some(source_list),
                         ..
@@ -4436,10 +4407,13 @@ FUNCTION catalog_row(signal) {
         .expect("catalog materialization operation");
     let PlanOpKind::DerivedValue {
         expression:
-            Some(PlanDerivedExpression::MaterializeList {
+            Some(PlanDerivedExpression::RowExpression {
+                expression: materialized_expression,
+            }),
+        materialization:
+            Some(PlanListMaterialization {
                 target_list,
                 fields: materialized_fields,
-                expression: materialized_expression,
                 ..
             }),
         ..
@@ -4460,13 +4434,9 @@ FUNCTION catalog_row(signal) {
             .all(|op| op.output != Some(ValueRef::Field(label))),
         "a materialized row field must not have a second indexed writer"
     );
-    let PlanDerivedExpression::RowExpression { expression } = materialized_expression.as_ref()
-    else {
-        panic!("catalog materializer must retain the exact list map");
-    };
     let (owner, row_local, source, body) = expect_contextual_map(
         &compiled.plan.row_expressions,
-        *expression,
+        *materialized_expression,
         "catalog materializer",
     );
     let source_rows = compiled
@@ -4565,22 +4535,13 @@ document: Document/new(
         .expect("selected operation");
     let PlanOpKind::DerivedValue {
         expression: Some(expression),
+        materialization: Some(materialization),
         ..
     } = &selected_op.kind
     else {
         panic!("selected operation lost its typed expression: {selected_op:#?}");
     };
-    let expression = match expression {
-        PlanDerivedExpression::MaterializeList {
-            target_list,
-            expression,
-            ..
-        } => {
-            assert_eq!(*target_list, selected);
-            expression.as_ref()
-        }
-        expression => expression,
-    };
+    assert_eq!(materialization.target_list, selected);
     let PlanDerivedExpression::RowExpression { expression } = expression else {
         panic!("selected list must lower its filtered map");
     };
@@ -4652,22 +4613,13 @@ document: Document/new(
         .expect("continued operation");
     let PlanOpKind::DerivedValue {
         expression: Some(expression),
+        materialization: Some(materialization),
         ..
     } = &continued_op.kind
     else {
         panic!("continued operation lost its typed expression: {continued_op:#?}");
     };
-    let expression = match expression {
-        PlanDerivedExpression::MaterializeList {
-            target_list,
-            expression,
-            ..
-        } => {
-            assert_eq!(*target_list, continued);
-            expression.as_ref()
-        }
-        expression => expression,
-    };
+    assert_eq!(materialization.target_list, continued);
     let PlanDerivedExpression::RowExpression { expression } = expression else {
         panic!("continued list must lower to a select expression");
     };
@@ -4850,11 +4802,11 @@ store: [
         .find(|op| op.output == Some(ValueRef::List(mapped_list)))
         .expect("mapped operation");
     let PlanOpKind::DerivedValue {
-        expression:
-            Some(PlanDerivedExpression::MaterializeList {
+        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+        materialization:
+            Some(PlanListMaterialization {
                 target_list,
                 fields,
-                expression,
                 ..
             }),
         ..
@@ -4864,9 +4816,6 @@ store: [
     };
     assert_eq!(*target_list, mapped_list);
     assert!(fields.contains_key("label"));
-    let PlanDerivedExpression::RowExpression { expression } = expression.as_ref() else {
-        panic!("mapped list lost its contextual row expression: {expression:#?}");
-    };
     let (owner, row_local, source, body) =
         expect_contextual_map(&compiled.plan.row_expressions, *expression, "mapped field");
     let selected_list = compiled
@@ -4990,13 +4939,13 @@ document: Document/new(
         .collect::<Vec<_>>();
     assert_eq!(producers.len(), 1, "filtered producers: {producers:#?}");
     let PlanOpKind::DerivedValue {
-        expression:
-            Some(PlanDerivedExpression::MaterializeList {
+        expression: Some(expression),
+        materialization:
+            Some(PlanListMaterialization {
                 target_list,
                 authority_source_list,
                 fields: materialized_fields,
                 value_list_authorities,
-                expression,
                 ..
             }),
         ..
@@ -5192,8 +5141,8 @@ store: [
         .find(|op| op.output == Some(ValueRef::List(rows)))
         .expect("outer rows materializer");
     let PlanOpKind::DerivedValue {
-        expression:
-            Some(PlanDerivedExpression::MaterializeList {
+        materialization:
+            Some(PlanListMaterialization {
                 authority_source_list,
                 value_list_authorities,
                 ..
@@ -5292,6 +5241,57 @@ store: [
         }),
         "forwarded resource members lost source ownership: locals={forwarded_locals:#?}; \
          fields={forwarded_fields:#?}"
+    );
+}
+
+#[test]
+fn source_routes_include_filtered_output_rows_without_a_later_map() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "filtered-output-source-route.bn",
+        r#"
+FUNCTION new_row(input) {
+    [
+        controls: [select: SOURCE]
+        label: input.label
+    ]
+}
+
+store: [
+    inputs: LIST {
+        [label: TEXT { first }]
+        [label: TEXT { second }]
+    }
+    rows:
+        inputs |> List/map(item, new: new_row(input: item))
+    filtered:
+        rows |> List/filter(item, if: True)
+    chunks:
+        filtered |> List/chunk(size: 1)
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let filtered = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.filtered")
+        .expect("filtered storage");
+    let route = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path.ends_with(".controls.select"))
+        .expect("row select route");
+
+    assert!(
+        route.row_projections.iter().any(|projection| {
+            projection.list == boon_plan::ListId(filtered.id.0)
+                && projection.path == ["controls", "select"]
+        }),
+        "compiled source authority omitted the filtered output row: {:#?}",
+        route.row_projections
     );
 }
 
@@ -5808,18 +5808,12 @@ FUNCTION decorate(item) {
         .expect("mapped operation");
 
     let PlanOpKind::DerivedValue {
-        expression:
-            Some(PlanDerivedExpression::MaterializeList {
-                expression: materialized,
-                ..
-            }),
+        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+        materialization: Some(_),
         ..
     } = &mapped_op.kind
     else {
         panic!("record-returning helper did not materialize its list: {mapped_op:#?}");
-    };
-    let PlanDerivedExpression::RowExpression { expression } = materialized.as_ref() else {
-        panic!("record-returning helper lost its row expression: {materialized:#?}");
     };
     let (owner, row_local, source, body) = expect_contextual_map(
         &compiled.plan.row_expressions,
@@ -5929,11 +5923,11 @@ FUNCTION select_items(items) {
         .expect("mapped operation");
 
     let PlanOpKind::DerivedValue {
-        expression:
-            Some(PlanDerivedExpression::MaterializeList {
+        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+        materialization:
+            Some(PlanListMaterialization {
                 target_list,
                 fields: materialized_fields,
-                expression: materialized,
                 ..
             }),
         ..
@@ -5951,9 +5945,6 @@ FUNCTION select_items(items) {
         .expect("mapped materialized ListId");
     assert_eq!(*target_list, mapped_list);
     assert!(materialized_fields.contains_key("label"));
-    let PlanDerivedExpression::RowExpression { expression } = materialized.as_ref() else {
-        panic!("multiline helper lost its row expression: {materialized:#?}");
-    };
     let (owner, row_local, source, body) = expect_contextual_map(
         &compiled.plan.row_expressions,
         *expression,
@@ -7294,10 +7285,8 @@ fn cells_rows_are_typed_visible_range_materializations() {
                 matches!(
                     &op.kind,
                     PlanOpKind::DerivedValue {
-                        expression: Some(boon_plan::PlanDerivedExpression::MaterializeList {
-                            target_list,
-                            ..
-                        }),
+                        materialization:
+                            Some(boon_plan::PlanListMaterialization { target_list, .. }),
                         ..
                     } if *target_list == cells_slot.list_id
                 )
@@ -8197,6 +8186,46 @@ fn distributed_compiler_rejects_both_direct_role_directions_for_values_and_calls
 }
 
 #[test]
+fn distributed_compiler_rejects_pass_across_runtime_islands() {
+    let explicit = compile_distributed_compiler_test_bundle(
+        &format!(
+            "store: [\n    value: Session/read(PASS: [value: 1])\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        "FUNCTION read() { 1 }\n",
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        explicit.contains("PASS")
+            && (explicit.contains("external callable")
+                || explicit.contains("across a runtime island")),
+        "unexpected explicit distributed PASS diagnostic: {explicit}"
+    );
+
+    let required = compile_distributed_compiler_test_bundle(
+        &format!(
+            "store: [\n    value: Session/read()\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+FUNCTION read() {
+    PASSED.value
+}
+"#,
+        "store: [\n    ready: True\n]\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        required
+            .contains("distributed function `read` cannot require PASS across a runtime island"),
+        "unexpected implicit distributed PASS diagnostic: {required}"
+    );
+}
+
+#[test]
 fn distributed_compiler_propagates_obsolete_dotted_role_syntax_diagnostic() {
     let error = compile_distributed_compiler_test_bundle(
         DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
@@ -8985,6 +9014,64 @@ FUNCTION add(value) {
     );
     assert!(
         matches!(second.result, ValueRef::Field(field) if second.ownership.fields.contains(&field))
+    );
+}
+
+#[test]
+fn distributed_compiler_resolves_transitive_producers_before_role_lowering() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        &format!(
+            "store: [\n    result: Session/outer(value: 5)\n]\n{}",
+            DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+        ),
+        r#"
+store: [ready: True]
+
+FUNCTION outer(value) {
+    Server/double(value: value)
+}
+"#,
+        r#"
+store: [ready: True]
+
+FUNCTION double(value) {
+    value * 2
+}
+"#,
+    )
+    .unwrap();
+
+    let client = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Client)
+        .expect("Client endpoint");
+    let session = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .expect("Session endpoint");
+    assert_eq!(client.remote_call_sites.len(), 1);
+    assert_eq!(session.remote_call_sites.len(), 1);
+    assert_eq!(
+        compiled
+            .program(ProgramRole::Session)
+            .expect("Session plan")
+            .plan
+            .producer_function_instances
+            .len(),
+        1
+    );
+    assert_eq!(
+        compiled
+            .program(ProgramRole::Server)
+            .expect("Server plan")
+            .plan
+            .producer_function_instances
+            .len(),
+        1
     );
 }
 

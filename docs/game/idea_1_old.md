@@ -1,10 +1,11 @@
-# Game-Like Boon Authoring: Idea 1
+# Game-Like Boon Authoring: Idea 1 (Historical)
 
-Status: concept note, not an implementation contract.
+Status: historical concept note, not an implementation contract. The current
+game vision is [`BOON_ORCHARD.md`](BOON_ORCHARD.md).
 
 This document captures the idea discussed for writing Boon programs by playing a
-game. The working names are `Boon Foundry`, `Circuitorio`, or `Boon Circuit
-Studio`.
+game. The working names at the time were `Boon Foundry`, `Circuitorio`, or
+`Boon Circuit Studio`.
 
 The important point is that this is not just a node editor with cute graphics.
 The game should be a playable projection of a real Boon program: typed source,

@@ -1803,7 +1803,7 @@ Repository contracts and implementation:
 - [`../architecture/DELTA_PROTOCOL.md`](../architecture/DELTA_PROTOCOL.md)
 - [`../architecture/LANGUAGE_SEMANTICS.md`](../architecture/LANGUAGE_SEMANTICS.md)
 - [`../architecture/NATIVE_GPU_PIPELINE.md`](../architecture/NATIVE_GPU_PIPELINE.md)
-- [`../../crates/boon_plan_executor/src/session.rs`](../../crates/boon_plan_executor/src/session.rs)
+- [`../../crates/boon_plan_executor/src/machine.rs`](../../crates/boon_plan_executor/src/machine.rs)
 - [`../../crates/boon_plan/src/lib.rs`](../../crates/boon_plan/src/lib.rs)
 - [`../../crates/boon_ir/src/lib.rs`](../../crates/boon_ir/src/lib.rs)
 - [`../../examples/novywave/RUN.bn`](../../examples/novywave/RUN.bn)
@@ -1811,7 +1811,7 @@ Repository contracts and implementation:
 Prior strict migration design consulted for semantic continuity:
 
 - `~/repos/boon_experiments/docs/new_boon/3.6_STATE_EVOLUTION.md`
-- [`../game/idea_1.md`](../game/idea_1.md)
+- [`../game/idea_1_old.md`](../game/idea_1_old.md)
 
 External Rust/storage references:
 

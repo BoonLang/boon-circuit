@@ -160,3 +160,83 @@ fn typed_focus_patch_has_a_stable_tagged_round_trip() {
     assert!(serialized.contains("profile-source"));
     assert_eq!(toml::from_str::<DocumentPatch>(&serialized).unwrap(), patch);
 }
+
+#[test]
+fn embedded_program_artifact_is_versioned_redacted_and_derived_from_the_full_bundle() {
+    let descriptor = EmbeddedProgramDescriptor {
+        source: "scene: Helper/render()\n".to_owned(),
+        revision: 7,
+        support_sources: vec![EmbeddedProgramSourceUnit {
+            path: "Helper.bn".to_owned(),
+            source: "FUNCTION render() { Scene/Element/text(element: [] style: [] text: TEXT { Secret child }) }\n"
+                .to_owned(),
+        }],
+        bootstrap_source: "scene: Helper/render()\n".to_owned(),
+        bootstrap_support_sources: vec![EmbeddedProgramSourceUnit {
+            path: "Helper.bn".to_owned(),
+            source: "FUNCTION render() { Scene/Element/text(element: [] style: [] text: TEXT { Secret starter }) }\n"
+                .to_owned(),
+        }],
+        bootstrap_revision: 3,
+        capability_profile: ProgramCapabilityProfile::PublicClient,
+        ..EmbeddedProgramDescriptor::default()
+    };
+    let digest = descriptor.source_bundle_digest_v1().unwrap().unwrap();
+    let bootstrap_digest = descriptor
+        .bootstrap_source_bundle_digest_v1()
+        .unwrap()
+        .unwrap();
+    assert_ne!(digest, bootstrap_digest);
+    let artifact = toml::to_string(&descriptor).unwrap();
+
+    assert!(artifact.contains(EMBEDDED_PROGRAM_ARTIFACT_FORMAT));
+    assert!(artifact.contains(&digest.to_string()));
+    assert!(artifact.contains(&bootstrap_digest.to_string()));
+    assert!(artifact.contains("entrypoint = \"RUN.bn\""));
+    assert!(artifact.contains("path = \"Helper.bn\""));
+    assert!(!artifact.contains("Secret child"));
+    assert!(!artifact.contains("Secret starter"));
+    assert!(!artifact.contains("source_digest ="));
+    assert!(!artifact.contains("bootstrap_source_digest"));
+    assert!(toml::from_str::<EmbeddedProgramDescriptor>(&artifact).is_err());
+}
+
+#[test]
+fn embedded_program_input_accepts_source_bytes_and_rejects_all_caller_digests() {
+    let input = r#"
+source = "scene: []"
+revision = 1
+capability_profile = "public_client"
+"#;
+    let descriptor: EmbeddedProgramDescriptor = toml::from_str(input).unwrap();
+    assert_eq!(descriptor.source, "scene: []");
+
+    for legacy in [
+        "source_digest = \"stale\"\n",
+        "bootstrap_source_digest = \"stale\"\n",
+        "source_bundle_digest_v1 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        "bootstrap_source_bundle_digest_v1 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+    ] {
+        assert!(
+            toml::from_str::<EmbeddedProgramDescriptor>(&format!("{input}{legacy}")).is_err(),
+            "accepted caller-controlled identity field {legacy}"
+        );
+    }
+
+    let support_legacy = r#"
+source = "scene: []"
+revision = 1
+capability_profile = "public_client"
+
+[[support_sources]]
+path = "Helper.bn"
+source = "FUNCTION helper() { [] }"
+source_digest = "stale"
+"#;
+    assert!(toml::from_str::<EmbeddedProgramDescriptor>(support_legacy).is_err());
+    let support_canonical = support_legacy.replace(
+        "source_digest = \"stale\"",
+        "source_bundle_digest_v1 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+    );
+    assert!(toml::from_str::<EmbeddedProgramDescriptor>(&support_canonical).is_err());
+}

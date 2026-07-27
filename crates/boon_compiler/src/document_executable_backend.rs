@@ -75,6 +75,14 @@ struct PatternBindingContext {
     projection: Vec<String>,
 }
 
+struct ExecutableCall<'a> {
+    expression: &'a ir::ExecutableExpression,
+    callable_kind: ir::ExecutableCallableKind,
+    function: &'a str,
+    arguments: &'a [ir::ExecutableCallArgument],
+    contexts: &'a [ir::ExecutableCallContextId],
+}
+
 struct DocumentCompiler<'a> {
     program: &'a ErasedProgram,
     value_index: &'a ValueIndex,
@@ -750,11 +758,13 @@ impl<'a> DocumentCompiler<'a> {
                 contexts,
                 ..
             } => self.compile_call(
-                expression,
-                *callable_kind,
-                name,
-                arguments,
-                contexts,
+                ExecutableCall {
+                    expression,
+                    callable_kind: *callable_kind,
+                    function: name,
+                    arguments,
+                    contexts,
+                },
                 context,
                 input_override,
             ),
@@ -1047,14 +1057,17 @@ impl<'a> DocumentCompiler<'a> {
 
     fn compile_call(
         &mut self,
-        expression: &ir::ExecutableExpression,
-        callable_kind: ir::ExecutableCallableKind,
-        function: &str,
-        arguments: &[ir::ExecutableCallArgument],
-        contexts: &[ir::ExecutableCallContextId],
+        call: ExecutableCall<'_>,
         context: &CompileContext,
         input_override: Option<DocumentExprId>,
     ) -> Result<DocumentExprId, PlanError> {
+        let ExecutableCall {
+            expression,
+            callable_kind,
+            function,
+            arguments,
+            contexts,
+        } = call;
         let compiler_id = expression.id.0;
         if callable_kind == ir::ExecutableCallableKind::External {
             return Err(PlanError::new(format!(

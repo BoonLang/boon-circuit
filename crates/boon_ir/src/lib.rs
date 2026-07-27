@@ -1505,10 +1505,17 @@ pub struct ErasedLocalMember {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct ErasedLocalMemberForwarding {
-    pub owner: StaticOwnerId,
-    pub local: MaterializationLocalId,
-    pub path: Vec<String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ErasedLocalMemberForwarding {
+    Local {
+        owner: StaticOwnerId,
+        local: MaterializationLocalId,
+        path: Vec<String>,
+    },
+    Row {
+        row: ErasedRowBinding,
+        path: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2367,11 +2374,14 @@ pub fn lower_checked(
         &lists,
     )?;
     resolve_executable_source_provenance(
-        &executable,
-        &out_net.graph.static_owners,
-        &sources,
-        &state_cells,
-        &materializations,
+        ExecutableSourceProvenanceContext {
+            executable: &executable,
+            static_owners: &out_net.graph.static_owners,
+            sources: &sources,
+            states: &state_cells,
+            materializations: &materializations,
+            list_storage: &derived_list_storage,
+        },
         &mut erased_fields,
         &mut erased_locals,
     )?;
@@ -2420,19 +2430,19 @@ pub fn lower_checked(
         &sources,
     )?;
     let derived_values_started = Instant::now();
-    let mut derived_values = derived_values(
-        &checked_program,
-        &executable,
-        &out_net.graph.static_owners,
-        &derived_list_storage,
-        &erased_fields,
-        &state_cells,
-        &sources,
-        &materializations,
-        &source_authority,
-        &producer_function_instances,
-        &distributed_references.value_references,
-    )?;
+    let mut derived_values = derived_values(DerivedValueContext {
+        checked: &checked_program,
+        executable: &executable,
+        static_owners: &out_net.graph.static_owners,
+        derived_list_storage: &derived_list_storage,
+        erased_fields: &erased_fields,
+        state_cells: &state_cells,
+        sources: &sources,
+        materializations: &materializations,
+        source_authority: &source_authority,
+        producer_function_instances: &producer_function_instances,
+        distributed_value_references: &distributed_references.value_references,
+    })?;
     derived_values.extend(producer_derived_values(
         &executable,
         &derived_list_storage,
@@ -2468,13 +2478,15 @@ pub fn lower_checked(
     trace_phase("derived_values", derived_values_ms);
     bind_derived_field_ids(&mut derived_values, &erased_fields)?;
     let mut scope_index = build_erased_scope_index(
-        &executable,
-        &out_net.graph.static_owners,
-        &materializations,
-        &sources,
-        &state_cells,
-        &lists,
-        &derived_list_storage,
+        ErasedScopeBuildContext {
+            executable: &executable,
+            static_owners: &out_net.graph.static_owners,
+            materializations: &materializations,
+            sources: &sources,
+            states: &state_cells,
+            lists: &lists,
+            list_storage: &derived_list_storage,
+        },
         erased_locals,
         std::mem::take(&mut erased_fields),
         source_authority.row_source_projections.clone(),
@@ -2536,14 +2548,16 @@ pub fn lower_checked(
     trace_phase("output_values", output_values_ms);
     let view_bindings_started = Instant::now();
     let view_bindings = view_bindings(
-        &executable,
-        &scope_index,
-        &source_authority,
-        &derived_list_storage,
+        ViewBindingContext {
+            executable: &executable,
+            storage: &scope_index,
+            source_authority: &source_authority,
+            list_storage: &derived_list_storage,
+            row_scopes: &row_scopes,
+            sources: &sources,
+            materializations: &materializations,
+        },
         &output_values,
-        &row_scopes,
-        &sources,
-        &materializations,
     )?;
     let view_bindings_ms = lower_elapsed_ms(view_bindings_started);
     trace_phase("view_bindings", view_bindings_ms);
@@ -3741,17 +3755,31 @@ fn static_owner_descends_from(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ErasedLocalMemberContext<'a> {
+    executable: &'a ExecutableProgram,
+    static_owners: &'a [StaticOwnerDef],
+    materializations: &'a [ContextualMaterialization],
+    fields: &'a [ErasedFieldDef],
+    sources: &'a [SourcePort],
+    states: &'a [StateCell],
+    lists: &'a [ListMemory],
+}
+
 fn erased_local_members(
-    executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
-    materializations: &[ContextualMaterialization],
-    fields: &[ErasedFieldDef],
-    sources: &[SourcePort],
-    states: &[StateCell],
-    lists: &[ListMemory],
+    context: ErasedLocalMemberContext<'_>,
     materialization: &ContextualMaterialization,
     row: Option<ErasedRowBinding>,
 ) -> Result<Vec<ErasedLocalMember>, String> {
+    let ErasedLocalMemberContext {
+        executable,
+        static_owners,
+        materializations,
+        fields,
+        sources,
+        states,
+        lists,
+    } = context;
     let Some(row) = row else {
         return Ok(Vec::new());
     };
@@ -4237,7 +4265,7 @@ impl<'a> ExecutableSourceProvenanceResolver<'a> {
                                     resolved.sources.push(ResolvedSourceMember {
                                         path,
                                         source,
-                                        forwarded_from: Some(ErasedLocalMemberForwarding {
+                                        forwarded_from: Some(ErasedLocalMemberForwarding::Local {
                                             owner: *owner,
                                             local: *local,
                                             path: local_member.path.clone(),
@@ -4519,7 +4547,7 @@ impl<'a> ExecutableSourceProvenanceResolver<'a> {
                         | ContextualOperationKind::SortBy
                         | ContextualOperationKind::ThenBy
                 ) {
-                    source_member.forwarded_from = Some(ErasedLocalMemberForwarding {
+                    source_member.forwarded_from = Some(ErasedLocalMemberForwarding::Local {
                         owner: input_definition.owner,
                         local: input_definition.row_local,
                         path: source_member.path.clone(),
@@ -4539,15 +4567,29 @@ impl<'a> ExecutableSourceProvenanceResolver<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ExecutableSourceProvenanceContext<'a> {
+    executable: &'a ExecutableProgram,
+    static_owners: &'a [StaticOwnerDef],
+    sources: &'a [SourcePort],
+    states: &'a [StateCell],
+    materializations: &'a [ContextualMaterialization],
+    list_storage: &'a BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+}
+
 fn resolve_executable_source_provenance(
-    executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
-    sources: &[SourcePort],
-    states: &[StateCell],
-    materializations: &[ContextualMaterialization],
+    context: ExecutableSourceProvenanceContext<'_>,
     fields: &mut [ErasedFieldDef],
     locals: &mut [ErasedLocalDef],
 ) -> Result<(), String> {
+    let ExecutableSourceProvenanceContext {
+        executable,
+        static_owners,
+        sources,
+        states,
+        materializations,
+        list_storage,
+    } = context;
     let fields_snapshot = fields.to_vec();
     let locals_snapshot = locals.to_vec();
     let mut resolver = ExecutableSourceProvenanceResolver::new(
@@ -4572,6 +4614,771 @@ fn resolve_executable_source_provenance(
     }
     for (local, members) in locals.iter_mut().zip(local_members) {
         local.members = members;
+    }
+    classify_transitive_row_resource_fields(
+        executable,
+        materializations,
+        list_storage,
+        sources,
+        fields,
+        locals,
+    )
+}
+
+/// Completes the direct provenance classification across row-forwarding
+/// cycles. The recursive resolver deliberately treats a FieldId cycle as a
+/// runtime value, so a source facade passed through one or more materialized
+/// rows can otherwise lose its `resource_only` bit even though its exact source
+/// route remains intact.
+///
+/// Each clause is conjunctive: a target becomes resource-only only after every
+/// exact FieldId dependency is resource-only. Runtime, state, ambiguous, and
+/// unmatched provenance never forms a clause, which keeps mixed source/scalar
+/// records in scalar storage.
+fn classify_transitive_row_resource_fields(
+    executable: &ExecutableProgram,
+    materializations: &[ContextualMaterialization],
+    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    sources: &[SourcePort],
+    fields: &mut [ErasedFieldDef],
+    locals: &mut [ErasedLocalDef],
+) -> Result<(), String> {
+    #[derive(Debug, Default)]
+    struct ResourceDependencyClause {
+        dependencies: BTreeSet<FieldId>,
+        has_direct_source: bool,
+        blocked: bool,
+    }
+
+    fn complete_identity_source_forwarding(
+        sources: &[SourcePort],
+        predecessors: &BTreeMap<ErasedRowBinding, BTreeSet<ErasedRowBinding>>,
+        locals: &mut [ErasedLocalDef],
+    ) -> Result<(), String> {
+        #[derive(Clone)]
+        struct ForwardingCandidate {
+            row: ErasedRowBinding,
+            owner: StaticOwnerId,
+            local: MaterializationLocalId,
+            path: Vec<String>,
+            source: SourceId,
+        }
+
+        let source_scopes = sources
+            .iter()
+            .map(|source| (source.id, source.scope_id))
+            .collect::<BTreeMap<_, _>>();
+        let candidates = locals
+            .iter()
+            .filter_map(|local| Some((local, local.row?)))
+            .flat_map(|(local, row)| {
+                local.members.iter().filter_map(move |member| {
+                    let ErasedLocalMemberTarget::Source(source) = member.target else {
+                        return None;
+                    };
+                    Some(ForwardingCandidate {
+                        row,
+                        owner: local.owner,
+                        local: local.local,
+                        path: member.path.clone(),
+                        source,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for local in locals {
+            let Some(target_row) = local.row else {
+                continue;
+            };
+            for member in &mut local.members {
+                let ErasedLocalMemberTarget::Source(source) = member.target else {
+                    continue;
+                };
+                if member.forwarded_from.is_some()
+                    || source_scopes.get(&source).copied().flatten() == Some(target_row.scope)
+                {
+                    continue;
+                }
+
+                let mut visited = BTreeSet::from([target_row]);
+                let mut frontier = predecessors.get(&target_row).cloned().unwrap_or_default();
+                let mut forwarded = false;
+                while !frontier.is_empty() {
+                    let mut matches = candidates
+                        .iter()
+                        .filter(|candidate| {
+                            frontier.contains(&candidate.row)
+                                && candidate.source == source
+                                && candidate.path == member.path
+                        })
+                        .collect::<Vec<_>>();
+                    matches
+                        .sort_by_key(|candidate| (candidate.owner, candidate.local, candidate.row));
+                    if let Some(candidate) = matches.first() {
+                        member.forwarded_from = Some(ErasedLocalMemberForwarding::Local {
+                            owner: candidate.owner,
+                            local: candidate.local,
+                            path: candidate.path.clone(),
+                        });
+                        forwarded = true;
+                        break;
+                    }
+
+                    let mut next = BTreeSet::new();
+                    for row in frontier {
+                        if !visited.insert(row) {
+                            continue;
+                        }
+                        next.extend(predecessors.get(&row).into_iter().flatten().copied());
+                    }
+                    frontier = next
+                        .into_iter()
+                        .filter(|row| !visited.contains(row))
+                        .collect();
+                }
+                if !forwarded {
+                    let source_scope = source_scopes.get(&source).copied().flatten();
+                    let direct_rows = visited
+                        .iter()
+                        .copied()
+                        .filter(|row| Some(row.scope) == source_scope)
+                        .collect::<Vec<_>>();
+                    if let [row] = direct_rows.as_slice() {
+                        member.forwarded_from = Some(ErasedLocalMemberForwarding::Row {
+                            row: *row,
+                            path: member.path.clone(),
+                        });
+                        continue;
+                    }
+                    let source_candidates = candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.source == source && candidate.path == member.path
+                        })
+                        .map(|candidate| (candidate.row, candidate.owner, candidate.local))
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "resource identity forwarding cannot connect owner {} local {} row {target_row:?} member `{}` source {source} scope {source_scope:?} through rows {visited:?}; candidates={source_candidates:?}",
+                        local.owner,
+                        local.local.0,
+                        member.path.join("."),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn direct_stored_list_predecessors(
+        executable: &ExecutableProgram,
+        materializations: &[ContextualMaterialization],
+        storage_by_path: &BTreeMap<String, ErasedRowBinding>,
+        storage_by_declaration: &BTreeMap<boon_typecheck::DeclId, ErasedRowBinding>,
+        statement_values: &BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
+        local_values: &BTreeMap<ExecutableLocalBindingId, ExecutableLocalBindingValue>,
+        root: ExecutableExprId,
+    ) -> Result<(BTreeSet<ErasedRowBinding>, BTreeSet<usize>, bool), String> {
+        let mut predecessors = BTreeSet::new();
+        let mut root_materializations = BTreeSet::new();
+        let mut has_unrepresented_branch = false;
+        let mut pending = vec![(root, Vec::<String>::new())];
+        let mut visited = BTreeSet::new();
+        while let Some((expression_id, projected_fields)) = pending.pop() {
+            if !visited.insert((expression_id, projected_fields.clone())) {
+                continue;
+            }
+            let expression = executable
+                .expressions
+                .get(expression_id.as_usize())
+                .filter(|expression| expression.id == expression_id)
+                .ok_or_else(|| {
+                    format!("resource dependency reaches missing list expression {expression_id}")
+                })?;
+            match &expression.kind {
+                ExecutableExpressionKind::CanonicalRead {
+                    target,
+                    path,
+                    projection,
+                    ..
+                } => {
+                    let mut combined = projection.clone();
+                    combined.extend(projected_fields);
+                    let path = canonical_read_path(path, &combined);
+                    if let Some(row) = storage_by_path.get(&path) {
+                        predecessors.insert(*row);
+                    } else if combined.is_empty()
+                        && let Some(row) = storage_by_declaration.get(target)
+                    {
+                        predecessors.insert(*row);
+                    } else if let Some(value) = statement_values.get(target).copied()
+                        && value != expression_id
+                    {
+                        pending.push((value, combined));
+                    } else {
+                        has_unrepresented_branch = true;
+                    }
+                }
+                ExecutableExpressionKind::LocalRead {
+                    binding,
+                    declaration,
+                    projection,
+                } => {
+                    let local = local_values.get(binding).ok_or_else(|| {
+                        format!(
+                            "resource dependency expression {expression_id} references missing local binding {binding}"
+                        )
+                    })?;
+                    if local.declaration != *declaration {
+                        return Err(format!(
+                            "resource dependency local expression {expression_id} declaration {} differs from binding {binding} declaration {}",
+                            declaration.0, local.declaration.0
+                        ));
+                    }
+                    let mut combined = projection.clone();
+                    combined.extend(projected_fields);
+                    pending.push((local.value, combined));
+                }
+                ExecutableExpressionKind::Object(_)
+                | ExecutableExpressionKind::Record(_)
+                | ExecutableExpressionKind::TaggedObject { .. }
+                    if !projected_fields.is_empty() =>
+                {
+                    let (projected, remaining) = exact_executable_record_projection(
+                        executable,
+                        expression_id,
+                        &projected_fields,
+                    )?;
+                    if projected == expression_id {
+                        has_unrepresented_branch = true;
+                    } else {
+                        pending.push((projected, remaining.to_vec()));
+                    }
+                }
+                ExecutableExpressionKind::Materialize { materialization }
+                    if projected_fields.is_empty()
+                        && matches!(expression.flow_type.ty, boon_typecheck::Type::List(_)) =>
+                {
+                    let materialization = materializations
+                        .get(*materialization)
+                        .filter(|candidate| candidate.id == *materialization)
+                        .ok_or_else(|| {
+                            format!(
+                                "resource dependency reaches missing materialization {materialization}"
+                            )
+                        })?;
+                    match materialization.operation {
+                        ContextualOperationKind::Map => {
+                            root_materializations.insert(materialization.id);
+                        }
+                        ContextualOperationKind::Filter
+                        | ContextualOperationKind::Retain
+                        | ContextualOperationKind::Remove
+                        | ContextualOperationKind::SortBy
+                        | ContextualOperationKind::ThenBy => {
+                            pending.push((materialization.source, Vec::new()));
+                        }
+                        ContextualOperationKind::Every
+                        | ContextualOperationKind::Any
+                        | ContextualOperationKind::Find => {
+                            has_unrepresented_branch = true;
+                        }
+                    }
+                }
+                ExecutableExpressionKind::Latest { branches } => {
+                    if branches.is_empty() {
+                        has_unrepresented_branch = true;
+                    }
+                    pending.extend(
+                        branches
+                            .iter()
+                            .map(|branch| (*branch, projected_fields.clone())),
+                    );
+                }
+                ExecutableExpressionKind::When { arms, .. } => {
+                    if arms.is_empty() {
+                        has_unrepresented_branch = true;
+                    }
+                    pending.extend(
+                        arms.iter()
+                            .map(|arm| (arm.output, projected_fields.clone())),
+                    );
+                }
+                ExecutableExpressionKind::Block { result, .. } => {
+                    pending.push((*result, projected_fields));
+                }
+                ExecutableExpressionKind::Draining { input } => {
+                    pending.push((*input, projected_fields));
+                }
+                ExecutableExpressionKind::Project { input, fields } => {
+                    let mut combined = fields.clone();
+                    combined.extend(projected_fields);
+                    pending.push((*input, combined));
+                }
+                ExecutableExpressionKind::Then {
+                    output: Some(output),
+                    ..
+                }
+                | ExecutableExpressionKind::MatchArm {
+                    output: Some(output),
+                    ..
+                } => {
+                    pending.push((*output, projected_fields));
+                }
+                _ => {
+                    has_unrepresented_branch = true;
+                }
+            }
+        }
+        Ok((
+            predecessors,
+            root_materializations,
+            has_unrepresented_branch,
+        ))
+    }
+
+    let mut fields_by_row_name = BTreeMap::<(ErasedRowBinding, String), Vec<FieldId>>::new();
+    let mut field_names_by_row = BTreeMap::<ErasedRowBinding, BTreeSet<String>>::new();
+    for field in fields
+        .iter()
+        .filter(|field| field.role.is_value() && field.row.is_some())
+    {
+        let row = field.row.expect("filtered row field");
+        fields_by_row_name
+            .entry((row, field.name.clone()))
+            .or_default()
+            .push(field.id);
+        field_names_by_row
+            .entry(row)
+            .or_default()
+            .insert(field.name.clone());
+    }
+    let mut clauses = BTreeMap::<FieldId, ResourceDependencyClause>::new();
+    let mut map_branch_materializations = Vec::new();
+    let mut identity_predecessors = BTreeMap::<ErasedRowBinding, BTreeSet<ErasedRowBinding>>::new();
+    {
+        let mut add_identity_predecessor =
+            |target_row: ErasedRowBinding, source_row: Option<ErasedRowBinding>| {
+                let Some(target_names) = field_names_by_row.get(&target_row) else {
+                    return;
+                };
+                for name in target_names {
+                    let targets = fields_by_row_name
+                        .get(&(target_row, name.clone()))
+                        .expect("target row name index is exact");
+                    let sources = source_row
+                        .and_then(|source_row| fields_by_row_name.get(&(source_row, name.clone())));
+                    for target in targets {
+                        let clause = clauses.entry(*target).or_default();
+                        let Some([source]) = sources.map(Vec::as_slice) else {
+                            clause.blocked = true;
+                            continue;
+                        };
+                        if targets.len() != 1 {
+                            clause.blocked = true;
+                            continue;
+                        }
+                        clause.dependencies.insert(*source);
+                    }
+                }
+            };
+        let storage_by_path = list_storage
+            .values()
+            .map(|storage| {
+                (
+                    storage.path.clone(),
+                    ErasedRowBinding {
+                        list: storage.list_id,
+                        scope: storage.row_scope_id,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let storage_by_declaration = list_storage
+            .iter()
+            .filter_map(|(statement_id, storage)| {
+                executable
+                    .statements
+                    .get(statement_id.as_usize())
+                    .filter(|statement| statement.id == *statement_id)
+                    .and_then(|statement| statement.declaration)
+                    .map(|declaration| {
+                        (
+                            declaration,
+                            ErasedRowBinding {
+                                list: storage.list_id,
+                                scope: storage.row_scope_id,
+                            },
+                        )
+                    })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let statement_values = executable
+            .statements
+            .iter()
+            .filter_map(|statement| Some((statement.declaration?, statement.value?)))
+            .collect::<BTreeMap<_, _>>();
+        let local_values = executable_local_binding_values(executable)?;
+        for statement in &executable.statements {
+            let Some(storage) = list_storage.get(&statement.id) else {
+                continue;
+            };
+            let Some(root) = statement.value else {
+                continue;
+            };
+            let target_row = ErasedRowBinding {
+                list: storage.list_id,
+                scope: storage.row_scope_id,
+            };
+            let (predecessors, root_materializations, has_unrepresented_branch) =
+                direct_stored_list_predecessors(
+                    executable,
+                    materializations,
+                    &storage_by_path,
+                    &storage_by_declaration,
+                    &statement_values,
+                    &local_values,
+                    root,
+                )?;
+            let has_represented_branch =
+                !predecessors.is_empty() || !root_materializations.is_empty();
+            for predecessor in predecessors {
+                if predecessor != target_row {
+                    identity_predecessors
+                        .entry(target_row)
+                        .or_default()
+                        .insert(predecessor);
+                    add_identity_predecessor(target_row, Some(predecessor));
+                }
+            }
+            for materialization_id in root_materializations {
+                let materialization = materializations
+                    .get(materialization_id)
+                    .filter(|candidate| candidate.id == materialization_id)
+                    .expect("root materialization was validated while walking");
+                debug_assert_eq!(materialization.operation, ContextualOperationKind::Map);
+                map_branch_materializations.push((target_row, materialization_id));
+            }
+            if has_unrepresented_branch && has_represented_branch {
+                add_identity_predecessor(target_row, None);
+            }
+        }
+    }
+    complete_identity_source_forwarding(sources, &identity_predecessors, locals)?;
+
+    let locals_by_id = locals
+        .iter()
+        .map(|local| ((local.owner, local.local), local))
+        .collect::<BTreeMap<_, _>>();
+    let mut add_provenance_dependencies = |target: FieldId,
+                                           provenance: &ExecutableValueProvenance|
+     -> Result<(), String> {
+        let clause = clauses.entry(target).or_default();
+        if provenance.members.is_empty() {
+            clause.blocked = true;
+            return Ok(());
+        }
+        for member in &provenance.members {
+            match &member.origin {
+                ExecutableValueOrigin::Runtime | ExecutableValueOrigin::State { .. } => {
+                    clause.blocked = true;
+                    break;
+                }
+                ExecutableValueOrigin::Source { .. }
+                | ExecutableValueOrigin::ProducerSource { .. } => {
+                    clause.has_direct_source = true;
+                }
+                ExecutableValueOrigin::MaterializationLocal {
+                    owner,
+                    local,
+                    projection,
+                } => {
+                    let local = locals_by_id.get(&(*owner, *local)).ok_or_else(|| {
+                            format!(
+                                "resource dependency FieldId {target} references missing local {owner}:{}",
+                                local.0
+                            )
+                        })?;
+                    let mut matched = false;
+                    for local_member in &local.members {
+                        let projects_member = local_member
+                            .path
+                            .strip_prefix(projection.as_slice())
+                            .is_some();
+                        let projects_inside_value = projection.starts_with(&local_member.path)
+                            && matches!(
+                                local_member.target,
+                                ErasedLocalMemberTarget::Field(_)
+                                    | ErasedLocalMemberTarget::State(_)
+                            );
+                        if !projects_member && !projects_inside_value {
+                            continue;
+                        }
+                        matched = true;
+                        match local_member.target {
+                            ErasedLocalMemberTarget::Source(_) => {
+                                clause.has_direct_source = true;
+                            }
+                            ErasedLocalMemberTarget::Field(dependency) => {
+                                clause.dependencies.insert(dependency);
+                            }
+                            ErasedLocalMemberTarget::State(_) => {
+                                clause.blocked = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !matched {
+                        clause.blocked = true;
+                    }
+                    if clause.blocked {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    for field in fields
+        .iter()
+        .filter(|field| field.role.is_value() && field.row.is_some())
+    {
+        let Some(producer) = field.producer else {
+            continue;
+        };
+        let expression = executable
+            .expressions
+            .get(producer.as_usize())
+            .filter(|expression| expression.id == producer)
+            .ok_or_else(|| {
+                format!(
+                    "resource dependency FieldId {} references missing producer {producer}",
+                    field.id
+                )
+            })?;
+        add_provenance_dependencies(field.id, &expression.provenance)?;
+    }
+    for (target_row, materialization_id) in map_branch_materializations {
+        let materialization = materializations
+            .get(materialization_id)
+            .filter(|candidate| candidate.id == materialization_id)
+            .ok_or_else(|| {
+                format!(
+                    "resource dependency reaches missing Map materialization {materialization_id}"
+                )
+            })?;
+        let body = executable
+            .expressions
+            .get(materialization.body.as_usize())
+            .filter(|expression| expression.id == materialization.body)
+            .ok_or_else(|| {
+                format!(
+                    "resource dependency Map materialization {materialization_id} has missing body {}",
+                    materialization.body
+                )
+            })?;
+        let Some(names) = field_names_by_row.get(&target_row) else {
+            continue;
+        };
+        for name in names {
+            let targets = fields_by_row_name
+                .get(&(target_row, name.clone()))
+                .expect("target row name index is exact");
+            if targets.len() != 1 {
+                for target in targets {
+                    add_provenance_dependencies(*target, &ExecutableValueProvenance::default())?;
+                }
+                continue;
+            }
+            add_provenance_dependencies(
+                targets[0],
+                &body.provenance.projected(std::slice::from_ref(name)),
+            )?;
+        }
+    }
+
+    // Every target with a complete row/list clause is owned by this
+    // conjunctive classifier. Direct resolver seeds are intentionally cleared
+    // so one source-only branch cannot bypass a scalar or unknown sibling.
+    for target in clauses.keys().copied().collect::<Vec<_>>() {
+        let field = fields
+            .get_mut(target.as_usize())
+            .filter(|field| field.id == target)
+            .ok_or_else(|| {
+                format!("resource dependency references missing target FieldId {target}")
+            })?;
+        field.resource_only = false;
+    }
+    let seed_resource_fields = fields
+        .iter()
+        .filter(|field| field.resource_only)
+        .map(|field| field.id)
+        .collect::<BTreeSet<_>>();
+
+    // Keep only clauses whose complete dependency closure can still be
+    // resource-only. A blocked target invalidates every conjunctive dependent.
+    let mut candidates = clauses
+        .iter()
+        .filter_map(|(target, clause)| {
+            (!clause.blocked && (clause.has_direct_source || !clause.dependencies.is_empty()))
+                .then_some(*target)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut dependents = BTreeMap::<FieldId, Vec<FieldId>>::new();
+    for (target, clause) in &clauses {
+        for dependency in &clause.dependencies {
+            fields
+                .get(dependency.as_usize())
+                .filter(|field| field.id == *dependency)
+                .ok_or_else(|| {
+                    format!(
+                        "resource dependency FieldId {target} references missing FieldId {dependency}"
+                    )
+                })?;
+            dependents.entry(*dependency).or_default().push(*target);
+        }
+    }
+    let mut invalid = candidates
+        .iter()
+        .filter(|target| {
+            clauses[*target].dependencies.iter().any(|dependency| {
+                !seed_resource_fields.contains(dependency) && !candidates.contains(dependency)
+            })
+        })
+        .copied()
+        .collect::<BTreeSet<_>>();
+    while let Some(target) = invalid.pop_first() {
+        if !candidates.remove(&target) {
+            continue;
+        }
+        for dependent in dependents.get(&target).into_iter().flatten() {
+            if candidates.contains(dependent) {
+                invalid.insert(*dependent);
+            }
+        }
+    }
+
+    // Collapse the remaining conjunctive graph into strongly connected
+    // components. A component is resource-only iff all of its external
+    // dependencies qualify and it is anchored by a direct SOURCE or an
+    // already-qualified external resource. Pure unanchored cycles stay scalar.
+    let mut visited = BTreeSet::new();
+    let mut finish_order = Vec::with_capacity(candidates.len());
+    for start in candidates.iter().copied() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((field, expanded)) = stack.pop() {
+            if expanded {
+                finish_order.push(field);
+                continue;
+            }
+            if !visited.insert(field) {
+                continue;
+            }
+            stack.push((field, true));
+            for dependency in clauses[&field].dependencies.iter().rev() {
+                if candidates.contains(dependency) && !visited.contains(dependency) {
+                    stack.push((*dependency, false));
+                }
+            }
+        }
+    }
+
+    let mut component_by_field = BTreeMap::<FieldId, usize>::new();
+    let mut components = Vec::<Vec<FieldId>>::new();
+    while let Some(start) = finish_order.pop() {
+        if component_by_field.contains_key(&start) {
+            continue;
+        }
+        let component_id = components.len();
+        let mut members = Vec::new();
+        let mut stack = vec![start];
+        component_by_field.insert(start, component_id);
+        while let Some(field) = stack.pop() {
+            members.push(field);
+            for dependent in dependents.get(&field).into_iter().flatten() {
+                if candidates.contains(dependent) && !component_by_field.contains_key(dependent) {
+                    component_by_field.insert(*dependent, component_id);
+                    stack.push(*dependent);
+                }
+            }
+        }
+        members.sort_unstable();
+        components.push(members);
+    }
+    if component_by_field.len() != candidates.len() {
+        return Err("resource dependency SCC classification lost a candidate field".to_owned());
+    }
+
+    let component_count = components.len();
+    let mut component_dependencies = vec![BTreeSet::<usize>::new(); component_count];
+    let mut component_dependents = vec![BTreeSet::<usize>::new(); component_count];
+    let mut component_anchor = vec![false; component_count];
+    for (component_id, members) in components.iter().enumerate() {
+        for field in members {
+            let clause = &clauses[field];
+            component_anchor[component_id] |= clause.has_direct_source;
+            for dependency in &clause.dependencies {
+                if seed_resource_fields.contains(dependency) {
+                    component_anchor[component_id] = true;
+                    continue;
+                }
+                let dependency_component = component_by_field[dependency];
+                if dependency_component != component_id {
+                    component_dependencies[component_id].insert(dependency_component);
+                    component_dependents[dependency_component].insert(component_id);
+                }
+            }
+        }
+    }
+
+    let mut remaining_dependencies = component_dependencies
+        .iter()
+        .map(BTreeSet::len)
+        .collect::<Vec<_>>();
+    let mut all_dependencies_qualify = vec![true; component_count];
+    let mut component_qualifies = vec![false; component_count];
+    let mut ready = remaining_dependencies
+        .iter()
+        .enumerate()
+        .filter_map(|(component, remaining)| (*remaining == 0).then_some(component))
+        .collect::<BTreeSet<_>>();
+    let mut processed = 0usize;
+    while let Some(component) = ready.pop_first() {
+        processed += 1;
+        let qualifies = all_dependencies_qualify[component] && component_anchor[component];
+        component_qualifies[component] = qualifies;
+        for dependent in component_dependents[component].iter().copied() {
+            all_dependencies_qualify[dependent] &= qualifies;
+            component_anchor[dependent] |= qualifies;
+            remaining_dependencies[dependent] = remaining_dependencies[dependent]
+                .checked_sub(1)
+                .ok_or_else(|| {
+                    format!("resource dependency component {dependent} readiness underflow")
+                })?;
+            if remaining_dependencies[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    if processed != component_count {
+        return Err("resource dependency SCC condensation retained a cycle".to_owned());
+    }
+    for (component, members) in components.iter().enumerate() {
+        if !component_qualifies[component] {
+            continue;
+        }
+        for field_id in members {
+            let field = fields
+                .get_mut(field_id.as_usize())
+                .filter(|field| field.id == *field_id)
+                .ok_or_else(|| {
+                    format!("resource dependency references missing target FieldId {field_id}")
+                })?;
+            field.resource_only = true;
+        }
     }
     Ok(())
 }
@@ -5026,6 +5833,15 @@ fn build_erased_locals(
     states: &[StateCell],
     lists: &[ListMemory],
 ) -> Result<Vec<ErasedLocalDef>, String> {
+    let member_context = ErasedLocalMemberContext {
+        executable,
+        static_owners,
+        materializations,
+        fields,
+        sources,
+        states,
+        lists,
+    };
     materializations
         .iter()
         .map(|materialization| {
@@ -5041,35 +5857,39 @@ fn build_erased_locals(
                 row,
                 source: materialization.source,
                 item_type: materialization.item_type.clone(),
-                members: erased_local_members(
-                    executable,
-                    static_owners,
-                    materializations,
-                    fields,
-                    sources,
-                    states,
-                    lists,
-                    materialization,
-                    row,
-                )?,
+                members: erased_local_members(member_context, materialization, row)?,
                 captures: Vec::new(),
             })
         })
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct ErasedScopeBuildContext<'a> {
+    executable: &'a ExecutableProgram,
+    static_owners: &'a [StaticOwnerDef],
+    materializations: &'a [ContextualMaterialization],
+    sources: &'a [SourcePort],
+    states: &'a [StateCell],
+    lists: &'a [ListMemory],
+    list_storage: &'a BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+}
+
 fn build_erased_scope_index(
-    executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
-    materializations: &[ContextualMaterialization],
-    sources: &[SourcePort],
-    states: &[StateCell],
-    lists: &[ListMemory],
-    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    context: ErasedScopeBuildContext<'_>,
     locals: Vec<ErasedLocalDef>,
     fields: Vec<ErasedFieldDef>,
     row_source_projections: Vec<ErasedRowSourceProjection>,
 ) -> Result<ErasedScopeIndex, String> {
+    let ErasedScopeBuildContext {
+        executable,
+        static_owners,
+        materializations,
+        sources,
+        states,
+        lists,
+        list_storage,
+    } = context;
     let mut bindings = Vec::new();
     let direct_storage_statements = direct_erased_storage_statements(executable);
     for statement in &executable.statements {
@@ -7608,42 +8428,97 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                             )
                         })?;
                     if let Some(forwarding) = member.forwarded_from.as_ref() {
-                        let upstream = program
-                            .scope_index
-                            .locals
-                            .iter()
-                            .find(|candidate| {
-                                candidate.owner == forwarding.owner
-                                    && candidate.local == forwarding.local
-                            })
-                            .ok_or_else(|| {
-                                format!(
-                                    "owner {} local {} member `{}` forwards from missing local {}:{}",
-                                    local.owner,
-                                    local.local.0,
-                                    member.path.join("."),
-                                    forwarding.owner,
-                                    forwarding.local.0
-                                )
-                            })?;
-                        let upstream_members = upstream
-                            .members
-                            .iter()
-                            .filter(|candidate| {
-                                candidate.path == forwarding.path
-                                    && candidate.target
-                                        == ErasedLocalMemberTarget::Source(source.id)
-                            })
-                            .collect::<Vec<_>>();
-                        if upstream_members.len() != 1 {
-                            return Err(format!(
-                                "owner {} local {} member `{}` forwards source {} from {} exact upstream members",
-                                local.owner,
-                                local.local.0,
-                                member.path.join("."),
-                                source.id,
-                                upstream_members.len()
-                            ));
+                        match forwarding {
+                            ErasedLocalMemberForwarding::Local {
+                                owner,
+                                local: upstream_local,
+                                path,
+                            } => {
+                                let upstream = program
+                                    .scope_index
+                                    .locals
+                                    .iter()
+                                    .find(|candidate| {
+                                        candidate.owner == *owner
+                                            && candidate.local == *upstream_local
+                                    })
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "owner {} local {} member `{}` forwards from missing local {}:{}",
+                                            local.owner,
+                                            local.local.0,
+                                            member.path.join("."),
+                                            owner,
+                                            upstream_local.0
+                                        )
+                                    })?;
+                                let upstream_members = upstream
+                                    .members
+                                    .iter()
+                                    .filter(|candidate| {
+                                        candidate.path == *path
+                                            && candidate.target
+                                                == ErasedLocalMemberTarget::Source(source.id)
+                                    })
+                                    .collect::<Vec<_>>();
+                                if upstream_members.len() != 1 {
+                                    return Err(format!(
+                                        "owner {} local {} member `{}` forwards source {} from {} exact upstream members",
+                                        local.owner,
+                                        local.local.0,
+                                        member.path.join("."),
+                                        source.id,
+                                        upstream_members.len()
+                                    ));
+                                }
+                            }
+                            ErasedLocalMemberForwarding::Row { row, path } => {
+                                let list = program
+                                    .lists
+                                    .get(row.list.as_usize())
+                                    .filter(|list| {
+                                        list.id == row.list
+                                            && list.row_scope_id == Some(row.scope)
+                                    })
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "owner {} local {} member `{}` forwards from missing row {row:?}",
+                                            local.owner,
+                                            local.local.0,
+                                            member.path.join(".")
+                                        )
+                                    })?;
+                                let relative = source
+                                    .path
+                                    .strip_prefix(&list.name)
+                                    .and_then(|suffix| suffix.strip_prefix('.'))
+                                    .map(|suffix| {
+                                        suffix.split('.').map(str::to_owned).collect::<Vec<_>>()
+                                    });
+                                let target_projection = local.row.is_some_and(|target_row| {
+                                    program.scope_index.row_source_projections.iter().any(
+                                        |projection| {
+                                            projection.row == target_row
+                                                && projection.path == member.path
+                                                && projection.source == source.id
+                                        },
+                                    )
+                                });
+                                if local.row == Some(*row)
+                                    || path != &member.path
+                                    || source.scope_id != Some(row.scope)
+                                    || relative.as_ref() != Some(path)
+                                    || !target_projection
+                                {
+                                    return Err(format!(
+                                        "owner {} local {} member `{}` has invalid row forwarding from {row:?} for source `{}`",
+                                        local.owner,
+                                        local.local.0,
+                                        member.path.join("."),
+                                        source.path
+                                    ));
+                                }
+                            }
                         }
                     } else if source.scope_id != local.row.map(|row| row.scope)
                         || relative_path(&source.path).is_none_or(|path| path != member.path)
@@ -7691,6 +8566,45 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                     }
                 }
             }
+        }
+    }
+    let mut local_forwarding = BTreeMap::<
+        (StaticOwnerId, MaterializationLocalId, Vec<String>, SourceId),
+        (StaticOwnerId, MaterializationLocalId, Vec<String>, SourceId),
+    >::new();
+    for local in &program.scope_index.locals {
+        for member in &local.members {
+            let ErasedLocalMemberTarget::Source(source) = member.target else {
+                continue;
+            };
+            let Some(ErasedLocalMemberForwarding::Local {
+                owner,
+                local: upstream_local,
+                path,
+            }) = member.forwarded_from.as_ref()
+            else {
+                continue;
+            };
+            local_forwarding.insert(
+                (local.owner, local.local, member.path.clone(), source),
+                (*owner, *upstream_local, path.clone(), source),
+            );
+        }
+    }
+    for start in local_forwarding.keys() {
+        let mut current = start;
+        let mut visited = BTreeSet::new();
+        while let Some(next) = local_forwarding.get(current) {
+            if !visited.insert(current.clone()) {
+                return Err(format!(
+                    "resource identity forwarding forms a local cycle at owner {} local {} member `{}` source {}",
+                    current.0,
+                    current.1.0,
+                    current.2.join("."),
+                    current.3
+                ));
+            }
+            current = next;
         }
     }
     for (index, binding) in program.scope_index.bindings.iter().enumerate() {
@@ -10081,11 +10995,11 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
         }
         match &binding.target {
             ViewBindingTarget::Read { read, .. } => {
-                if !program
+                if program
                     .scope_index
                     .reads
                     .get(read.as_usize())
-                    .is_some_and(|candidate| candidate.id == *read)
+                    .is_none_or(|candidate| candidate.id != *read)
                 {
                     return Err(format!(
                         "view binding `{}.{}` references missing erased read {read}",
@@ -10094,10 +11008,10 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                 }
             }
             ViewBindingTarget::Source { source } => {
-                if !program
+                if program
                     .sources
                     .get(source.as_usize())
-                    .is_some_and(|candidate| candidate.id == *source)
+                    .is_none_or(|candidate| candidate.id != *source)
                 {
                     return Err(format!(
                         "view binding `{}.{}` references missing source {source}",
@@ -12322,9 +13236,13 @@ fn bind_executable_state_resources(
                     format!("{target}.{}", executable_state.binding_path)
                 }
                 (None, Some(path)) => path.to_owned(),
-                (None, None) => is_canonical_resource_path(&executable_state.binding_path)
-                    .then(|| executable_state.binding_path.clone())
-                    .unwrap_or_else(|| declared_path.clone()),
+                (None, None) => {
+                    if is_canonical_resource_path(&executable_state.binding_path) {
+                        executable_state.binding_path.clone()
+                    } else {
+                        declared_path.clone()
+                    }
+                }
             }
         });
         let state_id = StateId(states.len());
@@ -12502,7 +13420,7 @@ fn executable_state_hold_name(
                 } if !name.is_empty() => Some(name.as_str()),
                 _ => None,
             })
-            .or_else(|| match &statement.checked.kind {
+            .or(match &statement.checked.kind {
                 boon_typecheck::CheckedStatementKind::Hold {
                     name: Some(name), ..
                 } if !name.is_empty() => Some(name.as_str()),
@@ -12739,16 +13657,30 @@ fn contextual_materializations(
         .map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Copy)]
+struct ViewBindingContext<'a> {
+    executable: &'a ExecutableProgram,
+    storage: &'a ErasedScopeIndex,
+    source_authority: &'a ExecutableSourceAuthorityIndex,
+    list_storage: &'a BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    row_scopes: &'a [RowScope],
+    sources: &'a [SourcePort],
+    materializations: &'a [ContextualMaterialization],
+}
+
 fn view_bindings(
-    executable: &ExecutableProgram,
-    storage: &ErasedScopeIndex,
-    source_authority: &ExecutableSourceAuthorityIndex,
-    list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    context: ViewBindingContext<'_>,
     output_values: &[OutputRootValue],
-    row_scopes: &[RowScope],
-    sources: &[SourcePort],
-    materializations: &[ContextualMaterialization],
 ) -> Result<Vec<ViewBinding>, String> {
+    let ViewBindingContext {
+        executable,
+        storage,
+        source_authority,
+        list_storage,
+        row_scopes,
+        sources,
+        materializations,
+    } = context;
     let mut collector = ExecutableViewBindingCollector::new(
         executable,
         storage,
@@ -13094,6 +14026,13 @@ fn bind_contextual_materialization_lineage(
     verify_contextual_materialization_lineage(materializations)
 }
 
+#[derive(Clone, Copy)]
+struct InputMaterializationMaps<'a> {
+    statement_values: &'a BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
+    statement_rows: &'a BTreeMap<boon_typecheck::DeclId, ErasedRowBinding>,
+    local_values: &'a BTreeMap<ExecutableLocalBindingId, ExecutableLocalBindingValue>,
+}
+
 fn collect_input_materializations(
     executable: &ExecutableProgram,
     expression_id: ExecutableExprId,
@@ -13103,14 +14042,17 @@ fn collect_input_materializations(
     visited: &mut BTreeSet<(ExecutableExprId, Vec<String>, bool)>,
     inputs: &mut BTreeSet<ContextualRowLineageLeaf>,
 ) -> Result<(), String> {
+    let context = InputMaterializationMaps {
+        statement_values,
+        statement_rows,
+        local_values,
+    };
     collect_input_materializations_at_projection(
         executable,
         expression_id,
         &[],
         true,
-        statement_values,
-        statement_rows,
-        local_values,
+        context,
         visited,
         inputs,
     )
@@ -13121,12 +14063,15 @@ fn collect_input_materializations_at_projection(
     expression_id: ExecutableExprId,
     projection: &[String],
     row_identity: bool,
-    statement_values: &BTreeMap<boon_typecheck::DeclId, ExecutableExprId>,
-    statement_rows: &BTreeMap<boon_typecheck::DeclId, ErasedRowBinding>,
-    local_values: &BTreeMap<ExecutableLocalBindingId, ExecutableLocalBindingValue>,
+    context: InputMaterializationMaps<'_>,
     visited: &mut BTreeSet<(ExecutableExprId, Vec<String>, bool)>,
     inputs: &mut BTreeSet<ContextualRowLineageLeaf>,
 ) -> Result<(), String> {
+    let InputMaterializationMaps {
+        statement_values,
+        statement_rows,
+        local_values,
+    } = context;
     if !visited.insert((expression_id, projection.to_vec(), row_identity)) {
         return Ok(());
     }
@@ -13153,9 +14098,7 @@ fn collect_input_materializations_at_projection(
                         *value,
                         &combined,
                         row_identity,
-                        statement_values,
-                        statement_rows,
-                        local_values,
+                        context,
                         visited,
                         inputs,
                     );
@@ -13188,9 +14131,7 @@ fn collect_input_materializations_at_projection(
                     local.value,
                     &combined,
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 );
@@ -13203,9 +14144,7 @@ fn collect_input_materializations_at_projection(
                     *input,
                     &combined,
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 );
@@ -13226,9 +14165,7 @@ fn collect_input_materializations_at_projection(
                     projected,
                     remaining,
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 );
@@ -13239,9 +14176,7 @@ fn collect_input_materializations_at_projection(
                     *input,
                     projection,
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 );
@@ -13252,9 +14187,7 @@ fn collect_input_materializations_at_projection(
                     *result,
                     projection,
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 );
@@ -13266,9 +14199,7 @@ fn collect_input_materializations_at_projection(
                         *branch,
                         projection,
                         row_identity,
-                        statement_values,
-                        statement_rows,
-                        local_values,
+                        context,
                         visited,
                         inputs,
                     )?;
@@ -13282,9 +14213,7 @@ fn collect_input_materializations_at_projection(
                         arm.output,
                         projection,
                         row_identity,
-                        statement_values,
-                        statement_rows,
-                        local_values,
+                        context,
                         visited,
                         inputs,
                     )?;
@@ -13303,9 +14232,7 @@ fn collect_input_materializations_at_projection(
                     output,
                     projection,
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 );
@@ -13369,26 +14296,18 @@ fn collect_input_materializations_at_projection(
         ExecutableExpressionKind::CanonicalRead {
             target, projection, ..
         } => {
-            if projection.is_empty() {
-                if let Some(row) = statement_rows.get(target) {
-                    if row_identity {
-                        inputs.insert(ContextualRowLineageLeaf::Stored(*row));
-                    }
-                    if let Some(value) = statement_values.get(target) {
-                        collect_input_materializations_at_projection(
-                            executable,
-                            *value,
-                            projection,
-                            false,
-                            statement_values,
-                            statement_rows,
-                            local_values,
-                            visited,
-                            inputs,
-                        )?;
-                    }
-                    return Ok(());
+            if projection.is_empty()
+                && let Some(row) = statement_rows.get(target)
+            {
+                if row_identity {
+                    inputs.insert(ContextualRowLineageLeaf::Stored(*row));
                 }
+                if let Some(value) = statement_values.get(target) {
+                    collect_input_materializations_at_projection(
+                        executable, *value, projection, false, context, visited, inputs,
+                    )?;
+                }
+                return Ok(());
             }
             if let Some(value) = statement_values.get(target) {
                 collect_input_materializations_at_projection(
@@ -13396,9 +14315,7 @@ fn collect_input_materializations_at_projection(
                     *value,
                     projection,
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 )?;
@@ -13429,9 +14346,7 @@ fn collect_input_materializations_at_projection(
                 local.value,
                 projection,
                 row_identity,
-                statement_values,
-                statement_rows,
-                local_values,
+                context,
                 visited,
                 inputs,
             )?;
@@ -13442,9 +14357,7 @@ fn collect_input_materializations_at_projection(
                 *input,
                 &[],
                 row_identity,
-                statement_values,
-                statement_rows,
-                local_values,
+                context,
                 visited,
                 inputs,
             )?;
@@ -13455,9 +14368,7 @@ fn collect_input_materializations_at_projection(
                 *input,
                 fields,
                 row_identity,
-                statement_values,
-                statement_rows,
-                local_values,
+                context,
                 visited,
                 inputs,
             )?;
@@ -13468,9 +14379,7 @@ fn collect_input_materializations_at_projection(
                 *result,
                 &[],
                 row_identity,
-                statement_values,
-                statement_rows,
-                local_values,
+                context,
                 visited,
                 inputs,
             )?;
@@ -13482,9 +14391,7 @@ fn collect_input_materializations_at_projection(
                     *branch,
                     &[],
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 )?;
@@ -13497,9 +14404,7 @@ fn collect_input_materializations_at_projection(
                     arm.output,
                     &[],
                     row_identity,
-                    statement_values,
-                    statement_rows,
-                    local_values,
+                    context,
                     visited,
                     inputs,
                 )?;
@@ -13517,9 +14422,7 @@ fn collect_input_materializations_at_projection(
                 output,
                 &[],
                 row_identity,
-                statement_values,
-                statement_rows,
-                local_values,
+                context,
                 visited,
                 inputs,
             )?;
@@ -14924,14 +15827,13 @@ impl<'a> ExecutableViewBindingCollector<'a> {
             .collect::<Vec<_>>();
         let multiple = candidates.len() > 1;
         for (member_path, path, source_id, scope_id) in &candidates {
-            let source_attr = if multiple || attr.is_none() {
-                member_path
+            let source_attr = match (multiple, attr) {
+                (false, Some(attr)) => attr,
+                _ => member_path
                     .last()
                     .map(String::as_str)
                     .or_else(|| path.rsplit('.').next())
-                    .unwrap_or("event")
-            } else {
-                attr.expect("checked above")
+                    .unwrap_or("event"),
             };
             self.bindings.push(ViewBinding {
                 id: ViewBindingId(self.bindings.len()),
@@ -16296,19 +17198,35 @@ fn state_update_arms(
     Ok(result)
 }
 
-fn derived_values(
-    checked: &boon_typecheck::CheckedProgram,
-    executable: &ExecutableProgram,
-    static_owners: &[StaticOwnerDef],
-    derived_list_storage: &BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
-    erased_fields: &[ErasedFieldDef],
-    state_cells: &[StateCell],
-    sources: &[SourcePort],
-    materializations: &[ContextualMaterialization],
-    source_authority: &ExecutableSourceAuthorityIndex,
-    producer_function_instances: &[ProducerFunctionInstance],
-    distributed_value_references: &[DistributedValueReference],
-) -> Result<Vec<DerivedValue>, String> {
+#[derive(Clone, Copy)]
+struct DerivedValueContext<'a> {
+    checked: &'a boon_typecheck::CheckedProgram,
+    executable: &'a ExecutableProgram,
+    static_owners: &'a [StaticOwnerDef],
+    derived_list_storage: &'a BTreeMap<ExecutableStatementId, DerivedListStorageIds>,
+    erased_fields: &'a [ErasedFieldDef],
+    state_cells: &'a [StateCell],
+    sources: &'a [SourcePort],
+    materializations: &'a [ContextualMaterialization],
+    source_authority: &'a ExecutableSourceAuthorityIndex,
+    producer_function_instances: &'a [ProducerFunctionInstance],
+    distributed_value_references: &'a [DistributedValueReference],
+}
+
+fn derived_values(context: DerivedValueContext<'_>) -> Result<Vec<DerivedValue>, String> {
+    let DerivedValueContext {
+        checked,
+        executable,
+        static_owners,
+        derived_list_storage,
+        erased_fields,
+        state_cells,
+        sources,
+        materializations,
+        source_authority,
+        producer_function_instances,
+        distributed_value_references,
+    } = context;
     let mut triggers =
         ExecutableTriggerResolver::new(executable, source_authority, materializations)?;
     let output_roots = output_root_declarations(checked, &checked.lowering_metadata);

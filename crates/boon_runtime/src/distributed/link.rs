@@ -29,6 +29,16 @@ pub(super) struct ClientSessionLink {
     resync_expected_next: Option<u64>,
 }
 
+pub(super) struct DataFrameRequest {
+    pub(super) operation_sequence: u64,
+    pub(super) edge_id: [u8; 32],
+    pub(super) operation: ClientSessionDataOperation,
+    pub(super) call_instance_id: Option<[u8; 32]>,
+    pub(super) semantic_revision: u64,
+    pub(super) result_revision: Option<u64>,
+    pub(super) payload: boon_data::Value,
+}
+
 impl ClientSessionLink {
     pub(super) fn new(
         graph_hash: [u8; 32],
@@ -105,13 +115,7 @@ impl ClientSessionLink {
 
     pub(super) fn encode_data(
         &self,
-        operation_sequence: u64,
-        edge_id: [u8; 32],
-        operation: ClientSessionDataOperation,
-        call_instance_id: Option<[u8; 32]>,
-        semantic_revision: u64,
-        result_revision: Option<u64>,
-        payload: boon_data::Value,
+        request: DataFrameRequest,
     ) -> Result<Vec<u8>, DistributedRuntimeError> {
         encode_client_session_frame(
             &ClientSessionFrame::Data {
@@ -120,14 +124,14 @@ impl ClientSessionLink {
                 schema_hash: self.schema_hash,
                 session_id: self.session_id,
                 generation: self.generation,
-                operation_sequence,
+                operation_sequence: request.operation_sequence,
                 ack_through: self.applied_receive_through,
-                edge_id,
-                operation,
-                call_instance_id,
-                semantic_revision,
-                result_revision,
-                payload,
+                edge_id: request.edge_id,
+                operation: request.operation,
+                call_instance_id: request.call_instance_id,
+                semantic_revision: request.semantic_revision,
+                result_revision: request.result_revision,
+                payload: request.payload,
             },
             ClientSessionFrameLimits::default(),
         )

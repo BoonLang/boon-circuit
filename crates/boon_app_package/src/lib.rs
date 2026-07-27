@@ -11,6 +11,7 @@ mod manifest;
 #[cfg(feature = "build")]
 mod build;
 
+pub use boon_contract::SourceBundleDigestV1;
 pub use browser::*;
 pub use bundle::*;
 pub use manifest::*;
@@ -22,7 +23,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 pub const APP_MANIFEST_FORMAT: u32 = 1;
-pub const BUNDLE_FORMAT: u32 = 2;
+pub const BUNDLE_FORMAT: u32 = 3;
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PACKAGE_FILE_BYTES: usize = 128 * 1024 * 1024;

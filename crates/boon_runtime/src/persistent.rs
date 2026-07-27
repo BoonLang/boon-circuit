@@ -675,6 +675,20 @@ struct ProgramArtifactLanes {
     requests: Vec<ProgramHostRequest>,
 }
 
+struct HostCompletionRequest<'a> {
+    session: &'a ProgramSessionId,
+    request_id: &'a ProgramRequestId,
+    result: Result<ProgramArtifact, ProgramDiagnostic>,
+    artifact_load: bool,
+    lifecycle_already_dispatched: bool,
+}
+
+struct LifecycleDispatchRequest<'a> {
+    path: &'a str,
+    payload: SourcePayload,
+    content_changes: Option<Vec<DurableContentArtifactChange>>,
+}
+
 impl PersistentRuntime {
     pub fn from_machine_plan<D>(
         plan: MachinePlan,
@@ -697,6 +711,9 @@ impl PersistentRuntime {
     where
         D: PersistenceDriver + Send + 'static,
     {
+        // Both variants carry the runtime inline so startup transfers ownership
+        // without introducing an allocation on either resolution path.
+        #[allow(clippy::large_enum_variant)]
         enum ResolvedRuntimeStartup {
             Ready {
                 runtime: LiveRuntime,
@@ -2945,10 +2962,27 @@ impl ProgramArtifactLanes {
         let request_is_current = host.request_is_current(session, request_id);
         let artifact_ownership = host.request_artifact_ownership(session, request_id);
         let artifact_load = host.request_is_artifact_load(session, request_id);
-        let (observed, mut drive) =
-            if request_is_current && let Some(ownership) = artifact_ownership {
-                match result {
-                    Ok(artifact) => {
+        let (observed, mut drive) = if request_is_current
+            && let Some(ownership) = artifact_ownership
+        {
+            match result {
+                Ok(artifact) => {
+                    if let Err(diagnostic) =
+                        host.validate_completion_artifact(session, request_id, &artifact)
+                    {
+                        self.finish_host_completion(
+                            runtime,
+                            host,
+                            source_sequence,
+                            HostCompletionRequest {
+                                session,
+                                request_id,
+                                result: Err(diagnostic),
+                                artifact_load: false,
+                                lifecycle_already_dispatched: false,
+                            },
+                        )?
+                    } else {
                         let activate_before_store =
                             ownership.retention == ContentArtifactRetention::Replaceable;
                         let pending = self.pending_store(
@@ -2965,11 +2999,13 @@ impl ProgramArtifactLanes {
                                 runtime,
                                 host,
                                 source_sequence,
-                                session,
-                                request_id,
-                                Ok(artifact),
-                                false,
-                                true,
+                                HostCompletionRequest {
+                                    session,
+                                    request_id,
+                                    result: Ok(artifact),
+                                    artifact_load: false,
+                                    lifecycle_already_dispatched: true,
+                                },
                             )?;
                             if !matches!(
                                 activated.completion,
@@ -3000,29 +3036,34 @@ impl ProgramArtifactLanes {
                             }
                         }
                     }
-                    Err(diagnostic) => self.finish_host_completion(
-                        runtime,
-                        host,
-                        source_sequence,
-                        session,
-                        request_id,
-                        Err(diagnostic),
-                        false,
-                        false,
-                    )?,
                 }
-            } else {
-                self.finish_host_completion(
+                Err(diagnostic) => self.finish_host_completion(
                     runtime,
                     host,
                     source_sequence,
+                    HostCompletionRequest {
+                        session,
+                        request_id,
+                        result: Err(diagnostic),
+                        artifact_load: false,
+                        lifecycle_already_dispatched: false,
+                    },
+                )?,
+            }
+        } else {
+            self.finish_host_completion(
+                runtime,
+                host,
+                source_sequence,
+                HostCompletionRequest {
                     session,
                     request_id,
                     result,
                     artifact_load,
-                    false,
-                )?
-            };
+                    lifecycle_already_dispatched: false,
+                },
+            )?
+        };
         drive.changed |= observed.changed;
         drive.completion = Some(observed.completion);
         Ok(drive)
@@ -3033,12 +3074,15 @@ impl ProgramArtifactLanes {
         runtime: &mut PersistentRuntime,
         host: &mut ProgramDocumentHost,
         source_sequence: &mut u64,
-        session: &ProgramSessionId,
-        request_id: &ProgramRequestId,
-        result: Result<ProgramArtifact, ProgramDiagnostic>,
-        artifact_load: bool,
-        lifecycle_already_dispatched: bool,
+        request: HostCompletionRequest<'_>,
     ) -> Result<(ObservedProgramCompletion, ProgramArtifactDrive), PersistentDispatchError> {
+        let HostCompletionRequest {
+            session,
+            request_id,
+            result,
+            artifact_load,
+            lifecycle_already_dispatched,
+        } = request;
         let (completion, update) = host.complete(session, request_id, result);
         let bootstrap = update.bootstrap;
         let lifecycle = if artifact_load || lifecycle_already_dispatched {
@@ -3071,10 +3115,12 @@ impl ProgramArtifactLanes {
                     runtime,
                     host,
                     source_sequence,
-                    &path,
-                    payload.clone(),
-                    None,
                     &mut drive,
+                    LifecycleDispatchRequest {
+                        path: &path,
+                        payload: payload.clone(),
+                        content_changes: None,
+                    },
                 )?;
             }
         }
@@ -3116,10 +3162,12 @@ impl ProgramArtifactLanes {
                 runtime,
                 host,
                 source_sequence,
-                &path,
-                payload.clone(),
-                None,
                 drive,
+                LifecycleDispatchRequest {
+                    path: &path,
+                    payload: payload.clone(),
+                    content_changes: None,
+                },
             )?;
         }
         Ok(())
@@ -3130,11 +3178,14 @@ impl ProgramArtifactLanes {
         runtime: &mut PersistentRuntime,
         host: &mut ProgramDocumentHost,
         source_sequence: &mut u64,
-        path: &str,
-        payload: SourcePayload,
-        content_changes: Option<Vec<DurableContentArtifactChange>>,
         drive: &mut ProgramArtifactDrive,
+        request: LifecycleDispatchRequest<'_>,
     ) -> Result<Option<DurabilityTicket>, PersistentDispatchError> {
+        let LifecycleDispatchRequest {
+            path,
+            payload,
+            content_changes,
+        } = request;
         let next_sequence = source_sequence.saturating_add(1);
         if host.owns_source_route(path) {
             if content_changes.is_some() {
@@ -3263,17 +3314,19 @@ impl ProgramArtifactLanes {
                 runtime,
                 host,
                 source_sequence,
-                &pending.session,
-                &pending.request_id,
-                Err(ProgramDiagnostic::artifact(
-                    pending.artifact.revision(),
-                    format!(
-                        "program artifact store has {} pending sessions, limit is {MAX_PROGRAM_ARTIFACT_STORE_SESSIONS}",
-                        self.store.session_count()
-                    ),
-                )),
-                false,
-                false,
+                HostCompletionRequest {
+                    session: &pending.session,
+                    request_id: &pending.request_id,
+                    result: Err(ProgramDiagnostic::artifact(
+                        pending.artifact.revision(),
+                        format!(
+                            "program artifact store has {} pending sessions, limit is {MAX_PROGRAM_ARTIFACT_STORE_SESSIONS}",
+                            self.store.session_count()
+                        ),
+                    )),
+                    artifact_load: false,
+                    lifecycle_already_dispatched: false,
+                },
             );
         }
 
@@ -3308,16 +3361,18 @@ impl ProgramArtifactLanes {
                 runtime,
                 host,
                 source_sequence,
-                &pending.session,
-                &pending.request_id,
-                Err(ProgramDiagnostic::artifact(
-                    pending.artifact.revision(),
-                    format!(
-                        "program artifact store would retain {projected_bytes} queued bytes, limit is {MAX_PROGRAM_ARTIFACT_STORE_BYTES}"
-                    ),
-                )),
-                false,
-                false,
+                HostCompletionRequest {
+                    session: &pending.session,
+                    request_id: &pending.request_id,
+                    result: Err(ProgramDiagnostic::artifact(
+                        pending.artifact.revision(),
+                        format!(
+                            "program artifact store would retain {projected_bytes} queued bytes, limit is {MAX_PROGRAM_ARTIFACT_STORE_BYTES}"
+                        ),
+                    )),
+                    artifact_load: false,
+                    lifecycle_already_dispatched: false,
+                },
             );
         }
 
@@ -3585,17 +3640,19 @@ impl ProgramArtifactLanes {
                     runtime,
                     host,
                     source_sequence,
-                    &session,
-                    &request_id,
-                    Err(ProgramDiagnostic::artifact(
-                        revision,
-                        format!(
-                            "retained embedded program requires exactly one compiled lifecycle route, found {}",
-                            paths.len()
-                        ),
-                    )),
-                    false,
-                    false,
+                    HostCompletionRequest {
+                        session: &session,
+                        request_id: &request_id,
+                        result: Err(ProgramDiagnostic::artifact(
+                            revision,
+                            format!(
+                                "retained embedded program requires exactly one compiled lifecycle route, found {}",
+                                paths.len()
+                            ),
+                        )),
+                        artifact_load: false,
+                        lifecycle_already_dispatched: false,
+                    },
                 )?;
                 let _ = observed;
                 drive.merge(completed);
@@ -3620,10 +3677,12 @@ impl ProgramArtifactLanes {
                 runtime,
                 host,
                 source_sequence,
-                &paths[0],
-                payload,
-                Some(vec![change]),
                 &mut drive,
+                LifecycleDispatchRequest {
+                    path: &paths[0],
+                    payload,
+                    content_changes: Some(vec![change]),
+                },
             ) {
                 Ok(Some(ticket)) => {
                     self.store.awaiting_durability.insert(
@@ -3651,11 +3710,13 @@ impl ProgramArtifactLanes {
                         runtime,
                         host,
                         source_sequence,
-                        &session,
-                        &request_id,
-                        Err(ProgramDiagnostic::artifact(revision, error.to_string())),
-                        false,
-                        false,
+                        HostCompletionRequest {
+                            session: &session,
+                            request_id: &request_id,
+                            result: Err(ProgramDiagnostic::artifact(revision, error.to_string())),
+                            artifact_load: false,
+                            lifecycle_already_dispatched: false,
+                        },
                     )?;
                     let _ = observed;
                     drive.merge(completed);
@@ -3718,11 +3779,13 @@ impl ProgramArtifactLanes {
                 runtime,
                 host,
                 source_sequence,
-                &pending.session,
-                &pending.request_id,
-                result.map(|()| pending.artifact),
-                false,
-                authority_committed,
+                HostCompletionRequest {
+                    session: &pending.session,
+                    request_id: &pending.request_id,
+                    result: result.map(|()| pending.artifact),
+                    artifact_load: false,
+                    lifecycle_already_dispatched: authority_committed,
+                },
             )?
         } else if !authority_committed {
             (
@@ -3766,13 +3829,13 @@ impl ProgramArtifactLanes {
 }
 
 fn compiled_program_payload(artifact: &ProgramArtifact, bootstrap: bool) -> SourcePayload {
-    let mut payload = SourcePayload {
-        text: Some(artifact.source_digest().to_owned()),
-        ..SourcePayload::default()
-    };
+    let mut payload = SourcePayload::default();
     for (name, value) in [
         ("revision", artifact.revision().to_string()),
-        ("source_digest", artifact.source_digest().to_owned()),
+        (
+            "source_bundle_digest_v1",
+            artifact.source_bundle_digest_v1().to_string(),
+        ),
         ("compiler", artifact.compiler_id().to_owned()),
         ("target", artifact.target_profile_id().to_owned()),
         (
@@ -3869,10 +3932,16 @@ fn reject_unfinished_outbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DocumentFrame, compile_program_artifact};
+    use boon_document_model::{
+        DocumentNode, DocumentNodeId, DocumentNodeKind, EmbeddedProgramDescriptor,
+        ProgramArtifactRetention,
+    };
     use boon_persistence::{
         CheckpointBatch, ContentArtifactOwnerId, InMemoryDriver, PersistenceCommand,
         PersistenceResult, RedbDriver, ShutdownAck, StoreError,
     };
+    use boon_plan::ApplicationIdentity;
     use boon_plan_executor::SourcePayload;
     use redb::{ReadableTable, TableDefinition};
     use std::collections::BTreeMap;
@@ -3881,6 +3950,239 @@ mod tests {
 
     fn number(value: i64) -> Value {
         Value::integer(value).unwrap()
+    }
+
+    fn program_parent_frame(
+        revision: u64,
+        source: String,
+        retention: ProgramArtifactRetention,
+    ) -> DocumentFrame {
+        let mut frame = DocumentFrame::empty("parent");
+        let mut program = DocumentNode::new("program", DocumentNodeKind::EmbeddedProgram);
+        program.parent = Some(frame.root.clone());
+        program.embedded_program = Some(EmbeddedProgramDescriptor {
+            source,
+            revision,
+            artifact_retention: retention,
+            ..EmbeddedProgramDescriptor::default()
+        });
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .unwrap()
+            .children
+            .push(program.id.clone());
+        frame.nodes.insert(program.id.clone(), program);
+        frame
+    }
+
+    fn child_program_source(label: &str) -> String {
+        format!("scene: Scene/Element/text(element: [], style: [], text: TEXT {{ {label} }})\n")
+    }
+
+    #[test]
+    fn archive_lane_rejects_wrong_artifacts_before_store_or_durable_authority() {
+        let parent_application =
+            ApplicationIdentity::new("dev.boon.archive-parent", "archive-test", "local");
+        let artifact_source = child_program_source("artifact A");
+        let artifact_frame =
+            program_parent_frame(2, artifact_source, ProgramArtifactRetention::Ephemeral);
+        let (_, build_requests) =
+            ProgramDocumentHost::mount(parent_application.clone(), &artifact_frame);
+        let artifact = compile_program_artifact(&build_requests[0].compile).unwrap();
+
+        let parent_runtime = LiveRuntime::from_source_with_identity(
+            "archive-parent.bn",
+            &child_program_source("parent"),
+            parent_application.clone(),
+        )
+        .unwrap();
+        let parent_plan = parent_runtime.shared_machine_plan();
+
+        for equal_revision_bootstrap in [false, true] {
+            let mut target_frame = program_parent_frame(
+                2,
+                child_program_source("current B"),
+                ProgramArtifactRetention::Archive,
+            );
+            if equal_revision_bootstrap {
+                let descriptor = target_frame
+                    .nodes
+                    .get_mut(&DocumentNodeId("program".to_owned()))
+                    .unwrap()
+                    .embedded_program
+                    .as_mut()
+                    .unwrap();
+                descriptor.bootstrap_artifact_id = artifact.id_text();
+                descriptor.bootstrap_revision = 2;
+            }
+            let (mut host, requests) =
+                ProgramDocumentHost::mount(parent_application.clone(), &target_frame);
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0]
+                    .artifact_ownership
+                    .expect("archive request ownership")
+                    .retention,
+                ContentArtifactRetention::Immutable
+            );
+
+            let storage = SharedPersistenceDriver::default();
+            let (mut runtime, _) = PersistentRuntime::from_shared_machine_plan(
+                Arc::clone(&parent_plan),
+                SessionOptions::default(),
+                storage.clone(),
+                PersistenceWorkerConfig::default(),
+            )
+            .unwrap();
+            let mut source_sequence = 0;
+            let drive = runtime
+                .complete_program_observed(
+                    &mut host,
+                    &mut source_sequence,
+                    &requests[0].session,
+                    &requests[0].request_id,
+                    Ok(artifact.clone()),
+                )
+                .unwrap();
+            assert!(matches!(
+                drive.completion,
+                Some(ProgramCompletionObservation::Host(
+                    ProgramHostCompletion::Program(ProgramCompletion::Rejected { .. })
+                ))
+            ));
+            assert!(drive.turns.is_empty());
+            assert_eq!(runtime.program_artifact_lane_counts(), (0, 0));
+            assert!(!runtime.program_artifacts_pending());
+            assert!(host.active_artifact(&requests[0].session).is_none());
+            let storage = storage
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                storage
+                    .image(&parent_application)
+                    .expect("initialized parent authority")
+                    .content_artifact_manifest
+                    .bindings
+                    .is_empty()
+            );
+            drop(storage);
+            runtime.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn equal_revision_replaceable_bootstrap_binds_the_exact_artifact_durably() {
+        let parent_application =
+            ApplicationIdentity::new("dev.boon.replaceable-parent", "bootstrap-test", "local");
+        let parent_source = r#"
+store: [
+    program: [
+        compiled: SOURCE
+        rejected: SOURCE
+    ]
+]
+scene: Scene/Element/program(
+    element: [events: store.program]
+    style: []
+    source: "scene: Scene/Element/text(element: [], style: [], text: TEXT { exact replaceable })"
+    revision: 2
+    artifact_retention: Replaceable
+    capability_profile: PublicClient
+    session_key: TEXT { exact-replaceable }
+    mount: False
+)
+"#;
+        let parent_runtime = LiveRuntime::from_source_with_identity(
+            "replaceable-parent.bn",
+            parent_source,
+            parent_application.clone(),
+        )
+        .unwrap();
+        let build_frame = parent_runtime
+            .primary_retained_output_frame()
+            .unwrap()
+            .clone();
+        let (_, build_requests) =
+            ProgramDocumentHost::mount(parent_application.clone(), &build_frame);
+        let artifact = compile_program_artifact(&build_requests[0].compile).unwrap();
+        let artifact_id = artifact.id();
+
+        let mut restored_frame = build_frame;
+        let descriptor = restored_frame
+            .nodes
+            .values_mut()
+            .find_map(|node| node.embedded_program.as_mut())
+            .expect("retained program descriptor");
+        descriptor.bootstrap_artifact_id = artifact.id_text();
+        descriptor.bootstrap_revision = 2;
+        let (mut host, requests) =
+            ProgramDocumentHost::mount(parent_application.clone(), &restored_frame);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].artifact_id, Some(artifact_id));
+        assert_eq!(
+            requests[0]
+                .artifact_ownership
+                .expect("equal-revision restore owns one replaceable binding")
+                .retention,
+            ContentArtifactRetention::Replaceable
+        );
+        let session = requests[0].session.clone();
+        let request_id = requests[0].request_id.clone();
+
+        let storage = SharedPersistenceDriver::default();
+        let (mut runtime, _) = PersistentRuntime::from_shared_machine_plan(
+            parent_runtime.shared_machine_plan(),
+            SessionOptions::default(),
+            storage.clone(),
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+        let mut source_sequence = 0;
+        let drive = runtime
+            .complete_program_observed(
+                &mut host,
+                &mut source_sequence,
+                &session,
+                &request_id,
+                Ok(artifact),
+            )
+            .unwrap();
+        assert!(matches!(
+            drive.completion,
+            Some(ProgramCompletionObservation::Host(
+                ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 2 })
+            ))
+        ));
+        assert!(host.request_is_current(&session, &request_id));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.program_artifacts_pending() {
+            runtime
+                .poll_program_artifacts(&mut host, &mut source_sequence)
+                .unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "replaceable artifact store did not reach durable authority"
+            );
+            std::thread::yield_now();
+        }
+
+        let storage = storage
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let manifest = &storage
+            .image(&parent_application)
+            .expect("initialized parent authority")
+            .content_artifact_manifest;
+        assert_eq!(manifest.bindings.len(), 1);
+        let binding = manifest.bindings.values().next().unwrap();
+        assert_eq!(binding.artifact_id, artifact_id);
+        assert_eq!(binding.retention, ContentArtifactRetention::Replaceable);
+        drop(storage);
+        runtime.shutdown().unwrap();
     }
 
     struct FailingActivationDriver {

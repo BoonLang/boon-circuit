@@ -1,0 +1,4 @@
+roles: SET {
+    Admin
+    Viewer
+}

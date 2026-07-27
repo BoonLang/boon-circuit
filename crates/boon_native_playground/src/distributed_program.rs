@@ -114,15 +114,29 @@ pub(crate) fn distributed_fixture_sources() -> Vec<ProgramSource> {
 mod tests {
     use super::*;
     use crate::protocol::SourceUnit;
+    use boon_contract::{SourceBundleDigestV1, SourceBundleUnit};
     use boon_runtime::ProgramArtifact;
 
     const SHARED_PATH: &str = "distributed_fixture/Shared/DistributedContract.bn";
+    const CLIENT_PATH: &str = "distributed_fixture/Client/RUN.bn";
+    const SESSION_PATH: &str = "distributed_fixture/Session/RUN.bn";
     const SERVER_PATH: &str = "distributed_fixture/Server/RUN.bn";
     const SHARED_SOURCE: &str =
         include_str!("../testdata/distributed_fixture/Shared/DistributedContract.bn");
     const CLIENT_SOURCE: &str = include_str!("../testdata/distributed_fixture/Client/RUN.bn");
     const SESSION_SOURCE: &str = include_str!("../testdata/distributed_fixture/Session/RUN.bn");
     const SERVER_SOURCE: &str = include_str!("../testdata/distributed_fixture/Server/RUN.bn");
+
+    fn expected_source_bundle_digest_v1(entry_path: &str, source: &str) -> SourceBundleDigestV1 {
+        SourceBundleDigestV1::new(
+            entry_path,
+            [
+                SourceBundleUnit::new(SHARED_PATH, SHARED_SOURCE),
+                SourceBundleUnit::new(entry_path, source),
+            ],
+        )
+        .unwrap()
+    }
 
     #[test]
     fn unrelated_distributed_program_compiles_role_owned_artifacts() {
@@ -148,16 +162,16 @@ mod tests {
             ProgramCapabilityProfile::TrustedServer
         );
         assert_eq!(
-            client.source_digest(),
-            boon_runtime::sha256_bytes(CLIENT_SOURCE.as_bytes())
+            client.source_bundle_digest_v1(),
+            expected_source_bundle_digest_v1(CLIENT_PATH, CLIENT_SOURCE)
         );
         assert_eq!(
-            session.source_digest(),
-            boon_runtime::sha256_bytes(SESSION_SOURCE.as_bytes())
+            session.source_bundle_digest_v1(),
+            expected_source_bundle_digest_v1(SESSION_PATH, SESSION_SOURCE)
         );
         assert_eq!(
-            server.source_digest(),
-            boon_runtime::sha256_bytes(SERVER_SOURCE.as_bytes())
+            server.source_bundle_digest_v1(),
+            expected_source_bundle_digest_v1(SERVER_PATH, SERVER_SOURCE)
         );
         assert_ne!(client.plan_digest(), session.plan_digest());
         assert_ne!(session.plan_digest(), server.plan_digest());

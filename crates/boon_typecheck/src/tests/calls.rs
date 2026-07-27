@@ -864,7 +864,7 @@ fn checked_program_keeps_unimplemented_callable_names_fail_closed() {
     ] {
         let parsed = boon_parser::parse_source(
             "checked-missing-schema.bn",
-            &format!("value: {function}()\n"),
+            format!("value: {function}()\n"),
         )
         .unwrap();
         let output = check_program(&parsed);
@@ -884,7 +884,7 @@ fn numeric_infix_operators_reject_text_coercion() {
     for operator in ["+", "-", "*", "/", "%", ">", "<", ">=", "<="] {
         let parsed = boon_parser::parse_source(
             "numeric-infix-types.bn",
-            &format!("value: TEXT {{ A }} {operator} 1\n"),
+            format!("value: TEXT {{ A }} {operator} 1\n"),
         )
         .unwrap();
         let report = check(&parsed);
@@ -1048,7 +1048,13 @@ scene: Scene/new(
                 element: []
                 style: [width: Fill, height: Fill]
                 source: TEXT { scene: Scene/new(root: NoElement) }
+                support_sources: LIST {}
                 revision: 1
+                bootstrap_source: TEXT { scene: Bootstrap/render() }
+                bootstrap_support_sources: LIST {
+                    [path: TEXT { Bootstrap.bn }, source: TEXT { FUNCTION render() }]
+                }
+                bootstrap_revision: 1
                 capability_profile: PublicClient
             )
             Scene/Element/embedded_media(
@@ -1105,6 +1111,7 @@ scene: Scene/new(
         "artifact_retention",
         "bootstrap_source",
         "bootstrap_artifact_id",
+        "bootstrap_support_sources",
         "bootstrap_revision",
         "capability_profile",
         "session_key",
@@ -1133,6 +1140,49 @@ scene: Scene/new(
         ],
     );
     assert_no_unbound_calls(&parsed, &program);
+}
+
+#[test]
+fn program_support_source_records_reject_all_caller_digest_fields() {
+    for (argument, digest_field) in [
+        ("support_sources", "source_digest"),
+        ("support_sources", "source_bundle_digest_v1"),
+        ("bootstrap_support_sources", "source_digest"),
+        (
+            "bootstrap_support_sources",
+            "source_bundle_digest_v1",
+        ),
+    ] {
+        let source = format!(
+            r#"
+value: Scene/Element/program(
+    element: []
+    revision: 1
+    capability_profile: PublicClient
+    {argument}: LIST {{
+        [
+            path: TEXT {{ Support.bn }}
+            source: TEXT {{ value: 1 }}
+            {digest_field}: TEXT {{ caller supplied }}
+        ]
+    }}
+)
+"#
+        );
+        let parsed =
+            boon_parser::parse_source("program-support-source-caller-digest.bn", source).unwrap();
+        let output = check_program(&parsed);
+        assert!(output.program.is_none(), "{argument}.{digest_field}");
+        assert!(
+            output.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains(&format!("argument `{argument}` has incompatible type"))
+            }),
+            "missing exact support-source diagnostic for {argument}.{digest_field}: {:#?}",
+            output.report.diagnostics
+        );
+    }
 }
 
 #[test]

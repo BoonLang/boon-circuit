@@ -1,0 +1,3638 @@
+format_version = 1
+baseline_source_head = "4a820727d339038826a9d589c207ef5f973dad83"
+baseline_scope = "current-worktree"
+
+[[entries]]
+id = "legacy-runtime-bool-null-error"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_data/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum Value {\n    Null,\n    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_data/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Error {\n        code: String,\n        fields: BTreeMap<String, Value>,\n    },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "pub enum Value {\n    Null,\n    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "    Error {\n        code: String,\n    },"
+expected_occurrences = 1
+expected_files = 1
+
+# Public parser, checked, executable, semantic, structural, migration, and
+# document Bool/Null carriers must disappear with the legacy runtime algebra.
+# Exact per-path maps prevent references from moving between known owners.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "AstExprKind::Bool"
+expected_occurrences = 18
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_parser/src/lib.rs" = 2
+"crates/boon_typecheck/src/lib.rs" = 16
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "CheckedExpressionKind::Bool"
+expected_occurrences = 11
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_ir/src/contextual_expansion.rs" = 1
+"crates/boon_ir/src/out_net.rs" = 1
+"crates/boon_typecheck/src/lib.rs" = 9
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "ExecutableExpressionKind::Bool"
+expected_occurrences = 17
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 1
+"crates/boon_compiler/src/machine_plan_backend.rs" = 4
+"crates/boon_ir/src/lib.rs" = 10
+"crates/boon_ir/src/semantic_migration.rs" = 1
+"crates/boon_ir/src/tests/sources_and_events.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "SemanticDataType::Bool"
+expected_occurrences = 6
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_ir/src/lib.rs" = 1
+"crates/boon_ir/src/semantic_migration.rs" = 4
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "SemanticDataType::Null"
+expected_occurrences = 6
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_ir/src/lib.rs" = 1
+"crates/boon_ir/src/semantic_migration.rs" = 4
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "StructuralValue::Bool"
+expected_occurrences = 17
+expected_files = 6
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_list_access/src/key.rs" = 1
+"crates/boon_list_access/src/tests.rs" = 9
+"crates/boon_list_access/tests/cross_target.rs" = 1
+"crates/boon_plan_executor/src/cursor.rs" = 4
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_plan_executor/tests/typed_list_cross_target.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "MigrationExpressionPlan::Bool"
+expected_occurrences = 4
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_persistence/src/migration.rs" = 1
+"crates/boon_plan/src/lib.rs" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "DocumentConstantValue::Bool"
+expected_occurrences = 3
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 2
+"crates/boon_runtime/src/document.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "InitialValue::Bool"
+expected_occurrences = 6
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 3
+"crates/boon_ir/src/lib.rs" = 3
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "ConcreteExpressionKind::Bool"
+expected_occurrences = 3
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_ir/src/contextual_expansion.rs" = 3
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "CheckedOrderSemanticExpression::Bool"
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_typecheck/src/lib.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "MigrationScenarioValue::Bool"
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_runtime/src/migration_scenario.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "DataValue::Bool"
+expected_occurrences = 2
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_server_runtime/src/distributed_sessions.rs" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "DataValue::Null"
+expected_occurrences = 7
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_runtime/src/distributed/client_session.rs" = 3
+"crates/boon_runtime/src/distributed/tests.rs" = 1
+"crates/boon_server_runtime/src/distributed_sessions.rs" = 3
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "DataValue::Error"
+expected_occurrences = 0
+expected_files = 0
+
+# `Value` is the canonical runtime data algebra. Identifier-bounded scans avoid
+# treating suffix carriers such as `EvalValue` and `StyleValue` as equivalent
+# references while still ratcheting every direct canonical use workspace-wide.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Value::Bool"
+expected_occurrences = 114
+expected_files = 23
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 2
+"crates/boon_data/src/lib.rs" = 1
+"crates/boon_host_runtime/src/lib.rs" = 4
+"crates/boon_host_runtime/tests/file_read_stream.rs" = 1
+"crates/boon_host_runtime/tests/host_services.rs" = 2
+"crates/boon_http_runtime/src/lib.rs" = 3
+"crates/boon_ir/src/lib.rs" = 2
+"crates/boon_native_playground/src/runtime_view.rs" = 8
+"crates/boon_plan_executor/src/cursor.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 53
+"crates/boon_plan_executor/src/tests.rs" = 9
+"crates/boon_plan_executor/tests/fjordpulse_server_search.rs" = 1
+"crates/boon_runtime/src/distributed/message.rs" = 1
+"crates/boon_runtime/src/document.rs" = 2
+"crates/boon_runtime/src/lib.rs" = 1
+"crates/boon_runtime/src/migration_scenario.rs" = 1
+"crates/boon_runtime/src/persistent.rs" = 3
+"crates/boon_server_runtime/src/distributed_sessions.rs" = 1
+"crates/boon_server_runtime/src/lib.rs" = 3
+"crates/boon_web_effect_host/src/file_effect_host.rs" = 4
+"crates/boon_wellen_host/src/lib.rs" = 2
+"crates/boon_wellen_host/tests/waveform.rs" = 1
+"crates/boon_wire/src/lib.rs" = 8
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Value::Null"
+expected_occurrences = 55
+expected_files = 17
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 3
+"crates/boon_data/src/lib.rs" = 1
+"crates/boon_native_playground/src/runtime_view.rs" = 1
+"crates/boon_phase0_baseline/src/fixtures.rs" = 1
+"crates/boon_plan_executor/src/cursor.rs" = 4
+"crates/boon_plan_executor/src/machine.rs" = 24
+"crates/boon_plan_executor/src/tests.rs" = 1
+"crates/boon_runtime/src/distributed.rs" = 1
+"crates/boon_runtime/src/distributed/endpoint.rs" = 1
+"crates/boon_runtime/src/distributed/message.rs" = 2
+"crates/boon_runtime/src/distributed/server.rs" = 1
+"crates/boon_runtime/src/distributed/tests.rs" = 2
+"crates/boon_runtime/src/document.rs" = 2
+"crates/boon_runtime/src/lib.rs" = 1
+"crates/boon_web_effect_host/src/file_effect_host.rs" = 2
+"crates/boon_wire/src/client_session_frame.rs" = 3
+"crates/boon_wire/src/lib.rs" = 5
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Value::Error"
+expected_occurrences = 49
+expected_files = 13
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_data/src/lib.rs" = 1
+"crates/boon_ir/src/lib.rs" = 1
+"crates/boon_native_playground/src/runtime_view.rs" = 1
+"crates/boon_plan_executor/src/cursor.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 27
+"crates/boon_plan_executor/src/tests.rs" = 8
+"crates/boon_runtime/src/distributed/message.rs" = 2
+"crates/boon_runtime/src/distributed/tests.rs" = 1
+"crates/boon_runtime/src/document.rs" = 1
+"crates/boon_runtime/src/lib.rs" = 1
+"crates/boon_web_effect_host/src/file_effect_host.rs" = 1
+"crates/boon_wire/src/lib.rs" = 3
+
+# `Kind` is a local alias for `CheckedExpressionKind`; it must not evade the
+# fully-qualified carrier scan above.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Kind::Bool"
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_ir/src/lib.rs" = 1
+
+# Document-model and host-facing value schemas are in the same flag-day blast
+# radius as the runtime algebra, including their serde-only representation.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "StyleValue::Bool"
+expected_occurrences = 40
+expected_files = 10
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_document/src/lib.rs" = 13
+"crates/boon_document/src/render_scene.rs" = 5
+"crates/boon_document_model/src/lib.rs" = 3
+"crates/boon_document_model/src/tests.rs" = 1
+"crates/boon_native_gpu/src/lib.rs" = 4
+"crates/boon_native_playground/src/runtime_view.rs" = 3
+"crates/boon_native_playground/src/ui.rs" = 3
+"crates/boon_native_playground/src/view.rs" = 1
+"crates/boon_runtime/src/document.rs" = 6
+"crates/boon_web_host/tests/document_runtime.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "StyleValueRepr::Bool"
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_document_model/src/lib.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "SemanticValue::Bool"
+expected_occurrences = 2
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_document/src/lib.rs" = 2
+
+# `Self`-qualified branches otherwise evade every public-type-qualified scan.
+# The Error scan is scoped to the two legacy carrier implementations so trait
+# associated types named `Self::Error` are not assigned to the flag-day owner.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Self::Bool"
+expected_occurrences = 9
+expected_files = 6
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_document_model/src/lib.rs" = 1
+"crates/boon_list_access/src/key.rs" = 2
+"crates/boon_plan/src/lib.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 2
+"crates/boon_runtime/src/document.rs" = 2
+"crates/boon_typecheck/src/lib.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Self::Null"
+expected_occurrences = 5
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_plan/src/lib.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 2
+"crates/boon_runtime/src/document.rs" = 2
+
+[[entries.scans]]
+roots = [
+    "crates/boon_plan/src/lib.rs",
+    "crates/boon_plan_executor/src/machine.rs",
+]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Self::Error"
+expected_occurrences = 4
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_plan/src/lib.rs" = 2
+"crates/boon_plan_executor/src/machine.rs" = 2
+
+# Definition scans keep unused legacy variants from escaping when their last
+# qualified reference is removed.
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Bool {\n        value: bool,\n    },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Bool {\n        value: bool,\n    },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_example_manifest/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum MigrationScenarioValue {\n    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/semantic_migration.rs"]
+extensions = ["rs"]
+needle = "    Bool,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/semantic_migration.rs"]
+extensions = ["rs"]
+needle = "    Null,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_list_access/src/key.rs"]
+extensions = ["rs"]
+needle = "    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Bool {\n        value: bool,\n    },"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/document.rs"]
+extensions = ["rs"]
+needle = "    Bool { value: bool },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_document_model/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum StyleValue {\n    Text(String),\n    Number(f64),\n    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_document_model/src/lib.rs"]
+extensions = ["rs"]
+needle = "enum StyleValueRepr {\n    Text(String),\n    Number(f64),\n    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_host/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum SemanticValue {\n    Text { text: String },\n    Bool { value: bool },"
+expected_occurrences = 1
+expected_files = 1
+
+# Type-display aliases and representation flags preserve the legacy Bool
+# algebra even when no public enum qualifier appears at the use site.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-token"
+needle = "BOOL"
+expected_occurrences = 8
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_typecheck/src/lib.rs" = 7
+"crates/boon_typecheck/src/tests/reactive_collections.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "variants_use_boolean_runtime_representation"
+expected_occurrences = 6
+expected_files = 4
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/distributed_compiler.rs" = 1
+"crates/boon_compiler/src/machine_plan_backend.rs" = 2
+"crates/boon_ir/src/semantic_migration.rs" = 1
+"crates/boon_typecheck/src/lib.rs" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "variants_are_bool_alias"
+expected_occurrences = 3
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_typecheck/src/lib.rs" = 3
+
+# `Error` remains privileged through both the parser's reserved library root
+# and typecheck's ordinary-Error propagation exception.
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "name: \"Error\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "is_propagating_error_type"
+expected_occurrences = 6
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_typecheck/src/lib.rs" = 6
+
+# Bind the current feature-registry entry and the still-planned replacement
+# entry to the same flag-day cutover, including both canonical fixtures.
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "id: \"legacy_bool_values\",\n        stage: LanguageFeatureStage::Current,\n        parse_expectation: LanguageFeatureParseExpectation::Accept,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_feature_coverage.toml"]
+extensions = ["toml"]
+needle = "id = \"legacy_bool_values\"\nstage = \"current\"\nparser_expectation = \"accept\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_surface/current/legacy_bool_values.bn"]
+extensions = ["bn"]
+needle = "enabled: True\ndisabled: False"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "id: \"tags_presence_and_fault_algebra\",\n        stage: LanguageFeatureStage::Planned,\n        parse_expectation: LanguageFeatureParseExpectation::Accept,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_feature_coverage.toml"]
+extensions = ["toml"]
+needle = "id = \"tags_presence_and_fault_algebra\"\nstage = \"planned\"\nparser_expectation = \"accept\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_surface/future/tags_presence_and_fault_algebra.bn"]
+extensions = ["bn"]
+needle = "unified presence/fault semantics are planned"
+expected_occurrences = 1
+expected_files = 1
+
+# Repository Boon source contains one explicit legacy Null value and one
+# adjacent current-behavior notice. The workspace-wide token scan prevents the
+# spelling from moving to another source file; the two exact scans prevent
+# executable and inert text from trading inside the fixture.
+[[entries.scans]]
+roots = ["."]
+extensions = ["bn", "scn"]
+mode = "rust-token"
+needle = "Null"
+expected_occurrences = 2
+expected_files = 1
+allowed_paths = ["testdata/phase0/fixtures/tags_presence_fault_current.bn"]
+
+[[entries.scans]]
+roots = ["testdata/phase0/fixtures/tags_presence_fault_current.bn"]
+extensions = ["bn"]
+needle = "current_absence: Null"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["testdata/phase0/fixtures/tags_presence_fault_current.bn"]
+extensions = ["bn"]
+needle = "visible facade presents Null"
+expected_occurrences = 1
+expected_files = 1
+
+# Tracked JSON/YAML schemas and golden fixtures must not encode Rust-side
+# legacy algebra names. Product fields named bool/error/null are not conflated
+# with these explicit representation identifiers.
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "Value::Bool"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "Value::Null"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "Value::Error"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "StoredValue::"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "DataTypePlan::"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "PlanValueType::Bool"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "PlanConstantValue::Bool"
+expected_occurrences = 0
+expected_files = 0
+
+# Source bundles are JSON containers, but their units[*].source values are Boon
+# programs. Decode those values before applying source-language deletion gates
+# so JSON escaping cannot hide legacy syntax.
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "Null"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "True"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "False"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "Bool/"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "BOOL"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries]]
+id = "legacy-enum-record-ast-types"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+# The final Object/TaggedObject/Tag AST already exists beside these legacy
+# Enum/Record paths. Every qualified use and local alias is ratcheted so the
+# Phase 1 cutover cannot preserve the dual representation.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "AstExprKind::Record"
+expected_occurrences = 32
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_parser/src/lib.rs" = 7
+"crates/boon_typecheck/src/lib.rs" = 25
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "AstExprKind::Enum"
+expected_occurrences = 28
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_typecheck/src/lib.rs" = 28
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "CheckedExpressionKind::Record"
+expected_occurrences = 14
+expected_files = 4
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_ir/src/contextual_expansion.rs" = 1
+"crates/boon_ir/src/lib.rs" = 1
+"crates/boon_typecheck/src/lib.rs" = 9
+"crates/boon_typecheck/src/tests/calls.rs" = 3
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Kind::Record"
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_ir/src/lib.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "ConcreteExpressionKind::Record"
+expected_occurrences = 6
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_ir/src/contextual_expansion.rs" = 6
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "ExecutableExpressionKind::Record"
+expected_occurrences = 28
+expected_files = 4
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 3
+"crates/boon_compiler/src/machine_plan_backend.rs" = 3
+"crates/boon_ir/src/lib.rs" = 21
+"crates/boon_ir/src/tests/sources_and_events.rs" = 1
+
+# Downstream Enum aliases keep the old AST representation observable after
+# lowering, so they belong to the same flag-day deletion family.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "PlanValueType::Enum"
+expected_occurrences = 12
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 8
+"crates/boon_plan/src/lib.rs" = 2
+"crates/boon_plan_executor/src/tests.rs" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "PlanConstantValue::Enum"
+expected_occurrences = 17
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 10
+"crates/boon_compiler/src/tests.rs" = 1
+"crates/boon_plan/src/lib.rs" = 3
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_plan_executor/src/tests.rs" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "InitialValue::Enum"
+expected_occurrences = 6
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 3
+"crates/boon_ir/src/lib.rs" = 3
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "DocumentConstantValue::Enum"
+expected_occurrences = 2
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 1
+"crates/boon_runtime/src/document.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "EvalValue::Enum"
+expected_occurrences = 11
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_runtime/src/document.rs" = 11
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "Self::Enum"
+expected_occurrences = 2
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_runtime/src/document.rs" = 2
+
+# Declarations remain explicit even after their final qualified use disappears.
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Enum(String),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Record(Vec<AstRecordField>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Record {\n        fields: Vec<CheckedRecordField>,\n    },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Record(Vec<ExecutableRecordField>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Enum {\n        value: String,\n    },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Enum {\n        value: String,\n    },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Enum,\n    Data,\n    Unknown,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/document.rs"]
+extensions = ["rs"]
+needle = "    Enum { name: DocumentNameId },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "    Enum(String),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "Record"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "Enum"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries]]
+id = "finite-real-binary64"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "FiniteReal"
+expected_occurrences = 174
+expected_files = 23
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 6
+"crates/boon_data/src/lib.rs" = 70
+"crates/boon_data/tests/number_wasm.rs" = 9
+"crates/boon_effect_schema/src/lib.rs" = 1
+"crates/boon_host_runtime/src/lib.rs" = 3
+"crates/boon_host_runtime/tests/host_services.rs" = 2
+"crates/boon_http_runtime/src/lib.rs" = 4
+"crates/boon_http_runtime/tests/loopback.rs" = 2
+"crates/boon_ir/src/lib.rs" = 1
+"crates/boon_native_playground/src/runtime_view.rs" = 8
+"crates/boon_persistence/src/codec.rs" = 6
+"crates/boon_persistence/src/migration.rs" = 5
+"crates/boon_plan/src/lib.rs" = 10
+"crates/boon_plan/src/tests.rs" = 1
+"crates/boon_plan/tests/data_reexport.rs" = 2
+"crates/boon_plan_executor/src/machine.rs" = 16
+"crates/boon_plan_executor/src/tests.rs" = 4
+"crates/boon_runtime/src/content_ref.rs" = 2
+"crates/boon_runtime/src/document.rs" = 8
+"crates/boon_runtime/src/migration_scenario.rs" = 2
+"crates/boon_wellen_host/src/lib.rs" = 4
+"crates/boon_wellen_host/tests/waveform.rs" = 2
+"crates/boon_wire/src/lib.rs" = 6
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "FiniteNumber"
+expected_occurrences = 32
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_list_access/src/key.rs" = 14
+"crates/boon_list_access/src/lib.rs" = 1
+"crates/boon_list_access/src/tests.rs" = 9
+"crates/boon_list_access/tests/cross_target.rs" = 3
+"crates/boon_wire/src/lib.rs" = 5
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "Number(f64),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "10f64.powi"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "f64::NEG_INFINITY"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "f64::INFINITY"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "fn number(&self) -> Option<f64>"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "impl Fn(f64, f64) -> f64"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "fn named_number(arguments: &[(String, EvalValue)], name: &str) -> Option<f64>"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "value.parse::<f64>()"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "milliseconds.round() as u64"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/cursor.rs"]
+extensions = ["rs"]
+needle = "f64::from_bits(reader.u64()?)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/cursor.rs"]
+extensions = ["rs"]
+needle = "value.to_bits().to_be_bytes()"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_wire/src/lib.rs"]
+extensions = ["rs"]
+needle = "number.get().to_bits().to_le_bytes()"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_wire/src/lib.rs"]
+extensions = ["rs"]
+needle = "f64::from_bits(u64::from_le_bytes(encoded))"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_persistence/src/codec.rs"]
+extensions = ["rs"]
+needle = "encoder.f64(value.get())"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_persistence/src/codec.rs"]
+extensions = ["rs"]
+needle = "decoder.f64().map_err(decode_error)?"
+expected_occurrences = 2
+expected_files = 1
+
+# Raw binary64 carriers and conversion seams are tracked independently from
+# FiniteReal so deleting the wrapper name cannot hide an equivalent f64 path.
+[[entries.scans]]
+roots = [
+    "crates/boon_data/src/lib.rs",
+    "crates/boon_data/tests/number_wasm.rs",
+]
+extensions = ["rs"]
+needle = "f64"
+expected_occurrences = 19
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_data/src/lib.rs" = 17
+"crates/boon_data/tests/number_wasm.rs" = 2
+
+[[entries.scans]]
+roots = ["crates/boon_list_access"]
+extensions = ["rs"]
+needle = "f64"
+expected_occurrences = 16
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_list_access/src/key.rs" = 6
+"crates/boon_list_access/src/tests.rs" = 8
+"crates/boon_list_access/tests/cross_target.rs" = 2
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "f64"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = "u64::MAX as f64"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/tests.rs"]
+extensions = ["rs"]
+needle = "f64::EPSILON"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_persistence/src/codec.rs"]
+extensions = ["rs"]
+needle = ".f64("
+expected_occurrences = 5
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_persistence/src/migration.rs"]
+extensions = ["rs"]
+needle = "fn stored_number_result(value: f64)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_wire/src/lib.rs"]
+extensions = ["rs"]
+needle = "f64"
+expected_occurrences = 4
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/cursor.rs"]
+extensions = ["rs"]
+needle = "value.get().to_bits().to_be_bytes()"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_phase0_baseline/src/fixtures.rs"]
+extensions = ["rs"]
+needle = "f64"
+expected_occurrences = 5
+expected_files = 1
+
+# These casts are the document runtime's implicit Number boundary. Filtering
+# by semantic consumers avoids ratcheting unrelated pixel/layout DTOs.
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "as f64"
+line_contains_any = [
+    "EvalValue::Number",
+    "values.len()",
+    "unwrap_or(from",
+    "u64::MAX",
+    "assert_eq!(ascii(",
+]
+expected_occurrences = 11
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "fn format_number(value: f64)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "f64::EPSILON"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "EvalValue::Number(value) => Some(StyleValue::Number(*value))"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/binary.rs"]
+extensions = ["rs"]
+needle = "fn serialize_f64(self, value: f64)"
+expected_occurrences = 1
+expected_files = 1
+
+# Document and host schemas expose raw binary64 as public Number storage even
+# though they do not use the FiniteReal wrapper.
+[[entries.scans]]
+roots = ["crates/boon_document_model/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum StyleValue {\n    Text(String),\n    Number(f64),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_document_model/src/lib.rs"]
+extensions = ["rs"]
+needle = "enum StyleValueRepr {\n    Text(String),\n    Number(f64),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_host/src/lib.rs"]
+extensions = ["rs"]
+needle = "    Number { value: f64 },"
+expected_occurrences = 1
+expected_files = 1
+
+# Map rendering is a host boundary, but these helpers currently expose Boon
+# Number as f64 without naming or enforcing an approximation policy.
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "map_required_number("
+expected_occurrences = 13
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "map_number("
+expected_occurrences = 5
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "EvalValue::Number(value) => Ok(*value),"
+expected_occurrences = 1
+expected_files = 1
+
+# Ratchet all executor-side textual NaN sentinels, not only the already-known
+# Bytes/find and pattern-selection branches.
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "\"NaN\""
+expected_occurrences = 6
+expected_files = 1
+
+# Document execution still silently converts invalid text to binary64 zero.
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "DocumentBuiltin::TextToNumber => {\n            EvalValue::Number(first.text().parse().unwrap_or_default())\n        }"
+expected_occurrences = 1
+expected_files = 1
+
+# `Text/to_number(fallback:)` is a compatibility surface forbidden by the
+# exact Parsed/InvalidNumber result contract.
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "optional_parameter(\"fallback\", Type::Number)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "(\"Text/to_number\", Some(\"radix\" | \"fallback\"))"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["bn", "scn"]
+mode = "boon-call-argument"
+needle = "fallback"
+call_functions = ["Text/to_number"]
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"examples/novywave/Model/NovyModel.bn" = 1
+
+# Bind the current binary64 feature and the still-planned exact-number
+# replacement to the same flag-day cutover and their canonical fixtures.
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "id: \"legacy_binary64_numbers\",\n        stage: LanguageFeatureStage::Current,\n        parse_expectation: LanguageFeatureParseExpectation::Accept,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_feature_coverage.toml"]
+extensions = ["toml"]
+needle = "id = \"legacy_binary64_numbers\"\nstage = \"current\"\nparser_expectation = \"accept\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_surface/current/legacy_binary64_numbers.bn"]
+extensions = ["bn"]
+needle = "whole: 42\nfraction: 1.25\nnegative: -7.5"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "id: \"exact_number_value_algebra\",\n        stage: LanguageFeatureStage::Planned,\n        parse_expectation: LanguageFeatureParseExpectation::Accept,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_feature_coverage.toml"]
+extensions = ["toml"]
+needle = "id = \"exact_number_value_algebra\"\nstage = \"planned\"\nparser_expectation = \"accept\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_surface/future/exact_number_value_algebra.bn"]
+extensions = ["bn"]
+needle = "exact rational semantics do not exist yet"
+expected_occurrences = 1
+expected_files = 1
+
+# Tracked schemas, generated reference fixtures, golden JSON, and the lockfile
+# must not silently acquire legacy Number representation names.
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "FiniteReal"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+mode = "rust-token"
+needle = "f64"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+mode = "rust-token"
+needle = "NaN"
+expected_occurrences = 0
+expected_files = 0
+
+# The persistence codec still accepts the retired integer-number wire tag and
+# canonicalizes it into binary64. Track the decoder arms and its compatibility
+# test independently from FiniteReal so an ExactNumber rename cannot hide this
+# dual decoder.
+[[entries.scans]]
+roots = ["crates/boon_persistence/src/codec.rs"]
+extensions = ["rs"]
+needle = "(2, 2) => Ok(StoredValue::Number("
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_persistence/src/codec.rs"]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "old_integer_number_decodes_and_reencodes_as_canonical_float_number"
+expected_occurrences = 1
+expected_files = 1
+
+# Cross-target typed-key goldens encode Number zero as sortable IEEE-754 bits.
+# The two exact paths must migrate together even if their constructors change.
+[[entries.scans]]
+roots = [
+    "crates/boon_list_access/tests/cross_target.rs",
+    "crates/boon_plan_executor/tests/typed_list_cross_target.rs",
+]
+extensions = ["rs"]
+needle = "0x11,\n        0x80,\n        0,\n        0,\n        0,\n        0,\n        0,\n        0,\n        0,\n        0x22"
+expected_occurrences = 2
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_list_access/tests/cross_target.rs" = 1
+"crates/boon_plan_executor/tests/typed_list_cross_target.rs" = 1
+
+# This wire golden fixes the Number tag and little-endian IEEE-754 payload for
+# 1.5 even if the Value::Number constructor is later renamed.
+[[entries.scans]]
+roots = ["crates/boon_wire/src/lib.rs"]
+extensions = ["rs"]
+needle = "b'n', 3, 0, 0,\n            0, 0, 0, 0, 0xf8, 0x3f"
+expected_occurrences = 1
+expected_files = 1
+
+# Active baseline producers and manifests explicitly label the current
+# semantics. These labels must disappear with the packed/exact flag day rather
+# than surviving behind fresh regenerated reports.
+[[entries.scans]]
+roots = [
+    "docs/architecture/phase0/packed_baseline_fixtures.toml",
+    "crates/boon_phase0_baseline/src/report.rs",
+    "crates/boon_phase0_baseline/src/manifest.rs",
+]
+extensions = ["toml", "rs"]
+needle = "legacy-current-runtime"
+expected_occurrences = 8
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_phase0_baseline/src/manifest.rs" = 1
+"crates/boon_phase0_baseline/src/report.rs" = 2
+"docs/architecture/phase0/packed_baseline_fixtures.toml" = 5
+
+[[entries.scans]]
+roots = [
+    "docs/architecture/phase0/fixtures.toml",
+    "crates/boon_phase0_baseline/src/fixtures.rs",
+]
+extensions = ["toml", "rs"]
+needle = "binary64"
+expected_occurrences = 6
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_phase0_baseline/src/fixtures.rs" = 3
+"docs/architecture/phase0/fixtures.toml" = 3
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "NaN"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "undefined"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-boon-call-argument"
+needle = "fallback"
+call_functions = ["Text/to_number"]
+expected_occurrences = 0
+expected_files = 0
+
+[[entries]]
+id = "zero-based-apis"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["docs/architecture/BYTES_SEMANTICS.md"]
+extensions = ["md"]
+mode = "boon-call-argument"
+needle = "index"
+call_functions = ["List/get", "Bytes/get", "Bytes/set"]
+expected_occurrences = 2
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"docs/architecture/BYTES_SEMANTICS.md" = 2
+
+[[entries.scans]]
+roots = ["docs/architecture/BYTES_SEMANTICS.md"]
+extensions = ["md"]
+mode = "boon-call-argument"
+needle = "offset"
+call_functions = [
+    "Bytes/slice",
+    "Bytes/read_unsigned",
+    "Bytes/read_signed",
+    "Bytes/write_unsigned",
+    "Bytes/write_signed",
+]
+expected_occurrences = 2
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"docs/architecture/BYTES_SEMANTICS.md" = 2
+
+# A workspace-root scan covers every checked-in .bn/.scn source, including
+# crate-local and testdata fixtures, and fails closed for future top-level
+# source directories.
+[[entries.scans]]
+roots = ["."]
+extensions = ["bn", "scn"]
+mode = "boon-call-argument"
+needle = "index"
+call_functions = ["List/get", "Bytes/get", "Bytes/set"]
+expected_occurrences = 34
+expected_files = 22
+
+[entries.scans.expected_path_occurrences]
+"examples/bytes_append_row_refresh_plan_ops.bn" = 1
+"examples/bytes_concat_chain_plan_ops.bn" = 1
+"examples/bytes_constant_expr_plan_ops.bn" = 1
+"examples/bytes_dynamic_slice_plan_ops.bn" = 1
+"examples/bytes_encoding_plan_ops.bn" = 1
+"examples/bytes_get_plan_ops.bn" = 1
+"examples/bytes_indexed_same_event_dependency_plan_ops.bn" = 3
+"examples/bytes_indexed_source_payload_plan_ops.bn" = 1
+"examples/bytes_same_event_dependency_plan_ops.bn" = 2
+"examples/bytes_set_conversion_bank_plan_ops.bn" = 1
+"examples/bytes_set_numeric_bank_plan_ops.bn" = 1
+"examples/bytes_set_numeric_write_bank_plan_ops.bn" = 1
+"examples/bytes_set_plan_ops.bn" = 2
+"examples/bytes_set_predicates_bank_plan_ops.bn" = 1
+"examples/bytes_set_read_bank_plan_ops.bn" = 2
+"examples/bytes_slice_take_drop_plan_ops.bn" = 1
+"examples/bytes_source_payload_plan_ops.bn" = 1
+"examples/bytes_type_system_fixture.bn" = 2
+"examples/bytes_typecheck_negative_fixture.bn" = 7
+"examples/cells/formula.bn" = 1
+"examples/fibonacci.bn" = 1
+"examples/server_http_echo.bn" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["bn", "scn"]
+mode = "boon-call-argument"
+needle = "offset"
+call_functions = [
+    "Bytes/slice",
+    "Bytes/read_unsigned",
+    "Bytes/read_signed",
+    "Bytes/write_unsigned",
+    "Bytes/write_signed",
+]
+expected_occurrences = 47
+expected_files = 10
+
+[entries.scans.expected_path_occurrences]
+"examples/bytes_constant_expr_plan_ops.bn" = 3
+"examples/bytes_dynamic_slice_plan_ops.bn" = 1
+"examples/bytes_indexed_search_plan_ops.bn" = 5
+"examples/bytes_numeric_plan_ops.bn" = 8
+"examples/bytes_set_numeric_bank_plan_ops.bn" = 3
+"examples/bytes_set_numeric_write_bank_plan_ops.bn" = 4
+"examples/bytes_slice_take_drop_plan_ops.bn" = 1
+"examples/bytes_type_system_fixture.bn" = 7
+"examples/bytes_typecheck_negative_fixture.bn" = 13
+"examples/cells/formula.bn" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["bn", "scn"]
+mode = "boon-call-argument"
+needle = "start"
+call_functions = ["Text/substring", "Bytes/slice"]
+expected_occurrences = 13
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"examples/cells/formula.bn" = 12
+"examples/novywave/Model/NovyModel.bn" = 1
+
+# Rust files can embed executable Boon source anywhere in the workspace. Exact
+# per-file counts prevent moved or newly introduced legacy calls from hiding
+# behind an unchanged aggregate.
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "boon-call-argument"
+needle = "index"
+call_functions = ["List/get", "Bytes/get", "Bytes/set"]
+expected_occurrences = 10
+expected_files = 4
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/tests.rs" = 4
+"crates/boon_plan_executor/src/tests.rs" = 1
+"crates/boon_typecheck/src/tests/calls.rs" = 1
+"crates/xtask/src/verify_phase0.rs" = 4
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "boon-call-argument"
+needle = "offset"
+call_functions = [
+    "Bytes/slice",
+    "Bytes/read_unsigned",
+    "Bytes/read_signed",
+    "Bytes/write_unsigned",
+    "Bytes/write_signed",
+]
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/xtask/src/verify_phase0.rs" = 1
+
+# Public callable definitions, static validation, typed-plan lowering, plan
+# schema, and both runtime engines are independent ratchets. Fixture edits alone
+# therefore cannot make this family reach zero while zero-based semantics remain.
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "required_parameter(\"index\", Type::Number)"
+expected_occurrences = 3
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "required_parameter(\"offset\", Type::Number)"
+expected_occurrences = 3
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "required_parameter(\"start\", Type::Number)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "\"Text/find\",\n            Type::Number,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "\"Bytes/find\",\n            Type::Number,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "\"List/get\",\n            contextual_item_type(),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "if index < 0 || index >= len"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "if offset < 0 || count < 0"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = ".zip(named(&[\"index\"]))"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = ".zip(named(&[\"offset\"]))"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = ".zip(named(&[\"offset\", \"start\"]))"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = ".zip(named(&[\"start\"]))"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "PlanRowBuiltinParameter::required(\"index\")"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "TextSubstring {\n        input: PlanRowExpressionId,\n        start: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "BytesGet {\n        input: PlanRowExpressionId,\n        index: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "BytesSlice {\n        input: PlanRowExpressionId,\n        offset: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "BytesReadUnsigned {\n        input: PlanRowExpressionId,\n        offset: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "BytesReadSigned {\n        input: PlanRowExpressionId,\n        offset: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "BytesSet {\n        input: PlanRowExpressionId,\n        index: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "BytesWriteUnsigned {\n        input: PlanRowExpressionId,\n        offset: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "BytesWriteSigned {\n        input: PlanRowExpressionId,\n        offset: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "bytes.get(index)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "bytes.get_mut(index)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "into_iter().nth(index)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "list.order.get(index)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = ".chars()\n                    .skip(start)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "bytes.slice(offset..end)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "bytes.get_mut(offset..end)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "Some(index) => Value::integer(index as i64)?"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "named_number(&arguments, \"index\").unwrap_or(0.0)"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "index < 0.0 || index.fract() != 0.0"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "runtime_list_row(list, logical_len, index as u64)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "values.remove(index)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "named_number(&arguments, \"start\")"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = ".chars()\n                    .skip(start)"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = ".find(&needle).unwrap_or(usize::MAX) as f64"
+expected_occurrences = 1
+expected_files = 1
+
+# Typechecker result contracts, aliases, range checks, and direct-result
+# provenance are separate one-based migration seams.
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "\"Bytes/get\",\n            Type::Bytes(BytesType::Dynamic),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "\"Bytes/get\" => Some(Type::Bytes(BytesType::Fixed(1))),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "&[\"offset\", \"start\"]"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "\"Bytes/get\" | \"Bytes/set\" => {"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "\"List/get\" | \"List/latest\" | \"List/find\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "\"Bytes/slice\",\n            Type::Bytes(BytesType::Dynamic),\n            vec![\n                required_parameter(\"input\", Type::Bytes(BytesType::Dynamic)),\n                required_parameter(\"offset\", Type::Number),\n                required_parameter(\"byte_count\", Type::Number),"
+expected_occurrences = 1
+expected_files = 1
+
+# Compiler result inference and direct-row provenance must migrate together
+# with argument lowering; otherwise the public spelling can change while the
+# typed plan still exposes zero-based behavior.
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = "\"Bytes/get\" => Some(PlanValueType::Bytes { fixed_len: Some(1) }),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = "PlanRowExpressionNode::BytesGet { .. } => Some(PlanValueType::Bytes { fixed_len: Some(1) }),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = "| \"Text/find\"\n        | \"Text/length\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = "| \"Bytes/find\"\n        | \"Bytes/read_unsigned\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = "PlanRowExpressionNode::BytesFind { .. }\n        | PlanRowExpressionNode::BytesReadUnsigned { .. }"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = "} if *function == PlanRowBuiltin::ListGet => self.unique_row_source(*source),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "if matches!(name.as_str(), \"List/get\" | \"List/latest\") => {"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "ListGetField {\n        list_id: ListId,\n        index: PlanRowExpressionId,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/document.rs"]
+extensions = ["rs"]
+needle = "TextSubstring,"
+expected_occurrences = 1
+expected_files = 1
+
+# Both executable engines retain direct zero-based conversion, out-of-bounds,
+# endpoint, and not-found conventions.
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "nonnegative_usize(eval_to_integer(&next()?)?, \"byte index\")"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "nonnegative_usize(eval_to_integer(&next()?)?, \"byte offset\")"
+expected_occurrences = 4
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "List/get index must be a non-negative integer"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "None => Value::Text(\"NaN\".to_owned()),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "DocumentBuiltin::BytesSlice | DocumentBuiltin::TextSubstring =>"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "let end = named_number(&arguments, \"to\")"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = ".or_else(|| named_number(&arguments, \"end\"))"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/document_executable_backend.rs"]
+extensions = ["rs"]
+needle = "\"Text/substring\" => DocumentBuiltin::TextSubstring,"
+expected_occurrences = 1
+expected_files = 1
+
+# Text/substring is the legacy name for the future one-based Text/slice API.
+# Track every production name-bearing layer so a partial rename cannot pass.
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "Text/substring"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "Text/substring"
+expected_occurrences = 5
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/machine_plan_backend.rs"]
+extensions = ["rs"]
+needle = "Text/substring"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "Text/substring"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["docs/examples/CELLS_CIRCUIT_STYLE.md"]
+extensions = ["md"]
+needle = "Text/substring"
+expected_occurrences = 1
+expected_files = 1
+
+# The future target surface must leave its planned state when this migration
+# reaches zero; otherwise legacy implementation names could disappear without
+# one-based semantics ever becoming current.
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "id: \"one_based_positions\",\n        stage: LanguageFeatureStage::Planned,\n        parse_expectation: LanguageFeatureParseExpectation::Accept,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_feature_coverage.toml"]
+extensions = ["toml"]
+needle = "id = \"one_based_positions\"\nstage = \"planned\"\nparser_expectation = \"accept\""
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["examples/language_surface/future/one_based_positions.bn"]
+extensions = ["bn"]
+needle = "one-based semantics are planned"
+expected_occurrences = 1
+expected_files = 1
+
+# Decode source-bundle units before analyzing named arguments; escaped newlines
+# in JSON must not let zero-based calls evade the ordinary .bn/.scn scans.
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-boon-call-argument"
+needle = "index"
+call_functions = ["List/get", "Bytes/get", "Bytes/set"]
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-boon-call-argument"
+needle = "offset"
+call_functions = [
+    "Bytes/slice",
+    "Bytes/read_unsigned",
+    "Bytes/read_signed",
+    "Bytes/write_unsigned",
+    "Bytes/write_signed",
+]
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-boon-call-argument"
+needle = "start"
+call_functions = ["Text/substring", "Bytes/slice"]
+expected_occurrences = 0
+expected_files = 0
+
+[[entries]]
+id = "zero-based-api-negative-fixtures"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "rejection-only"
+target = "negative-fixtures-only"
+measurement = "occurrence"
+
+# This string asserts that Text/substring is absent from the canonical
+# PlanRowBuiltin inventory; it is not an executable legacy implementation.
+[[entries.scans]]
+roots = ["crates/boon_plan/src/tests.rs"]
+extensions = ["rs"]
+needle = "Text/substring"
+expected_occurrences = 1
+expected_files = 1
+allowed_paths = ["crates/boon_plan/src/tests.rs"]
+
+[[entries]]
+id = "legacy-match-patterns"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "Bool { value: bool },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "    NaN,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "tokens == [\"True\"]"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "tokens == [\"False\"]"
+expected_occurrences = 2
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_parser/src/lib.rs"]
+extensions = ["rs"]
+needle = "tokens == [\"NaN\"]"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "Bool { value: bool },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "    NaN,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "=> Self::Bool"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_typecheck/src/lib.rs"]
+extensions = ["rs"]
+needle = "=> Self::NaN"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum PlanRowSelectPattern {\n    Bool { value: bool },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "    NaN,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "AstMatchPattern::Bool"
+expected_occurrences = 5
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_parser/src/lib.rs" = 2
+"crates/boon_typecheck/src/lib.rs" = 3
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "AstMatchPattern::NaN"
+expected_occurrences = 3
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_parser/src/lib.rs" = 1
+"crates/boon_typecheck/src/lib.rs" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "CheckedMatchPattern::Bool"
+expected_occurrences = 3
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 2
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "CheckedMatchPattern::NaN"
+expected_occurrences = 2
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 1
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "PlanRowSelectPattern::Bool"
+expected_occurrences = 8
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_compiler/src/tests.rs" = 4
+"crates/boon_persistence/src/migration.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_plan_executor/src/tests.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "PlanRowSelectPattern::NaN"
+expected_occurrences = 3
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_persistence/src/migration.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["bn", "scn"]
+needle = "NaN =>"
+expected_occurrences = 10
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"examples/cells/formula.bn" = 9
+"examples/novywave/Model/NovyModel.bn" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "NaN =>"
+expected_occurrences = 7
+expected_files = 6
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 1
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_persistence/src/migration.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_typecheck/src/lib.rs" = 2
+"crates/boon_typecheck/src/tests/calls.rs" = 1
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "True =>"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "False =>"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "NaN =>"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries]]
+id = "recursive-executable-values"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_data/src/lib.rs"]
+extensions = ["rs"]
+needle = "List(Vec<Value>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_data/src/lib.rs"]
+extensions = ["rs"]
+needle = "Record(BTreeMap<String, Value>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_data/src/lib.rs"]
+extensions = ["rs"]
+needle = "fields: BTreeMap<String, Value>,"
+expected_occurrences = 2
+expected_files = 1
+
+# Structural carriers keep this ratchet valid even if enum variants are merely
+# renamed during the packed-data migration.
+[[entries.scans]]
+roots = ["crates/boon_data/src/lib.rs"]
+extensions = ["rs"]
+needle = "Vec<Value>"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_data/src/lib.rs"]
+extensions = ["rs"]
+needle = "BTreeMap<String, Value>"
+expected_occurrences = 3
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "List(Vec<Value>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "Record(BTreeMap<String, Value>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "MappedRow {\n        id: RowId,\n        fields: BTreeMap<String, Value>,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "Row {\n        id: RowId,\n        fields: BTreeMap<FieldId, Value>,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "visible: Box<Value>,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "List(Vec<EvalValue>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "Record(BTreeMap<String, EvalValue>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "MappedRow {\n        id: RowId,\n        fields: BTreeMap<String, EvalValue>,"
+expected_occurrences = 1
+expected_files = 1
+
+# Recursive capture carriers exist in the mapped-row value and both resumable
+# map states; exact indentation/name scans prevent suffix matches from trading.
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "\n        captures: BTreeMap<FieldId, EvalValue>,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "\n    captures: BTreeMap<FieldId, EvalValue>,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "evaluated_captures: BTreeMap<FieldId, EvalValue>,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "OrderedList {\n        items: Vec<OrderedEvalItem>,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "struct OrderedEvalItem {\n    value: EvalValue,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "Record(BTreeMap<String, EvalValue>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "fields: BTreeMap<String, EvalValue>,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "Tagged(String, BTreeMap<String, EvalValue>),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "List(Vec<EvalValue>),"
+expected_occurrences = 1
+expected_files = 1
+
+# Runtime execution still interprets document and machine plan AST enums
+# directly rather than dense packed op tables.
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "DocumentExprOp"
+expected_occurrences = 55
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "PlanRowExpressionNode"
+expected_occurrences = 157
+expected_files = 1
+
+# Every ordinary-turn full-list comparison routes through one instrumented
+# helper; its definition, two production call sites, and focused regression
+# call remain deletion-owned together.
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "whole_list_snapshot_changed("
+expected_occurrences = 4
+expected_files = 1
+
+# The comparison is only the visible symptom: ordinary turns also retain and
+# clone the complete derived-list snapshot. The helper scan owns its definition,
+# six production calls, and two regression calls, while the retained carrier
+# keeps the deletion gate intact if the helper is renamed.
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "items: Option<Vec<EvalValue>>"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "clone_whole_list_snapshot("
+expected_occurrences = 9
+expected_files = 1
+
+# Upstream executable AST ownership is required during compiler lowering, but
+# it must never leak back into either runtime execution root.
+[[entries.scans]]
+roots = ["crates/boon_runtime", "crates/boon_plan_executor"]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "ExecutableExpressionKind"
+expected_occurrences = 0
+expected_files = 0
+
+# Runtime execution must not regress to parser, checked, or even erased
+# compiler artifacts while the positive DocumentExprOp/PlanRowExpressionNode
+# carriers above remain explicit deletion debt.
+[[entries.scans]]
+roots = ["crates/boon_runtime", "crates/boon_plan_executor"]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "AstExprKind"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["crates/boon_runtime", "crates/boon_plan_executor"]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "CheckedExpressionKind"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["crates/boon_runtime", "crates/boon_plan_executor"]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "ErasedProgram"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["crates/boon_runtime", "crates/boon_plan_executor"]
+extensions = ["rs"]
+needle = "program.executable"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries]]
+id = "runtime-string-field-lookup"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "runtime_string_map_get("
+expected_occurrences = 21
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "BTreeMap<String, Value>"
+expected_occurrences = 10
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "BTreeMap<String, EvalValue>"
+expected_occurrences = 7
+expected_files = 1
+
+# The document runtime has an independent string-key EvalValue algebra. Its
+# typed carriers cover current get/remove helpers without conflating FieldId
+# maps, and must disappear with runtime field-name rediscovery.
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "BTreeMap<String, EvalValue>"
+expected_occurrences = 14
+expected_files = 1
+
+# Object-field evaluation consumes string names destructively as well as
+# through `get`; the helper definition and four production calls are ordinary
+# runtime lookup debt.
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "runtime_string_map_remove("
+expected_occurrences = 5
+expected_files = 1
+
+# A separate helper owns the remaining contains-by-name operation.
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "runtime_string_map_contains_key("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries]]
+id = "tree-containers"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+status = "present"
+target = "classified-retained-only"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+mode = "rust-token"
+needle = "BTreeMap"
+expected_occurrences = 2530
+expected_files = 113
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+mode = "rust-token"
+needle = "BTreeSet"
+expected_occurrences = 1527
+expected_files = 85
+
+# The exact occurrence ledger classifies every construct per use. Mirroring
+# each category count here makes ID-to-tree and name-lookup debt explicit
+# instead of hiding it inside the aggregate container totals.
+[[entries.scans]]
+roots = ["docs/architecture/phase0/container_occurrences.tsv"]
+extensions = ["tsv"]
+needle = "\tdense-id-table\t"
+expected_occurrences = 968
+expected_files = 1
+
+[[entries.scans]]
+roots = ["docs/architecture/phase0/container_occurrences.tsv"]
+extensions = ["tsv"]
+needle = "\tmembership\t"
+expected_occurrences = 1375
+expected_files = 1
+
+[[entries.scans]]
+roots = ["docs/architecture/phase0/container_occurrences.tsv"]
+extensions = ["tsv"]
+needle = "\tordered-index\t"
+expected_occurrences = 27
+expected_files = 1
+
+[[entries.scans]]
+roots = ["docs/architecture/phase0/container_occurrences.tsv"]
+extensions = ["tsv"]
+needle = "\tname-lookup\t"
+expected_occurrences = 521
+expected_files = 1
+
+[[entries.scans]]
+roots = ["docs/architecture/phase0/container_occurrences.tsv"]
+extensions = ["tsv"]
+needle = "\tcanonical-boundary\t"
+expected_occurrences = 345
+expected_files = 1
+
+[[entries.scans]]
+roots = ["docs/architecture/phase0/container_occurrences.tsv"]
+extensions = ["tsv"]
+needle = "\ttest-oracle\t"
+expected_occurrences = 537
+expected_files = 1
+
+[[entries.scans]]
+roots = ["docs/architecture/phase0/container_occurrences.tsv"]
+extensions = ["tsv"]
+needle = "\tunrelated-host-code\t"
+expected_occurrences = 366
+expected_files = 1
+
+[[entries]]
+id = "id-to-tree-expansion"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+# The general tree-container family preserves legitimate cold/boundary uses.
+# Dense-ID tables are different: every classified occurrence, including its
+# dedicated imports, belongs to the packed flag-day deletion target.
+[[entries.scans]]
+roots = ["docs/architecture/phase0/container_occurrences.tsv"]
+extensions = ["tsv"]
+needle = "\tdense-id-table\t"
+expected_occurrences = 968
+expected_files = 1
+
+[[entries]]
+id = "query-world-artifacts"
+owner_phase = "goal-phase-3-typed-list"
+owner_plan = "docs/plans/TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md"
+status = "rejection-only"
+target = "negative-fixtures-only"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs", "bn", "scn"]
+needle = "List/query"
+expected_occurrences = 2
+expected_files = 1
+allowed_paths = ["crates/boon_typecheck/src/tests/calls.rs"]
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs", "bn", "scn"]
+needle = "List/query_prefix"
+expected_occurrences = 1
+expected_files = 1
+allowed_paths = ["crates/boon_typecheck/src/tests/calls.rs"]
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "ListQuery"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "PlanQuery"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "QueryCollectionState"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "IndexedQuery"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "ListProjectionKind::TextPrefix"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["Cargo.toml", "Cargo.lock", "crates", "apps"]
+extensions = ["rs", "toml", "lock"]
+needle = "boon_query"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["Cargo.toml", "Cargo.lock", "crates", "apps"]
+extensions = ["rs", "toml", "lock"]
+needle = "boon_query_redb"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["Cargo.toml", "Cargo.lock", "crates", "apps"]
+extensions = ["rs", "toml", "lock"]
+needle = "boon-query"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["Cargo.toml", "Cargo.lock", "crates", "apps"]
+extensions = ["rs", "toml", "lock"]
+needle = "boon-query-redb"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "List/query"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "List/query_prefix"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries]]
+id = "unverified-compiler-entrypoints"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn lower("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn lower_runtime("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn lower_with_external_types("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn lower_runtime_with_external_types("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn lower_runtime_with_external_types_and_producer_functions("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn lower_checked("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries]]
+id = "physical-layout-leaks"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub target_profile: TargetProfile"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub storage_layout: StorageLayout"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub regions: Vec<OperationRegion>"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub capability_summary: CapabilitySummary"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries]]
+id = "forgeable-erased-program-boundary"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+# The current erased artifact is public, directly constructible, and
+# deserializable instead of being opaque and verification-derived.
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub struct ErasedProgram {"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = '''#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedProgram {'''
+expected_occurrences = 1
+expected_files = 1
+
+# Public payload and verification-result fields make forged artifacts
+# indistinguishable at the Rust type boundary.
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub executable: ExecutableProgram,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub hidden_identity_verified: bool,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub static_schedule_verified: bool,"
+expected_occurrences = 1
+expected_files = 1
+
+# The source compiler returns the forgeable artifact and five public typed-plan
+# entrypoints accept arbitrary ErasedProgram values.
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub ir: ErasedProgram,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn compile_typed_program"
+expected_occurrences = 5
+expected_files = 1
+
+# Six public boon_ir lowerers construct ErasedProgram without the Phase 1
+# ContractVerifiedProgram gate. Both production compiler routes call the
+# checked-to-erased bypass directly.
+[[entries.scans]]
+roots = ["crates/boon_ir/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn lower"
+expected_occurrences = 6
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src"]
+extensions = ["rs"]
+needle = "boon_ir::lower_checked("
+expected_occurrences = 2
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/distributed_compiler.rs" = 1
+"crates/boon_compiler/src/lib.rs" = 1
+
+[[entries]]
+id = "recursive-persistence-values"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_persistence/src/lib.rs"]
+extensions = ["rs"]
+needle = "Value as StoredValue"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "StoredValue::Bool"
+expected_occurrences = 44
+expected_files = 10
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_native_playground/src/passkey_simulator.rs" = 2
+"crates/boon_persistence/src/codec.rs" = 4
+"crates/boon_persistence/src/lib.rs" = 6
+"crates/boon_persistence/src/migration.rs" = 18
+"crates/boon_persistence/src/native.rs" = 4
+"crates/boon_persistence/src/web.rs" = 2
+"crates/boon_persistence/tests/web_indexeddb.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 2
+"crates/boon_plan_executor/src/tests.rs" = 4
+"crates/boon_runtime/src/persistent.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "StoredValue::Null"
+expected_occurrences = 12
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_persistence/src/codec.rs" = 4
+"crates/boon_persistence/src/lib.rs" = 2
+"crates/boon_persistence/src/migration.rs" = 3
+"crates/boon_persistence/src/web.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "StoredValue::Error"
+expected_occurrences = 14
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_persistence/src/codec.rs" = 4
+"crates/boon_persistence/src/lib.rs" = 2
+"crates/boon_persistence/src/migration.rs" = 5
+"crates/boon_persistence/src/web.rs" = 1
+"crates/boon_plan_executor/src/machine.rs" = 2
+
+[[entries]]
+id = "plan-value-algebra-sentinels"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "DataTypePlan::Bool"
+expected_occurrences = 26
+expected_files = 9
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/distributed_compiler.rs" = 1
+"crates/boon_compiler/src/machine_plan_backend.rs" = 7
+"crates/boon_persistence/src/lib.rs" = 1
+"crates/boon_persistence/src/migration.rs" = 1
+"crates/boon_plan/src/lib.rs" = 7
+"crates/boon_plan/src/tests.rs" = 4
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_plan_executor/src/tests.rs" = 1
+"crates/boon_server_runtime/src/lib.rs" = 3
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "DataTypePlan::Null"
+expected_occurrences = 12
+expected_files = 6
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 5
+"crates/boon_persistence/src/lib.rs" = 1
+"crates/boon_persistence/src/migration.rs" = 1
+"crates/boon_plan/src/lib.rs" = 3
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_runtime/src/distributed/client_session.rs" = 1
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "DataTypePlan::Error"
+expected_occurrences = 11
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 5
+"crates/boon_persistence/src/lib.rs" = 1
+"crates/boon_persistence/src/migration.rs" = 1
+"crates/boon_plan/src/lib.rs" = 3
+"crates/boon_plan_executor/src/machine.rs" = 1
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "PlanValueType::Bool"
+expected_occurrences = 18
+expected_files = 4
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 11
+"crates/boon_plan/src/lib.rs" = 4
+"crates/boon_plan/src/tests.rs" = 1
+"crates/boon_plan_executor/src/tests.rs" = 2
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "PlanConstantValue::Bool"
+expected_occurrences = 23
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 13
+"crates/boon_compiler/src/tests.rs" = 1
+"crates/boon_plan/src/lib.rs" = 3
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_plan_executor/src/tests.rs" = 5
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum DataTypePlan {\n    Null,\n    Bool,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum PlanValueType {\n    Text,\n    Number,\n    Bool,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "KeyKind::Bool"
+expected_occurrences = 7
+expected_files = 4
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_list_access/src/key.rs" = 1
+"crates/boon_list_access/src/tests.rs" = 4
+"crates/boon_list_access/tests/cross_target.rs" = 1
+"crates/boon_plan_executor/tests/typed_list_cross_target.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "PlanListIndexKeyKind::Bool"
+expected_occurrences = 6
+expected_files = 3
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 2
+"crates/boon_plan/src/lib.rs" = 2
+"crates/boon_plan_executor/src/machine.rs" = 2
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+mode = "rust-code-token"
+needle = "AccessKeyKind::Bool"
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_plan_executor/src/machine.rs" = 1
+
+[[entries.scans]]
+roots = ["crates/boon_list_access/src/key.rs"]
+extensions = ["rs"]
+needle = "pub enum KeyKind {\n    Number,\n    Text,\n    Bool,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum PlanListIndexKeyKind {\n    Number,\n    Text,\n    Bool,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries]]
+id = "effect-schema-bool-defaults"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_effect_schema/src"]
+extensions = ["rs"]
+needle = "ValueType::Bool"
+expected_occurrences = 13
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_effect_schema/src"]
+extensions = ["rs"]
+needle = "IntentDefaultValueSpec::Bool"
+expected_occurrences = 3
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_effect_schema/src"]
+extensions = ["rs"]
+needle = "Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_effect_schema/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum ValueType {\n    Bool,"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "boon_effect_schema::ValueType::Bool"
+expected_occurrences = 2
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_plan/src/lib.rs" = 1
+"crates/boon_typecheck/src/lib.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "boon_effect_schema::IntentDefaultValueSpec::Bool"
+expected_occurrences = 1
+expected_files = 1
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_plan/src/lib.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs"]
+needle = "EffectIntentDefaultValuePlan::Bool"
+expected_occurrences = 3
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_plan/src/lib.rs" = 2
+
+[[entries.scans]]
+roots = ["crates/boon_plan/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub enum EffectIntentDefaultValuePlan {\n    Bool { value: bool },"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries]]
+id = "wire-bool-null-error-tags"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_wire/src"]
+extensions = ["rs"]
+needle = "TAG_FALSE"
+expected_occurrences = 3
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_wire/src"]
+extensions = ["rs"]
+needle = "TAG_TRUE"
+expected_occurrences = 3
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_wire/src"]
+extensions = ["rs"]
+needle = "TAG_NULL"
+expected_occurrences = 3
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_wire/src"]
+extensions = ["rs"]
+needle = "TAG_ERROR"
+expected_occurrences = 3
+expected_files = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "TAG_FALSE"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "TAG_TRUE"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "TAG_NULL"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "TAG_ERROR"
+expected_occurrences = 0
+expected_files = 0
+
+# Raw golden bytes are contracts in their own right. Constructor and TAG_*
+# scans cannot detect a stale legacy byte vector after the encoder is renamed.
+[[entries.scans]]
+roots = ["crates/boon_wire/src/lib.rs"]
+extensions = ["rs"]
+needle = "b'a', 2, 1, b'z'"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_wire/src/client_session_frame.rs"]
+extensions = ["rs"]
+needle = "data_golden.extend_from_slice(&[0x45, b'B', b'W', b'V', 0x01, 0x00]);"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = [
+    "crates/boon_list_access/tests/cross_target.rs",
+    "crates/boon_plan_executor/tests/typed_list_cross_target.rs",
+]
+extensions = ["rs"]
+needle = "0x33,\n        1,\n        0x44"
+expected_occurrences = 2
+expected_files = 2
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_list_access/tests/cross_target.rs" = 1
+"crates/boon_plan_executor/tests/typed_list_cross_target.rs" = 1
+
+[[entries]]
+id = "privileged-error-builtins"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs", "bn", "scn"]
+needle = "Error/new"
+expected_occurrences = 13
+expected_files = 7
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 1
+"crates/boon_parser/src/lib.rs" = 1
+"crates/boon_plan/src/lib.rs" = 1
+"crates/boon_plan_executor/src/tests.rs" = 1
+"crates/boon_typecheck/src/lib.rs" = 1
+"crates/boon_typecheck/src/tests/calls.rs" = 1
+"examples/cells/formula.bn" = 7
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["rs", "bn", "scn"]
+needle = "Error/text"
+expected_occurrences = 11
+expected_files = 8
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 1
+"crates/boon_compiler/src/machine_plan_backend.rs" = 1
+"crates/boon_parser/src/lib.rs" = 1
+"crates/boon_plan/src/lib.rs" = 1
+"crates/boon_plan_executor/src/tests.rs" = 1
+"crates/boon_typecheck/src/lib.rs" = 2
+"examples/cells/cell.bn" = 1
+"examples/cells/formula.bn" = 3
+
+[[entries.scans]]
+roots = ["docs/examples/CELLS_CIRCUIT_STYLE.md"]
+extensions = ["md"]
+needle = "Error/text"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "ErrorNew"
+expected_occurrences = 9
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 1
+"crates/boon_plan/src/document.rs" = 1
+"crates/boon_plan/src/lib.rs" = 5
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_runtime/src/document.rs" = 1
+
+[[entries.scans]]
+roots = ["crates"]
+extensions = ["rs"]
+needle = "ErrorText"
+expected_occurrences = 9
+expected_files = 5
+
+[entries.scans.expected_path_occurrences]
+"crates/boon_compiler/src/document_executable_backend.rs" = 1
+"crates/boon_plan/src/document.rs" = 1
+"crates/boon_plan/src/lib.rs" = 5
+"crates/boon_plan_executor/src/machine.rs" = 1
+"crates/boon_runtime/src/document.rs" = 1
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "Error/new"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["."]
+extensions = ["json", "yaml", "yml", "lock"]
+needle = "Error/text"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "Error/new"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["fixtures/contracts/source_bundle_digest_v1.json"]
+extensions = ["json"]
+mode = "json-source-bundle-text"
+needle = "Error/text"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries]]
+id = "executor-runtime-sentinel-values"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+status = "present"
+target = "zero"
+measurement = "occurrence"
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "EvalValue::Value(Value::Null)"
+expected_occurrences = 8
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "EvalValue::Value(Value::Bool"
+expected_occurrences = 27
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_plan_executor/src/machine.rs"]
+extensions = ["rs"]
+needle = "EvalValue::Value(Value::Error"
+expected_occurrences = 4
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "EvalValue::Bool"
+expected_occurrences = 31
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "EvalValue::Null"
+expected_occurrences = 38
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "enum EvalValue {\n    Null,\n    Bool(bool),"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_runtime/src/document.rs"]
+extensions = ["rs"]
+needle = "EvalValue::Bool(value) => Some(StyleValue::Bool(*value))"
+expected_occurrences = 1
+expected_files = 1
+
+[[entries]]
+id = "stale-reports"
+owner_phase = "goal-phase-0"
+owner_plan = "docs/plans/GOAL_PROMPT.md"
+status = "policy"
+target = "exact-identity-only"
+measurement = "report-identity"

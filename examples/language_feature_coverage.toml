@@ -1,0 +1,102 @@
+format_version = 1
+registry_owner = "boon_parser"
+
+# `stage` describes delivery, while `parser_expectation` describes only today's
+# grammar. Planned features may reuse accepted syntax without claiming their
+# planned semantics exist.
+
+[[feature]]
+id = "bits_fixed_width_literals"
+stage = "planned"
+parser_expectation = "reject"
+fixture = "examples/language_surface/future/bits_fixed_width_literals.bn"
+
+[[feature]]
+id = "distributed_role_paths"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/distributed_role_paths.bn"
+
+[[feature]]
+id = "exact_number_value_algebra"
+stage = "planned"
+parser_expectation = "accept"
+fixture = "examples/language_surface/future/exact_number_value_algebra.bn"
+
+[[feature]]
+id = "flush_control"
+stage = "planned"
+parser_expectation = "reject"
+fixture = "examples/language_surface/future/flush_control.bn"
+
+[[feature]]
+id = "immutable_bytes"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/immutable_bytes.bn"
+
+[[feature]]
+id = "legacy_binary64_numbers"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/legacy_binary64_numbers.bn"
+
+[[feature]]
+id = "legacy_bool_values"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/legacy_bool_values.bn"
+
+[[feature]]
+id = "map_literals"
+stage = "planned"
+parser_expectation = "reject"
+fixture = "examples/language_surface/future/map_literals.bn"
+
+[[feature]]
+id = "one_based_positions"
+stage = "planned"
+parser_expectation = "accept"
+fixture = "examples/language_surface/future/one_based_positions.bn"
+
+[[feature]]
+id = "reactive_temporal_operators"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/reactive_temporal_operators.bn"
+
+[[feature]]
+id = "record_and_list_literals"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/record_and_list_literals.bn"
+
+[[feature]]
+id = "set_literals"
+stage = "planned"
+parser_expectation = "reject"
+fixture = "examples/language_surface/future/set_literals.bn"
+
+[[feature]]
+id = "structured_out_and_pass"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/structured_out_and_pass.bn"
+
+[[feature]]
+id = "tags_presence_and_fault_algebra"
+stage = "planned"
+parser_expectation = "accept"
+fixture = "examples/language_surface/future/tags_presence_and_fault_algebra.bn"
+
+[[feature]]
+id = "typed_list_pipelines"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/typed_list_pipelines.bn"
+
+[[feature]]
+id = "where_contracts"
+stage = "planned"
+parser_expectation = "reject"
+fixture = "examples/language_surface/future/where_contracts.bn"

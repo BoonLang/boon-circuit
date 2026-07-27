@@ -7,6 +7,7 @@ use crate::{
     MAX_PACKAGE_FILES, NamespaceProfile, PackageError, RunMode, StaticCachePolicy,
     validate_relative_path,
 };
+use boon_contract::SourceBundleDigestV1;
 use boon_persistence::{ContentArtifact, ContentArtifactId};
 use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
 use boon_runtime::{ProgramArtifact, ProgramCapabilityProfile};
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 
 pub const BUNDLE_MANIFEST_FILE: &str = "bundle.cbor";
@@ -47,8 +49,7 @@ pub struct ArtifactDescriptor {
     pub content_media_type: String,
     pub bytes_sha256: String,
     pub bytes_len: usize,
-    pub source_bundle_sha256: String,
-    pub source_digest: String,
+    pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub plan_digest: String,
     pub compiler_id: String,
     pub target_profile: TargetProfile,
@@ -211,8 +212,6 @@ impl BundleManifest {
             }
             validate_sha256("content_artifact_id", &artifact.content_artifact_id)?;
             validate_sha256("artifact bytes_sha256", &artifact.bytes_sha256)?;
-            validate_sha256("source_bundle_sha256", &artifact.source_bundle_sha256)?;
-            validate_sha256("source_digest", &artifact.source_digest)?;
             validate_sha256("plan_digest", &artifact.plan_digest)?;
             validate_identifier(
                 "artifact capability_profile_id",
@@ -393,8 +392,14 @@ impl LoadedAppBundle {
         }
         let bytes = fs::read(&manifest_path)
             .map_err(|error| PackageError::context("read bundle manifest", error))?;
-        let manifest: BundleManifest = ciborium::from_reader(bytes.as_slice())
+        let mut reader = Cursor::new(bytes.as_slice());
+        let manifest: BundleManifest = ciborium::from_reader(&mut reader)
             .map_err(|error| PackageError::context("decode bundle manifest", error))?;
+        if reader.position() != bytes.len() as u64 {
+            return Err(PackageError::new(
+                "bundle manifest contains trailing CBOR data",
+            ));
+        }
         manifest.validate()?;
         for descriptor in &manifest.files {
             verify_file(&root, descriptor)?;
@@ -488,8 +493,8 @@ fn load_artifact(
             artifact.id_text() == descriptor.content_artifact_id,
         ),
         (
-            "source digest",
-            artifact.source_digest() == descriptor.source_digest,
+            "SourceBundleDigestV1",
+            artifact.source_bundle_digest_v1() == descriptor.source_bundle_digest_v1,
         ),
         (
             "plan digest",

@@ -279,12 +279,15 @@ impl ProgramArtifactRetention {
     }
 }
 
+pub const EMBEDDED_PROGRAM_ENTRY_PATH: &str = "RUN.bn";
+pub const EMBEDDED_PROGRAM_ARTIFACT_FORMAT: &str = "boon.embedded-program-artifact.v1";
+
 #[derive(Clone, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddedProgramSourceUnit {
     pub path: String,
     #[serde(default)]
     pub source: String,
-    pub source_digest: String,
 }
 
 impl Debug for EmbeddedProgramSourceUnit {
@@ -292,38 +295,25 @@ impl Debug for EmbeddedProgramSourceUnit {
         formatter
             .debug_struct("EmbeddedProgramSourceUnit")
             .field("path", &self.path)
-            .field("source_digest", &self.source_digest)
             .field("source_bytes", &self.source.len())
             .finish()
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct EmbeddedProgramDescriptor {
-    #[serde(default)]
     pub source: String,
-    pub source_digest: String,
     pub revision: u64,
-    #[serde(default)]
     pub artifact_id: String,
-    #[serde(default)]
     pub artifact_retention: ProgramArtifactRetention,
-    #[serde(default)]
     pub support_sources: Vec<EmbeddedProgramSourceUnit>,
-    #[serde(default)]
     pub bootstrap_source: String,
-    #[serde(default)]
-    pub bootstrap_source_digest: String,
-    #[serde(default)]
     pub bootstrap_artifact_id: String,
-    #[serde(default)]
+    pub bootstrap_support_sources: Vec<EmbeddedProgramSourceUnit>,
     pub bootstrap_revision: u64,
-    #[serde(default)]
     pub role: ProgramRole,
     pub capability_profile: ProgramCapabilityProfile,
-    #[serde(default)]
     pub session_key: String,
-    #[serde(default = "default_true")]
     pub mount: bool,
 }
 
@@ -331,14 +321,13 @@ impl Default for EmbeddedProgramDescriptor {
     fn default() -> Self {
         Self {
             source: String::new(),
-            source_digest: String::new(),
             revision: 0,
             artifact_id: String::new(),
             artifact_retention: ProgramArtifactRetention::default(),
             support_sources: Vec::new(),
             bootstrap_source: String::new(),
-            bootstrap_source_digest: String::new(),
             bootstrap_artifact_id: String::new(),
+            bootstrap_support_sources: Vec::new(),
             bootstrap_revision: 0,
             role: ProgramRole::Client,
             capability_profile: ProgramCapabilityProfile::default(),
@@ -350,17 +339,24 @@ impl Default for EmbeddedProgramDescriptor {
 
 impl Debug for EmbeddedProgramDescriptor {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let source_bundle_digest_v1 = self.source_bundle_digest_v1().ok().flatten();
+        let bootstrap_source_bundle_digest_v1 =
+            self.bootstrap_source_bundle_digest_v1().ok().flatten();
         formatter
             .debug_struct("EmbeddedProgramDescriptor")
-            .field("source_digest", &self.source_digest)
+            .field("source_bundle_digest_v1", &source_bundle_digest_v1)
             .field("source_bytes", &self.source.len())
             .field("revision", &self.revision)
             .field("artifact_id", &self.artifact_id)
             .field("artifact_retention", &self.artifact_retention)
             .field("support_sources", &self.support_sources)
-            .field("bootstrap_source_digest", &self.bootstrap_source_digest)
+            .field(
+                "bootstrap_source_bundle_digest_v1",
+                &bootstrap_source_bundle_digest_v1,
+            )
             .field("bootstrap_source_bytes", &self.bootstrap_source.len())
             .field("bootstrap_artifact_id", &self.bootstrap_artifact_id)
+            .field("bootstrap_support_sources", &self.bootstrap_support_sources)
             .field("bootstrap_revision", &self.bootstrap_revision)
             .field("role", &self.role)
             .field("capability_profile", &self.capability_profile)
@@ -370,61 +366,255 @@ impl Debug for EmbeddedProgramDescriptor {
     }
 }
 
+impl EmbeddedProgramDescriptor {
+    pub fn canonical_source_bundle_v1(
+        &self,
+    ) -> Result<Option<boon_contract::CanonicalSourceBundleV1<'_>>, boon_contract::SourceBundleError>
+    {
+        canonical_embedded_program_source_bundle_v1(&self.source, &self.support_sources)
+    }
+
+    pub fn canonical_bootstrap_source_bundle_v1(
+        &self,
+    ) -> Result<Option<boon_contract::CanonicalSourceBundleV1<'_>>, boon_contract::SourceBundleError>
+    {
+        canonical_embedded_program_source_bundle_v1(
+            &self.bootstrap_source,
+            &self.bootstrap_support_sources,
+        )
+    }
+
+    pub fn source_bundle_digest_v1(
+        &self,
+    ) -> Result<Option<boon_contract::SourceBundleDigestV1>, boon_contract::SourceBundleError> {
+        self.canonical_source_bundle_v1()
+            .map(|bundle| bundle.map(|bundle| bundle.digest()))
+    }
+
+    pub fn bootstrap_source_bundle_digest_v1(
+        &self,
+    ) -> Result<Option<boon_contract::SourceBundleDigestV1>, boon_contract::SourceBundleError> {
+        self.canonical_bootstrap_source_bundle_v1()
+            .map(|bundle| bundle.map(|bundle| bundle.digest()))
+    }
+}
+
+fn canonical_embedded_program_source_bundle_v1<'a>(
+    source: &'a str,
+    support_sources: &'a [EmbeddedProgramSourceUnit],
+) -> Result<Option<boon_contract::CanonicalSourceBundleV1<'a>>, boon_contract::SourceBundleError> {
+    if source.is_empty() {
+        return Ok(None);
+    }
+    boon_contract::CanonicalSourceBundleV1::new(
+        EMBEDDED_PROGRAM_ENTRY_PATH,
+        std::iter::once(boon_contract::SourceBundleUnit::new(
+            EMBEDDED_PROGRAM_ENTRY_PATH,
+            source,
+        ))
+        .chain(
+            support_sources
+                .iter()
+                .map(|unit| boon_contract::SourceBundleUnit::new(&unit.path, &unit.source)),
+        ),
+    )
+    .map(Some)
+}
+
+#[derive(Serialize)]
+struct EmbeddedProgramArtifactV1<'a> {
+    format: &'static str,
+    current: EmbeddedProgramRevisionArtifactV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bootstrap: Option<EmbeddedProgramRevisionArtifactV1>,
+    session_key: &'a str,
+    mount: bool,
+}
+
+#[derive(Serialize)]
+struct EmbeddedProgramRevisionArtifactV1 {
+    revision: u64,
+    role: ProgramRole,
+    capability_profile: ProgramCapabilityProfile,
+    artifact_retention: ProgramArtifactRetention,
+    payload: EmbeddedProgramPayloadArtifactV1,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum EmbeddedProgramPayloadArtifactV1 {
+    Source {
+        source_bundle_digest_v1: boon_contract::SourceBundleDigestV1,
+        entrypoint: String,
+        units: Vec<EmbeddedProgramUnitArtifactV1>,
+    },
+    ContentArtifact {
+        content_artifact_id: String,
+    },
+    Missing,
+    Invalid {
+        error: String,
+    },
+}
+
+#[derive(Serialize)]
+struct EmbeddedProgramUnitArtifactV1 {
+    path: String,
+    source_bytes: usize,
+}
+
+fn embedded_program_payload_artifact_v1(
+    source: &str,
+    artifact_id: &str,
+    support_sources: &[EmbeddedProgramSourceUnit],
+) -> EmbeddedProgramPayloadArtifactV1 {
+    let has_source = !source.is_empty();
+    let has_artifact = !artifact_id.trim().is_empty();
+    if has_source && has_artifact {
+        return EmbeddedProgramPayloadArtifactV1::Invalid {
+            error: "source and content artifact identity are mutually exclusive".to_owned(),
+        };
+    }
+    if !support_sources.is_empty() && !has_source {
+        return EmbeddedProgramPayloadArtifactV1::Invalid {
+            error: "support sources require a source payload".to_owned(),
+        };
+    }
+    if has_source {
+        return match canonical_embedded_program_source_bundle_v1(source, support_sources) {
+            Ok(Some(bundle)) => EmbeddedProgramPayloadArtifactV1::Source {
+                source_bundle_digest_v1: bundle.digest(),
+                entrypoint: bundle.entrypoint().to_owned(),
+                units: bundle
+                    .units()
+                    .iter()
+                    .map(|unit| EmbeddedProgramUnitArtifactV1 {
+                        path: unit.path().to_owned(),
+                        source_bytes: unit.source().len(),
+                    })
+                    .collect(),
+            },
+            Ok(None) => EmbeddedProgramPayloadArtifactV1::Missing,
+            Err(error) => EmbeddedProgramPayloadArtifactV1::Invalid {
+                error: bounded_embedded_program_error(error.to_string()),
+            },
+        };
+    }
+    if has_artifact {
+        return EmbeddedProgramPayloadArtifactV1::ContentArtifact {
+            content_artifact_id: artifact_id.trim().to_owned(),
+        };
+    }
+    EmbeddedProgramPayloadArtifactV1::Missing
+}
+
+fn bounded_embedded_program_error(error: String) -> String {
+    const MAX_BYTES: usize = 512;
+    if error.len() <= MAX_BYTES {
+        return error;
+    }
+    let mut bounded = String::new();
+    for character in error.chars() {
+        if bounded.len() + character.len_utf8() + 3 > MAX_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded.push_str("...");
+    bounded
+}
+
 impl Serialize for EmbeddedProgramDescriptor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        #[derive(Serialize)]
-        struct Artifact<'a> {
-            source_digest: &'a str,
-            source_bytes: usize,
-            revision: u64,
-            artifact_id: &'a str,
-            artifact_retention: ProgramArtifactRetention,
-            support_sources: Vec<SourceUnitArtifact<'a>>,
-            bootstrap_source_digest: &'a str,
-            bootstrap_source_bytes: usize,
-            bootstrap_artifact_id: &'a str,
-            bootstrap_revision: u64,
-            role: ProgramRole,
-            capability_profile: ProgramCapabilityProfile,
-            session_key: &'a str,
-            mount: bool,
-        }
-
-        #[derive(Serialize)]
-        struct SourceUnitArtifact<'a> {
-            path: &'a str,
-            source_digest: &'a str,
-            source_bytes: usize,
-        }
-
-        Artifact {
-            source_digest: &self.source_digest,
-            source_bytes: self.source.len(),
+        let current = EmbeddedProgramRevisionArtifactV1 {
             revision: self.revision,
-            artifact_id: &self.artifact_id,
-            artifact_retention: self.artifact_retention,
-            support_sources: self
-                .support_sources
-                .iter()
-                .map(|unit| SourceUnitArtifact {
-                    path: &unit.path,
-                    source_digest: &unit.source_digest,
-                    source_bytes: unit.source.len(),
-                })
-                .collect(),
-            bootstrap_source_digest: &self.bootstrap_source_digest,
-            bootstrap_source_bytes: self.bootstrap_source.len(),
-            bootstrap_artifact_id: &self.bootstrap_artifact_id,
-            bootstrap_revision: self.bootstrap_revision,
             role: self.role,
             capability_profile: self.capability_profile,
+            artifact_retention: self.artifact_retention,
+            payload: embedded_program_payload_artifact_v1(
+                &self.source,
+                &self.artifact_id,
+                &self.support_sources,
+            ),
+        };
+        let has_bootstrap = self.bootstrap_revision > 0
+            || !self.bootstrap_source.is_empty()
+            || !self.bootstrap_artifact_id.trim().is_empty()
+            || !self.bootstrap_support_sources.is_empty();
+        EmbeddedProgramArtifactV1 {
+            format: EMBEDDED_PROGRAM_ARTIFACT_FORMAT,
+            current,
+            bootstrap: has_bootstrap.then(|| EmbeddedProgramRevisionArtifactV1 {
+                revision: self.bootstrap_revision,
+                role: self.role,
+                capability_profile: self.capability_profile,
+                artifact_retention: ProgramArtifactRetention::Ephemeral,
+                payload: embedded_program_payload_artifact_v1(
+                    &self.bootstrap_source,
+                    &self.bootstrap_artifact_id,
+                    &self.bootstrap_support_sources,
+                ),
+            }),
             session_key: &self.session_key,
             mount: self.mount,
         }
         .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EmbeddedProgramDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Input {
+            #[serde(default)]
+            source: String,
+            revision: u64,
+            #[serde(default)]
+            artifact_id: String,
+            #[serde(default)]
+            artifact_retention: ProgramArtifactRetention,
+            #[serde(default)]
+            support_sources: Vec<EmbeddedProgramSourceUnit>,
+            #[serde(default)]
+            bootstrap_source: String,
+            #[serde(default)]
+            bootstrap_artifact_id: String,
+            #[serde(default)]
+            bootstrap_support_sources: Vec<EmbeddedProgramSourceUnit>,
+            #[serde(default)]
+            bootstrap_revision: u64,
+            #[serde(default)]
+            role: ProgramRole,
+            capability_profile: ProgramCapabilityProfile,
+            #[serde(default)]
+            session_key: String,
+            #[serde(default = "default_true")]
+            mount: bool,
+        }
+
+        let input = Input::deserialize(deserializer)?;
+        Ok(Self {
+            source: input.source,
+            revision: input.revision,
+            artifact_id: input.artifact_id,
+            artifact_retention: input.artifact_retention,
+            support_sources: input.support_sources,
+            bootstrap_source: input.bootstrap_source,
+            bootstrap_artifact_id: input.bootstrap_artifact_id,
+            bootstrap_support_sources: input.bootstrap_support_sources,
+            bootstrap_revision: input.bootstrap_revision,
+            role: input.role,
+            capability_profile: input.capability_profile,
+            session_key: input.session_key,
+            mount: input.mount,
+        })
     }
 }
 

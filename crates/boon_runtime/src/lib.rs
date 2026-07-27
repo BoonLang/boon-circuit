@@ -5,6 +5,7 @@ use boon_compiler::{
     compiler_source_text_for_path, compiler_source_units_for_manifest_source,
     compiler_source_units_for_path,
 };
+use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 pub use boon_document_model::{DocumentFrame, DocumentPatch, ProgramCapabilityProfile};
 use boon_example_manifest::ExampleManifest;
 pub use boon_example_manifest::{
@@ -141,6 +142,9 @@ pub struct LiveRuntime {
     source_ids_by_path: BTreeMap<String, SourceId>,
 }
 
+// Boxing `Ready` would change this public incremental-build API and add an
+// allocation to the successful runtime startup path.
+#[allow(clippy::large_enum_variant)]
 pub enum LiveRuntimeBuildPoll {
     Pending(MachineBuildProgress),
     Ready(LiveRuntime),
@@ -179,14 +183,8 @@ struct CachedPlan {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum RuntimeSourceCacheKey {
-    SourceText(String),
-    SourceUnits(String),
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct RuntimePlanCacheKey {
-    source: RuntimeSourceCacheKey,
+    source_bundle_digest_v1: SourceBundleDigestV1,
     application: ApplicationIdentity,
     role: ProgramRole,
 }
@@ -329,14 +327,19 @@ impl LiveRuntime {
         role: ProgramRole,
         application: ApplicationIdentity,
     ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+        let source_bundle = CanonicalSourceBundleV1::new(
+            source_label,
+            [SourceBundleUnit::new(source_label, source)],
+        )?;
         let key = RuntimePlanCacheKey {
-            source: RuntimeSourceCacheKey::SourceText(sha256_bytes(source.as_bytes())),
+            source_bundle_digest_v1: source_bundle.digest(),
             application: application.clone(),
             role,
         };
+        let entrypoint = source_bundle.entrypoint().to_owned();
         let (cached, cache_hit) = cached_plan(key, || {
             compile_runtime_source_text_to_machine_plan_for_role_with_identity(
-                source_label,
+                &entrypoint,
                 source,
                 TargetProfile::SoftwareDefault,
                 role,
@@ -419,21 +422,29 @@ impl LiveRuntime {
         role: ProgramRole,
         application: ApplicationIdentity,
     ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+        let source_bundle = CanonicalSourceBundleV1::new(
+            source_label,
+            units
+                .iter()
+                .map(|unit| SourceBundleUnit::new(&unit.path, &unit.source)),
+        )?;
         let key = RuntimePlanCacheKey {
-            source: RuntimeSourceCacheKey::SourceUnits(source_units_hash(units)),
+            source_bundle_digest_v1: source_bundle.digest(),
             application: application.clone(),
             role,
         };
-        let compiler_units = units
+        let entrypoint = source_bundle.entrypoint().to_owned();
+        let compiler_units = source_bundle
+            .units()
             .iter()
             .map(|unit| CompilerSourceUnit {
-                path: unit.path.clone(),
-                source: unit.source.clone(),
+                path: unit.path().to_owned(),
+                source: unit.source().to_owned(),
             })
             .collect::<Vec<_>>();
         let (cached, cache_hit) = cached_plan(key, || {
             compile_runtime_source_units_to_machine_plan_for_role_with_identity(
-                source_label,
+                &entrypoint,
                 &compiler_units,
                 TargetProfile::SoftwareDefault,
                 role,
@@ -2168,21 +2179,19 @@ pub fn example_manifest_entry(id: &str) -> RuntimeResult<ExampleManifestEntry> {
 }
 
 pub fn source_units_for_path(path: &Path) -> RuntimeResult<Vec<RuntimeSourceUnit>> {
-    Ok(compiler_source_units_for_path(path)?
+    compiler_source_units_for_path(path)?
         .into_iter()
         .map(runtime_source_unit)
-        .collect())
+        .collect()
 }
 
 pub fn source_units_for_entry(
     entry: &ExampleManifestEntry,
 ) -> RuntimeResult<Vec<RuntimeSourceUnit>> {
-    Ok(
-        compiler_source_units_for_manifest_source(&entry.source, &entry.source_files)?
-            .into_iter()
-            .map(runtime_source_unit)
-            .collect(),
-    )
+    compiler_source_units_for_manifest_source(&entry.source, &entry.source_files)?
+        .into_iter()
+        .map(runtime_source_unit)
+        .collect()
 }
 
 pub fn migration_sequence_for_entry(
@@ -2207,33 +2216,30 @@ pub fn source_text_for_entry(entry: &ExampleManifestEntry) -> RuntimeResult<Stri
     source_text_for_path(Path::new(&entry.source))
 }
 
-fn runtime_source_unit(unit: CompilerSourceUnit) -> RuntimeSourceUnit {
-    RuntimeSourceUnit {
-        path: unit.path,
+fn runtime_source_unit(unit: CompilerSourceUnit) -> RuntimeResult<RuntimeSourceUnit> {
+    let path = Path::new(&unit.path);
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("runtime manifest directory has no workspace parent")?;
+    let relative = if path.is_absolute() {
+        path.strip_prefix(workspace).map_err(|_| {
+            format!(
+                "runtime source path `{}` is outside workspace `{}`",
+                path.display(),
+                workspace.display()
+            )
+        })?
+    } else {
+        path
+    };
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| format!("runtime source path `{}` is not UTF-8", path.display()))?;
+    Ok(RuntimeSourceUnit {
+        path: boon_contract::normalize_source_path(relative)?,
         source: unit.source,
-    }
-}
-
-pub fn source_units_hash(units: &[RuntimeSourceUnit]) -> String {
-    let parts = units
-        .iter()
-        .map(|unit| (unit.path.as_str(), unit.source.as_str()))
-        .collect::<Vec<_>>();
-    source_unit_parts_hash(&parts)
-}
-
-pub fn source_unit_parts_hash(units: &[(&str, &str)]) -> String {
-    if let [(_, source)] = units {
-        return sha256_bytes(source.as_bytes());
-    }
-    let mut hasher = Sha256::new();
-    for (path, source) in units {
-        hasher.update(path.as_bytes());
-        hasher.update([0]);
-        hasher.update(source.as_bytes());
-        hasher.update([0xff]);
-    }
-    format!("{:x}", hasher.finalize())
+    })
 }
 
 pub fn sha256_bytes(bytes: &[u8]) -> String {
@@ -2256,6 +2262,153 @@ fn resolve_repo_file(relative: impl AsRef<Path>) -> PathBuf {
         }
     }
     relative.to_path_buf()
+}
+
+#[cfg(test)]
+mod source_identity_tests {
+    use super::*;
+
+    fn renderer(label: &str) -> String {
+        format!(
+            "FUNCTION render() {{\n    Scene/Element/text(element: [], style: [width: Fill], text: TEXT {{ {label} }})\n}}\n"
+        )
+    }
+
+    fn frame_has_text(runtime: &LiveRuntime, expected: &str) -> bool {
+        runtime.document_frame().is_some_and(|frame| {
+            frame
+                .nodes
+                .values()
+                .any(|node| node.text.as_ref().is_some_and(|text| text.text == expected))
+        })
+    }
+
+    #[test]
+    fn multi_unit_plan_cache_identity_includes_the_canonical_entrypoint() {
+        let units = vec![
+            RuntimeSourceUnit {
+                path: "A.bn".to_owned(),
+                source: renderer("Entry A"),
+            },
+            RuntimeSourceUnit {
+                path: "B.bn".to_owned(),
+                source: renderer("Entry B"),
+            },
+            RuntimeSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: "scene: render()\n".to_owned(),
+            },
+        ];
+        let application =
+            ApplicationIdentity::new("dev.boon.test", "entrypoint-cache-identity", "test");
+
+        let (runtime_a, profile_a) =
+            LiveRuntime::from_project_profiled_with_identity("A.bn", &units, application.clone())
+                .unwrap();
+        assert!(!profile_a.cache_hit);
+        assert!(frame_has_text(&runtime_a, "Entry A"));
+
+        let (runtime_b, profile_b) =
+            LiveRuntime::from_project_profiled_with_identity("B.bn", &units, application).unwrap();
+        assert!(!profile_b.cache_hit);
+        assert!(frame_has_text(&runtime_b, "Entry B"));
+    }
+}
+
+#[cfg(test)]
+mod semantic_metadata_currentness_tests {
+    use super::*;
+    use boon_document_model::{DocumentNode, StyleValue};
+
+    fn semantic_node(runtime: &LiveRuntime) -> &DocumentNode {
+        runtime
+            .document_frame()
+            .expect("fixture document frame")
+            .nodes
+            .values()
+            .find(|node| node.style.contains_key("target"))
+            .expect("fixture semantic node")
+    }
+
+    #[test]
+    fn retained_event_metadata_updates_exactly_and_keeps_its_source_route() {
+        let mut runtime = LiveRuntime::from_source(
+            "retained-event-metadata.bn",
+            r#"
+store: [
+    change: SOURCE
+    selected:
+        TEXT { A } |> HOLD selected {
+            store.change |> THEN { TEXT { B } }
+        }
+]
+
+document: Document/new(
+    root: Element/button(
+        element: [
+            event: [press: store.change]
+            target: store.selected
+            address: store.selected
+        ]
+        style: []
+        label: TEXT { semantic metadata }
+        target: store.selected
+    )
+)
+"#,
+        )
+        .unwrap();
+
+        let initial = semantic_node(&runtime);
+        assert_eq!(
+            initial.style.get("target"),
+            Some(&StyleValue::Text("A".to_owned()))
+        );
+        assert_eq!(
+            initial.style.get("address"),
+            Some(&StyleValue::Text("A".to_owned()))
+        );
+        let initial_bindings = initial.source_bindings.clone();
+        assert_eq!(initial_bindings.len(), 1);
+
+        let event = runtime
+            .source_event_for_path(1, "store.change", &[], SourcePayload::default())
+            .unwrap();
+        let turn = runtime.dispatch(event).unwrap();
+        assert!(turn.document_patches.iter().any(|patch| {
+            matches!(
+                patch,
+                DocumentPatch::SetStyle { patch, .. }
+                    if patch.get("target")
+                        == Some(&Some(StyleValue::Text("B".to_owned())))
+                        && patch.get("address")
+                            == Some(&Some(StyleValue::Text("B".to_owned())))
+            )
+        }));
+
+        let current = semantic_node(&runtime);
+        assert_eq!(
+            current.style.get("target"),
+            Some(&StyleValue::Text("B".to_owned()))
+        );
+        assert_eq!(
+            current.style.get("address"),
+            Some(&StyleValue::Text("B".to_owned()))
+        );
+        assert_eq!(current.source_bindings, initial_bindings);
+        assert!(
+            !runtime
+                .document_frame()
+                .unwrap()
+                .nodes
+                .values()
+                .any(|node| {
+                    ["target", "address"]
+                        .iter()
+                        .any(|key| node.style.get(*key) == Some(&StyleValue::Text("A".to_owned())))
+                })
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2685,7 +2838,7 @@ document: Document/new(
     #[test]
     fn cells_sheet_window_patches_retained_subtree_without_full_document_evaluation() {
         let units = source_units_for_path(std::path::Path::new("../../examples/cells.bn")).unwrap();
-        let mut runtime = LiveRuntime::from_project("cells-retained-window.bn", &units).unwrap();
+        let mut runtime = LiveRuntime::from_project("examples/cells.bn", &units).unwrap();
         let sheet_rows = runtime
             .session
             .plan()

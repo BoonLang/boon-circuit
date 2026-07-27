@@ -1,0 +1,486 @@
+format_version = 1
+baseline_source_head = "4a820727d339038826a9d589c207ef5f973dad83"
+baseline_scope = "current-worktree"
+claim = "inventory-only"
+
+[report_identity]
+protocol = "boon-phase0-evidence-v1"
+source_head = "exact"
+workspace_digest = "exact"
+dirty_final_evidence = "forbidden"
+stale_result = "fail"
+inspect_directory = "target/reports/report-v2"
+max_report_files = 64
+max_report_bytes = 524288
+max_output_bytes = 65536
+
+[[artifacts]]
+id = "parsed-program"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md"
+status = "present"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_parser/src/lib.rs"
+needle = "pub struct ParsedProgram"
+
+[[artifacts]]
+id = "checked-program"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md"
+status = "present"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_typecheck/src/lib.rs"
+needle = "pub struct CheckedProgram"
+
+[[artifacts]]
+id = "source-bundle-digest-v1"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "present"
+
+[[artifacts.probes]]
+kind = "path-exists"
+path = "crates/boon_contract/src/lib.rs"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_contract/src/lib.rs"
+needle = "pub struct CanonicalSourceBundleV1"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "CanonicalSourceBundleV1::new"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_app_package/src/bundle.rs"
+needle = "pub source_bundle_digest_v1: SourceBundleDigestV1"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_app_package/src/build.rs"
+needle = "artifact.source_bundle_digest_v1() != self.source_bundle_digest_v1"
+
+[[artifacts]]
+id = "embedded-program-redacted-artifact"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "present"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_document_model/src/lib.rs"
+needle = "boon.embedded-program-artifact.v1"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_document_model/src/lib.rs"
+needle = "struct EmbeddedProgramArtifactV1"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_document_model/src/lib.rs"
+needle = "source_bundle_digest_v1: boon_contract::SourceBundleDigestV1"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_document_model/src/lib.rs"
+needle = "source_bytes: usize"
+
+[[artifacts]]
+id = "embedded-program-request-currentness"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "present"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "boon.embedded-program-request.v3\\0"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "fn hash_prepared_program_revision_identity("
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "PreparedProgramPayloadIdentity::SourceBundle(digest) => {"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "hash_owner_part(hasher, digest.as_bytes());"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "hash_owner_part(hasher, COMPILER_ID.as_bytes());"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "hash_owner_part(hasher, b\"software_bounded\");"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "&descriptor.bootstrap_support_sources"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "equal_revision_current_identity: Option<PreparedProgramRevisionIdentity>"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "let equal_revision_bootstrap_current_identity = (bootstrapping"
+
+[[artifacts]]
+id = "caller-controlled-embedded-program-digests"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "absent"
+
+[[artifacts.probes]]
+kind = "text-absent"
+path = "crates/boon_document_model/src/lib.rs"
+needle = "pub source_digest:"
+
+[[artifacts.probes]]
+kind = "text-absent"
+path = "crates/boon_document_model/src/lib.rs"
+needle = "pub bootstrap_source_digest:"
+
+[[artifacts]]
+id = "semantic-program"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "absent"
+
+[[artifacts.probes]]
+kind = "path-absent"
+path = "crates/boon_semantic"
+
+[[artifacts]]
+id = "contract-verified-program"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "absent"
+
+[[artifacts.probes]]
+kind = "path-absent"
+path = "crates/boon_verify"
+
+[[artifacts]]
+id = "erased-program"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "legacy-present"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_ir/src/lib.rs"
+needle = "pub struct ErasedProgram"
+
+[[artifacts]]
+id = "machine-plan"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+status = "present"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_plan/src/lib.rs"
+needle = "pub struct MachinePlan"
+
+[[artifacts]]
+id = "program-artifact-v3"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+status = "present"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "const PROGRAM_ARTIFACT_FORMAT: u32 = 3;"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "const PROGRAM_ARTIFACT_MEDIA_TYPE: &str = \"application/vnd.boon.machine-plan+cbor;version=3\";"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "source_bundle_digest_v1: SourceBundleDigestV1"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_runtime/src/program.rs"
+needle = "if stored.format != PROGRAM_ARTIFACT_FORMAT"
+
+[[artifacts]]
+id = "native-playground-protocol-v13"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
+status = "present"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_native_playground/src/protocol.rs"
+needle = "const MAGIC: [u8; 4] = *b\"BNIP\";"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_native_playground/src/protocol.rs"
+needle = "const VERSION: u16 = 13;"
+
+[[artifacts]]
+id = "physical-plan"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+status = "absent"
+
+[[artifacts.probes]]
+kind = "text-absent"
+path = "crates/boon_plan/src/lib.rs"
+needle = "pub struct PhysicalPlan"
+
+[[artifacts]]
+id = "kernel-ir"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+status = "absent"
+
+[[artifacts.probes]]
+kind = "text-absent"
+path = "crates/boon_plan/src/lib.rs"
+needle = "pub struct KernelIR"
+
+[[artifacts]]
+id = "hardware-process"
+owner_phase = "goal-phase-8-riscv"
+owner_plan = "docs/plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md"
+status = "absent"
+
+[[artifacts.probes]]
+kind = "path-absent"
+path = "crates/boon_riscv_process"
+
+[[artifacts]]
+id = "portfolio-completion-evidence"
+owner_phase = "goal-phase-9-portfolio"
+owner_plan = "docs/plans/BOON_EXAMPLE_PORTFOLIO_PLAN.md"
+status = "absent"
+
+[[artifacts.probes]]
+kind = "path-absent"
+path = "target/reports/portfolio-v1/complete.json"
+
+[[version_axes]]
+id = "semantic-value-profile"
+absent = true
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+target = "ExactNumberSemanticProfileV1 plus final Tags/BITS/MAP/SET/FLUSH algebra"
+replacement = "Replace unversioned FiniteReal/binary64 and privileged Bool/Null/Error semantics in one flag-day cut."
+
+[[version_axes]]
+id = "semantic-program-artifact"
+absent = true
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "SemanticProgramV1"
+replacement = "Create boon_semantic and freeze its canonical artifact encoding and digest."
+
+[[version_axes]]
+id = "erased-program-artifact"
+absent = true
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "ErasedProgramV1"
+replacement = "Version the opaque verification-derived executable artifact; the public legacy struct is not a version."
+
+[[version_axes]]
+id = "verification-policy"
+absent = true
+owner_phase = "goal-phase-4-formal"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "VerificationPolicyV1"
+replacement = "Freeze accepted assurance, resource, kernel, and solver policy before accepting obligations."
+
+[[version_axes]]
+id = "verification-manifest"
+absent = true
+owner_phase = "goal-phase-4-formal"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "VerificationManifestV1"
+replacement = "Add the completeness-checked required and successful manifest encodings."
+
+[[version_axes]]
+id = "proof-report"
+absent = true
+owner_phase = "goal-phase-4-formal"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "ProofReportV1"
+replacement = "Add bounded deterministic proof report and failure-reservation schemas."
+
+[[version_axes]]
+id = "physical-layout-profile"
+absent = true
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+target = "PhysicalPlanV1"
+replacement = "Split physical layout selection from semantic MachinePlan and version its layout hash."
+
+[[version_axes]]
+id = "target-profile-registry"
+absent = true
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+target = "TargetProfileRegistryV1"
+replacement = "Replace the unversioned target enum with a generic versioned capability/profile registry."
+
+[[version_axes]]
+id = "novywave-product-contract"
+absent = true
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/NOVYWAVE_BOON_REWRITE_PLAN.md"
+target = "NovyWaveProductContractV1"
+replacement = "Freeze the real-data fixture set, product budgets, and acceptance manifest on the final runtime."
+
+[[version_axes]]
+id = "fjordpulse-product-contract"
+current_version = "reference-dd6e750c2ca9dec3041f66ceda31d30379d4027a"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/FJORDPULSE_FULL_STACK_BOON_REWRITE_PLAN.md"
+target = "FjordPulseProductContractV1@dd6e750c2ca9dec3041f66ceda31d30379d4027a"
+replacement = "Freeze the 108-story and 340-scenario manifest without changing the pinned reference dataset."
+
+[[version_axes]]
+id = "dataset-fixture-identity"
+current_version = "boon.dataset-fixture-manifest.v1+SourceBundleDigestV1"
+owner_phase = "goal-phase-0"
+owner_plan = "docs/plans/GOAL_PROMPT.md"
+target = "DatasetFixtureManifestV1"
+replacement = "Keep stable semantic fixture IDs bound to exact canonical source-unit sets; bump the manifest schema whenever identity framing or required categories change."
+
+[[version_axes]]
+id = "source-bundle-artifact"
+current_version = "SourceBundleDigestV1"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "SourceBundleDigestV1"
+replacement = "Keep the single entrypoint-and-unit framed SHA-256 implementation shared by compiler, runtime, and package."
+
+[[version_axes]]
+id = "embedded-program-redacted-artifact"
+current_version = "boon.embedded-program-artifact.v1"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "redacted embedded-program artifact with SourceBundleDigestV1 identity"
+replacement = "Bump when the redacted artifact schema, payload identity, or source-disclosure policy changes; reject older artifact encodings."
+
+[[version_axes]]
+id = "embedded-program-request-currentness"
+current_version = "boon.embedded-program-request.v3"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "request identity derived from canonical source bundle, compiler, target, role, capability, retention, revision, parent/session identity, and equal-revision bootstrap current identity"
+replacement = "Bump whenever any request-currentness input or framing changes; callers do not supply descriptor digests."
+
+[[version_axes]]
+id = "machine-plan-artifact"
+current_version = "6.0"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+target = "semantic MachinePlan version after PhysicalPlan split"
+replacement = "Bump only with the flag-day semantic/physical boundary and reject older executable artifacts."
+
+[[version_axes]]
+id = "program-artifact"
+current_version = "3"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+target = "program artifact format 3 with application/vnd.boon.machine-plan+cbor;version=3, bound to SourceBundleDigestV1, compiler identity, target, capability, and plan digest"
+replacement = "Bump both stored format and media-type version, then reject older artifacts whenever executable identity or stored artifact framing changes."
+
+[[version_axes]]
+id = "wire-format"
+current_version = "1"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/GOAL_PROMPT.md"
+target = "final-algebra wire format"
+replacement = "Bump with removal of Bool/Null/Error wire tags and retain no dual decoder."
+
+[[version_axes]]
+id = "client-session-protocol"
+current_version = "4"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/GOAL_PROMPT.md"
+target = "final Client/Session/Server protocol"
+replacement = "Bump after final role topology and wire algebra are frozen."
+
+[[version_axes]]
+id = "session-control-protocol"
+current_version = "3"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/GOAL_PROMPT.md"
+target = "final session-control protocol"
+replacement = "Bump after final routing, cancellation, and stale-launch rules are frozen."
+
+[[version_axes]]
+id = "persistence-format"
+current_version = "format-2-schema-1"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md"
+target = "canonical durable DTO and activation schema"
+replacement = "Bump with final value DTOs, semantic identity, migration catalog, and proof activation."
+
+[[version_axes]]
+id = "typed-list-key-codec"
+current_version = "1"
+owner_phase = "goal-phase-3-typed-list"
+owner_plan = "docs/plans/TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md"
+target = "final-algebra structural-key codec"
+replacement = "Bump after exact Number, Tags, BITS, and typed view keys replace the legacy key algebra."
+
+[[version_axes]]
+id = "typed-list-cursor-token"
+current_version = "5"
+owner_phase = "goal-phase-3-typed-list"
+owner_plan = "docs/plans/TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md"
+target = "final view-instance cursor token"
+replacement = "Bump after final key codec, view identity, and physical access plan are frozen."
+
+[[version_axes]]
+id = "native-report-tool"
+current_version = "report-v2/tool-v2"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
+target = "manifest-backed final handoff report/tool version"
+replacement = "Retain exact source and workspace identity; bump only with a schema/tool contract change."
+
+[[version_axes]]
+id = "native-playground-protocol"
+current_version = "13"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
+target = "BNIP native playground protocol v13"
+replacement = "Bump with any native desktop, preview, dev, source-bundle, catalog, migration, or verification frame contract change."
+
+[[version_axes]]
+id = "phase0-evidence-report"
+current_version = "1"
+owner_phase = "goal-phase-0"
+owner_plan = "docs/plans/GOAL_PROMPT.md"
+target = "boon-phase0-evidence-v1"
+replacement = "Keep bounded JSON and exact worktree identity for this inventory contract."

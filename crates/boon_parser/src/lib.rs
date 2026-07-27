@@ -212,6 +212,178 @@ impl ProgramKind {
     }
 }
 
+/// Delivery status for a public Boon language-surface feature.
+///
+/// This is deliberately independent from parser acceptance: some planned
+/// semantics reuse syntax that the current parser already accepts, while
+/// planned syntax with no implementation must continue to fail closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LanguageFeatureStage {
+    Current,
+    Planned,
+}
+
+impl LanguageFeatureStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Planned => "planned",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LanguageFeatureParseExpectation {
+    Accept,
+    Reject,
+}
+
+impl LanguageFeatureParseExpectation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LanguageFeatureSpec {
+    pub id: &'static str,
+    pub stage: LanguageFeatureStage,
+    pub parse_expectation: LanguageFeatureParseExpectation,
+    pub spellings: &'static [&'static str],
+    pub summary: &'static str,
+}
+
+/// Canonical parser-owned registry for the public language-surface coverage
+/// contract. Entries are sorted by `id`.
+///
+/// `Planned + Accept` means only that the current grammar accepts the fixture;
+/// it does not claim the planned semantics exist. `Planned + Reject` reserves a
+/// fail-closed spelling until the implementing phase lands atomically.
+pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
+    LanguageFeatureSpec {
+        id: "bits_fixed_width_literals",
+        stage: LanguageFeatureStage::Planned,
+        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        spellings: &["BITS"],
+        summary: "fixed-width BITS[N] literals are planned and rejected today",
+    },
+    LanguageFeatureSpec {
+        id: "distributed_role_paths",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["Client/", "Session/", "Server/"],
+        summary: "slash-qualified Client, Session, and Server values and calls",
+    },
+    LanguageFeatureSpec {
+        id: "exact_number_value_algebra",
+        stage: LanguageFeatureStage::Planned,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["integer literal", "decimal literal"],
+        summary: "existing number token syntax parses, but exact arithmetic semantics are planned",
+    },
+    LanguageFeatureSpec {
+        id: "flush_control",
+        stage: LanguageFeatureStage::Planned,
+        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        spellings: &["FLUSH"],
+        summary: "fail-fast FLUSH control is planned and rejected today",
+    },
+    LanguageFeatureSpec {
+        id: "immutable_bytes",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["BYTES", "Bytes/"],
+        summary: "immutable dynamic, inferred, and fixed-size byte values",
+    },
+    LanguageFeatureSpec {
+        id: "legacy_binary64_numbers",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["integer literal", "decimal literal"],
+        summary: "current number literals lower through the legacy finite binary64 value",
+    },
+    LanguageFeatureSpec {
+        id: "legacy_bool_values",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["True", "False"],
+        summary: "True and False currently parse as dedicated legacy Bool values",
+    },
+    LanguageFeatureSpec {
+        id: "map_literals",
+        stage: LanguageFeatureStage::Planned,
+        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        spellings: &["MAP"],
+        summary: "authoritative MAP literals are planned and rejected today",
+    },
+    LanguageFeatureSpec {
+        id: "one_based_positions",
+        stage: LanguageFeatureStage::Planned,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["position:", "from:", "count:"],
+        summary: "one-based LIST, TEXT, BYTES, and BITS position semantics are planned",
+    },
+    LanguageFeatureSpec {
+        id: "reactive_temporal_operators",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["SOURCE", "HOLD", "LATEST", "THEN", "WHEN", "WHILE"],
+        summary: "current reactive sources, state, merge, event, and selection operators",
+    },
+    LanguageFeatureSpec {
+        id: "record_and_list_literals",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["[field: value]", "LIST"],
+        summary: "structural record and ordered LIST literals",
+    },
+    LanguageFeatureSpec {
+        id: "set_literals",
+        stage: LanguageFeatureStage::Planned,
+        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        spellings: &["SET"],
+        summary: "authoritative SET literals are planned and rejected today",
+    },
+    LanguageFeatureSpec {
+        id: "structured_out_and_pass",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["OUT", "PASS", "PASSED"],
+        summary: "structured output bindings and a separate final PASS context",
+    },
+    LanguageFeatureSpec {
+        id: "tags_presence_and_fault_algebra",
+        stage: LanguageFeatureStage::Planned,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["Tag", "Tag[field: value]"],
+        summary: "tag syntax parses today, while the unified presence and fault algebra is planned",
+    },
+    LanguageFeatureSpec {
+        id: "typed_list_pipelines",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["List/map", "List/filter", "List/sort", "List/page"],
+        summary: "typed LIST pipelines with structured row bindings",
+    },
+    LanguageFeatureSpec {
+        id: "where_contracts",
+        stage: LanguageFeatureStage::Planned,
+        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        spellings: &["WHERE"],
+        summary: "authored WHERE proof obligations are planned and rejected today",
+    },
+];
+
+pub fn language_feature(id: &str) -> Option<&'static LanguageFeatureSpec> {
+    LANGUAGE_FEATURE_REGISTRY
+        .binary_search_by_key(&id, |feature| feature.id)
+        .ok()
+        .map(|index| &LANGUAGE_FEATURE_REGISTRY[index])
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParsedProgram {
     pub path: String,
@@ -3420,6 +3592,21 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
                 "`LINK` is not supported in boon-circuit examples; declare input ports with `SOURCE`",
             ));
         }
+        if let Some(feature) = LANGUAGE_FEATURE_REGISTRY.iter().find(|feature| {
+            feature.stage == LanguageFeatureStage::Planned
+                && feature.parse_expectation == LanguageFeatureParseExpectation::Reject
+                && feature.spellings.contains(&token.lexeme.as_str())
+        }) {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                &format!(
+                    "`{}` belongs to planned language feature `{}` and is rejected until that feature is implemented",
+                    token.lexeme, feature.id
+                ),
+            ));
+        }
         if example_source && matches!(token.lexeme.as_str(), "bg" | "fill" | "true" | "false") {
             return Err(error(
                 path,
@@ -5339,6 +5526,71 @@ mapped:
                 root.name
             );
         }
+    }
+
+    #[test]
+    fn canonical_language_feature_registry_is_sorted_unique_and_honest() {
+        assert!(!LANGUAGE_FEATURE_REGISTRY.is_empty());
+        for features in LANGUAGE_FEATURE_REGISTRY.windows(2) {
+            assert!(
+                features[0].id < features[1].id,
+                "language feature `{}` must sort before unique feature `{}`",
+                features[0].id,
+                features[1].id
+            );
+        }
+        for feature in LANGUAGE_FEATURE_REGISTRY {
+            assert!(
+                !feature.id.is_empty()
+                    && feature
+                        .id
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
+                "invalid language feature id `{}`",
+                feature.id
+            );
+            assert!(
+                !feature.spellings.is_empty(),
+                "{} has no spellings",
+                feature.id
+            );
+            assert!(!feature.summary.is_empty(), "{} has no summary", feature.id);
+            assert_eq!(language_feature(feature.id), Some(feature));
+            if feature.stage == LanguageFeatureStage::Current {
+                assert_eq!(
+                    feature.parse_expectation,
+                    LanguageFeatureParseExpectation::Accept,
+                    "current feature `{}` cannot claim parser rejection",
+                    feature.id
+                );
+            }
+        }
+        assert_eq!(language_feature("not_a_language_feature"), None);
+    }
+
+    #[test]
+    fn planned_unimplemented_spellings_fail_closed_outside_comments_and_text() {
+        for feature in LANGUAGE_FEATURE_REGISTRY.iter().filter(|feature| {
+            feature.stage == LanguageFeatureStage::Planned
+                && feature.parse_expectation == LanguageFeatureParseExpectation::Reject
+        }) {
+            for spelling in feature.spellings {
+                let source = format!("value: {spelling} {{}}\n");
+                let error = parse_source("planned-language-surface.bn", source).unwrap_err();
+                assert!(
+                    error.message.contains(feature.id),
+                    "unexpected `{spelling}` error for {}: {error}",
+                    feature.id
+                );
+            }
+        }
+
+        parse_source(
+            "planned-words-in-text.bn",
+            "-- BITS FLUSH MAP SET WHERE remain ordinary comment text\n\
+             note: TEXT { BITS FLUSH MAP SET WHERE }\n",
+        )
+        .unwrap();
     }
 
     #[test]

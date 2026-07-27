@@ -1,0 +1,5 @@
+settings: [enabled: True, title: TEXT { coverage }]
+rows: LIST {
+    [id: 1, name: TEXT { one }]
+    [id: 2, name: TEXT { two }]
+}

@@ -42,13 +42,12 @@ fn session_info_intrinsics_enforce_role_visibility_and_closed_types() {
         &ExternalTypeEnvironment::empty(ProgramRole::Session),
     );
     assert!(!session.has_errors(), "{:#?}", session.diagnostics);
-    for role in [ProgramRole::Client] {
-        let report = check_with_external_types(&principal, &ExternalTypeEnvironment::empty(role));
-        assert!(
-            report.has_errors(),
-            "{role:?} unexpectedly accepted principal"
-        );
-    }
+    let role = ProgramRole::Client;
+    let report = check_with_external_types(&principal, &ExternalTypeEnvironment::empty(role));
+    assert!(
+        report.has_errors(),
+        "{role:?} unexpectedly accepted principal"
+    );
     let server = check_with_external_types(
         &principal,
         &ExternalTypeEnvironment::empty(ProgramRole::Server),
@@ -487,7 +486,7 @@ fn distributed_adjacent_roles_can_read_in_both_directions() {
         ),
     ] {
         let parsed =
-            boon_parser::parse_source("adjacent-role.bn", &format!("value: {path}\n")).unwrap();
+            boon_parser::parse_source("adjacent-role.bn", format!("value: {path}\n")).unwrap();
         let mut environment = ExternalTypeEnvironment::empty(consumer);
         environment
             .values

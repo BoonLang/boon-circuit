@@ -1,0 +1,15 @@
+store: [
+    cells:
+        List/range(from: 0, to: 2599)
+        |> List/map(item, new: [
+            address: item |> Number/to_text(radix: 10)
+            value: item
+        ])
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: TEXT { retained window fixture }
+    )
+)

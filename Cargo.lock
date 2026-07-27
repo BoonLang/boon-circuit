@@ -630,11 +630,13 @@ dependencies = [
 name = "boon_app_package"
 version = "0.1.0"
 dependencies = [
+ "boon_contract",
  "boon_persistence",
  "boon_plan",
  "boon_runtime",
  "ciborium",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "toml",
@@ -683,6 +685,7 @@ dependencies = [
 name = "boon_compiler"
 version = "0.1.0"
 dependencies = [
+ "boon_contract",
  "boon_data",
  "boon_example_manifest",
  "boon_ir",
@@ -690,10 +693,20 @@ dependencies = [
  "boon_plan",
  "boon_typecheck",
  "serde",
+ "serde_json",
  "sha2",
  "toml",
  "unicode-segmentation",
  "web-time",
+]
+
+[[package]]
+name = "boon_contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -720,6 +733,7 @@ dependencies = [
 name = "boon_document_model"
 version = "0.1.0"
 dependencies = [
+ "boon_contract",
  "serde",
  "toml",
 ]
@@ -856,6 +870,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "boon_compiler",
+ "boon_contract",
  "boon_document",
  "boon_document_model",
  "boon_editor",
@@ -923,6 +938,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_phase0_baseline"
+version = "0.1.0"
+dependencies = [
+ "boon_compiler",
+ "boon_contract",
+ "boon_plan",
+ "boon_plan_executor",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "boon_plan"
 version = "0.1.0"
 dependencies = [
@@ -950,6 +979,7 @@ dependencies = [
  "serde",
  "sha2",
  "wasm-bindgen-test",
+ "web-time",
 ]
 
 [[package]]
@@ -957,6 +987,7 @@ name = "boon_runtime"
 version = "0.1.0"
 dependencies = [
  "boon_compiler",
+ "boon_contract",
  "boon_data",
  "boon_document",
  "boon_document_model",
@@ -971,6 +1002,7 @@ dependencies = [
  "js-sys",
  "redb",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "toml",
@@ -6201,6 +6233,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "boon_phase0_baseline",
  "libc",
  "serde",
  "serde_json",

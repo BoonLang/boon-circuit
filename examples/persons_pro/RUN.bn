@@ -388,7 +388,7 @@ store: [
     published_source_digest:
         Text/empty() |> HOLD published_source_digest {
             elements.publish_candidate_program.compiled
-                |> THEN { elements.publish_candidate_program.compiled.source_digest }
+                |> THEN { elements.publish_candidate_program.compiled.source_bundle_digest_v1 }
         }
 
     published_artifact_id:
@@ -423,7 +423,7 @@ store: [
 
     published_revision_to_append:
         elements.publish_candidate_program.compiled
-            |> THEN { elements.publish_candidate_program.compiled.source_digest }
+            |> THEN { elements.publish_candidate_program.compiled.source_bundle_digest_v1 }
 
     published_revisions:
         LIST {}

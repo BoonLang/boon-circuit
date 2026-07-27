@@ -320,13 +320,15 @@ fn distributed_graph_prelude(
     })
 }
 
+type DistributedProducerClosure = (
+    BTreeMap<ProgramRole, Vec<boon_ir::ProducerFunctionLoweringRequest>>,
+    BTreeMap<(ProgramRole, String), PrelinkedCallSite>,
+);
+
 fn resolve_distributed_producer_closure(
     checked: &BTreeMap<ProgramRole, CheckedProgram>,
     prelude: &DistributedGraphPrelude,
-) -> CompilerResult<(
-    BTreeMap<ProgramRole, Vec<boon_ir::ProducerFunctionLoweringRequest>>,
-    BTreeMap<(ProgramRole, String), PrelinkedCallSite>,
-)> {
+) -> CompilerResult<DistributedProducerClosure> {
     let mut requests =
         BTreeMap::<ProgramRole, BTreeSet<boon_ir::ProducerFunctionLoweringRequest>>::new();
     let mut producer_lineages = BTreeMap::<[u8; 32], Vec<(ProgramRole, String)>>::new();
@@ -2293,10 +2295,8 @@ fn origin_scoped_server_values<'a>(
         expression.visit_intrinsics(&server.plan.row_expressions, &mut |_| {
             has_session_info = true
         })?;
-        if has_session_info {
-            if let Some(output) = &op.output {
-                scoped.insert(output.clone());
-            }
+        if has_session_info && let Some(output) = &op.output {
+            scoped.insert(output.clone());
         }
     }
     loop {

@@ -1,0 +1,104 @@
+format_version = 1
+protocol = "boon-phase0-current-runtime-v1"
+target_profile = "software_default"
+build_profile = "release"
+allocator_scope = "All Rust allocations in the single-threaded native producer process; intervals exclude compilation, warmup, JSON serialization, and report I/O unless named otherwise."
+
+[[fixtures]]
+id = "counter"
+source = "examples/counter.bn"
+expected_authoritative_rows = 0
+semantics = "legacy-current-runtime"
+
+[[fixtures.actions]]
+id = "increment"
+class = "sparse"
+kind = "root-source"
+target = "store.sources.increment_button.events.press"
+warmup_turns = 8
+measured_turns = 64
+semantic_rows_per_turn = 0
+require_no_interaction_index_rebuild = true
+
+[[fixtures]]
+id = "todomvc"
+source = "examples/todomvc.bn"
+expected_authoritative_rows = 4
+semantics = "legacy-current-runtime"
+
+[[fixtures.actions]]
+id = "toggle-all"
+class = "dense"
+kind = "root-source"
+target = "store.sources.toggle_all_checkbox.events.click"
+warmup_turns = 8
+measured_turns = 32
+semantic_rows_per_turn = 4
+require_no_interaction_index_rebuild = true
+
+[[fixtures]]
+id = "cells"
+source = "examples/cells.bn"
+expected_authoritative_rows = 2600
+semantics = "legacy-current-runtime"
+
+[[fixtures.actions]]
+id = "edit-a0"
+class = "sparse"
+kind = "row-source"
+target = "cells.sources.editor.commit"
+warmup_turns = 4
+measured_turns = 20
+row_key = 1
+row_generation = 1
+payload_address = "A0"
+payload_text = ["6", "5"]
+semantic_rows_per_turn = 1
+require_no_interaction_index_rebuild = true
+
+[[fixtures]]
+id = "fjordpulse-shaped"
+source = "testdata/fjordpulse_scale_access.bn"
+expected_authoritative_rows = 58500
+semantics = "legacy-current-runtime"
+
+[[fixtures.actions]]
+id = "indexed-page"
+class = "query"
+kind = "cursor-page"
+target = "store.page_after_input"
+read_after = "store.page"
+warmup_turns = 4
+measured_turns = 20
+semantic_rows_per_turn = 0
+require_no_full_scan = true
+require_no_interaction_index_rebuild = true
+
+[[fixtures]]
+id = "million-row"
+source = "testdata/phase0/million_row_current_runtime.bn"
+expected_authoritative_rows = 1000000
+semantics = "legacy-current-runtime"
+
+[[fixtures.actions]]
+id = "indexed-tail"
+class = "query"
+kind = "root-source"
+target = "store.sources.shift_page"
+read_after = "store.page_count"
+warmup_turns = 1
+measured_turns = 5
+semantic_rows_per_turn = 0
+require_no_full_scan = true
+require_no_interaction_index_rebuild = true
+
+[[fixtures.actions]]
+id = "toggle-all-rows"
+class = "dense"
+kind = "root-source"
+target = "store.sources.toggle_all"
+read_after = "store.enabled_count"
+warmup_turns = 1
+measured_turns = 3
+semantic_rows_per_turn = 1000000
+require_no_interaction_index_rebuild = true

@@ -1,0 +1,8 @@
+store: [
+    pulse: SOURCE
+
+    count:
+        0 |> HOLD count {
+            pulse |> THEN { count + 1 }
+        }
+]

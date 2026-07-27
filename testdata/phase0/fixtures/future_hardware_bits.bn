@@ -1,0 +1,9 @@
+FUNCTION add_registers(left: BITS[32], right: BITS[32]) {
+    left + right
+}
+
+result:
+    add_registers(
+        left: BITS[32] { 16u00000001 }
+        right: BITS[32] { 16u00000002 }
+    )

@@ -1,0 +1,10 @@
+store: [
+    start: SOURCE
+
+    result:
+        NotRequested |> HOLD result {
+            start |> THEN {
+                Random/bytes(byte_count: 1)
+            }
+        }
+]

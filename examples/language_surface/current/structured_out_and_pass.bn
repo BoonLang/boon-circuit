@@ -1,0 +1,16 @@
+FUNCTION remap(list, item: OUT, new) {
+    list
+    |> List/map(
+        item: item
+        new: new
+    )
+}
+
+rows: LIST { [value: 1] }
+mapped:
+    remap(
+        list: rows
+        item
+        new: item.value
+        PASS: [theme: theme]
+    )

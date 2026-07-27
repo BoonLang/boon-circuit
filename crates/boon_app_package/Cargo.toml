@@ -10,6 +10,7 @@ default = []
 build = ["dep:wasm-bindgen-cli-support"]
 
 [dependencies]
+boon_contract.workspace = true
 boon_persistence.workspace = true
 boon_plan.workspace = true
 boon_runtime.workspace = true
@@ -20,5 +21,6 @@ toml.workspace = true
 wasm-bindgen-cli-support = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile = "3.23.0"
 wat = "1.240.0"

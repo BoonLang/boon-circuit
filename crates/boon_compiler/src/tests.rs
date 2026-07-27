@@ -1,10 +1,27 @@
 use super::*;
+use boon_contract::{CanonicalSourceBundleV1, SourceBundleUnit};
 use boon_plan::{
     DistributedRouteScopePlan, HostPortPlan, ListInitializerKind, PlanInfixOp,
     PlanListAccessSelection, PlanListProjection, PlanListRowFieldRole, PlanRowBuiltin,
     SourcePayloadField, distributed_graph_schema_hash,
 };
 use std::collections::BTreeSet;
+
+#[derive(serde::Deserialize)]
+struct SourceBundleGoldenFixture {
+    schema: String,
+    entrypoint: String,
+    units: Vec<SourceBundleGoldenUnit>,
+    canonical_entrypoint: String,
+    canonical_paths: Vec<String>,
+    digest: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SourceBundleGoldenUnit {
+    path: String,
+    source: String,
+}
 
 #[test]
 fn nested_effect_guards_lower_to_bounded_selector_conjunctions() {
@@ -4248,23 +4265,22 @@ store: [
         .regions
         .iter()
         .flat_map(|region| &region.ops)
-        .find_map(|op| match &op.kind {
-            PlanOpKind::StateUpdate {
-                effect: Some(effect),
-                ..
-            } if matches!(
-                row_node(&compiled.plan.row_expressions, effect.gate),
-                PlanRowExpressionNode::Select { input, .. }
-                    if matches!(
-                        row_node(&compiled.plan.row_expressions, *input),
-                        PlanRowExpressionNode::BuiltinCall { function, .. }
-                            if *function == PlanRowBuiltin::ListIsNotEmpty
-                    )
-            ) =>
-            {
-                Some(op)
-            }
-            _ => None,
+        .find(|op| {
+            matches!(
+                &op.kind,
+                PlanOpKind::StateUpdate {
+                    effect: Some(effect),
+                    ..
+                } if matches!(
+                    row_node(&compiled.plan.row_expressions, effect.gate),
+                    PlanRowExpressionNode::Select { input, .. }
+                        if matches!(
+                            row_node(&compiled.plan.row_expressions, *input),
+                            PlanRowExpressionNode::BuiltinCall { function, .. }
+                                if *function == PlanRowBuiltin::ListIsNotEmpty
+                        )
+                )
+            )
         })
         .expect("typed scalar-list nonempty host-effect guard");
     assert_eq!(guarded_effect.unresolved_executable_ref_count, 0);
@@ -5296,6 +5312,619 @@ store: [
 }
 
 #[test]
+fn chained_filters_keep_forwarded_source_objects_out_of_scalar_row_storage() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "chained-filter-resource-fields.bn",
+        r#"
+FUNCTION new_row(input) {
+    [
+        controls: [select: SOURCE]
+        label: input.label
+    ]
+}
+
+store: [
+    inputs: LIST {
+        [label: TEXT { first }]
+        [label: TEXT { second }]
+    }
+    rows:
+        inputs |> List/map(item, new: new_row(input: item))
+    filtered:
+        rows |> List/filter(item, if: item.label == TEXT { first })
+    selected:
+        filtered |> List/filter(item, if: True)
+    remapped:
+        selected |> List/map(item, new: [
+            controls: item.controls
+            label: item.label
+        ])
+    selected_label:
+        remapped
+        |> List/map(item, new: item.controls.select |> THEN { item.label })
+        |> List/latest()
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let forwarded_lists = [
+        "store.rows",
+        "store.filtered",
+        "store.selected",
+        "store.remapped",
+    ]
+    .into_iter()
+    .map(|name| {
+        compiled
+            .ir
+            .lists
+            .iter()
+            .find(|list| list.name == name)
+            .unwrap_or_else(|| panic!("missing forwarded list `{name}`"))
+            .id
+    })
+    .collect::<BTreeSet<_>>();
+    let control_fields = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.role.is_value()
+                && field.name == "controls"
+                && field
+                    .row
+                    .is_some_and(|row| forwarded_lists.contains(&row.list))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        control_fields
+            .iter()
+            .filter_map(|field| field.row.map(|row| row.list))
+            .collect::<BTreeSet<_>>(),
+        forwarded_lists,
+        "each forwarded list must retain its controls resource facade"
+    );
+    assert!(
+        control_fields.iter().all(|field| field.resource_only),
+        "filter forwarding reintroduced a nested SOURCE object as scalar data: {control_fields:#?}"
+    );
+    let control_ids = control_fields
+        .iter()
+        .map(|field| boon_plan::FieldId(field.id.as_usize()))
+        .collect::<BTreeSet<_>>();
+    let remapped = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.remapped")
+        .expect("remapped list");
+    let remapped_label_fields = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.role.is_value()
+                && field.name == "label"
+                && field.row.is_some_and(|row| row.list == remapped.id)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !remapped_label_fields.is_empty()
+            && remapped_label_fields
+                .iter()
+                .all(|field| !field.resource_only),
+        "ordinary scalar siblings must survive resource forwarding: {remapped_label_fields:#?}"
+    );
+    let remapped_label_ids = remapped_label_fields
+        .iter()
+        .map(|field| boon_plan::FieldId(field.id.as_usize()))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        compiled.plan.source_routes.iter().any(|route| {
+            route.row_projections.iter().any(|projection| {
+                projection.list == boon_plan::ListId(remapped.id.as_usize())
+                    && projection.path == ["controls", "select"]
+            })
+        }),
+        "resource-only scalar exclusion lost the remapped-row source route"
+    );
+    assert!(
+        compiled
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .filter(|slot| slot.list_id == boon_plan::ListId(remapped.id.as_usize()))
+            .flat_map(|slot| &slot.row_fields)
+            .any(|field| remapped_label_ids.contains(&field.field_id)),
+        "ordinary remapped label disappeared from scalar row storage"
+    );
+    assert!(
+        compiled
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .flat_map(|slot| &slot.row_fields)
+            .all(|field| !control_ids.contains(&field.field_id)),
+        "resource-only controls entered scalar row storage"
+    );
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .filter_map(|op| match &op.kind {
+                PlanOpKind::DerivedValue {
+                    materialization: Some(materialization),
+                    ..
+                } => Some(materialization),
+                _ => None,
+            })
+            .flat_map(|materialization| materialization.fields.values())
+            .all(|field| !control_ids.contains(field)),
+        "resource-only controls entered scalar materialization fields"
+    );
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .filter_map(|op| match &op.kind {
+                PlanOpKind::DerivedValue {
+                    materialization: Some(materialization),
+                    ..
+                } => Some(materialization),
+                _ => None,
+            })
+            .flat_map(|materialization| &materialization.row_field_copies)
+            .all(|copy| {
+                !control_ids.contains(&copy.source_field)
+                    && !control_ids.contains(&copy.target_field)
+            }),
+        "resource-only controls entered a scalar materialization copy"
+    );
+}
+
+#[test]
+fn direct_projected_and_block_aliased_resource_rows_remain_resource_only() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "wrapped-resource-row-storage.bn",
+        r#"
+FUNCTION new_row(input) {
+    [
+        controls: [select: SOURCE]
+        label: input.label
+    ]
+}
+
+store: [
+    seed: LIST {
+        [label: TEXT { mapped }]
+    }
+    rows:
+        seed |> List/map(item, new: new_row(input: item))
+    container: [rows: rows]
+    projected: container.rows
+    blocked:
+        BLOCK {
+            alias: projected
+            alias
+        }
+    direct: LIST {
+        [controls: [select: SOURCE], label: TEXT { direct }]
+    }
+    blocked_use:
+        blocked
+        |> List/map(item, new: item.controls.select |> THEN { item.label })
+        |> List/latest()
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: store.blocked_use
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let lists = [
+        "store.rows",
+        "store.projected",
+        "store.blocked",
+        "store.direct",
+    ]
+    .into_iter()
+    .map(|name| {
+        compiled
+            .ir
+            .lists
+            .iter()
+            .find(|list| list.name == name)
+            .unwrap_or_else(|| panic!("missing wrapped list `{name}`"))
+            .id
+    })
+    .collect::<BTreeSet<_>>();
+    let controls = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.role.is_value()
+                && field.name == "controls"
+                && field.row.is_some_and(|row| lists.contains(&row.list))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        controls
+            .iter()
+            .filter_map(|field| field.row.map(|row| row.list))
+            .collect::<BTreeSet<_>>(),
+        lists,
+        "every exact wrapper must retain a controls field"
+    );
+    assert!(
+        controls.iter().all(|field| field.resource_only),
+        "an exact list wrapper demoted a SOURCE facade: {controls:#?}"
+    );
+    let control_ids = controls
+        .iter()
+        .map(|field| boon_plan::FieldId(field.id.as_usize()))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        compiled
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .flat_map(|slot| &slot.row_fields)
+            .all(|field| !control_ids.contains(&field.field_id)),
+        "wrapped resource facades entered scalar row storage"
+    );
+}
+
+#[test]
+fn direct_list_source_and_scalar_branches_remain_scalar() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "direct-list-resource-branches.bn",
+        r#"
+store: [
+    mixed:
+        False |> WHEN {
+            True => LIST {
+                [controls: [select: SOURCE], label: TEXT { source }]
+            }
+            False => LIST {
+                [controls: [select: [text: TEXT { scalar }]], label: TEXT { scalar }]
+            }
+        }
+    mixed_check:
+        mixed
+        |> List/map(item, new: item.controls == item.controls)
+        |> List/latest()
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label:
+            store.mixed_check |> WHEN {
+                True => TEXT { yes }
+                False => TEXT { no }
+            }
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let list = |name: &str| {
+        compiled
+            .ir
+            .lists
+            .iter()
+            .find(|list| list.name == name)
+            .unwrap_or_else(|| panic!("missing direct branch list `{name}`"))
+            .id
+    };
+    let mixed = list("store.mixed");
+    let fields = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| field.role.is_value() && field.name == "controls")
+        .collect::<Vec<_>>();
+    let mixed_fields = fields
+        .iter()
+        .copied()
+        .filter(|field| field.row.is_some_and(|row| row.list == mixed))
+        .collect::<Vec<_>>();
+    assert!(
+        !mixed_fields.is_empty() && mixed_fields.iter().all(|field| !field.resource_only),
+        "a SOURCE direct branch erased its scalar sibling: {mixed_fields:#?}"
+    );
+}
+
+#[test]
+fn merged_filter_branches_keep_mixed_source_and_scalar_fields_in_storage() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "mixed-resource-and-scalar-filter-branches.bn",
+        r#"
+FUNCTION resource_row(input) {
+    [controls: [select: SOURCE], label: input.label]
+}
+
+store: [
+    seed: LIST {
+        [label: TEXT { source }]
+    }
+    resource_rows:
+        seed |> List/map(item, new: resource_row(input: item))
+    resource_use:
+        resource_rows
+        |> List/map(item, new: item.controls.select.text |> THEN { item.label })
+        |> List/latest()
+    scalar_rows: LIST {
+        [controls: [select: [text: TEXT { scalar }]], label: TEXT { scalar }]
+    }
+    merged:
+        False |> WHEN {
+            True => resource_rows |> List/filter(item, if: True)
+            False => scalar_rows
+        }
+    mixed_check:
+        merged
+        |> List/map(item, new: item.controls == item.controls)
+        |> List/latest()
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: store.mixed_check |> WHEN {
+            True => TEXT { yes }
+            False => TEXT { no }
+        }
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let merged = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.merged")
+        .expect("merged list");
+    let controls = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.role.is_value()
+                && field.name == "controls"
+                && field.row.is_some_and(|row| row.list == merged.id)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !controls.is_empty() && controls.iter().all(|field| !field.resource_only),
+        "one source branch erased a scalar branch of the merged field: {controls:#?}"
+    );
+    let control_ids = controls
+        .iter()
+        .map(|field| boon_plan::FieldId(field.id.as_usize()))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        compiled
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .filter(|slot| slot.list_id == boon_plan::ListId(merged.id.as_usize()))
+            .flat_map(|slot| &slot.row_fields)
+            .any(|field| control_ids.contains(&field.field_id)),
+        "mixed merged controls field disappeared from scalar row storage"
+    );
+    assert!(
+        compiled.plan.source_routes.iter().any(|route| {
+            route.row_projections.iter().any(|projection| {
+                projection.list == boon_plan::ListId(merged.id.as_usize())
+                    && projection.path == ["controls", "select"]
+            })
+        }),
+        "mixed scalar storage lost the resource branch source route"
+    );
+}
+
+#[test]
+fn inline_mapped_resource_branch_does_not_erase_scalar_merged_field() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "inline-resource-map-and-scalar-branch.bn",
+        r#"
+FUNCTION resource_row(input) {
+    [controls: [select: SOURCE], label: input.label]
+}
+
+store: [
+    seed: LIST {
+        [label: TEXT { source }]
+    }
+    scalar_rows: LIST {
+        [controls: [select: [text: TEXT { scalar }]], label: TEXT { scalar }]
+    }
+    merged:
+        False |> WHEN {
+            True => seed |> List/map(item, new: resource_row(input: item))
+            False => scalar_rows
+        }
+    mixed_check:
+        merged
+        |> List/map(item, new: item.controls == item.controls)
+        |> List/latest()
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: store.mixed_check |> WHEN {
+            True => TEXT { yes }
+            False => TEXT { no }
+        }
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let merged = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.merged")
+        .expect("merged list");
+    let controls = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.role.is_value()
+                && field.name == "controls"
+                && field.row.is_some_and(|row| row.list == merged.id)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !controls.is_empty() && controls.iter().all(|field| !field.resource_only),
+        "an inline source-producing map erased the scalar branch: {controls:#?}"
+    );
+    let control_ids = controls
+        .iter()
+        .map(|field| boon_plan::FieldId(field.id.as_usize()))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        compiled
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .filter(|slot| slot.list_id == boon_plan::ListId(merged.id.as_usize()))
+            .flat_map(|slot| &slot.row_fields)
+            .any(|field| control_ids.contains(&field.field_id)),
+        "mixed inline-map controls disappeared from scalar row storage"
+    );
+}
+
+#[test]
+fn merged_mapped_resource_branches_remain_resource_only() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "merged-resource-map-branches.bn",
+        r#"
+FUNCTION resource_row(input) {
+    [controls: [select: SOURCE], label: input.label]
+}
+
+store: [
+    seed: LIST {
+        [label: TEXT { source }]
+    }
+    resource_rows:
+        seed |> List/map(item, new: resource_row(input: item))
+    resource_use:
+        resource_rows
+        |> List/map(item, new: item.controls.select.text |> THEN { item.label })
+        |> List/latest()
+    merged:
+        False |> WHEN {
+            True => resource_rows |> List/map(item, new: [
+                controls: item.controls
+                label: item.label
+            ])
+            False => resource_rows |> List/map(item, new: [
+                controls: item.controls
+                label: item.label
+            ])
+        }
+    merged_use:
+        merged
+        |> List/map(item, new: item.controls.select.text |> THEN { item.label })
+        |> List/latest()
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: store.merged_use
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let merged = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.merged")
+        .expect("merged list");
+    let controls = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.role.is_value()
+                && field.name == "controls"
+                && field.row.is_some_and(|row| row.list == merged.id)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !controls.is_empty() && controls.iter().all(|field| field.resource_only),
+        "all-resource Map branches reintroduced scalar storage: {controls:#?}"
+    );
+    assert!(
+        controls.iter().all(|field| field.producer.is_none()),
+        "the two-Map regression must exercise aggregate provenance without a unique producer: \
+         {controls:#?}"
+    );
+    let control_ids = controls
+        .iter()
+        .map(|field| boon_plan::FieldId(field.id.as_usize()))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        compiled
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .flat_map(|slot| &slot.row_fields)
+            .all(|field| !control_ids.contains(&field.field_id)),
+        "all-resource merged controls entered scalar row storage"
+    );
+    assert!(
+        compiled.plan.source_routes.iter().any(|route| {
+            route.row_projections.iter().any(|projection| {
+                projection.list == boon_plan::ListId(merged.id.as_usize())
+                    && projection.path == ["controls", "select"]
+            })
+        }),
+        "all-resource merged controls lost their exact source route"
+    );
+}
+
+#[test]
 fn remapped_row_resource_members_replace_filtered_source_ownership() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "remapped-row-resource-members.bn",
@@ -5309,8 +5938,8 @@ FUNCTION new_row(input) {
 
 store: [
     inputs: LIST {
-        [label: TEXT { same }]
-        [label: TEXT { other }]
+        [controls: [remove: [text: TEXT { scalar }]], label: TEXT { same }]
+        [controls: [remove: [text: TEXT { scalar }]], label: TEXT { other }]
     }
     rows:
         inputs
@@ -5336,6 +5965,28 @@ store: [
         .collect::<Vec<_>>();
     assert_eq!(remove_routes.len(), 2, "old and replacement row sources");
     assert_ne!(remove_routes[0].source_id, remove_routes[1].source_id);
+    let filtered = compiled
+        .ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.filtered")
+        .expect("filtered replacement list");
+    let controls = compiled
+        .ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.role.is_value()
+                && field.name == "controls"
+                && field.row.is_some_and(|row| row.list == filtered.id)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !controls.is_empty() && controls.iter().all(|field| field.resource_only),
+        "a scalar identity predecessor constrained the replacement Map source facade: \
+         {controls:#?}"
+    );
 }
 
 #[test]
@@ -6649,6 +7300,74 @@ document: Document/new(
             .collect::<Vec<_>>();
         names == ["width", "height", "background", "__hover_gloss"]
     }));
+}
+
+#[test]
+fn shared_source_bundle_digest_v1_golden_compiles_canonical_client_bundle() {
+    let fixture: SourceBundleGoldenFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/contracts/source_bundle_digest_v1.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.schema, "boon.source-bundle-golden.v1");
+
+    let canonical = CanonicalSourceBundleV1::new(
+        &fixture.entrypoint,
+        fixture
+            .units
+            .iter()
+            .map(|unit| SourceBundleUnit::new(&unit.path, &unit.source)),
+    )
+    .unwrap();
+    assert_eq!(canonical.entrypoint(), fixture.canonical_entrypoint);
+    assert_eq!(
+        canonical
+            .units()
+            .iter()
+            .map(|unit| unit.path())
+            .collect::<Vec<_>>(),
+        fixture
+            .canonical_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(canonical.digest().to_string(), fixture.digest);
+
+    let units = canonical
+        .units()
+        .iter()
+        .map(|unit| CompilerSourceUnit {
+            path: unit.path().to_owned(),
+            source: unit.source().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let compiled = compile_source_units_to_machine_plan(
+        canonical.entrypoint(),
+        &units,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let document = compiled
+        .plan
+        .document
+        .as_ref()
+        .expect("golden client bundle must retain a visual document");
+
+    assert_eq!(compiled.plan.program_role, ProgramRole::Client);
+    assert_eq!(compiled.plan.outputs.len(), 1);
+    assert_eq!(compiled.plan.outputs[0].name, "scene");
+    assert_eq!(compiled.plan.outputs[0].contract, OutputContractKind::Scene);
+    assert_eq!(
+        compiled.plan.outputs[0].demand,
+        OutputDemandPolicy::HostDemanded
+    );
+    assert_eq!(
+        compiled.plan.outputs[0].value,
+        OutputValueRef::RetainedVisual {
+            expression: document.root.expression
+        }
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
 }
 
 #[test]
@@ -8397,14 +9116,13 @@ store: [
 #[test]
 fn distributed_compiler_rejects_session_info_captured_by_global_server_state() {
     for intrinsic in ["status", "principal"] {
-        let server = format!(
-            r#"
+        let server = r#"
 store: [
     seed: 1
     saved: Server/store.saved
 ]
-"#,
-        );
+"#
+        .to_string();
         let global_state = format!(
             r#"
 store: [
@@ -8434,13 +9152,12 @@ store: [
 #[test]
 fn distributed_compiler_accepts_server_session_info_in_origin_scoped_call_branch() {
     for intrinsic in ["status", "principal"] {
-        let session = format!(
-            r#"
+        let session = r#"
 store: [
     info: Server/session_info(seed: 1)
 ]
-"#,
-        );
+"#
+        .to_string();
         let server = format!(
             r#"
 store: [

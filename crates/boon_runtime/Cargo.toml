@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 boon_compiler.workspace = true
+boon_contract.workspace = true
 boon_data.workspace = true
 boon_document_model.workspace = true
 boon_example_manifest.workspace = true
@@ -26,6 +27,7 @@ web-time = "1.1.0"
 [dev-dependencies]
 boon_document.workspace = true
 redb.workspace = true
+serde_json.workspace = true
 tempfile = "3.27.0"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

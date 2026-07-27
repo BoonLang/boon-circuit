@@ -44,10 +44,7 @@ fn exact_state_cause(program: &ErasedProgram, path: &str) -> EventCause {
     )
 }
 
-fn exact_subtree<'a>(
-    program: &'a ErasedProgram,
-    root: ExecutableExprId,
-) -> Vec<&'a ExecutableExpression> {
+fn exact_subtree(program: &ErasedProgram, root: ExecutableExprId) -> Vec<&ExecutableExpression> {
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
     let mut expressions = Vec::new();
@@ -113,7 +110,7 @@ fn source_payload_erasure_keeps_the_endpoint_field_and_residual_projection() {
 
     assert_eq!(
         erased_source_payload_read(
-            &[source.clone()],
+            std::slice::from_ref(&source),
             ErasedBindingId(0),
             source.id,
             &["payload".to_owned(), "child".to_owned()],

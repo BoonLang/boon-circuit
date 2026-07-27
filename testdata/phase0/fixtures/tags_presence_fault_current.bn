@@ -1,0 +1,6 @@
+-- Ordinary tagged records work today. The visible facade presents Null as an
+-- ordinary Tag while internal absence and host/compiler fault channels remain
+-- outside this source-level analogue.
+present: Present[value: 7]
+ordinary_fault: InvalidNumber
+current_absence: Null

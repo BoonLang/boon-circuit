@@ -1,0 +1,11 @@
+-- SoftwareBounded is the only generic bounded compilation profile today.
+-- CoreHardwareIR and generic hardware eligibility do not exist yet.
+bounded_rows: LIST[4] {
+    [value: 1]
+    [value: 2]
+}
+
+result:
+    bounded_rows
+    |> List/map(item, new: item.value)
+    |> List/sum()

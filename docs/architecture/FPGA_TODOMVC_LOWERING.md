@@ -1,7 +1,25 @@
 # FPGA TodoMVC Lowering
 
-This document describes how the ordinary circuit-style TodoMVC should lower to
-FPGA hardware without requiring a central reducer or a user-visible todo `id`.
+> **Phase 0 status: delete after replacement.**
+>
+> **Current executable behavior:** there is no production FPGA TodoMVC backend
+> implementing this document; current software/native behavior remains defined
+> by checked-in executable paths.
+>
+> **Historical/stale content:** the lowering sketch and referenced
+> `explain-hardware` workflow predate the unified processor plan and are not
+> current hardware evidence.
+>
+> **Target-only content:** hardware lowering without user-visible row identity
+> remains a target constraint, not an implemented FPGA capability.
+>
+> **Flag-day owner:** unified goal Phase 8 replaces this sketch with the
+> bounded RISC-V processor pipeline and then deletes this file rather than
+> retaining a second hardware contract.
+
+This document records the earlier design for lowering ordinary circuit-style
+TodoMVC to FPGA hardware without requiring a central reducer or a user-visible
+todo `id`.
 
 ## Why This Matters
 

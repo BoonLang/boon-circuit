@@ -1,18 +1,38 @@
 #![cfg(feature = "build")]
 
 use boon_app_package::{
-    AppManifest, BUNDLE_MANIFEST_FILE, BrowserAppConfig, BrowserPackageAssetDescriptor,
-    BuildRequest, BundleFileKind, BundleManifest, LoadedAppBundle, MAX_BROWSER_APP_CONFIG_BYTES,
-    MAX_BROWSER_PACKAGE_ASSETS, MAX_CAPABILITY_GRANTS_PER_PROFILE, MAX_CAPABILITY_PROFILES,
-    MAX_PACKAGE_FILE_BYTES, NamespaceProfile, RunMode, build_app_package,
+    AppManifest, BUNDLE_FORMAT, BUNDLE_MANIFEST_FILE, BrowserAppConfig,
+    BrowserPackageAssetDescriptor, BuildRequest, BundleFileKind, BundleManifest, LoadedAppBundle,
+    MAX_BROWSER_APP_CONFIG_BYTES, MAX_BROWSER_PACKAGE_ASSETS, MAX_CAPABILITY_GRANTS_PER_PROFILE,
+    MAX_CAPABILITY_PROFILES, MAX_PACKAGE_FILE_BYTES, NamespaceProfile, RunMode,
+    SourceBundleDigestV1, build_app_package,
 };
 use boon_plan::ProgramRole;
 use boon_runtime::ProgramCapabilityProfile;
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Deserialize)]
+struct SharedSourceBundleDigestFixture {
+    schema: String,
+    entrypoint: String,
+    units: Vec<SharedSourceBundleUnit>,
+    digest: String,
+}
+
+#[derive(Deserialize)]
+struct SharedSourceBundleUnit {
+    path: String,
+    source: String,
+}
+
 fn fixture_manifest() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/triple/app.toml")
+}
+
+fn workspace_fjordpulse_manifest() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/fjordpulse/app.toml")
 }
 
 fn browser_wasm(temp: &tempfile::TempDir) -> PathBuf {
@@ -47,6 +67,26 @@ fn write_bundle_manifest(output: &Path, manifest: &BundleManifest) {
     let mut bytes = Vec::new();
     ciborium::into_writer(manifest, &mut bytes).unwrap();
     fs::write(output.join(BUNDLE_MANIFEST_FILE), bytes).unwrap();
+}
+
+fn replace_first_bytes(bytes: &[u8], original: &[u8], replacement: &[u8]) -> Vec<u8> {
+    let offset = bytes
+        .windows(original.len())
+        .position(|window| window == original)
+        .expect("encoded bundle value must exist");
+    let mut replaced = Vec::with_capacity(bytes.len() - original.len() + replacement.len());
+    replaced.extend_from_slice(&bytes[..offset]);
+    replaced.extend_from_slice(replacement);
+    replaced.extend_from_slice(&bytes[offset + original.len()..]);
+    replaced
+}
+
+fn cbor_short_text(value: &str) -> Vec<u8> {
+    assert!(value.len() < 24);
+    let mut encoded = Vec::with_capacity(value.len() + 1);
+    encoded.push(0x60 | value.len() as u8);
+    encoded.extend_from_slice(value.as_bytes());
+    encoded
 }
 
 fn assert_bundle_manifest_rejected(
@@ -112,6 +152,70 @@ fn strict_manifest_rejects_unknown_fields_and_protocol_mismatch() {
             1,
         );
     assert!(toml::from_str::<AppManifest>(&legacy_document).is_err());
+}
+
+#[test]
+fn shared_source_bundle_digest_v1_fixture_matches_package_contract() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/contracts/source_bundle_digest_v1.json");
+    let fixture: SharedSourceBundleDigestFixture =
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(fixture.schema, "boon.source-bundle-golden.v1");
+    let digest = SourceBundleDigestV1::new(
+        &fixture.entrypoint,
+        fixture
+            .units
+            .iter()
+            .map(|unit| boon_contract::SourceBundleUnit::new(&unit.path, &unit.source)),
+    )
+    .unwrap();
+    assert_eq!(digest.to_string(), fixture.digest);
+}
+
+#[test]
+fn workspace_fjordpulse_manifest_is_a_strict_three_role_package() {
+    let path = workspace_fjordpulse_manifest();
+    let manifest = AppManifest::from_path(&path).unwrap();
+
+    assert_eq!(manifest.package.id, "cz.kavik.fjordpulse");
+    assert_eq!(manifest.programs.client.role, ProgramRole::Client);
+    assert_eq!(manifest.programs.session.role, ProgramRole::Session);
+    assert_eq!(manifest.programs.server.role, ProgramRole::Server);
+    assert_eq!(
+        manifest.programs.client.capability_profile,
+        ProgramCapabilityProfile::PublicClient
+    );
+    assert_eq!(
+        manifest.programs.session.capability_profile,
+        ProgramCapabilityProfile::TrustedSession
+    );
+    assert_eq!(
+        manifest.programs.server.capability_profile,
+        ProgramCapabilityProfile::TrustedServer
+    );
+    assert_eq!(manifest.programs.client.artifact, "artifacts/client.boon");
+    assert_eq!(manifest.programs.session.artifact, "artifacts/session.boon");
+    assert_eq!(manifest.programs.server.artifact, "artifacts/server.boon");
+    assert_eq!(
+        manifest
+            .programs
+            .session
+            .namespace(NamespaceProfile::Production),
+        "fjordpulse-session-production-v1"
+    );
+
+    let source = fs::read_to_string(path).unwrap();
+    let legacy_document = source
+        .replacen("[programs.client]", "[programs.document]", 1)
+        .replacen(
+            "[programs.client.namespaces]",
+            "[programs.document.namespaces]",
+            1,
+        );
+    assert!(
+        toml::from_str::<AppManifest>(&legacy_document).is_err(),
+        "the removed programs.document package shape must stay rejected"
+    );
 }
 
 #[test]
@@ -222,6 +326,18 @@ fn unrelated_triple_builds_and_loads_with_exact_roles_profiles_and_identity() {
         "dev.boon.fixture.triple-notes"
     );
     assert_eq!(loaded.manifest().artifacts.len(), 3);
+    for descriptor in &loaded.manifest().artifacts {
+        let artifact = match descriptor.role {
+            ProgramRole::Client => loaded.client_artifact(),
+            ProgramRole::Session => loaded.session_artifact(),
+            ProgramRole::Server => loaded.server_artifact(),
+        };
+        assert_eq!(
+            descriptor.source_bundle_digest_v1,
+            artifact.source_bundle_digest_v1(),
+            "package and runtime source identity must use the same SourceBundleDigestV1"
+        );
+    }
     assert_eq!(loaded.manifest().capability_profiles.len(), 3);
     assert_eq!(
         loaded
@@ -404,6 +520,107 @@ fn bundle_capability_profile_tampering_and_omission_fail_closed() {
         .unwrap();
     client.grants.insert(1, client.grants[0].clone());
     assert_bundle_manifest_rejected(&output, &duplicate_grant, "strictly sorted and unique");
+}
+
+#[test]
+fn source_bundle_digest_v1_round_trips_and_rejects_tampering_and_legacy_shapes() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = build_fixture(&temp, "bundle");
+    let manifest_path = output.join(BUNDLE_MANIFEST_FILE);
+    let original_bytes = fs::read(&manifest_path).unwrap();
+    let original = read_bundle_manifest(&output);
+
+    assert_eq!(original.format, BUNDLE_FORMAT);
+    let mut round_trip_bytes = Vec::new();
+    ciborium::into_writer(&original, &mut round_trip_bytes).unwrap();
+    let round_trip: BundleManifest = ciborium::from_reader(round_trip_bytes.as_slice()).unwrap();
+    assert_eq!(round_trip, original);
+
+    let value: ciborium::Value = ciborium::from_reader(original_bytes.as_slice()).unwrap();
+    let ciborium::Value::Map(root) = value else {
+        panic!("bundle manifest must encode as a CBOR map");
+    };
+    let artifacts = root
+        .iter()
+        .find_map(|(key, value)| {
+            matches!(key, ciborium::Value::Text(name) if name == "artifacts").then_some(value)
+        })
+        .expect("bundle manifest must contain artifacts");
+    let ciborium::Value::Array(artifacts) = artifacts else {
+        panic!("bundle artifacts must encode as a CBOR array");
+    };
+    let ciborium::Value::Map(fields) = &artifacts[0] else {
+        panic!("bundle artifact must encode as a CBOR map");
+    };
+    let field_names = fields
+        .iter()
+        .filter_map(|(key, _)| match key {
+            ciborium::Value::Text(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(field_names.contains(&"source_bundle_digest_v1"));
+    assert!(!field_names.contains(&"source_bundle_sha256"));
+    assert!(!field_names.contains(&"source_digest"));
+
+    let mut tampered = original.clone();
+    let original_digest = tampered.artifacts[0].source_bundle_digest_v1;
+    let replacement = ["00".repeat(32), "11".repeat(32)]
+        .into_iter()
+        .map(|value| value.parse::<SourceBundleDigestV1>().unwrap())
+        .find(|value| *value != original_digest)
+        .unwrap();
+    tampered.artifacts[0].source_bundle_digest_v1 = replacement;
+    assert_bundle_manifest_rejected(&output, &tampered, "SourceBundleDigestV1 differs");
+
+    let encoded_digest = original_digest.to_string();
+    for invalid in ["A".repeat(64), "g".repeat(64)] {
+        let bytes = replace_first_bytes(
+            &original_bytes,
+            encoded_digest.as_bytes(),
+            invalid.as_bytes(),
+        );
+        fs::write(&manifest_path, bytes).unwrap();
+        let error = LoadedAppBundle::load(&output)
+            .err()
+            .expect("non-canonical SourceBundleDigestV1 must fail");
+        assert!(
+            error.to_string().contains("SourceBundleDigestV1"),
+            "unexpected package error: {error}"
+        );
+    }
+
+    for legacy_field in ["source_bundle_sha256", "source_digest"] {
+        let bytes = replace_first_bytes(
+            &original_bytes,
+            &cbor_short_text("source_bundle_digest_v1"),
+            &cbor_short_text(legacy_field),
+        );
+        fs::write(&manifest_path, bytes).unwrap();
+        assert!(
+            LoadedAppBundle::load(&output).is_err(),
+            "legacy `{legacy_field}` must not be accepted"
+        );
+    }
+
+    let mut legacy_format = original;
+    legacy_format.format = BUNDLE_FORMAT - 1;
+    assert_bundle_manifest_rejected(&output, &legacy_format, "unsupported bundle format");
+}
+
+#[test]
+fn bundle_manifest_rejects_trailing_cbor_data() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = build_fixture(&temp, "bundle");
+    let manifest_path = output.join(BUNDLE_MANIFEST_FILE);
+    let mut bytes = fs::read(&manifest_path).unwrap();
+    bytes.push(0);
+    fs::write(&manifest_path, bytes).unwrap();
+
+    let error = LoadedAppBundle::load(&output)
+        .err()
+        .expect("trailing bundle manifest data must fail");
+    assert!(error.to_string().contains("trailing CBOR data"));
 }
 
 #[test]

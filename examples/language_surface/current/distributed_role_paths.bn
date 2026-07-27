@@ -1,0 +1,3 @@
+server_count: Server/store.count
+session_title: Session/store.title
+client_event: Client/store.event

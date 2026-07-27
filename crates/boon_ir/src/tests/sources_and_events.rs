@@ -2454,6 +2454,38 @@ FUNCTION new_row(input) {
 }
 
 #[test]
+fn erased_scope_index_rejects_cyclic_resource_forwarding() {
+    let mut ir = resource_only_row_program();
+    let local = ir
+        .scope_index
+        .locals
+        .iter_mut()
+        .find(|local| {
+            local
+                .members
+                .iter()
+                .any(|member| matches!(member.target, ErasedLocalMemberTarget::Source(_)))
+        })
+        .expect("materialized source member");
+    let owner = local.owner;
+    let local_id = local.local;
+    let member = local
+        .members
+        .iter_mut()
+        .find(|member| matches!(member.target, ErasedLocalMemberTarget::Source(_)))
+        .expect("materialized source member");
+    member.forwarded_from = Some(ErasedLocalMemberForwarding::Local {
+        owner,
+        local: local_id,
+        path: member.path.clone(),
+    });
+
+    let error = verify_erased_scope_index(&ir)
+        .expect_err("resource forwarding must terminate at direct source authority");
+    assert!(error.contains("forwarding forms a local cycle"), "{error}");
+}
+
+#[test]
 fn erased_value_binding_rejects_resource_only_field_authority() {
     let mut ir = resource_only_row_program();
     let resource = ir

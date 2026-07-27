@@ -45,6 +45,8 @@ use crate::protocol::{
 };
 use crate::transient_host::{NativeTransientHost, PackageAsset, TransientHostCompletion};
 use crate::view::HitTarget;
+#[cfg(test)]
+use crate::view::node_matches_semantic_text;
 type ViewResult<T> = Result<T, String>;
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -183,11 +185,19 @@ pub struct RuntimeView {
     async_lane_observations: Vec<RuntimeAsyncLaneObservation>,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the view owns either backend in place; boxing would add a runtime allocation"
+)]
 enum RuntimeBackend {
     Single(PersistentRuntime),
     Distributed(InProcessDistributedRuntime),
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "startup evidence is retained in place without an extra allocation"
+)]
 enum RuntimeStartup {
     Single(PersistentRuntimeStartup),
     Distributed(PersistentServerStartup),
@@ -197,6 +207,17 @@ pub(crate) struct RuntimeStartupEvidence {
     pub disposition: PersistentRuntimeStartupDisposition,
     pub schema_version: u64,
     pub schema_hash: [u8; 32],
+}
+
+struct PersistentMountRequest<'a> {
+    runtime: PersistentRuntime,
+    turn: RuntimeTurn,
+    host_started: Option<RuntimeTurn>,
+    startup: PersistentRuntimeStartup,
+    host_identity_mode: HostIdentityMode,
+    host_identity_generation: u64,
+    content_root: PathBuf,
+    assets: &'a [AssetBlob],
 }
 
 impl RuntimeBackend {
@@ -344,16 +365,16 @@ impl RuntimeView {
             1,
         )?;
         let mount = runtime.runtime().mount();
-        Self::mount_persistent(
+        Self::mount_persistent(PersistentMountRequest {
             runtime,
-            mount,
+            turn: mount,
             host_started,
             startup,
-            HostIdentityMode::Deterministic,
+            host_identity_mode: HostIdentityMode::Deterministic,
             host_identity_generation,
-            transient_content_root(&repository_root().join("target/boon-transient")),
+            content_root: transient_content_root(&repository_root().join("target/boon-transient")),
             assets,
-        )
+        })
     }
 
     pub fn open_distributed_with_assets(
@@ -585,28 +606,29 @@ impl RuntimeView {
             1,
         )?;
         let mount = runtime.runtime().mount();
-        Self::mount_persistent(
+        Self::mount_persistent(PersistentMountRequest {
             runtime,
-            mount,
+            turn: mount,
             host_started,
             startup,
             host_identity_mode,
             host_identity_generation,
             content_root,
             assets,
-        )
+        })
     }
 
-    fn mount_persistent(
-        mut runtime: PersistentRuntime,
-        turn: RuntimeTurn,
-        host_started: Option<RuntimeTurn>,
-        startup: PersistentRuntimeStartup,
-        host_identity_mode: HostIdentityMode,
-        host_identity_generation: u64,
-        content_root: PathBuf,
-        assets: &[AssetBlob],
-    ) -> ViewResult<Self> {
+    fn mount_persistent(request: PersistentMountRequest<'_>) -> ViewResult<Self> {
+        let PersistentMountRequest {
+            mut runtime,
+            turn,
+            host_started,
+            startup,
+            host_identity_mode,
+            host_identity_generation,
+            content_root,
+            assets,
+        } = request;
         let source_sequence = source_sequence_after_turn(
             source_sequence_after_turn(0, turn.source_sequence),
             host_started.as_ref().and_then(|turn| turn.source_sequence),
@@ -3669,6 +3691,9 @@ fn document_subtree_contains_text(
     root: &DocumentNodeId,
     expected: &str,
 ) -> bool {
+    // Historical scripted scenarios also select rows by a visible-text
+    // fragment. Production hit routing uses exact semantic target/label/address
+    // matching through `node_matches_semantic_text`.
     let mut pending = vec![root.clone()];
     let mut visited = BTreeSet::new();
     while let Some(node_id) = pending.pop() {
@@ -3678,10 +3703,11 @@ fn document_subtree_contains_text(
         let Some(node) = frame.nodes.get(&node_id) else {
             continue;
         };
-        if node
-            .text
-            .as_ref()
-            .is_some_and(|text| text.text == expected || text.text.contains(expected))
+        if node_matches_semantic_text(node, expected)
+            || node
+                .text
+                .as_ref()
+                .is_some_and(|text| text.text.contains(expected))
         {
             return true;
         }

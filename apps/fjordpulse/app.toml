@@ -24,8 +24,8 @@ deployment_domain = "fjordpulse-boon.kavik.cz"
 protocol_version = 1
 modes = ["deterministic", "live"]
 
-[programs.document]
-role = "document"
+[programs.client]
+role = "client"
 entry = "../../examples/fjordpulse/Client/RUN.bn"
 sources = [
   "../../examples/fjordpulse/Shared/FjordPulseContract.bn",
@@ -36,16 +36,34 @@ sources = [
   "../../examples/fjordpulse/View/FjordPulseView.bn",
   "../../examples/fjordpulse/Client/RUN.bn",
 ]
-artifact = "artifacts/document.boon"
+artifact = "artifacts/client.boon"
 target_profile = "software_bounded"
-capability_profile = "public_document"
+capability_profile = "public_client"
 capability_profile_id = "fjordpulse-public-webgpu-v1"
 protocol_version = 1
 
-[programs.document.namespaces]
+[programs.client.namespaces]
 deterministic = "fjordpulse-client-deterministic-v1"
 staging = "fjordpulse-client-staging-v1"
 production = "fjordpulse-client-production-v1"
+
+[programs.session]
+role = "session"
+entry = "../../examples/fjordpulse/Session/RUN.bn"
+sources = [
+  "../../examples/fjordpulse/Shared/FjordPulseContract.bn",
+  "../../examples/fjordpulse/Session/RUN.bn",
+]
+artifact = "artifacts/session.boon"
+target_profile = "software_bounded"
+capability_profile = "trusted_session"
+capability_profile_id = "fjordpulse-trusted-session-v1"
+protocol_version = 1
+
+[programs.session.namespaces]
+deterministic = "fjordpulse-session-deterministic-v1"
+staging = "fjordpulse-session-staging-v1"
+production = "fjordpulse-session-production-v1"
 
 [programs.server]
 role = "server"
@@ -67,7 +85,7 @@ production = "fjordpulse-server-production-v1"
 
 [capability_profiles."fjordpulse-public-webgpu-v1"]
 id = "fjordpulse-public-webgpu-v1"
-role = "document"
+role = "client"
 grants = [
   "browser.webgpu",
   "browser.same-origin-http",
@@ -76,6 +94,13 @@ grants = [
   "browser.history",
   "browser.accessibility",
   "map.raster-tiles",
+]
+
+[capability_profiles."fjordpulse-trusted-session-v1"]
+id = "fjordpulse-trusted-session-v1"
+role = "session"
+grants = [
+  "session.state",
 ]
 
 [capability_profiles."fjordpulse-trusted-server-v1"]

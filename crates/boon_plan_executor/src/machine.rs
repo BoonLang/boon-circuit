@@ -39,8 +39,17 @@ use std::fmt;
 use std::ops::{Bound, Range};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "phase0-instrumentation")]
+use web_time::Instant;
 
 static NEXT_SESSION_LAUNCH_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+type RowPositionsWithVisits = (Vec<(RowId, usize)>, usize, usize);
+
+#[cfg(feature = "phase0-instrumentation")]
+fn elapsed_ns(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 pub const MAX_SESSION_INFO_TEXT_BYTES: usize = 1024;
 pub const MAX_SESSION_INFO_ROLE_COUNT: usize = 64;
@@ -99,7 +108,8 @@ impl fmt::Debug for HostValueBinding {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[cfg_attr(not(feature = "phase0-instrumentation"), derive(Clone))]
 pub enum Value {
     Null,
     Bool(bool),
@@ -124,6 +134,305 @@ pub enum Value {
         visible: Box<Value>,
         binding: HostValueBinding,
     },
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LegacyRuntimeCounters {
+    value_clone_count: u64,
+    recursive_value_clone_count: u64,
+    recursive_value_clone_value_count: u64,
+    boundary_materialization_count: u64,
+    recursive_boundary_materialization_count: u64,
+    boundary_materialized_value_count: u64,
+    boundary_materialized_payload_bytes: u64,
+    runtime_string_field_lookup_count: u64,
+    tree_container_lookup_count: u64,
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+impl LegacyRuntimeCounters {
+    fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            value_clone_count: self
+                .value_clone_count
+                .wrapping_sub(earlier.value_clone_count),
+            recursive_value_clone_count: self
+                .recursive_value_clone_count
+                .wrapping_sub(earlier.recursive_value_clone_count),
+            recursive_value_clone_value_count: self
+                .recursive_value_clone_value_count
+                .wrapping_sub(earlier.recursive_value_clone_value_count),
+            boundary_materialization_count: self
+                .boundary_materialization_count
+                .wrapping_sub(earlier.boundary_materialization_count),
+            recursive_boundary_materialization_count: self
+                .recursive_boundary_materialization_count
+                .wrapping_sub(earlier.recursive_boundary_materialization_count),
+            boundary_materialized_value_count: self
+                .boundary_materialized_value_count
+                .wrapping_sub(earlier.boundary_materialized_value_count),
+            boundary_materialized_payload_bytes: self
+                .boundary_materialized_payload_bytes
+                .wrapping_sub(earlier.boundary_materialized_payload_bytes),
+            runtime_string_field_lookup_count: self
+                .runtime_string_field_lookup_count
+                .wrapping_sub(earlier.runtime_string_field_lookup_count),
+            tree_container_lookup_count: self
+                .tree_container_lookup_count
+                .wrapping_sub(earlier.tree_container_lookup_count),
+        }
+    }
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+thread_local! {
+    // Value cloning and boundary conversion happen in helpers that deliberately
+    // do not receive transaction state. A thread-local monotonic counter lets
+    // each Work instance take an exact interval without global cross-thread
+    // contamination or changing the runtime API.
+    static LEGACY_RUNTIME_COUNTERS: std::cell::Cell<LegacyRuntimeCounters> =
+        const { std::cell::Cell::new(LegacyRuntimeCounters {
+            value_clone_count: 0,
+            recursive_value_clone_count: 0,
+            recursive_value_clone_value_count: 0,
+            boundary_materialization_count: 0,
+            recursive_boundary_materialization_count: 0,
+            boundary_materialized_value_count: 0,
+            boundary_materialized_payload_bytes: 0,
+            runtime_string_field_lookup_count: 0,
+            tree_container_lookup_count: 0,
+        }) };
+    static VALUE_CLONE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn legacy_runtime_counters() -> LegacyRuntimeCounters {
+    LEGACY_RUNTIME_COUNTERS.get()
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn update_legacy_runtime_counters(update: impl FnOnce(&mut LegacyRuntimeCounters)) {
+    LEGACY_RUNTIME_COUNTERS.set({
+        let mut counters = LEGACY_RUNTIME_COUNTERS.get();
+        update(&mut counters);
+        counters
+    });
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ValueTreeStats {
+    value_count: u64,
+    logical_payload_bytes: u64,
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+impl ValueTreeStats {
+    fn add_value(&mut self, payload_bytes: u64) {
+        self.value_count = self.value_count.saturating_add(1);
+        self.logical_payload_bytes = self
+            .logical_payload_bytes
+            .saturating_add(1)
+            .saturating_add(payload_bytes);
+    }
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn sized_payload_bytes(len: usize) -> u64 {
+    8_u64.saturating_add(u64::try_from(len).unwrap_or(u64::MAX))
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn value_tree_stats(value: &Value) -> ValueTreeStats {
+    fn visit(value: &Value, stats: &mut ValueTreeStats) {
+        match value {
+            Value::Null => stats.add_value(0),
+            Value::Bool(_) => stats.add_value(1),
+            Value::Number(_) => stats.add_value(8),
+            Value::Text(value) => stats.add_value(sized_payload_bytes(value.len())),
+            Value::Bytes(value) => stats.add_value(sized_payload_bytes(value.len())),
+            Value::List(values) => {
+                stats.add_value(8);
+                for value in values {
+                    visit(value, stats);
+                }
+            }
+            Value::Record(fields) => {
+                stats.add_value(8);
+                for (name, value) in fields {
+                    stats.logical_payload_bytes = stats
+                        .logical_payload_bytes
+                        .saturating_add(sized_payload_bytes(name.len()));
+                    visit(value, stats);
+                }
+            }
+            Value::MappedRow { fields, .. } => {
+                stats.add_value(24_u64.saturating_add(8));
+                for (name, value) in fields {
+                    stats.logical_payload_bytes = stats
+                        .logical_payload_bytes
+                        .saturating_add(sized_payload_bytes(name.len()));
+                    visit(value, stats);
+                }
+            }
+            Value::Row { fields, .. } => {
+                stats.add_value(24_u64.saturating_add(8));
+                for value in fields.values() {
+                    stats.logical_payload_bytes = stats.logical_payload_bytes.saturating_add(8);
+                    visit(value, stats);
+                }
+            }
+            Value::Error { code } => stats.add_value(sized_payload_bytes(code.len())),
+            Value::HostBound { visible, .. } => {
+                // Opaque host bindings are 32-byte issuer + 32-byte handle +
+                // 4-byte generation. The visible child is counted recursively.
+                stats.add_value(68);
+                visit(visible, stats);
+            }
+        }
+    }
+
+    let mut stats = ValueTreeStats::default();
+    visit(value, &mut stats);
+    stats
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn value_is_recursive(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::List(_)
+            | Value::Record(_)
+            | Value::MappedRow { .. }
+            | Value::Row { .. }
+            | Value::HostBound { .. }
+    )
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+struct ValueCloneDepthGuard {
+    outermost: bool,
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+impl ValueCloneDepthGuard {
+    fn enter() -> Self {
+        let outermost = VALUE_CLONE_DEPTH.get() == 0;
+        VALUE_CLONE_DEPTH.set(VALUE_CLONE_DEPTH.get().saturating_add(1));
+        Self { outermost }
+    }
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+impl Drop for ValueCloneDepthGuard {
+    fn drop(&mut self) {
+        VALUE_CLONE_DEPTH.set(VALUE_CLONE_DEPTH.get().saturating_sub(1));
+    }
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        let guard = ValueCloneDepthGuard::enter();
+        let recursive_stats =
+            (guard.outermost && value_is_recursive(self)).then(|| value_tree_stats(self));
+        // Keep this structurally equivalent to `#[derive(Clone)]`: collection
+        // fields use their own Clone implementations, preserving the legacy
+        // allocation/copy shape. The depth guard only suppresses accounting for
+        // recursive Value::clone calls made by those collection clones.
+        let cloned = match self {
+            Value::Null => Value::Null,
+            Value::Bool(value) => Value::Bool(value.clone()),
+            Value::Number(value) => Value::Number(value.clone()),
+            Value::Text(value) => Value::Text(value.clone()),
+            Value::Bytes(value) => Value::Bytes(value.clone()),
+            Value::List(values) => Value::List(values.clone()),
+            Value::Record(fields) => Value::Record(fields.clone()),
+            Value::MappedRow { id, fields } => Value::MappedRow {
+                id: id.clone(),
+                fields: fields.clone(),
+            },
+            Value::Row { id, fields } => Value::Row {
+                id: id.clone(),
+                fields: fields.clone(),
+            },
+            Value::Error { code } => Value::Error { code: code.clone() },
+            Value::HostBound { visible, binding } => Value::HostBound {
+                visible: visible.clone(),
+                binding: binding.clone(),
+            },
+        };
+        if guard.outermost {
+            update_legacy_runtime_counters(|counters| {
+                counters.value_clone_count = counters.value_clone_count.wrapping_add(1);
+                if let Some(stats) = recursive_stats {
+                    counters.recursive_value_clone_count =
+                        counters.recursive_value_clone_count.wrapping_add(1);
+                    counters.recursive_value_clone_value_count = counters
+                        .recursive_value_clone_value_count
+                        .wrapping_add(stats.value_count);
+                }
+            });
+        }
+        cloned
+    }
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn record_boundary_materialization(value: &Value) {
+    let recursive = value_is_recursive(value);
+    let stats = value_tree_stats(value);
+    update_legacy_runtime_counters(|counters| {
+        counters.boundary_materialization_count =
+            counters.boundary_materialization_count.wrapping_add(1);
+        if recursive {
+            counters.recursive_boundary_materialization_count = counters
+                .recursive_boundary_materialization_count
+                .wrapping_add(1);
+        }
+        counters.boundary_materialized_value_count = counters
+            .boundary_materialized_value_count
+            .wrapping_add(stats.value_count);
+        counters.boundary_materialized_payload_bytes = counters
+            .boundary_materialized_payload_bytes
+            .wrapping_add(stats.logical_payload_bytes);
+    });
+}
+
+#[cfg(not(feature = "phase0-instrumentation"))]
+#[inline(always)]
+fn record_boundary_materialization(_value: &Value) {}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn record_runtime_string_field_lookup() {
+    update_legacy_runtime_counters(|counters| {
+        counters.runtime_string_field_lookup_count =
+            counters.runtime_string_field_lookup_count.wrapping_add(1);
+        counters.tree_container_lookup_count = counters.tree_container_lookup_count.wrapping_add(1);
+    });
+}
+
+#[cfg(not(feature = "phase0-instrumentation"))]
+#[inline(always)]
+fn record_runtime_string_field_lookup() {}
+
+#[inline]
+fn runtime_string_map_get<'a, V>(fields: &'a BTreeMap<String, V>, name: &str) -> Option<&'a V> {
+    record_runtime_string_field_lookup();
+    fields.get(name)
+}
+
+#[inline]
+fn runtime_string_map_remove<V>(fields: &mut BTreeMap<String, V>, name: &str) -> Option<V> {
+    record_runtime_string_field_lookup();
+    fields.remove(name)
+}
+
+#[inline]
+fn runtime_string_map_contains_key<V>(fields: &BTreeMap<String, V>, name: &str) -> bool {
+    record_runtime_string_field_lookup();
+    fields.contains_key(name)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -743,6 +1052,92 @@ pub struct TurnMetrics {
     pub source_order_relabel_operation_count: u64,
     pub source_order_relabel_row_count: u64,
     pub source_order_relabel_window_max: u64,
+    /// Root `Value::clone` calls observed while this work interval was active.
+    pub value_clone_count: u64,
+    /// Root clones whose value carrier owns recursive children.
+    pub recursive_value_clone_count: u64,
+    /// Value nodes copied by recursive-root clones.
+    pub recursive_value_clone_value_count: u64,
+    /// Successful evaluator/report boundary conversions.
+    pub boundary_materialization_count: u64,
+    /// Boundary conversions whose root carrier owns recursive children.
+    pub recursive_boundary_materialization_count: u64,
+    /// Value nodes exposed by boundary conversions.
+    pub boundary_materialized_value_count: u64,
+    /// Deterministic logical bytes exposed by boundary conversions. This is
+    /// value tags, fixed-width scalar/ID payloads, length prefixes, names, and
+    /// text/byte contents; it is deliberately not allocator-retained bytes.
+    pub boundary_materialized_payload_bytes: u64,
+    /// Lookups/removals by runtime field name in string-keyed value maps.
+    pub runtime_string_field_lookup_count: u64,
+    /// Exact tree-container operations covered by the current runtime
+    /// instrumentation: each string-keyed `BTreeMap` get/remove/contains
+    /// operation routed through the field-map wrappers. This is intentionally
+    /// not an exhaustive count of every legacy tree in the executor.
+    pub tree_container_lookup_count: u64,
+    /// Unique root-state mutation carriers already held in the work interval's
+    /// rollback set. Restore/bootstrap work without rollback carriers is zero.
+    pub touched_root_state_count: u64,
+    /// Unique list revision rollback carriers held by this work interval.
+    pub touched_list_count: u64,
+    /// Unique row-field mutation carriers held in the rollback set.
+    pub touched_row_field_count: u64,
+    /// Sum of the three allocation-free existing-carrier populations above.
+    pub touched_population_count: u64,
+    /// Full derived-list snapshots cloned, including both cache reads and
+    /// replacement staging.
+    pub whole_list_snapshot_clone_count: u64,
+    /// Top-level list items copied by those snapshot clones.
+    pub whole_list_snapshot_cloned_item_count: u64,
+    /// Full derived-list old/new equality checks.
+    pub whole_list_snapshot_comparison_count: u64,
+    /// Old plus new top-level item population presented to those checks.
+    pub whole_list_snapshot_comparison_input_item_count: u64,
+    /// Maximum number of pending expression continuation tasks.
+    pub evaluator_task_queue_high_water: u64,
+    pub evaluator_task_queue_push_count: u64,
+    pub evaluator_task_queue_capacity_growth_count: u64,
+    pub evaluator_task_queue_capacity_growth_items: u64,
+    /// Maximum number of pending evaluator values.
+    pub evaluator_value_queue_high_water: u64,
+    pub evaluator_value_queue_push_count: u64,
+    pub evaluator_value_queue_capacity_growth_count: u64,
+    pub evaluator_value_queue_capacity_growth_items: u64,
+    /// Maximum pending dirty-propagation work in one explicit work stack.
+    pub dirty_propagation_queue_high_water: u64,
+    pub dirty_propagation_queue_push_count: u64,
+    pub dirty_propagation_queue_capacity_growth_count: u64,
+    pub dirty_propagation_queue_capacity_growth_items: u64,
+    /// Maximum staged mutation population held by `Work`.
+    pub pending_mutation_queue_high_water: u64,
+    pub pending_mutation_queue_push_count: u64,
+    pub pending_mutation_queue_capacity_growth_count: u64,
+    pub pending_mutation_queue_capacity_growth_items: u64,
+    /// Aggregate maximum across the explicit evaluator/work queues above.
+    pub queue_high_water: u64,
+    /// Final public delta population after same-target coalescing.
+    pub delta_item_count: u64,
+    /// Deterministic logical bytes of the final public delta stream.
+    pub delta_logical_byte_count: u64,
+    /// Final authority delta population.
+    pub authority_delta_item_count: u64,
+    /// Deterministic logical bytes of the final authority delta stream.
+    pub authority_delta_logical_byte_count: u64,
+    /// Wall-clock nanoseconds spent validating and admitting a source event.
+    /// Zero for non-source work intervals.
+    pub elapsed_ingest_ns: u64,
+    /// Wall-clock nanoseconds spent in `route_event_with_work` for a source
+    /// turn. This includes currentness evaluation and staged mutations.
+    pub elapsed_evaluate_ns: u64,
+    /// Wall-clock nanoseconds spent creating durability changes, advancing
+    /// turn identity, and committing transient effects for a source turn.
+    pub elapsed_commit_ns: u64,
+    /// Wall-clock nanoseconds spent coalescing, exposing, and accounting the
+    /// final public and authority delta streams for a source turn.
+    pub elapsed_delta_ns: u64,
+    /// Wall-clock nanoseconds spent in the complete public root/list
+    /// `*_with_metrics` read path through value boundary materialization.
+    pub elapsed_boundary_ns: u64,
     pub work_unit_count: u64,
     pub recomputed_targets: Vec<ValueTarget>,
 }
@@ -1491,7 +1886,7 @@ impl ListOrder {
             .map(|(positions, _, _)| positions)
     }
 
-    fn positions_with_visits(&self, rows: &[RowId]) -> Option<(Vec<(RowId, usize)>, usize, usize)> {
+    fn positions_with_visits(&self, rows: &[RowId]) -> Option<RowPositionsWithVisits> {
         let mut visit_count = 0_usize;
         let mut visit_max = 0_usize;
         let positions = rows
@@ -3200,17 +3595,16 @@ impl ListState {
         let owner_prefix = owner_instances.ancestry_parent(row.owner_ancestry)?;
         let partition = self.owner_partitions.entry(owner_prefix).or_default();
         partition.order.push(row_id);
-        if let Some(origin) = row.materialization_origin {
-            if partition
+        if let Some(origin) = row.materialization_origin
+            && partition
                 .by_materialization_origin
                 .insert(origin, row_id)
                 .is_some()
-            {
-                return Err(Error::InvalidPlan(format!(
-                    "list {} owner partition repeats a materialization origin",
-                    row_id.list.0
-                )));
-            }
+        {
+            return Err(Error::InvalidPlan(format!(
+                "list {} owner partition repeats a materialization origin",
+                row_id.list.0
+            )));
         }
         Ok(())
     }
@@ -3342,6 +3736,13 @@ enum Consumer {
 struct EffectConsumer {
     op: PlanOpId,
     row: Option<RowId>,
+}
+
+#[derive(Clone, Copy)]
+struct EffectApplicationContext {
+    owner: OwnerInstanceId,
+    row: Option<RowId>,
+    sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4519,6 +4920,7 @@ impl Metadata {
     }
 
     fn list_authority_field(&self, list: ListId, name: &str) -> Result<FieldId, Error> {
+        record_runtime_string_field_lookup();
         self.list_authority_fields
             .get(&(list, name.to_owned()))
             .copied()
@@ -4528,7 +4930,7 @@ impl Metadata {
     }
 
     fn exact_list_field(&self, name: &str) -> Result<Option<(ListId, FieldId)>, Error> {
-        let Some(fields) = self.list_fields_by_exact_name.get(name) else {
+        let Some(fields) = runtime_string_map_get(&self.list_fields_by_exact_name, name) else {
             return Ok(None);
         };
         match fields.as_slice() {
@@ -4569,7 +4971,7 @@ fn unique_root_name<T: Copy + std::fmt::Debug>(
     name: &str,
     kind: &str,
 ) -> Result<Option<T>, Error> {
-    match names.get(name).map(Vec::as_slice) {
+    match runtime_string_map_get(names, name).map(Vec::as_slice) {
         Some([value]) => Ok(Some(*value)),
         Some(values) => Err(Error::InvalidPlan(format!(
             "root {kind} name `{name}` is ambiguous across {values:?}"
@@ -4863,7 +5265,7 @@ pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValu
                 .filter(|(name, _)| name.as_str() != "$tag")
                 .map(|(name, value)| Ok((name.clone(), stored_value(value)?)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()?;
-            match fields.get("$tag") {
+            match runtime_string_map_get(fields, "$tag") {
                 Some(Value::Text(tag)) => Ok(boon_persistence::StoredValue::Variant {
                     tag: tag.clone(),
                     fields: std::mem::take(&mut stored),
@@ -4987,7 +5389,7 @@ fn validate_value_for_data_type(
             }
         }
         (Value::Record(values), DataTypePlan::Variant { variants }) => {
-            let Some(Value::Text(tag)) = values.get("$tag") else {
+            let Some(Value::Text(tag)) = runtime_string_map_get(values, "$tag") else {
                 return Err(Error::Evaluation(format!(
                     "{path} structured variant has no text `$tag`"
                 )));
@@ -5058,7 +5460,7 @@ fn validate_record_for_data_type(
     path: &str,
 ) -> Result<(), Error> {
     for field in fields {
-        let value = values.get(&field.name).ok_or_else(|| {
+        let value = runtime_string_map_get(values, &field.name).ok_or_else(|| {
             Error::Evaluation(format!("{path} is missing field `{}`", field.name))
         })?;
         validate_value_for_data_type(value, &field.data_type, &format!("{path}.{}", field.name))?;
@@ -5173,6 +5575,17 @@ enum DistributedContextTurn {
     Execution,
 }
 
+#[cfg(feature = "phase0-instrumentation")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LegacyRuntimeCounterStart(LegacyRuntimeCounters);
+
+#[cfg(feature = "phase0-instrumentation")]
+impl Default for LegacyRuntimeCounterStart {
+    fn default() -> Self {
+        Self(legacy_runtime_counters())
+    }
+}
+
 #[derive(Clone, Default)]
 struct Work {
     emit: bool,
@@ -5211,6 +5624,8 @@ struct Work {
     work_limit: Option<u64>,
     work_units: u64,
     enforce_work_limit: bool,
+    #[cfg(feature = "phase0-instrumentation")]
+    legacy_runtime_counter_start: LegacyRuntimeCounterStart,
 }
 
 impl Work {
@@ -5259,6 +5674,10 @@ impl Work {
         self.previous_turn_sequence = turn_sequence;
         self.work_units = 0;
         self.enforce_work_limit = true;
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            self.legacy_runtime_counter_start = LegacyRuntimeCounterStart::default();
+        }
     }
 
     fn consume(&mut self, units: u64) -> Result<(), Error> {
@@ -5300,6 +5719,35 @@ impl Work {
     }
 
     fn finish_metrics(&mut self) {
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            let legacy = legacy_runtime_counters().delta_since(self.legacy_runtime_counter_start.0);
+            self.metrics.value_clone_count = legacy.value_clone_count;
+            self.metrics.recursive_value_clone_count = legacy.recursive_value_clone_count;
+            self.metrics.recursive_value_clone_value_count =
+                legacy.recursive_value_clone_value_count;
+            self.metrics.boundary_materialization_count = legacy.boundary_materialization_count;
+            self.metrics.recursive_boundary_materialization_count =
+                legacy.recursive_boundary_materialization_count;
+            self.metrics.boundary_materialized_value_count =
+                legacy.boundary_materialized_value_count;
+            self.metrics.boundary_materialized_payload_bytes =
+                legacy.boundary_materialized_payload_bytes;
+            self.metrics.runtime_string_field_lookup_count =
+                legacy.runtime_string_field_lookup_count;
+            self.metrics.tree_container_lookup_count = legacy.tree_container_lookup_count;
+            self.metrics.touched_root_state_count =
+                u64::try_from(self.undo_root_states.len()).unwrap_or(u64::MAX);
+            self.metrics.touched_list_count =
+                u64::try_from(self.list_revision_undo.len()).unwrap_or(u64::MAX);
+            self.metrics.touched_row_field_count =
+                u64::try_from(self.undo_row_fields.len()).unwrap_or(u64::MAX);
+            self.metrics.touched_population_count = self
+                .metrics
+                .touched_root_state_count
+                .saturating_add(self.metrics.touched_list_count)
+                .saturating_add(self.metrics.touched_row_field_count);
+        }
         self.metrics.dirty_state_count = self.dirty_states.len();
         self.metrics.dirty_field_count = self.dirty_consumers.len();
         self.metrics.changed_row_count = self.changed_rows.len();
@@ -5310,6 +5758,47 @@ impl Work {
             .extend(self.recomputed_targets.iter().copied());
         self.metrics.recomputed_targets.sort_unstable();
     }
+}
+
+#[inline(always)]
+fn clone_whole_list_snapshot(items: &[EvalValue], work: &mut Work) -> Vec<EvalValue> {
+    #[cfg(feature = "phase0-instrumentation")]
+    {
+        work.metrics.whole_list_snapshot_clone_count = work
+            .metrics
+            .whole_list_snapshot_clone_count
+            .saturating_add(1);
+        work.metrics.whole_list_snapshot_cloned_item_count = work
+            .metrics
+            .whole_list_snapshot_cloned_item_count
+            .saturating_add(u64::try_from(items.len()).unwrap_or(u64::MAX));
+    }
+    #[cfg(not(feature = "phase0-instrumentation"))]
+    let _ = work;
+    items.to_owned()
+}
+
+#[inline(always)]
+fn whole_list_snapshot_changed(
+    old: Option<&Vec<EvalValue>>,
+    new: &Vec<EvalValue>,
+    work: &mut Work,
+) -> bool {
+    #[cfg(feature = "phase0-instrumentation")]
+    {
+        work.metrics.whole_list_snapshot_comparison_count = work
+            .metrics
+            .whole_list_snapshot_comparison_count
+            .saturating_add(1);
+        let input_items = old.map_or(0, Vec::len).saturating_add(new.len());
+        work.metrics.whole_list_snapshot_comparison_input_item_count = work
+            .metrics
+            .whole_list_snapshot_comparison_input_item_count
+            .saturating_add(u64::try_from(input_items).unwrap_or(u64::MAX));
+    }
+    #[cfg(not(feature = "phase0-instrumentation"))]
+    let _ = work;
+    old != Some(new)
 }
 
 fn record_ordered_index_fanout(work: &mut Work, fanout: usize) {
@@ -6096,6 +6585,23 @@ struct DetachedOrderedIndex {
     rollback_dirty_rows: BTreeSet<RowId>,
 }
 
+#[derive(Clone, Copy)]
+struct MaterializedListSchema<'plan> {
+    list_id: ListId,
+    authority_source_list: Option<ListId>,
+    field_ids: &'plan BTreeMap<String, FieldId>,
+    row_field_copies: &'plan [PlanMaterializedRowFieldCopy],
+}
+
+struct MaterializedListReconciliation {
+    list_id: ListId,
+    authority_source_list: Option<ListId>,
+    owner_prefix: OwnerAncestryId,
+    existing: Vec<RowId>,
+    current_len: usize,
+    desired_len: usize,
+}
+
 struct MaterializedListEvaluationState<'event, 'plan> {
     list_id: ListId,
     authority_source_list: Option<ListId>,
@@ -6844,6 +7350,22 @@ struct ExpressionWorkStack<'event, 'plan> {
     tasks: Vec<ExpressionTask<'event, 'plan>>,
     values: Vec<EvalValue>,
     limit: usize,
+    #[cfg(feature = "phase0-instrumentation")]
+    task_push_count: u64,
+    #[cfg(feature = "phase0-instrumentation")]
+    task_high_water: usize,
+    #[cfg(feature = "phase0-instrumentation")]
+    task_capacity_growth_count: u64,
+    #[cfg(feature = "phase0-instrumentation")]
+    task_capacity_growth_items: usize,
+    #[cfg(feature = "phase0-instrumentation")]
+    value_push_count: u64,
+    #[cfg(feature = "phase0-instrumentation")]
+    value_high_water: usize,
+    #[cfg(feature = "phase0-instrumentation")]
+    value_capacity_growth_count: u64,
+    #[cfg(feature = "phase0-instrumentation")]
+    value_capacity_growth_items: usize,
 }
 
 impl<'event, 'plan> ExpressionWorkStack<'event, 'plan> {
@@ -6852,6 +7374,22 @@ impl<'event, 'plan> ExpressionWorkStack<'event, 'plan> {
             tasks: Vec::new(),
             values: Vec::new(),
             limit,
+            #[cfg(feature = "phase0-instrumentation")]
+            task_push_count: 0,
+            #[cfg(feature = "phase0-instrumentation")]
+            task_high_water: 0,
+            #[cfg(feature = "phase0-instrumentation")]
+            task_capacity_growth_count: 0,
+            #[cfg(feature = "phase0-instrumentation")]
+            task_capacity_growth_items: 0,
+            #[cfg(feature = "phase0-instrumentation")]
+            value_push_count: 0,
+            #[cfg(feature = "phase0-instrumentation")]
+            value_high_water: 0,
+            #[cfg(feature = "phase0-instrumentation")]
+            value_capacity_growth_count: 0,
+            #[cfg(feature = "phase0-instrumentation")]
+            value_capacity_growth_items: 0,
         }
     }
 
@@ -6862,7 +7400,20 @@ impl<'event, 'plan> ExpressionWorkStack<'event, 'plan> {
                 self.limit
             )));
         }
+        #[cfg(feature = "phase0-instrumentation")]
+        let previous_capacity = self.tasks.capacity();
         self.tasks.push(task);
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            self.task_push_count = self.task_push_count.saturating_add(1);
+            self.task_high_water = self.task_high_water.max(self.tasks.len());
+            if self.tasks.capacity() > previous_capacity {
+                self.task_capacity_growth_count = self.task_capacity_growth_count.saturating_add(1);
+                self.task_capacity_growth_items = self
+                    .task_capacity_growth_items
+                    .saturating_add(self.tasks.capacity() - previous_capacity);
+            }
+        }
         Ok(())
     }
 
@@ -6873,7 +7424,21 @@ impl<'event, 'plan> ExpressionWorkStack<'event, 'plan> {
                 self.limit
             )));
         }
+        #[cfg(feature = "phase0-instrumentation")]
+        let previous_capacity = self.values.capacity();
         self.values.push(value);
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            self.value_push_count = self.value_push_count.saturating_add(1);
+            self.value_high_water = self.value_high_water.max(self.values.len());
+            if self.values.capacity() > previous_capacity {
+                self.value_capacity_growth_count =
+                    self.value_capacity_growth_count.saturating_add(1);
+                self.value_capacity_growth_items = self
+                    .value_capacity_growth_items
+                    .saturating_add(self.values.capacity() - previous_capacity);
+            }
+        }
         Ok(())
     }
 
@@ -6881,6 +7446,45 @@ impl<'event, 'plan> ExpressionWorkStack<'event, 'plan> {
         self.values.pop().ok_or_else(|| {
             Error::InvalidPlan("expression continuation produced no operand value".to_owned())
         })
+    }
+
+    fn record_metrics(&self, metrics: &mut TurnMetrics) {
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            let task_high_water = u64::try_from(self.task_high_water).unwrap_or(u64::MAX);
+            let value_high_water = u64::try_from(self.value_high_water).unwrap_or(u64::MAX);
+            metrics.evaluator_task_queue_high_water =
+                metrics.evaluator_task_queue_high_water.max(task_high_water);
+            metrics.evaluator_task_queue_push_count = metrics
+                .evaluator_task_queue_push_count
+                .saturating_add(self.task_push_count);
+            metrics.evaluator_task_queue_capacity_growth_count = metrics
+                .evaluator_task_queue_capacity_growth_count
+                .saturating_add(self.task_capacity_growth_count);
+            metrics.evaluator_task_queue_capacity_growth_items = metrics
+                .evaluator_task_queue_capacity_growth_items
+                .saturating_add(u64::try_from(self.task_capacity_growth_items).unwrap_or(u64::MAX));
+            metrics.evaluator_value_queue_high_water = metrics
+                .evaluator_value_queue_high_water
+                .max(value_high_water);
+            metrics.evaluator_value_queue_push_count = metrics
+                .evaluator_value_queue_push_count
+                .saturating_add(self.value_push_count);
+            metrics.evaluator_value_queue_capacity_growth_count = metrics
+                .evaluator_value_queue_capacity_growth_count
+                .saturating_add(self.value_capacity_growth_count);
+            metrics.evaluator_value_queue_capacity_growth_items = metrics
+                .evaluator_value_queue_capacity_growth_items
+                .saturating_add(
+                    u64::try_from(self.value_capacity_growth_items).unwrap_or(u64::MAX),
+                );
+            metrics.queue_high_water = metrics
+                .queue_high_water
+                .max(task_high_water)
+                .max(value_high_water);
+        }
+        #[cfg(not(feature = "phase0-instrumentation"))]
+        let _ = metrics;
     }
 }
 
@@ -7513,6 +8117,10 @@ pub struct MachineBuildProgress {
     pub completed_steps: u64,
 }
 
+// Build polling returns the completed machine by value as part of its public,
+// allocation-free handoff contract. Boxing only this arm would add an
+// allocation and change that API for a transient size reduction.
+#[allow(clippy::large_enum_variant)]
 pub enum MachineBuildPoll {
     Pending(MachineBuildProgress),
     Ready(MachineInstance),
@@ -7541,6 +8149,10 @@ struct ListRowsCursor {
     row: usize,
 }
 
+// Restore polling keeps its mutable replacement image inline across bounded
+// steps; boxing the active arm would add allocation and pointer chasing to the
+// state-machine hot path.
+#[allow(clippy::large_enum_variant)]
 enum AuthorityListRestoreState {
     SparseRows {
         rows: std::vec::IntoIter<RowAuthority>,
@@ -7668,6 +8280,9 @@ struct OrderedIndexImageBuild {
     prepared: PreparedOrderedIndexImage,
 }
 
+// The builder owns exactly one phase payload and advances it in place. Keeping
+// those payloads inline avoids per-build phase allocations.
+#[allow(clippy::large_enum_variant)]
 enum MachineBuildState {
     Bootstrap,
     TranslateDurableRestore(DurableRestoreBuild),
@@ -8679,22 +9294,24 @@ impl MachineBuildTask {
                     build.phase = AuthorityRestorePhase::Lists;
                     return Ok(false);
                 };
-                let session = self.session_mut();
-                if !session
-                    .plan
-                    .storage_layout
-                    .scalar_slots
-                    .iter()
-                    .any(|slot| !slot.indexed && slot.state_id == state)
                 {
-                    return Err(Error::InvalidPlan(format!(
-                        "restore image contains unknown root state {}",
-                        state.0
-                    )));
-                }
-                if scalar.touched {
-                    session.root_states.insert(state, scalar.value);
-                    session.touched_root_states.insert(state);
+                    let session = self.session_mut();
+                    if !session
+                        .plan
+                        .storage_layout
+                        .scalar_slots
+                        .iter()
+                        .any(|slot| !slot.indexed && slot.state_id == state)
+                    {
+                        return Err(Error::InvalidPlan(format!(
+                            "restore image contains unknown root state {}",
+                            state.0
+                        )));
+                    }
+                    if scalar.touched {
+                        session.root_states.insert(state, scalar.value);
+                        session.touched_root_states.insert(state);
+                    }
                 }
             }
             AuthorityRestorePhase::Lists => {
@@ -8815,54 +9432,54 @@ impl MachineBuildTask {
                         restored_row.id.key, restored_row.id.generation
                     )));
                 }
-                let session = self.session_mut();
-                let restored_owner = session
-                    .owner_instances
-                    .intern_ancestry_rows(restored_row.owner_ancestors.iter().copied())?;
-                let restored_origin = restored_row
-                    .materialization_origin
-                    .as_ref()
-                    .map(|origin| {
-                        session
-                            .owner_instances
-                            .intern_ancestry_rows(origin.iter().copied())
-                    })
-                    .transpose()?;
-                let row = session
-                    .lists
-                    .get(&build.list_id)
-                    .and_then(|list| list.rows.get(&restored_row.id))
-                    .ok_or_else(|| {
-                        Error::InvalidPlan(format!(
-                            "restore row override {}:{} does not exist in current defaults",
-                            restored_row.id.key, restored_row.id.generation
-                        ))
-                    })?;
-                if row.owner_ancestry != restored_owner {
-                    return Err(Error::InvalidPlan(format!(
-                        "restore row override {}:{} changed structural owner",
-                        restored_row.id.key, restored_row.id.generation
-                    )));
-                }
-                if row.materialization_origin != restored_origin {
-                    return Err(Error::InvalidPlan(format!(
-                        "restore row override {}:{} changed materialization origin",
-                        restored_row.id.key, restored_row.id.generation
-                    )));
-                }
                 let restored_fields = restored_row.fields;
                 let field_ids = restored_fields.keys().copied().collect::<Vec<_>>();
                 {
+                    let session = self.session_mut();
+                    let restored_owner = session
+                        .owner_instances
+                        .intern_ancestry_rows(restored_row.owner_ancestors.iter().copied())?;
+                    let restored_origin = restored_row
+                        .materialization_origin
+                        .as_ref()
+                        .map(|origin| {
+                            session
+                                .owner_instances
+                                .intern_ancestry_rows(origin.iter().copied())
+                        })
+                        .transpose()?;
+                    let row = session
+                        .lists
+                        .get(&build.list_id)
+                        .and_then(|list| list.rows.get(&restored_row.id))
+                        .ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "restore row override {}:{} does not exist in current defaults",
+                                restored_row.id.key, restored_row.id.generation
+                            ))
+                        })?;
+                    if row.owner_ancestry != restored_owner {
+                        return Err(Error::InvalidPlan(format!(
+                            "restore row override {}:{} changed structural owner",
+                            restored_row.id.key, restored_row.id.generation
+                        )));
+                    }
+                    if row.materialization_origin != restored_origin {
+                        return Err(Error::InvalidPlan(format!(
+                            "restore row override {}:{} changed materialization origin",
+                            restored_row.id.key, restored_row.id.generation
+                        )));
+                    }
                     let row = session
                         .lists
                         .get_mut(&build.list_id)
                         .and_then(|list| list.rows.get_mut(&restored_row.id))
                         .expect("validated sparse restore row remains present");
                     row.fields.extend(restored_fields);
-                }
-                for field in field_ids {
-                    session.touched_row_fields.insert((restored_row.id, field));
-                    session.suspend_row_default(restored_row.id, field)?;
+                    for field in field_ids.iter().copied() {
+                        session.touched_row_fields.insert((restored_row.id, field));
+                        session.suspend_row_default(restored_row.id, field)?;
+                    }
                 }
             }
             AuthorityListRestoreState::ReplacementRows {
@@ -9976,14 +10593,14 @@ impl MachineInstance {
             })
             .collect::<Vec<_>>();
         let reset_call_results = matches!(install, DistributedContextInstall::Replace);
-        let reset_call_result_keys = reset_call_results
-            .then(|| {
-                self.row_owned_call_results
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let reset_call_result_keys = if reset_call_results {
+            self.row_owned_call_results
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if !context_changed && changed_imports.is_empty() && reset_call_result_keys.is_empty() {
             let mut work = self.fresh_work();
             self.initialize_active_producer_lease(&mut work)?;
@@ -10091,12 +10708,13 @@ impl MachineInstance {
                 None => None,
             };
             self.turn_sequence = sequence;
+            let (deltas, authority_deltas) = take_report_deltas(&mut work);
             work.finish_metrics();
             let turn = Turn {
                 sequence,
                 source_sequence: None,
-                deltas: report_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: Vec::new(),
+                deltas,
+                authority_deltas,
                 durable_changes: Vec::new(),
                 outbox_changes: Vec::new(),
                 transient_effects: Vec::new(),
@@ -10470,14 +11088,13 @@ impl MachineInstance {
                 .checked_add(1)
                 .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
             self.commit_transient_effects(&mut work)?;
+            let (deltas, authority_deltas) = take_report_deltas(&mut work);
             work.finish_metrics();
             let turn = Turn {
                 sequence: self.turn_sequence,
                 source_sequence: Some(source_sequence),
-                deltas: report_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: report_authority_deltas(std::mem::take(
-                    &mut work.authority_deltas,
-                )),
+                deltas,
+                authority_deltas,
                 durable_changes,
                 outbox_changes: std::mem::take(&mut work.outbox_changes),
                 transient_effects: std::mem::take(&mut work.transient_effects),
@@ -10637,16 +11254,15 @@ impl MachineInstance {
         call_site_id: RemoteCallSiteId,
         call_instance_id: DistributedCallInstanceId,
     ) -> Result<Value, Error> {
-        if let Some(active) = &self.active_producer_lease {
-            if active.call_site_id == call_site_id
-                && active.key.call_instance_id == call_instance_id
-            {
-                return active.producer_result.clone().ok_or_else(|| {
-                    Error::Evaluation(
-                        "distributed producer call instance has no current result".to_owned(),
-                    )
-                });
-            }
+        if let Some(active) = &self.active_producer_lease
+            && active.call_site_id == call_site_id
+            && active.key.call_instance_id == call_instance_id
+        {
+            return active.producer_result.clone().ok_or_else(|| {
+                Error::Evaluation(
+                    "distributed producer call instance has no current result".to_owned(),
+                )
+            });
         }
         let instance = self
             .metadata
@@ -10841,12 +11457,13 @@ impl MachineInstance {
                     self.ensure_published_current(None, &mut work)?;
                 }
                 self.turn_sequence = sequence;
+                let (deltas, authority_deltas) = take_report_deltas(&mut work);
                 work.finish_metrics();
                 let turn = Turn {
                     sequence,
                     source_sequence: None,
-                    deltas: report_deltas(std::mem::take(&mut work.deltas)),
-                    authority_deltas: Vec::new(),
+                    deltas,
+                    authority_deltas,
                     durable_changes: Vec::new(),
                     outbox_changes: Vec::new(),
                     transient_effects: Vec::new(),
@@ -10922,7 +11539,7 @@ impl MachineInstance {
             {
                 let mut bindings = BTreeMap::new();
                 let gate = self.eval_row_expression(
-                    &arm.gate,
+                    arm.gate,
                     trigger.active.target,
                     trigger.source_event,
                     None,
@@ -10953,7 +11570,7 @@ impl MachineInstance {
             for argument in &call.arguments {
                 let mut bindings = BTreeMap::new();
                 let evaluated = self.eval_row_expression(
-                    &argument.value,
+                    argument.value,
                     trigger.active.target,
                     trigger.source_event,
                     None,
@@ -11119,10 +11736,19 @@ impl MachineInstance {
         &mut self,
         list: ListId,
     ) -> Result<(Value, TurnMetrics), Error> {
+        #[cfg(feature = "phase0-instrumentation")]
+        let boundary_started = Instant::now();
         let mut work = self.fresh_work();
         let value =
             self.eval_value_ref(&ValueRef::List(list), None, None, None, None, &mut work)?;
         let value = self.materialize_eval(value)?.into_visible_facade();
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            work.metrics.elapsed_boundary_ns = work
+                .metrics
+                .elapsed_boundary_ns
+                .saturating_add(elapsed_ns(boundary_started));
+        }
         work.finish_metrics();
         Ok((value, work.metrics))
     }
@@ -12118,12 +12744,21 @@ impl MachineInstance {
         &mut self,
         name: &str,
     ) -> Result<(Value, TurnMetrics), Error> {
+        #[cfg(feature = "phase0-instrumentation")]
+        let boundary_started = Instant::now();
+        let mut work = self.fresh_work();
         let field = unique_root_name(&self.metadata.root_field_by_exact_name, name, "field")?
             .ok_or_else(|| Error::InvalidPlan(format!("no root field `{name}`")))?;
-        let mut work = self.fresh_work();
         let value = self
             .ensure_root_field(field, None, &mut work)?
             .into_visible_facade();
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            work.metrics.elapsed_boundary_ns = work
+                .metrics
+                .elapsed_boundary_ns
+                .saturating_add(elapsed_ns(boundary_started));
+        }
         work.finish_metrics();
         Ok((value, work.metrics))
     }
@@ -12915,7 +13550,7 @@ impl MachineInstance {
         prepared_order.commit(list);
         list.next_key = list.next_key.max(next_key);
         list.rows.insert(row_id, row);
-        list.index_owner_partition_row(row_id, &mut self.owner_instances)?;
+        list.index_owner_partition_row(row_id, &self.owner_instances)?;
         record_source_order_maintenance(work, &maintenance);
         self.bind_row_sources(row_id, slot.scope_id)?;
         Ok(row_id)
@@ -13155,13 +13790,16 @@ impl MachineInstance {
                 )));
             }
             let owner = self.owner_instances.intern_route(&owner)?;
+            self.deactivate_effect_activation(EffectConsumer { op: op.id, row }, &mut work);
             self.apply_effect_outcome(
                 &op,
                 &effect.result,
-                owner,
-                row,
+                EffectApplicationContext {
+                    owner,
+                    row,
+                    sequence,
+                },
                 outcome.clone(),
-                sequence,
                 &mut work,
             )?;
             self.commit_pending_list_mutations(&mut work)?;
@@ -13179,14 +13817,13 @@ impl MachineInstance {
                 });
             self.commit_transient_effects(&mut work)?;
             self.turn_sequence = sequence;
+            let (deltas, authority_deltas) = take_report_deltas(&mut work);
             work.finish_metrics();
             let turn = Turn {
                 sequence,
                 source_sequence: None,
-                deltas: report_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: report_authority_deltas(std::mem::take(
-                    &mut work.authority_deltas,
-                )),
+                deltas,
+                authority_deltas,
                 durable_changes,
                 outbox_changes: std::mem::take(&mut work.outbox_changes),
                 transient_effects: std::mem::take(&mut work.transient_effects),
@@ -13282,10 +13919,12 @@ impl MachineInstance {
             self.apply_effect_outcome(
                 &op,
                 &effect.result,
-                pending.owner,
-                pending.target,
+                EffectApplicationContext {
+                    owner: pending.owner,
+                    row: pending.target,
+                    sequence,
+                },
                 stored_outcome,
-                sequence,
                 &mut work,
             )?;
             self.commit_pending_list_mutations(&mut work)?;
@@ -13303,14 +13942,13 @@ impl MachineInstance {
             work.completed_transient_effects.push((call_id, removed));
             self.commit_transient_effects(&mut work)?;
             self.turn_sequence = sequence;
+            let (deltas, authority_deltas) = take_report_deltas(&mut work);
             work.finish_metrics();
             let turn = Turn {
                 sequence,
                 source_sequence: None,
-                deltas: report_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: report_authority_deltas(std::mem::take(
-                    &mut work.authority_deltas,
-                )),
+                deltas,
+                authority_deltas,
                 durable_changes,
                 outbox_changes: Vec::new(),
                 transient_effects: std::mem::take(&mut work.transient_effects),
@@ -13441,10 +14079,12 @@ impl MachineInstance {
             self.apply_effect_outcome(
                 &op,
                 &effect.result,
-                pending.owner,
-                pending.target,
+                EffectApplicationContext {
+                    owner: pending.owner,
+                    row: pending.target,
+                    sequence,
+                },
                 stored_outcome,
-                sequence,
                 &mut work,
             )?;
             self.commit_pending_list_mutations(&mut work)?;
@@ -13497,14 +14137,13 @@ impl MachineInstance {
 
             self.commit_transient_effects(&mut work)?;
             self.turn_sequence = sequence;
+            let (deltas, authority_deltas) = take_report_deltas(&mut work);
             work.finish_metrics();
             let turn = Turn {
                 sequence,
                 source_sequence: None,
-                deltas: report_deltas(std::mem::take(&mut work.deltas)),
-                authority_deltas: report_authority_deltas(std::mem::take(
-                    &mut work.authority_deltas,
-                )),
+                deltas,
+                authority_deltas,
                 durable_changes,
                 outbox_changes: Vec::new(),
                 transient_effects: std::mem::take(&mut work.transient_effects),
@@ -13859,16 +14498,14 @@ impl MachineInstance {
         &mut self,
         op: &PlanOp,
         route: &boon_plan::EffectResultRoute,
-        owner: OwnerInstanceId,
-        row: Option<RowId>,
+        context: EffectApplicationContext,
         outcome: boon_persistence::StoredValue,
-        sequence: u64,
         work: &mut Work,
     ) -> Result<(), Error> {
         match route {
             boon_plan::EffectResultRoute::Target { target, .. } => {
                 let value = runtime_value(outcome)?;
-                self.apply_effect_result(op, target, owner, row, value, sequence, work)
+                self.apply_effect_result(op, target, context, value, work)
             }
         }
     }
@@ -13877,10 +14514,8 @@ impl MachineInstance {
         &mut self,
         op: &PlanOp,
         target: &ValueRef,
-        owner: OwnerInstanceId,
-        row: Option<RowId>,
+        context: EffectApplicationContext,
         value: Value,
-        sequence: u64,
         work: &mut Work,
     ) -> Result<(), Error> {
         let ValueRef::State(state) = target else {
@@ -13890,7 +14525,7 @@ impl MachineInstance {
             )));
         };
         if op.indexed {
-            let row = row.ok_or_else(|| {
+            let row = context.row.ok_or_else(|| {
                 Error::InvalidPlan(format!(
                     "indexed effect invocation {} has no durable row target",
                     op.id.0
@@ -13916,13 +14551,13 @@ impl MachineInstance {
             let trigger = TriggerFrame::effect(
                 effect_invocation_id(op)?,
                 effect_invocation_plan(op)?.owner.clone(),
-                owner,
+                context.owner,
                 Some(row),
-                sequence,
+                context.sequence,
             );
             self.route_state_transition(*state, &trigger, Some(row), work)?;
         } else {
-            if row.is_some() {
+            if context.row.is_some() {
                 return Err(Error::InvalidPlan(format!(
                     "root effect invocation {} unexpectedly carries a row target",
                     op.id.0
@@ -13938,9 +14573,9 @@ impl MachineInstance {
             let trigger = TriggerFrame::effect(
                 effect_invocation_id(op)?,
                 effect_invocation_plan(op)?.owner.clone(),
-                owner,
+                context.owner,
                 None,
-                sequence,
+                context.sequence,
             );
             self.route_state_transition(*state, &trigger, None, work)?;
         }
@@ -14235,7 +14870,7 @@ impl MachineInstance {
                         Error::Evaluation(format!("rollback list {} is missing", row.list.0))
                     })?;
                     if let Some(removed) = list.rows.remove(&row) {
-                        list.remove_owner_partition_row(row, &removed, &mut self.owner_instances)?;
+                        list.remove_owner_partition_row(row, &removed, &self.owner_instances)?;
                     }
                     list.restore_source_order(&source_order)?;
                     list.next_key = previous_next_key;
@@ -14259,9 +14894,15 @@ impl MachineInstance {
                         Error::Evaluation(format!("rollback list {} is missing", row.list.0))
                     })?;
                     list.restore_source_order(&source_order)?;
-                    if !list.rows.contains_key(&row) {
-                        list.rows.insert(row, value);
-                        list.index_owner_partition_row(row, &mut self.owner_instances)?;
+                    let inserted = match list.rows.entry(row) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(value);
+                            true
+                        }
+                        std::collections::btree_map::Entry::Occupied(_) => false,
+                    };
+                    if inserted {
+                        list.index_owner_partition_row(row, &self.owner_instances)?;
                     }
                     list.next_key = previous_next_key;
                     self.touched_row_fields
@@ -14336,8 +14977,30 @@ impl MachineInstance {
         demanded_targets: &[ValueTarget],
         work: &mut Work,
     ) -> Result<Turn, Error> {
+        #[cfg(feature = "phase0-instrumentation")]
+        let ingest_started = Instant::now();
         self.validate_event(&event)?;
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            work.metrics.elapsed_ingest_ns = work
+                .metrics
+                .elapsed_ingest_ns
+                .saturating_add(elapsed_ns(ingest_started));
+        }
+
+        #[cfg(feature = "phase0-instrumentation")]
+        let evaluate_started = Instant::now();
         self.route_event_with_work(&mut event, demanded_targets, work)?;
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            work.metrics.elapsed_evaluate_ns = work
+                .metrics
+                .elapsed_evaluate_ns
+                .saturating_add(elapsed_ns(evaluate_started));
+        }
+
+        #[cfg(feature = "phase0-instrumentation")]
+        let commit_started = Instant::now();
         let durable_changes = self.durable_changes(&work.authority_deltas)?;
 
         self.last_sequence = Some(event.sequence);
@@ -14346,12 +15009,30 @@ impl MachineInstance {
             .checked_add(1)
             .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
         self.commit_transient_effects(work)?;
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            work.metrics.elapsed_commit_ns = work
+                .metrics
+                .elapsed_commit_ns
+                .saturating_add(elapsed_ns(commit_started));
+        }
+
+        #[cfg(feature = "phase0-instrumentation")]
+        let delta_started = Instant::now();
+        let (deltas, authority_deltas) = take_report_deltas(work);
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            work.metrics.elapsed_delta_ns = work
+                .metrics
+                .elapsed_delta_ns
+                .saturating_add(elapsed_ns(delta_started));
+        }
         work.finish_metrics();
         Ok(Turn {
             sequence: self.turn_sequence,
             source_sequence: Some(event.sequence),
-            deltas: report_deltas(std::mem::take(&mut work.deltas)),
-            authority_deltas: report_authority_deltas(std::mem::take(&mut work.authority_deltas)),
+            deltas,
+            authority_deltas,
             durable_changes,
             outbox_changes: std::mem::take(&mut work.outbox_changes),
             transient_effects: std::mem::take(&mut work.transient_effects),
@@ -14896,6 +15577,13 @@ impl MachineInstance {
             .or_insert_with(|| self.effect_activations.get(&consumer).cloned());
     }
 
+    fn deactivate_effect_activation(&mut self, consumer: EffectConsumer, work: &mut Work) {
+        self.record_effect_activation_undo(consumer, work);
+        self.effect_activations.remove(&consumer);
+        self.clear_consumer_dependencies(Consumer::Effect(consumer));
+        work.pending_effect_reconciliations.remove(&consumer);
+    }
+
     fn reconcile_dirty_effects(&mut self, work: &mut Work) -> Result<(), Error> {
         while let Some(consumer) = work.pending_effect_reconciliations.pop_first() {
             let Some(activation) = self.effect_activations.get(&consumer).cloned() else {
@@ -14973,7 +15661,7 @@ impl MachineInstance {
             let consumer = Consumer::Effect(effect_consumer);
             self.clear_consumer_dependencies(consumer);
             let gate = self.eval_row_expression(
-                &effect.gate,
+                effect.gate,
                 effect_consumer
                     .row
                     .or_else(|| source_event.as_ref().and_then(|event| event.target)),
@@ -15095,7 +15783,7 @@ impl MachineInstance {
         work.pending_effect_reconciliations.remove(&effect_consumer);
         let consumer = Consumer::Effect(effect_consumer);
         let gate = self.eval_row_expression(
-            &effect.gate,
+            effect.gate,
             row.or_else(|| trigger.source_event.and_then(|event| event.target)),
             trigger.source_event,
             None,
@@ -15103,6 +15791,10 @@ impl MachineInstance {
             &mut PlanLocalBindings::new(),
             work,
         )?;
+        // Bringing a gate dependency current while this activation is being
+        // evaluated is part of capturing the activation, not a subsequent
+        // semantic change that should reconcile it again.
+        work.pending_effect_reconciliations.remove(&effect_consumer);
         if !value_to_bool(&self.materialize_eval(gate)?)? {
             self.cancel_pending_transient_effect_owner(
                 effect.invocation_id,
@@ -15127,6 +15819,10 @@ impl MachineInstance {
                 Ok((field.name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        // The same rule applies to dependencies first materialized while
+        // capturing the intent. A later invalidation can enqueue reconciliation
+        // again because the consumer remains registered.
+        work.pending_effect_reconciliations.remove(&effect_consumer);
         let transient_intent = Value::Record(intent_values.clone());
         validate_value_for_data_type(&transient_intent, &schema.intent_type, "effect intent")?;
         let sequence = self
@@ -15170,12 +15866,13 @@ impl MachineInstance {
                 .intent_fields
                 .iter()
                 .map(|field| {
-                    let value = intent_values.get(&field.name).ok_or_else(|| {
-                        Error::InvalidPlan(format!(
-                            "effect invocation {} lost intent field `{}`",
-                            effect.invocation_id, field.name
-                        ))
-                    })?;
+                    let value =
+                        runtime_string_map_get(&intent_values, &field.name).ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "effect invocation {} lost intent field `{}`",
+                                effect.invocation_id, field.name
+                            ))
+                        })?;
                     Ok((
                         field.name.clone(),
                         stored_value_for_data_type(value, &field.data_type)?,
@@ -15343,7 +16040,11 @@ impl MachineInstance {
                 return self
                     .derived_lists
                     .get(&list)
-                    .and_then(|cell| cell.items.clone())
+                    .and_then(|cell| {
+                        cell.items
+                            .as_ref()
+                            .map(|items| clone_whole_list_snapshot(items, work))
+                    })
                     .ok_or_else(|| {
                         Error::Evaluation(format!("current derived list {} has no items", list.0))
                     });
@@ -15394,21 +16095,23 @@ impl MachineInstance {
                 return Err(error);
             }
         };
-        let old = self
-            .derived_lists
-            .get(&list)
-            .and_then(|cell| cell.items.clone());
+        let old = self.derived_lists.get(&list).and_then(|cell| {
+            cell.items
+                .as_ref()
+                .map(|items| clone_whole_list_snapshot(items, work))
+        });
+        let retained_items = clone_whole_list_snapshot(&items, work);
         {
             let cell = self
                 .derived_lists
                 .get_mut(&list)
                 .expect("derived list checked above");
-            cell.items = Some(items.clone());
+            cell.items = Some(retained_items);
             cell.window = None;
             cell.currentness = Currentness::Current;
         }
         work.metrics.recomputed_list_count += 1;
-        if old.as_ref() != Some(&items) {
+        if whole_list_snapshot_changed(old.as_ref(), &items, work) {
             self.invalidate_list_structure(list, work);
         }
         Ok(items)
@@ -15570,9 +16273,11 @@ impl MachineInstance {
                     });
                     (window, had_full_items)
                 };
-                let full_rows = had_full_items
-                    .then(|| self.list_row_ids(current))
-                    .unwrap_or_default();
+                let full_rows = if had_full_items {
+                    self.list_row_ids(current)
+                } else {
+                    Vec::new()
+                };
                 frames.push(ChunkLogicalLenFrame {
                     list: current,
                     size: chunk_size,
@@ -16243,7 +16948,8 @@ impl MachineInstance {
             .metadata
             .row_field_names
             .iter()
-            .filter_map(|((owner, field), name)| (*owner == list).then(|| (name.clone(), *field)))
+            .filter(|((owner, _), _)| *owner == list)
+            .map(|((_, field), name)| (name.clone(), *field))
             .collect::<BTreeMap<_, _>>();
         if fields_by_name.is_empty() {
             return Err(Error::InvalidPlan(format!(
@@ -16254,12 +16960,14 @@ impl MachineInstance {
         let fields = fields
             .into_iter()
             .map(|(name, value)| {
-                let field = fields_by_name.get(&name).copied().ok_or_else(|| {
-                    Error::InvalidPlan(format!(
-                        "list projection target {} record field `{name}` has no compiled FieldId",
-                        list.0
-                    ))
-                })?;
+                let field = runtime_string_map_get(&fields_by_name, &name)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "list projection target {} record field `{name}` has no compiled FieldId",
+                            list.0
+                        ))
+                    })?;
                 Ok((field, self.materialize_eval(value)?))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
@@ -16977,6 +17685,12 @@ impl MachineInstance {
             .unwrap_or_default();
         let (subscriptions, old_cursors) =
             self.ordered_index_subscriber_snapshot(index_id, &dirty_rows_snapshot);
+        let publication = OrderedIndexPublicationState {
+            dirty_rows_snapshot,
+            subscriptions,
+            old_cursors,
+            requesting_consumer,
+        };
         let plan = metadata.list_indexes.get(&index_id).ok_or_else(|| {
             Error::InvalidPlan(format!("missing typed list index {}", index_id.0))
         })?;
@@ -16993,10 +17707,8 @@ impl MachineInstance {
             self.publish_ordered_index_subscriber_changes(
                 index_id,
                 true,
-                &dirty_rows_snapshot,
-                &subscriptions,
-                &old_cursors,
-                requesting_consumer,
+                &publication.dirty_rows_snapshot,
+                &publication,
                 work,
             )?;
             self.record_ordered_index_footprint(work);
@@ -17102,9 +17814,7 @@ impl MachineInstance {
             index_id,
             false,
             &dirty_rows,
-            &subscriptions,
-            &old_cursors,
-            requesting_consumer,
+            &publication,
             work,
         )?;
         self.record_ordered_index_footprint(work);
@@ -17145,11 +17855,10 @@ impl MachineInstance {
         index_id: PlanListIndexId,
         fully_dirty: bool,
         dirty_rows: &BTreeSet<RowId>,
-        subscriptions: &ListAccessSubscriptions,
-        old_cursors: &OrderedIndexCursorSnapshot,
-        requesting_consumer: Option<Consumer>,
+        publication: &OrderedIndexPublicationState,
         work: &mut Work,
     ) -> Result<(), Error> {
+        let subscriptions = &publication.subscriptions;
         if subscriptions.is_empty() {
             return Ok(());
         }
@@ -17167,12 +17876,16 @@ impl MachineInstance {
                         subscribed
                             .iter()
                             .copied()
-                            .filter(|consumer| Some(*consumer) != requesting_consumer),
+                            .filter(|consumer| Some(*consumer) != publication.requesting_consumer),
                     );
                 }
             } else {
                 for row in dirty_rows {
-                    let old = old_cursors.get(row).cloned().unwrap_or_default();
+                    let old = publication
+                        .old_cursors
+                        .get(row)
+                        .cloned()
+                        .unwrap_or_default();
                     let new = index.cursor_keys_for(access_row_id(*row));
                     if old == new {
                         continue;
@@ -17189,12 +17902,9 @@ impl MachineInstance {
                                 .map_err(|error| Error::Evaluation(error.to_string()))
                             })?;
                         if matches {
-                            consumers.extend(
-                                subscribed
-                                    .iter()
-                                    .copied()
-                                    .filter(|consumer| Some(*consumer) != requesting_consumer),
-                            );
+                            consumers.extend(subscribed.iter().copied().filter(|consumer| {
+                                Some(*consumer) != publication.requesting_consumer
+                            }));
                         }
                     }
                 }
@@ -17384,11 +18094,13 @@ impl MachineInstance {
                 let value = self.eval_contextual_body(
                     (key.owner, key.row_local),
                     EvalValue::Row(row),
-                    &key.expression,
-                    Some(row),
-                    None,
-                    None,
-                    None,
+                    key.expression,
+                    ExpressionContext {
+                        row: Some(row),
+                        event: None,
+                        output: None,
+                        consumer: None,
+                    },
                     &mut bindings,
                     work,
                 )?;
@@ -17510,9 +18222,30 @@ impl MachineInstance {
     ) {
         let mut pending = Vec::new();
         let mut scheduled = BTreeSet::new();
-        let schedule = |task, pending: &mut Vec<_>, scheduled: &mut BTreeSet<_>| {
+        #[cfg(feature = "phase0-instrumentation")]
+        let mut push_count = 0_u64;
+        #[cfg(feature = "phase0-instrumentation")]
+        let mut high_water = 0_usize;
+        #[cfg(feature = "phase0-instrumentation")]
+        let mut capacity_growth_count = 0_u64;
+        #[cfg(feature = "phase0-instrumentation")]
+        let mut capacity_growth_items = 0_usize;
+        #[allow(unused_mut)]
+        let mut schedule = |task, pending: &mut Vec<_>, scheduled: &mut BTreeSet<_>| {
             if scheduled.insert(task) {
+                #[cfg(feature = "phase0-instrumentation")]
+                let previous_capacity = pending.capacity();
                 pending.push(task);
+                #[cfg(feature = "phase0-instrumentation")]
+                {
+                    push_count = push_count.saturating_add(1);
+                    high_water = high_water.max(pending.len());
+                    if pending.capacity() > previous_capacity {
+                        capacity_growth_count = capacity_growth_count.saturating_add(1);
+                        capacity_growth_items = capacity_growth_items
+                            .saturating_add(pending.capacity() - previous_capacity);
+                    }
+                }
             }
         };
         let initial = initial.into_iter().collect::<Vec<_>>();
@@ -17786,6 +18519,27 @@ impl MachineInstance {
             for task in next.into_iter().rev() {
                 schedule(task, &mut pending, &mut scheduled);
             }
+        }
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            let high_water = u64::try_from(high_water).unwrap_or(u64::MAX);
+            work.metrics.dirty_propagation_queue_high_water = work
+                .metrics
+                .dirty_propagation_queue_high_water
+                .max(high_water);
+            work.metrics.dirty_propagation_queue_push_count = work
+                .metrics
+                .dirty_propagation_queue_push_count
+                .saturating_add(push_count);
+            work.metrics.dirty_propagation_queue_capacity_growth_count = work
+                .metrics
+                .dirty_propagation_queue_capacity_growth_count
+                .saturating_add(capacity_growth_count);
+            work.metrics.dirty_propagation_queue_capacity_growth_items = work
+                .metrics
+                .dirty_propagation_queue_capacity_growth_items
+                .saturating_add(u64::try_from(capacity_growth_items).unwrap_or(u64::MAX));
+            work.metrics.queue_high_water = work.metrics.queue_high_water.max(high_water);
         }
     }
 
@@ -18131,9 +18885,11 @@ impl MachineInstance {
                 values.len()
             )));
         }
-        values.pop().ok_or_else(|| {
+        let value = values.pop().ok_or_else(|| {
             Error::InvalidPlan("evaluation materialization produced no root value".to_owned())
-        })
+        })?;
+        record_boundary_materialization(&value);
+        Ok(value)
     }
 }
 
@@ -18141,16 +18897,18 @@ impl MachineInstance {
     #[cfg(test)]
     fn reconcile_materialized_list(
         &mut self,
-        list_id: ListId,
-        authority_source_list: Option<ListId>,
-        field_ids: &BTreeMap<String, FieldId>,
-        row_field_copies: &[PlanMaterializedRowFieldCopy],
+        schema: MaterializedListSchema<'_>,
         value: EvalValue,
         owner_prefix: OwnerAncestryId,
-        event: Option<&SourceEvent>,
-        consumer: Option<Consumer>,
+        context: ExpressionContext<'_>,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
+        let MaterializedListSchema {
+            list_id,
+            authority_source_list,
+            field_ids,
+            row_field_copies: _,
+        } = schema;
         let items = eval_to_list(value)?;
         let desired_len = items.len();
         let current_len = self.list_row_ids(list_id).len();
@@ -18195,148 +18953,36 @@ impl MachineInstance {
         }
         let desired = items
             .into_iter()
-            .map(|item| {
-                self.materialized_row_fields(
-                    list_id,
-                    authority_source_list,
-                    field_ids,
-                    row_field_copies,
-                    item,
-                    event,
-                    consumer,
-                    work,
-                )
-            })
+            .map(|item| self.materialized_row_fields(schema, item, context, work))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut desired_origins = BTreeSet::new();
-        for (origin, _) in &desired {
-            if !desired_origins.insert(*origin) {
-                return Err(Error::Evaluation(format!(
-                    "materialized list {} produced duplicate structural row identity",
-                    list_id.0
-                )));
-            }
-        }
-        let state_fields = self
-            .metadata
-            .indexed_state_field
-            .iter()
-            .filter_map(|(state, field)| {
-                (self.metadata.indexed_state_owner.get(state) == Some(&list_id)).then_some(*field)
-            })
-            .collect::<BTreeSet<_>>();
-        if let Some(authority_source_list) = authority_source_list {
-            let mut ordered_rows = Vec::with_capacity(desired_len);
-            for (origin, fields) in desired {
-                let leaf = self.owner_instances.ancestry_leaf(origin)?.ok_or_else(|| {
-                    Error::InvalidPlan(format!(
-                        "materialized list {} authority-backed row has no structural origin",
-                        list_id.0
-                    ))
-                })?;
-                if leaf.list != authority_source_list {
-                    return Err(Error::InvalidPlan(format!(
-                        "materialized list {} authority-backed row originates in ListId {}, expected {}",
-                        list_id.0, leaf.list.0, authority_source_list.0
-                    )));
-                }
-                let row = RowId {
-                    list: list_id,
-                    key: leaf.key,
-                    generation: leaf.generation,
-                };
-                let target_origin = self
-                    .owner_instances
-                    .ancestry_with_leaf_list(origin, list_id)?;
-                if self.row_owner_ancestry(row)? != target_origin {
-                    return Err(Error::InvalidPlan(format!(
-                        "materialized list {} authority row {}:{} has stale structural identity",
-                        list_id.0, row.key, row.generation
-                    )));
-                }
-                for (field, value) in fields {
-                    if state_fields.contains(&field) {
-                        continue;
-                    }
-                    self.record_row_field_undo(row, field, work);
-                    self.set_row_authority_field(row, field, value, work)?;
-                }
-                ordered_rows.push(row);
-            }
-            return Ok(EvalValue::List(
-                ordered_rows.into_iter().map(EvalValue::Row).collect(),
-            ));
-        }
-        let mut existing_by_origin = self
-            .lists
-            .get(&list_id)
-            .and_then(|list| list.owner_partitions.get(&owner_prefix))
-            .map(|partition| partition.by_materialization_origin.clone())
-            .unwrap_or_default();
-        if existing_by_origin.len() != existing.len() {
-            return Err(Error::InvalidPlan(format!(
-                "list {} owner partition mixes materialized and authoritative rows",
-                list_id.0
-            )));
-        }
-        let insertion_index = self
-            .lists
-            .get(&list_id)
-            .and_then(|list| list.order.minimum_position(&existing))
-            .unwrap_or(current_len);
-        let unmatched = existing_by_origin
-            .iter()
-            .filter_map(|(origin, row)| (!desired_origins.contains(origin)).then_some(*row))
-            .collect::<Vec<_>>();
-        for row in unmatched.into_iter().rev() {
-            self.remove_row(row, work)?;
-        }
-
-        let mut ordered_rows = Vec::with_capacity(desired_len);
-        for (origin, fields) in desired {
-            let row = if let Some(row) = existing_by_origin.remove(&origin) {
-                row
-            } else {
-                self.append_row_with_owner_prefix(
-                    list_id,
-                    fields.clone(),
-                    owner_prefix,
-                    Some(origin),
-                    work,
-                )?
-            };
-            for (field, value) in fields {
-                if state_fields.contains(&field) {
-                    continue;
-                }
-                self.record_row_field_undo(row, field, work);
-                self.set_row_authority_field(row, field, value, work)?;
-            }
-            ordered_rows.push(row);
-        }
-        if self.set_materialized_partition_order(list_id, insertion_index, &ordered_rows, work)? {
-            work.authority_deltas.push(AuthorityDelta::ReplaceList {
+        self.finish_materialized_list_reconciliation(
+            MaterializedListReconciliation {
                 list_id,
-                authority: self.list_authority(list_id)?,
-            });
-            self.invalidate_list_structure(list_id, work);
-        }
-        Ok(EvalValue::List(
-            ordered_rows.into_iter().map(EvalValue::Row).collect(),
-        ))
+                authority_source_list,
+                owner_prefix,
+                existing,
+                current_len,
+                desired_len,
+            },
+            desired,
+            work,
+        )
     }
 
     fn finish_materialized_list_reconciliation(
         &mut self,
-        list_id: ListId,
-        authority_source_list: Option<ListId>,
-        owner_prefix: OwnerAncestryId,
-        existing: Vec<RowId>,
-        current_len: usize,
-        desired_len: usize,
+        reconciliation: MaterializedListReconciliation,
         desired: Vec<(OwnerAncestryId, BTreeMap<FieldId, Value>)>,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
+        let MaterializedListReconciliation {
+            list_id,
+            authority_source_list,
+            owner_prefix,
+            existing,
+            current_len,
+            desired_len,
+        } = reconciliation;
         let mut desired_origins = BTreeSet::new();
         for (origin, _) in &desired {
             if !desired_origins.insert(*origin) {
@@ -18506,12 +19152,14 @@ impl MachineInstance {
                 let fields = fields
                     .into_iter()
                     .map(|(name, value)| {
-                        let field = fields_by_name.get(&name).copied().ok_or_else(|| {
-                            Error::InvalidPlan(format!(
-                                "typed value-list authority {} record field `{name}` has no compiled FieldId",
-                                list_id.0
-                            ))
-                        })?;
+                        let field = runtime_string_map_get(fields_by_name, &name)
+                            .copied()
+                            .ok_or_else(|| {
+                                Error::InvalidPlan(format!(
+                                    "typed value-list authority {} record field `{name}` has no compiled FieldId",
+                                    list_id.0
+                                ))
+                            })?;
                         Ok((field, self.materialize_eval(value)?))
                     })
                     .collect::<Result<BTreeMap<_, _>, Error>>()?;
@@ -18646,15 +19294,17 @@ impl MachineInstance {
 
     fn materialized_row_fields(
         &mut self,
-        list_id: ListId,
-        authority_source_list: Option<ListId>,
-        field_ids: &BTreeMap<String, FieldId>,
-        row_field_copies: &[PlanMaterializedRowFieldCopy],
+        schema: MaterializedListSchema<'_>,
         item: EvalValue,
-        event: Option<&SourceEvent>,
-        consumer: Option<Consumer>,
+        context: ExpressionContext<'_>,
         work: &mut Work,
     ) -> Result<(OwnerAncestryId, BTreeMap<FieldId, Value>), Error> {
+        let MaterializedListSchema {
+            list_id,
+            authority_source_list,
+            field_ids,
+            row_field_copies,
+        } = schema;
         let (origin, fields, captures) = match item {
             EvalValue::Record(fields) => (OwnerAncestryId::ROOT, fields, BTreeMap::new()),
             EvalValue::MappedRow {
@@ -18696,8 +19346,9 @@ impl MachineInstance {
                 }
                 let mut fields = BTreeMap::new();
                 for copy in copies {
-                    self.register_row_dependency(consumer, row, copy.source_field);
-                    let value = self.ensure_row_field(row, copy.source_field, event, work)?;
+                    self.register_row_dependency(context.consumer, row, copy.source_field);
+                    let value =
+                        self.ensure_row_field(row, copy.source_field, context.event, work)?;
                     fields.insert(copy.target_field, value);
                 }
                 return Ok((
@@ -18715,12 +19366,14 @@ impl MachineInstance {
         let mut fields = fields
             .into_iter()
             .map(|(name, value)| {
-                let field = field_ids.get(&name).copied().ok_or_else(|| {
-                    Error::InvalidPlan(format!(
-                        "materialized list {} record field `{name}` has no compiled FieldId",
-                        list_id.0
-                    ))
-                })?;
+                let field = runtime_string_map_get(field_ids, &name)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "materialized list {} record field `{name}` has no compiled FieldId",
+                            list_id.0
+                        ))
+                    })?;
                 Ok((field, self.materialize_eval(value)?))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
@@ -18756,6 +19409,7 @@ impl MachineInstance {
             if *candidate_list != list_id {
                 continue;
             }
+            record_runtime_string_field_lookup();
             let Some(value_fields) = self
                 .metadata
                 .list_fields_by_name
@@ -19563,27 +20217,26 @@ impl MachineInstance {
                                         target,
                                         ..
                                     }) = &work.active_trigger
-                                    {
-                                        if let Some(arm) = arms.iter().find(|arm| {
+                                        && let Some(arm) = arms.iter().find(|arm| {
                                             matches!(
                                                 &arm.trigger,
                                                 ValueRef::State(trigger) if trigger == state
                                             )
-                                        }) {
-                                            let triggered = match (*target, context.event) {
-                                                (Some(row), _) => Some(row),
-                                                (None, Some(event)) => event.target,
-                                                (None, None) => None,
-                                            };
-                                            selected = Some((
-                                                arm.value,
-                                                exact_expression_row(
-                                                    context.row,
-                                                    triggered,
-                                                    "state event transform",
-                                                )?,
-                                            ));
-                                        }
+                                        })
+                                    {
+                                        let triggered = match (*target, context.event) {
+                                            (Some(row), _) => Some(row),
+                                            (None, Some(event)) => event.target,
+                                            (None, None) => None,
+                                        };
+                                        selected = Some((
+                                            arm.value,
+                                            exact_expression_row(
+                                                context.row,
+                                                triggered,
+                                                "state event transform",
+                                            )?,
+                                        ));
                                     }
                                     if selected.is_none()
                                         && let Some(event) = context.event
@@ -19789,12 +20442,14 @@ impl MachineInstance {
                         ExpressionTask::MaterializedListNext { mut state } => {
                             let Some(item) = state.remaining.next() else {
                                 let value = self.finish_materialized_list_reconciliation(
-                                    state.list_id,
-                                    state.authority_source_list,
-                                    state.owner_prefix,
-                                    state.existing,
-                                    state.current_len,
-                                    state.desired_len,
+                                    MaterializedListReconciliation {
+                                        list_id: state.list_id,
+                                        authority_source_list: state.authority_source_list,
+                                        owner_prefix: state.owner_prefix,
+                                        existing: state.existing,
+                                        current_len: state.current_len,
+                                        desired_len: state.desired_len,
+                                    },
                                     state.desired,
                                     work,
                                 )?;
@@ -19806,13 +20461,19 @@ impl MachineInstance {
                                 | EvalValue::Value(Value::Row { id: row, .. }) => row,
                                 item => {
                                     let desired = self.materialized_row_fields(
-                                        state.list_id,
-                                        state.authority_source_list,
-                                        state.field_ids,
-                                        state.row_field_copies,
+                                        MaterializedListSchema {
+                                            list_id: state.list_id,
+                                            authority_source_list: state.authority_source_list,
+                                            field_ids: state.field_ids,
+                                            row_field_copies: state.row_field_copies,
+                                        },
                                         item,
-                                        state.event,
-                                        state.consumer,
+                                        ExpressionContext {
+                                            row: None,
+                                            event: state.event,
+                                            output: None,
+                                            consumer: state.consumer,
+                                        },
                                         work,
                                     )?;
                                     state.desired.push(desired);
@@ -20609,7 +21270,11 @@ impl MachineInstance {
                                     let items = self
                                         .derived_lists
                                         .get(&list)
-                                        .and_then(|cell| cell.items.clone())
+                                        .and_then(|cell| {
+                                            cell.items
+                                                .as_ref()
+                                                .map(|items| clone_whole_list_snapshot(items, work))
+                                        })
                                         .ok_or_else(|| {
                                             Error::Evaluation(format!(
                                                 "current derived list {} has no items",
@@ -20688,10 +21353,12 @@ impl MachineInstance {
                                     stack.limit
                                 )));
                             }
-                            let old = self
-                                .derived_lists
-                                .get(&list)
-                                .and_then(|cell| cell.items.clone());
+                            let old = self.derived_lists.get(&list).and_then(|cell| {
+                                cell.items
+                                    .as_ref()
+                                    .map(|items| clone_whole_list_snapshot(items, work))
+                            });
+                            let retained_items = clone_whole_list_snapshot(&items, work);
                             {
                                 let cell = self.derived_lists.get_mut(&list).ok_or_else(|| {
                                     Error::InvalidPlan(format!(
@@ -20699,7 +21366,7 @@ impl MachineInstance {
                                         list.0
                                     ))
                                 })?;
-                                cell.items = Some(items.clone());
+                                cell.items = Some(retained_items);
                                 cell.window = None;
                                 cell.currentness = Currentness::Current;
                             }
@@ -20708,7 +21375,7 @@ impl MachineInstance {
                                 ExpressionCurrentnessTarget::List(list),
                             )?;
                             work.metrics.recomputed_list_count += 1;
-                            if old.as_ref() != Some(&items) {
+                            if whole_list_snapshot_changed(old.as_ref(), &items, work) {
                                 self.invalidate_list_structure(list, work);
                             }
                             stack.push_value(EvalValue::List(items))?;
@@ -22770,11 +23437,13 @@ impl MachineInstance {
                             let Some((name, field)) = state.fields.get(state.next_field).cloned()
                             else {
                                 let value = if state.scalar_type.is_some() {
-                                    state.output.remove("value").ok_or_else(|| {
-                                        Error::InvalidPlan(
-                                            "scalar typed list page row lost its value".to_owned(),
-                                        )
-                                    })?
+                                    runtime_string_map_remove(&mut state.output, "value")
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(
+                                                "scalar typed list page row lost its value"
+                                                    .to_owned(),
+                                            )
+                                        })?
                                 } else {
                                     Value::Record(state.output)
                                 };
@@ -23201,9 +23870,7 @@ impl MachineInstance {
                                     index_id,
                                     true,
                                     &state.publication.dirty_rows_snapshot,
-                                    &state.publication.subscriptions,
-                                    &state.publication.old_cursors,
-                                    state.publication.requesting_consumer,
+                                    &state.publication,
                                     work,
                                 )?;
                                 self.record_ordered_index_footprint(work);
@@ -23266,9 +23933,7 @@ impl MachineInstance {
                                     index_id,
                                     false,
                                     &state.dirty_rows,
-                                    &state.publication.subscriptions,
-                                    &state.publication.old_cursors,
-                                    state.publication.requesting_consumer,
+                                    &state.publication,
                                     work,
                                 )?;
                                 self.record_ordered_index_footprint(work);
@@ -23716,7 +24381,6 @@ impl MachineInstance {
                                     }
                                 }
                             }
-                            drop(next_value);
                             if stack.values.len() != value_base {
                                 return Err(Error::InvalidPlan(format!(
                                     "{} produced extra evaluated operands",
@@ -24337,6 +25001,7 @@ impl MachineInstance {
             stack.pop_value()
         })();
 
+        stack.record_metrics(&mut work.metrics);
         while let Some(undo) = binding_undos.pop() {
             restore_expression_binding(bindings, undo);
         }
@@ -24650,7 +25315,6 @@ impl MachineInstance {
                 )));
             }
         };
-        drop(next);
         if operands.len() != value_base {
             return Err(Error::InvalidPlan(format!(
                 "row expression {} left unused evaluated operands",
@@ -24665,15 +25329,20 @@ impl MachineInstance {
         local: (PlanStaticOwnerId, PlanLocalId),
         value: EvalValue,
         body: impl IntoExpressionId,
-        row: Option<RowId>,
-        event: Option<&SourceEvent>,
-        output: Option<FieldId>,
-        consumer: Option<Consumer>,
+        context: ExpressionContext<'_>,
         bindings: &mut PlanLocalBindings,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
         let previous = bindings.insert(local, value);
-        let result = self.eval_row_expression(body, row, event, output, consumer, bindings, work);
+        let result = self.eval_row_expression(
+            body,
+            context.row,
+            context.event,
+            context.output,
+            context.consumer,
+            bindings,
+            work,
+        );
         match previous {
             Some(previous) => {
                 bindings.insert(local, previous);
@@ -24800,23 +25469,21 @@ impl MachineInstance {
         match object {
             EvalValue::Record(mut record) => {
                 let keys = record.keys().cloned().collect();
-                record.remove(field).ok_or_else(|| missing(keys))
+                runtime_string_map_remove(&mut record, field).ok_or_else(|| missing(keys))
             }
             EvalValue::MappedRow { mut fields, .. } => {
                 let keys = fields.keys().cloned().collect();
-                fields.remove(field).ok_or_else(|| missing(keys))
+                runtime_string_map_remove(&mut fields, field).ok_or_else(|| missing(keys))
             }
             EvalValue::Value(Value::Record(mut record)) => {
                 let keys = record.keys().cloned().collect();
-                record
-                    .remove(field)
+                runtime_string_map_remove(&mut record, field)
                     .map(EvalValue::Value)
                     .ok_or_else(|| missing(keys))
             }
             EvalValue::Value(Value::MappedRow { mut fields, .. }) => {
                 let keys = fields.keys().cloned().collect();
-                fields
-                    .remove(field)
+                runtime_string_map_remove(&mut fields, field)
                     .map(EvalValue::Value)
                     .ok_or_else(|| missing(keys))
             }
@@ -25196,7 +25863,37 @@ impl MachineInstance {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        #[cfg(feature = "phase0-instrumentation")]
+        let pushed = pending.len();
+        #[cfg(feature = "phase0-instrumentation")]
+        let previous_capacity = work.pending_list_mutations.capacity();
         work.pending_list_mutations.extend(pending);
+        #[cfg(feature = "phase0-instrumentation")]
+        {
+            work.metrics.pending_mutation_queue_push_count = work
+                .metrics
+                .pending_mutation_queue_push_count
+                .saturating_add(u64::try_from(pushed).unwrap_or(u64::MAX));
+            let high_water = u64::try_from(work.pending_list_mutations.len()).unwrap_or(u64::MAX);
+            work.metrics.pending_mutation_queue_high_water = work
+                .metrics
+                .pending_mutation_queue_high_water
+                .max(high_water);
+            if work.pending_list_mutations.capacity() > previous_capacity {
+                work.metrics.pending_mutation_queue_capacity_growth_count = work
+                    .metrics
+                    .pending_mutation_queue_capacity_growth_count
+                    .saturating_add(1);
+                work.metrics.pending_mutation_queue_capacity_growth_items = work
+                    .metrics
+                    .pending_mutation_queue_capacity_growth_items
+                    .saturating_add(
+                        u64::try_from(work.pending_list_mutations.capacity() - previous_capacity)
+                            .unwrap_or(u64::MAX),
+                    );
+            }
+            work.metrics.queue_high_water = work.metrics.queue_high_water.max(high_water);
+        }
         Ok(())
     }
 
@@ -25283,7 +25980,7 @@ impl MachineInstance {
                 }
                 let row = event.and_then(|event| event.target);
                 let gate = self.eval_row_expression(
-                    &append.gate,
+                    append.gate,
                     row,
                     event,
                     None,
@@ -25295,7 +25992,7 @@ impl MachineInstance {
                     return Ok(None);
                 }
                 let item = self.eval_row_expression(
-                    &append.item,
+                    append.item,
                     row,
                     event,
                     None,
@@ -25351,11 +26048,13 @@ impl MachineInstance {
                     let gate = self.eval_contextual_body(
                         local,
                         EvalValue::Row(row),
-                        &remove.gate,
-                        Some(row),
-                        event,
-                        None,
-                        None,
+                        remove.gate,
+                        ExpressionContext {
+                            row: Some(row),
+                            event,
+                            output: None,
+                            consumer: None,
+                        },
                         &mut PlanLocalBindings::new(),
                         work,
                     )?;
@@ -25365,11 +26064,13 @@ impl MachineInstance {
                     let predicate = self.eval_contextual_body(
                         local,
                         EvalValue::Row(row),
-                        &remove.predicate,
-                        Some(row),
-                        event,
-                        None,
-                        None,
+                        remove.predicate,
+                        ExpressionContext {
+                            row: Some(row),
+                            event,
+                            output: None,
+                            consumer: None,
+                        },
                         &mut PlanLocalBindings::new(),
                         work,
                     )?;
@@ -25469,7 +26170,10 @@ impl MachineInstance {
         }
         .expect("record append item");
 
-        if record.keys().any(|name| !fields_by_name.contains_key(name)) {
+        if record
+            .keys()
+            .any(|name| !runtime_string_map_contains_key(&fields_by_name, name))
+        {
             return Err(Error::Evaluation(format!(
                 "append into list {} produced unknown fields {:?}; authority fields are {:?}",
                 list.0,
@@ -25480,7 +26184,8 @@ impl MachineInstance {
         record
             .into_iter()
             .map(|(name, value)| {
-                let field = fields_by_name[&name];
+                let field = *runtime_string_map_get(&fields_by_name, &name)
+                    .expect("record fields were validated above");
                 Ok((field, self.materialize_eval(value)?))
             })
             .collect()
@@ -25854,7 +26559,7 @@ impl MachineInstance {
                     row.list.0, row.key, row.generation
                 ))
             })?;
-            list.remove_owner_partition_row(row, &removed, &mut self.owner_instances)?;
+            list.remove_owner_partition_row(row, &removed, &self.owner_instances)?;
             removed
         };
         self.commit_ordered_index_dirty(prepared_index_dirty);
@@ -26242,9 +26947,12 @@ fn page_position_bytes(value: &Value) -> Result<Option<Bytes>, ()> {
         Value::Text(tag) if tag == "Start" => Ok(None),
         Value::Record(fields)
             if fields.len() == 2
-                && matches!(fields.get("$tag"), Some(Value::Text(tag)) if tag == "Cursor") =>
+                && matches!(
+                    runtime_string_map_get(fields, "$tag"),
+                    Some(Value::Text(tag)) if tag == "Cursor"
+                ) =>
         {
-            match fields.get("value") {
+            match runtime_string_map_get(fields, "value") {
                 Some(Value::Bytes(value)) => Ok(Some(value.clone())),
                 _ => Err(()),
             }
@@ -26817,7 +27525,7 @@ fn eval_named_fields_data_equal(
         return Ok(false);
     }
     for (name, left) in left {
-        let Some(right) = right.get(name) else {
+        let Some(right) = runtime_string_map_get(right, name) else {
             return Ok(false);
         };
         if !eval_data_equal(left, right)? {
@@ -26835,7 +27543,7 @@ fn value_named_fields_data_equal(
         return Ok(false);
     }
     for (name, left) in left {
-        let Some(right) = right.get(name) else {
+        let Some(right) = runtime_string_map_get(right, name) else {
             return Ok(false);
         };
         if !value_data_equal(left, right)? {
@@ -26853,7 +27561,7 @@ fn value_eval_named_fields_data_equal(
         return Ok(false);
     }
     for (name, value) in values {
-        let Some(eval) = evals.get(name) else {
+        let Some(eval) = runtime_string_map_get(evals, name) else {
             return Ok(false);
         };
         if !value_eval_data_equal(value, eval)? {
@@ -26990,7 +27698,7 @@ fn tagged_value_label(value: &Value) -> Option<&str> {
     let Value::Record(fields) = value else {
         return None;
     };
-    fields.get("$tag").and_then(|tag| match tag {
+    runtime_string_map_get(fields, "$tag").and_then(|tag| match tag {
         Value::Text(tag) => Some(tag.as_str()),
         _ => None,
     })
@@ -27232,11 +27940,11 @@ pub(crate) fn report_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
         .map(|delta| match delta {
             Delta::SetValue { target, value } => Delta::SetValue {
                 target,
-                value: value.into_visible_facade(),
+                value: report_boundary_value(value),
             },
             Delta::SetDistributedImport { import_id, value } => Delta::SetDistributedImport {
                 import_id,
-                value: value.into_visible_facade(),
+                value: report_boundary_value(value),
             },
             Delta::InsertRow { row } => Delta::InsertRow {
                 row: report_row_snapshot(row),
@@ -27254,7 +27962,7 @@ fn report_authority_deltas(deltas: Vec<AuthorityDelta>) -> Vec<AuthorityDelta> {
         .map(|delta| match delta {
             AuthorityDelta::SetRoot { state, value } => AuthorityDelta::SetRoot {
                 state,
-                value: value.into_visible_facade(),
+                value: report_boundary_value(value),
             },
             AuthorityDelta::SetRowField {
                 row,
@@ -27267,7 +27975,7 @@ fn report_authority_deltas(deltas: Vec<AuthorityDelta>) -> Vec<AuthorityDelta> {
                 owner_ancestors,
                 materialization_origin,
                 field,
-                value: value.into_visible_facade(),
+                value: report_boundary_value(value),
             },
             AuthorityDelta::ReplaceList { list_id, authority } => AuthorityDelta::ReplaceList {
                 list_id,
@@ -27294,7 +28002,7 @@ fn report_row_snapshot(row: RowSnapshot) -> RowSnapshot {
         fields: row
             .fields
             .into_iter()
-            .map(|(field, value)| (field, value.into_visible_facade()))
+            .map(|(field, value)| (field, report_boundary_value(value)))
             .collect(),
     }
 }
@@ -27308,7 +28016,7 @@ fn report_row_authority(row: RowAuthority) -> RowAuthority {
         fields: row
             .fields
             .into_iter()
-            .map(|(field, value)| (field, value.into_visible_facade()))
+            .map(|(field, value)| (field, report_boundary_value(value)))
             .collect(),
         touched_fields: row.touched_fields,
     }
@@ -27326,6 +28034,162 @@ fn report_list_authority(authority: ListAuthority) -> ListAuthority {
             .map(report_row_authority)
             .collect(),
     }
+}
+
+fn report_boundary_value(value: Value) -> Value {
+    let value = value.into_visible_facade();
+    record_boundary_materialization(&value);
+    value
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn value_target_logical_bytes(target: ValueTarget) -> u64 {
+    match target {
+        ValueTarget::State(_) | ValueTarget::Field(_) => 1 + 8,
+        ValueTarget::RowField { .. } => 1 + 24 + 8,
+    }
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn row_snapshot_logical_bytes(row: &RowSnapshot) -> u64 {
+    let field_bytes = row.fields.values().fold(0_u64, |total, value| {
+        total
+            .saturating_add(8)
+            .saturating_add(value_tree_stats(value).logical_payload_bytes)
+    });
+    let provenance_bytes = u64::try_from(row.provenance.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(8 + 24);
+    24_u64
+        .saturating_add(8)
+        .saturating_add(field_bytes)
+        .saturating_add(8)
+        .saturating_add(provenance_bytes)
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn delta_logical_bytes(delta: &Delta) -> u64 {
+    let payload = match delta {
+        Delta::SetValue { target, value } => value_target_logical_bytes(*target)
+            .saturating_add(value_tree_stats(value).logical_payload_bytes),
+        Delta::SetDistributedImport { value, .. } => {
+            32_u64.saturating_add(value_tree_stats(value).logical_payload_bytes)
+        }
+        Delta::InsertRow { row } => row_snapshot_logical_bytes(row),
+        Delta::RemoveRow { .. } => 24,
+        Delta::BindSource { .. } | Delta::UnbindSource { .. } => 24 + 8 + 8,
+    };
+    1_u64.saturating_add(payload)
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn owner_rows_logical_bytes(rows: &[OwnerInstanceRow]) -> u64 {
+    8_u64.saturating_add(
+        u64::try_from(rows.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(24),
+    )
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn row_authority_logical_bytes(row: &RowAuthority) -> u64 {
+    let fields = row.fields.values().fold(0_u64, |total, value| {
+        total
+            .saturating_add(8)
+            .saturating_add(value_tree_stats(value).logical_payload_bytes)
+    });
+    24_u64
+        .saturating_add(16)
+        .saturating_add(owner_rows_logical_bytes(&row.owner_ancestors))
+        .saturating_add(row.materialization_origin.as_deref().map_or(1, |rows| {
+            1_u64.saturating_add(owner_rows_logical_bytes(rows))
+        }))
+        .saturating_add(8)
+        .saturating_add(fields)
+        .saturating_add(8)
+        .saturating_add(
+            u64::try_from(row.touched_fields.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(8),
+        )
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn list_authority_logical_bytes(authority: &ListAuthority) -> u64 {
+    authority.rows.iter().fold(
+        1_u64
+            .saturating_add(8)
+            .saturating_add(8)
+            .saturating_add(16)
+            .saturating_add(8),
+        |total, row| total.saturating_add(row_authority_logical_bytes(row)),
+    )
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn authority_delta_logical_bytes(delta: &AuthorityDelta) -> u64 {
+    let payload = match delta {
+        AuthorityDelta::SetRoot { value, .. } => {
+            8_u64.saturating_add(value_tree_stats(value).logical_payload_bytes)
+        }
+        AuthorityDelta::SetRowField {
+            owner_ancestors,
+            materialization_origin,
+            value,
+            ..
+        } => 24_u64
+            .saturating_add(owner_rows_logical_bytes(owner_ancestors))
+            .saturating_add(materialization_origin.as_deref().map_or(1, |rows| {
+                1_u64.saturating_add(owner_rows_logical_bytes(rows))
+            }))
+            .saturating_add(8)
+            .saturating_add(value_tree_stats(value).logical_payload_bytes),
+        AuthorityDelta::ReplaceList { authority, .. } => {
+            8_u64.saturating_add(list_authority_logical_bytes(authority))
+        }
+        AuthorityDelta::InsertRow {
+            row,
+            index: _,
+            next_key: _,
+        } => row_authority_logical_bytes(row)
+            .saturating_add(8)
+            .saturating_add(8),
+        AuthorityDelta::RemoveRow { .. } => 24 + 8,
+    };
+    1_u64.saturating_add(payload)
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+fn record_delta_metrics(
+    metrics: &mut TurnMetrics,
+    deltas: &[Delta],
+    authority_deltas: &[AuthorityDelta],
+) {
+    metrics.delta_item_count = u64::try_from(deltas.len()).unwrap_or(u64::MAX);
+    metrics.delta_logical_byte_count = deltas.iter().fold(0_u64, |total, delta| {
+        total.saturating_add(delta_logical_bytes(delta))
+    });
+    metrics.authority_delta_item_count = u64::try_from(authority_deltas.len()).unwrap_or(u64::MAX);
+    metrics.authority_delta_logical_byte_count =
+        authority_deltas.iter().fold(0_u64, |total, delta| {
+            total.saturating_add(authority_delta_logical_bytes(delta))
+        });
+}
+
+#[cfg(not(feature = "phase0-instrumentation"))]
+#[inline(always)]
+fn record_delta_metrics(
+    _metrics: &mut TurnMetrics,
+    _deltas: &[Delta],
+    _authority_deltas: &[AuthorityDelta],
+) {
+}
+
+fn take_report_deltas(work: &mut Work) -> (Vec<Delta>, Vec<AuthorityDelta>) {
+    let deltas = report_deltas(std::mem::take(&mut work.deltas));
+    let authority_deltas = report_authority_deltas(std::mem::take(&mut work.authority_deltas));
+    record_delta_metrics(&mut work.metrics, &deltas, &authority_deltas);
+    (deltas, authority_deltas)
 }
 
 fn coalesce_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
@@ -27361,11 +28225,9 @@ fn source_payload_value(payload: &SourcePayload, field: &SourcePayloadField) -> 
         SourcePayloadField::Address => payload.address.clone().map(Value::Text),
         SourcePayloadField::Key => payload.key.clone().map(Value::Text),
         SourcePayloadField::Text => payload.text.clone().map(Value::Text),
-        SourcePayloadField::Named(name) => payload.fields.get(name).cloned(),
-        SourcePayloadField::Bytes => payload
-            .fields
-            .get("bytes")
-            .or_else(|| payload.fields.get("Bytes"))
+        SourcePayloadField::Named(name) => runtime_string_map_get(&payload.fields, name).cloned(),
+        SourcePayloadField::Bytes => runtime_string_map_get(&payload.fields, "bytes")
+            .or_else(|| runtime_string_map_get(&payload.fields, "Bytes"))
             .cloned(),
     }
 }
@@ -27374,7 +28236,9 @@ pub(crate) fn project_value<'a>(value: &'a Value, field_path: &[String]) -> Opti
     let mut value = value;
     for field in field_path {
         value = match value {
-            Value::Record(fields) | Value::MappedRow { fields, .. } => fields.get(field)?,
+            Value::Record(fields) | Value::MappedRow { fields, .. } => {
+                runtime_string_map_get(fields, field)?
+            }
             _ => return None,
         };
     }
@@ -27491,6 +28355,136 @@ mod ownership_tests {
         for hidden in [SENTINEL, "b1b1", "b2b2", "b3b3", "181", "182"] {
             assert!(!diagnostic.contains(hidden), "leaked `{hidden}`");
         }
+    }
+
+    #[cfg(feature = "phase0-instrumentation")]
+    #[test]
+    fn legacy_runtime_intervals_count_recursive_clones_boundaries_and_string_trees() {
+        let value = Value::Record(BTreeMap::from([(
+            "items".to_owned(),
+            Value::List(vec![Value::Text("alpha".to_owned()), Value::Bool(true)]),
+        )]));
+        let mut work = Work::with_limit(None);
+
+        let cloned = value.clone();
+        let Value::Record(fields) = &cloned else {
+            panic!("fixture remains a record");
+        };
+        assert!(runtime_string_map_get(fields, "items").is_some());
+        record_boundary_materialization(&cloned);
+        work.finish_metrics();
+
+        assert_eq!(work.metrics.value_clone_count, 1);
+        assert_eq!(work.metrics.recursive_value_clone_count, 1);
+        assert_eq!(work.metrics.recursive_value_clone_value_count, 4);
+        assert_eq!(work.metrics.boundary_materialization_count, 1);
+        assert_eq!(work.metrics.recursive_boundary_materialization_count, 1);
+        assert_eq!(work.metrics.boundary_materialized_value_count, 4);
+        assert!(work.metrics.boundary_materialized_payload_bytes > 4);
+        assert_eq!(work.metrics.runtime_string_field_lookup_count, 1);
+        assert_eq!(work.metrics.tree_container_lookup_count, 1);
+    }
+
+    #[cfg(feature = "phase0-instrumentation")]
+    #[test]
+    fn explicit_evaluator_queues_report_high_water_and_capacity_growth() {
+        let mut stack = ExpressionWorkStack::new(8);
+        stack
+            .push_task(ExpressionTask::RestoreBinding { undo: 0 })
+            .unwrap();
+        stack
+            .push_task(ExpressionTask::RestoreBinding { undo: 1 })
+            .unwrap();
+        stack
+            .push_value(EvalValue::Value(Value::Bool(false)))
+            .unwrap();
+        stack
+            .push_value(EvalValue::Value(Value::Bool(true)))
+            .unwrap();
+        let mut metrics = TurnMetrics::default();
+        stack.record_metrics(&mut metrics);
+
+        assert_eq!(metrics.evaluator_task_queue_high_water, 2);
+        assert_eq!(metrics.evaluator_task_queue_push_count, 2);
+        assert_eq!(metrics.evaluator_value_queue_high_water, 2);
+        assert_eq!(metrics.evaluator_value_queue_push_count, 2);
+        assert_eq!(metrics.queue_high_water, 2);
+        assert!(metrics.evaluator_task_queue_capacity_growth_count >= 1);
+        assert!(metrics.evaluator_task_queue_capacity_growth_items >= 2);
+        assert!(metrics.evaluator_value_queue_capacity_growth_count >= 1);
+        assert!(metrics.evaluator_value_queue_capacity_growth_items >= 2);
+    }
+
+    #[cfg(feature = "phase0-instrumentation")]
+    #[test]
+    fn whole_snapshot_and_final_delta_metrics_count_exact_logical_work() {
+        let items = vec![
+            EvalValue::Value(Value::Text("first".to_owned())),
+            EvalValue::Value(Value::Text("second".to_owned())),
+        ];
+        let mut work = Work::with_limit(None);
+        let old = clone_whole_list_snapshot(&items, &mut work);
+        let replacement = clone_whole_list_snapshot(&items, &mut work);
+        assert!(!whole_list_snapshot_changed(
+            Some(&old),
+            &replacement,
+            &mut work
+        ));
+
+        work.deltas.push(Delta::SetValue {
+            target: ValueTarget::State(StateId(7)),
+            value: Value::Text("stale".to_owned()),
+        });
+        work.deltas.push(Delta::SetValue {
+            target: ValueTarget::State(StateId(7)),
+            value: Value::Text("current".to_owned()),
+        });
+        work.authority_deltas.push(AuthorityDelta::SetRoot {
+            state: StateId(7),
+            value: Value::Record(BTreeMap::from([("value".to_owned(), Value::Bool(true))])),
+        });
+        let (deltas, authority_deltas) = take_report_deltas(&mut work);
+        work.finish_metrics();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(authority_deltas.len(), 1);
+        assert_eq!(work.metrics.whole_list_snapshot_clone_count, 2);
+        assert_eq!(work.metrics.whole_list_snapshot_cloned_item_count, 4);
+        assert_eq!(work.metrics.whole_list_snapshot_comparison_count, 1);
+        assert_eq!(
+            work.metrics.whole_list_snapshot_comparison_input_item_count,
+            4
+        );
+        assert_eq!(work.metrics.delta_item_count, 1);
+        assert!(work.metrics.delta_logical_byte_count > 0);
+        assert_eq!(work.metrics.authority_delta_item_count, 1);
+        assert!(work.metrics.authority_delta_logical_byte_count > 0);
+        assert_eq!(work.metrics.boundary_materialization_count, 2);
+        assert_eq!(work.metrics.recursive_boundary_materialization_count, 1);
+    }
+
+    #[cfg(feature = "phase0-instrumentation")]
+    #[test]
+    fn touched_population_uses_existing_rollback_carriers_exactly() {
+        let mut work = Work::with_limit(None);
+        let row = RowId {
+            list: ListId(11),
+            key: 12,
+            generation: 13,
+        };
+        work.undo_root_states.insert(StateId(7));
+        work.undo_root_states.insert(StateId(7));
+        work.undo_row_fields.insert((row, FieldId(8)));
+        work.undo_row_fields.insert((row, FieldId(8)));
+        work.list_revision_undo.insert(ListId(11), 14);
+        work.list_revision_undo.insert(ListId(11), 15);
+
+        work.finish_metrics();
+
+        assert_eq!(work.metrics.touched_root_state_count, 1);
+        assert_eq!(work.metrics.touched_row_field_count, 1);
+        assert_eq!(work.metrics.touched_list_count, 1);
+        assert_eq!(work.metrics.touched_population_count, 3);
     }
 
     fn order_test_row(key: u64) -> RowId {
@@ -28080,6 +29074,18 @@ store: [
             .map(|field| (field.name.clone(), field.field_id))
             .collect::<BTreeMap<_, _>>();
         let value_field = child_fields["value"];
+        let child_schema = MaterializedListSchema {
+            list_id: child_list,
+            authority_source_list: None,
+            field_ids: &child_fields,
+            row_field_copies: &[],
+        };
+        let reconciliation_context = ExpressionContext {
+            row: None,
+            event: None,
+            output: None,
+            consumer: None,
+        };
         let item = |id, value: &str| EvalValue::MappedRow {
             id,
             fields: BTreeMap::from([(
@@ -28142,14 +29148,10 @@ store: [
 
         session
             .reconcile_materialized_list(
-                child_list,
-                None,
-                &child_fields,
-                &[],
+                child_schema,
                 EvalValue::List(vec![item(origin_a1, "a-1"), item(origin_a2, "a-2")]),
                 owner_a,
-                None,
-                None,
+                reconciliation_context,
                 &mut work,
             )
             .unwrap();
@@ -28157,14 +29159,10 @@ store: [
         assert_eq!(initial_a.len(), 2);
         let reordered = session
             .reconcile_materialized_list(
-                child_list,
-                None,
-                &child_fields,
-                &[],
+                child_schema,
                 EvalValue::List(vec![item(origin_a2, "a-2"), item(origin_a1, "a-1")]),
                 owner_a,
-                None,
-                None,
+                reconciliation_context,
                 &mut work,
             )
             .unwrap();
@@ -28177,14 +29175,10 @@ store: [
         );
         session
             .reconcile_materialized_list(
-                child_list,
-                None,
-                &child_fields,
-                &[],
+                child_schema,
                 EvalValue::List(vec![item(origin_b1, "b-1")]),
                 owner_b,
-                None,
-                None,
+                reconciliation_context,
                 &mut work,
             )
             .unwrap();
@@ -28193,14 +29187,10 @@ store: [
 
         let result = session
             .reconcile_materialized_list(
-                child_list,
-                None,
-                &child_fields,
-                &[],
+                child_schema,
                 EvalValue::List(vec![item(origin_a2, "a-replaced")]),
                 owner_a,
-                None,
-                None,
+                reconciliation_context,
                 &mut work,
             )
             .unwrap();

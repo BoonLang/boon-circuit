@@ -43,20 +43,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         source_revision,
         force: args.iter().any(|arg| arg == "--force"),
     })?;
-    let document = result
+    let client = result
         .manifest
         .artifact(boon_plan::ProgramRole::Client)
-        .ok_or("built bundle lost its document artifact")?;
+        .ok_or("built bundle lost its client artifact")?;
+    let session = result
+        .manifest
+        .artifact(boon_plan::ProgramRole::Session)
+        .ok_or("built bundle lost its session artifact")?;
     let server = result
         .manifest
         .artifact(boon_plan::ProgramRole::Server)
         .ok_or("built bundle lost its server artifact")?;
     println!(
-        "built {} {} at {}\n  document {}\n  server   {}",
+        "built {} {} at {}\n  client  {}\n  session {}\n  server  {}",
         result.manifest.package_id,
         result.manifest.source_revision,
         result.output_dir.display(),
-        document.content_artifact_id,
+        client.content_artifact_id,
+        session.content_artifact_id,
         server.content_artifact_id,
     );
     Ok(())

@@ -233,7 +233,7 @@ store: [
 ]
 "#,
         );
-        let parsed = boon_parser::parse_source(&format!("wrong-{label}.bn"), &source).unwrap();
+        let parsed = boon_parser::parse_source(format!("wrong-{label}.bn"), &source).unwrap();
         let report = check(&parsed);
         assert!(
             report.diagnostics.iter().any(|diagnostic| {
@@ -263,7 +263,7 @@ store: [
 ]
 "#,
         );
-        let parsed = boon_parser::parse_source(&format!("missing-{missing}.bn"), &source).unwrap();
+        let parsed = boon_parser::parse_source(format!("missing-{missing}.bn"), &source).unwrap();
         let report = check(&parsed);
         assert!(
             report.diagnostics.iter().any(|diagnostic| diagnostic
@@ -314,7 +314,7 @@ host_ports: [
 ]
 "#
         );
-        let parsed = boon_parser::parse_source(&format!("valid-http-{index}.bn"), &source).unwrap();
+        let parsed = boon_parser::parse_source(format!("valid-http-{index}.bn"), &source).unwrap();
         let report = check(&parsed);
         assert!(
             !report.has_errors(),
@@ -382,7 +382,7 @@ host_ports: [
 "#
         );
         let parsed =
-            boon_parser::parse_source(&format!("invalid-http-{name}.bn"), &source).unwrap();
+            boon_parser::parse_source(format!("invalid-http-{name}.bn"), &source).unwrap();
         let report = check(&parsed);
         assert!(
             report.diagnostics.iter().any(|diagnostic| {

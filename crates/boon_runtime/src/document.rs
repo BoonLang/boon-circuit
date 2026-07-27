@@ -1406,6 +1406,8 @@ impl DocumentRuntime {
                 &retained.environment,
             )?;
         }
+        let semantic_metadata = resolve_retained_semantic_metadata(self, &retained.arguments)?;
+        apply_resolved_semantic_metadata(&mut node, semantic_metadata);
         if node.kind == DocumentNodeKind::Button {
             node.style
                 .entry("cursor".to_owned())
@@ -1557,6 +1559,17 @@ struct RetainedArgument {
     role: DocumentArgumentRole,
     value: EvalValue,
     binding: Option<RetainedScalarBinding>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ResolvedSemanticMetadata {
+    target: Option<String>,
+    address: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SemanticMetadataCandidate {
+    observed: Option<Option<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2430,11 +2443,11 @@ impl<'a> Evaluator<'a> {
                 ) && let Some(right) = right
                 {
                     let guarded_side = if self.direct_target_expression(*left, env, target)
-                        && self.guard_key_expression(*right, env, 0)
+                        && self.guard_key_expression(*right, 0)
                     {
                         Some(*right)
                     } else if self.direct_target_expression(*right, env, target)
-                        && self.guard_key_expression(*left, env, 0)
+                        && self.guard_key_expression(*left, 0)
                     {
                         Some(*left)
                     } else {
@@ -2542,12 +2555,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn guard_key_expression(
-        &self,
-        expression: DocumentExprId,
-        env: &EvalEnv,
-        depth: usize,
-    ) -> bool {
+    fn guard_key_expression(&self, expression: DocumentExprId, depth: usize) -> bool {
         if depth > 512 {
             return false;
         }
@@ -2558,7 +2566,7 @@ impl<'a> Evaluator<'a> {
         let all = |expressions: &[DocumentExprId]| {
             expressions
                 .iter()
-                .all(|child| self.guard_key_expression(*child, env, next))
+                .all(|child| self.guard_key_expression(*child, next))
         };
         match op.as_ref() {
             DocumentExprOp::Constant { .. } | DocumentExprOp::NoElement => true,
@@ -2574,7 +2582,7 @@ impl<'a> Evaluator<'a> {
                 | DocumentRead::Source { .. }
                 | DocumentRead::Row { .. } => false,
             },
-            DocumentExprOp::Project { input, .. } => self.guard_key_expression(*input, env, next),
+            DocumentExprOp::Project { input, .. } => self.guard_key_expression(*input, next),
             DocumentExprOp::Record { fields } | DocumentExprOp::TaggedRecord { fields, .. } => {
                 all(&fields.iter().map(|field| field.value).collect::<Vec<_>>())
             }
@@ -2591,37 +2599,37 @@ impl<'a> Evaluator<'a> {
             DocumentExprOp::LocalBlock { bindings, result } => {
                 bindings
                     .iter()
-                    .all(|binding| self.guard_key_expression(binding.value, env, next))
-                    && self.guard_key_expression(*result, env, next)
+                    .all(|binding| self.guard_key_expression(binding.value, next))
+                    && self.guard_key_expression(*result, next)
             }
             DocumentExprOp::Builtin {
                 input, arguments, ..
             } => {
                 input
                     .iter()
-                    .all(|input| self.guard_key_expression(*input, env, next))
+                    .all(|input| self.guard_key_expression(*input, next))
                     && arguments
                         .iter()
-                        .all(|argument| self.guard_key_expression(argument.value, env, next))
+                        .all(|argument| self.guard_key_expression(argument.value, next))
             }
             DocumentExprOp::Scalar { left, right, .. } => {
-                self.guard_key_expression(*left, env, next)
+                self.guard_key_expression(*left, next)
                     && right
                         .iter()
-                        .all(|right| self.guard_key_expression(*right, env, next))
+                        .all(|right| self.guard_key_expression(*right, next))
             }
             DocumentExprOp::Select { input, arms } => {
-                self.guard_key_expression(*input, env, next)
+                self.guard_key_expression(*input, next)
                     && arms
                         .iter()
-                        .all(|arm| self.guard_key_expression(arm.output, env, next))
+                        .all(|arm| self.guard_key_expression(arm.output, next))
             }
             DocumentExprOp::Latest { branches } => all(branches),
             DocumentExprOp::Then { input, output } => {
-                self.guard_key_expression(*input, env, next)
+                self.guard_key_expression(*input, next)
                     && output
                         .iter()
-                        .all(|output| self.guard_key_expression(*output, env, next))
+                        .all(|output| self.guard_key_expression(*output, next))
             }
             DocumentExprOp::Constructor { .. }
             | DocumentExprOp::Materialize { .. }
@@ -3288,6 +3296,9 @@ impl<'a> Evaluator<'a> {
                 binding: argument.binding,
             });
         }
+        let semantic_metadata =
+            resolve_retained_semantic_metadata(self.runtime, &retained_arguments)?;
+        apply_resolved_semantic_metadata(&mut node, semantic_metadata);
         if node.kind == DocumentNodeKind::Button {
             node.style
                 .entry("cursor".to_owned())
@@ -3538,7 +3549,9 @@ fn apply_argument(
         DocumentArgumentRole::StaticText | DocumentArgumentRole::DynamicText => {
             apply_text_argument(node, name, value)
         }
-        DocumentArgumentRole::EventBindings => attach_sources(runtime, session, node, &value, env)?,
+        DocumentArgumentRole::EventBindings => {
+            attach_sources(runtime, session, node, &value, env)?;
+        }
         DocumentArgumentRole::Value => apply_value_argument(node, name, value),
         DocumentArgumentRole::Child
         | DocumentArgumentRole::Children
@@ -3550,6 +3563,129 @@ fn apply_argument(
         | DocumentArgumentRole::MapGeneration => {}
     }
     Ok(())
+}
+
+fn resolve_retained_semantic_metadata(
+    runtime: &DocumentRuntime,
+    arguments: &[RetainedArgument],
+) -> Result<ResolvedSemanticMetadata, DocumentError> {
+    let mut named_arguments = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        let name = runtime
+            .plan()
+            .names
+            .get(argument.name.0)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                DocumentError::InvalidPlan(format!("name {} is missing", argument.name.0))
+            })?;
+        named_arguments.push((name, argument.role, &argument.value));
+    }
+    resolve_semantic_metadata(named_arguments)
+}
+
+fn resolve_semantic_metadata<'a>(
+    arguments: impl IntoIterator<Item = (&'a str, DocumentArgumentRole, &'a EvalValue)>,
+) -> Result<ResolvedSemanticMetadata, DocumentError> {
+    let mut style_target = SemanticMetadataCandidate::default();
+    let mut style_address = SemanticMetadataCandidate::default();
+    let mut event_target = SemanticMetadataCandidate::default();
+    let mut event_address = SemanticMetadataCandidate::default();
+    let mut explicit_target = SemanticMetadataCandidate::default();
+    let mut explicit_address = SemanticMetadataCandidate::default();
+
+    for (name, role, value) in arguments {
+        if matches!(
+            role,
+            DocumentArgumentRole::StaticStyle | DocumentArgumentRole::DynamicStyle
+        ) {
+            let Some(fields) = record_fields(value) else {
+                continue;
+            };
+            observe_semantic_metadata(&mut style_target, fields.get("target"), "style target")?;
+            observe_semantic_metadata(&mut style_address, fields.get("address"), "style address")?;
+        }
+        if role == DocumentArgumentRole::EventBindings {
+            let Some(fields) = record_fields(value) else {
+                continue;
+            };
+            observe_semantic_metadata(&mut event_target, fields.get("target"), "event target")?;
+            observe_semantic_metadata(&mut event_address, fields.get("address"), "event address")?;
+        }
+        if role == DocumentArgumentRole::Value {
+            match name {
+                "target" => {
+                    observe_semantic_metadata(&mut explicit_target, Some(value), "explicit target")?
+                }
+                "address" => observe_semantic_metadata(
+                    &mut explicit_address,
+                    Some(value),
+                    "explicit address",
+                )?,
+                _ => {}
+            }
+        }
+    }
+
+    Ok(ResolvedSemanticMetadata {
+        target: choose_semantic_metadata(explicit_target, event_target, style_target),
+        address: choose_semantic_metadata(explicit_address, event_address, style_address),
+    })
+}
+
+fn semantic_scalar_text(value: &EvalValue) -> Option<String> {
+    matches!(
+        value,
+        EvalValue::Bool(_) | EvalValue::Number(_) | EvalValue::Text(_) | EvalValue::Enum(_)
+    )
+    .then(|| value.text())
+}
+
+fn observe_semantic_metadata(
+    candidate: &mut SemanticMetadataCandidate,
+    value: Option<&EvalValue>,
+    field: &str,
+) -> Result<(), DocumentError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let observed = semantic_scalar_text(value);
+    if candidate
+        .observed
+        .as_ref()
+        .is_some_and(|previous| previous != &observed)
+    {
+        return Err(DocumentError::Evaluation(format!(
+            "conflicting {field} metadata on one document node"
+        )));
+    }
+    candidate.observed = Some(observed);
+    Ok(())
+}
+
+fn choose_semantic_metadata(
+    explicit: SemanticMetadataCandidate,
+    event: SemanticMetadataCandidate,
+    style: SemanticMetadataCandidate,
+) -> Option<String> {
+    explicit
+        .observed
+        .or(event.observed)
+        .or(style.observed)
+        .flatten()
+}
+
+fn apply_resolved_semantic_metadata(node: &mut DocumentNode, metadata: ResolvedSemanticMetadata) {
+    node.style.remove("target");
+    node.style.remove("address");
+    if let Some(target) = metadata.target {
+        node.style
+            .insert("target".to_owned(), StyleValue::Text(target));
+    }
+    if let Some(address) = metadata.address {
+        node.style
+            .insert("address".to_owned(), StyleValue::Text(address));
+    }
 }
 
 fn retained_argument_role(role: DocumentArgumentRole) -> bool {
@@ -4232,7 +4368,6 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
         match name {
             "source" => {
                 program.source = value.text();
-                program.source_digest = crate::sha256_bytes(program.source.as_bytes());
             }
             "revision" => {
                 program.revision = value.number().unwrap_or(0.0).max(0.0) as u64;
@@ -4252,11 +4387,12 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
             }
             "bootstrap_source" => {
                 program.bootstrap_source = value.text();
-                program.bootstrap_source_digest =
-                    crate::sha256_bytes(program.bootstrap_source.as_bytes());
             }
             "bootstrap_artifact_id" => {
                 program.bootstrap_artifact_id = value.text();
+            }
+            "bootstrap_support_sources" => {
+                program.bootstrap_support_sources = embedded_program_source_units(&value);
             }
             "bootstrap_revision" => {
                 program.bootstrap_revision = value.number().unwrap_or(0.0).max(0.0) as u64;
@@ -4284,6 +4420,7 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
                 | "support_sources"
                 | "bootstrap_source"
                 | "bootstrap_artifact_id"
+                | "bootstrap_support_sources"
                 | "bootstrap_revision"
                 | "capability_profile"
                 | "session_key"
@@ -4338,20 +4475,27 @@ fn embedded_program_source_units(value: &EvalValue) -> Vec<EmbeddedProgramSource
                 EvalValue::MappedRow { fields, .. } => Some(fields),
                 _ => None,
             };
+            let Some(fields) = fields else {
+                return EmbeddedProgramSourceUnit {
+                    path: String::new(),
+                    source: String::new(),
+                };
+            };
+            if fields.len() != 2 || !fields.contains_key("path") || !fields.contains_key("source") {
+                return EmbeddedProgramSourceUnit {
+                    path: String::new(),
+                    source: String::new(),
+                };
+            }
             let path = fields
-                .and_then(|fields| fields.get("path"))
+                .get("path")
                 .map(|value| value.text())
                 .unwrap_or_default();
             let source = fields
-                .and_then(|fields| fields.get("source"))
+                .get("source")
                 .map(|value| value.text())
                 .unwrap_or_default();
-            let source_digest = crate::sha256_bytes(source.as_bytes());
-            EmbeddedProgramSourceUnit {
-                path,
-                source,
-                source_digest,
-            }
+            EmbeddedProgramSourceUnit { path, source }
         })
         .collect()
 }
@@ -5919,7 +6063,6 @@ mod tests {
         program.parent = Some(previous.root.clone());
         program.embedded_program = Some(EmbeddedProgramDescriptor {
             source: "first".to_owned(),
-            source_digest: crate::sha256_bytes(b"first"),
             revision: 1,
             ..EmbeddedProgramDescriptor::default()
         });
@@ -5939,7 +6082,6 @@ mod tests {
             .as_mut()
             .unwrap();
         descriptor.source = "second".to_owned();
-        descriptor.source_digest = crate::sha256_bytes(b"second");
         descriptor.revision = 2;
 
         assert!(matches!(
@@ -5947,6 +6089,44 @@ mod tests {
             [DocumentPatch::SetEmbeddedProgram { id, program }]
                 if id.0 == "program" && program.revision == 2
         ));
+    }
+
+    #[test]
+    fn embedded_program_support_unit_runtime_lowering_fails_closed_on_extra_fields() {
+        let exact = embedded_program_source_units(&EvalValue::List(vec![EvalValue::Record(
+            BTreeMap::from([
+                ("path".to_owned(), EvalValue::Text("Support.bn".to_owned())),
+                ("source".to_owned(), EvalValue::Text("value: 1".to_owned())),
+            ]),
+        )]));
+        assert_eq!(
+            exact,
+            vec![EmbeddedProgramSourceUnit {
+                path: "Support.bn".to_owned(),
+                source: "value: 1".to_owned(),
+            }]
+        );
+
+        for digest_field in ["source_digest", "source_bundle_digest_v1"] {
+            let invalid = embedded_program_source_units(&EvalValue::List(vec![EvalValue::Record(
+                BTreeMap::from([
+                    ("path".to_owned(), EvalValue::Text("Support.bn".to_owned())),
+                    ("source".to_owned(), EvalValue::Text("value: 1".to_owned())),
+                    (
+                        digest_field.to_owned(),
+                        EvalValue::Text("caller supplied".to_owned()),
+                    ),
+                ]),
+            )]));
+            assert_eq!(
+                invalid,
+                vec![EmbeddedProgramSourceUnit {
+                    path: String::new(),
+                    source: String::new(),
+                }],
+                "{digest_field}"
+            );
+        }
     }
 
     #[test]
@@ -6002,6 +6182,137 @@ mod tests {
             );
             assert_eq!(invalid.activation_focus, None);
         }
+    }
+
+    #[test]
+    fn semantic_metadata_is_order_independent_normalized_and_explicit_values_win() {
+        let style = EvalValue::Record(BTreeMap::from([
+            (
+                "target".to_owned(),
+                EvalValue::Text("style target".to_owned()),
+            ),
+            (
+                "address".to_owned(),
+                EvalValue::Text("style address".to_owned()),
+            ),
+        ]));
+        let events = EvalValue::Record(BTreeMap::from([
+            (
+                "target".to_owned(),
+                EvalValue::Text("waveform canvas".to_owned()),
+            ),
+            ("address".to_owned(), EvalValue::Bool(true)),
+            ("unrelated".to_owned(), EvalValue::Text("hidden".to_owned())),
+        ]));
+        let explicit_target = EvalValue::Number(7.0);
+        let explicit_address = EvalValue::Enum("row-7".to_owned());
+        let forward = resolve_semantic_metadata([
+            ("style", DocumentArgumentRole::StaticStyle, &style),
+            ("element", DocumentArgumentRole::EventBindings, &events),
+            ("target", DocumentArgumentRole::Value, &explicit_target),
+            ("address", DocumentArgumentRole::Value, &explicit_address),
+        ])
+        .unwrap();
+        let reversed = resolve_semantic_metadata([
+            ("address", DocumentArgumentRole::Value, &explicit_address),
+            ("target", DocumentArgumentRole::Value, &explicit_target),
+            ("element", DocumentArgumentRole::EventBindings, &events),
+            ("style", DocumentArgumentRole::StaticStyle, &style),
+        ])
+        .unwrap();
+        assert_eq!(forward, reversed);
+        assert_eq!(
+            forward,
+            ResolvedSemanticMetadata {
+                target: Some("7".to_owned()),
+                address: Some("row-7".to_owned()),
+            }
+        );
+        assert_eq!(
+            resolve_semantic_metadata([("style", DocumentArgumentRole::StaticStyle, &style)])
+                .unwrap(),
+            ResolvedSemanticMetadata {
+                target: Some("style target".to_owned()),
+                address: Some("style address".to_owned()),
+            }
+        );
+
+        let mut node = DocumentNode::new("button", DocumentNodeKind::Button);
+        node.style.insert(
+            "target".to_owned(),
+            StyleValue::Text("stale target".to_owned()),
+        );
+        apply_resolved_semantic_metadata(&mut node, forward);
+        assert_eq!(
+            node.style.get("target"),
+            Some(&StyleValue::Text("7".to_owned()))
+        );
+        assert_eq!(
+            node.style.get("address"),
+            Some(&StyleValue::Text("row-7".to_owned()))
+        );
+        assert!(!node.style.contains_key("unrelated"));
+    }
+
+    #[test]
+    fn semantic_metadata_removes_absent_or_nonscalar_values_and_rejects_conflicts() {
+        let events = EvalValue::Record(BTreeMap::from([
+            (
+                "target".to_owned(),
+                EvalValue::Text("event target".to_owned()),
+            ),
+            ("address".to_owned(), EvalValue::Record(BTreeMap::new())),
+        ]));
+        let style = EvalValue::Record(BTreeMap::from([
+            (
+                "target".to_owned(),
+                EvalValue::Text("style fallback target".to_owned()),
+            ),
+            (
+                "address".to_owned(),
+                EvalValue::Text("style fallback address".to_owned()),
+            ),
+        ]));
+        let nonscalar_target = EvalValue::Null;
+        let metadata = resolve_semantic_metadata([
+            ("style", DocumentArgumentRole::StaticStyle, &style),
+            ("element", DocumentArgumentRole::EventBindings, &events),
+            ("target", DocumentArgumentRole::Value, &nonscalar_target),
+        ])
+        .unwrap();
+        assert_eq!(metadata, ResolvedSemanticMetadata::default());
+
+        let mut node = DocumentNode::new("button", DocumentNodeKind::Button);
+        node.style.insert(
+            "target".to_owned(),
+            StyleValue::Text("stale target".to_owned()),
+        );
+        node.style.insert(
+            "address".to_owned(),
+            StyleValue::Text("stale address".to_owned()),
+        );
+        apply_resolved_semantic_metadata(&mut node, metadata);
+        assert!(!node.style.contains_key("target"));
+        assert!(!node.style.contains_key("address"));
+
+        let first = EvalValue::Record(BTreeMap::from([(
+            "address".to_owned(),
+            EvalValue::Text("A0".to_owned()),
+        )]));
+        let second = EvalValue::Record(BTreeMap::from([(
+            "address".to_owned(),
+            EvalValue::Text("B0".to_owned()),
+        )]));
+        let error = resolve_semantic_metadata([
+            ("first", DocumentArgumentRole::EventBindings, &first),
+            ("second", DocumentArgumentRole::EventBindings, &second),
+        ])
+        .expect_err("conflicting event metadata must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting event address metadata")
+        );
     }
 
     #[test]

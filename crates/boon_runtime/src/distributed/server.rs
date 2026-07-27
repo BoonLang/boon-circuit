@@ -2326,11 +2326,11 @@ where
             .collect::<Vec<_>>();
         for edge in edges {
             let value = export_runtime_value(self.machine.export_current(edge.export_id)?)?;
-            let changed = !self
+            let changed = self
                 .state
                 .shared_sent_values
                 .get(&edge.export_id)
-                .is_some_and(|(_, current)| current == &value);
+                .is_none_or(|(_, current)| current != &value);
             let revision = if changed {
                 let revision = next_revision(
                     self.state

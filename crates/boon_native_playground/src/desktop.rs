@@ -375,6 +375,7 @@ impl DesktopSupervisor {
             source: if self.source.programs.is_empty() {
                 PreviewSource::BuiltInSingleRole {
                     application: self.source.application.clone(),
+                    entry_path: self.source.entry_path.clone(),
                     units: self.source.working_units.clone(),
                 }
             } else {
@@ -437,6 +438,7 @@ impl Drop for DesktopSupervisor {
 struct SourceState {
     active: LoadedExample,
     application: ApplicationIdentity,
+    entry_path: String,
     baseline_units: Vec<SourceUnit>,
     working_units: Vec<SourceUnit>,
     programs: Vec<ProgramSource>,
@@ -450,6 +452,7 @@ impl SourceState {
         let baseline_units = active.units.clone();
         let test_steps = active.test_steps.clone();
         let application = active.application.clone();
+        let entry_path = active.entry_path.clone();
         let programs = active.programs.clone();
         let migration_stage = active
             .migration
@@ -459,6 +462,7 @@ impl SourceState {
             working_units: baseline_units.clone(),
             active,
             application,
+            entry_path,
             programs,
             migration_stage,
             baseline_units,
@@ -472,6 +476,7 @@ impl SourceState {
         self.baseline_units = active.units.clone();
         self.working_units = active.units.clone();
         self.application = active.application.clone();
+        self.entry_path = active.entry_path.clone();
         self.programs = active.programs.clone();
         self.migration_stage = active
             .migration
@@ -490,6 +495,7 @@ impl SourceState {
             .ok_or_else(|| format!("migration stage `{stage_id}` is not in the active catalog"))?;
         self.baseline_units.clone_from(&stage.units);
         self.working_units.clone_from(&stage.units);
+        self.entry_path.clone_from(&stage.source);
         self.migration_stage = Some(stage_id.to_owned());
         Ok(())
     }

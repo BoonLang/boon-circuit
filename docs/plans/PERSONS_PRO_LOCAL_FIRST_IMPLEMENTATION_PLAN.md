@@ -2,8 +2,26 @@
 
 Date: 2026-07-15
 
-Status: local-first implementation complete; final acceptance is defined by
-the source-bound manifest reports named below
+> **Phase 0 status: rewrite required.**
+>
+> **Current executable behavior:** the local `persons_pro` example, its
+> compiler/runtime paths, and its manifest-listed verifier route exist; only
+> reports regenerated from the exact current source can describe their present
+> result.
+>
+> **Historical/stale content:** the former “implementation complete” label and
+> previously generated reports are not final evidence for the current worktree.
+>
+> **Target-only content:** hosted `persons.pro`, browser adapters, passkey
+> account protection, publication, and production service behavior below
+> remain product targets unless an executable current gate proves them.
+>
+> **Flag-day owner:** unified goal Phase 6 rewrites this plan when the
+> Client/Session/Server, web, persistence, and product replacement is
+> implemented; Phase 0 does not claim that work complete.
+
+Status: local example present; broader local-first and hosted-product acceptance
+remains target-only pending its Phase 6 flag-day replacement and fresh evidence.
 
 Persons.pro is a Boon-hosted personal publishing workspace. A visitor receives
 an immediately usable anonymous workspace, edits a small Boon program, sees the

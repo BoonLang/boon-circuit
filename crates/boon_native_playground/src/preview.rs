@@ -23,7 +23,7 @@ use boon_runtime::{
 
 use crate::compile::{
     CompileRequest, CompileWorker, ProgramCompileReceipt, ProgramCompileWorker,
-    compile_migration_stage, preview_project_key, project_key_for_stage,
+    compile_migration_stage, preview_project_key,
 };
 use crate::frame::{
     NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, host_event_digest,
@@ -379,7 +379,7 @@ impl StateEvidenceConfig {
             .transpose()?;
         let responsive_navigation_sources =
             bounded_evidence_ids(RESPONSIVE_NAVIGATION_SOURCES_ENV)?;
-        if responsive_width.is_some() != !responsive_navigation_sources.is_empty()
+        if responsive_width.is_some() == responsive_navigation_sources.is_empty()
             || responsive_navigation_sources.len() > 8
         {
             return Err(format!(
@@ -732,6 +732,10 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 .flatten()
                 .min(),
         );
+        #[allow(
+            clippy::large_enum_variant,
+            reason = "wake payloads are moved directly from futures; boxing would add per-wake allocations"
+        )]
         enum Wake {
             Native(Result<HostEventEnvelope, boon_native_app_window::NativeHostError>),
             Ipc(Option<Result<Message, String>>),
@@ -942,10 +946,10 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                     if pointer_presentation.is_some() {
                         workflow_pointer_presentation = pointer_presentation;
                     }
-                    if is_ascii_batch_end(&envelope.event) {
-                        if let Some(benchmark) = profile_benchmark.as_mut() {
-                            close_profile_input_batch(benchmark)?;
-                        }
+                    if is_ascii_batch_end(&envelope.event)
+                        && let Some(benchmark) = profile_benchmark.as_mut()
+                    {
+                        close_profile_input_batch(benchmark)?;
                     }
                 }
                 if runtime.is_none() {
@@ -1244,7 +1248,11 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             .checked_add(1)
                             .ok_or("preview compile job identity exhausted")?;
                         let compile_job = desired_compile_job;
-                        let key = preview_project_key(&source, migration_stage.as_deref());
+                        let key = preview_project_key(
+                            &source,
+                            migration.as_ref(),
+                            migration_stage.as_deref(),
+                        )?;
                         if intent == PreviewIntent::Replace {
                             switch_started = Some((revision, accepted_at));
                             emit(
@@ -3341,11 +3349,12 @@ async fn execute_migration_command(
                 let (steps, deletions) = migration_counts(change.migration.as_ref());
                 *active_stage = stage_id.clone();
                 *previewed_stage = None;
-                *runtime_key = Some(project_key_for_stage(
+                *runtime_key = Some(crate::compile::migration_project_key(
                     runtime.application_identity(),
-                    &stage.units,
-                    Some(&stage_id),
-                ));
+                    migration,
+                    &stage_id,
+                    None,
+                )?);
                 if let Some(presented) = present_runtime(runtime, view, product, host, columns)
                     .await
                     .map_err(|error| error.to_string())?
@@ -5477,13 +5486,7 @@ fn retain_latest_program_request(
     latest: &mut BTreeMap<ProgramSessionId, ProgramHostRequest>,
     request: ProgramHostRequest,
 ) {
-    let replace = latest.get(&request.session).is_none_or(|current| {
-        (request.compile.revision, request.request_id.0.as_str())
-            > (current.compile.revision, current.request_id.0.as_str())
-    });
-    if replace {
-        latest.insert(request.session.clone(), request);
-    }
+    latest.insert(request.session.clone(), request);
 }
 
 fn submit_program_requests(
@@ -6116,6 +6119,31 @@ mod readiness_tests {
     use super::*;
     use boon_plan::TargetProfile;
 
+    fn program_request(request_id: &str, revision: u64) -> ProgramHostRequest {
+        ProgramHostRequest {
+            request_id: ProgramRequestId(request_id.to_owned()),
+            session: ProgramSessionId("arrival-order".to_owned()),
+            host: boon_document_model::DocumentNodeId("program-host".to_owned()),
+            compile: boon_runtime::ProgramCompileRequest {
+                revision,
+                entry_path: "RUN.bn".to_owned(),
+                units: vec![boon_runtime::RuntimeSourceUnit {
+                    path: "RUN.bn".to_owned(),
+                    source: format!("value: {request_id}\n"),
+                }],
+                application: ApplicationIdentity::new(
+                    "dev.boon.preview-test",
+                    "arrival-order",
+                    "test",
+                ),
+                role: boon_plan::ProgramRole::Client,
+                capability_profile: boon_document_model::ProgramCapabilityProfile::PublicClient,
+            },
+            artifact_id: None,
+            artifact_ownership: None,
+        }
+    }
+
     fn plan() -> Arc<boon_plan::MachinePlan> {
         Arc::new(
             boon_compiler::compile_runtime_source_text_to_machine_plan_with_identity(
@@ -6158,5 +6186,19 @@ mod readiness_tests {
             Err(PreparedActivationPublishError::OwnerStale(_))
         ));
         assert_eq!(active.as_ref().unwrap().owner_stamp(), second_stamp);
+    }
+
+    #[test]
+    fn test_request_coalescing_is_last_arrival_wins_not_hash_or_revision_order() {
+        let mut latest = BTreeMap::new();
+        retain_latest_program_request(&mut latest, program_request("ff", 7));
+        retain_latest_program_request(&mut latest, program_request("00", 7));
+        retain_latest_program_request(&mut latest, program_request("lower-remount", 1));
+
+        let retained = latest
+            .get(&ProgramSessionId("arrival-order".to_owned()))
+            .unwrap();
+        assert_eq!(retained.request_id.0, "lower-remount");
+        assert_eq!(retained.compile.revision, 1);
     }
 }

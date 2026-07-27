@@ -13,7 +13,7 @@ pub use boon_runtime::{
 };
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 12;
+const VERSION: u16 = 13;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
@@ -71,6 +71,7 @@ pub struct ProgramSource {
 pub enum PreviewSource {
     BuiltInSingleRole {
         application: ApplicationIdentity,
+        entry_path: String,
         units: Vec<SourceUnit>,
     },
     DistributedPackage {
@@ -1502,9 +1503,14 @@ impl Encoder {
 
     fn preview_source(&mut self, source: &PreviewSource) -> Result<(), ProtocolError> {
         match source {
-            PreviewSource::BuiltInSingleRole { application, units } => {
+            PreviewSource::BuiltInSingleRole {
+                application,
+                entry_path,
+                units,
+            } => {
                 self.u8(1);
                 self.application_identity(application)?;
+                self.string(entry_path)?;
                 self.source_units(units)
             }
             PreviewSource::DistributedPackage { programs } => {
@@ -2147,6 +2153,7 @@ impl<'a> Decoder<'a> {
         match self.u8()? {
             1 => Ok(PreviewSource::BuiltInSingleRole {
                 application: self.application_identity()?,
+                entry_path: self.string()?,
                 units: self.source_units()?,
             }),
             2 => Ok(PreviewSource::DistributedPackage {
@@ -2971,6 +2978,7 @@ mod tests {
                     revision: 1,
                     source: PreviewSource::BuiltInSingleRole {
                         application: application(),
+                        entry_path: "RUN.bn".to_owned(),
                         units: units(),
                     },
                     test_steps: Vec::new(),

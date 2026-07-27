@@ -1,0 +1,3 @@
+-- The current compiler has no verified WHERE artifact yet. This paired
+-- no-WHERE source proves the existing source-to-ErasedProgram-to-runtime path.
+result: (20 + 1) * 2

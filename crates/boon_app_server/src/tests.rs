@@ -1,7 +1,7 @@
 use super::*;
 use boon_app_package::{
-    ArtifactDescriptor, BrowserManifest, CapabilityProfileDescriptor, EnvironmentVariableManifest,
-    HttpManifest, NamespaceProfile,
+    ArtifactDescriptor, BUNDLE_FORMAT, BrowserManifest, CapabilityProfileDescriptor,
+    EnvironmentVariableManifest, HttpManifest, NamespaceProfile, SourceBundleDigestV1,
 };
 use boon_plan::{ProgramRole, TargetProfile};
 use boon_runtime::ProgramCapabilityProfile;
@@ -18,11 +18,10 @@ fn server_descriptor(namespace: &str) -> ArtifactDescriptor {
         path: "artifacts/server.boon".to_owned(),
         revision: 1,
         content_artifact_id: digest(),
-        content_media_type: "application/vnd.boon.machine-plan+cbor;version=2".to_owned(),
+        content_media_type: "application/vnd.boon.machine-plan+cbor;version=3".to_owned(),
         bytes_sha256: digest(),
         bytes_len: 16,
-        source_bundle_sha256: digest(),
-        source_digest: digest(),
+        source_bundle_digest_v1: digest().parse::<SourceBundleDigestV1>().unwrap(),
         plan_digest: digest(),
         compiler_id: "boon-compiler/0.1.0".to_owned(),
         target_profile: TargetProfile::SoftwareBounded,
@@ -35,7 +34,7 @@ fn server_descriptor(namespace: &str) -> ArtifactDescriptor {
 
 fn manifest(environment: Vec<EnvironmentVariableManifest>) -> BundleManifest {
     BundleManifest {
-        format: 1,
+        format: BUNDLE_FORMAT,
         package_id: "dev.boon.fixture.server".to_owned(),
         package_version: "1.0.0".to_owned(),
         deployment_domain: "fixture.local".to_owned(),

@@ -1,0 +1,540 @@
+format_version = 3
+schema_status = "current-runtime-measured"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+baseline_source_head = "4a820727d339038826a9d589c207ef5f973dad83"
+baseline_scope = "current-worktree"
+current_runtime_report = "target/reports/phase0-v1/packed-baseline.json"
+fixture_manifest = "docs/architecture/phase0/packed_baseline_fixtures.toml"
+
+# Integer baselines below are the first complete Phase 0 current-runtime
+# measurements. Current limits are explicit regression ratchets; final limits
+# are the packed flag-day targets. Maxima and minima are never conflated, and
+# generated reports may improve without silently learning a new baseline.
+
+[protocol]
+name = "boon-phase0-current-runtime-v1"
+target_profile = "software_default"
+build_profile = "release"
+allocator_scope = "All Rust allocations in the single-threaded native producer process; intervals exclude compilation, warmup, JSON serialization, and report I/O unless named otherwise."
+allocator_instrumentation_status = "current-runtime-measured"
+warmup_status = "current-runtime-measured"
+measured_turn_interval_status = "current-runtime-measured"
+
+[[baselines]]
+id = "counter"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Use this legacy current-runtime result only as a comparison point; rerun the same fixture after packed semantics land."
+measured_report = "target/reports/phase0-v1/packed-baseline.json"
+
+[[baselines]]
+id = "todomvc"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Use the deterministic toggle-all result as the legacy dense comparison and rerun it on the final packed runtime."
+measured_report = "target/reports/phase0-v1/packed-baseline.json"
+
+[[baselines]]
+id = "cells"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Use the deterministic A0 edit as the legacy sparse comparison and rerun it on the final packed runtime."
+measured_report = "target/reports/phase0-v1/packed-baseline.json"
+
+[[baselines]]
+id = "fjordpulse-shaped"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Retain this synthetic indexed access as a non-product legacy comparison and rerun it after packed indexes land."
+measured_report = "target/reports/phase0-v1/packed-baseline.json"
+
+[[baselines]]
+id = "million-row"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Retain this deterministic legacy scale comparison and rerun its indexed and dense turns after packed storage lands."
+measured_report = "target/reports/phase0-v1/packed-baseline.json"
+
+[[metrics]]
+id = "allocation-count"
+unit = "allocations"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Replace process-global legacy allocation work with zero-allocation warm bounded turns."
+direction = "max"
+baseline_u64 = 52_089_871
+current_limit_u64 = 65_112_338
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "allocated-bytes"
+unit = "bytes"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Eliminate requested allocation and reallocation bytes in warm fixed-capacity turns."
+direction = "max"
+baseline_u64 = 60_880_187_446
+current_limit_u64 = 76_100_234_307
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "bytes-per-row"
+unit = "bytes-per-row"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Replace whole-runtime requested-live bytes with exact packed ownership within the final per-row ceiling."
+direction = "max"
+baseline_u64 = 20_562
+current_limit_u64 = 25_702
+target_limit_u64 = 256
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "bytes-per-store"
+unit = "bytes"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Replace the conservative whole-MachineInstance legacy-store upper bound with exact packed store-owned retained-byte accounting."
+direction = "max"
+baseline_u64 = 6_711_349_706
+current_limit_u64 = 8_389_187_132
+target_limit_u64 = 1_073_741_824
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "packed-bytes"
+unit = "bytes"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Emit bytes keyed by packed store kind and layout kind when physical stores land."
+direction = "max"
+target_limit_u64 = 1_073_741_824
+
+[[metrics]]
+id = "arena-live-bytes"
+unit = "bytes"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Land packed live arenas and expose deterministic live-byte high-water accounting."
+direction = "max"
+target_limit_u64 = 1_073_741_824
+
+[[metrics]]
+id = "arena-staged-bytes"
+unit = "bytes"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Land staged packed handles and expose staged-byte high-water accounting."
+direction = "max"
+target_limit_u64 = 134_217_728
+
+[[metrics]]
+id = "arena-leased-bytes"
+unit = "bytes"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Land generational leases and expose leased-byte high-water accounting."
+direction = "max"
+target_limit_u64 = 134_217_728
+
+[[metrics]]
+id = "arena-retired-bytes"
+unit = "bytes"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Land retirement/quiescence accounting and bound retired bytes."
+direction = "max"
+target_limit_u64 = 268_435_456
+
+[[metrics]]
+id = "recursive-boundary-materialization-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Eliminate the measured ordinary-turn recursive boundary materialization roots."
+direction = "max"
+baseline_u64 = 1_300
+current_limit_u64 = 1_625
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "boundary-materialization-bytes"
+unit = "bytes"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Bound the measured logical payload bytes exposed by evaluator and report boundary materializations."
+direction = "max"
+baseline_u64 = 12_227_416
+current_limit_u64 = 15_284_270
+target_limit_u64 = 12_227_416
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "recursive-clone-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Delete the measured recursive value-tree and whole-list clone roots in ordinary turns."
+direction = "max"
+baseline_u64 = 968
+current_limit_u64 = 1_210
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "whole-list-snapshot-clone-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Delete the measured full derived-list snapshot clones in ordinary turns."
+direction = "max"
+baseline_u64 = 8
+current_limit_u64 = 10
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "whole-list-snapshot-comparison-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Delete the measured full derived-list old/new comparisons in ordinary turns."
+direction = "max"
+baseline_u64 = 8
+current_limit_u64 = 10
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "runtime-string-lookup-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Eliminate the measured post-resolution string-key field lookups in ordinary turns."
+direction = "max"
+baseline_u64 = 128
+current_limit_u64 = 160
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "tree-container-lookup-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Eliminate the measured tree-backed lookup lower bound from cycle-hot paths; retain the exhaustive static ledger for total site ownership."
+direction = "max"
+baseline_u64 = 128
+current_limit_u64 = 160
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "dense-slot-read-count"
+unit = "items"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Instrument packed slot reads when dense stores land."
+direction = "max"
+target_limit_u64 = 100_000_000
+
+[[metrics]]
+id = "dense-slot-write-count"
+unit = "items"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Instrument packed slot writes when dense stores land."
+direction = "max"
+target_limit_u64 = 25_000_000
+
+[[metrics]]
+id = "dirty-population-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve sparse dirty populations and bound the all-row turn explicitly."
+direction = "max"
+baseline_u64 = 1_000_004
+current_limit_u64 = 1_250_005
+target_limit_u64 = 1_100_000
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "touched-population-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve the measured touched-set population while replacing currentness storage."
+direction = "max"
+baseline_u64 = 303
+current_limit_u64 = 378
+target_limit_u64 = 303
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "dependency-edge-visit-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve charged dependency fanout and improve dense adjacency traversal."
+direction = "max"
+baseline_u64 = 6_001_137
+current_limit_u64 = 7_501_421
+target_limit_u64 = 6_500_000
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "queue-high-water"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Bound the measured task, value, dirty-propagation, and mutation queue populations."
+direction = "max"
+baseline_u64 = 2_000_000
+current_limit_u64 = 2_500_000
+target_limit_u64 = 2_100_000
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "queue-capacity-growth-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Eliminate the measured queue capacity-growth events from warm fixed-capacity turns."
+direction = "max"
+baseline_u64 = 3_004_462
+current_limit_u64 = 3_755_577
+target_limit_u64 = 0
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "index-work"
+unit = "work-units"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Bound typed-list key and candidate work and preserve sparse seeks."
+direction = "max"
+baseline_u64 = 2_440
+current_limit_u64 = 3_050
+target_limit_u64 = 2_500
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "index-page-touch-count"
+unit = "items"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Instrument page touches when page-oriented indexes are selected."
+direction = "max"
+target_limit_u64 = 10_000
+
+[[metrics]]
+id = "index-segment-touch-count"
+unit = "items"
+status = "unavailable"
+owner = "packed-runtime"
+owner_action = "Instrument segment touches when packed-flat indexes are selected."
+direction = "max"
+target_limit_u64 = 10_000
+
+[[metrics]]
+id = "delta-item-count"
+unit = "items"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Bound the measured final coalesced public and authority delta items."
+direction = "max"
+baseline_u64 = 3_002_572
+current_limit_u64 = 3_753_215
+target_limit_u64 = 3_100_000
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "delta-byte-count"
+unit = "bytes"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Bound the measured deterministic logical bytes in final public and authority delta streams."
+direction = "max"
+baseline_u64 = 108_200_096
+current_limit_u64 = 135_250_120
+target_limit_u64 = 108_200_096
+allowed_regression_bps = 2_500
+
+[[metrics]]
+id = "elapsed-ingest-ns"
+unit = "nanoseconds"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve the measured source-event validation split while improving the runtime."
+direction = "max"
+baseline_u64 = 19_224
+current_limit_u64 = 28_836
+target_limit_u64 = 19_224
+allowed_regression_bps = 5_000
+
+[[metrics]]
+id = "elapsed-evaluate-ns"
+unit = "nanoseconds"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve and improve the measured evaluator/runtime phase split."
+direction = "max"
+baseline_u64 = 56_541_498_224
+current_limit_u64 = 84_812_247_336
+target_limit_u64 = 60_000_000_000
+allowed_regression_bps = 5_000
+
+[[metrics]]
+id = "elapsed-commit-ns"
+unit = "nanoseconds"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve the measured durable-change, sequence, and transient-effect commit split."
+direction = "max"
+baseline_u64 = 79_243
+current_limit_u64 = 118_864
+target_limit_u64 = 79_243
+allowed_regression_bps = 5_000
+
+[[metrics]]
+id = "elapsed-delta-ns"
+unit = "nanoseconds"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve and improve the measured final delta construction split."
+direction = "max"
+baseline_u64 = 884_932_839
+current_limit_u64 = 1_327_399_258
+target_limit_u64 = 884_932_839
+allowed_regression_bps = 5_000
+
+[[metrics]]
+id = "elapsed-boundary-ns"
+unit = "nanoseconds"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve and improve the measured public boundary read/materialization split."
+direction = "max"
+baseline_u64 = 14_499_157
+current_limit_u64 = 21_748_735
+target_limit_u64 = 14_499_157
+allowed_regression_bps = 5_000
+
+[[metrics]]
+id = "sparse-latency-p95"
+unit = "nanoseconds"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve interactive sparse p95 under the exact fixture protocol."
+direction = "max"
+baseline_u64 = 1_187_934
+current_limit_u64 = 1_781_901
+target_limit_u64 = 1_000_000
+allowed_regression_bps = 5_000
+
+[[metrics]]
+id = "sparse-throughput"
+unit = "turns-per-second-milli"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Preserve sparse turn throughput under the exact fixture protocol."
+direction = "min"
+baseline_u64 = 849_208
+current_limit_u64 = 424_604
+target_limit_u64 = 1_000_000
+allowed_regression_bps = 5_000
+
+[[metrics]]
+id = "dense-latency-p95"
+unit = "nanoseconds"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Bound the million-row all-row p95 under the exact fixture protocol."
+direction = "max"
+baseline_u64 = 6_979_895_897
+current_limit_u64 = 10_469_843_845
+target_limit_u64 = 2_000_000_000
+allowed_regression_bps = 5_000
+
+[[metrics]]
+id = "dense-throughput"
+unit = "rows-per-second-milli"
+status = "current-runtime-measured"
+owner = "packed-runtime"
+owner_action = "Raise dense sequential throughput while preserving semantic row accounting."
+direction = "min"
+baseline_u64 = 143_341_143
+current_limit_u64 = 71_670_572
+target_limit_u64 = 500_000_000
+allowed_regression_bps = 5_000
+
+[[action_ratchets]]
+fixture = "counter"
+action = "increment"
+throughput_metric = "turns-per-second"
+allocation_count = { unit = "allocations", direction = "max", baseline_u64 = 640, current_limit_u64 = 800, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+allocated_bytes = { unit = "bytes", direction = "max", baseline_u64 = 329_408, current_limit_u64 = 411_760, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+latency_p95 = { unit = "nanoseconds", direction = "max", baseline_u64 = 2_383, current_limit_u64 = 3_574, target_limit_u64 = 2_500, allowed_regression_bps = 5_000 }
+charged_work = { unit = "work-units", direction = "max", baseline_u64 = 256, current_limit_u64 = 320, target_limit_u64 = 256, allowed_regression_bps = 2_500 }
+index_work = { unit = "work-units", direction = "max", baseline_u64 = 0, current_limit_u64 = 0, target_limit_u64 = 0, allowed_regression_bps = 0 }
+throughput = { unit = "turns-per-second-milli", direction = "min", baseline_u64 = 397_088_842, current_limit_u64 = 198_544_421, target_limit_u64 = 500_000_000, allowed_regression_bps = 5_000 }
+
+[[action_ratchets]]
+fixture = "todomvc"
+action = "toggle-all"
+throughput_metric = "rows-per-second"
+allocation_count = { unit = "allocations", direction = "max", baseline_u64 = 800, current_limit_u64 = 1_000, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+allocated_bytes = { unit = "bytes", direction = "max", baseline_u64 = 354_752, current_limit_u64 = 443_440, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+latency_p95 = { unit = "nanoseconds", direction = "max", baseline_u64 = 4_707, current_limit_u64 = 7_060, target_limit_u64 = 6_000, allowed_regression_bps = 5_000 }
+charged_work = { unit = "work-units", direction = "max", baseline_u64 = 384, current_limit_u64 = 480, target_limit_u64 = 384, allowed_regression_bps = 2_500 }
+index_work = { unit = "work-units", direction = "max", baseline_u64 = 0, current_limit_u64 = 0, target_limit_u64 = 0, allowed_regression_bps = 0 }
+throughput = { unit = "rows-per-second-milli", direction = "min", baseline_u64 = 841_485_221, current_limit_u64 = 420_742_611, target_limit_u64 = 1_000_000_000, allowed_regression_bps = 5_000 }
+
+[[action_ratchets]]
+fixture = "cells"
+action = "edit-a0"
+throughput_metric = "rows-per-second"
+allocation_count = { unit = "allocations", direction = "max", baseline_u64 = 106_000, current_limit_u64 = 132_500, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+allocated_bytes = { unit = "bytes", direction = "max", baseline_u64 = 33_965_740, current_limit_u64 = 42_457_175, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+latency_p95 = { unit = "nanoseconds", direction = "max", baseline_u64 = 1_187_934, current_limit_u64 = 1_781_901, target_limit_u64 = 1_000_000, allowed_regression_bps = 5_000 }
+charged_work = { unit = "work-units", direction = "max", baseline_u64 = 208_180, current_limit_u64 = 260_225, target_limit_u64 = 100_000, allowed_regression_bps = 2_500 }
+index_work = { unit = "work-units", direction = "max", baseline_u64 = 0, current_limit_u64 = 0, target_limit_u64 = 0, allowed_regression_bps = 0 }
+throughput = { unit = "rows-per-second-milli", direction = "min", baseline_u64 = 849_208, current_limit_u64 = 424_604, target_limit_u64 = 1_000_000, allowed_regression_bps = 5_000 }
+
+[[action_ratchets]]
+fixture = "fjordpulse-shaped"
+action = "indexed-page"
+throughput_metric = "turns-per-second"
+allocation_count = { unit = "allocations", direction = "max", baseline_u64 = 126_675, current_limit_u64 = 158_343, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+allocated_bytes = { unit = "bytes", direction = "max", baseline_u64 = 15_313_626, current_limit_u64 = 19_142_032, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+latency_p95 = { unit = "nanoseconds", direction = "max", baseline_u64 = 837_507, current_limit_u64 = 1_256_260, target_limit_u64 = 750_000, allowed_regression_bps = 5_000 }
+charged_work = { unit = "work-units", direction = "max", baseline_u64 = 6_280, current_limit_u64 = 7_850, target_limit_u64 = 5_000, allowed_regression_bps = 2_500 }
+index_work = { unit = "work-units", direction = "max", baseline_u64 = 840, current_limit_u64 = 1_050, target_limit_u64 = 840, allowed_regression_bps = 2_500 }
+throughput = { unit = "turns-per-second-milli", direction = "min", baseline_u64 = 1_297_953, current_limit_u64 = 648_977, target_limit_u64 = 2_000_000, allowed_regression_bps = 5_000 }
+
+[[action_ratchets]]
+fixture = "million-row"
+action = "indexed-tail"
+throughput_metric = "turns-per-second"
+allocation_count = { unit = "allocations", direction = "max", baseline_u64 = 65_444, current_limit_u64 = 81_805, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+allocated_bytes = { unit = "bytes", direction = "max", baseline_u64 = 41_967_164_339, current_limit_u64 = 52_458_955_423, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+latency_p95 = { unit = "nanoseconds", direction = "max", baseline_u64 = 7_481_072_731, current_limit_u64 = 11_221_609_096, target_limit_u64 = 2_000_000_000, allowed_regression_bps = 5_000 }
+charged_work = { unit = "work-units", direction = "max", baseline_u64 = 6_110, current_limit_u64 = 7_637, target_limit_u64 = 5_000, allowed_regression_bps = 2_500 }
+index_work = { unit = "work-units", direction = "max", baseline_u64 = 1_000, current_limit_u64 = 1_250, target_limit_u64 = 1_000, allowed_regression_bps = 2_500 }
+throughput = { unit = "turns-per-second-milli", direction = "min", baseline_u64 = 136, current_limit_u64 = 68, target_limit_u64 = 1_000, allowed_regression_bps = 5_000 }
+
+[[action_ratchets]]
+fixture = "million-row"
+action = "toggle-all-rows"
+throughput_metric = "rows-per-second"
+allocation_count = { unit = "allocations", direction = "max", baseline_u64 = 51_790_312, current_limit_u64 = 64_737_890, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+allocated_bytes = { unit = "bytes", direction = "max", baseline_u64 = 18_863_059_581, current_limit_u64 = 23_578_824_476, target_limit_u64 = 0, allowed_regression_bps = 2_500 }
+latency_p95 = { unit = "nanoseconds", direction = "max", baseline_u64 = 6_979_895_897, current_limit_u64 = 10_469_843_845, target_limit_u64 = 2_000_000_000, allowed_regression_bps = 5_000 }
+charged_work = { unit = "work-units", direction = "max", baseline_u64 = 24_002_457, current_limit_u64 = 30_003_071, target_limit_u64 = 10_000_000, allowed_regression_bps = 2_500 }
+index_work = { unit = "work-units", direction = "max", baseline_u64 = 600, current_limit_u64 = 750, target_limit_u64 = 600, allowed_regression_bps = 2_500 }
+throughput = { unit = "rows-per-second-milli", direction = "min", baseline_u64 = 143_341_143, current_limit_u64 = 71_670_572, target_limit_u64 = 500_000_000, allowed_regression_bps = 5_000 }

@@ -1415,7 +1415,7 @@ fn synthesize_statement_owned_states(
         }
         if let Some(existing) = expressions.iter().find(|expression| {
             expression.owner == owner
-                && resource_declaration(program, &lookup, expression.checked_expr_id)
+                && resource_declaration(program, lookup, expression.checked_expr_id)
                     == Some(declaration)
                 && (matches!(expression.kind, ConcreteExpressionKind::Hold { .. })
                     || matches!(

@@ -1,8 +1,26 @@
 # PASS/PASSED And TodoMVC UI Model
 
-This document is the implementation contract for the classic TodoMVC cleanup.
-It separates language context passing, classic document UI APIs, physical scene
-APIs, and native renderer internals.
+> **Phase 0 status: rewrite required.**
+>
+> **Current executable behavior:** the repository currently parses,
+> typechecks, contextually expands, and executes a substantial `PASS`/`PASSED`
+> slice; checked-in code and executable tests define its exact present boundary.
+>
+> **Historical/stale content:** the broader TodoMVC cleanup narrative and any
+> prior observations below do not prove the final verified artifact spine.
+>
+> **Target-only content:** complete final-position `PASS`, semantic
+> verification, post-verification erasure, and the unified classic/physical UI
+> boundary remain Phase 1 target behavior wherever tests do not yet prove them.
+>
+> **Flag-day owner:** unified goal Phase 1 rewrites this document when the
+> `ParsedProgram -> CheckedProgram -> SemanticProgram ->
+> ContractVerifiedProgram -> ErasedProgram` replacement lands.
+
+This document records the earlier classic TodoMVC cleanup contract. It separates
+language context passing, classic document UI APIs, physical scene APIs, and
+native renderer internals, but it is not the final Phase 1 implementation
+contract.
 
 ## Why PASS/PASSED Exists
 

@@ -1,0 +1,13 @@
+rows: LIST {
+    [value: 1]
+    [value: 2]
+    [value: 3]
+}
+
+result:
+    rows
+    |> List/map(
+        item
+        new: item.value * 2
+    )
+    |> List/sum()

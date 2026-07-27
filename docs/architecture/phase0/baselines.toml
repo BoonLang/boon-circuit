@@ -1,0 +1,392 @@
+format_version = 2
+baseline_source_head = "4a820727d339038826a9d589c207ef5f973dad83"
+baseline_scope = "current-runtime-before-goal-flag-days"
+packed_report = "target/reports/phase0-v1/packed-baseline.json"
+packed_protocol = "boon-phase0-current-runtime-v1"
+
+# Exact report-backed values live only in the generated report. Duplicating its
+# workspace digest or volatile measurements here would make clean report
+# identity self-referential. Stable test-owned values remain inline below.
+
+[compiler]
+source_head = "4a820727d339038826a9d589c207ef5f973dad83"
+workspace_state = "clean"
+command = "cargo test -p boon_parser -p boon_typecheck -p boon_ir -p boon_compiler --lib"
+status = "pass"
+total_passed = 405
+
+[[compiler.crates]]
+name = "boon_parser"
+passed = 24
+
+[[compiler.crates]]
+name = "boon_typecheck"
+passed = 131
+
+[[compiler.crates]]
+name = "boon_ir"
+passed = 103
+
+[[compiler.crates]]
+name = "boon_compiler"
+passed = 147
+
+[[historical_reports]]
+id = "architecture"
+path = "target/reports/report-v2/architecture.json"
+status = "stale"
+source_head = "4bb1b16e7ce0f822cb566def590e098fb91bcbdd"
+workspace_digest = "08c437e93206f5b95233d52e3e33ab6cab72a4989e4d14bfcf868677f09c54b2"
+dirty = true
+
+[[historical_reports]]
+id = "cells"
+path = "target/reports/report-v2/cells.json"
+status = "stale"
+source_head = "4bb1b16e7ce0f822cb566def590e098fb91bcbdd"
+workspace_digest = "08c437e93206f5b95233d52e3e33ab6cab72a4989e4d14bfcf868677f09c54b2"
+dirty = true
+
+[[historical_reports]]
+id = "counter-dev"
+path = "target/reports/report-v2/counter-dev.json"
+status = "stale"
+source_head = "4bb1b16e7ce0f822cb566def590e098fb91bcbdd"
+workspace_digest = "08c437e93206f5b95233d52e3e33ab6cab72a4989e4d14bfcf868677f09c54b2"
+dirty = true
+
+[[historical_reports]]
+id = "negative"
+path = "target/reports/report-v2/negative.json"
+status = "stale"
+source_head = "4bb1b16e7ce0f822cb566def590e098fb91bcbdd"
+workspace_digest = "08c437e93206f5b95233d52e3e33ab6cab72a4989e4d14bfcf868677f09c54b2"
+dirty = true
+
+[[historical_reports]]
+id = "novywave"
+path = "target/reports/report-v2/novywave.json"
+status = "stale"
+source_head = "7349bfb8f8fcdb805f11eb655a2d960d6a424fc2"
+workspace_digest = "26e560d7266606bdff841b06db8e37dac9cabe96cbbf6765d744a94f7c2dbfea"
+dirty = true
+
+[[historical_reports]]
+id = "persons-pro"
+path = "target/reports/report-v2/persons-pro.json"
+status = "stale"
+source_head = "4bb1b16e7ce0f822cb566def590e098fb91bcbdd"
+workspace_digest = "08c437e93206f5b95233d52e3e33ab6cab72a4989e4d14bfcf868677f09c54b2"
+dirty = true
+
+[[historical_reports]]
+id = "todomvc-physical"
+path = "target/reports/report-v2/todomvc-physical.json"
+status = "stale"
+source_head = "4bb1b16e7ce0f822cb566def590e098fb91bcbdd"
+workspace_digest = "08c437e93206f5b95233d52e3e33ab6cab72a4989e4d14bfcf868677f09c54b2"
+dirty = true
+
+[[historical_reports]]
+id = "verify-all"
+path = "target/reports/report-v2/verify-all.json"
+status = "stale"
+source_head = "7349bfb8f8fcdb805f11eb655a2d960d6a424fc2"
+workspace_digest = "a1493b4bc22cccf5c4a4971d4dd8f14dfae57db242a0e04c203550a639a4ea90"
+dirty = false
+
+[[areas]]
+id = "allocations"
+status = "measured"
+scope = "current-runtime"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+command = "cargo xtask verify-packed-baseline --check-existing"
+claim = "Process-global Rust allocator events are measured for declared warmup-excluded release intervals; this is not packed allocator ownership."
+
+[[areas.evidence]]
+id = "declared-action-allocation-count"
+status = "measured"
+metric = "allocation-count"
+unit = "allocations"
+source = "target/reports/phase0-v1/packed-baseline.json#metrics.allocation-count"
+detail = "Sum across the declared Counter, TodoMVC, Cells, FjordPulse-shaped, and million-row measured actions."
+
+[[areas.evidence]]
+id = "declared-action-allocated-bytes"
+status = "measured"
+metric = "allocated-bytes"
+unit = "bytes"
+source = "target/reports/phase0-v1/packed-baseline.json#metrics.allocated-bytes"
+detail = "Requested allocation plus reallocation bytes across the exact warmup-excluded action intervals."
+
+[[areas.evidence]]
+id = "allocator-scope"
+status = "measured"
+metric = "allocator-scope"
+value_text = "All Rust allocations in the single-threaded native producer process"
+unit = "text"
+source = "docs/architecture/phase0/packed_baseline_fixtures.toml#allocator_scope"
+detail = "Compilation, warmup, JSON serialization, and report I/O are excluded unless explicitly named."
+
+[[areas]]
+id = "memory"
+status = "partial"
+scope = "current-runtime"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+command = "cargo xtask verify-packed-baseline --check-existing"
+claim = "Whole-runtime requested-live deltas, a conservative legacy per-store upper bound, and logical index payloads are measured; exact packed store/layout and arena ownership remain unavailable."
+
+[[areas.evidence]]
+id = "counter-retained-requested-bytes"
+status = "measured"
+metric = "retained-runtime-requested-bytes"
+unit = "bytes"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.counter.metrics.retained-runtime-requested-bytes"
+detail = "Whole MachineInstance requested-live delta above the retained plan."
+
+[[areas.evidence]]
+id = "todomvc-retained-requested-bytes"
+status = "measured"
+metric = "retained-runtime-requested-bytes"
+unit = "bytes"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.todomvc.metrics.retained-runtime-requested-bytes"
+detail = "Whole MachineInstance requested-live delta above the retained plan."
+
+[[areas.evidence]]
+id = "cells-retained-requested-bytes"
+status = "measured"
+metric = "retained-runtime-requested-bytes"
+unit = "bytes"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.cells.metrics.retained-runtime-requested-bytes"
+detail = "Whole MachineInstance requested-live delta above the retained plan."
+
+[[areas.evidence]]
+id = "fjordpulse-shaped-retained-requested-bytes"
+status = "measured"
+metric = "retained-runtime-requested-bytes"
+unit = "bytes"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.fjordpulse-shaped.metrics.retained-runtime-requested-bytes"
+detail = "Whole MachineInstance requested-live delta above the retained plan."
+
+[[areas.evidence]]
+id = "million-row-retained-requested-bytes"
+status = "measured"
+metric = "retained-runtime-requested-bytes"
+unit = "bytes"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.million-row.metrics.retained-runtime-requested-bytes"
+detail = "Whole MachineInstance requested-live delta above the retained plan."
+
+[[areas.evidence]]
+id = "maximum-current-bytes-per-row"
+status = "measured"
+metric = "bytes-per-row"
+unit = "bytes-per-row"
+source = "target/reports/phase0-v1/packed-baseline.json#metrics.bytes-per-row"
+detail = "Maximum whole-runtime requested-live delta per authoritative row; not a packed-store claim."
+
+[[areas.evidence]]
+id = "legacy-store-retained-upper-bound"
+status = "measured"
+metric = "bytes-per-store"
+unit = "bytes"
+source = "target/reports/phase0-v1/packed-baseline.json#metrics.bytes-per-store"
+detail = "Maximum whole-MachineInstance requested-live delta is a conservative upper bound for any one legacy store; it does not claim exact store allocation ownership."
+
+[[areas.evidence]]
+id = "packed-store-and-arena-owned-bytes"
+status = "unavailable"
+metric = "packed-bytes-by-store-layout-and-arena"
+unit = "bytes"
+source = "target/reports/phase0-v1/packed-baseline.json#metrics"
+detail = "The current tree-backed runtime has no final packed store/layout ownership and no live, staged, leased, or retired packed arenas."
+required_change = "Land packed arena/store ownership and deterministic byte accounting in Phase 5."
+
+[[areas]]
+id = "lookup-currentness-work"
+status = "measured"
+scope = "current-runtime"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+command = "cargo xtask verify-packed-baseline --check-existing && cargo test -p boon_phase0_baseline fixture_stale_routing_rejects_old_revision --lib"
+claim = "Typed access work, full-scan absence, sparse dirty work, and revision-current route rejection are executable current-runtime baselines."
+
+[[areas.evidence]]
+id = "aggregate-index-work"
+status = "measured"
+metric = "index-work"
+unit = "work-units"
+source = "target/reports/phase0-v1/packed-baseline.json#metrics.index-work"
+detail = "Typed-list keys plus candidates visited across declared actions."
+
+[[areas.evidence]]
+id = "fjordpulse-shaped-full-scans"
+status = "measured"
+metric = "access-full-scan-count"
+unit = "work-units"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.fjordpulse-shaped.actions.indexed-page.work-total.access-full-scan-count"
+detail = "Twenty measured indexed page turns performed no full scan."
+
+[[areas.evidence]]
+id = "million-row-full-scans"
+status = "measured"
+metric = "access-full-scan-count"
+unit = "work-units"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.million-row.actions.indexed-tail.work-total.access-full-scan-count"
+detail = "Five measured million-row tail seeks performed no full scan."
+
+[[areas.evidence]]
+id = "cells-sparse-charged-work"
+status = "measured"
+metric = "charged-work"
+unit = "work-units"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.cells.actions.edit-a0.metrics.charged-work"
+detail = "Twenty sparse cell edits, one semantic row per turn."
+
+[[areas.evidence]]
+id = "revision-stale-route"
+status = "measured"
+metric = "stale-route-rejections"
+value_u64 = 1
+unit = "events"
+source = "boon_phase0_baseline::fixtures::stale_route_is_rejected_before_current_route_executes"
+detail = "A revision-1 route is rejected before one revision-2 event executes."
+
+[[areas]]
+id = "native-wasm"
+status = "partial"
+scope = "current-runtime"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
+command = "cargo xtask verify-packed-baseline --check-existing && cargo check -p boon_plan_executor --target wasm32-unknown-unknown"
+claim = "Native headless runtime behavior and Wasm compilation are current; browser execution and native product handoff remain unavailable/stale."
+
+[[areas.evidence]]
+id = "native-headless-actions"
+status = "measured"
+metric = "fixture-action-groups"
+unit = "fixtures"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.*.target-facts.native-headless"
+detail = "Release MachineInstance startup and every declared deterministic action completed for all five packed fixtures."
+
+[[areas.evidence]]
+id = "wasm-build"
+status = "measured"
+metric = "wasm32-unknown-unknown-check"
+value_u64 = 1
+unit = "builds"
+source = "cargo check -p boon_plan_executor --target wasm32-unknown-unknown"
+detail = "The shared executor compiles for Wasm; this is build evidence, not browser runtime parity."
+
+[[areas.evidence]]
+id = "wasm-browser-runtime"
+status = "unavailable"
+metric = "browser-runtime-actions"
+unit = "actions"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.*.target-facts.wasm-browser"
+detail = "The Phase 0 producer has no browser allocator or browser report transport."
+required_change = "Run final native/Wasm parity and browser behavior evidence after semantic and packed cuts."
+
+[[areas.evidence]]
+id = "native-product-handoff"
+status = "stale"
+metric = "native-product-reports"
+unit = "reports"
+source = "target/reports/report-v2"
+detail = "Existing app-owned native reports predate the Phase 0 source/dataset changes and cannot prove the final revision."
+
+[[areas]]
+id = "product-latency"
+status = "partial"
+scope = "current-runtime-headless"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/GOAL_PROMPT.md"
+command = "cargo xtask verify-packed-baseline --check-existing"
+claim = "Deterministic headless action latency is measured where the packed producer covers a product shape; final product UX latency is not inferred from it."
+
+[[areas.evidence]]
+id = "cells-sparse-p95"
+status = "measured"
+metric = "latency-p95"
+unit = "nanoseconds"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.cells.actions.edit-a0.latency.p95-ns"
+detail = "Twenty measured sparse Cells edits after four warmup turns."
+
+[[areas.evidence]]
+id = "fjordpulse-shaped-page-p95"
+status = "measured"
+metric = "latency-p95"
+unit = "nanoseconds"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.fjordpulse-shaped.actions.indexed-page.latency.p95-ns"
+detail = "Twenty measured indexed pages on 58,500 rows after four warmup turns."
+
+[[areas.evidence]]
+id = "todomvc-dense-p95"
+status = "measured"
+metric = "latency-p95"
+unit = "nanoseconds"
+source = "target/reports/phase0-v1/packed-baseline.json#fixtures.todomvc.actions.toggle-all.latency.p95-ns"
+detail = "Thirty-two measured four-row dense turns after eight warmup turns."
+
+[[areas.evidence]]
+id = "novywave-final-product-latency"
+status = "unavailable"
+metric = "product-latency-p95"
+unit = "nanoseconds"
+source = "target/reports/report-v2/novywave.json"
+detail = "The existing NovyWave report is stale and no current Phase 0 headless producer covers its full effect/render path."
+required_change = "Run the final NovyWave product gate on one unchanged post-packed revision."
+
+[[areas.evidence]]
+id = "native-visible-product-latency"
+status = "stale"
+metric = "product-ux-p95"
+unit = "microseconds"
+source = "target/reports/report-v2"
+detail = "Prior visible native product timings are preserved only as stale historical evidence; Phase 0 does not rerun handoff reports."
+
+[[areas]]
+id = "persistence"
+status = "partial"
+scope = "current-runtime-correctness"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md"
+command = "cargo test -p boon_persistence row_field_checkpoints_remain_sparse_and_can_coalesce_per_list --lib && cargo test -p boon_persistence restore_image_round_trips_canonical_cbor --lib && cargo test -p boon_persistence whole_list_migration_preserves_identity_order_allocator_and_sparse_fields --lib && cargo test -p boon_runtime cells_restart_restores_one_sparse_edit_without_materializing_the_grid --lib"
+claim = "Canonical DTO roundtrip, sparse checkpoints, migration, and sparse Cells restart are executable; persistence latency and encoded-byte metrics are not currently emitted."
+
+[[areas.evidence]]
+id = "canonical-restore-roundtrip"
+status = "measured"
+metric = "canonical-roundtrips"
+value_u64 = 1
+unit = "fixtures"
+source = "boon_persistence::codec::tests::restore_image_round_trips_canonical_cbor"
+detail = "The canonical RestoreImage re-encodes to byte-identical CBOR."
+
+[[areas.evidence]]
+id = "sparse-cells-stored-rows"
+status = "measured"
+metric = "stored-row-overrides"
+value_u64 = 1
+unit = "rows"
+source = "boon_runtime::persistent::tests::cells_restart_restores_one_sparse_edit_without_materializing_the_grid"
+detail = "One A3 edit stores one row override, restores at least 2,600 logical cells, at most 32 sheet rows, and at most 512 document items."
+
+[[areas.evidence]]
+id = "whole-list-migration"
+status = "measured"
+metric = "migration-fixtures"
+value_u64 = 1
+unit = "fixtures"
+source = "boon_persistence::migration::tests::whole_list_migration_preserves_identity_order_allocator_and_sparse_fields"
+detail = "Whole-list migration preserves row identity, order, allocator state, and sparse fields."
+
+[[areas.evidence]]
+id = "persistence-costs"
+status = "unavailable"
+metric = "checkpoint-restore-migration-latency-and-stored-bytes"
+unit = "mixed"
+source = "docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md"
+detail = "Current focused correctness tests do not emit canonical encode_us, checkpoint_ms, restore_ms, migration_ms, or stored_bytes evidence."
+required_change = "Add a bounded persistence cost producer before setting final persistence budgets."

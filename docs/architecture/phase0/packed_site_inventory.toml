@@ -1,0 +1,135 @@
+format_version = 1
+baseline_source_head = "4a820727d339038826a9d589c207ef5f973dad83"
+baseline_scope = "current-worktree"
+scan_roots = [
+  "crates/boon_compiler",
+  "crates/boon_data",
+  "crates/boon_document_model",
+  "crates/boon_ir",
+  "crates/boon_list_access",
+  "crates/boon_persistence",
+  "crates/boon_plan",
+  "crates/boon_plan_executor",
+  "crates/boon_runtime",
+  "crates/boon_typecheck",
+  "crates/boon_wire",
+]
+runtime_roots = [
+  "crates/boon_list_access",
+  "crates/boon_plan_executor",
+  "crates/boon_runtime",
+]
+hot_roots = [
+  "crates/boon_list_access/src",
+  "crates/boon_plan_executor/src",
+  "crates/boon_runtime/src",
+]
+boundary_roots = [
+  "crates/boon_data",
+  "crates/boon_document_model",
+  "crates/boon_persistence",
+  "crates/boon_wire",
+]
+boundary_file_suffixes = [
+  "/persistent.rs",
+  "/web_persistent.rs",
+  "/distributed/message.rs",
+  "/content_ref.rs",
+]
+boundary_context_needles = [
+  "archive",
+  "boundary",
+  "decode",
+  "encode",
+  "export",
+  "import",
+  "migration",
+  "persist",
+  "restore",
+  "serialize",
+  "snapshot",
+  "wire",
+]
+test_attributes = [
+  "#[cfg(test)]",
+  "#[test]",
+  "#[tokio::test]",
+  "#[wasm_bindgen_test]",
+]
+extension = "rs"
+lexical_scope = "rust-code-excluding-comments-and-literals"
+workspace_file_policy = "git-cached-and-untracked-nonignored"
+candidate_policy = "deterministic-conservative-syntactic-sites"
+execution_class_policy = "test-scopes-cold-boundary-roots-or-context-boundary-runtime-roots-hot-otherwise-cold"
+occurrence_ledger_path = "docs/architecture/phase0/packed_site_occurrences.tsv"
+occurrence_ledger_protocol = "boon-phase0-packed-site-occurrences-v1"
+occurrence_ledger_generator = "cargo run -p xtask --example packed_site_inventory -- --generate"
+occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventory -- --check"
+
+# Updated only after reviewing a deterministic generator run.
+expected_probe_set_sha256 = "54f1c6ca0c9e9c0994bdb66f1a7829d6df3142afa3297b93d48290f8a856479c"
+expected_file_set_sha256 = "fb4da916cc842d9e27df752823304dfab765821df5e8e60203f8fc74317c3531"
+expected_scanned_files = 75
+expected_occurrence_files = 66
+expected_occurrence_ledger_sha256 = "6ab1bff7612c58004b03b749d0d13a116c8e7d44181d71b058e59698ad4494d4"
+expected_occurrence_rows = 19180
+
+[[categories]]
+order = 0
+id = "recursive-value-carrier"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+expected_rows = 862
+expected_hot = 532
+expected_cold = 269
+expected_boundary = 61
+
+[[categories]]
+order = 1
+id = "runtime-string-lookup"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+expected_rows = 122
+expected_hot = 83
+expected_cold = 31
+expected_boundary = 8
+
+[[categories]]
+order = 2
+id = "recursive-clone"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+expected_rows = 1415
+expected_hot = 930
+expected_cold = 377
+expected_boundary = 108
+
+[[categories]]
+order = 3
+id = "allocation-or-growth"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+expected_rows = 14470
+expected_hot = 3347
+expected_cold = 9984
+expected_boundary = 1139
+
+[[categories]]
+order = 4
+id = "whole-snapshot-or-comparison"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+expected_rows = 431
+expected_hot = 108
+expected_cold = 254
+expected_boundary = 69
+
+[[categories]]
+order = 5
+id = "boundary-or-runtime-materialization"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+expected_rows = 1880
+expected_hot = 411
+expected_cold = 1355
+expected_boundary = 114

@@ -467,7 +467,9 @@ fn manifest_has_dependency(value: &toml::Value, dependency: &str) -> bool {
 fn single_execution_path(workspace: &Path) -> Result<String, String> {
     let files = workspace_files(workspace)?;
     let mut machine_plan_definitions = Vec::new();
-    let mut duplicate_runtime_types = Vec::new();
+    let mut machine_instance_definitions = Vec::new();
+    let mut machine_template_definitions = Vec::new();
+    let mut forbidden_runtime_types = Vec::new();
     for relative in &files {
         if !relative.starts_with("crates/")
             || relative.starts_with("crates/xtask/")
@@ -485,30 +487,40 @@ fn single_execution_path(workspace: &Path) -> Result<String, String> {
         for _ in text.match_indices("pub struct MachinePlan") {
             machine_plan_definitions.push(relative.clone());
         }
-        if !relative.starts_with("crates/boon_plan_executor/")
-            && [
-                "struct PlanExecutorLiveSession",
-                "struct PlanExecutorRuntimeState",
-                "struct PlanExecutorOutputEvaluator",
-            ]
-            .iter()
-            .any(|marker| text.contains(marker))
-        {
-            duplicate_runtime_types.push(relative.clone());
+        for _ in text.match_indices("struct MachineInstance") {
+            machine_instance_definitions.push(relative.clone());
+        }
+        for _ in text.match_indices("struct MachineTemplate") {
+            machine_template_definitions.push(relative.clone());
+        }
+        for marker in [
+            "struct PlanExecutorLiveSession",
+            "struct PlanExecutorRuntimeState",
+            "struct PlanExecutorOutputEvaluator",
+            "struct PackedExecutor",
+            "struct ReferenceExecutor",
+        ] {
+            for _ in text.match_indices(marker) {
+                forbidden_runtime_types.push(format!("{relative}:{marker}"));
+            }
         }
     }
     let executor_source = read_text(&workspace.join("crates/boon_plan_executor/src/lib.rs"))?;
     let executor_machine = read_text(&workspace.join("crates/boon_plan_executor/src/machine.rs"))?;
     let runtime_source = read_text(&workspace.join("crates/boon_runtime/src/lib.rs"))?;
-    let machine_owned_by_executor = executor_source.contains("MachineInstance")
+    let expected_executor_machine = vec!["crates/boon_plan_executor/src/machine.rs".to_owned()];
+    let machine_owned_by_executor = machine_instance_definitions == expected_executor_machine
+        && machine_template_definitions == expected_executor_machine
+        && executor_source.contains("MachineInstance")
         && executor_source.contains("MachineTemplate")
-        && executor_machine.contains("pub struct MachineInstance")
-        && executor_machine.contains("pub struct MachineTemplate");
+        && executor_machine.contains("struct MachineInstance")
+        && executor_machine.contains("struct MachineTemplate");
     let runtime_uses_machine = runtime_source.contains("boon_plan_executor::MachineInstance")
         || (runtime_source.contains("use boon_plan_executor")
             && runtime_source.contains("MachineInstance"));
 
     let mut direct_executor_dependents = Vec::new();
+    let mut instrumentation_dependents = Vec::new();
     for entry in fs::read_dir(workspace.join("crates")).map_err(|error| error.to_string())? {
         let manifest_path = entry
             .map_err(|error| error.to_string())?
@@ -524,30 +536,44 @@ fn single_execution_path(workspace: &Path) -> Result<String, String> {
             .and_then(|package| package.get("name"))
             .and_then(toml::Value::as_str)
             .unwrap_or("<unknown>");
-        if package != "boon_plan_executor"
-            && manifest
-                .get("dependencies")
-                .and_then(toml::Value::as_table)
-                .is_some_and(|dependencies| dependencies.contains_key("boon_plan_executor"))
-        {
-            direct_executor_dependents.push(package.to_owned());
+        let executor_dependency = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .and_then(|dependencies| dependencies.get("boon_plan_executor"));
+        if package != "boon_plan_executor" && executor_dependency.is_some() {
+            let optional_instrumentation = package == "boon_phase0_baseline"
+                && executor_dependency
+                    .and_then(toml::Value::as_table)
+                    .and_then(|dependency| dependency.get("optional"))
+                    .and_then(toml::Value::as_bool)
+                    == Some(true);
+            if optional_instrumentation {
+                instrumentation_dependents.push(package.to_owned());
+            } else {
+                direct_executor_dependents.push(package.to_owned());
+            }
         }
     }
     direct_executor_dependents.sort();
+    instrumentation_dependents.sort();
 
     let valid = machine_plan_definitions == vec!["crates/boon_plan/src/lib.rs".to_owned()]
-        && duplicate_runtime_types.is_empty()
+        && forbidden_runtime_types.is_empty()
         && machine_owned_by_executor
         && runtime_uses_machine
-        && direct_executor_dependents == vec!["boon_runtime".to_owned()];
+        && direct_executor_dependents == vec!["boon_runtime".to_owned()]
+        && instrumentation_dependents == vec!["boon_phase0_baseline".to_owned()];
     if valid {
-        Ok("one MachinePlan definition and one boon_plan_executor MachineTemplate/MachineInstance path".to_owned())
+        Ok("one MachinePlan definition and one boon_plan_executor MachineTemplate/MachineInstance path; the only non-runtime dependent is the optional Phase 0 instrumentation producer".to_owned())
     } else {
         Err(format!(
-            "MachinePlan defs={}; duplicate runtime executors={}; executor machine={machine_owned_by_executor}; runtime uses machine={runtime_uses_machine}; direct dependents={}",
+            "MachinePlan defs={}; MachineInstance defs={}; MachineTemplate defs={}; forbidden runtime executors={}; executor machine={machine_owned_by_executor}; runtime uses machine={runtime_uses_machine}; direct dependents={}; optional instrumentation dependents={}",
             bounded_list(&machine_plan_definitions),
-            bounded_list(&duplicate_runtime_types),
-            bounded_list(&direct_executor_dependents)
+            bounded_list(&machine_instance_definitions),
+            bounded_list(&machine_template_definitions),
+            bounded_list(&forbidden_runtime_types),
+            bounded_list(&direct_executor_dependents),
+            bounded_list(&instrumentation_dependents)
         ))
     }
 }

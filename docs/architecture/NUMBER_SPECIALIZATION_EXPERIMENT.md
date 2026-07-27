@@ -1,6 +1,24 @@
 # Number Specialization Experiment
 
-Status: rejected and removed on 2026-07-22.
+> **Phase 0 status: delete after replacement.**
+>
+> **Current executable behavior:** the rejected hidden-integer specialization
+> code is absent, while the current runtime still uses the legacy finite
+> binary64 `NUMBER` model.
+>
+> **Historical/stale content:** the measurements below apply only to that
+> binary64 representation and cannot justify or benchmark the target exact
+> arithmetic implementation.
+>
+> **Target-only content:** exact `NUMBER` and any replacement specialization
+> benchmark remain future Phase 2 work.
+>
+> **Flag-day owner:** unified goal Phase 2 carries any useful method into a new
+> exact-`NUMBER` benchmark and deletes this contradictory historical file after
+> the exact arithmetic replacement lands.
+
+Status: specialization code rejected and removed on 2026-07-22; this document
+remains temporarily as explicitly stale Phase 0 evidence.
 
 ## Decision Gate
 

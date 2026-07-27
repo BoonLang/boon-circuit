@@ -1,8 +1,12 @@
 mod architecture;
 mod fjordpulse_traceability;
 mod gates;
+mod language_surface;
+mod packed_baseline;
+mod packed_site_inventory;
 mod report_v2;
 mod shaders;
+mod verify_phase0;
 
 use fjordpulse_traceability::TraceabilityAction;
 use report_v2::{GateName, HandoffManifest, ReportStatus, ToolResult, load_manifest};
@@ -38,6 +42,12 @@ fn main() {
 fn run() -> ToolResult<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let workspace = workspace_root();
+    if let Some(status) = run_standalone(&workspace, &args)? {
+        if status == ReportStatus::Fail {
+            return Err("verification wrote a valid fail report".into());
+        }
+        return Ok(());
+    }
     let (manifest, _) = load_manifest(&workspace)?;
     let parsed = parse_command(&args, &manifest)?;
     let status = match parsed {
@@ -71,6 +81,59 @@ fn run() -> ToolResult<()> {
         return Err("verification wrote a valid fail report".into());
     }
     Ok(())
+}
+
+fn run_standalone(workspace: &Path, args: &[String]) -> ToolResult<Option<ReportStatus>> {
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    match command {
+        "shaders" => {
+            let check = match &args[1..] {
+                [] => false,
+                [flag] if flag == "--check" => true,
+                _ => return Err("usage: cargo xtask shaders [--check]".into()),
+            };
+            shaders::run(workspace, check)?;
+            Ok(Some(ReportStatus::Pass))
+        }
+        "fjordpulse-traceability" => {
+            let (action, reference) = parse_fjordpulse_traceability_options(&args[1..])?;
+            fjordpulse_traceability::run(workspace, action, &reference)?;
+            Ok(Some(ReportStatus::Pass))
+        }
+        "verify-language-surface" => {
+            if args.len() != 1 {
+                return Err("usage: cargo xtask verify-language-surface".into());
+            }
+            language_surface::run(workspace)?;
+            Ok(Some(ReportStatus::Pass))
+        }
+        "verify-phase0" => {
+            let mut unused_check_existing = false;
+            let mut report = None;
+            parse_verify_options(&args[1..], false, &mut unused_check_existing, &mut report)?;
+            verify_phase0::run(workspace, report.map(|path| resolve_path(workspace, path)))
+                .map(Some)
+        }
+        "verify-packed-baseline" => {
+            let mut check_existing = false;
+            let mut report = None;
+            parse_verify_options(&args[1..], true, &mut check_existing, &mut report)?;
+            packed_baseline::run(
+                workspace,
+                check_existing,
+                report.map(|path| resolve_path(workspace, path)),
+            )
+            .map(Some)
+        }
+        "packed-site-inventory" => {
+            packed_site_inventory::run_cli(workspace, &args[1..])
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            Ok(Some(ReportStatus::Pass))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn parse_command(args: &[String], manifest: &HandoffManifest) -> Result<ParsedCommand, String> {
@@ -186,6 +249,9 @@ fn print_help(manifest: &HandoffManifest) {
     println!("Boon Circuit tooling");
     println!("  shaders");
     println!("  fjordpulse-traceability <import|verify> --reference <FjordPulse-repo>");
+    println!("  verify-language-surface");
+    println!("  verify-phase0 [--report <path>]");
+    println!("  verify-packed-baseline [--check-existing] [--report <path>]");
     for gate in &manifest.gates {
         println!("  {}", gate.verifier.as_str());
     }

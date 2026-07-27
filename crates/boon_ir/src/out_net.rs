@@ -1450,18 +1450,17 @@ where
                     .iter()
                     .any(|producer| producer.port == *port_id)
                     && let Some(owner) = net.owner
+                    && let Some(checked_call) = call.provenance.call_id
                 {
-                    if let Some(checked_call) = call.provenance.call_id {
-                        concrete_producers_by_checked
-                            .entry(checked_call)
-                            .or_default()
-                            .push(ConcreteOutProducer {
-                                call: call.id,
-                                port: *port_id,
-                                net: net.id,
-                                owner,
-                            });
-                    }
+                    concrete_producers_by_checked
+                        .entry(checked_call)
+                        .or_default()
+                        .push(ConcreteOutProducer {
+                            call: call.id,
+                            port: *port_id,
+                            net: net.id,
+                            owner,
+                        });
                 }
             }
         }

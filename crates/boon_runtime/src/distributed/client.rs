@@ -29,6 +29,9 @@ pub struct DistributedClientRuntime {
     owned_transient_effects: BTreeSet<crate::TransientEffectCallId>,
 }
 
+// Boxing `Ready` would change this public incremental-startup API and add an
+// allocation to the successful startup path.
+#[allow(clippy::large_enum_variant)]
 pub enum DistributedClientStartupPoll {
     Pending(MachineBuildProgress),
     Ready(DistributedClientRuntime),
@@ -488,10 +491,11 @@ impl DistributedClientRuntime {
             .iter()
             .copied()
             .collect::<Vec<_>>();
-        let targets = self
-            .connected
-            .then_some(&[ProgramRole::Session][..])
-            .unwrap_or(&[]);
+        let targets = if self.connected {
+            &[ProgramRole::Session][..]
+        } else {
+            &[]
+        };
         let prepared = self
             .endpoint
             .prepare_transient_effect_cancellation(&call_ids, targets)?;

@@ -1,7 +1,24 @@
 # Boon Type Notation And Inspector
 
-This document is the implementation contract for Boon-facing type notation,
-runtime object shapes, editor type hints, and inspector UI. It is also the
+> **Phase 0 status: rewrite required.**
+>
+> **Current executable behavior:** the checked-in parser, typechecker, native
+> editor, and inspector code remain authoritative for what runs today.
+>
+> **Historical/stale content:** the notation and screenshots below mix that
+> behavior with the superseded public `BOOL`, `VALUE`, and `ABSENT` vocabulary;
+> they are not current verification evidence.
+>
+> **Target-only content:** any UI or notation prescription below that is not
+> already implemented is a design proposal, not an available language feature.
+>
+> **Flag-day owner:** unified goal Phase 2 rewrites this document together with
+> the Tags-only truth, private presence/fault channels, exact `NUMBER`, and
+> collection-position replacement. Until then, this is not an implementation
+> contract.
+
+This document records the earlier design for Boon-facing type notation, runtime
+object shapes, editor type hints, and inspector UI. It was also intended as the
 template for future runtime roots such as `scene:`.
 
 ## Boon-Facing Type Notation

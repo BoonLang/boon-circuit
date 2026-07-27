@@ -13,6 +13,7 @@ pub struct LoadedExample {
     pub id: String,
     pub label: String,
     pub application: ApplicationIdentity,
+    pub entry_path: String,
     pub units: Vec<SourceUnit>,
     pub test_steps: Vec<TestStep>,
     pub assets: Vec<AssetBlob>,
@@ -103,6 +104,10 @@ impl Catalog {
                 })
                 .collect(),
         };
+        let entry_path = migration
+            .as_ref()
+            .and_then(MigrationBundle::launch)
+            .map_or_else(|| entry.source.clone(), |stage| stage.source.clone());
         let base_application = built_in_application_identity(entry);
         let programs = load_program_sources(entry, &base_application, &units)?;
         let application = programs
@@ -126,6 +131,7 @@ impl Catalog {
             id: entry.id.clone(),
             label: entry.label.clone(),
             application,
+            entry_path,
             units,
             test_steps,
             assets,
@@ -243,11 +249,13 @@ fn load_migration_bundle(
                 &stage.source_files,
             )?
             .into_iter()
-            .map(|unit| SourceUnit {
-                path: unit.path,
-                source: unit.source,
+            .map(|unit| {
+                Ok(SourceUnit {
+                    path: workspace_relative_source_path(&unit.path)?,
+                    source: unit.source,
+                })
             })
-            .collect();
+            .collect::<RuntimeResult<Vec<_>>>()?;
             Ok(MigrationStage {
                 id: stage.id.clone(),
                 label: stage.label.clone(),

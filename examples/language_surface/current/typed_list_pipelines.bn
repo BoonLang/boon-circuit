@@ -1,0 +1,11 @@
+rows: LIST {
+    [id: 1, visible: True]
+    [id: 2, visible: False]
+}
+
+visible:
+    rows
+    |> List/filter(item, if: item.visible)
+    |> List/map(item, new: [id: item.id])
+    |> List/sort(item, by: item.id, direction: Ascending)
+    |> List/take(count: 1)

@@ -1,9 +1,24 @@
 # Native Editor Type Hints
 
-This document covers the native editor behavior. The Boon-facing notation,
-runtime object-shape rules, and inspector examples are defined in
-`docs/architecture/BOON_TYPE_NOTATION_AND_INSPECTOR.md` and must remain the
-source of truth.
+> **Phase 0 status: rewrite required.**
+>
+> **Current executable behavior:** native editor behavior is defined by the
+> checked-in implementation and `docs/architecture/NATIVE_GPU_PIPELINE.md`.
+>
+> **Historical/stale content:** the hint tokens and inspector examples below
+> inherit superseded type notation and are not native GPU handoff evidence.
+>
+> **Target-only content:** sidebar, highlighting, and hint behavior described
+> below but absent from the current implementation remains proposed behavior.
+>
+> **Flag-day owner:** unified goal Phase 2 rewrites this file with
+> `BOON_TYPE_NOTATION_AND_INSPECTOR.md` after the final value algebra and
+> one-based public APIs land.
+
+This document records the earlier native-editor type-hint design. Its
+Boon-facing notation and object-shape examples came from
+`docs/architecture/BOON_TYPE_NOTATION_AND_INSPECTOR.md`; that file is also
+marked for the same flag-day rewrite.
 
 ## Inline Hints
 

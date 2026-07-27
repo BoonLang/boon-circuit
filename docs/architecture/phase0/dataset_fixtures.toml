@@ -1,0 +1,288 @@
+format_version = 1
+schema = "boon.dataset-fixture-manifest.v1"
+identity = "SourceBundleDigestV1"
+
+# IDs are semantic and versioned; paths are deliberately not the identity.
+# Every digest is recomputed over the exact canonical source-unit set.
+
+[[fixtures]]
+id = "correctness.direct-out.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Direct OUT source-to-compiler-to-runtime ownership analogue."
+entrypoint = "testdata/phase0/fixtures/direct_out.bn"
+units = ["testdata/phase0/fixtures/direct_out.bn"]
+source_bundle_digest_v1 = "c14769615e34b915b02f92218757d718f4f0a6194458c7747dc969a64cc81467"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.effect-cancellation.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Source-owned transient effect cancellation with late-publication rejection."
+entrypoint = "testdata/phase0/fixtures/effect_cancellation_current.bn"
+units = ["testdata/phase0/fixtures/effect_cancellation_current.bn"]
+source_bundle_digest_v1 = "2adc78b39cb52b60895ef8e05fc24aea54a26360dae97fa2b81bc0e0fe16344a"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md"
+
+[[fixtures]]
+id = "correctness.exact-arithmetic-current.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Current representable arithmetic execution before the exact Number flag-day."
+entrypoint = "testdata/phase0/fixtures/exact_arithmetic_current.bn"
+units = ["testdata/phase0/fixtures/exact_arithmetic_current.bn"]
+source_bundle_digest_v1 = "eba2c7134055938df2d2e6f586961b6cdae170d186d3ec30a0d31533b19d2cb8"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.future-bits-rejection.v1"
+category = "correctness"
+behavior = "compile-reject-future"
+purpose = "Future BITS syntax rejection before the final bounded-bit value algebra exists."
+entrypoint = "testdata/phase0/fixtures/future_bits.bn"
+units = ["testdata/phase0/fixtures/future_bits.bn"]
+source_bundle_digest_v1 = "15535ead7609116a55cc3b2ec1e3a4c230eb07366c8b8211d1cf930bb09d14e6"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.future-exact-integer-rejection.v1"
+category = "correctness"
+behavior = "compile-reject-future"
+purpose = "Exact-only integer source rejection before exact rational NUMBER is implemented."
+entrypoint = "testdata/phase0/fixtures/future_exact_integer.bn"
+units = ["testdata/phase0/fixtures/future_exact_integer.bn"]
+source_bundle_digest_v1 = "2e9195dc1f29056484a6aa80b005742dc522afc828f7d5030ca2580dbdc76292"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.future-map-rejection.v1"
+category = "correctness"
+behavior = "compile-reject-future"
+purpose = "Future MAP authority syntax rejection before the final collection algebra exists."
+entrypoint = "testdata/phase0/fixtures/future_map.bn"
+units = ["testdata/phase0/fixtures/future_map.bn"]
+source_bundle_digest_v1 = "bdc6103e719a78485283795514fe02c4bd1ff761e063687ea674d7e955a875ad"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.future-set-rejection.v1"
+category = "correctness"
+behavior = "compile-reject-future"
+purpose = "Future SET authority syntax rejection before the final collection algebra exists."
+entrypoint = "testdata/phase0/fixtures/future_set.bn"
+units = ["testdata/phase0/fixtures/future_set.bn"]
+source_bundle_digest_v1 = "0bf088ef2a864fb63d1372e49938a0d89bac276dfe4920f6443e5f38d73b3d8a"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.future-where-rejection.v1"
+category = "correctness"
+behavior = "compile-reject-future"
+purpose = "Future WHERE contract rejection before mandatory verification is implemented."
+entrypoint = "testdata/phase0/fixtures/future_where.bn"
+units = ["testdata/phase0/fixtures/future_where.bn"]
+source_bundle_digest_v1 = "89facebc0fc59d796068cf8c9f4b1175e730696dbe46a61a38ecc72b4ca6a165"
+owner_phase = "goal-phase-4-formal"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+
+[[fixtures]]
+id = "correctness.nested-ownership.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Two transparent OUT wrapper layers preserving current ownership behavior."
+entrypoint = "testdata/phase0/fixtures/nested_ownership.bn"
+units = ["testdata/phase0/fixtures/nested_ownership.bn"]
+source_bundle_digest_v1 = "3690b8590d648bd788c922320579e9ab21413e697678c4fcedbb04e02f87084f"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.proof-erasure-current.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Current contract-free executable analogue paired with future WHERE rejection."
+entrypoint = "testdata/phase0/fixtures/proof_erasure_current.bn"
+units = ["testdata/phase0/fixtures/proof_erasure_current.bn"]
+source_bundle_digest_v1 = "e3b889a032d7a464dbd57bc226f709829fec1a19f985b39f23e6c1c6262dc2ae"
+owner_phase = "goal-phase-4-formal"
+owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+
+[[fixtures]]
+id = "correctness.stale-routing.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Current runtime rejection of a stale revision before one current route executes."
+entrypoint = "testdata/phase0/fixtures/stale_routing_current.bn"
+units = ["testdata/phase0/fixtures/stale_routing_current.bn"]
+source_bundle_digest_v1 = "d5de59077e19c4fb7f114b0d3a458df07198cd40bdf5ce2bdd69551b67fffefd"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/GOAL_PROMPT.md"
+
+[[fixtures]]
+id = "correctness.tags-presence-fault.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Current tagged values and visible Null Tag facade before private channel replacement."
+entrypoint = "testdata/phase0/fixtures/tags_presence_fault_current.bn"
+units = ["testdata/phase0/fixtures/tags_presence_fault_current.bn"]
+source_bundle_digest_v1 = "2466c98a015966f8aa1981004b69b38613beb511eef7956867dc43a80b0dfb67"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.typed-views.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Typed filtering, stable order, bounded take, and cursor-page analogue."
+entrypoint = "testdata/phase0/fixtures/typed_views_current.bn"
+units = ["testdata/phase0/fixtures/typed_views_current.bn"]
+source_bundle_digest_v1 = "3991d75562be86e0aa18a66a008a62320d201f5df5ed8f0992d7819d511cba7e"
+owner_phase = "goal-phase-3-typed-list"
+owner_plan = "docs/plans/TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md"
+
+[[fixtures]]
+id = "correctness.wrapped-out.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "One transparent OUT wrapper preserving the direct executable result."
+entrypoint = "testdata/phase0/fixtures/wrapped_out.bn"
+units = ["testdata/phase0/fixtures/wrapped_out.bn"]
+source_bundle_digest_v1 = "ebd1e1577443f521adb907a467383086eee2f681c1a0aeb8f53306d422fbdef1"
+owner_phase = "goal-phase-1-verified-spine"
+owner_plan = "docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md"
+
+[[fixtures]]
+id = "hardware.bounded-profile-analogue.v1"
+category = "hardware"
+behavior = "compile-execute-current"
+purpose = "Current SoftwareBounded compilation analogue without a hardware-readiness claim."
+entrypoint = "testdata/phase0/fixtures/bounded_hardware_current.bn"
+units = ["testdata/phase0/fixtures/bounded_hardware_current.bn"]
+source_bundle_digest_v1 = "86706cf0b96ddd9f41bc67e052d2b62fd475240b8829e6a3466e8a7b014620b0"
+owner_phase = "goal-phase-8-riscv"
+owner_plan = "docs/plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md"
+
+[[fixtures]]
+id = "hardware.future-bits-rejection.v1"
+category = "hardware"
+behavior = "compile-reject-future"
+purpose = "Future fixed-width register syntax must fail closed before CoreHardwareIR exists."
+entrypoint = "testdata/phase0/fixtures/future_hardware_bits.bn"
+units = ["testdata/phase0/fixtures/future_hardware_bits.bn"]
+source_bundle_digest_v1 = "b283045e63be8474b09675bf9cc0ee45ece948d5a3d1487d0846ca7048024d15"
+owner_phase = "goal-phase-8-riscv"
+owner_plan = "docs/plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md"
+
+[[fixtures]]
+id = "performance.cells.v1"
+category = "performance"
+behavior = "measured-current"
+purpose = "Current retained 2,600-cell and sparse-edit baseline dataset."
+entrypoint = "examples/cells.bn"
+units = [
+  "examples/cells.bn",
+  "examples/cells/cell.bn",
+  "examples/cells/columns.bn",
+  "examples/cells/defaults.bn",
+  "examples/cells/formula.bn",
+  "examples/cells/model.bn",
+  "examples/cells/store.bn",
+  "examples/cells/view.bn",
+]
+source_bundle_digest_v1 = "dc172ca8bf4fcd11b93d23fc26360a6e5d4057500013e6f733f04d32df70e224"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+
+[[fixtures]]
+id = "performance.counter.v1"
+category = "performance"
+behavior = "measured-current"
+purpose = "Current Counter startup and sparse scalar update baseline dataset."
+entrypoint = "examples/counter.bn"
+units = ["examples/counter.bn"]
+source_bundle_digest_v1 = "bc935273b2b62416d4cb7873e189bb195814e21a3c0fd5ddf7e9d248e957e778"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+
+[[fixtures]]
+id = "performance.fjordpulse-shaped.v1"
+category = "performance"
+behavior = "measured-current"
+purpose = "Current 58,500-row FjordPulse-shaped indexed-access dataset."
+entrypoint = "testdata/fjordpulse_scale_access.bn"
+units = ["testdata/fjordpulse_scale_access.bn"]
+source_bundle_digest_v1 = "91ab006a40bc955237891fefe207b94df74af7f33390741078fea6e41d5090df"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+
+[[fixtures]]
+id = "performance.million-row.v1"
+category = "performance"
+behavior = "measured-current"
+purpose = "Current synthetic million-row sparse-query and dense-update dataset."
+entrypoint = "testdata/phase0/million_row_current_runtime.bn"
+units = ["testdata/phase0/million_row_current_runtime.bn"]
+source_bundle_digest_v1 = "5971ed7f0e9457619dc2667deac5df9ce5d00dc8fbed82a9304b73421fa28335"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+
+[[fixtures]]
+id = "performance.packed-scalar-row.v1"
+category = "performance"
+behavior = "measured-current"
+purpose = "Current scalar and row execution analogue before universal packed storage."
+entrypoint = "testdata/phase0/fixtures/packed_scalar_row_current.bn"
+units = ["testdata/phase0/fixtures/packed_scalar_row_current.bn"]
+source_bundle_digest_v1 = "8b00de121890c7bfd8a58b9096a671d4ae9b6c6dac5db3ad1c37e3c384bed708"
+owner_phase = "goal-phase-5-packed"
+owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+
+[[fixtures]]
+id = "performance.visible-window.v1"
+category = "performance"
+behavior = "measured-current"
+purpose = "Current headless retained eight-row window over 2,600 logical rows."
+entrypoint = "testdata/phase0/fixtures/visible_window_current.bn"
+units = ["testdata/phase0/fixtures/visible_window_current.bn"]
+source_bundle_digest_v1 = "6b4eef4fd2fa9704e976e0f5609db64a6b58c045c2d110197b9ed201d5af5dcf"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
+
+[[fixtures]]
+id = "product.novywave.v1"
+category = "product"
+behavior = "product-regression-current"
+purpose = "Current NovyWave multi-unit product source dataset; assets have separate content identities."
+entrypoint = "examples/novywave/RUN.bn"
+units = [
+  "examples/novywave/Bridge/NovyBridge.bn",
+  "examples/novywave/Generated/Assets.bn",
+  "examples/novywave/Generated/NovyReference.bn",
+  "examples/novywave/Model/NovyModel.bn",
+  "examples/novywave/RUN.bn",
+  "examples/novywave/Theme/NovyTheme.bn",
+  "examples/novywave/View/NovyView.bn",
+  "examples/novywave/hold.bn",
+]
+source_bundle_digest_v1 = "c29225327633269bdb67754f82bb800286eb45ab49f4bf6a4d9409832a7cb732"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/NOVYWAVE_BOON_REWRITE_PLAN.md"
+
+[[fixtures]]
+id = "product.todomvc.v1"
+category = "product"
+behavior = "product-regression-current"
+purpose = "Current self-contained TodoMVC product source dataset."
+entrypoint = "examples/todomvc.bn"
+units = ["examples/todomvc.bn"]
+source_bundle_digest_v1 = "4e156f0e296a8b7df793cca721a8484616b3c3dd3627084e805d9dfd9f8be77b"
+owner_phase = "goal-phase-6-web-persistence"
+owner_plan = "docs/plans/GOAL_PROMPT.md"

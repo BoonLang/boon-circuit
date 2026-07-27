@@ -435,9 +435,12 @@ fn subtree_matches_semantic_text(
     false
 }
 
-fn node_matches_semantic_text(node: &boon_document::DocumentNode, expected: &str) -> bool {
+pub(crate) fn node_matches_semantic_text(
+    node: &boon_document::DocumentNode,
+    expected: &str,
+) -> bool {
     node.text.as_ref().is_some_and(|text| text.text == expected)
-        || ["target", "label"].iter().any(|name| {
+        || ["target", "label", "address"].iter().any(|name| {
             matches!(
                 node.style.get(*name),
                 Some(boon_document::StyleValue::Text(value)) if value == expected
@@ -628,4 +631,69 @@ fn clip_rect(style: &boon_document::StyleMap) -> Option<Rect> {
 
 fn rect_area(rect: Rect) -> f32 {
     rect.width.max(0.0) * rect.height.max(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boon_document::{DocumentNode, StyleValue};
+
+    fn add_child(frame: &mut DocumentFrame, mut node: DocumentNode) {
+        node.parent = Some(frame.root.clone());
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .expect("test root must exist")
+            .children
+            .push(node.id.clone());
+        frame.nodes.insert(node.id.clone(), node);
+    }
+
+    #[test]
+    fn semantic_subtree_text_includes_exact_target_and_label_metadata() {
+        let mut frame = DocumentFrame::empty("root");
+        let mut target = DocumentNode::new("target", DocumentNodeKind::Stack);
+        target.style.insert(
+            "target".to_owned(),
+            StyleValue::Text("waveform canvas".to_owned()),
+        );
+        add_child(&mut frame, target);
+
+        let mut label = DocumentNode::new("label", DocumentNodeKind::Stack);
+        label.style.insert(
+            "label".to_owned(),
+            StyleValue::Text("simple_tb.s.temperature".to_owned()),
+        );
+        add_child(&mut frame, label);
+
+        let mut address = DocumentNode::new("address", DocumentNodeKind::Stack);
+        address.style.insert(
+            "address".to_owned(),
+            StyleValue::Text("row:temperature".to_owned()),
+        );
+        add_child(&mut frame, address);
+
+        let root = frame.nodes.get(&frame.root).expect("test root must exist");
+        assert!(subtree_matches_semantic_text(
+            &frame,
+            root,
+            "waveform canvas"
+        ));
+        assert!(subtree_matches_semantic_text(
+            &frame,
+            root,
+            "simple_tb.s.temperature"
+        ));
+        assert!(subtree_matches_semantic_text(
+            &frame,
+            root,
+            "row:temperature"
+        ));
+        assert!(!subtree_matches_semantic_text(&frame, root, "waveform"));
+        assert!(!subtree_matches_semantic_text(
+            &frame,
+            root,
+            "missing target"
+        ));
+    }
 }

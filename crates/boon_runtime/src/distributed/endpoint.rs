@@ -52,6 +52,9 @@ pub(super) struct EndpointRuntime {
     protocol: EndpointProtocolState,
 }
 
+// Keeping the ready runtime inline avoids an allocation on every endpoint
+// startup and preserves the enclosing startup poll representation.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum EndpointBuildPoll {
     Pending(MachineBuildProgress),
     Ready(EndpointRuntime),

@@ -701,7 +701,7 @@ mod tests {
     use super::*;
     use boon_app_package::{
         ArtifactDescriptor, BUNDLE_FORMAT, BrowserManifest, CapabilityProfileDescriptor,
-        HttpManifest, NamespaceProfile, RunMode, StaticCachePolicy,
+        HttpManifest, NamespaceProfile, RunMode, SourceBundleDigestV1, StaticCachePolicy,
     };
     use boon_host_runtime::{
         ContentStore, ContentStoreLimits, FileCapabilityRegistry, NamedSecret,
@@ -746,11 +746,10 @@ mod tests {
             path: format!("artifacts/{}.boon", role.as_str()),
             revision: 1,
             content_artifact_id: "11".repeat(32),
-            content_media_type: "application/vnd.boon.machine-plan+cbor;version=2".to_owned(),
+            content_media_type: "application/vnd.boon.machine-plan+cbor;version=3".to_owned(),
             bytes_sha256: "11".repeat(32),
             bytes_len: 1,
-            source_bundle_sha256: "11".repeat(32),
-            source_digest: "11".repeat(32),
+            source_bundle_digest_v1: "11".repeat(32).parse::<SourceBundleDigestV1>().unwrap(),
             plan_digest: "11".repeat(32),
             compiler_id: "test".to_owned(),
             target_profile: TargetProfile::SoftwareBounded,

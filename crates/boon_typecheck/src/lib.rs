@@ -547,17 +547,14 @@ pub struct CheckedDeclaration {
     pub span: CheckedSpan,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckedEvaluationScope {
+    #[default]
     Parent,
-    Output { formal: DeclId },
-}
-
-impl Default for CheckedEvaluationScope {
-    fn default() -> Self {
-        Self::Parent
-    }
+    Output {
+        formal: DeclId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1361,6 +1358,17 @@ struct CheckedProgramBuilder<'a> {
     diagnostics: Vec<TypeDiagnostic>,
 }
 
+struct CheckedProgramBuildInputs<'a> {
+    external_types: &'a ExternalTypeEnvironment,
+    expr_type_table: &'a ExprTypeTable,
+    function_type_table: &'a FunctionTypeTable,
+    named_value_type_table: &'a NamedValueTypeTable,
+    render_slot_table: &'a RenderSlotTable,
+    source_payload_shape_table: &'a [SourcePayloadShapeEntry],
+    builtins: &'a BuiltinSignatureRegistry,
+    render_contracts: &'a RenderContractRegistry,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct CheckedFlowInferenceTestStats {
@@ -1567,15 +1575,18 @@ fn checked_contextual_operation_formals(
 impl<'a> CheckedProgramBuilder<'a> {
     fn build(
         program: &'a ParsedProgram,
-        external_types: &ExternalTypeEnvironment,
-        expr_type_table: &ExprTypeTable,
-        function_type_table: &FunctionTypeTable,
-        named_value_type_table: &NamedValueTypeTable,
-        render_slot_table: &RenderSlotTable,
-        source_payload_shape_table: &[SourcePayloadShapeEntry],
-        builtins: &BuiltinSignatureRegistry,
-        render_contracts: &RenderContractRegistry,
+        inputs: CheckedProgramBuildInputs<'_>,
     ) -> (CheckedProgram, Vec<TypeDiagnostic>, bool) {
+        let CheckedProgramBuildInputs {
+            external_types,
+            expr_type_table,
+            function_type_table,
+            named_value_type_table,
+            render_slot_table,
+            source_payload_shape_table,
+            builtins,
+            render_contracts,
+        } = inputs;
         let trace_checked_program = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
         macro_rules! checked_program_phase {
             ($name:literal, $body:expr) => {{
@@ -4537,7 +4548,12 @@ impl<'a> CheckedProgramBuilder<'a> {
             AstExprKind::Source | AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
             AstExprKind::Identifier(name) => self
-                .infer_instantiated_read_mode(expression, &[name.clone()], bindings, active)
+                .infer_instantiated_read_mode(
+                    expression,
+                    std::slice::from_ref(name),
+                    bindings,
+                    active,
+                )
                 .unwrap_or(FlowMode::Continuous),
             AstExprKind::Path(parts) => self
                 .infer_instantiated_read_mode(expression, parts, bindings, active)
@@ -5034,7 +5050,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             AstExprKind::Source | AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
             AstExprKind::Identifier(name) => self
-                .checked_read_flow_mode(expr_id, &[name.clone()], active)
+                .checked_read_flow_mode(expr_id, std::slice::from_ref(name), active)
                 .unwrap_or(fallback),
             AstExprKind::Path(parts) => self
                 .checked_read_flow_mode(expr_id, parts, active)
@@ -5440,14 +5456,18 @@ impl<'a> CheckedProgramBuilder<'a> {
             .unwrap_or(LexicalScopeId(0));
         let (target, remaining) =
             self.resolve_checked_read_path(root.0 as usize, scope_id, parts)?;
-        if !remaining.is_empty() {
-            return None;
-        }
-        let value = self
+        let mut value = self
             .declarations
             .iter()
             .find(|declaration| declaration.id == target)?
             .value?;
+        if !remaining.is_empty() {
+            let (projected, consumed) = self.checked_projected_value_prefix(value, &remaining)?;
+            if consumed != remaining.len() {
+                return None;
+            }
+            value = projected;
+        }
         self.checked_list_item_projection_flow_mode(value, projection, active, visited)
     }
 
@@ -6122,12 +6142,15 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .map_or(scope_id, |signature| signature.scope_id)
             } else {
                 let child_scope = self.allocate_scope();
-                let kind = statement
+                let kind = if statement
                     .expr
                     .and_then(|expr_id| self.program.expressions.get(expr_id))
                     .is_some_and(|expr| matches!(expr.kind, AstExprKind::Record(_)))
-                    .then_some(CheckedScopeKind::Record)
-                    .unwrap_or(CheckedScopeKind::Block);
+                {
+                    CheckedScopeKind::Record
+                } else {
+                    CheckedScopeKind::Block
+                };
                 self.scopes.push(CheckedScope {
                     id: child_scope,
                     parent: Some(scope_id),
@@ -7456,7 +7479,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .collect::<Vec<_>>()
         };
         match &expr.kind {
-            AstExprKind::Identifier(name) => self.checked_read(expr.id, scope_id, &[name.clone()]),
+            AstExprKind::Identifier(name) => {
+                self.checked_read(expr.id, scope_id, std::slice::from_ref(name))
+            }
             AstExprKind::Path(parts) => self.checked_read(expr.id, scope_id, parts),
             AstExprKind::Drain { path } => {
                 let parts = match path {
@@ -10843,14 +10868,16 @@ impl<'a> Checker<'a> {
         let (mut checked_program, call_diagnostics, exact_pipeline_inputs_valid) =
             CheckedProgramBuilder::build(
                 self.program,
-                &self.external_types,
-                &self.expr_type_table,
-                &self.function_type_table,
-                &named_value_type_table,
-                &self.render_slot_table,
-                &source_payload_shape_table,
-                &self.builtins,
-                &self.render_contracts,
+                CheckedProgramBuildInputs {
+                    external_types: &self.external_types,
+                    expr_type_table: &self.expr_type_table,
+                    function_type_table: &self.function_type_table,
+                    named_value_type_table: &named_value_type_table,
+                    render_slot_table: &self.render_slot_table,
+                    source_payload_shape_table: &source_payload_shape_table,
+                    builtins: &self.builtins,
+                    render_contracts: &self.render_contracts,
+                },
             );
         refine_checked_host_port_source_payload_types(&mut checked_program, &self.host_port_table);
         let deferred_style_diagnostics =
@@ -11939,13 +11966,12 @@ impl<'a> Checker<'a> {
                             args,
                         ),
                         contextual_body_type.as_ref(),
-                    ) {
-                        if type_contains_skip(&item_type) {
-                            self.diagnostics.push(self.diagnostic_for_expr(
-                                new_expr_id,
-                                "`SKIP` cannot be used as a `List/map` item".to_owned(),
-                            ));
-                        }
+                    ) && type_contains_skip(item_type)
+                    {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            new_expr_id,
+                            "`SKIP` cannot be used as a `List/map` item".to_owned(),
+                        ));
                     }
                     let item_type = contextual_body_type.unwrap_or_else(open_object_type);
                     Type::List(Box::new(item_type))
@@ -11953,17 +11979,17 @@ impl<'a> Checker<'a> {
                     true_false_type()
                 } else if op == "List/latest" {
                     list_item_type_from_list_type(&input_flow.ty).unwrap_or_else(open_object_type)
-                } else if op == "SOURCE" {
-                    input_flow.ty
-                } else if matches!(
-                    op.as_str(),
-                    "List/filter"
-                        | "List/retain"
-                        | "List/remove"
-                        | "List/sort_by"
-                        | "List/then_by"
-                        | "List/take"
-                ) {
+                } else if op == "SOURCE"
+                    || matches!(
+                        op.as_str(),
+                        "List/filter"
+                            | "List/retain"
+                            | "List/remove"
+                            | "List/sort_by"
+                            | "List/then_by"
+                            | "List/take"
+                    )
+                {
                     input_flow.ty
                 } else if op == "List/page" {
                     page_result_type(
@@ -17088,30 +17114,25 @@ impl Default for BuiltinSignatureRegistry {
             None,
         );
 
-        drop(register);
         let stateful_effect = CheckedEffectSummary {
             reads_state: true,
             writes_state: true,
             ..CheckedEffectSummary::default()
         };
-        for name in ["Bool/toggle"] {
-            let callable = entries
-                .get_mut(name)
-                .and_then(|entry| entry.callable.as_mut())
-                .expect("registered stateful builtin");
-            callable.effect = stateful_effect;
-        }
+        let callable = entries
+            .get_mut("Bool/toggle")
+            .and_then(|entry| entry.callable.as_mut())
+            .expect("registered stateful builtin");
+        callable.effect = stateful_effect;
         let source_effect = CheckedEffectSummary {
             emits_source: true,
             ..CheckedEffectSummary::default()
         };
-        for name in ["Timer/interval"] {
-            let callable = entries
-                .get_mut(name)
-                .and_then(|entry| entry.callable.as_mut())
-                .expect("registered source-emitting builtin");
-            callable.effect = source_effect;
-        }
+        let callable = entries
+            .get_mut("Timer/interval")
+            .and_then(|entry| entry.callable.as_mut())
+            .expect("registered source-emitting builtin");
+        callable.effect = source_effect;
         for (name, result) in [
             ("List/move_field_first", list_type()),
             ("List/move_field_last", list_type()),
@@ -17539,7 +17560,7 @@ fn render_constructor_parameters(function: &str) -> Option<Vec<AuthoritativePara
             text("source", false),
             render_parameter(
                 "support_sources",
-                Type::List(Box::new(open_object_type())),
+                embedded_program_source_units_type(),
                 false,
             ),
             text("artifact_id", false),
@@ -17547,6 +17568,11 @@ fn render_constructor_parameters(function: &str) -> Option<Vec<AuthoritativePara
             render_parameter("artifact_retention", Type::Unknown, false),
             text("bootstrap_source", false),
             text("bootstrap_artifact_id", false),
+            render_parameter(
+                "bootstrap_support_sources",
+                embedded_program_source_units_type(),
+                false,
+            ),
             number("bootstrap_revision", false),
             render_parameter("capability_profile", Type::Unknown, true),
             text("session_key", false),
@@ -18340,7 +18366,30 @@ fn render_field_type_accepts(actual: &Type, expected: &Type) -> bool {
             Type::Object(_) | Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
         );
     }
+    if *expected == embedded_program_source_units_type() {
+        return exact_closed_type_is_assignable(actual, expected);
+    }
     type_is_assignable_to(actual, expected)
+}
+
+fn exact_closed_type_is_assignable(actual: &Type, expected: &Type) -> bool {
+    match (actual, expected) {
+        (Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }, _) => true,
+        (actual, _) if is_open_object_type(actual) => true,
+        (Type::List(actual), Type::List(expected)) => {
+            exact_closed_type_is_assignable(actual, expected)
+        }
+        (Type::Object(actual), Type::Object(expected)) if !expected.open => {
+            !actual.open
+                && actual.fields.len() == expected.fields.len()
+                && expected.fields.iter().all(|(field, expected_field)| {
+                    actual.fields.get(field).is_some_and(|actual_field| {
+                        exact_closed_type_is_assignable(actual_field, expected_field)
+                    })
+                })
+        }
+        _ => type_is_assignable_to(actual, expected),
+    }
 }
 
 fn variant_is_assignable_to(actual: &Variant, expected: &Variant) -> bool {
@@ -20072,14 +20121,10 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
         )
     {
         Some(Type::List(Box::new(open_object_type())))
-    } else if function == "Router/go_to" {
-        Some(Type::Text)
-    } else if matches!(
-        function,
-        "Text/to_bytes" | "File/read_text" | "Log/error" | "Log/info"
-    ) {
-        Some(Type::Text)
-    } else if function.starts_with("Text/") {
+    } else if function == "Router/go_to"
+        || function.starts_with("Text/")
+        || matches!(function, "File/read_text" | "Log/error" | "Log/info")
+    {
         Some(Type::Text)
     } else if matches!(
         function,
@@ -20522,7 +20567,9 @@ fn render_arg_expected_type(function: &str, arg_name: Option<&str>) -> Option<Ty
                 | "bootstrap_artifact_id"
                 | "session_key",
             ) => Some(Type::Text),
-            Some("support_sources") => Some(Type::List(Box::new(open_object_type()))),
+            Some("support_sources" | "bootstrap_support_sources") => {
+                Some(embedded_program_source_units_type())
+            }
             Some("revision" | "bootstrap_revision") => Some(Type::Number),
             Some("mount") => Some(true_false_type()),
             Some("artifact_retention" | "capability_profile") => Some(Type::Unknown),
@@ -22118,7 +22165,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
         };
         if declaration.kind == CheckedDeclarationKind::ValueParameter {
             for call in self.calls.values() {
-                if let Some(actual) = checked_call_formal_input(*call, target) {
+                if let Some(actual) = checked_call_formal_input(call, target) {
                     resolved.extend(self.expression_sources(actual, projection, visiting));
                 }
             }
@@ -22201,16 +22248,15 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                         if let Some(result) = callable.result_expression {
                             resolved.extend(self.expression_sources(result, projection, visiting));
                         }
-                    } else if matches!(
+                    } else if (matches!(
                         callable.contextual_operation,
                         Some(CheckedContextualOperation::Find { .. })
                     ) || matches!(
                         call.function.as_str(),
                         "List/get" | "List/latest" | "List/find"
-                    ) {
-                        if let Some(list) = checked_call_input(call, "list") {
-                            resolved.extend(self.list_item_sources(list, projection, visiting));
-                        }
+                    )) && let Some(list) = checked_call_input(call, "list")
+                    {
+                        resolved.extend(self.list_item_sources(list, projection, visiting));
                     }
                 }
             }
@@ -22285,20 +22331,19 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                 projection: list_projection,
                 ..
             } => {
-                if list_projection.is_empty() {
-                    if let Some(declaration) = self.declarations.get(target).copied() {
-                        if declaration.kind == CheckedDeclarationKind::ValueParameter {
-                            for call in self.calls.values() {
-                                if let Some(actual) = checked_call_formal_input(*call, *target) {
-                                    resolved.extend(
-                                        self.list_item_sources(actual, projection, visiting),
-                                    );
-                                }
+                if list_projection.is_empty()
+                    && let Some(declaration) = self.declarations.get(target).copied()
+                {
+                    if declaration.kind == CheckedDeclarationKind::ValueParameter {
+                        for call in self.calls.values() {
+                            if let Some(actual) = checked_call_formal_input(call, *target) {
+                                resolved
+                                    .extend(self.list_item_sources(actual, projection, visiting));
                             }
                         }
-                        if let Some(value) = declaration.value {
-                            resolved.extend(self.list_item_sources(value, projection, visiting));
-                        }
+                    }
+                    if let Some(value) = declaration.value {
+                        resolved.extend(self.list_item_sources(value, projection, visiting));
                     }
                 }
             }
@@ -24939,6 +24984,16 @@ fn expr_is_skip(expr: &AstExpr) -> bool {
 
 fn open_object_type() -> Type {
     Type::Object(ObjectShape::new(BTreeMap::new(), true))
+}
+
+fn embedded_program_source_units_type() -> Type {
+    Type::List(Box::new(Type::Object(ObjectShape::from_ordered_fields(
+        [
+            ("path".to_owned(), Type::Text),
+            ("source".to_owned(), Type::Text),
+        ],
+        false,
+    ))))
 }
 
 fn exact_empty_object_type() -> Type {

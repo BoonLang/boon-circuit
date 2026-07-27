@@ -1,0 +1,20 @@
+{
+  "schema": "boon.source-bundle-golden.v1",
+  "entrypoint": "RUN.bn",
+  "units": [
+    {
+      "path": "RUN.bn",
+      "source": "scene: ProfilePage/render()\n"
+    },
+    {
+      "path": "ProfilePage.bn",
+      "source": "\nFUNCTION render() {\n    Scene/Element/text(\n        element: []\n        style: [width: Fill]\n        text: TEXT { Typed profile }\n    )\n}\n"
+    }
+  ],
+  "canonical_entrypoint": "RUN.bn",
+  "canonical_paths": [
+    "ProfilePage.bn",
+    "RUN.bn"
+  ],
+  "digest": "af7a0c88f4d8a33d740d10c42a7da620868975c8a471665968951a80e37bb07d"
+}

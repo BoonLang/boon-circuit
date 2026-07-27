@@ -1,6 +1,7 @@
 use super::*;
 use boon_plan::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 fn compile_server_source(
     source_label: &str,
@@ -532,6 +533,60 @@ fn root_value_comparison_tracks_both_state_inputs() {
         session.root_value_current("store.same").unwrap(),
         Value::Bool(false)
     );
+}
+
+#[cfg(feature = "phase0-instrumentation")]
+#[test]
+fn phase_elapsed_metrics_are_scoped_to_source_and_boundary_work() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let update = const_update(&mut row_expressions, 1, 0, 1, 1);
+    let comparison = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::DerivedValue {
+            derived_kind: PlanDerivedKind::Pure,
+            startup_recompute: true,
+            materialization: None,
+            expression: Some(PlanDerivedExpression::ValueCompare {
+                left: ValueRef::State(StateId(0)),
+                op: PlanInfixOp::Equal,
+                right: ValueRef::State(StateId(1)),
+            }),
+        },
+        inputs: vec![ValueRef::State(StateId(0)), ValueRef::State(StateId(1))],
+        output: Some(ValueRef::Field(FieldId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let mut session = MachineInstance::new(
+        plan(
+            RootOutputDemand::All,
+            row_expressions,
+            vec![
+                constant(0, number_constant(3)),
+                constant(1, number_constant(4)),
+            ],
+            vec![route(0, None)],
+            vec![number_slot(0, 0), number_slot(1, 0)],
+            Vec::new(),
+            vec![comparison, update],
+            vec![(StateId(0), "store.left"), (StateId(1), "store.right")],
+            Vec::new(),
+            vec![(FieldId(0), "store.same")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    let (_, boundary_metrics) = session
+        .root_value_current_with_metrics("store.same")
+        .unwrap();
+    assert_eq!(boundary_metrics.elapsed_ingest_ns, 0);
+    assert_eq!(boundary_metrics.elapsed_evaluate_ns, 0);
+    assert_eq!(boundary_metrics.elapsed_commit_ns, 0);
+    assert_eq!(boundary_metrics.elapsed_delta_ns, 0);
+
+    let turn = session.apply(event(&session, 1, 0, None)).unwrap();
+    assert_eq!(turn.metrics.elapsed_boundary_ns, 0);
 }
 
 #[test]
@@ -2369,9 +2424,10 @@ document: Document/new(
         .unwrap();
     assert_eq!(logical_len, 100);
     assert!(beyond_end.is_empty());
+    let reversed_window = Range { start: 8, end: 7 };
     assert!(
         session
-            .list_row_snapshots_window_current(rows, 8..7)
+            .list_row_snapshots_window_current(rows, reversed_window)
             .is_err()
     );
 }
@@ -10569,6 +10625,90 @@ fn apply_register_effect(
     );
     let dispatched = dispatch_item(&mut session, &pending);
     (session, dispatched)
+}
+
+#[test]
+fn durable_effect_completion_does_not_reactivate_from_its_own_result_dependencies() {
+    let machine = compile_server_source(
+        "durable-effect-completion-is-one-shot.bn",
+        r#"
+store: [
+    register: SOURCE
+    registration_result:
+        RegistrationNotRequested |> HOLD registration_result {
+            register |> THEN {
+                DevelopmentPasskey/register(
+                    workspace_id: TEXT { workspace-1 }
+                    workspace_grant_id: TEXT { grant-1 }
+                    account_id: TEXT {}
+                    credential_count: credential_count
+                    simulation: Success
+                )
+            }
+        }
+    credential_count:
+        registration_result |> WHEN {
+            RegistrationSucceeded => 1
+            __ => 0
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    let register = source_id(&machine, "store.register");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let pending = enqueue_item(
+        &session
+            .apply(SourceEvent {
+                sequence: 1,
+                source: register,
+                route: route_token(&session, register, None),
+                target: None,
+                payload: SourcePayload::default(),
+            })
+            .unwrap(),
+    );
+    let dispatching = dispatch_item(&mut session, &pending);
+    let completed = session
+        .complete_effect(
+            &dispatching,
+            result_variant(
+                "RegistrationSucceeded",
+                [
+                    (
+                        "account_id",
+                        boon_persistence::StoredValue::Text("account-1".to_owned()),
+                    ),
+                    (
+                        "credential_id",
+                        boon_persistence::StoredValue::Text("credential-1".to_owned()),
+                    ),
+                    (
+                        "label",
+                        boon_persistence::StoredValue::Text("Primary".to_owned()),
+                    ),
+                    (
+                        "workspace_grant_bound",
+                        boon_persistence::StoredValue::Bool(true),
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        completed.outbox_changes.as_slice(),
+        [boon_persistence::DurableOutboxChange::Complete { item_id, .. }]
+            if *item_id == dispatching.item_id
+    ));
+    assert_eq!(
+        session
+            .root_value_current("store.credential_count")
+            .unwrap(),
+        number(1)
+    );
 }
 
 #[test]

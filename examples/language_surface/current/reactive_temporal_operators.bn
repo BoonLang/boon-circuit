@@ -1,0 +1,20 @@
+trigger: SOURCE
+
+count:
+    0 |> HOLD count {
+        LATEST {
+            trigger |> THEN { count + 1 }
+        }
+    }
+
+sampled:
+    count |> WHEN {
+        0 => TEXT { zero }
+        __ => TEXT { nonzero }
+    }
+
+live:
+    count |> WHILE {
+        0 => TEXT { zero }
+        __ => TEXT { nonzero }
+    }

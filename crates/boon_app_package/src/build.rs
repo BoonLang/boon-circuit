@@ -4,12 +4,12 @@ use crate::{
     CapabilityProfileDescriptor, MAX_PACKAGE_FILE_BYTES, NamespaceProfile, PackageError,
     PackageFileManifest, ProgramManifest, RunMode, StaticCachePolicy, sha256_bytes,
 };
+use boon_contract::{SourceBundleDigestV1, SourceBundleUnit};
 use boon_plan::{ApplicationIdentity, ProgramRole};
 use boon_runtime::{
     ProgramArtifact, ProgramCompileRequest, RuntimeSourceUnit,
     compile_trusted_package_distributed_program_bundle,
 };
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -357,12 +357,12 @@ fn selected_capability_profiles(
 
 struct CompiledProgram {
     artifact: ProgramArtifact,
-    source_bundle_sha256: String,
+    source_bundle_digest_v1: SourceBundleDigestV1,
 }
 
 struct PreparedProgram {
     request: ProgramCompileRequest,
-    source_bundle_sha256: String,
+    source_bundle_digest_v1: SourceBundleDigestV1,
 }
 
 impl PreparedProgram {
@@ -374,15 +374,16 @@ impl PreparedProgram {
         if artifact.role() != program.role
             || artifact.capability_profile() != program.capability_profile
             || artifact.plan().target_profile != program.target_profile
+            || artifact.source_bundle_digest_v1() != self.source_bundle_digest_v1
         {
             return Err(PackageError::new(format!(
-                "compiled {} artifact does not match the declared role/profile contract",
+                "compiled {} artifact does not match the declared role/profile/source contract",
                 program.role.as_str()
             )));
         }
         Ok(CompiledProgram {
             artifact,
-            source_bundle_sha256: self.source_bundle_sha256,
+            source_bundle_digest_v1: self.source_bundle_digest_v1,
         })
     }
 }
@@ -416,7 +417,13 @@ fn prepare_program(
         .get(program.entry.as_str())
         .ok_or_else(|| PackageError::new("program entry was not resolved from sources"))?
         .clone();
-    let source_bundle_sha256 = source_bundle_digest(&units);
+    let source_bundle_digest_v1 = SourceBundleDigestV1::new(
+        &entry_path,
+        units
+            .iter()
+            .map(|unit| SourceBundleUnit::new(&unit.path, &unit.source)),
+    )
+    .map_err(|error| PackageError::new(format!("invalid source bundle identity: {error}")))?;
     let request = ProgramCompileRequest {
         revision: PROGRAM_ARTIFACT_REVISION,
         role: program.role,
@@ -431,7 +438,7 @@ fn prepare_program(
     };
     Ok(PreparedProgram {
         request,
-        source_bundle_sha256,
+        source_bundle_digest_v1,
     })
 }
 
@@ -476,8 +483,7 @@ fn write_artifact(
         content_media_type: content.media_type,
         bytes_sha256,
         bytes_len: content.bytes.len(),
-        source_bundle_sha256: compiled.source_bundle_sha256,
-        source_digest: compiled.artifact.source_digest().to_owned(),
+        source_bundle_digest_v1: compiled.source_bundle_digest_v1,
         plan_digest: compiled.artifact.plan_digest().to_owned(),
         compiler_id: compiled.artifact.compiler_id().to_owned(),
         target_profile: compiled.artifact.plan().target_profile,
@@ -788,18 +794,6 @@ fn write_bytes(output: &Path, target: &str, bytes: &[u8]) -> Result<(), PackageE
     }
     fs::write(path, bytes)?;
     Ok(())
-}
-
-fn source_bundle_digest(units: &[RuntimeSourceUnit]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"boon.source-bundle.v1");
-    for unit in units {
-        hasher.update((unit.path.len() as u64).to_be_bytes());
-        hasher.update(unit.path.as_bytes());
-        hasher.update((unit.source.len() as u64).to_be_bytes());
-        hasher.update(unit.source.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 fn browser_index(title: &str, canvas_id: &str) -> String {

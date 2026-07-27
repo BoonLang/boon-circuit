@@ -1,5 +1,5 @@
 use super::DistributedRuntimeError;
-use super::link::ClientSessionLink;
+use super::link::{ClientSessionLink, DataFrameRequest};
 use super::message::{DistributedMessage, DistributedMessagePayload};
 use boon_data::Value as DataValue;
 use boon_plan::{
@@ -337,15 +337,15 @@ fn encode_message(
                 )
             }
         };
-    link.encode_data(
+    link.encode_data(DataFrameRequest {
         operation_sequence,
-        message.edge_bytes(),
+        edge_id: message.edge_bytes(),
         operation,
         call_instance_id,
         semantic_revision,
         result_revision,
         payload,
-    )
+    })
 }
 
 pub(super) fn decode_frame(
@@ -372,14 +372,16 @@ pub(super) fn decode_frame(
             ack_through,
             message: classify_data(
                 schema,
-                producer,
-                consumer,
-                edge_id,
-                operation,
-                call_instance_id,
-                semantic_revision,
-                result_revision,
-                payload,
+                ClassifiedDataRequest {
+                    producer,
+                    consumer,
+                    edge_id,
+                    operation,
+                    call_instance_id,
+                    semantic_revision,
+                    result_revision,
+                    payload,
+                },
             )?,
         }),
         ClientSessionFrame::Ack { ack_through, .. } => {
@@ -391,8 +393,7 @@ pub(super) fn decode_frame(
     }
 }
 
-fn classify_data(
-    schema: &DistributedWireSchemaPlan,
+struct ClassifiedDataRequest {
     producer: ProgramRole,
     consumer: ProgramRole,
     edge_id: [u8; 32],
@@ -401,7 +402,22 @@ fn classify_data(
     semantic_revision: u64,
     result_revision: Option<u64>,
     payload: DataValue,
+}
+
+fn classify_data(
+    schema: &DistributedWireSchemaPlan,
+    request: ClassifiedDataRequest,
 ) -> Result<DistributedMessage, DistributedRuntimeError> {
+    let ClassifiedDataRequest {
+        producer,
+        consumer,
+        edge_id,
+        operation,
+        call_instance_id,
+        semantic_revision,
+        result_revision,
+        payload,
+    } = request;
     if operation == ClientSessionDataOperation::Event
         && let Some(edge) = schema.event_edges.iter().find(|edge| {
             edge.export_id.0 == edge_id
@@ -638,13 +654,13 @@ fn validate_adjacent_roles(
     producer: ProgramRole,
     consumer: ProgramRole,
 ) -> Result<(), DistributedRuntimeError> {
-    if producer.can_depend_on(consumer) || consumer.can_depend_on(producer) {
-        if !matches!(
+    if (producer.can_depend_on(consumer) || consumer.can_depend_on(producer))
+        && !matches!(
             (producer, consumer),
             (ProgramRole::Client, ProgramRole::Server) | (ProgramRole::Server, ProgramRole::Client)
-        ) {
-            return Ok(());
-        }
+        )
+    {
+        return Ok(());
     }
     Err(DistributedRuntimeError::UnknownTransportEdge)
 }

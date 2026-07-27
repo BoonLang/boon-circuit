@@ -4273,14 +4273,20 @@ fn patch_render_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeId> {
     patches
         .iter()
         .filter_map(|patch| match patch {
-            DocumentPatch::SetText { id, .. }
-            | DocumentPatch::SetStyle { id, .. }
-            | DocumentPatch::SetScroll { id, .. } => Some(id.clone()),
+            DocumentPatch::SetText { id, .. } | DocumentPatch::SetScroll { id, .. } => {
+                Some(id.clone())
+            }
+            DocumentPatch::SetStyle { id, patch }
+                if patch.keys().any(|key| style_key_affects_render(key)) =>
+            {
+                Some(id.clone())
+            }
             DocumentPatch::UpsertNode(_)
             | DocumentPatch::RemoveNode { .. }
             | DocumentPatch::InsertChild { .. }
             | DocumentPatch::RemoveChild { .. }
             | DocumentPatch::MoveChild { .. }
+            | DocumentPatch::SetStyle { .. }
             | DocumentPatch::SetBinding { .. }
             | DocumentPatch::SetBindingAt { .. }
             | DocumentPatch::SetTextInputFocus { .. }
@@ -6709,6 +6715,9 @@ fn style_patch_invalidation(changed_keys: &BTreeSet<String>) -> Vec<PatchInvalid
             push_unique_invalidation(&mut invalidation, PatchInvalidationClass::SourceBinding);
             push_unique_invalidation(&mut invalidation, PatchInvalidationClass::HitRegion);
         }
+        if style_key_affects_semantic_targeting(key) {
+            push_unique_invalidation(&mut invalidation, PatchInvalidationClass::HitRegion);
+        }
     }
     if invalidation.len() == 1 {
         push_unique_invalidation(&mut invalidation, PatchInvalidationClass::PaintOnly);
@@ -6963,7 +6972,7 @@ fn push_optional_key_text(key: &mut String, value: Option<&str>) {
 
 fn style_key_in_hash_category(key: &str, category: StyleHashCategory) -> bool {
     match category {
-        StyleHashCategory::All => true,
+        StyleHashCategory::All => style_key_affects_render(key),
         StyleHashCategory::Layout => style_key_affects_layout(key),
         StyleHashCategory::Paint => style_key_affects_paint(key),
         StyleHashCategory::Material => style_key_affects_material(key),
@@ -6980,6 +6989,17 @@ fn style_key_is_known(key: &str) -> bool {
         || style_key_affects_font(key)
         || style_key_affects_pseudo_state(key)
         || style_key_affects_source_binding(key)
+        || style_key_affects_semantic_targeting(key)
+}
+
+fn style_key_affects_render(key: &str) -> bool {
+    !style_key_is_known(key)
+        || style_key_affects_layout(key)
+        || style_key_affects_paint(key)
+        || style_key_affects_material(key)
+        || style_key_affects_font(key)
+        || style_key_affects_pseudo_state(key)
+        || style_key_affects_clip(key)
 }
 
 fn style_key_affects_layout(key: &str) -> bool {
@@ -7059,6 +7079,10 @@ fn style_key_affects_source_binding(key: &str) -> bool {
     key == "source_intent" || key == "source_binding" || key == "__source_binding"
 }
 
+fn style_key_affects_semantic_targeting(key: &str) -> bool {
+    key == "target" || key == "address"
+}
+
 fn materialization_report(
     node: &DocumentNode,
     materialized: &MaterializedRange,
@@ -7130,5 +7154,155 @@ fn demand_from_report(report: &MaterializationReport) -> LayoutDemand {
         stable_key_prefix: report.stable_key_prefix.clone(),
         first_stable_key: report.first_stable_key.clone(),
         last_stable_key: report.last_stable_key.clone(),
+    }
+}
+
+#[cfg(test)]
+mod semantic_style_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_metadata_style_patch_avoids_layout_render_and_binding_refresh_work() {
+        let patch = DocumentPatch::SetStyle {
+            id: DocumentNodeId("semantic-node".to_owned()),
+            patch: BTreeMap::from([
+                (
+                    "target".to_owned(),
+                    Some(StyleValue::Text("waveform canvas".to_owned())),
+                ),
+                (
+                    "address".to_owned(),
+                    Some(StyleValue::Text("simple_tb.s.temperature".to_owned())),
+                ),
+            ]),
+        };
+        let patches = [patch];
+
+        assert!(patch_render_nodes(&patches).is_empty());
+        assert!(patch_hit_metadata_nodes(&patches).is_empty());
+
+        let invalidation =
+            style_patch_invalidation(&BTreeSet::from(["target".to_owned(), "address".to_owned()]));
+        assert!(invalidation.contains(&PatchInvalidationClass::Style));
+        assert!(invalidation.contains(&PatchInvalidationClass::HitRegion));
+        for forbidden in [
+            PatchInvalidationClass::FullDocument,
+            PatchInvalidationClass::Layout,
+            PatchInvalidationClass::LayoutOnly,
+            PatchInvalidationClass::PaintOnly,
+            PatchInvalidationClass::SourceBinding,
+        ] {
+            assert!(!invalidation.contains(&forbidden), "{forbidden:?}");
+        }
+        assert_eq!(
+            ComputedStyleIdentity::from_style(&BTreeMap::new()),
+            ComputedStyleIdentity::from_style(&BTreeMap::from([
+                (
+                    "target".to_owned(),
+                    StyleValue::Text("waveform canvas".to_owned()),
+                ),
+                (
+                    "address".to_owned(),
+                    StyleValue::Text("simple_tb.s.temperature".to_owned()),
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn retained_semantic_metadata_patch_keeps_visual_identity_and_scene_current() {
+        let mut frame = DocumentFrame::empty("root");
+        let id = DocumentNodeId("semantic-button".to_owned());
+        let mut node = DocumentNode::new(id.0.clone(), DocumentNodeKind::Button);
+        node.parent = Some(frame.root.clone());
+        node.style
+            .insert("width".to_owned(), StyleValue::Number(120.0));
+        node.style
+            .insert("height".to_owned(), StyleValue::Number(32.0));
+        node.style.insert(
+            "target".to_owned(),
+            StyleValue::Text("old target".to_owned()),
+        );
+        node.style.insert(
+            "address".to_owned(),
+            StyleValue::Text("old address".to_owned()),
+        );
+        frame
+            .nodes
+            .get_mut(&frame.root)
+            .expect("test root")
+            .children
+            .push(id.clone());
+        frame.nodes.insert(id.clone(), node);
+
+        let viewport = Viewport {
+            surface: 1,
+            width: 320.0,
+            height: 200.0,
+            scale: 1.0,
+        };
+        let mut columns = render_scene::ApproximateTextColumnMeasurer;
+        let mut retained = RetainedDocument::new(frame, viewport, &mut columns).unwrap();
+        let previous_stats = retained.stats();
+        let previous_identity = retained
+            .layout()
+            .display_list
+            .iter()
+            .find(|item| item.node == id)
+            .expect("semantic display item")
+            .style_identity;
+        let previous_scene = retained.scene().clone();
+
+        let update = retained
+            .apply_patches(
+                vec![DocumentPatch::SetStyle {
+                    id: id.clone(),
+                    patch: BTreeMap::from([
+                        (
+                            "target".to_owned(),
+                            Some(StyleValue::Text("new target".to_owned())),
+                        ),
+                        (
+                            "address".to_owned(),
+                            Some(StyleValue::Text("new address".to_owned())),
+                        ),
+                    ]),
+                }],
+                &mut columns,
+            )
+            .unwrap();
+
+        assert!(update.content_changed);
+        assert!(!update.layout_changed);
+        assert!(!update.render_changed);
+        assert!(!update.full_lowered);
+        assert_eq!(
+            retained.stats().layout_revision,
+            previous_stats.layout_revision
+        );
+        assert_eq!(
+            retained.stats().render_revision,
+            previous_stats.render_revision
+        );
+        assert_eq!(retained.scene(), &previous_scene);
+        let item = retained
+            .layout()
+            .display_list
+            .iter()
+            .find(|item| item.node == id)
+            .expect("updated semantic display item");
+        assert_eq!(item.style_identity, previous_identity);
+        assert_eq!(
+            item.style.get("target"),
+            Some(&StyleValue::Text("new target".to_owned()))
+        );
+        assert_eq!(
+            retained
+                .frame()
+                .nodes
+                .get(&id)
+                .and_then(|node| node.style.get("address")),
+            Some(&StyleValue::Text("new address".to_owned()))
+        );
     }
 }

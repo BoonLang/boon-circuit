@@ -1,0 +1,19 @@
+store: [
+    increment: SOURCE
+
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+
+    rows:
+        LIST {
+            [id: 1, amount: 2]
+            [id: 2, amount: 3]
+        }
+
+    row_total:
+        rows
+        |> List/map(item, new: item.amount)
+        |> List/sum()
+]

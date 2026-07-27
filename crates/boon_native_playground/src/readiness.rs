@@ -64,6 +64,10 @@ impl RuntimeReadinessRetry {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this public activation handoff keeps replacement ownership allocation-free"
+)]
 pub enum PreparedRuntimeActivation {
     Opened(Box<RuntimeView>),
     Replacement(PreparedPersistentPlanActivation),
@@ -88,6 +92,10 @@ pub struct RuntimeReadinessOutcome {
     pub result: Result<ReadyPreview, String>,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "readiness jobs own their build request directly; boxing would add a worker-job allocation"
+)]
 enum RuntimeBuild {
     Open {
         executable: CompiledExecutable,

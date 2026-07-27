@@ -1,0 +1,2 @@
+packet: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
+prefix: packet |> Bytes/take(byte_count: 2)

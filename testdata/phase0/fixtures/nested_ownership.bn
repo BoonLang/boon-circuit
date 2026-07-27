@@ -1,0 +1,29 @@
+FUNCTION doubled(list, entry: OUT, new) {
+    list
+    |> List/map(
+        item: entry
+        new: new * 2
+    )
+}
+
+FUNCTION wrapped(list, row: OUT, new) {
+    list
+    |> doubled(
+        entry: row
+        new: new
+    )
+}
+
+rows: LIST {
+    [value: 1]
+    [value: 2]
+    [value: 3]
+}
+
+result:
+    rows
+    |> wrapped(
+        row
+        new: row.value
+    )
+    |> List/sum()

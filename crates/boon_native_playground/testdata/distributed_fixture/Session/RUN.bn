@@ -3,9 +3,7 @@ store: [
 
     session_count:
         0 |> HOLD session_count {
-            LATEST {
-                store.session_changed |> THEN { session_count + 1 }
-            }
+            store.session_changed |> THEN { session_count + 1 }
         }
 ]
 

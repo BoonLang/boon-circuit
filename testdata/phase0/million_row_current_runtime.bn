@@ -1,0 +1,57 @@
+-- Deterministic Phase 0 current-runtime scale fixture.
+--
+-- This deliberately measures the legacy tree-backed runtime. It does not claim
+-- packed representation, final Number/BITS/TAG semantics, or product behavior.
+
+store: [
+    sources: [
+        toggle_all: SOURCE
+        shift_page: SOURCE
+    ]
+
+    all_enabled:
+        False |> HOLD enabled {
+            sources.toggle_all |> THEN { enabled |> Bool/not() }
+        }
+
+    page_shifted:
+        False |> HOLD shifted {
+            sources.shift_page |> THEN { shifted |> Bool/not() }
+        }
+
+    page_floor:
+        page_shifted |> WHILE {
+            True => 999800
+            False => 999900
+        }
+
+    rows:
+        List/range(from: 0, to: 999999)
+        |> List/map(item, new: [
+            id: item
+            bucket: item % 100
+            enabled: all_enabled
+        ])
+
+    page:
+        rows
+        |> List/filter(item, if: item.id >= page_floor)
+        |> List/sort_by(item, key: item.id, direction: Ascending)
+        |> List/take(count: 100)
+
+    page_count:
+        page
+        |> List/count()
+
+    enabled_count:
+        rows
+        |> List/retain(item, if: item.enabled)
+        |> List/count()
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: store.page_count + store.enabled_count
+    )
+)

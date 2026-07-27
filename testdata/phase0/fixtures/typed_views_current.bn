@@ -1,0 +1,26 @@
+selected_city: TEXT { Oslo }
+page_after: Start
+
+rows: LIST[4] {
+    [id: 3, city: TEXT { Oslo }, name: TEXT { Gamma }]
+    [id: 1, city: TEXT { Oslo }, name: TEXT { Alpha }]
+    [id: 2, city: TEXT { Bergen }, name: TEXT { Beta }]
+    [id: 4, city: TEXT { Oslo }, name: TEXT { Delta }]
+}
+
+selected:
+    rows
+    |> List/filter(item, if: item.city == selected_city)
+    |> List/sort_by(item, key: item.id, direction: Ascending)
+    |> List/take(count: 2)
+    |> List/map(item, new: item.id)
+
+selected_sum:
+    selected
+    |> List/sum()
+
+page:
+    rows
+    |> List/filter(item, if: item.city == selected_city)
+    |> List/sort_by(item, key: item.name, direction: Ascending)
+    |> List/page(size: 2, after: page_after)

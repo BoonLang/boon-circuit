@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use boon_compiler::{
     CompilerSourceUnit, compile_runtime_source_units_to_machine_plan_with_persistence_catalog,
 };
+use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 use boon_plan::{
     DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, TargetProfile,
 };
@@ -14,6 +15,7 @@ use boon_runtime::{
     ProgramHostRequest, ProgramRequestId, ProgramSessionId, compile_program_artifact,
 };
 use futures::channel::mpsc;
+use sha2::{Digest, Sha256};
 
 use crate::distributed_program::compile_distributed_program;
 #[cfg(test)]
@@ -166,41 +168,28 @@ impl ProgramCompileWorker {
     pub fn replace(&self, request: ProgramHostRequest) -> ProgramCompileReceipt {
         let (lock, wake) = &*self.state;
         let mut state = lock.lock().expect("program compile worker lock");
-        let replace = state.pending.get(&request.session).is_none_or(|current| {
-            (request.compile.revision, request.request_id.0.as_str())
-                > (
-                    current.request.compile.revision,
-                    current.request.request_id.0.as_str(),
-                )
-        });
         if state.pending.contains_key(&request.session) {
             state.replaced = state.replaced.saturating_add(1);
         }
-        if replace {
-            let session = request.session.clone();
-            state.pending.insert(
-                session.clone(),
-                PendingProgramCompile {
-                    request,
-                    pending_depth: 0,
-                    queued_at: Instant::now(),
-                },
-            );
-            let pending_depth = state.pending.len().try_into().unwrap_or(u32::MAX);
-            state
-                .pending
-                .get_mut(&session)
-                .expect("inserted child program compile")
-                .pending_depth = pending_depth;
-            wake.notify_one();
-            return ProgramCompileReceipt {
-                accepted: true,
-                pending_depth,
-            };
-        }
+        let session = request.session.clone();
+        state.pending.insert(
+            session.clone(),
+            PendingProgramCompile {
+                request,
+                pending_depth: 0,
+                queued_at: Instant::now(),
+            },
+        );
+        let pending_depth = state.pending.len().try_into().unwrap_or(u32::MAX);
+        state
+            .pending
+            .get_mut(&session)
+            .expect("inserted child program compile")
+            .pending_depth = pending_depth;
+        wake.notify_one();
         ProgramCompileReceipt {
-            accepted: false,
-            pending_depth: state.pending.len().try_into().unwrap_or(u32::MAX),
+            accepted: true,
+            pending_depth,
         }
     }
 
@@ -316,28 +305,41 @@ fn compile_loop(
 
 fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
     let started = Instant::now();
-    let source_key = preview_project_key(&request.source, request.migration_stage.as_deref());
+    let source_key = preview_project_key(
+        &request.source,
+        request.migration.as_ref(),
+        request.migration_stage.as_deref(),
+    )?;
     let executable = match &request.source {
-        PreviewSource::BuiltInSingleRole { application, units } => {
+        PreviewSource::BuiltInSingleRole {
+            application,
+            entry_path,
+            units,
+        } => {
             if units.is_empty() {
                 return Err("preview source bundle is empty".to_owned());
             }
-            let label = units
-                .last()
-                .map(|unit| unit.path.clone())
-                .unwrap_or_else(|| "preview.bn".to_owned());
             let plan = match (&request.migration, request.migration_stage.as_deref()) {
                 (Some(migration), Some(stage_id)) => compile_migration_stage_with_units(
                     application,
                     migration,
                     stage_id,
-                    Some(units),
+                    Some((entry_path, units)),
                 )?,
                 (None, None) => {
-                    let units = compiler_units(units);
+                    let bundle = canonical_preview_source_bundle(entry_path, units)?;
+                    let entry_path = bundle.entrypoint().to_owned();
+                    let units = bundle
+                        .units()
+                        .iter()
+                        .map(|unit| CompilerSourceUnit {
+                            path: unit.path().to_owned(),
+                            source: unit.source().to_owned(),
+                        })
+                        .collect::<Vec<_>>();
                     Arc::new(
                         compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
-                            &label,
+                            &entry_path,
                             &units,
                             TargetProfile::SoftwareDefault,
                             application.clone(),
@@ -395,22 +397,47 @@ fn compile_migration_stage_with_units(
     application: &ApplicationIdentity,
     migration: &MigrationBundle,
     target_stage: &str,
-    target_units: Option<&[SourceUnit]>,
+    target_source: Option<(&str, &[SourceUnit])>,
 ) -> Result<Arc<MachinePlan>, String> {
     if migration.stage(target_stage).is_none() {
         return Err(format!("migration stage `{target_stage}` is absent"));
     }
     let mut predecessor = None::<MigrationPredecessorBinding>;
     for stage in &migration.stages {
-        let units = compiler_units(if stage.id == target_stage {
-            target_units.unwrap_or(&stage.units)
+        let source_units = if stage.id == target_stage {
+            if let Some((entry_path, units)) = target_source {
+                let working_entrypoint = canonical_preview_source_bundle(entry_path, units)?
+                    .entrypoint()
+                    .to_owned();
+                let declared_entrypoint = canonical_preview_source_bundle(&stage.source, units)?
+                    .entrypoint()
+                    .to_owned();
+                if working_entrypoint != declared_entrypoint {
+                    return Err(format!(
+                        "migration stage `{target_stage}` working entrypoint `{working_entrypoint}` differs from declared entrypoint `{declared_entrypoint}`"
+                    ));
+                }
+                units
+            } else {
+                &stage.units
+            }
         } else {
             &stage.units
-        });
+        };
+        let bundle = canonical_preview_source_bundle(&stage.source, source_units)?;
+        let entry_path = bundle.entrypoint().to_owned();
+        let units = bundle
+            .units()
+            .iter()
+            .map(|unit| CompilerSourceUnit {
+                path: unit.path().to_owned(),
+                source: unit.source().to_owned(),
+            })
+            .collect::<Vec<_>>();
         let predecessors = predecessor.as_slice();
         let plan = Arc::new(
             compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
-                &stage.source,
+                &entry_path,
                 &units,
                 TargetProfile::SoftwareDefault,
                 application.clone(),
@@ -428,96 +455,168 @@ fn compile_migration_stage_with_units(
     Err(format!("migration stage `{target_stage}` is absent"))
 }
 
-fn compiler_units(units: &[SourceUnit]) -> Vec<CompilerSourceUnit> {
-    units
-        .iter()
-        .map(|unit| CompilerSourceUnit {
-            path: unit.path.clone(),
-            source: unit.source.clone(),
-        })
-        .collect()
-}
-
-pub fn source_key(units: &[SourceUnit]) -> String {
-    let parts = units
-        .iter()
-        .map(|unit| (unit.path.as_str(), unit.source.as_str()))
-        .collect::<Vec<_>>();
-    boon_runtime::source_unit_parts_hash(&parts)
+fn canonical_preview_source_bundle<'a>(
+    entry_path: &str,
+    units: &'a [SourceUnit],
+) -> Result<CanonicalSourceBundleV1<'a>, String> {
+    CanonicalSourceBundleV1::new(
+        entry_path,
+        units
+            .iter()
+            .map(|unit| SourceBundleUnit::new(&unit.path, &unit.source)),
+    )
+    .map_err(|error| format!("invalid preview source bundle identity: {error}"))
 }
 
 #[cfg(test)]
-pub fn project_key(application: &ApplicationIdentity, units: &[SourceUnit]) -> String {
-    project_key_for_stage(application, units, None)
+pub fn source_key(entry_path: &str, units: &[SourceUnit]) -> Result<String, String> {
+    canonical_preview_source_bundle(entry_path, units).map(|bundle| bundle.digest().to_string())
+}
+
+#[cfg(test)]
+pub fn project_key(
+    application: &ApplicationIdentity,
+    entry_path: &str,
+    units: &[SourceUnit],
+) -> Result<String, String> {
+    project_key_for_stage(application, entry_path, units, None)
 }
 
 pub fn project_key_for_stage(
     application: &ApplicationIdentity,
+    entry_path: &str,
     units: &[SourceUnit],
     migration_stage: Option<&str>,
-) -> String {
-    let source = source_key(units);
-    boon_runtime::source_unit_parts_hash(&[
-        ("application.package_id", application.package_id.as_str()),
-        (
-            "application.state_namespace",
-            application.state_namespace.as_str(),
-        ),
-        (
-            "application.deployment_domain",
-            application.deployment_domain.as_str(),
-        ),
-        ("migration.stage", migration_stage.unwrap_or_default()),
-        ("source", source.as_str()),
-    ])
+) -> Result<String, String> {
+    let digest = canonical_preview_source_bundle(entry_path, units)?.digest();
+    Ok(preview_identity_key(
+        migration_stage,
+        [(boon_plan::ProgramRole::Client, application, digest)],
+        [],
+    ))
 }
 
-pub fn preview_project_key(source: &PreviewSource, migration_stage: Option<&str>) -> String {
+pub fn preview_project_key(
+    source: &PreviewSource,
+    migration: Option<&MigrationBundle>,
+    migration_stage: Option<&str>,
+) -> Result<String, String> {
     let programs = match source {
-        PreviewSource::BuiltInSingleRole { application, units } => {
-            return project_key_for_stage(application, units, migration_stage);
+        PreviewSource::BuiltInSingleRole {
+            application,
+            entry_path,
+            units,
+        } => {
+            return match (migration, migration_stage) {
+                (None, None) => project_key_for_stage(application, entry_path, units, None),
+                (Some(migration), Some(stage_id)) => migration_project_key(
+                    application,
+                    migration,
+                    stage_id,
+                    Some((entry_path, units)),
+                ),
+                _ => Err(
+                    "migration source identity requires both a bundle and an active stage"
+                        .to_owned(),
+                ),
+            };
         }
         PreviewSource::DistributedPackage { programs } => programs,
     };
+    if migration.is_some() || migration_stage.is_some() {
+        return Err("distributed packages cannot use single-role migration identity".to_owned());
+    }
     let mut programs = programs.iter().collect::<Vec<_>>();
     programs.sort_by_key(|program| match program.role {
         boon_plan::ProgramRole::Client => 0,
         boon_plan::ProgramRole::Session => 1,
         boon_plan::ProgramRole::Server => 2,
     });
-    let mut owned = Vec::<(String, String)>::new();
-    for (program_index, program) in programs.into_iter().enumerate() {
-        let prefix = format!("program.{program_index}");
-        owned.push((format!("{prefix}.role"), program.role.as_str().to_owned()));
-        owned.push((format!("{prefix}.entry"), program.entry_path.clone()));
-        owned.push((
-            format!("{prefix}.package_id"),
-            program.application.package_id.clone(),
-        ));
-        owned.push((
-            format!("{prefix}.state_namespace"),
-            program.application.state_namespace.clone(),
-        ));
-        owned.push((
-            format!("{prefix}.deployment_domain"),
-            program.application.deployment_domain.clone(),
-        ));
-        for (unit_index, unit) in program.units.iter().enumerate() {
-            owned.push((
-                format!("{prefix}.unit.{unit_index}.path"),
-                unit.path.clone(),
-            ));
-            owned.push((
-                format!("{prefix}.unit.{unit_index}.source"),
-                unit.source.clone(),
+    let mut identities = Vec::with_capacity(programs.len());
+    for program in programs {
+        let digest = canonical_preview_source_bundle(&program.entry_path, &program.units)?.digest();
+        identities.push((program.role, &program.application, digest));
+    }
+    Ok(preview_identity_key(None, identities, []))
+}
+
+pub(crate) fn migration_project_key(
+    application: &ApplicationIdentity,
+    migration: &MigrationBundle,
+    target_stage: &str,
+    target_source: Option<(&str, &[SourceUnit])>,
+) -> Result<String, String> {
+    let mut stages = Vec::new();
+    for stage in &migration.stages {
+        let units = if stage.id == target_stage {
+            if let Some((entry_path, units)) = target_source {
+                let working_entrypoint = canonical_preview_source_bundle(entry_path, units)?
+                    .entrypoint()
+                    .to_owned();
+                let declared_entrypoint = canonical_preview_source_bundle(&stage.source, units)?
+                    .entrypoint()
+                    .to_owned();
+                if working_entrypoint != declared_entrypoint {
+                    return Err(format!(
+                        "migration stage `{target_stage}` working entrypoint `{working_entrypoint}` differs from declared entrypoint `{declared_entrypoint}`"
+                    ));
+                }
+                units
+            } else {
+                &stage.units
+            }
+        } else {
+            &stage.units
+        };
+        let digest = canonical_preview_source_bundle(&stage.source, units)?.digest();
+        stages.push((stage.id.as_str(), stage.schema_version, digest));
+        if stage.id == target_stage {
+            return Ok(preview_identity_key(
+                Some(target_stage),
+                [(boon_plan::ProgramRole::Client, application, digest)],
+                stages,
             ));
         }
     }
-    let parts = owned
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect::<Vec<_>>();
-    boon_runtime::source_unit_parts_hash(&parts)
+    Err(format!("migration stage `{target_stage}` is absent"))
+}
+
+fn preview_identity_key<'a, 'b>(
+    migration_stage: Option<&str>,
+    programs: impl IntoIterator<
+        Item = (
+            boon_plan::ProgramRole,
+            &'a ApplicationIdentity,
+            SourceBundleDigestV1,
+        ),
+    >,
+    migration_stages: impl IntoIterator<Item = (&'b str, u64, SourceBundleDigestV1)>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.preview-project.v3\0");
+    hash_preview_identity_part(&mut hasher, migration_stage.unwrap_or_default().as_bytes());
+    let programs = programs.into_iter().collect::<Vec<_>>();
+    hash_preview_identity_part(&mut hasher, &(programs.len() as u64).to_be_bytes());
+    for (role, application, digest) in programs {
+        hash_preview_identity_part(&mut hasher, role.as_str().as_bytes());
+        hash_preview_identity_part(&mut hasher, application.package_id.as_bytes());
+        hash_preview_identity_part(&mut hasher, application.state_namespace.as_bytes());
+        hash_preview_identity_part(&mut hasher, application.deployment_domain.as_bytes());
+        hash_preview_identity_part(&mut hasher, digest.as_bytes());
+    }
+    let migration_stages = migration_stages.into_iter().collect::<Vec<_>>();
+    hash_preview_identity_part(&mut hasher, &(migration_stages.len() as u64).to_be_bytes());
+    for (stage_id, schema_version, digest) in migration_stages {
+        hash_preview_identity_part(&mut hasher, stage_id.as_bytes());
+        hash_preview_identity_part(&mut hasher, &schema_version.to_be_bytes());
+        hash_preview_identity_part(&mut hasher, digest.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_preview_identity_part(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
 }
 
 #[cfg(test)]
@@ -542,6 +641,7 @@ mod tests {
                 revision: 7,
                 source: PreviewSource::BuiltInSingleRole {
                     application: application(&format!("mailbox-{job_id}")),
+                    entry_path: "RUN.bn".to_owned(),
                     units: Vec::new(),
                 },
                 test_steps: Vec::new(),
@@ -558,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn child_program_mailbox_is_depth_one_per_session_and_latest_wins() {
+    fn child_program_mailbox_is_depth_one_per_session_and_last_arrival_wins() {
         let worker = ProgramCompileWorker {
             state: Arc::new((Mutex::new(ProgramCompileState::default()), Condvar::new())),
             thread: None,
@@ -566,7 +666,7 @@ mod tests {
         let host = boon_document_model::DocumentNodeId("program-host".to_owned());
         let session = ProgramSessionId("public-page".to_owned());
         for revision in [4, 1, 3, 2] {
-            worker.replace(ProgramHostRequest {
+            let receipt = worker.replace(ProgramHostRequest {
                 request_id: ProgramRequestId(format!("request-{revision}")),
                 session: session.clone(),
                 host: host.clone(),
@@ -584,12 +684,40 @@ mod tests {
                 artifact_id: None,
                 artifact_ownership: None,
             });
+            assert!(receipt.accepted);
         }
 
-        assert_eq!(worker.replaced_count(), 3);
+        {
+            let state = worker.state.0.lock().unwrap();
+            assert_eq!(state.pending[&session].request.compile.revision, 2);
+        }
+        for request_id in ["ff", "00"] {
+            let receipt = worker.replace(ProgramHostRequest {
+                request_id: ProgramRequestId(request_id.to_owned()),
+                session: session.clone(),
+                host: host.clone(),
+                compile: boon_runtime::ProgramCompileRequest {
+                    revision: 2,
+                    entry_path: "RUN.bn".to_owned(),
+                    units: vec![boon_runtime::RuntimeSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: format!("value: {request_id}\n"),
+                    }],
+                    application: application("child-mailbox"),
+                    role: boon_plan::ProgramRole::Client,
+                    capability_profile: boon_document_model::ProgramCapabilityProfile::PublicClient,
+                },
+                artifact_id: None,
+                artifact_ownership: None,
+            });
+            assert!(receipt.accepted);
+        }
+
+        assert_eq!(worker.replaced_count(), 5);
         let state = worker.state.0.lock().unwrap();
         assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.pending[&session].request.compile.revision, 4);
+        assert_eq!(state.pending[&session].request.compile.revision, 2);
+        assert_eq!(state.pending[&session].request.request_id.0, "00");
         assert_eq!(state.pending[&session].pending_depth, 1);
     }
 
@@ -600,8 +728,114 @@ mod tests {
             source: "value: 1\n".to_owned(),
         }];
         assert_ne!(
-            project_key(&application("first"), &units),
-            project_key(&application("second"), &units)
+            project_key(&application("first"), "RUN.bn", &units).unwrap(),
+            project_key(&application("second"), "RUN.bn", &units).unwrap()
+        );
+    }
+
+    #[test]
+    fn source_key_includes_entry_path_and_normalizes_unit_order_and_separators() {
+        let source = "value: 1\n";
+        assert_ne!(
+            source_key(
+                "A.bn",
+                &[SourceUnit {
+                    path: "A.bn".to_owned(),
+                    source: source.to_owned(),
+                }],
+            )
+            .unwrap(),
+            source_key(
+                "B.bn",
+                &[SourceUnit {
+                    path: "B.bn".to_owned(),
+                    source: source.to_owned(),
+                }],
+            )
+            .unwrap()
+        );
+
+        let slash = vec![
+            SourceUnit {
+                path: "nested/Entry.bn".to_owned(),
+                source: source.to_owned(),
+            },
+            SourceUnit {
+                path: "nested/Support.bn".to_owned(),
+                source: "FUNCTION helper() {\n    []\n}\n".to_owned(),
+            },
+        ];
+        let mut backslash = slash.clone();
+        backslash.reverse();
+        for unit in &mut backslash {
+            unit.path = unit.path.replace('/', "\\");
+        }
+        assert_eq!(
+            source_key("nested/Entry.bn", &slash).unwrap(),
+            source_key("nested\\Entry.bn", &backslash).unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_project_key_covers_ordered_predecessor_source_and_schema() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("counter_migration")
+            .unwrap();
+        let migration = example.migration.expect("counter migration bundle");
+        let target_index = migration.stages.len() - 1;
+        let target = &migration.stages[target_index];
+        let target_stage = target.id.clone();
+        assert!(target_index > 0, "fixture must have a predecessor stage");
+        let source = PreviewSource::BuiltInSingleRole {
+            application: example.application,
+            entry_path: target.source.clone(),
+            units: target.units.clone(),
+        };
+        let before = preview_project_key(&source, Some(&migration), Some(&target_stage)).unwrap();
+
+        let mut changed_source = migration.clone();
+        changed_source.stages[target_index - 1].units[0]
+            .source
+            .push('\n');
+        assert_ne!(
+            before,
+            preview_project_key(&source, Some(&changed_source), Some(&target_stage)).unwrap()
+        );
+
+        let mut changed_schema = migration;
+        changed_schema.stages[target_index - 1].schema_version += 1;
+        assert_ne!(
+            before,
+            preview_project_key(&source, Some(&changed_schema), Some(&target_stage)).unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_project_key_rejects_a_working_entrypoint_mismatch() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("counter_migration")
+            .unwrap();
+        let migration = example.migration.expect("counter migration bundle");
+        let target = migration.stages.last().expect("migration target stage");
+        let target_stage = target.id.clone();
+        let mut units = target.units.clone();
+        units.push(SourceUnit {
+            path: "DifferentEntry.bn".to_owned(),
+            source: "scene: []\n".to_owned(),
+        });
+        let source = PreviewSource::BuiltInSingleRole {
+            application: example.application,
+            entry_path: "DifferentEntry.bn".to_owned(),
+            units,
+        };
+        let error =
+            preview_project_key(&source, Some(&migration), Some(&target_stage)).unwrap_err();
+        assert!(error.contains("working entrypoint"), "{error}");
+        assert!(
+            error.contains("differs from declared entrypoint"),
+            "{error}"
         );
     }
 
@@ -642,9 +876,33 @@ mod tests {
                 programs: programs.clone(),
             },
             None,
+            None,
+        )
+        .unwrap();
+        let mut equivalent = programs.clone();
+        equivalent.reverse();
+        for program in &mut equivalent {
+            program.entry_path = program.entry_path.replace('/', "\\");
+            program.units.reverse();
+            for unit in &mut program.units {
+                unit.path = unit.path.replace('/', "\\");
+            }
+        }
+        assert_eq!(
+            before,
+            preview_project_key(
+                &PreviewSource::DistributedPackage {
+                    programs: equivalent,
+                },
+                None,
+                None,
+            )
+            .unwrap()
         );
         programs[2].units[0].source = "value: 4\n".to_owned();
-        let after = preview_project_key(&PreviewSource::DistributedPackage { programs }, None);
+        let after =
+            preview_project_key(&PreviewSource::DistributedPackage { programs }, None, None)
+                .unwrap();
         assert_ne!(before, after);
     }
 
@@ -735,6 +993,7 @@ mod tests {
             revision: 1,
             source: PreviewSource::BuiltInSingleRole {
                 application: application.clone(),
+                entry_path: "examples/minimal.bn".to_owned(),
                 units: vec![SourceUnit {
                     path: "examples/minimal.bn".to_owned(),
                     source: include_str!("../../../examples/minimal.bn").to_owned(),

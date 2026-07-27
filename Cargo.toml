@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/boon_phase0_baseline",
+    "crates/boon_contract",
     "crates/boon_data",
     "crates/boon_wire",
     "crates/boon_effect_schema",
@@ -43,6 +45,8 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
+boon_phase0_baseline = { path = "crates/boon_phase0_baseline", default-features = false }
+boon_contract = { path = "crates/boon_contract" }
 boon_data = { path = "crates/boon_data" }
 boon_wire = { path = "crates/boon_wire" }
 boon_effect_schema = { path = "crates/boon_effect_schema" }

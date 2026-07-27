@@ -1,0 +1,5 @@
+FUNCTION nonnegative(value) WHERE {
+    value >= 0
+} {
+    value
+}

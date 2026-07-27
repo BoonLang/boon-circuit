@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+boon_phase0_baseline = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

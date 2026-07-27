@@ -548,17 +548,17 @@ pub(crate) fn producer_function_ownership_seed(
 
     let mut lists = BTreeSet::new();
     for derived in &program.derived_values {
-        if owned_fields.contains(&plan_field_id(derived.id)) {
-            if let Some(list) = derived.materialized_list_id {
-                lists.insert(plan_list_id(list));
-            }
+        if owned_fields.contains(&plan_field_id(derived.id))
+            && let Some(list) = derived.materialized_list_id
+        {
+            lists.insert(plan_list_id(list));
         }
     }
     for materialization in &program.materializations {
-        if owned_ir.contains(&materialization.owner) {
-            if let Some(list) = materialization.target_list_id {
-                lists.insert(plan_list_id(list));
-            }
+        if owned_ir.contains(&materialization.owner)
+            && let Some(list) = materialization.target_list_id
+        {
+            lists.insert(plan_list_id(list));
         }
     }
     for definition in program
@@ -787,11 +787,10 @@ fn plan_source_row_projections(
         .scope_index
         .row_source_projections
         .iter()
-        .filter_map(|projection| {
-            (projection.source == source.id).then(|| SourceRowProjection {
-                list: plan_list_id(projection.row.list),
-                path: projection.path.clone(),
-            })
+        .filter(|projection| projection.source == source.id)
+        .map(|projection| SourceRowProjection {
+            list: plan_list_id(projection.row.list),
+            path: projection.path.clone(),
         })
         .collect::<Vec<_>>();
     projections.sort();
@@ -4443,7 +4442,11 @@ pub(crate) fn compile_typed_program_with_distributed_context(
             let mut inputs = vec![trigger.clone()];
             let exact_effect = exact_host_effect_expression(program, arm.output_expression_id)?;
             let (value, effect) = if let Some(effect_expression) = exact_effect {
-                let (operation, effect_gate, intent_expressions) = exact_host_effect_plan_parts(
+                let HostEffectPlanParts {
+                    operation,
+                    gate: effect_gate,
+                    intent_expressions,
+                } = exact_host_effect_plan_parts(
                     program,
                     &index,
                     &mut row_expressions,
@@ -5286,6 +5289,78 @@ pub(crate) fn validate_resource_only_fields_excluded(
         return Ok(());
     }
 
+    fn validate_field_id(
+        field: FieldId,
+        resource_fields: &BTreeSet<FieldId>,
+        location: &str,
+    ) -> Result<(), PlanError> {
+        if resource_fields.contains(&field) {
+            return Err(PlanError::new(format!(
+                "resource-only FieldId {} entered {location}",
+                field.0
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_captures(
+        captures: &[PlanRowCapture],
+        resource_fields: &BTreeSet<FieldId>,
+        location: &str,
+    ) -> Result<(), PlanError> {
+        for capture in captures {
+            validate_field_id(capture.field, resource_fields, location)?;
+        }
+        Ok(())
+    }
+
+    fn validate_list_access_captures(
+        access: &PlanListAccess,
+        resource_fields: &BTreeSet<FieldId>,
+    ) -> Result<(), PlanError> {
+        for map in &access.maps {
+            validate_captures(
+                &map.captures,
+                resource_fields,
+                "a typed list-access scalar capture",
+            )?;
+        }
+        Ok(())
+    }
+
+    if let RootOutputDemand::Selected(fields) = &plan.demand.root_derived_outputs {
+        for field in fields {
+            validate_field_id(
+                *field,
+                &resource_fields,
+                "selected root-output scalar demand",
+            )?;
+        }
+    }
+    for memory in &plan.persistence.memory {
+        for leaf in &memory.leaves {
+            if let Some(field) = leaf.runtime_field_id {
+                validate_field_id(field, &resource_fields, "persistent scalar memory metadata")?;
+            }
+        }
+    }
+    for list in &plan.persistence.lists {
+        for field in &list.row_fields {
+            if let Some(field) = field.runtime_field_id {
+                validate_field_id(
+                    field,
+                    &resource_fields,
+                    "persistent list-row memory metadata",
+                )?;
+            }
+        }
+    }
+    for slot in &plan.storage_layout.scalar_slots {
+        if let Some(field) = slot.indexed_field_id {
+            validate_field_id(field, &resource_fields, "indexed scalar storage metadata")?;
+        }
+    }
+
     if let Some(distributed) = &plan.distributed_endpoint {
         for export in &distributed.endpoint.value_exports {
             validate_resource_value_ref(&export.value, &resource_fields)?;
@@ -5324,8 +5399,30 @@ pub(crate) fn validate_resource_only_fields_excluded(
         }
     }
     for (_, expression) in plan.row_expressions.iter() {
-        if let PlanRowExpressionNode::Field { input } = expression {
-            validate_resource_value_ref(input, &resource_fields)?;
+        match expression {
+            PlanRowExpressionNode::Field { input } => {
+                validate_resource_value_ref(input, &resource_fields)?;
+            }
+            PlanRowExpressionNode::ListGetField { field, .. } => {
+                validate_field_id(*field, &resource_fields, "a scalar ListGetField read")?;
+            }
+            PlanRowExpressionNode::ListRowField { field, .. } => {
+                validate_field_id(*field, &resource_fields, "a scalar ListRowField read")?;
+            }
+            PlanRowExpressionNode::ContextualCollection { captures, .. } => {
+                validate_captures(
+                    captures,
+                    &resource_fields,
+                    "a contextual collection scalar capture",
+                )?;
+            }
+            PlanRowExpressionNode::ListAccess { access } => {
+                validate_list_access_captures(access, &resource_fields)?;
+            }
+            PlanRowExpressionNode::ListPage { page } => {
+                validate_list_access_captures(&page.access, &resource_fields)?;
+            }
+            _ => {}
         }
     }
     for delta in &plan.delta_plan.deltas {
@@ -5339,6 +5436,69 @@ pub(crate) fn validate_resource_only_fields_excluded(
                     "resource-only FieldId {} entered ListId {} scalar storage",
                     field.field_id.0, slot.list_id.0
                 )));
+            }
+        }
+        for row in &slot.initial_rows {
+            for field in &row.fields {
+                if let Some(field) = field.field_id {
+                    validate_field_id(field, &resource_fields, "a scalar initial-list row field")?;
+                }
+            }
+        }
+    }
+
+    if let Some(document) = &plan.document {
+        for expression in &document.expressions {
+            let DocumentExprOp::Read { read } = &expression.op else {
+                continue;
+            };
+            match read {
+                DocumentRead::Field { field } => {
+                    validate_field_id(
+                        *field,
+                        &resource_fields,
+                        "a retained document scalar field read",
+                    )?;
+                }
+                DocumentRead::Row {
+                    field: Some(field), ..
+                } => {
+                    validate_field_id(
+                        *field,
+                        &resource_fields,
+                        "a retained document row-field read",
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        for materialization in &document.materializations {
+            let field = match &materialization.source {
+                DocumentMaterializationSource::Field { field }
+                | DocumentMaterializationSource::ScopedField { field, .. }
+                | DocumentMaterializationSource::ParameterField { field, .. } => Some(*field),
+                _ => None,
+            };
+            if let Some(field) = field {
+                validate_field_id(
+                    field,
+                    &resource_fields,
+                    "a retained document materialization source",
+                )?;
+            }
+        }
+        for binding in &document.view_bindings {
+            let field = match &binding.target {
+                DocumentBindingTarget::Field { field }
+                | DocumentBindingTarget::ScopedField { field, .. } => Some(*field),
+                _ => None,
+            };
+            if let Some(field) = field {
+                validate_field_id(
+                    field,
+                    &resource_fields,
+                    "a retained document scalar binding target",
+                )?;
             }
         }
     }
@@ -5358,12 +5518,30 @@ pub(crate) fn validate_resource_only_fields_excluded(
         Ok(())
     }
 
-    fn validate_materialization_copies(
+    fn validate_materialization_resource_fields(
         materialization: &PlanListMaterialization,
         resource_fields: &BTreeSet<FieldId>,
     ) -> Result<(), PlanError> {
+        for (name, field) in &materialization.fields {
+            if resource_fields.contains(field) {
+                return Err(PlanError::new(format!(
+                    "resource-only FieldId {} entered ListId {} scalar materialization field `{name}`",
+                    field.0, materialization.target_list.0
+                )));
+            }
+        }
         for copy in &materialization.row_field_copies {
             validate_copy(copy, resource_fields)?;
+        }
+        for authority in &materialization.value_list_authorities {
+            for (name, field) in &authority.fields {
+                if resource_fields.contains(field) {
+                    return Err(PlanError::new(format!(
+                        "resource-only FieldId {} entered ListId {} value-list authority field `{name}`",
+                        field.0, authority.list_id.0
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -5400,7 +5578,7 @@ pub(crate) fn validate_resource_only_fields_excluded(
                     expression,
                     ..
                 } => {
-                    validate_materialization_copies(materialization, &resource_fields)?;
+                    validate_materialization_resource_fields(materialization, &resource_fields)?;
                     if let Some(expression) = expression {
                         validate_resource_derived_expression(expression, &resource_fields)?;
                     }
@@ -5429,6 +5607,14 @@ pub(crate) fn validate_resource_only_fields_excluded(
                 PlanOpKind::ListMutation { mutation } => match mutation {
                     PlanListMutation::Append(append) => {
                         validate_resource_value_ref(&append.trigger, &resource_fields)?;
+                        for field in &append.fields {
+                            if resource_fields.contains(&field.field_id) {
+                                return Err(PlanError::new(format!(
+                                    "resource-only FieldId {} entered list append field `{}`",
+                                    field.field_id.0, field.name
+                                )));
+                            }
+                        }
                         for copy in &append.row_field_copies {
                             validate_copy(copy, &resource_fields)?;
                         }
@@ -6409,6 +6595,15 @@ fn plan_initial_list_rows(
                                 list.name, field.name
                             ))
                         })?;
+                        if program
+                            .scope_index
+                            .fields
+                            .get(field_id.0)
+                            .filter(|field| plan_field_id(field.id) == field_id)
+                            .is_some_and(|field| field.resource_only)
+                        {
+                            return Ok(None);
+                        }
                         let initializer = if let Some(value) = initial_constant_value(&field.value) {
                             PlanInitialListFieldInitializer::Constant { value }
                         } else if let Some(expression_id) = field.expression {
@@ -6511,13 +6706,16 @@ fn plan_initial_list_rows(
                             }
                             }
                         };
-                        Ok(PlanInitialListField {
+                        Ok(Some(PlanInitialListField {
                             name: field.name.clone(),
                             field_id: Some(field_id),
                             initializer,
-                        })
+                        }))
                     })
-                    .collect::<Result<Vec<_>, PlanError>>()?,
+                    .collect::<Result<Vec<_>, PlanError>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect(),
             })
         })
         .collect()
@@ -7048,12 +7246,16 @@ fn materialized_resource_fields(
     program: &ErasedProgram,
     target_list: ListId,
 ) -> impl Iterator<Item = String> + '_ {
-    program.scope_index.fields.iter().filter_map(move |field| {
-        (field.row.map(|row| plan_list_id(row.list)) == Some(target_list)
-            && field.role.is_value()
-            && field.resource_only)
-            .then(|| field.name.clone())
-    })
+    program
+        .scope_index
+        .fields
+        .iter()
+        .filter(move |field| {
+            field.row.map(|row| plan_list_id(row.list)) == Some(target_list)
+                && field.role.is_value()
+                && field.resource_only
+        })
+        .map(|field| field.name.clone())
 }
 
 fn strip_materialized_non_value_fields(
@@ -7201,6 +7403,11 @@ struct UnresolvedOrderedKeyCandidate {
     row_local: PlanLocalId,
     expression: PlanRowExpressionId,
     direction: PlanRowExpressionId,
+}
+
+struct ResolvedOrderDirectionVariants {
+    selectors: Vec<PlanRowExpressionId>,
+    key_variants: Vec<(Vec<PlanOrderDirection>, Vec<OrderedKeyCandidate>)>,
 }
 
 struct PlannedListAccessSet {
@@ -7390,24 +7597,22 @@ fn lower_exhaustive_candidate_view(
             operation: PlanContextualOperationKind::Filter,
             ..
         }
-    ) {
-        if let Some(accesses) = plan_typed_list_access(
-            program,
-            value_index,
-            arena,
-            constants,
-            expression,
-            terminal_limit,
-            indexes,
-        )? {
-            let expression = build_directional_access_expression(arena, accesses, |mut access| {
-                access.exhaustive_candidate_limit = Some(MAX_EXHAUSTIVE_LIST_CANDIDATES);
-                PlanRowExpressionNode::ListAccess {
-                    access: Box::new(access),
-                }
-            })?;
-            return Ok((expression, true));
-        }
+    ) && let Some(accesses) = plan_typed_list_access(
+        program,
+        value_index,
+        arena,
+        constants,
+        expression,
+        terminal_limit,
+        indexes,
+    )? {
+        let expression = build_directional_access_expression(arena, accesses, |mut access| {
+            access.exhaustive_candidate_limit = Some(MAX_EXHAUSTIVE_LIST_CANDIDATES);
+            PlanRowExpressionNode::ListAccess {
+                access: Box::new(access),
+            }
+        })?;
+        return Ok((expression, true));
     }
 
     let child = match &node {
@@ -7717,8 +7922,10 @@ fn plan_typed_list_access(
     else {
         return Ok(None);
     };
-    let (selectors, key_variants) =
-        resolve_order_direction_variants(arena, constants, &unresolved_keys)?;
+    let ResolvedOrderDirectionVariants {
+        selectors,
+        key_variants,
+    } = resolve_order_direction_variants(arena, constants, &unresolved_keys)?;
     let mut variants = Vec::with_capacity(key_variants.len());
     for (directions, keys) in key_variants {
         let Some(access) = plan_static_typed_list_access(
@@ -7829,13 +8036,7 @@ fn resolve_order_direction_variants(
     arena: &PlanRowExpressionArena,
     constants: &[PlanConstant],
     keys: &[UnresolvedOrderedKeyCandidate],
-) -> Result<
-    (
-        Vec<PlanRowExpressionId>,
-        Vec<(Vec<PlanOrderDirection>, Vec<OrderedKeyCandidate>)>,
-    ),
-    PlanError,
-> {
+) -> Result<ResolvedOrderDirectionVariants, PlanError> {
     enum DirectionSource {
         Static(PlanOrderDirection),
         Selector(usize),
@@ -7899,7 +8100,10 @@ fn resolve_order_direction_variants(
             .collect();
         variants.push((selector_directions, resolved));
     }
-    Ok((selectors, variants))
+    Ok(ResolvedOrderDirectionVariants {
+        selectors,
+        key_variants: variants,
+    })
 }
 
 fn build_directional_access_expression(
@@ -8504,11 +8708,11 @@ fn selection_for_range_pair(
         return None;
     }
     let lower = PlanListAccessBound {
-        value: lower_value.clone(),
+        value: *lower_value,
         inclusive: *lower_operator == PlanInfixOp::GreaterOrEqual,
     };
     let upper = PlanListAccessBound {
-        value: upper_value.clone(),
+        value: *upper_value,
         inclusive: *upper_operator == PlanInfixOp::LessOrEqual,
     };
     let (lower, upper) = if direction == PlanOrderDirection::Ascending {
@@ -8531,23 +8735,23 @@ fn selection_for_filter_atom(
     match &atom.atom {
         FilterSeekAtom::Exact { value, .. } => {
             let mut values = leading;
-            values.push(value.clone());
+            values.push(*value);
             Some(PlanListAccessSelection::KeyPrefix { values })
         }
         FilterSeekAtom::ListMembership { value, .. } => {
             let mut values = leading;
-            values.push(value.clone());
+            values.push(*value);
             Some(PlanListAccessSelection::KeyPrefix { values })
         }
         FilterSeekAtom::TextPrefix { prefix, .. } => Some(PlanListAccessSelection::TextPrefix {
             leading,
-            prefix: prefix.clone(),
+            prefix: *prefix,
         }),
         FilterSeekAtom::Range {
             operator, value, ..
         } => {
             let bound = PlanListAccessBound {
-                value: value.clone(),
+                value: *value,
                 inclusive: matches!(
                     operator,
                     PlanInfixOp::GreaterOrEqual | PlanInfixOp::LessOrEqual
@@ -11488,29 +11692,26 @@ fn plan_builtin_expression(
     if let Some(runtime_builtin) = runtime_builtin {
         runtime_builtin.validate_call(input, &args)?;
     }
-    let fallback_input = input.clone();
+    let fallback_input = input;
     let named = |names: &[&str]| row_call_arg_value(&args, names);
     let expression =
         match function {
             "Text/trim" => input
                 .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::TextTrim { input: input }),
+                .map(|input| PlanRowExpressionNode::TextTrim { input }),
             "Text/is_empty" => input
                 .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::TextIsEmpty { input: input }),
+                .map(|input| PlanRowExpressionNode::TextIsEmpty { input }),
             "Text/starts_with" => input
                 .or_else(|| named(&["input", "text"]))
                 .zip(named(&["prefix"]))
-                .map(|(input, prefix)| PlanRowExpressionNode::TextStartsWith {
-                    input: input,
-                    prefix: prefix,
-                }),
+                .map(|(input, prefix)| PlanRowExpressionNode::TextStartsWith { input, prefix }),
             "Text/length" => input
                 .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::TextLength { input: input }),
+                .map(|input| PlanRowExpressionNode::TextLength { input }),
             "Text/to_number" => input
                 .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::TextToNumber { input: input }),
+                .map(|input| PlanRowExpressionNode::TextToNumber { input }),
             "Text/concat" => input
                 .or_else(|| named(&["input", "text", "left"]))
                 .zip(named(&["with", "right"]))
@@ -11528,48 +11729,45 @@ fn plan_builtin_expression(
                 .zip(named(&["length"]))
                 .map(
                     |((input, start), length)| PlanRowExpressionNode::TextSubstring {
-                        input: input,
-                        start: start,
-                        length: length,
+                        input,
+                        start,
+                        length,
                     },
                 ),
             "Text/to_bytes" => input.or_else(|| named(&["input", "text"])).map(|input| {
                 PlanRowExpressionNode::TextToBytes {
-                    input: input,
+                    input,
                     encoding: named(&["encoding"]),
                 }
             }),
             "Bytes/to_text" => input.or_else(|| named(&["input", "bytes"])).map(|input| {
                 PlanRowExpressionNode::BytesToText {
-                    input: input,
+                    input,
                     encoding: named(&["encoding"]),
                 }
             }),
             "Bytes/to_hex" => input
                 .or_else(|| named(&["input", "bytes"]))
-                .map(|input| PlanRowExpressionNode::BytesToHex { input: input }),
+                .map(|input| PlanRowExpressionNode::BytesToHex { input }),
             "Bytes/to_base64" => input
                 .or_else(|| named(&["input", "bytes"]))
-                .map(|input| PlanRowExpressionNode::BytesToBase64 { input: input }),
+                .map(|input| PlanRowExpressionNode::BytesToBase64 { input }),
             "Bytes/from_hex" => input
                 .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::BytesFromHex { input: input }),
+                .map(|input| PlanRowExpressionNode::BytesFromHex { input }),
             "Bytes/from_base64" => input
                 .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::BytesFromBase64 { input: input }),
+                .map(|input| PlanRowExpressionNode::BytesFromBase64 { input }),
             "Bytes/is_empty" => input
                 .or_else(|| named(&["input"]))
-                .map(|input| PlanRowExpressionNode::BytesIsEmpty { input: input }),
+                .map(|input| PlanRowExpressionNode::BytesIsEmpty { input }),
             "Bytes/length" => input
                 .or_else(|| named(&["input"]))
-                .map(|input| PlanRowExpressionNode::BytesLength { input: input }),
+                .map(|input| PlanRowExpressionNode::BytesLength { input }),
             "Bytes/get" => input
                 .or_else(|| named(&["input"]))
                 .zip(named(&["index"]))
-                .map(|(input, index)| PlanRowExpressionNode::BytesGet {
-                    input: input,
-                    index: index,
-                }),
+                .map(|(input, index)| PlanRowExpressionNode::BytesGet { input, index }),
             "Bytes/read_unsigned" | "Bytes/read_signed" => input
                 .or_else(|| named(&["input"]))
                 .zip(named(&["offset"]))
@@ -11578,17 +11776,17 @@ fn plan_builtin_expression(
                 .map(|(((input, offset), byte_count), endian)| {
                     if function == "Bytes/read_signed" {
                         PlanRowExpressionNode::BytesReadSigned {
-                            input: input,
-                            offset: offset,
-                            byte_count: byte_count,
-                            endian: endian,
+                            input,
+                            offset,
+                            byte_count,
+                            endian,
                         }
                     } else {
                         PlanRowExpressionNode::BytesReadUnsigned {
-                            input: input,
-                            offset: offset,
-                            byte_count: byte_count,
-                            endian: endian,
+                            input,
+                            offset,
+                            byte_count,
+                            endian,
                         }
                     }
                 }),
@@ -11598,38 +11796,29 @@ fn plan_builtin_expression(
                 .zip(named(&["byte_count", "length", "count"]))
                 .map(
                     |((input, offset), byte_count)| PlanRowExpressionNode::BytesSlice {
-                        input: input,
-                        offset: offset,
-                        byte_count: byte_count,
+                        input,
+                        offset,
+                        byte_count,
                     },
                 ),
             "Bytes/take" => input
                 .or_else(|| named(&["input"]))
                 .zip(named(&["byte_count", "length", "count"]))
-                .map(|(input, byte_count)| PlanRowExpressionNode::BytesTake {
-                    input: input,
-                    byte_count: byte_count,
-                }),
+                .map(|(input, byte_count)| PlanRowExpressionNode::BytesTake { input, byte_count }),
             "Bytes/drop" => input
                 .or_else(|| named(&["input"]))
                 .zip(named(&["byte_count", "length", "count"]))
-                .map(|(input, byte_count)| PlanRowExpressionNode::BytesDrop {
-                    input: input,
-                    byte_count: byte_count,
-                }),
-            "Bytes/zeros" => named(&["byte_count", "length", "count"]).map(|byte_count| {
-                PlanRowExpressionNode::BytesZeros {
-                    byte_count: byte_count,
-                }
-            }),
+                .map(|(input, byte_count)| PlanRowExpressionNode::BytesDrop { input, byte_count }),
+            "Bytes/zeros" => named(&["byte_count", "length", "count"])
+                .map(|byte_count| PlanRowExpressionNode::BytesZeros { byte_count }),
             "Bytes/set" => input
                 .or_else(|| named(&["input"]))
                 .zip(named(&["index"]))
                 .zip(named(&["value"]))
                 .map(|((input, index), value)| PlanRowExpressionNode::BytesSet {
-                    input: input,
-                    index: index,
-                    value: value,
+                    input,
+                    index,
+                    value,
                 }),
             "Bytes/write_unsigned" | "Bytes/write_signed" => input
                 .or_else(|| named(&["input"]))
@@ -11640,63 +11829,48 @@ fn plan_builtin_expression(
                 .map(|((((input, offset), byte_count), endian), value)| {
                     if function == "Bytes/write_signed" {
                         PlanRowExpressionNode::BytesWriteSigned {
-                            input: input,
-                            offset: offset,
-                            byte_count: byte_count,
-                            endian: endian,
-                            value: value,
+                            input,
+                            offset,
+                            byte_count,
+                            endian,
+                            value,
                         }
                     } else {
                         PlanRowExpressionNode::BytesWriteUnsigned {
-                            input: input,
-                            offset: offset,
-                            byte_count: byte_count,
-                            endian: endian,
-                            value: value,
+                            input,
+                            offset,
+                            byte_count,
+                            endian,
+                            value,
                         }
                     }
                 }),
             "Bytes/find" => input
                 .or_else(|| named(&["input"]))
                 .zip(named(&["needle"]))
-                .map(|(input, needle)| PlanRowExpressionNode::BytesFind {
-                    input: input,
-                    needle: needle,
-                }),
+                .map(|(input, needle)| PlanRowExpressionNode::BytesFind { input, needle }),
             "Bytes/starts_with" => input
                 .or_else(|| named(&["input"]))
                 .zip(named(&["prefix"]))
-                .map(|(input, prefix)| PlanRowExpressionNode::BytesStartsWith {
-                    input: input,
-                    prefix: prefix,
-                }),
+                .map(|(input, prefix)| PlanRowExpressionNode::BytesStartsWith { input, prefix }),
             "Bytes/ends_with" => input
                 .or_else(|| named(&["input"]))
                 .zip(named(&["suffix"]))
-                .map(|(input, suffix)| PlanRowExpressionNode::BytesEndsWith {
-                    input: input,
-                    suffix: suffix,
-                }),
+                .map(|(input, suffix)| PlanRowExpressionNode::BytesEndsWith { input, suffix }),
             "Bytes/concat" => input
                 .or_else(|| named(&["left", "input"]))
                 .zip(named(&["right", "with"]))
-                .map(|(left, right)| PlanRowExpressionNode::BytesConcat {
-                    left: left,
-                    right: right,
-                }),
+                .map(|(left, right)| PlanRowExpressionNode::BytesConcat { left, right }),
             "Bytes/equal" => input
                 .or_else(|| named(&["left", "input"]))
                 .zip(named(&["right", "with"]))
-                .map(|(left, right)| PlanRowExpressionNode::BytesEqual {
-                    left: left,
-                    right: right,
-                }),
+                .map(|(left, right)| PlanRowExpressionNode::BytesEqual { left, right }),
             "List/range" => named(&["from"])
                 .zip(named(&["to"]))
-                .map(|(from, to)| PlanRowExpressionNode::ListRange { from: from, to: to }),
+                .map(|(from, to)| PlanRowExpressionNode::ListRange { from, to }),
             "List/sum" => input
                 .or_else(|| named(&["input", "list"]))
-                .map(|input| PlanRowExpressionNode::ListSum { input: input }),
+                .map(|input| PlanRowExpressionNode::ListSum { input }),
             "List/get" | "List/latest" | "List/count" | "List/length" | "List/is_not_empty"
             | "List/take" => input.or_else(|| named(&["input", "list"])).map(|input| {
                 PlanRowExpressionNode::BuiltinCall {
@@ -11996,6 +12170,12 @@ fn exact_host_effect_expression(
     }
 }
 
+struct HostEffectPlanParts {
+    operation: String,
+    gate: PlanRowExpressionId,
+    intent_expressions: Vec<(String, PlanRowExpressionId)>,
+}
+
 fn exact_host_effect_plan_parts(
     program: &ErasedProgram,
     index: &ValueIndex,
@@ -12006,14 +12186,7 @@ fn exact_host_effect_plan_parts(
     active_state: ir::ExecutableStateId,
     output: ir::ExecutableExprId,
     effect: ir::ExecutableExprId,
-) -> Result<
-    (
-        String,
-        PlanRowExpressionId,
-        Vec<(String, PlanRowExpressionId)>,
-    ),
-    PlanError,
-> {
+) -> Result<HostEffectPlanParts, PlanError> {
     let expression = program
         .executable
         .expressions
@@ -12076,7 +12249,11 @@ fn exact_host_effect_plan_parts(
         };
         intent_expressions.push((field.name, value));
     }
-    Ok((name.clone(), gate, intent_expressions))
+    Ok(HostEffectPlanParts {
+        operation: name.clone(),
+        gate,
+        intent_expressions,
+    })
 }
 
 fn push_plan_constant(
@@ -12829,7 +13006,7 @@ impl ValueIndex {
                         .filter(|field| !field.is_empty())
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
-                    (!field_path.is_empty()).then(|| {
+                    (!field_path.is_empty()).then_some({
                         (
                             candidate.len(),
                             ValueRef::StateProjection {
@@ -12992,6 +13169,16 @@ document: Document/new(
         );
     }
 
+    fn assert_resource_field_surface_rejected(
+        compiled: &crate::CompiledMachinePlanFromSource,
+        plan: &MachinePlan,
+        expected: &str,
+    ) {
+        let error = validate_resource_only_fields_excluded(&compiled.ir, plan)
+            .expect_err("resource-only typed field surface must fail");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
     #[test]
     fn value_index_excludes_resource_only_paths() {
         let compiled = compiled_resource_rows();
@@ -13102,6 +13289,169 @@ document: Document/new(
         nodes.push(PlanRowExpressionNode::Field { input: resource });
         arena_plan.row_expressions = PlanRowExpressionArena::from_nodes(nodes).unwrap();
         assert_resource_ref_rejected(&compiled, &arena_plan, "unreachable arena node");
+
+        let resource_field = resource_field(&compiled);
+        let mut materialization_plan = compiled.plan.clone();
+        let materialization = materialization_plan
+            .regions
+            .iter_mut()
+            .flat_map(|region| &mut region.ops)
+            .find_map(|op| match &mut op.kind {
+                PlanOpKind::DerivedValue {
+                    materialization: Some(materialization),
+                    ..
+                } => Some(materialization),
+                _ => None,
+            })
+            .expect("resource-row fixture materialization");
+        materialization
+            .fields
+            .insert("forged_resource".to_owned(), resource_field);
+        let error = validate_resource_only_fields_excluded(&compiled.ir, &materialization_plan)
+            .expect_err("resource-only materialization field must fail");
+        assert!(
+            error.to_string().contains("scalar materialization field"),
+            "{error}"
+        );
+
+        let mut authority_plan = compiled.plan.clone();
+        let materialization = authority_plan
+            .regions
+            .iter_mut()
+            .flat_map(|region| &mut region.ops)
+            .find_map(|op| match &mut op.kind {
+                PlanOpKind::DerivedValue {
+                    materialization: Some(materialization),
+                    ..
+                } => Some(materialization),
+                _ => None,
+            })
+            .expect("resource-row fixture materialization");
+        materialization
+            .value_list_authorities
+            .push(PlanValueListAuthority {
+                owner: PlanStaticOwnerId::ROOT,
+                list_id: materialization.target_list,
+                fields: BTreeMap::from([("forged_resource".to_owned(), resource_field)]),
+            });
+        let error = validate_resource_only_fields_excluded(&compiled.ir, &authority_plan)
+            .expect_err("resource-only value-list authority field must fail");
+        assert!(
+            error.to_string().contains("value-list authority field"),
+            "{error}"
+        );
+
+        let mut append_plan = compiled.plan.clone();
+        let row_expression = append_plan
+            .row_expressions
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("resource-row fixture row expression");
+        let list_id = append_plan
+            .storage_layout
+            .list_slots
+            .first()
+            .map(|slot| slot.list_id)
+            .expect("resource-row fixture list");
+        append_plan.regions[0].ops[0].kind = PlanOpKind::ListMutation {
+            mutation: PlanListMutation::Append(PlanListAppend {
+                site: 0,
+                ordinal: 0,
+                owner: PlanOwner::root(),
+                trigger: ValueRef::List(list_id),
+                gate: row_expression,
+                item: row_expression,
+                fields: vec![PlanListAppendField {
+                    name: "forged_resource".to_owned(),
+                    field_id: resource_field,
+                }],
+                row_field_copies: Vec::new(),
+            }),
+        };
+        let error = validate_resource_only_fields_excluded(&compiled.ir, &append_plan)
+            .expect_err("resource-only append field must fail");
+        assert!(error.to_string().contains("list append field"), "{error}");
+
+        let mut demand_plan = compiled.plan.clone();
+        demand_plan.demand.root_derived_outputs = RootOutputDemand::Selected(vec![resource_field]);
+        assert_resource_field_surface_rejected(
+            &compiled,
+            &demand_plan,
+            "selected root-output scalar demand",
+        );
+
+        let mut persistence_plan = compiled.plan.clone();
+        persistence_plan
+            .persistence
+            .memory
+            .first_mut()
+            .expect("resource-row fixture scalar memory")
+            .leaves
+            .first_mut()
+            .expect("resource-row fixture scalar memory leaf")
+            .runtime_field_id = Some(resource_field);
+        assert_resource_field_surface_rejected(
+            &compiled,
+            &persistence_plan,
+            "persistent scalar memory metadata",
+        );
+
+        let mut initial_row_plan = compiled.plan.clone();
+        initial_row_plan
+            .storage_layout
+            .list_slots
+            .iter_mut()
+            .flat_map(|slot| &mut slot.initial_rows)
+            .flat_map(|row| &mut row.fields)
+            .next()
+            .expect("resource-row fixture initial list field")
+            .field_id = Some(resource_field);
+        assert_resource_field_surface_rejected(
+            &compiled,
+            &initial_row_plan,
+            "scalar initial-list row field",
+        );
+
+        let mut list_get_plan = compiled.plan.clone();
+        let mut nodes = list_get_plan.row_expressions.clone().into_nodes();
+        let index = PlanRowExpressionId(0);
+        let list_id = list_get_plan
+            .storage_layout
+            .list_slots
+            .first()
+            .expect("resource-row fixture list")
+            .list_id;
+        nodes.push(PlanRowExpressionNode::ListGetField {
+            list_id,
+            index,
+            field: resource_field,
+        });
+        list_get_plan.row_expressions = PlanRowExpressionArena::from_nodes(nodes).unwrap();
+        assert_resource_field_surface_rejected(
+            &compiled,
+            &list_get_plan,
+            "scalar ListGetField read",
+        );
+
+        let mut document_plan = compiled.plan.clone();
+        document_plan
+            .document
+            .as_mut()
+            .expect("resource-row fixture document")
+            .expressions
+            .first_mut()
+            .expect("resource-row fixture document expression")
+            .op = DocumentExprOp::Read {
+            read: DocumentRead::Field {
+                field: resource_field,
+            },
+        };
+        assert_resource_field_surface_rejected(
+            &compiled,
+            &document_plan,
+            "retained document scalar field read",
+        );
     }
 }
 

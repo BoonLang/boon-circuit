@@ -1,0 +1,187 @@
+format_version = 1
+
+[[documents]]
+id = "implementation-order"
+path = "docs/plans/steps.md"
+classification = "sequence-contract"
+owner_phase = "all"
+
+[[documents]]
+id = "unified-goal"
+path = "docs/plans/GOAL_PROMPT.md"
+classification = "execution-contract"
+owner_phase = "all"
+
+[[documents]]
+id = "out-parameters"
+path = "docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-1-verified-spine"
+
+[[documents]]
+id = "type-inference"
+path = "docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-1-verified-spine"
+
+[[documents]]
+id = "foundations"
+path = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-2-foundations"
+
+[[documents]]
+id = "typed-list"
+path = "docs/plans/TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-3-typed-list"
+
+[[documents]]
+id = "formal-verification"
+path = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-4-formal"
+
+[[documents]]
+id = "persistence"
+path = "docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-6-web-persistence"
+
+[[documents]]
+id = "packed-data"
+path = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-5-packed"
+
+[[documents]]
+id = "first-riscv"
+path = "docs/plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-8-riscv"
+
+[[documents]]
+id = "portfolio"
+path = "docs/plans/BOON_EXAMPLE_PORTFOLIO_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-9-portfolio"
+
+[[documents]]
+id = "novywave"
+path = "docs/plans/NOVYWAVE_BOON_REWRITE_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-6-web-persistence"
+
+[[documents]]
+id = "fjordpulse"
+path = "docs/plans/FJORDPULSE_FULL_STACK_BOON_REWRITE_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-6-web-persistence"
+
+[[documents]]
+id = "language-semantics"
+path = "docs/architecture/LANGUAGE_SEMANTICS.md"
+classification = "current-behavior"
+owner_phase = "goal-phase-2-foundations"
+
+[[documents]]
+id = "bytes-semantics"
+path = "docs/architecture/BYTES_SEMANTICS.md"
+classification = "current-behavior"
+owner_phase = "goal-phase-2-foundations"
+
+[[documents]]
+id = "runtime-model"
+path = "docs/architecture/RUNTIME_MODEL.md"
+classification = "current-behavior"
+owner_phase = "goal-phase-5-packed"
+
+[[documents]]
+id = "list-model"
+path = "docs/architecture/LIST_MODEL.md"
+classification = "current-behavior"
+owner_phase = "goal-phase-3-typed-list"
+
+[[documents]]
+id = "delta-protocol"
+path = "docs/architecture/DELTA_PROTOCOL.md"
+classification = "current-behavior"
+owner_phase = "goal-phase-6-web-persistence"
+
+[[documents]]
+id = "native-gpu-pipeline"
+path = "docs/architecture/NATIVE_GPU_PIPELINE.md"
+classification = "active-implementation-contract"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+
+[[documents]]
+id = "native-gpu-handoff-manifest"
+path = "docs/architecture/native_gpu_handoff_manifest.json"
+classification = "active-implementation-contract"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+
+[[documents]]
+id = "repository-agent-contract"
+path = "AGENTS.md"
+classification = "active-implementation-contract"
+owner_phase = "all"
+
+[[documents]]
+id = "boon-type-notation-and-inspector"
+path = "docs/architecture/BOON_TYPE_NOTATION_AND_INSPECTOR.md"
+classification = "rewrite-required"
+owner_phase = "goal-phase-2-foundations"
+status_notice = "Phase 0 status: rewrite required."
+
+[[documents]]
+id = "native-editor-type-hints"
+path = "docs/architecture/NATIVE_EDITOR_TYPE_HINTS.md"
+classification = "rewrite-required"
+owner_phase = "goal-phase-2-foundations"
+status_notice = "Phase 0 status: rewrite required."
+
+[[documents]]
+id = "pass-passed-and-todomvc-ui-model"
+path = "docs/architecture/PASS_PASSED_AND_TODOMVC_UI_MODEL.md"
+classification = "rewrite-required"
+owner_phase = "goal-phase-1-verified-spine"
+status_notice = "Phase 0 status: rewrite required."
+
+[[documents]]
+id = "number-specialization-experiment"
+path = "docs/architecture/NUMBER_SPECIALIZATION_EXPERIMENT.md"
+classification = "delete-after-replacement"
+owner_phase = "goal-phase-2-foundations"
+status_notice = "Phase 0 status: delete after replacement."
+
+[[documents]]
+id = "fpga-todomvc-lowering"
+path = "docs/architecture/FPGA_TODOMVC_LOWERING.md"
+classification = "delete-after-replacement"
+owner_phase = "goal-phase-8-riscv"
+status_notice = "Phase 0 status: delete after replacement."
+
+[[documents]]
+id = "previous-attempts"
+path = "docs/architecture/PREVIOUS_ATTEMPTS.md"
+classification = "historical-context"
+owner_phase = "all"
+
+[[documents]]
+id = "simplification-native-recovery"
+path = "docs/plans/BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md"
+classification = "active-implementation-contract"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+
+[[documents]]
+id = "manual-testing-runbook"
+path = "docs/plans/MANUAL_TESTING_RUNBOOK.md"
+classification = "active-implementation-contract"
+owner_phase = "goal-phase-7-pre-hardware-evidence"
+
+[[documents]]
+id = "persons-pro-local-first"
+path = "docs/plans/PERSONS_PRO_LOCAL_FIRST_IMPLEMENTATION_PLAN.md"
+classification = "rewrite-required"
+owner_phase = "goal-phase-6-web-persistence"
+status_notice = "Phase 0 status: rewrite required."

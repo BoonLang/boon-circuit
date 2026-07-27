@@ -1,0 +1,4 @@
+lookup: MAP {
+    TEXT { one } => 1
+    TEXT { two } => 2
+}

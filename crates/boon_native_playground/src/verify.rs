@@ -682,17 +682,18 @@ fn run_linux_harness(profile: &VerifierProfile, run_id: &str, artifact_dir: &Pat
             return capture.into_evidence(profile);
         }
     };
-    let mut session = match NativeSession::start(
-        &workspace,
-        &scratch.path,
-        &executable,
-        profile.example(),
-        &observer_path,
-        &artifact_dir.join("primary"),
-        &state_root,
+    let primary_artifact_dir = artifact_dir.join("primary");
+    let mut session = match NativeSession::start(NativeSessionStartRequest {
+        workspace: &workspace,
+        runtime_dir: &scratch.path,
+        executable: &executable,
+        example: profile.example(),
+        observer_socket: &observer_path,
+        artifact_dir: &primary_artifact_dir,
+        state_root: &state_root,
         profile,
-        NativeSessionPhase::Primary,
-    ) {
+        phase: NativeSessionPhase::Primary,
+    }) {
         Ok(session) => session,
         Err(error) => {
             capture
@@ -1026,17 +1027,17 @@ fn run_restart_phase(
     baseline: &RestartBaseline,
 ) -> Result<(NativeSession, RolePids), String> {
     let start = events.len();
-    let mut session = NativeSession::start(
+    let mut session = NativeSession::start(NativeSessionStartRequest {
         workspace,
         runtime_dir,
         executable,
-        profile.example(),
-        observer_path,
+        example: profile.example(),
+        observer_socket: observer_path,
         artifact_dir,
         state_root,
         profile,
-        NativeSessionPhase::Restart,
-    )?;
+        phase: NativeSessionPhase::Restart,
+    })?;
     let result = (|| {
         let roles = session.wait_for_roles(ROLE_READY_TIMEOUT)?;
         if roles.preview == baseline.frame.process_id
@@ -3041,7 +3042,7 @@ fn drive_profile_visible_sample(
         return drive_click_sample(session, observer, events, preview_point, preview_target);
     }
     let alternate = off_target.ok_or("hover profile has no alternate target")?;
-    let (point, expected) = if ordinal % 2 == 0 {
+    let (point, expected) = if ordinal.is_multiple_of(2) {
         (preview_point, Some(preview_target))
     } else {
         (alternate.0, alternate.1.as_deref())
@@ -6560,18 +6561,32 @@ enum NativeSessionPhase {
 }
 
 #[cfg(target_os = "linux")]
+struct NativeSessionStartRequest<'a> {
+    workspace: &'a Path,
+    runtime_dir: &'a Path,
+    executable: &'a Path,
+    example: &'a str,
+    observer_socket: &'a Path,
+    artifact_dir: &'a Path,
+    state_root: &'a Path,
+    profile: &'a VerifierProfile,
+    phase: NativeSessionPhase,
+}
+
+#[cfg(target_os = "linux")]
 impl NativeSession {
-    fn start(
-        workspace: &Path,
-        runtime_dir: &Path,
-        executable: &Path,
-        example: &str,
-        observer_socket: &Path,
-        artifact_dir: &Path,
-        state_root: &Path,
-        profile: &VerifierProfile,
-        phase: NativeSessionPhase,
-    ) -> Result<Self, String> {
+    fn start(request: NativeSessionStartRequest<'_>) -> Result<Self, String> {
+        let NativeSessionStartRequest {
+            workspace,
+            runtime_dir,
+            executable,
+            example,
+            observer_socket,
+            artifact_dir,
+            state_root,
+            profile,
+            phase,
+        } = request;
         let ipc = runtime_dir.join("desktop.sock");
         let launch_log = runtime_dir.join("desktop-launch.log");
         let role_log = runtime_dir.join("native-roles.log");

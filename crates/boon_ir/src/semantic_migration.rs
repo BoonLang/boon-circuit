@@ -510,7 +510,6 @@ fn semantic_type_for_state(
     Ok(std::iter::once(semantic_data_type(&initial.flow_type.ty))
         .chain(std::iter::once(semantic_data_type(&binding.flow_type.ty)))
         .chain(field.map(|field| semantic_data_type(&field.flow_type.ty)))
-        .into_iter()
         .max_by_key(type_quality)
         .unwrap_or_else(|| SemanticDataType::Unknown {
             reason: format!(
@@ -534,7 +533,6 @@ fn semantic_type_for_list(
                 .map(|flow_type| semantic_data_type(&flow_type.ty))
         })
         .filter(|data_type| matches!(data_type, SemanticDataType::List { .. }))
-        .into_iter()
         .max_by_key(semantic_list_type_quality)
         .unwrap_or_else(|| SemanticDataType::Unknown {
             reason: format!(

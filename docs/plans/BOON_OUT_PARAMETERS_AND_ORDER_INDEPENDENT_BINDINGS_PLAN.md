@@ -7,6 +7,15 @@ language surface, compiler cutover, runtime ownership model, collection API
 migrations, verification work, and clear end condition. It is not a
 description of syntax currently accepted by every compiler path.
 
+Under the combined order in [`steps.md`](steps.md), the structural/compiler
+slice establishes the verified artifact boundary first. This plan's full Clear
+End Condition closes only after formal phases 0–5 validate that final semantic
+model.
+
+The public value algebra, truth model, and compiler artifact spine are governed
+by [`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md).
+This plan specializes that universal contract for contextual calls and `OUT`.
+
 The design must remain a general Boon feature. `List/map` is the motivating
 case, but compiler, runtime, document, distributed, and verifier code must not
 special-case `List/map` or any example.
@@ -27,8 +36,8 @@ special-case `List/map` or any example.
   forwarding statically.
 - Replace reflective collection calls with typed contextual calls that remain
   indexable and virtualizable.
-- Make every executable backend consume one checked and elaborated program
-  instead of rediscovering call or row semantics independently.
+- Make every executable backend consume one verified and erased program instead
+  of rediscovering call or row semantics independently.
 - Materialize only demanded keyed list windows while keeping logical list
   length, state, dependencies, and identity intact.
 
@@ -792,19 +801,35 @@ Before backend lowering:
 6. Infer and validate each argument's evaluation scope.
 7. Expand the function in its declaring runtime island.
 8. Unify output nets and validate exactly one producer.
-9. Erase transparent function and `OUT` wiring.
-10. Assign canonical plan IDs from structural provenance.
+9. Record the proof-visible contextual graph and obligations in
+   `SemanticProgram`.
+10. Verify the complete semantic contract and produce
+    `ContractVerifiedProgram`.
+11. Erase transparent functions, `OUT`, `PASS`, and `WHERE`.
+12. Assign canonical plan IDs from structural provenance.
 
 No fallback may eagerly compile all call arguments in the caller scope when
 the typed signature requires a contextual scope.
 
-### Checked And Erased Programs
+### Authoritative Compiler Spine
 
-The cutover uses two authoritative compiler products rather than letting each
-backend reinterpret parser AST:
+The cutover uses the universal compiler artifact sequence rather than letting
+each backend reinterpret parser AST:
 
 ```text
-CheckedProgram (owned by boon_typecheck)
+ParsedProgram
+-> CheckedProgram
+-> SemanticProgram
+-> ContractVerifiedProgram
+-> ErasedProgram
+-> MachinePlan
+-> PhysicalPlan or CoreHardwareIR
+```
+
+The `OUT`-specific contents of those products are:
+
+```text
+CheckedProgram (boon_typecheck)
   stable DeclId and LexicalScopeId
   resolved callable identity
   exact typed call entries
@@ -813,23 +838,44 @@ CheckedProgram (owned by boon_typecheck)
   scope-effect and correlation summaries
   typed collection predicates and projections
 
-ErasedProgram (owned by boon_ir)
+SemanticProgram (boon_semantic)
   expanded contextual functions
   unified and validated OutNet graph
   structural OwnerInstanceId anchors
+  typed list views and dependency manifests
+  proof-visible calls, outputs, ownership, and obligations
+
+ContractVerifiedProgram (boon_verify)
+  certified reference to the exact SemanticProgram
+  discharged obligations and verification-profile evidence
+  no verification bypass for programs without authored WHERE
+
+ErasedProgram (boon_ir)
   canonical executable operations
-  no OUT, PASS, wrapper call, or parser-level call ambiguity
+  no OUT, PASS, WHERE, wrapper call, or parser-level call ambiguity
 ```
 
-No new crate is required. `boon_typecheck` owns declaration resolution and the
-checked semantic program; `boon_ir` owns contextual elaboration, output-net
-validation, erasure, and canonical executable IR. Machine, document,
-distributed, persistence, native host, and verifier backends consume only the
-post-erasure representation.
+Rejected or unsupported mandatory obligations produce diagnostics and no
+`ContractVerifiedProgram`.
+
+`boon_typecheck` owns declaration resolution and `CheckedProgram`.
+`boon_semantic` owns contextual expansion, `OutNet`, semantic ownership, typed
+list views, dependency manifests, and proof obligations. `boon_verify` owns the
+mandatory `ContractVerifiedProgram` gate. `boon_ir` consumes only that verified
+artifact and erases `WHERE`, `OUT`, `PASS`, and transparent wrappers into
+`ErasedProgram`.
+
+The OUT migration introduces no runtime OUT value, handle, net, or
+representation. Proof-visible call and output structure exists only in
+`SemanticProgram`; `ContractVerifiedProgram` certifies that exact semantic
+artifact, and executable planning sees only the erased result. Machine,
+document, distributed, persistence, native/Wasm, GPU, FPGA, and hardware
+backends consume post-verification artifacts.
 
 One typed signature registry covers built-ins and user functions. Initially,
 built-ins may register trusted generic signatures and lowering capabilities,
-but they are checked through the same call binder and `OutNet` verifier. Parser
+but they are checked through the same call binder, semantic `OutNet`
+validation, and contract-verification gate. Parser
 row-scope heuristics, `ListMapBinding`, backend-specific positional binders,
 string matching on contextual function names, and backend rediscovery of
 template arguments are deleted after the cutover.
@@ -873,7 +919,8 @@ The implementation starts from concrete duplicated paths that exist today:
   and structured function parameters.
 - `boon_typecheck::ListMapBinding`, render-slot template fields, and parser
   helpers such as `list_map_binding_name` encode contextual row behavior outside
-  the general function model and must disappear into `CheckedProgram`.
+  the general function model. Replace them with ordinary typed call entries in
+  `CheckedProgram` and typed logical views in `SemanticProgram`.
 - `boon_ir` and both compiler backends repeatedly inspect `AstCallArg` and
   function strings to reconstruct list-map, find, chunk, and template behavior.
   Those consumers must receive typed call/elaboration nodes instead.
@@ -1004,16 +1051,22 @@ dual execution path, or permanent syntax adapter may ship.
    declaration order, a pipe only for the first ordinary input, and the
    separate final `PASS` clause. Delete positional binding, argument
    renaming, first-unused-parameter recovery, and unknown-name fallback.
-6. **Implement `OutNet` elaboration in `boon_ir`.** Allocate and unify output
-   nets, validate one producer, type/shape/role/generation/correlation
-   compatibility, expand contextual functions in their declaring island, and
-   erase wrappers/outputs into `ErasedProgram` before executable IDs and hashes
-   are assigned.
-7. **Cut every backend to `ErasedProgram`.** Convert machine, document,
-   distributed, persistence, native host, and verifier lowering together.
-   Delete `ListMapBinding`, template-argument rediscovery, string-based
-   contextual function switches, backend positional binders, and runtime
-   `OUT` representations. Do not leave an AST fallback.
+6. **Implement semantic elaboration in `boon_semantic`.** Allocate and unify
+   `OutNet`s, validate one producer and
+   type/shape/role/generation/correlation compatibility, expand contextual
+   functions in their declaring island, assign structural semantic ownership,
+   build typed list views and dependency manifests, and emit all proof
+   obligations in `SemanticProgram`.
+7. **Install verification and erasure as mandatory boundaries.** Make
+   `boon_verify` certify the exact `SemanticProgram` as
+   `ContractVerifiedProgram`, including programs without authored `WHERE`.
+   Then make `boon_ir` erase `WHERE`, `OUT`, `PASS`, and transparent wrappers
+   into `ErasedProgram` before executable IDs and hashes are assigned. Cut
+   machine, document, distributed, persistence, native/Wasm, GPU, FPGA, and
+   hardware lowering to post-verification artifacts. Delete `ListMapBinding`,
+   template-argument rediscovery, string-based contextual switches, backend
+   positional binders, runtime `OUT` representations, and every AST or
+   verification-bypass fallback.
 8. **Install structural keyed ownership.** Intern `OwnerInstanceId` from static
    owner plus all ancestor `(list, key, generation)` instances. Key state,
    sources, effects, dependencies, persistence, retained document rows, and
@@ -1166,9 +1219,11 @@ This plan is complete only when all of the following are true from final source:
    named forwarding, pipe semantics, order-independent lexical resolution, and
    separate final `PASS` context are enforced once in
    `CheckedProgram`, not independently by backends.
-3. `OutNet` validation and transparent expansion produce one `ErasedProgram`;
-   every executable backend consumes it and no backend reparses contextual
-   semantics from AST, names, or strings.
+3. `OutNet` validation, transparent expansion, semantic ownership, typed list
+   views, dependency manifests, and proof obligations produce one
+   `SemanticProgram`; `boon_verify` produces the mandatory
+   `ContractVerifiedProgram`, and only then does `boon_ir` erase contextual
+   structure into `ErasedProgram`.
 4. Generic user-defined wrappers express the collection examples without
    built-in-only contextual syntax, and built-ins use the same typed signature
    and output verification model.
@@ -1209,6 +1264,11 @@ This plan is complete only when all of the following are true from final source:
     `docs/architecture/native_gpu_handoff_manifest.json` is fresh and passing,
     and `cargo xtask verify-all --check-existing --report
     target/reports/report-v2/verify-all.json` passes against those artifacts.
+16. Every compiler entry point follows
+    `ParsedProgram -> CheckedProgram -> SemanticProgram ->
+    ContractVerifiedProgram -> ErasedProgram`; programs without authored
+    `WHERE` do not bypass verification, and no runtime or backend contains an
+    `OUT` representation.
 
 The work must not be marked complete because syntax parses, one example works,
 output values happen to match, or a compatibility path keeps old fixtures
@@ -1225,8 +1285,10 @@ editor evidence, and fresh manifest-backed verification are all mandatory.
   finite scope-effect proof and exact branch signatures.
 - `PASS` is the sole reserved call-context clause. It is never a user
   parameter, executable value, persisted value, or wire field.
-- The implementation uses existing crates: `boon_typecheck` owns
-  `CheckedProgram`; `boon_ir` owns elaboration, output-net verification, and
+- Compiler ownership is fixed: `boon_typecheck` owns `CheckedProgram`;
+  `boon_semantic` owns elaboration, `OutNet`, ownership, typed views,
+  dependency manifests, and proof obligations; `boon_verify` owns
+  `ContractVerifiedProgram`; and `boon_ir` owns verified erasure into
   `ErasedProgram`.
 - Source migration is parser-aware Rust code that is deleted after use. No
   Python, regex-only source rewriting, or permanent compatibility translator is

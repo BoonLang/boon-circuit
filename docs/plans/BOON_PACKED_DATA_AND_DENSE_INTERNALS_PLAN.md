@@ -2,10 +2,10 @@
 
 Status: proposed implementation contract.
 
-This plan is the universal substrate work that should happen before the first
-processor project. It is useful on native CPU, Wasm, servers, GPU-oriented
-kernels, and FPGA targets. It does not design a RISC-V core or any other
-processor.
+This plan defines the universal native, Wasm, and server runtime architecture
+that must be completed before the first canonical processor implementation.
+The same packed substrate also feeds GPU-oriented kernels and FPGA targets. It
+does not design a RISC-V core or any other processor.
 
 The central change is:
 
@@ -34,7 +34,7 @@ compiler/runtime machinery, not a second public data model.
 
 The following documents remain authoritative for their existing domains:
 
-- [`BOON_SELF_HOSTING_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_SELF_HOSTING_LANGUAGE_FOUNDATIONS_PLAN.md)
+- [`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md)
   owns the public value algebra, exact `NUMBER`, Tags, `BITS[N]`, and
   `LIST`/`SET`/`MAP` authority semantics.
 - [`BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md`](BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md)
@@ -44,6 +44,9 @@ The following documents remain authoritative for their existing domains:
   behavior.
 - [`BOON_PERSISTENCE_ARCHITECTURE_PLAN.md`](BOON_PERSISTENCE_ARCHITECTURE_PLAN.md)
   owns stable semantic identity, atomic turns, migration, and durable DTOs.
+- [`BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md`](BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md)
+  owns proof obligations, `ContractVerifiedProgram`, and proof-backed
+  optimization eligibility.
 - [`../architecture/RUNTIME_MODEL.md`](../architecture/RUNTIME_MODEL.md) owns
   the static graph, typed-slot, dirty-key, candidate/commit, and delta model.
 - [`../architecture/LIST_MODEL.md`](../architecture/LIST_MODEL.md) owns hidden
@@ -156,21 +159,28 @@ the full consumer chain keeps them dense.
 
 ## Non-Negotiable Semantic Boundary
 
-The portable pipeline is:
+The portable compiler spine is:
 
 ```text
-Boon source
-  -> parsed syntax
-  -> checked program
-  -> erased semantic program
-  -> semantic MachinePlan
+ParsedProgram
+  -> CheckedProgram
+  -> SemanticProgram
+  -> ContractVerifiedProgram
+  -> ErasedProgram
+  -> MachinePlan
   -> target/profile specialization
   -> PhysicalPlan
   -> packed executor or target lowering
 ```
 
-The semantic `MachinePlan` says what the program means. `PhysicalPlan` says how
-one target will store and execute it.
+`SemanticProgram` owns contextual expansion, semantic ownership, typed views,
+dependency manifests, and proof obligations. `ContractVerifiedProgram` is the
+mandatory proof gate even when the source authors no `WHERE` clause.
+`ErasedProgram` contains no executable proof, `OUT`, `PASS`, or transparent
+wrapper machinery. The semantic `MachinePlan` says what the verified,
+post-erasure program means. `PhysicalPlan` says how one target will store and
+execute it. No packed consumer may bypass verification or rediscover semantics
+from parser or checked syntax.
 
 The current `MachinePlan` already mixes semantic and physical-looking fields.
 The migration must classify them explicitly:
@@ -786,9 +796,10 @@ generations. It never stores:
 Restore builds a fresh packed store through validated boundary visitors and
 publishes it only after all semantic and capacity checks pass.
 
-The persistence plan contains older wording around legacy value variants. Before
-the packed cutover reaches those DTOs, reconcile that wording with the
-foundations plan so the project implements one final value algebra.
+The persistence plan is reconciled to the foundations value algebra and
+authority model. Packed boundary visitors must implement that exact canonical
+DTO/authority split; they may not revive a legacy value variant or nested
+collection snapshot encoding.
 
 ## Target Profiles And Reports
 
@@ -830,7 +841,7 @@ Packed implementation starts only after its semantic owner is final:
 | bit cells, columns, and bitwise kernels | end-to-end `BITS[N]` semantics |
 | keyed `MAP`/`SET` storage classes | final authority, equality, conflict, and canonical-order semantics |
 | object/Tag shape tables | final checked structural type/fingerprint rules |
-| executable expression and owner arenas | authoritative checked-to-erased program cut |
+| executable expression and owner arenas | authoritative verified compiler spine through `ErasedProgram` |
 | persistence/wire visitors | final semantic DTO/schema and identity decisions |
 
 Reference oracles for a landed packed slice implement only the final algebra.
@@ -870,8 +881,9 @@ manifest exist; no category is hidden inside an aggregate "map count."
   comments, and presentation/diagnostic labels into debug sidecars.
 - Make all executable consumers use typed IDs rather than rediscovery by name.
 
-Exit: the checked/erased/plan pipeline has one compact expression arena and
-validated dense tables.
+Exit: the `CheckedProgram` -> `SemanticProgram` ->
+`ContractVerifiedProgram` -> `ErasedProgram` -> `MachinePlan` pipeline has one
+compact expression arena and validated dense tables.
 
 ### Phase 2: Packed Cells And Typed Arenas
 
@@ -927,13 +939,19 @@ Exit: `LIST`/`MAP`/`SET` semantics no longer depend on host container behavior.
 ### Phase 7: Kernel IR And Density-Aware Execution
 
 - Add the minimal pure `KernelIR`.
-- Discover and fuse compatible regions from checked/erased semantics.
+- Integrate formal-plan Phase 6 with `KernelIR`: proof facts enter physical
+  selection only through `ContractVerifiedProgram` and its derived semantic
+  artifacts.
+- Discover and fuse compatible regions from verified, erased semantics.
 - Add packed scalar execution first.
 - Measure auto-vectorization and density thresholds.
 - Add additional backends only against the same differential fixtures.
+- Keep proof-disabled reference execution test-only; production has no
+  verification-bypass or compatibility engine.
 
-Exit: the same physical plan can choose sparse scalar or dense batch execution
-without changing semantics.
+Exit: translation validation proves that the same physical plan can choose
+sparse scalar or dense batch execution without changing semantics, and formal
+Phase 6's optimization obligations pass.
 
 ### Phase 8: Boundaries, Native/Wasm, And Hardware Eligibility
 
@@ -1163,9 +1181,9 @@ This plan is complete only when:
     charging, candidate/commit behavior, and exact semantic traces; thresholds
     are measured.
 
-The minimum dependency gate for the processor plan is narrower than completion
-of every phase here. Processor planning and isolated generic hardware fixtures
-may begin earlier. Canonical processor implementation may begin only once:
+The following technical minimum is retained only as a diagnostic milestone. It
+shows that processor-shaped fixtures can exercise the right generic machinery;
+it is not permission to begin the canonical CPU:
 
 - `BITS[N]` works end to end;
 - bounded `MAP` can lower to a proved dense direct-address layout;
@@ -1179,6 +1197,12 @@ may begin earlier. Canonical processor implementation may begin only once:
 - every compiler/runtime/layout path used by the processor has completed its
   flag-day deletion, with no reference/legacy production switch or
   compatibility materializer remaining.
+
+Canonical processor implementation begins only after **all** phases and all 26
+acceptance criteria in this plan pass, including Phase 9 flag-day deletion,
+native/Wasm parity, product-scale reports, and formal Phase 6 integration.
+Read-only processor specification/toolchain inventory may occur earlier, but
+neither a canonical CPU source nor a processor-specific compiler path may.
 
 ## Risks And Mitigations
 

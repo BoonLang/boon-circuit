@@ -11,6 +11,19 @@ performance laboratory that grows with it. It covers six performance/product
 examples and seven clean, canonical 7GUIs examples. Existing examples remain
 valid unless this plan explicitly changes only their catalog presentation.
 
+Full portfolio implementation follows completion of
+[`BOON_FIRST_RISCV_PROCESSOR_PLAN.md`](BOON_FIRST_RISCV_PROCESSOR_PLAN.md) and
+its Boon Orchard milestone. Before then, selected existing and planned
+portfolio-shaped fixtures may run only as generic language, runtime,
+packed-data, formal, and product regression probes. That earlier use does not
+claim the example, phase, or portfolio complete.
+
+The value algebra comes from
+[`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md).
+Executable artifacts follow the mandatory `ParsedProgram` -> `CheckedProgram`
+-> `SemanticProgram` -> `ContractVerifiedProgram` -> `ErasedProgram` ->
+`MachinePlan` spine.
+
 ## Executive Decision
 
 Add these thirteen new manifest examples:
@@ -104,12 +117,13 @@ Active documentation uses this migration rule:
 5. A GPU implementation is generated from an eligible pure Boon kernel and the
    authoritative typed IR. Do not hand-write a second WGSL algorithm that only
    resembles the Boon program.
-   Browser CPU/Wasm preserves Boon's finite binary64 `Number` semantics. A
-   portable WebGPU floating kernel uses a separately named reduced-precision
-   profile such as `ApproxF32`, with its own profile id, oracle, tolerances, and
-   eligibility limits; it is never described as interpreter-equivalent. Exact
-   32-bit word kernels may lower proven lanes to WGSL `u32` without exposing a
-   second Boon scalar type.
+   Native and browser CPU/Wasm preserve Boon's exact rational `Number`
+   semantics. GPU eligibility requires a proved exact lowering, a proved
+   fixed-point or `BITS[N]` lowering, or explicit source-level exact rounding
+   whose final observable result is equivalent to the interpreter. A backend
+   that cannot prove one of those contracts reports `NotEligible`; there is no
+   approximate Boon Number profile. Exact word kernels may lower proven lanes
+   to WGSL `u32` without exposing a second Boon scalar type.
 6. FPGA DSP is lowered from bounded Boon kernels and explicit hardware profiles.
    Board I/O shells may be target adapters, but no second handwritten DSP
    implementation may become the evidence path.
@@ -201,8 +215,9 @@ Every example is delivered vertically, native first and browser second:
    deterministic reduction evidence.
 4. **Native WGPU compute**: only for an eligible pure kernel and only after the
    interpreter result is authoritative.
-5. **Browser Wasm interpreter**: same source, same fixtures, same digest or
-   numerical tolerance, one compute worker where needed so UI stays responsive.
+5. **Browser Wasm interpreter**: same source, same fixtures, and the same
+   canonical result/digest, with one compute worker where needed so UI stays
+   responsive.
 6. **Browser worker execution**: independent workers or shared-memory workers
    according to the workload and security headers. Record the actual mode.
 7. **Browser WebGPU**: only for eligible generated kernels. Report transfer and
@@ -692,8 +707,9 @@ matching final note cannot hide an incorrect pipeline.
 Pitch mapping uses configurable A4, initially 440 Hz, and the normal equal-
 temperament relationship. Cross-backend results use a bounded structural
 record such as validity, note id, signed cents in fixed units, confidence,
-level, and input sample index. Floating and fixed-point profiles declare their
-tolerances.
+level, and input sample index. The source semantics declare exact rounding into
+those bounded units. Any fixed-point backend proves the same final record,
+rather than introducing a tolerance-only Number profile.
 
 ### Native And Browser Audio
 
@@ -899,8 +915,9 @@ policy. Fixture stage traces compare model and generated RTL; unexpected
 overflow is a failure rather than a hidden quality reduction. Fixed point is a
 generated backend representation, not a second normal Boon source-number type.
 Resource reports include LUTs, DSPs, BRAM, maximum clock, frame latency,
-initiation interval, scaling/overflow events, CDC results, and numerical error
-against the CPU interpreter.
+initiation interval, scaling/overflow events, CDC results, intermediate error
+measurements, and exact equality of the final source-rounded result against the
+CPU interpreter.
 
 Bring-up order is synthetic PCM simulation, transport loopback, known-tone
 hardware input, machine-readable pitch output, display-register verification,
@@ -927,19 +944,21 @@ generation, cancels or discards stale tiles, prioritizes visible coarse tiles,
 and progressively refines without blocking input.
 
 Named profiles freeze width/height, viewport bounds, coordinate transform and
-pixel-center rule, escape radius, maximum iterations, and numeric precision.
-The raw iteration-count buffer is the primary oracle; the palette image is a
-secondary presentation artifact. CPU/native and CPU/browser use canonical
-binary64 `Number`. `ApproxF32` GPU profiles use a precision-matched reference
-and declared raw-buffer/image mismatch metrics. Each backend publishes a safe
-zoom limit or reports `NotEligible`; a collapsed deep zoom is not accepted as a
-faster image.
+pixel-center rule, escape radius, maximum iterations, and an explicit exact
+rounding grid when a bounded backend requires one. The raw iteration-count
+buffer is the primary oracle; the palette image is a secondary presentation
+artifact. CPU/native and CPU/browser use exact rational `Number`. A GPU profile
+must prove exact rational lowering or execute the source-declared rounding grid
+through fixed-point/`BITS[N]` lanes and produce the identical iteration buffer.
+Otherwise it reports `NotEligible`. Each eligible backend publishes a safe
+zoom limit; a collapsed deep zoom is not accepted as a faster image.
 
 Evidence includes:
 
 - canonical viewport/coordinate mapping and exact iteration buffers for the
   CPU reference profile;
-- declared tolerance/image comparison for lower-precision GPU profiles;
+- exact iteration-buffer and final image equality for every eligible GPU
+  profile;
 - pixels/second and actual iteration count/second;
 - first useful frame and time to final quality;
 - 1/2/4/8-worker speedup and efficiency;
@@ -972,7 +991,8 @@ Every random sample comes from an exact integer counter-based generator keyed
 by `(scene_version, pixel, logical_sample, bounce, dimension)`. Logical sample
 ids and retry keys are idempotent. Per-pixel samples accumulate in a fixed
 logical order or specified fixed reduction tree; schedule-independent random
-numbers alone are insufficient because floating addition order also matters.
+numbers alone are insufficient because a backend's rounded accumulation order
+also matters.
 Worker order, retries, and tile assignment therefore cannot change the CPU
 reference image. Camera/scene changes create a new generation and
 cancel/discard stale accumulation.
@@ -986,9 +1006,10 @@ Evidence includes rays/second, samples/second, first usable image, time to fixed
 samples-per-pixel, worker/GPU scaling, cancellation, memory, BVH build/traversal,
 and image comparison against a deterministic CPU reference. It records complete
 scene/camera/material/profile digests, geometric intersection and material
-unit oracles, finite-value/NaN checks, energy bounds, and a defined image-error
-metric. Generated GPU output is evaluated under its named precision tolerance,
-not claimed bit-identical to binary64 CPU accumulation.
+unit oracles, denominator/range checks, energy bounds, and exact final image
+bytes. A GPU profile is eligible only when proved exact or when source-level
+rounding defines a bounded fixed-point/`BITS[N]` computation with an identical
+final observable image.
 
 ## Boon Fingerprint
 
@@ -1009,13 +1030,13 @@ vectors:
 
 - 1 KiB chunks and block compression;
 - exact modulo-32-bit word addition, XOR, logical shifts, and rotations over
-  whole `Number` values whose domain is `0..2^32-1`;
+  `BITS[32]`;
 - explicit little-endian fixed-size byte/word conversion;
 - chaining values and deterministic binary tree reduction;
 - streaming updates without retaining the entire input;
-- 64-bit chunk/output counters represented as two exact 32-bit Number words or
-  `BYTES[8]`, with explicit carry, low/high compression lanes, and stream-length
-  overflow detection; never as one inexact Number beyond `2^53`;
+- 64-bit chunk/output counters represented as `BITS[64]`, two `BITS[32]`
+  words, or `BYTES[8]`, with explicit carry, low/high compression lanes, and
+  stream-length overflow detection;
 - XOF output/seek, keyed, and key-derivation modes after base hash mode is
   correct, before the full compatibility label is used.
 
@@ -1309,10 +1330,10 @@ responsibilities.
 
 ### Numeric And Memory Model
 
-Boon source keeps one visible finite IEEE-754 binary64 `Number` type and
-immutable `BYTES`; this portfolio does not introduce a public integer/`u32` or
-standalone byte scalar, nor a casually mutable collection. Performance work
-must preserve those observable semantics while enabling:
+Boon source keeps one visible arbitrary-precision exact rational `Number`
+type, explicit `BITS[N]`, and immutable `BYTES`; this portfolio does not
+introduce an approximate source Number or casually mutable collection.
+Performance work must preserve those observable semantics while enabling:
 
 - dense lowered numeric and byte storage, efficient read-only slices/views,
   fixed-size arrays, complex-number layouts, and compact immutable serialized
@@ -1320,28 +1341,32 @@ must preserve those observable semantics while enabling:
 - compiler-proven nonescaping/single-owner scratch or builder regions for
   bounded in-place kernels, frozen when published through pure source
   semantics;
-- exact width-constrained word operations over whole Number values in
-  `0..2^32-1`: modulo addition, XOR, logical shifts, rotations, range errors,
-  and explicit little-endian conversion to/from immutable BYTES;
-- an internal typed-IR `Word32` lane/array refinement only when range/width is
-  proven, with checked boundaries and no observable second scalar type;
-- `sqrt`, `log2`, trigonometry, interpolation, finite-number diagnostics, and
-  complex layouts without per-value heap objects;
+- exact width-constrained word operations over `BITS[32]`: modulo addition,
+  XOR, logical shifts, rotations, and explicit little-endian conversion
+  to/from immutable BYTES;
+- internal typed-IR word lanes only when their widths are proven, with checked
+  boundaries and no approximate scalar type;
+- interpolation over exact rationals plus explicitly source-rounded `sqrt`,
+  `log2`, and trigonometric operations whose scale, tie rule, domain, and error
+  are part of the call contract and whose result is again an exact rational;
+  denominator/budget diagnostics and complex layouts require no per-value heap
+  objects on eligible packed paths;
 - allocation-free repeated execution, reusable plans/twiddle tables,
   predictable bounds checks with safe proof-based elimination/hoisting, and
   lazy immutable data loading where the host supports it;
-- generated fixed-point hardware profiles with explicit widths, scaling,
-  rounding, and overflow, without changing normal source Number semantics.
+- generated fixed-point/GPU/hardware profiles with explicit widths, scaling,
+  source-level exact rounding, and overflow, with proof that the final
+  observable result matches normal exact Number semantics.
 
 Before the first compute lowering in Phase 3, an architecture checkpoint
 updates the authoritative language/IR contracts for pure kernel boundaries,
-Number-preserving dense storage, compiler-proven scratch/builders, and named
-reduced-precision backend profiles. Before BLAKE3 in Phase 5, a second
-language/BYTES/IR checkpoint freezes exact word operations, Word32 proof lanes,
-counter pairs, and endian boundaries. Do not smuggle bit operations through
-approximate floating arithmetic. Differential tests compare boxed-Number
-reference behavior with every unboxed/Word32/scratch optimization, including
-errors and publication boundaries.
+exact-Number-preserving dense storage, compiler-proven scratch/builders,
+source-declared rounding, and exact/fixed-point/`BITS[N]` backend eligibility.
+Before BLAKE3 in Phase 5, a second language/BYTES/IR checkpoint freezes exact
+word operations, proof lanes, counters, and endian boundaries. Do not smuggle
+bit operations through Number arithmetic. Differential tests compare the
+exact-Number reference with every packed/fixed-point/word/scratch optimization,
+including errors, rounding, and publication boundaries.
 
 These are generic language/IR/runtime capabilities. Do not add `BLAKE3/round`,
 `Search/score`, `Tuner/pitch`, or `Mandelbrot/pixel` Rust intrinsics.
@@ -1407,9 +1432,10 @@ WebGPU evidence records adapter/device/features and the timing source.
 reported and never labelled kernel-only. Measurements separate adapter/device
 setup, shader/pipeline compilation, first dispatch, upload, steady dispatch,
 presentation, and validation readback. Readback is required for evidence but is
-not forced into normal product-frame timing. Portable floating compute uses
-named `ApproxF32`; portable WGSL `f64` is not assumed. Exact proven word lanes
-may lower to WGSL `u32`.
+not forced into normal product-frame timing. Portable WGSL `f64` is not
+assumed. WebGPU computation is admitted only through proved exact operations,
+fixed-point or `BITS[N]` lanes, or explicit source-level exact rounding with
+equivalent final observables. Proven word lanes may lower to WGSL `u32`.
 
 ### Code Generation
 
@@ -1427,7 +1453,7 @@ their contracts:
 
 | Capability | Primary generic owner | Required contract update |
 |---|---|---|
-| syntax, types, one-Number/word semantics | parser, typechecker, typed IR | language, BYTES, and IR architecture docs |
+| syntax, exact Number, and word semantics | parser, typechecker, typed IR | language-foundations, BYTES, and IR architecture docs |
 | executable/lazy artifacts | compiler plan builder and plan loader | `MachinePlan`/ABI/loading contract |
 | evaluation, currentness, dense slots/scratch | plan executor and runtime | executor/runtime architecture and differential tests |
 | automatic CPU work and streaming workers | task runtime/scheduler | task eligibility, cost, reduction, cancellation contract |
@@ -1454,8 +1480,9 @@ claim. Evidence answers:
 - Which generic runtime cost dominates?
 - Did a runtime/compiler change improve the same workload and machine?
 - Does automatic parallelism beat the same engine's one-worker result?
-- Does generated CPU/GPU/FPGA output satisfy its declared exact-or-tolerance
-  oracle derived from the interpreter reference?
+- Does generated CPU/GPU/FPGA output match the interpreter's final observable
+  result exactly for its declared source profile, while separately satisfying
+  any algorithm/specification-level tolerance oracle such as an NPB norm?
 
 For every published measurement record:
 
@@ -1491,8 +1518,8 @@ treatments. Never force an unnatural N-worker graph through the one-worker path
 and call it Auto performance.
 
 Do not change algorithms silently to create a favorable graph. Legacy,
-improved, scalar, parallel, generated, reduced-precision, and GPU variants have
-different semantic/profile ids where their work differs.
+improved, scalar, parallel, generated, source-rounded, and GPU variants have
+different semantic/profile ids where their declared work differs.
 
 ## Verification Contract
 
@@ -1507,8 +1534,8 @@ Every implementation slice adds evidence proportional to its risk:
    `NATIVE_GPU_PIPELINE.md` source-driven two-window contract;
 6. app-owned render/readback artifacts and exact frame/input identities;
 7. browser scenarios using the same fixture ids and result oracle;
-8. generated CPU/GPU exact equivalence for identical profiles, or the declared
-   interpreter-derived tolerance oracle for approximate profiles;
+8. generated CPU/GPU exact equivalence for identical profiles, including exact
+   final observables for source-rounded fixed-point/`BITS[N]` profiles;
 9. BoonTune bit-accurate fixed-point equivalence, CDC/reset/FIFO simulation,
    bounded protocol evidence, machine-readable pitch, atomically latched
    display masks, simulated/probed multiplex waveform, resource/timing closure,
@@ -1542,7 +1569,10 @@ handoff target and the manifest/schema budgets are designed accordingly.
 ## Implementation Phases
 
 Phases are dependency ordered. Each example still completes its native-first,
-browser-second vertical slice before being called complete.
+browser-second vertical slice before being called complete. Phase 0 begins only
+after the complete Boon RV32I/Boon Orchard proof milestone. Earlier use of a
+selected fixture by another plan is regression evidence for that owner, not
+early portfolio implementation.
 
 ### Phase 0 — Plan And Baselines
 
@@ -1552,8 +1582,8 @@ browser-second vertical slice before being called complete.
 - Record interpreter startup, numeric loop, byte loop, list, allocation, and
   task-spawn baselines before portfolio-driven optimization.
 - Design and accept the first architecture gate for pure kernel eligibility,
-  Number-preserving dense/scratch lowering, and named approximate backend
-  profiles before Phase 3 compute work.
+  exact-Number-preserving dense/scratch lowering, source-declared rounding, and
+  proved fixed-point/`BITS[N]` backend profiles before Phase 3 compute work.
 
 ### Phase 1 — Canonical UI Foundations And 7GUIs
 
@@ -1586,8 +1616,9 @@ browser-second vertical slice before being called complete.
   adding any WGPU/WebGPU compute lowering.
 - Implement scalar interpreter reference and progressive native UI.
 - Add automatic CPU tiles with deterministic output/cancellation.
-- Add generated WGPU and browser interpreter/worker/WebGPU `ApproxF32` modes
-  with separately declared precision and timing sources.
+- Add generated WGPU and browser interpreter/worker/WebGPU modes only for
+  proved exact or source-rounded fixed-point/`BITS[N]` profiles, with exact
+  final-observable equality and separately declared timing sources.
 - Extract pixel/tile/scheduler probes into Runtime Lab.
 
 ### Phase 4 — BoonSearch And Compact Collections
@@ -1599,11 +1630,11 @@ browser-second vertical slice before being called complete.
 - Add deterministic parallel build and batch/shard modes.
 - Complete native and browser product/footprint evidence and Runtime Lab probes.
 
-### Phase 5 — Boon Fingerprint And Exact Integer/Byte Kernels
+### Phase 5 — Boon Fingerprint And Exact Bit/Byte Kernels
 
-- Complete the mandatory one-Number/BYTES/typed-IR architecture checkpoint and
-  add exact width-constrained word operations plus proof-specialized internal
-  lanes and scratch ownership generically.
+- Complete the mandatory Number/`BITS[N]`/BYTES/typed-IR architecture
+  checkpoint and add exact width-constrained word operations plus
+  proof-specialized internal lanes and scratch ownership generically.
 - Implement base hash-mode vectors first, then XOF/seek, keyed, and derive-key;
   add streaming, canonical subtree parallelism, native, and browser modes.
 - Add exact Runtime Lab probes and keep GPU optional.
@@ -1642,12 +1673,16 @@ browser-second vertical slice before being called complete.
   then live microphone.
 - Keep PC USB audio and board transport as platform adapters; DSP remains Boon.
 
-### Phase 10 — Future Generated CPU Backends
+### Phase 10 — Proven Processor And Boon Orchard Integration
 
-- Add Rust/Zig generated execution only after an authoritative typed-IR backend
-  and equivalence contract exist.
-- Register them as Runtime Lab engine modes without changing example source.
-- This phase does not authorize handwritten Rust/Zig workload comparisons.
+- Consume the already-proved Boon RV32I source, artifact lineage, simulators,
+  generated RTL, formal results, FPGA signature, and Boon Orchard proof bundle.
+- Add portfolio/Runtime Lab views that exercise and explain those existing
+  generic artifacts without rebuilding the CPU, changing its evidence, or
+  introducing a processor-specific runtime path.
+- Keep future Rust/Zig generated execution outside this portfolio completion
+  sequence until a separately accepted typed-IR backend and equivalence
+  contract exists.
 
 ## Risks And Mitigations
 
@@ -1684,10 +1719,12 @@ instances/copies, and expose cache lifecycle.
 
 ### GPU Semantic Drift
 
-Different precision/order can alter images and DSP. Keep one CPU reference,
-declare precision profiles/tolerances, use portable `ApproxF32` rather than
-assuming WGSL `f64`, generate kernels from typed IR, and record timing source,
-setup, transfer, dispatch, presentation, and validation overhead separately.
+Different representations or operation order can alter images and DSP. Keep
+one exact CPU reference, require proved exact/fixed-point/`BITS[N]` lowering or
+explicit source-level exact rounding with equivalent final observables,
+generate kernels from typed IR, and record timing source, setup, transfer,
+dispatch, presentation, and validation overhead separately. Unsupported
+floating workloads remain native/Wasm and report `NotEligible` on WebGPU.
 
 ### Audio Permissions And Real-Time Deadlines
 
@@ -1745,9 +1782,9 @@ evidence before the relevant implementation slice:
 - initial large BoonSearch corpus and redistribution/download policy;
 - initial LZ4 corpus beyond committed compatibility fixtures;
 - exact Runtime Lab Measure/Extended durations after interpreter baselines;
-- exact `ApproxF32` tolerance/eligibility limits per WebGPU workload; any later
-  nonportable higher-precision backend is a separately named capability, not a
-  portable-WebGPU assumption;
+- exact fixed-point/`BITS[N]` widths, source rounding points, and proof
+  eligibility limits per WebGPU workload; any later nonportable arithmetic
+  backend is a separately named capability, not a portable-WebGPU assumption;
 - whether Cells Advanced catalog group is named `showcase`, `performance`, or
   another generic group already supported when implementation begins.
 
@@ -1778,6 +1815,8 @@ This portfolio is complete only when:
   closure, and later separate physical-wiring observation;
 - Mandelbrot and Path Tracer execute the same source-derived kernel across CPU
   and generated GPU profiles;
+- Phase 10 consumes the already-proved Boon RV32I and Boon Orchard lineage
+  without duplicating CPU semantics or weakening its proof manifest;
 - Boon Fingerprint implements hash, XOF/seek, keyed, and derive-key modes and
   passes their official vectors across streaming/worker modes;
 - Runtime Lab contains the five suite groups, validates every result, exports

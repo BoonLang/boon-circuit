@@ -2,6 +2,13 @@
 
 Status: implementation in progress
 
+The final value algebra and compiler ownership follow
+[`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md) and
+[`BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md`](BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md).
+Every executable path follows `ParsedProgram -> CheckedProgram ->
+SemanticProgram -> ContractVerifiedProgram -> ErasedProgram -> MachinePlan`.
+This reconciliation changes no NovyWave product behavior or acceptance gate.
+
 ## Implementation Checkpoint (2026-07-17)
 
 Implemented generically in the engine and native host:
@@ -141,12 +148,16 @@ NovyWave collection code uses only the canonical typed forms:
   including through user wrappers.
 
 `boon_typecheck` resolves this source once into the authoritative
-`CheckedProgram`. `boon_ir` elaborates contextual calls, validates output nets,
-expands transparent wrappers, erases `OUT` and `PASS`, and emits the
-authoritative `ErasedProgram`. Executor, native document/render, host-effect,
-and verifier paths consume only `ErasedProgram`; equivalent direct,
-one-wrapper, and multi-wrapper source must have equivalent executable work and
-ownership.
+`CheckedProgram`. `boon_semantic` elaborates contextual calls, validates output
+nets, expands transparent wrappers, records ownership and proof obligations,
+and emits `SemanticProgram`. `boon_verify` produces the mandatory
+`ContractVerifiedProgram`, including when the source authors no `WHERE`.
+`boon_ir` consumes only that verified artifact, erases `WHERE`, `OUT`, `PASS`,
+and transparent wrappers, and emits the authoritative opaque
+`ErasedProgram`. Executor, native document/render, and host-effect paths consume
+only post-verification artifacts; the verifier consumes `SemanticProgram`.
+Equivalent direct, one-wrapper, and multi-wrapper source must have equivalent
+executable work and ownership.
 
 ## Goal
 

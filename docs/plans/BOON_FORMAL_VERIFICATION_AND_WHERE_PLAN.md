@@ -13,6 +13,15 @@ implementation is accepted, the normative language semantics must also be
 integrated into `docs/architecture/LANGUAGE_SEMANTICS.md`; that document must
 then link back here for implementation history and rollout details.
 
+Reconciled on 2026-07-27 with
+`BOON_LANGUAGE_FOUNDATIONS_PLAN.md` and
+`BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md`. Those plans own the public
+value algebra and packed execution architecture. This plan owns proof syntax,
+obligations, evidence, and the mandatory verification gate. In particular,
+Boon `NUMBER` is an exact normalized rational, `True` and `False` are ordinary
+Tags, and no public Boolean, floating-point, absence, or fault value is
+introduced by formal verification.
+
 ## Executive Decision
 
 Boon gets exactly two application-facing formal-verification forms:
@@ -89,7 +98,7 @@ records, and lists.
 - State precisely whether a theorem applies to continuous values, present event
   payloads, successful results, or presence itself.
 - Preserve Boon's structural values, hidden list identity, event presence,
-  currentness, and finite-number semantics.
+  currentness, and exact-Number semantics.
 - Produce source-level counterexamples that are useful to humans and AI.
 - Make contracts stable inputs to refactoring, generation, migration, and API
   compatibility checks.
@@ -556,12 +565,12 @@ from an ordinary runtime function call.
 
 ## Condition Semantics
 
-A condition block is one static logical formula formed from pure Boolean
-clauses.
+A condition block is one static logical formula formed from pure clauses whose
+source type is the closed ordinary Tag set `True | False`.
 
 Each condition must:
 
-- typecheck as a present Boolean;
+- typecheck as a present `True | False` Tag value;
 - be deterministic;
 - be pure;
 - be total under the block's admitted assumptions;
@@ -587,10 +596,15 @@ under the existing admitted path and facts:
     and Value(condition) == True
 ```
 
-Declared pure Boolean helper functions are valid only when their bodies or
+Declared pure truth-valued helper functions are valid only when their bodies or
 checked contracts are available to the verifier. An undeclared name is ordinary
 invalid Boon syntax; formal verification does not create an implicit predicate
 namespace.
+
+The verifier may normalize these two Tags into a private logical Boolean sort.
+That sort is solver machinery only. It never appears in source types, checked
+public signatures, persistence, wire schemas, reports as a Boon type, or
+runtime values.
 
 Unstratified cycles in proof dependencies are rejected. A condition cannot
 justify itself through a downstream result or through a mutually circular set
@@ -1294,7 +1308,8 @@ an imperative execution model.
 
 ### `WHEN` And `WHILE`
 
-Branch match and Boolean conditions enter the corresponding proof context.
+Branch matches and `True | False` conditions enter the corresponding proof
+context.
 
 For:
 
@@ -1438,7 +1453,7 @@ a hidden app assertion:
 ```text
 AuthorityActivationRequirementV1 {
     authority_persistence_key
-    authority_schema_hash
+    authority_semantic_schema_hash
     invariant_statement_hash
     persistence_compatibility_key
     accepted_commit_protocol_versions
@@ -1456,7 +1471,7 @@ LastWriterActivationBasisV1 =
 
 VerifiedAuthorityInvariantStampV1 {
     authority_persistence_key
-    authority_schema_hash
+    authority_semantic_schema_hash
     invariant_statement_hash
     last_writer_semantic_program_digest
     last_writer_verification_manifest_digest
@@ -1666,7 +1681,7 @@ name. The initial exact lemma schemas are:
   under the operation's actual presence rules;
 - `List/retain` returns a stable-order subsequence whose count does not exceed
   the input count;
-- complementary Boolean `retain` predicates partition a snapshot list;
+- complementary `True | False` `retain` predicates partition a snapshot list;
 - `List/append` and `List/remove` obey their exact cardinality laws under their
   documented presence and match rules;
 - `List/every` establishes its element predicate for a literal list or a
@@ -1700,23 +1715,31 @@ ids. It never infers a theorem by matching source strings such as
 their summaries, but are regression evidence rather than proof of a trusted
 summary.
 
-Freeze a target-independent language limit:
+List cardinality has an independent versioned resource contract:
 
 ```text
-MAX_EXACT_LIST_CARDINALITY_V1 = 9_007_199_254_740_991
+ListCapacityProfileV1 {
+    max_semantic_cardinality
+    maximum_cardinality_encoding
+    terminal_capacity_fault
+}
 ```
 
-This is `2^53 - 1`, so every legal list count and every complementary partition
-sum up to that count is exactly representable by binary64 `Number`. All list
-construction, append, materialization, and growth paths check the limit before
-commit and return the language's typed capacity error when it would be
-exceeded. `List/count` uses a checked cardinality-to-`FiniteReal` conversion;
-it must not cast `usize` to `i64` with `as`.
+The compiler records the selected profile in `SemanticProgram`, proof evidence,
+and the executable artifact. All list construction, append, materialization,
+and growth paths check `max_semantic_cardinality` before commit and produce the
+profile's deterministic terminal resource fault when it would be exceeded.
+This bound is not derived from a floating-point mantissa, a host `usize`, or an
+optimizer-selected storage width. Portable bundles use one declared bound
+supported by every selected target; a target unable to honor it rejects the
+artifact before execution.
 
-This semantic limit, rather than physical memory, makes the TodoMVC partition
-theorem target-independent. Platform allocation can fail earlier and remains
-ordinary modeled runtime failure; no successfully committed list can exceed
-the language limit.
+`List/count` converts the bounded nonnegative cardinality to exact `NUMBER`
+without loss. Proofs use an unbounded mathematical integer for intermediate
+cardinality reasoning plus the explicit capacity bound when connecting that
+reasoning to an executable list. Platform allocation can fail earlier as an
+ordinary terminal resource fault, but no successfully committed list can
+exceed its artifact's declared capacity profile.
 
 No optimizer miss may silently become an assumed list theorem or an implicit
 runtime scan. Unsupported list algebra fails closed. Open-ended structural
@@ -1724,51 +1747,106 @@ induction over arbitrary list callbacks is deferred.
 
 ## Number Semantics
 
-Runtime and verifier share a versioned `NumberSemanticProfileV1`, implemented
-over `boon_data::FiniteReal`. Formal reasoning must match Boon's one finite
-IEEE-754 binary64 `Number` type:
+Runtime and verifier share a versioned `ExactNumberSemanticProfileV1`.
+Every Boon `NUMBER` is the unique normalized rational:
 
-- integer literals are parsed through the checked `i64`/exact-representability
-  rules; they do not introduce a hidden unbounded integer type;
-- decimal literals are converted to binary64 exactly as the runtime parser
-  specifies;
-- every arithmetic operation rounds to nearest with ties to even;
-- subnormals are handled gradually and must not be flushed differently by a
-  target backend;
-- NaN and infinity are not ordinary Number values;
-- an operation whose result would be non-finite produces the language's typed
-  evaluation error;
-- negative zero is normalized on construction and operation result according
-  to `FiniteReal`;
-- division or remainder by zero is an error;
-- comparisons and checked conversions use the same profile as runtime;
-- whole-number operations and bounded indices retain their documented rules.
+```text
+numerator: arbitrary-precision signed integer
+denominator: arbitrary-precision positive integer
+gcd(abs(numerator), denominator) = 1
+zero = 0 / 1
+```
 
-`boon_data` exposes one low-level checked semantic API for arithmetic,
-comparison, rounding, whole-number/index conversion, and list-cardinality
-conversion. `boon_plan_executor` and `boon_verify` both consume it; neither
-reimplements Number behavior independently.
+Integer, decimal, and exponent source literals parse exactly; exact division
+constructs rationals, and canonical fraction text round-trips through the
+specified text API. Arithmetic normalizes its exact rational result; it does
+not round, overflow, wrap, or create hidden floating-point states. Division by
+zero and invalid operation domains are deterministic terminal faults unless an
+explicitly safe operation returns an ordinary closed Tag result. Rounding is
+itself an exact operation with an authored positive quantum and rule, as
+specified by the language foundations plan.
 
-The verifier must not translate general Boon arithmetic to mathematical real
-arithmetic. Any interval abstraction is outward-rounded and proved sound for
-this profile.
+`boon_data` exposes one low-level exact semantic API for normalization,
+arithmetic, comparison, rational rounding, whole-number/index conversion, and
+list-cardinality conversion. `boon_plan_executor`, `boon_verify`, native/Wasm
+backends, and test evaluators consume it; none reimplements observable Number
+behavior independently.
+
+The proof kernel models numerators, denominators, normalization, definedness,
+and comparisons exactly. A solver may use its exact integer/rational theories,
+but a model or certificate is replayed through the shared semantic evaluator.
+No binary floating-point approximation, host float, interval guess, or
+mathematical-real rewrite may change an observable rational result.
 
 V1 may prove:
 
 - exact constant calculations;
 - equality and order;
-- bounded linear arithmetic where binary64 behavior and operation definedness
-  are modeled exactly;
-- small whole-number state machines whose bounds make each operation exact;
-- explicitly supported rounding operations.
+- bounded linear rational arithmetic;
+- whole-number and bounded-index facts;
+- small exact-rational state machines;
+- explicitly supported exact rounding operations.
 
-Unsupported nonlinear, transcendental, overflow-sensitive, or otherwise
-unmodeled arithmetic returns `unsupported`, not a guessed result.
+Unsupported nonlinear, transcendental, or otherwise unmodeled arithmetic
+returns `unsupported`, not a guessed result. Proof and runtime profiles bound
+numerator/denominator bits, aggregate numeric memory, arithmetic/GCD work,
+parsed digits, and formatted digits. Exceeding such a bound is a deterministic
+terminal resource failure; it never truncates, approximates, wraps, or proves a
+weaker statement.
 
-`List/count` returns a Boon `Number`, not a hidden mathematical integer. A list
-summary must establish that its cardinality is exactly representable as
-`Number`, or model the conversion/error path explicitly. Cardinality proofs
-must not assume an unbounded integer result that runtime cannot produce.
+An obligation that requires an exact numeric result must also establish
+definedness under the artifact's numeric resource profile, or preserve the
+terminal-fault path in its modeled outcome. Solver timeout/memory exhaustion is
+a separate compile-time `timeout`/`unknown` result and likewise never becomes
+proof success.
+
+`List/count` returns an exact Boon `NUMBER`. The proof engine may reason about
+cardinality as an internal unbounded nonnegative integer, but its executable
+connection must establish the selected `ListCapacityProfileV1` bound and the
+lossless exact-Number conversion.
+
+## `BITS[N]`, `MAP`, `SET`, And `FLUSH` Proof Models
+
+The verifier implements the public algebra from
+`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`; it does not invent proof-only application
+types.
+
+For `BITS[N]`:
+
+- `N` is a positive compile-time width and part of the type;
+- equality, bitwise operations, concatenation, slicing, shifts, rotations,
+  extension, explicit truncation, and modulo operations use the exact
+  width-index and bit-order rules;
+- signed or unsigned interpretation is explicit for operations that require
+  it;
+- bounds, shift, conversion, underflow, and overflow results follow the exact
+  ordinary-operation or closed-Tag contracts;
+- solver bit-vectors are private encodings of these semantics, never a new
+  source type.
+
+For `MAP<K, V>` and `SET<K>`:
+
+- proof equality is extensional and uses complete canonical Boon key equality,
+  not hash buckets or insertion history;
+- only the key-safe closed values accepted by the language foundations plan
+  enter the proof model;
+- `Map/get`, `Set/contains`, upsert/add/remove, canonical enumeration, and
+  per-turn conflict resolution use the same presence, ordering, and source
+  sequence rules as execution;
+- finite-map/set summaries bind exact key/value types, semantic profile,
+  canonical encoding, operation contract, and implementation digest;
+- a hash collision, worker schedule, or backend iteration order can establish
+  no proof fact.
+
+`FLUSH` is a private control effect, not a data value. Verification tracks
+normal and flushing paths through the same activation tree used by semantic
+lowering. A flushing path aborts the owning candidate subtree, publishes no
+state or collection delta from that subtree, and dispatches no staged
+downstream effect. The hidden status is erased at the language-defined lexical
+boundary into the ordinary payload Tag. It is never matched, persisted,
+serialized, transported across a distributed cut, or used as a theorem
+subject. A `WHERE` condition itself must remain total and therefore cannot
+flush.
 
 ## Runtime Validation And Error Handling
 
@@ -1789,10 +1867,10 @@ FUNCTION accept_percentage(number) WHERE {
 draft
 |> Text/to_number()
 |> WHILE {
-    NaN =>
+    InvalidNumber[reason, position] =>
         Rejected[message: TEXT { Enter a number }]
 
-    number =>
+    Parsed[number] =>
         number >= 0
         |> Bool/and(right: number <= 100)
         |> WHEN {
@@ -2014,10 +2092,10 @@ store: [
         draft
         |> Text/to_number()
         |> WHILE {
-            NaN =>
+            InvalidNumber[reason, position] =>
                 Rejected[message: TEXT { Enter a number }]
 
-            number =>
+            Parsed[number] =>
                 number >= 0
                 |> Bool/and(right: number <= 100)
                 |> WHEN {
@@ -2341,7 +2419,22 @@ manifest entrypoint and `Scenario.source` to match and the compiled
 
 ## Compiler Architecture
 
-The required pipeline is:
+The mandatory semantic gate is:
+
+```text
+CheckedProgram
+    -> SemanticProgram
+    -> ContractVerifiedProgram
+    -> ErasedProgram
+```
+
+Every production frontend and backend follows that exact ownership order,
+including programs that author no local `WHERE`. `ParsedProgram` precedes it;
+`MachinePlan`, `PhysicalPlan`, native/Wasm code, and hardware IR follow it.
+No compiler flag, cache format, precompiled package, distributed role, test
+fixture, or target-specific lowering may skip the gate.
+
+The complete required pipeline is:
 
 ```text
 Boon source
@@ -2376,8 +2469,7 @@ ContractVerifiedProgram
     `--> boon_ir::erase_and_lower
              |
              v
-         VerifiedErasure {
-             erased_program: ErasedProgram
+         ErasedProgram {
              semantic_program_digest
              verification_manifest_digest
          }
@@ -2421,21 +2513,23 @@ executable IR:
 
 ```text
 VerifiedCompilationUnit {
-    verified_erasure
+    erased_program
     verified_public_contract_bundles
     authority_activation_requirements
     proof_report_reference
 }
 ```
 
-Compiler backends accept only the opaque `VerifiedErasure` and internally
-consume its `erased_program`; executable expression/state graphs contain
-neither proof wrappers nor contract nodes. Deployment/runtime sidecars retain
-only the static authority activation requirements needed to gate persisted
-restore. Module, package, and later distributed interface compilation consume
-the verified bundles. Tooling follows the report reference. This side path
-prevents both silent contract loss at erasure and accidental proof objects as
-Boon runtime values.
+Compiler backends accept only the opaque `ErasedProgram` produced by
+`boon_ir::erase_and_lower(ContractVerifiedProgram)`. Its constructors and
+verification-provenance fields are private, and a raw deserialized value is not
+accepted as a source-compilation result. Executable expression/state graphs
+contain neither proof wrappers nor contract nodes. Deployment/runtime sidecars
+retain only the static authority activation requirements needed to gate
+persisted restore. Module, package, and later distributed interface compilation
+consume the verified bundles. Tooling follows the report reference. This side
+path prevents both silent contract loss at erasure and accidental proof objects
+as Boon runtime values.
 
 Every compiler entrypoint imports transitive public contracts, elaborates the
 semantic graph, constructs its complete required-obligation manifest, verifies
@@ -2681,8 +2775,8 @@ must never widen one another's proof domain.
 
 The typechecker rejects:
 
-- non-Boolean conditions;
-- absent Boolean flows;
+- conditions whose source type is not the closed `True | False` Tag set;
+- absent `True | False` condition flows;
 - effects or state writes inside conditions;
 - unmodeled host/runtime identity;
 - a proof alias used outside its condition block;
@@ -2737,6 +2831,12 @@ VerificationManifest {
     manifest_digest
 }
 ```
+
+`semantic_profile_hashes` includes the exact-Number profile, list-capacity
+profile, every used `BITS[N]` operation profile, canonical MAP/SET key and
+operation profiles, and the `FLUSH` activation/commit profile. Changing any
+used profile invalidates the affected evidence and every dependent exported
+bundle.
 
 These embedded digests are also non-recursive and domain-separated:
 
@@ -2971,10 +3071,10 @@ Phase 1 removes or privatizes the current source-to-IR entrypoints `lower`,
 `lower_runtime_with_external_types`,
 `lower_runtime_with_external_types_and_producer_functions`, and
 `lower_checked`. The sole production entrypoint returns an opaque
-`VerifiedErasure`. Backend functions either accept that wrapper or are
-`pub(crate)` helpers reachable only after its digest checks. A publicly
-deserializable raw `ErasedProgram` is never accepted as a production
-source-compilation result.
+`ErasedProgram` whose private construction requires `ContractVerifiedProgram`.
+Backend functions either accept that value or are `pub(crate)` helpers
+reachable only after its provenance checks. A publicly deserializable raw
+`ErasedProgram` is never accepted as a production source-compilation result.
 
 An architecture test enumerates all production callers and fails if a new
 unchecked lowering or raw-backend path appears.
@@ -2985,7 +3085,8 @@ The verifier is layered:
 
 1. type, presence, purity, and definedness checks;
 2. constant folding and structural equality normalization;
-3. Boolean, tag, interval, finite-number, and cardinality analysis;
+3. private logical-Boolean, Tag, exact-rational, `BITS[N]`, finite
+   `MAP`/`SET`, and cardinality analysis;
 4. modular function-contract substitution;
 5. path-sensitive symbolic execution for `WHEN`, `WHILE`, and `THEN`;
 6. exact `LATEST` candidate coverage;
@@ -2996,18 +3097,19 @@ The verifier is layered:
 10. independent replay of refuting models through the shared semantic
     evaluator.
 
-Phase 1 uses a deterministic native prover for the supported Boolean, constant,
-structural, bounded-range, branch, and exact finite-number fragment. The
-current workspace has no selected SMT dependency, so an external SMT solver is
-not a V1 prerequisite and must not be chosen accidentally during
-implementation.
+Phase 1 uses a deterministic native prover for the supported private logical
+Boolean, constant, structural, bounded-range, branch, exact-rational, and
+fixed-width bit fragment. The current workspace has no selected SMT dependency,
+so an external SMT solver is not a V1 prerequisite and must not be chosen
+accidentally during implementation.
 
 Phase 0 produces a solver ADR before any external solver is added. It freezes:
 
 - backend, version, license, supported host/target matrix, and Rust interface;
 - static/dynamic linking and packaging policy;
 - offline installation and reproducibility;
-- supported theories and exact binary64 encoding;
+- supported exact integer/rational, private logical-Boolean, bit-vector, and
+  finite collection theories and their canonical encodings;
 - deterministic seeds, time and memory limits;
 - model extraction and validation;
 - proof-certificate support or explicit trusted-unsat status.
@@ -3193,8 +3295,7 @@ The normative transformation is:
 ```text
 ContractVerifiedProgram
     -> proof-erased SemanticProgram projection
-    -> ErasedProgram
-    -> private VerifiedErasure construction with semantic/verification digests
+    -> opaque ErasedProgram with semantic/verification digests
 ```
 
 `ErasedProgram` and the executable portion of `MachinePlan` contain no runtime
@@ -3205,9 +3306,8 @@ Verified public-contract bundles and compiler/debug proof reports remain
 interface/sidecar projections in `VerifiedCompilationUnit`; they are not
 discarded with executable proof nodes and never become runtime values.
 
-Production lowering inside `VerifiedErasure` is compared with a test-only
-reference projection of the same verified `SemanticProgram`, not with
-arbitrary hand-edited source.
+Production erasure is compared with a test-only reference projection of the
+same verified `SemanticProgram`, not with arbitrary hand-edited source.
 Handwritten contracted/uncontracted source pairs remain useful illustrative
 differential fixtures but are not the normative erasure oracle.
 
@@ -3399,9 +3499,10 @@ Canonical bytes use an explicitly specified length-prefixed field encoding,
 ordered lists, ordinal parameter binders in normalized formulas, and SHA-256.
 Hashing does not depend on Rust `serde` map order, source formatting, or
 process-local ids. Formula normalization is structural alpha-normalization plus
-only explicitly sound rewrites. It preserves operand order and definedness
-under binary64 semantics; mathematical-real reassociation or commutation is
-forbidden.
+only explicitly sound rewrites. It preserves operand order, definedness, exact
+rational semantics, `BITS[N]` width, and canonical collection ordering; a
+rewrite that changes normalization, a possible terminal fault, or
+`FLUSH`/commit behavior is forbidden.
 
 The theorem hash drives contract/API compatibility and covers only the public
 callable shape plus normalized authored statements and their public semantic
@@ -3668,9 +3769,9 @@ durability, or human usability verification.
 
 `WHERE` itself has no intended runtime cost because it is erased and does not
 duplicate input evaluation. V1 separately adds ordinary executor validation
-for the target-independent exact list-cardinality limit. That check is not a
-runtime proof assertion; its branch/cost and typed-capacity-error behavior must
-be measured and reported separately.
+for the artifact's explicit `ListCapacityProfileV1`. That check is not a
+runtime proof assertion; its branch/cost and terminal-capacity-fault behavior
+must be measured and reported separately.
 
 Persisted authorities carrying verified invariants also have an explicit host
 cost: bounded stamp bytes, atomic value-plus-stamp commit work, last-writer
@@ -3727,9 +3828,13 @@ The rollout and gates below exist to contain these risks.
 V1 comprises Phases 0 through 3 and is complete only when it supports:
 
 - both agreed syntax forms;
-- pure Boolean condition blocks;
-- constants, structural equality, tags, records, and supported finite-number
-  range reasoning under `NumberSemanticProfileV1`;
+- pure condition blocks over present `True | False` Tags;
+- constants, structural equality, Tags, records, and supported exact-rational
+  range reasoning under `ExactNumberSemanticProfileV1`;
+- exact `BITS[N]` and finite `MAP`/`SET` proof models for the operations in the
+  language-foundations phases completed before formal acceptance;
+- `FLUSH` path, candidate-abort, and staged-effect suppression modeling without
+  exposing its hidden status as data;
 - modular function input and returned-value contracts over parent-evaluated
   ordinary and implicit `PASSED` contextual formals;
 - exhaustive callable dependency manifests, resource-specific effect
@@ -3743,7 +3848,8 @@ V1 comprises Phases 0 through 3 and is complete only when it supports:
 - fail-closed fresh/restored state and list activation with versioned invariant
   statements, last-writer evidence, and measured persistence stamps;
 - the closed initial set of standard-list summary schemas;
-- target-independent exact list cardinality and checked `List/count`;
+- an explicit target-compatible list-capacity profile and lossless exact
+  `List/count`;
 - parameter-equivalent `PASS`/`PASSED` proof substitution plus V1-local rules
   for `OUT`, output-evaluated arguments, and compiler-supplied contexts;
 - the four teaching examples;
@@ -3780,6 +3886,21 @@ express the needed developer contract cleanly.
 
 ## Implementation Phases
 
+All phases in this plan are mandatory before canonical processor or other
+hardware implementation begins. Phases 0 through 5 establish the source and
+verification contract. Phase 6 is implemented jointly with packed
+`KernelIR` selection and translation validation in
+`BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md`. Phase 7 starts only after the
+Client/Session/Server role interfaces and distributed semantic fixed point are
+stable. Research inventories may run earlier, but hardware implementation may
+not consume a partial proof architecture.
+
+The unified goal pulls forward only the `boon_semantic`, `boon_verify`,
+required-manifest, `ContractVerifiedProgram`, and opaque `ErasedProgram`
+artifact boundary needed to establish the compiler spine. That bootstrap slice
+does not satisfy a Phase 0 or Phase 1 exit. Both phases are audited and
+completed here after the final foundations and typed-list semantics exist.
+
 ### Phase 0: Freeze Semantics And Make Parsing Fail Closed
 
 - Accept this document as the implementation contract.
@@ -3803,8 +3924,9 @@ express the needed developer contract cleanly.
   contract, last-writer evidence catalog, and
   `trusted_persistence_activation_v1` assurance scope for restored proved
   authorities.
-- Freeze `NumberSemanticProfileV1`, the shared checked Number operations, and
-  `MAX_EXACT_LIST_CARDINALITY_V1`.
+- Freeze `ExactNumberSemanticProfileV1`, the shared exact Number operations,
+  `ListCapacityProfileV1`, and exact `BITS[N]`/`MAP`/`SET`/`FLUSH` proof
+  profiles.
 - Freeze and centralize `SourceBundleDigestV1`.
 - Freeze `PublicContractTheoremV1`,
   `VerifiedPublicContractBundleV1`, their canonical encodings, and hash rules.
@@ -3834,16 +3956,18 @@ Exit:
 ### Phase 1: Pure Values And Functions
 
 - Add checked contracts and proof-only aliases.
-- Add `boon_verify`, `ContractVerifiedProgram`, and the completeness-checked
-  manifest.
+- Complete `boon_verify`, `ContractVerifiedProgram`, and the
+  completeness-checked manifest on the final semantic model.
 - Emit verified theorem/evidence bundles for source-co-compiled modules and
   reject claim-only precompiled imports.
-- Implement constants, Boolean logic, structural equality, bounded supported
-  Number reasoning, ordinary and `PASSED` contextual substitution, lexical
-  capture closure, and continuous-value `WHEN`/`WHILE` branch path facts.
+- Implement constants, private logical-Boolean reasoning over `True | False`
+  Tags, structural equality, bounded supported exact-Number and `BITS[N]`
+  reasoning, finite `MAP`/`SET` operations, `FLUSH` paths, ordinary and
+  `PASSED` contextual substitution, lexical capture closure, and
+  continuous-value `WHEN`/`WHILE` branch path facts.
 - Route every compiler entrypoint through verification.
-- Remove/private all raw source-to-IR entrypoints and require opaque
-  `VerifiedErasure` at compiler backends.
+- Remove/private all raw source-to-IR entrypoints and require opaque,
+  verification-derived `ErasedProgram` at compiler backends.
 - Add `CompileOutcome`, source-bound per-source reports with deterministic
   semantic cores, the exact
   `boon_cli verify` command, and core diagnostics.
@@ -3890,8 +4014,8 @@ Exit:
 
 ### Phase 3: Lists And Real TodoMVC
 
-- Enforce the target-independent list limit on every executor construction and
-  mutation path, and replace unchecked count casts.
+- Enforce the artifact's explicit `ListCapacityProfileV1` on every executor
+  construction and mutation path, and replace unchecked host-size casts.
 - Add the enumerated versioned standard-list summaries with assurance and
   implementation digests.
 - Extend invariant stamps and activation checks to persisted list authorities,
@@ -3948,20 +4072,31 @@ Exit:
 
 ### Phase 6: Proof-Driven Optimization
 
-- Select measured generic opportunities.
-- Consume facts from `ContractVerifiedProgram`.
-- Add translation validation.
-- Keep proof-disabled reference lowering available for differential checks.
+- Start only after formal Phases 0–5 and packed-runtime prerequisites are
+  complete.
+- Select measured generic opportunities jointly with packed `KernelIR`
+  construction.
+- Consume facts from `ContractVerifiedProgram` through a versioned verified
+  fact projection; never reread source contracts in the optimizer.
+- Add per-transformation translation validation between the verified semantic
+  reference and packed kernel.
+- Keep proof-disabled reference execution test-only for differential checks.
+- Cover values, presence, exact Number, `BITS[N]`, canonical collection order,
+  state/currentness, `FLUSH`, effects, and terminal faults.
 - Benchmark correctness before speed.
 
 Exit:
 
 - every accepted optimization has semantic and measured evidence;
+- every proof-selected packed kernel has source/target hashes and
+  transformation-specific validation evidence;
 - no example-specific branch exists;
 - programs without relevant facts do not regress.
 
 ### Phase 7: External And Distributed Contracts
 
+- Start only after Client/Session/Server interfaces, role identities, wire
+  schemas, and the distributed semantic fixed point are stable.
 - Version target-profile provider contracts.
 - Extend cross-role function signatures.
 - Add certificate-checked or explicitly trusted provider-bundle import.
@@ -4020,7 +4155,7 @@ Exit:
 - body-local invisibility from headers;
 - alias locality and escape rejection;
 - fact dropping at `BLOCK`, `HOLD`, and materialization scope exit;
-- Boolean, presence, purity, and totality;
+- `True | False` condition typing, presence, purity, and totality;
 - function result export over ordinary and `PASSED` formals;
 - rejection of private/materialization-local free declarations or unrecorded
   ambient assumptions in exported contracts;
@@ -4081,7 +4216,7 @@ Exit:
   changed default invalidates summary and proof caches;
 - a distributed producer with an ambient mutable capture is rejected, while an
   allowed closed constant capture is fully bound by interface evidence;
-- different migration predecessor catalogs, schema hashes, or leaf
+- different migration predecessor catalogs, semantic-schema hashes, or leaf
   fingerprints cannot reuse preservation evidence;
 - a same-statement private refactor may accept a restored invariant stamp only
   after validating its named last-writer evidence and current proof; a missing
@@ -4115,7 +4250,7 @@ Exit:
 - `HOLD` base failure;
 - `HOLD` transition failure;
 - fresh versus restored `HOLD` activation, including compatible
-  statement/schema/stamp acceptance, last-writer and current-evidence
+  statement/semantic-schema/stamp acceptance, last-writer and current-evidence
   validation, value/artifact/requirement-bound receipt creation,
   same-statement private-refactor acceptance, and rejection of a same-schema
   `-1` value written by an older uncontracted program under `current >= 0`;
@@ -4132,9 +4267,17 @@ Exit:
   symbolic quantified summary permits public export;
 - per-materialization caller obligations when an otherwise modular `PASSED`
   actual depends on `OUT` or another repeated context;
-- supported exact binary64 arithmetic;
-- subnormal, overflow, negative-zero, and list-count conversion boundaries;
-- exact list-cardinality limit and complementary partition arithmetic;
+- supported exact rational arithmetic, normalization, comparison, and authored
+  rounding;
+- numerator/denominator, arithmetic-work, API-domain, and list-capacity
+  resource boundaries;
+- exact list-cardinality/profile bounds and complementary partition
+  arithmetic;
+- `BITS[N]` widths, slicing, shifts, interpretation, and checked conversions;
+- extensional `MAP`/`SET` equality, canonical ordering, operation summaries,
+  and collision/scheduler-independence;
+- `FLUSH` candidate-abort, staged-effect suppression, lexical erasure, and
+  non-persistability;
 - unsupported arithmetic;
 - each enumerated list summary and its implementation/semantic digest;
 - timeout and unknown fail closed;
@@ -4252,9 +4395,10 @@ reports.
 4. Pipeline aliases are required, proof-only, lexically local, and follow the
    stated shadowing rule.
 5. Conditions are pure, total under admitted assumptions, defined, and produce
-   present Booleans. Subjects may retain ordinary modeled reactive, state, or
-   effect-result semantics; every admitted produced subject is defined, and
-   `WHERE` adds no executable effect.
+   present values of the closed `True | False` Tag set. Subjects may retain
+   ordinary modeled reactive, state, or effect-result semantics; every
+   admitted produced subject is defined, and `WHERE` adds no executable
+   effect.
 6. Header satisfiability is required; contradictory, unknown, timed-out, and
    unsupported domains are rejected.
 7. Only `valid` results with V1-allowed assurance dependencies satisfy an
@@ -4321,7 +4465,7 @@ reports.
     dependencies change evidence/bundle identity and trigger re-verification
     without creating a false contract diff.
 25. A restored contracted state/list authority activates only after exact
-    schema/invariant/persistence compatibility, accepted last-writer evidence,
+    semantic-schema/invariant/persistence compatibility, accepted last-writer evidence,
     current induction evidence, and the versioned persistence checker succeed
     and issue an exact artifact/requirement/value/stamp-bound receipt. Concrete
     receipts are host evidence and are never prerequisites or placeholders for
@@ -4346,8 +4490,8 @@ reports.
 3. If app-authored old/new relationships are introduced, they bind an explicit
    proof-only semantic witness through a separately approved source design.
 4. Preservation evidence binds the exact predecessor application/persistence
-   plans, schema/catalog/recipe hashes, and state/list leaves, and states the
-   treatment of durable effect-outbox state.
+   plans, semantic-schema/catalog/recipe hashes, and state/list leaves, and
+   states the treatment of durable effect-outbox state.
 5. Failed migration verification emits no accepted artifact.
 
 ### Tooling Acceptance: Phase 5
@@ -4363,6 +4507,9 @@ reports.
    translation validation and measurement pass.
 2. Every accepted optimization is generic, preserves modeled semantics, and
    does not regress programs lacking its required facts.
+3. Packed `KernelIR` selection consumes only verified fact projections and
+   proves equivalent exact values, presence, order, state/currentness,
+   `FLUSH`, effects, and terminal faults.
 
 ### External Contract Acceptance: Phase 7
 
@@ -4378,8 +4525,9 @@ Expected implementation surfaces include:
 - `docs/architecture/LANGUAGE_SEMANTICS.md`;
 - `Cargo.toml`;
 - `Cargo.lock`;
-- `crates/boon_data` for shared checked `NumberSemanticProfileV1` operations
-  and list-cardinality conversion;
+- `crates/boon_data` for shared exact `ExactNumberSemanticProfileV1`,
+  `BITS[N]` operations, canonical collection keys, and lossless
+  list-cardinality conversion;
 - new `crates/boon_contract` for data-only theorem/bundle and invariant-stamp
   DTOs;
 - `crates/boon_parser`;
@@ -4446,7 +4594,7 @@ and know, without learning a theorem-prover sublanguage:
 That compact mental model is the design constraint against which every
 implementation and future extension must be reviewed.
 
-## Review Record
+## Historical Review Record
 
 Date: 2026-07-26
 
@@ -4454,7 +4602,7 @@ This plan received three independent read-only review tracks:
 
 1. Boon syntax, locality, current APIs, reactive semantics, and
    `OUT`/`PASS`/`PASSED`;
-2. formal soundness, obligation completeness, trust, finite-number/list
+2. formal soundness, obligation completeness, trust, Number/list
    semantics, public theorems, and erasure;
 3. current-repository parser, compiler, distributed, runtime, manifest,
    playground, CLI, xtask, and package integration.
@@ -4495,7 +4643,7 @@ The blocker-only second passes additionally drove:
   only in deployment/runtime sidecars;
 - explicit semantic/executable crate and id ownership;
 - the distributed semantic fixed point before verification;
-- target-independent exact list cardinality for the TodoMVC theorem;
+- an explicit list-cardinality bound for the TodoMVC theorem;
 - structured failed-proof compiler outcomes and bounded report schemas;
 - canonical `SourceBundleDigestV1`;
 - exact contract-refresh and negative-fixture tooling;
@@ -4503,7 +4651,8 @@ The blocker-only second passes additionally drove:
 - exact phase ownership for every teaching example and real-source upgrade.
 
 After those revisions, all three reviewers performed a blocker-only reread of
-the same stable final snapshot and reported no remaining concrete blocker. The
-review verdict is implementation-ready at the architecture/plan level.
-Reviews were document/source inspection only; no build, test, runtime, native
-GPU, commit, or push was performed.
+that 2026-07-26 snapshot and reported no remaining concrete blocker. The
+2026-07-27 reconciliation replaces its floating-point and public-Boolean
+assumptions with the final language-foundation contracts and adds packed-kernel
+and hardware sequencing. Reviews were document/source inspection only; no
+build, test, runtime, native GPU, commit, or push was performed.

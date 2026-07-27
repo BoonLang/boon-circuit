@@ -1,10 +1,22 @@
 # Typed List Pipelines And Query Removal Plan
 
-Status: authoritative replacement architecture and implementation plan. No
-implementation is claimed by this document. Its list-access, ordering,
-pagination, index, and query-removal contracts supersede conflicting active
-`List/query`, `List/query_prefix`, persistent-query-driver, and cursor guidance
-in older plans.
+Status: authoritative replacement architecture and implementation plan. Commit
+`4d9863e` is a substantial partial checkpoint: it deleted the separate query
+crates/world and introduced compiler-derived typed access machinery. That
+checkpoint is preserved and audited, but it does not satisfy this plan's Clear
+End Condition. The list-access, ordering, pagination, index, and query-removal
+contracts here supersede conflicting active `List/query`, `List/query_prefix`,
+persistent-query-driver, and cursor guidance in older plans.
+
+Under the combined order in [`steps.md`](steps.md), the semantic/compiler/
+runtime cut lands before the full formal roadmap. Formal-dependent Clear End
+Condition evidence closes only after formal phases 0–5.
+
+The value algebra and compiler boundaries are governed by
+[`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md) and
+[`BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md`](BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md).
+This plan must use exact `NUMBER`, ordinary Tags, and the mandatory verified
+artifact spine; it defines no alternate list/query semantic profile.
 
 ## Summary
 
@@ -33,9 +45,9 @@ implementation must delete the old syntax, special lowering, runtime path, and
 tests. It must not retain aliases, deprecated forms, fallback parsing, or an
 example-specific branch.
 
-## Why The Existing Surface Must Go
+## Why The Superseded Surface Had To Go
 
-The current `List/query` signature combines the list receiver with 27 query
+The superseded `List/query` signature combined the list receiver with 27 query
 arguments. One call controls:
 
 - reflected field paths;
@@ -48,26 +60,26 @@ arguments. One call controls:
 - limit and cursor behavior;
 - WGS84 distance filtering.
 
-This creates invalid argument combinations that the normal type system cannot
-exclude. Fields and normalizations are encoded as comma-separated `TEXT`, and
-residual fields are encoded as dotted paths. IR lowering reparses checked source
+This created invalid argument combinations that the normal type system could
+not exclude. Fields and normalizations were encoded as comma-separated `TEXT`,
+and residual fields as dotted paths. IR lowering reparsed checked source
 instead of consuming authoritative typed field identities.
 
-The executor also maintains two representations:
+The pre-cutover executor also maintained two representations:
 
 1. canonical PlanExecutor rows and typed equality indexes;
 2. a separate query collection containing reconstructed, string-keyed records
    and another set of indexes.
 
-Every relevant row update synchronizes both structures. The persistent query
-backend validates redb authority but loads rows into the in-memory query engine
-for execution. This is useful reference machinery, but it is not one unified
+Every relevant row update synchronized both structures. The persistent query
+backend validated redb authority but loaded rows into the in-memory query engine
+for execution. This was useful reference machinery, but it was not one unified
 LIST runtime or a scalable persistent query path.
 
-The current API is also incomplete as a database abstraction. It has no general
+That API was also incomplete as a database abstraction. It had no general
 joins, groups, aggregates, Boolean planner, collation model, full-text ranking,
-or spatial index. WGS84 is a Haversine residual, not a spatial access method.
-The API is therefore both too large for `List` and too narrow to be a database.
+or spatial index. WGS84 was a Haversine residual, not a spatial access method.
+The API was therefore both too large for `List` and too narrow to be a database.
 
 ## Architectural Decision
 
@@ -123,9 +135,10 @@ matching_stations:
     )
 ```
 
-Repeated filters express conjunction. `Bool/and` and `Bool/or` express explicit
-Boolean composition; `Bool/or` must exist as an ordinary typed standard
-function before disjunction examples migrate. A range is two comparisons.
+Repeated filters express conjunction. `Bool/and` and `Bool/or` are ordinary
+functions over the closed `True | False` Tag set and express explicit truth
+composition; their namespace does not introduce a public Boolean type.
+`Bool/or` must exist before disjunction examples migrate. A range is two comparisons.
 Token membership is an ordinary typed token-list predicate. There is no
 `select:` mode and no user-visible residual mode.
 
@@ -163,21 +176,27 @@ comma-separated metadata. Both operations are stable: rows equal under every
 declared key preserve their current semantic source-list order. A second
 `List/sort_by` starts a new primary order rather than appending a key.
 
-The checked program carries an order-chain qualifier that `sort_by` creates and
-`then_by` extends. It is compile-time information, not a Boon value or runtime
+`CheckedProgram` proves each key type and call signature.
+`SemanticProgram` carries the order-chain qualifier that `sort_by` creates and
+`then_by` extends. It is compiler information, not a Boon value or runtime
 wrapper. Direct calls and transparent user wrappers preserve it. Filtering,
 one-to-one keyed mapping, and `take` preserve a compatible chain; reordering,
 many-to-one/expanding transformations, incompatible branches, and unknown
 calls clear it. Calling `then_by` without a compatible preceding chain is a
-compile error. The qualifier is erased after access planning.
+compile error. After verification, `boon_ir` lowers the qualifier's observable
+keys, directions, stability, bounds, and cursor requirements into a typed
+`ListAccessIntent` in `ErasedProgram`, then erases the semantic-only qualifier
+and proof provenance. `MachinePlan` carries that portable intent;
+`PhysicalPlan` selects indexes without rereading `SemanticProgram`.
 
-The initial orderable values are finite `NUMBER`, ordinal `TEXT`, `BOOL`, and
-closed fieldless tags. Objects, LIST, BYTES, events, effects, and error-capable
-keys are rejected. Text normalization is explicit and its semantics/version
-participate in the view fingerprint. Each compound key component owns its
-direction. Reversing one physical traversal is valid only when it implements
-the complete requested direction vector; `(A ascending, B descending)` is not
-implemented by reversing an `(A ascending, B ascending)` index.
+The initial orderable values are exact `NUMBER`, ordinal `TEXT`,
+lexicographically ordered equal-width `BITS[N]`, and eligible closed Tag sets.
+Objects, LIST, SET, MAP, BYTES, flow/effect values, and error-capable keys are
+rejected. Text normalization is explicit and its semantics/version participate
+in the view fingerprint. Each compound key component owns its direction.
+Reversing one physical traversal is valid only when it implements the complete
+requested direction vector; `(A ascending, B descending)` is not implemented
+by reversing an `(A ascending, B ascending)` index.
 
 ### Bounded Results
 
@@ -232,13 +251,15 @@ back, but modifying them can only produce `InvalidPageCursor`.
 schema detail to application code. The dev inspector and bounded diagnostics
 may report the internal reason without turning it into a public oracle.
 
-`size` is a finite whole `NUMBER`. Invalid literal sizes are compile errors;
-dynamic values outside `1..=10000` return `InvalidPageSize`. Products may impose
-smaller typed boundary limits, such as FjordPulse's external `1..=50`. No page
-evaluation may exceed the target candidate/residual budget; exhaustion returns
-`PageWorkLimitExceeded` rather than scanning farther or returning a misleading
-partial page. `take |> page` pages only that bounded view, and the evaluated
-take count participates in cursor identity.
+`size` is an exact positive whole `NUMBER` and must fit the explicit target
+profile bound. The default software profile permits `1..=10000`; invalid
+literals are compile errors and dynamic values outside the active bound return
+`InvalidPageSize`. Products may impose smaller typed boundary limits, such as
+FjordPulse's external `1..=50`. No page evaluation may exceed the target
+candidate/residual budget; exhaustion returns `PageWorkLimitExceeded` rather
+than scanning farther or returning a misleading partial page. `take |> page`
+pages only that bounded view, and the evaluated take count participates in
+cursor identity.
 
 ## Pagination Alternatives Considered
 
@@ -402,8 +423,8 @@ application-visible bounded continuation such as a server response.
 
 ### Typed Logical Views
 
-Lower list pipelines from the authoritative checked/erased expression graph
-into a typed logical view graph:
+`boon_semantic` constructs list pipelines from `CheckedProgram` as a typed
+logical view graph inside `SemanticProgram`:
 
 ```text
 SourceList
@@ -419,15 +440,39 @@ Each row use carries static owner, local, `ListId`, and `FieldId` identities.
 No backend may rediscover row fields from source text, debug labels, object
 geometry, or string paths.
 
-The typed graph also carries the order-chain qualifier described above and a
-closed operation-order boundary. Optimizers may not commute `filter`, `map`,
-`sort_by`, `then_by`, `take`, or terminal `page` unless equivalence, stable
-order, currentness, and work bounds are proven. Branches must agree on item
-type and compatible order provenance or the order qualifier is cleared.
+The semantic graph also carries the order-chain qualifier, evaluated-capture
+identities, authority and owner scope, dependency/currentness manifests, a
+closed operation-order boundary, and proof obligations. Optimizers may not
+commute `filter`, `map`, `sort_by`, `then_by`, `take`, or terminal `page`
+unless equivalence, stable order, currentness, and work bounds are proven.
+Branches must agree on item type and compatible order provenance or the order
+qualifier is cleared.
+
+The artifact boundary is mandatory:
+
+```text
+ParsedProgram
+-> CheckedProgram
+-> SemanticProgram
+-> ContractVerifiedProgram
+-> ErasedProgram
+-> MachinePlan
+-> PhysicalPlan or CoreHardwareIR
+```
+
+`boon_verify` certifies every logical-view obligation, including bounded
+access, exact key semantics, capture identity, stable order, and allowed
+operator transformations. `boon_ir` converts the certified logical view into
+`ListAccessIntent` inside `ErasedProgram`; machine planning preserves that
+target-independent intent, and only `PhysicalPlan` selects an executable index
+layout. Physical planning never consumes `SemanticProgram`, and erasure never
+discards an observable order, predicate, bound, or cursor requirement. No
+backend may derive a view or index directly from parser AST or an unverified
+`CheckedProgram`.
 
 ### Predicate Analysis
 
-Recognize physical opportunities from typed pure expressions:
+Record physical opportunities as proof obligations over typed pure expressions:
 
 - row field or pure computed key equal to a row-independent value;
 - lower and upper comparisons;
@@ -448,9 +493,10 @@ Normalization is explicit source composition:
 item.name |> Text/trim() |> Text/to_lowercase()
 ```
 
-The compiler may index that deterministic computed key. It must not request a
-parallel normalization string. Locale collation, stemming, fuzzy matching, and
-spatial indexes belong to separately typed libraries/backends.
+After contract verification, physical planning may index that deterministic
+computed key. It must not request a parallel normalization string. Locale
+collation, stemming, fuzzy matching, and spatial indexes belong to separately
+typed libraries/backends.
 
 ### Logical And Physical Identity
 
@@ -598,9 +644,9 @@ Do not put the following into `List/page`, `List/filter`, or compiler syntax:
 
 These are typed pure libraries plus optional specialized physical backends.
 For example, a Boon predicate may call `Geo/distance(...)`; semantics remain a
-normal Boolean expression. A compiler/backend may recognize a supported spatial
-function and select a spatial index, but correctness never depends on that
-optimization.
+normal expression returning the `True | False` Tag set. A compiler/backend may
+recognize a supported spatial function and select a spatial index, but
+correctness never depends on that optimization.
 
 "Optional" describes specialized acceleration, not FjordPulse behavior.
 FjordPulse must still express and pass exact station ID, normalized/multi-token
@@ -617,6 +663,13 @@ results are byte-for-byte deterministic across native and
 `wasm32-unknown-unknown`. Persisted/cursor fields use fixed-width integers and
 never `usize`.
 
+The ordered-key codec compares normalized rational numerator/denominator pairs
+by mathematical rational order and emits a canonical order-preserving NUMBER
+encoding. It orders TEXT by ordinal text semantics, BITS by declared width and
+lexicographic bit order, and closed Tags by canonical semantic order. It never
+converts NUMBER through f32/f64 or compares Tags by incidental host enum/hash
+order.
+
 The deterministic access kernel owns no filesystem, thread, wall-clock, or
 `std::time::Instant` dependency. Hosts supply timing/instrumentation around it;
 the browser implementation must not call APIs that panic on Wasm. IndexedDB
@@ -627,6 +680,13 @@ never changes query semantics or silently moves disk work onto the UI thread.
 
 ## Clean Implementation Sequence
 
+Preserve completed replacement work. If the old query crates/syntax are already
+deleted and the typed list-access kernel already exists, begin with a
+final-algebra and artifact-boundary audit, adapt the surviving implementation,
+and continue from the first unmet gate. Do not recreate deleted query
+machinery, rebuild equivalent list access under a new name, or discard valid
+ownership/currentness work.
+
 ### 1. Freeze Replacement Semantics
 
 - Add canonical signatures and flow types for typed `List/sort_by`,
@@ -634,19 +694,31 @@ never changes query semantics or silently moves disk work onto the UI thread.
 - Specify stable ordering, order-chain propagation, operator-order semantics,
   key types, dynamic page bounds, closed page variants, evaluated-capture
   fingerprints, cursor sealing, and expiry in `LANGUAGE_SEMANTICS.md`.
+- Lock orderable keys to exact `NUMBER`, ordinal `TEXT`, equal-width `BITS[N]`,
+  and eligible closed Tags; lock page counts/sizes to exact whole Numbers under
+  explicit target bounds.
 - Add compile-time negative tests for wrong OUT use, impure keys, unsupported
   directions, invalid `then_by` chains, invalid literal page sizes, unsupported
   keys, and invalid cursor variants.
 
 ### 2. Build Typed Logical List Plans
 
-- Lower filter/order/take/page pipelines from ErasedProgram only.
+- Build filter/order/take/page logical views in `SemanticProgram` from
+  `CheckedProgram`, including ordering provenance, evaluated captures, semantic
+  ownership, dependency manifests, and proof obligations.
+- Make `boon_verify` certify those obligations in
+  `ContractVerifiedProgram`; only then may `boon_ir` lower the verified view
+  into `ListAccessIntent`, machine planning preserve its portable requirements,
+  and physical planning select executable access plans.
 - Preserve generic row type through every operator and through `Page.items`.
 - Add semantic view-instance hashing over typed expressions, transitive pure
   function semantics, evaluated captures, hidden owner scope, and authority
   revision, independent of source formatting and physical indexes.
-- Preserve or clear checked order-chain provenance according to the explicit
-  operator rules, then erase it after access planning.
+- Preserve or clear checked order-chain provenance in `SemanticProgram`
+  according to the explicit operator rules. During verified erasure, translate
+  every observable requirement into `ListAccessIntent` and remove the
+  semantic-only qualifier; do not retain it until or reconstruct it during
+  physical access planning.
 - Extend the existing typed equality lookup inference instead of creating a
   second query extractor.
 
@@ -693,7 +765,8 @@ never changes query semantics or silently moves disk work onto the UI thread.
   fixtures with ordinary typed pipelines.
 - Replace query-time uniqueness tests with atomic typed existence-check plus
   append tests.
-- Add `Bool/or` as an ordinary typed function before migrating disjunctions.
+- Add `Bool/or` as an ordinary typed function over `True | False` Tags before
+  migrating disjunctions; do not add a Boolean type.
 - Update wrappers to prove that generic Boon functions can compose these
   operators without compiler-only source spellings.
 - Update language, runtime, persistence, FjordPulse, and unified-goal docs.
@@ -739,6 +812,13 @@ tree has one path.
 - string field paths and comma-separated field declarations are rejected.
 - page items preserve `T`; no open-object fallback is accepted.
 - unsupported or impure ordering/normalization expressions fail clearly.
+- exact NUMBER, ordinal TEXT, equal-width BITS, and eligible closed Tags order
+  deterministically; public Boolean, binary64, unequal-width BITS, objects, and
+  collection keys are rejected.
+- typed logical views and capture/order/dependency identities exist in
+  `SemanticProgram`, their obligations are certified in
+  `ContractVerifiedProgram`, and executable access planning cannot bypass that
+  gate.
 
 ### Semantic Equivalence
 
@@ -871,6 +951,10 @@ This plan is complete only when all of the following are true:
    artifacts.
 8. Independent reviews find no reflective query metadata, duplicate authority,
    hidden runtime fallback, compatibility alias, or stale report used as proof.
+9. Logical views, order provenance, capture identity, dependencies, and proof
+   obligations are constructed once in `SemanticProgram`; every executable
+   access plan descends from `ContractVerifiedProgram`, and no parser,
+   typechecker-only, or backend rediscovery path remains.
 
 Do not mark the larger unified goal complete merely because this replacement
 plan passes. Distributed/session work, streaming, NovyWave, Cells frame budgets,

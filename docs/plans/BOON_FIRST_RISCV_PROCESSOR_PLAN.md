@@ -1,8 +1,8 @@
 # First Boon-Designed RISC-V Processor Plan
 
-Status: proposed implementation contract, dependent on the minimum packed-data
-gate in
-[`BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md`](BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md).
+Status: proposed implementation contract. Canonical implementation depends on
+complete language foundations, formal verification, universal packed-runtime
+completion, and the mature web-application gates described below.
 
 Working core name: **Boon RV32I**.
 
@@ -12,9 +12,12 @@ Build a real RV32I processor whose architectural logic is authored in Boon,
 then run the same source through:
 
 ```text
-Boon source
-  -> checked and erased Boon program
-  -> semantic MachinePlan
+ParsedProgram
+  -> CheckedProgram
+  -> SemanticProgram
+  -> ContractVerifiedProgram
+  -> ErasedProgram
+  -> MachinePlan
   -> CoreHardwareIR
   -> native and browser/Wasm cycle simulators
   -> target elaboration
@@ -111,8 +114,8 @@ In the Wasm milestone, the **Boon-authored processor model** runs in a
 browser/Wasm simulator. That does not mean the simulated RV32I executes the
 Boon compiler or runtime.
 
-If self-hosting later becomes useful, it is a separate product decision with
-its own cost and proof. It is not hidden in the acceptance criteria here.
+Self-hosting is outside this roadmap. It is neither a prerequisite, a milestone,
+nor hidden acceptance work.
 
 ## Current Repository Baseline
 
@@ -146,10 +149,29 @@ Important gaps remain:
 Phase 0 must correct these gaps honestly. Existing planning language is not
 hardware-readiness evidence.
 
-## Dependency On Universal Packed Work
+## Dependency On The Completed Universal Stack
 
-Planning and isolated generic hardware fixtures may begin immediately. The
-canonical processor implementation begins after the following minimum gate:
+Before the canonical processor project begins, all of these prerequisites must
+be complete:
+
+- [`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md),
+  including the final value algebra, `BITS[N]`, bounded `MAP`, and its flag-day
+  deletions;
+- the verified `ParsedProgram` -> `CheckedProgram` -> `SemanticProgram` ->
+  `ContractVerifiedProgram` -> `ErasedProgram` -> `MachinePlan` compiler
+  spine;
+- every phase of
+  [`BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md`](BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md);
+- every phase and acceptance criterion of
+  [`BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md`](BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md),
+  including formal Phase 6 integration, native/Wasm parity, product-scale
+  reports, and flag-day deletion;
+- the final Client/Session/Server, persistence, content/streaming, NovyWave,
+  Cells, FjordPulse, native, Wasm, browser, and deployment gates required by
+  the active combined [`GOAL_PROMPT.md`](GOAL_PROMPT.md).
+
+The following narrower technical gate remains useful as a diagnostic milestone
+inside the foundation and packed work:
 
 - `BITS[N]` parses, typechecks, lowers, executes, serializes, and compares
   identically on native and Wasm;
@@ -161,20 +183,18 @@ canonical processor implementation begins after the following minimum gate:
   `BTreeMap`, `BTreeSet`, `HashMap`, or `HashSet`;
 - target profiles express concrete widths, capacities, ports, latency, and
   overflow/fault behavior;
-- the checked/erased/semantic-`MachinePlan` and physical/hardware plan versions
-  used by the processor are stable and separately hashed;
+- the `CheckedProgram`/`SemanticProgram`/`ContractVerifiedProgram`/
+  `ErasedProgram`/`MachinePlan` and physical/hardware artifact versions used by
+  the processor are stable and separately hashed;
 - every compiler/runtime/layout path used by processor cycles has completed its
   flag-day deletion, with no legacy/reference production switch or
   compatibility materializer.
 
-The processor does not have to wait for:
-
-- every general `SET` optimization;
-- every GPU/vector backend;
-- all text/byte optimizations;
-- self-hosting;
-- the final custom Boon processor;
-- all server/persistence product work.
+Passing this milestone does not authorize canonical processor implementation.
+Before every prerequisite above passes, a pre-Stage-0 activity may perform only
+read-only specification, board, toolchain, test-suite, and repository
+inventory. Do not write canonical processor source, hardware IR implementation,
+generated RTL, processor-specific compiler paths, or acceptance fixtures early.
 
 Architectural CPU state uses `BITS`, bounded `MAP`, Tags, records, sources, and
 ordinary Boon state/flow. It need not depend on general exact `NUMBER`
@@ -416,9 +436,13 @@ are reported separately.
 
 ## CoreHardwareIR And TargetHardwareIR
 
-The authoritative erased program produces a semantic `MachinePlan`.
-`MachinePlan` is the hardware semantic input and the sibling software-oracle
-artifact used for provenance/differential traces.
+The mandatory verified compiler spine produces the authoritative
+`ErasedProgram`, which produces a semantic `MachinePlan`. `MachinePlan` is the
+hardware semantic input and the sibling software-oracle artifact used for
+provenance/differential traces. Generic proof facts may establish boundedness,
+purity, widths, totality, and hardware eligibility only after they pass through
+`ContractVerifiedProgram`; hardware lowering may not recover or trust an
+unverified source-level claim.
 
 `CoreHardwareIR` is derived from:
 
@@ -656,6 +680,9 @@ equivalence.
 
 ### Stage 0: Freeze Contracts And Inventory Gaps
 
+- Begin only after every prerequisite in the "Dependency On The Completed
+  Universal Stack" section passes; reconcile the earlier read-only inventory
+  against that unchanged revision.
 - Reconcile the stale FPGA CLI/documentation claims.
 - Inventory missing `BITS`, `MAP`, profile, IR, simulator, report, and toolchain
   pieces.
@@ -763,6 +790,11 @@ Exit: there is no manual functional RTL patch between Boon and the passing RTL.
 - Add core-specific safety and bounded-progress properties.
 
 Exit: a self-written smoke program is not the only evidence.
+
+Generic `WHERE` proofs and `ContractVerifiedProgram` may justify hardware
+eligibility and translation steps, but they do not prove RV32I compliance.
+Architectural tests, Sail differential execution, RVFI, `riscv-formal`, and
+core-specific properties remain independent mandatory evidence.
 
 ### Stage 7: First FPGA Board
 
@@ -1059,43 +1091,45 @@ the final design.
 
 The plan is complete only when:
 
-1. The architectural CPU logic is Boon source.
-2. The implemented ISA contract is complete RV32I for the declared execution
+1. Every language, compiler, formal, packed-runtime, mature-web-stack, and
+   fresh cross-target prerequisite named by this plan passed before Stage 0.
+2. The architectural CPU logic is Boon source.
+3. The implemented ISA contract is complete RV32I for the declared execution
    environment.
-3. `BITS[N]` and bounded `MAP` are general language/compiler features.
-4. The register file is a compiler-selected bounded `MAP` layout.
-5. No `MEMORY` keyword exists.
-6. The cycle hot path contains no recursive runtime value, string field lookup,
+4. `BITS[N]` and bounded `MAP` are general language/compiler features.
+5. The register file is a compiler-selected bounded `MAP` layout.
+6. No `MEMORY` keyword exists.
+7. The cycle hot path contains no recursive runtime value, string field lookup,
    or standard map/set container.
-7. Generic hardware fixtures pass before the CPU depends on them.
-8. One normalized `CoreHardwareIR` drives native/Wasm and every target
+8. Generic hardware fixtures pass before the CPU depends on them.
+9. One normalized `CoreHardwareIR` drives native/Wasm and every target
    elaboration; each `TargetHardwareIR` records that parent digest.
-9. Native and Wasm retirement traces and final digests agree.
-10. Generated RTL matches `TargetHardwareIR` ports and retirement cycle by
+10. Native and Wasm retirement traces and final digests agree.
+11. Generated RTL matches `TargetHardwareIR` ports and retirement cycle by
     cycle, and target elaboration preserves the core-visible contract.
-11. Architectural signatures match a pinned independent reference.
-12. Required formal properties pass.
-13. Yosys synthesis and target place/route produce bounded fresh reports.
-14. The physical board returns a machine-readable signature matching
+12. Architectural signatures match a pinned independent reference.
+13. Required formal properties pass.
+14. Yosys synthesis and target place/route produce bounded fresh reports.
+15. The physical board returns a machine-readable signature matching
     simulation.
-15. The core source, semantic plan, core profile, and `CoreHardwareIR` digest
+16. The core source, semantic plan, core profile, and `CoreHardwareIR` digest
     are unchanged across board profiles; target IR and shell digests are
     separately recorded.
-16. The Boon Orchard milestone consumes the real proof bundle.
-17. Self-hosting, Linux, networking, and a useful server workload were not
+17. The Boon Orchard milestone consumes the real proof bundle.
+18. Self-hosting, Linux, networking, and a useful server workload were not
     smuggled into the critical path.
-18. The memory port proves one acceptance/one response, stable backpressure,
+19. The memory port proves one acceptance/one response, stable backpressure,
     little-endian lane behavior, one outstanding transaction, and no side
     effect on a faulting store.
-19. Hardware `SOURCE` presence and `LATEST` sequence arbitration match software
+20. Hardware `SOURCE` presence and `LATEST` sequence arbitration match software
     semantics; synthesis/source order never chooses a winner.
-20. The register `MAP` is explicitly total after the declared reset and cannot
+21. The register `MAP` is explicitly total after the declared reset and cannot
     yield `NotFound`.
-21. Instruction traps and pre-instruction fetch faults have distinct,
+22. Instruction traps and pre-instruction fetch faults have distinct,
     unambiguous trace/RVFI treatment and no forbidden side effects.
-22. `MAX_MEMORY_WAIT` and per-instruction cycle bounds are proved under the
+23. `MAX_MEMORY_WAIT` and per-instruction cycle bounds are proved under the
     declared response assumption; an unbounded stall remains safe.
-23. Every architectural-test exclusion has replacement Sail, dedicated
+24. Every architectural-test exclusion has replacement Sail, dedicated
     fixture, or formal evidence.
 
 ## Risks And Mitigations

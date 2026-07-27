@@ -2,11 +2,12 @@
 
 Date: 2026-07-13
 
-Status: implemented architecture and canonical acceptance contract. Durable
-semantic memory, restore, migration, effects, native redb, browser IndexedDB,
-and development tooling are present in the worktree. Completion is determined
-by fresh tests and the manifest-backed native handoff reports, not by a second
-hand-maintained pass list in this document.
+Status: canonical architecture and acceptance contract, reconciled with the
+final language-value plan on 2026-07-27. Durable semantic memory, restore,
+migration, effects, native redb, browser IndexedDB, and development tooling
+exist in the worktree. Exact `NUMBER`, `BITS[N]`, canonical `MAP`/`SET`, private
+absence/fault handling, and `FLUSH` atomicity remain mandatory reconciliation
+work; the goal is not complete until fresh tests prove the complete contract.
 
 The language decision is recorded and implemented: authoritative memory is
 durable by default, and `DRAIN` / `DRAINING` is the explicit state-evolution
@@ -19,9 +20,15 @@ second active persistence plan.
 
 The implementation is split along existing ownership boundaries:
 
-- `boon_ir` and `boon_compiler` produce MachinePlan v3 semantic memory,
+- The compiler follows `ParsedProgram -> CheckedProgram -> SemanticProgram ->
+  ContractVerifiedProgram -> ErasedProgram -> MachinePlan`.
+  `boon_semantic` owns semantic memory/authority and migration meaning;
+  `boon_verify` certifies every obligation; `boon_ir` performs only verified
+  erasure; and `boon_compiler`/`boon_plan` produce `MachinePlan` memory,
   recursive type fingerprints, stable storage identities, output roots,
-  migration edges, and effect contracts.
+  migration edges, and effect contracts from `ErasedProgram`. Target
+  elaboration produces a separate `PhysicalPlan`; its layout identity never
+  changes semantic persistence compatibility.
 - `boon_plan_executor::Session` owns prepare/commit/settle, sparse authority
   deltas, restore-before-publication, demand currentness, list identity, and
   cycle-safe dependency evaluation.
@@ -136,9 +143,12 @@ row representations. Persistence must not derive its file schema directly from
 that implementation enum.
 
 Define a Boon-owned recursive `StoredValue` format for language-level data and
-separate storage DTOs for list/row authority. Internal row views, runtime IDs,
-evaluation stacks, source bindings, document objects, and errors internal to
-the engine are never serialized as runtime snapshots.
+separate storage DTOs for list/row, `MAP`, and `SET` authority. Internal row
+views, runtime IDs, evaluation stacks, source bindings, document objects,
+absence markers, hidden `FLUSH` envelopes, and engine faults are never
+serialized. A source value spelled `Null`, `True`, `False`, or `Error[...]` is
+ordinary Tag/object data and uses that generic encoding; none receives a
+privileged persistence variant.
 
 All language-level data must have a deterministic encoding. The existence of a
 codec does not mean every computed value is written. Only authoritative memory
@@ -352,31 +362,42 @@ an end-to-end secrecy claim: the host and authentication endpoint necessarily
 process the secret. A future general sensitivity/taint system requires its own
 language and threat-model plan.
 
-## Semantic Memory And MachinePlan v3
+## Semantic Memory Plan And Physical Layout
 
-Persistence requires a clean plan break. Introduce MachinePlan v3 and remove
-the old plan shape rather than carrying a dual executor or compatibility
+Persistence requires a clean plan break. Keep portable semantic memory in
+`MachinePlan`, reached only through the mandatory verified compiler spine;
+elaborate backend representation into `PhysicalPlan`, and remove the old
+combined plan shape rather than carrying a dual executor or compatibility
 fallback.
 
 Illustrative plan types:
 
 ```rust
 pub struct MachinePlan {
-    pub format_version: u32, // exactly 3
+    pub semantic_format_version: u32,
     pub application: ApplicationPlan,
-    pub storage: StorageLayout,
     pub persistence: PersistencePlan,
     pub effects: Vec<EffectContract>,
     pub outputs: Vec<OutputRootPlan>,
     // Existing operation regions, source routes, constants, and debug map.
 }
 
+pub struct PhysicalPlan {
+    pub semantic_plan_hash: [u8; 32],
+    pub physical_layout_hash: [u8; 32],
+    pub storage: StorageLayout,
+    pub derived_indexes: Vec<DerivedIndexLayout>,
+    // Target/backend scheduling, packing, cache, and table choices.
+}
+
 pub struct PersistencePlan {
     pub format_version: u32,
-    pub schema_version: u64,
-    pub schema_hash: [u8; 32],
+    pub semantic_schema_version: u64,
+    pub semantic_schema_hash: [u8; 32],
     pub memory: Vec<MemoryPlan>,
     pub lists: Vec<ListMemoryPlan>,
+    pub maps: Vec<MapMemoryPlan>,
+    pub sets: Vec<SetMemoryPlan>,
     pub migration_edges: Vec<MigrationEdgePlan>,
 }
 
@@ -393,11 +414,16 @@ pub struct MemoryPlan {
 pub enum MemoryKind {
     Scalar,
     IndexedField,
+    List,
+    Map,
+    Set,
 }
 ```
 
 `PersistencePlan` includes every semantic memory node. It has no durable versus
-session versus transient role enum.
+session versus transient role enum. `PhysicalPlan` may choose dense, sparse,
+hashed, ordered, direct-address, or packed storage only when the choice
+preserves this semantic plan.
 
 ### Stable Application Identity
 
@@ -444,7 +470,7 @@ Identity excludes:
 - current default values;
 - derived expressions;
 - document/render structure;
-- type fingerprints and schema hashes;
+- type fingerprints, `semantic_schema_hash`, and `physical_layout_hash`;
 - migration markers.
 
 An anonymous stateful operation that cannot receive a unique stable semantic
@@ -457,26 +483,29 @@ key.
 `PlanValueType` must become a recursive canonical data schema capable of
 describing:
 
-- null/unit;
-- booleans, numbers, bytes, and text;
-- variants/tags and their fields;
+- exact normalized rational numbers, bytes, text, and width-bearing
+  `BITS[N]`;
+- ordinary Tags, including `Null`, `True`, `False`, and application error
+  Tags, and their canonical fields;
 - records with canonical field identities;
-- lists and row constructor authority;
+- lists, `MAP`, `SET`, and their authority/key/value schemas;
 - fixed-length and variable bytes;
-- language-level error/result data where exposed as ordinary values.
+- application error/result objects represented through ordinary Tags and
+  structural fields.
 
 Type fingerprints are separate from memory identity. Compatible additions and
 migrations operate on known schemas. Bytes are never reinterpreted under a
 different type merely because a path matches.
 
-### Schema Hash
+### Semantic Schema And Physical Layout Hashes
 
-The persistence schema hash covers:
+The `semantic_schema_hash` covers:
 
 - application and state namespace format;
 - semantic memory identities;
 - memory kinds and recursive type fingerprints;
 - list ownership and authoritative row fields;
+- `MAP` key/value and `SET` element schemas plus canonical key encoding;
 - effect outbox schema.
 
 It excludes source formatting, pure-derived fields, output trees, render
@@ -484,17 +513,27 @@ resources, debug labels, unrelated constants, and the historical migration
 catalog. Adding an older supported migration recipe must not change the state
 schema identity of an already deployed target.
 
+The separate `physical_layout_hash` covers backend table layout, derived access
+indexes, page/blob placement, compression, cache shape, and other
+`PhysicalPlan` choices. A physical-only change rebuilds or compacts those
+structures from canonical authority without a language migration. It cannot
+change `semantic_schema_hash`, memory identity, canonical value bytes,
+migration compatibility, or application-visible behavior. Reports and stored
+metadata carry both hashes under distinct field names; a generic `schema_hash`
+field that could mean either is forbidden.
+
 Migration identity is separate and non-circular:
 
 - each current-source `DRAIN` recipe has a canonical `recipe_hash` over stable
   source/destination memory leaves, transfer kinds, and the closed pure
   expression plan;
-- a bound historical edge ID hashes the exact source schema reference, target
-  schema reference, and `recipe_hash`;
+- a bound historical edge ID hashes the exact source semantic-schema
+  reference, target semantic-schema reference, and `recipe_hash`;
 - a bundle may expose a `catalog_hash` over its ordered edge IDs for artifact
-  reproducibility, but `catalog_hash` is not part of `schema_hash`;
-- an edge ID never depends on a target schema hash that itself includes that
-  edge or catalog.
+  reproducibility, but `catalog_hash` is not part of
+  `semantic_schema_hash`;
+- an edge ID never depends on a target semantic-schema hash that itself
+  includes that edge or catalog.
 
 ## Durable Data Model
 
@@ -505,25 +544,55 @@ structs:
 
 ```text
 StoredValue
-  Null
-  Bool
-  signed 64-bit Number
+  ExactNumber(
+      numerator_sign: Negative | Zero | Positive,
+      minimal big-endian numerator_magnitude bytes,
+      minimal positive big-endian denominator bytes
+  )
   Text
   Bytes or BlobRef
-  Variant(tag, canonical fields)
-  Record(canonical fields)
-  ListValue(values) when the list is ordinary nested data
-  ErrorData(code, fields) when it is a language value
+  Bits(width, canonical big-endian bytes)
+  Tag(name, canonical fields)
+  Object(canonical fields)
 ```
 
-Mutable semantic list authority uses dedicated list/row records instead of a
-single encoded `Value::List` snapshot.
+The exact Number numerator and denominator are arbitrary precision. Magnitudes
+use no leading zero byte; zero uses an empty numerator magnitude with sign
+`Zero`; nonzero values use `Negative` or `Positive`; the denominator is
+strictly positive and never empty. Numerator and denominator share no common
+factor, and zero is encoded only as `0 / 1`. Signed zero, alternate fractions,
+host floats, and backend-width-dependent integers are rejected as noncanonical.
+
+`Bits.width` is positive and part of the stored type fingerprint. The payload
+has exactly `ceil(width / 8)` bytes in big-endian order; the unused high bits of
+the first byte are zero. Decoding rejects a nonzero padding bit or a payload
+whose length does not match its width.
+
+`Null`, `True`, `False`, application errors, `Found`/`NotFound`, and every
+other source variant use `Tag`; records and tagged payloads use canonical
+objects. There are deliberately no dedicated `Null`, `Bool`, or `ErrorData`
+storage variants. Private absence, engine faults, resources, and the hidden
+`FLUSH` status have no `StoredValue` encoding and fail serialization before a
+write batch is created.
+
+Every LIST, MAP, and SET construction is an authority under the foundations
+plan. It therefore uses dedicated authority records, never a `StoredValue`
+snapshot variant. When an object, Tag payload, MAP value, or LIST row contains
+a nested collection, the enclosing authority record stores a private typed
+parent-child authority edge with stable child memory identity and generation.
+That edge is persistence metadata, not a Boon value; restore validates the
+single-parent acyclic ownership tree before publication. Public equality,
+hashing, export, and inspection recursively observe canonical child contents,
+but a transient materialized export tree never becomes durable application
+state or a second collection authority.
 
 Use `minicbor` with:
 
 - a top-level format version;
 - numeric field and variant tags that are never reused;
 - canonical field/map ordering;
+- canonical Tag names, object field order, exact rational encoding, BITS width,
+  and collection-key order;
 - bounded lengths and nesting depth;
 - explicit unknown-field handling for compatible additions;
 - SHA-256 checksums for checkpoint and migration envelopes;
@@ -565,6 +634,41 @@ Append then remove must not resurrect initial rows or reuse an old key after
 restart. Derived mapped fields, source bindings, lookup indexes, filters,
 chunks, and summaries are reconstructed.
 
+### MAP And SET Authority
+
+Authoritative `MAP` and `SET` values persist their semantic owner, recursive
+key/value schema, canonical entries, and committed revision. They never persist
+hash buckets, randomized hash seeds, probe order, worker shards, or
+backend-specific tree nodes.
+
+One committed turn emits sparse canonical deltas:
+
+```text
+MapDelta
+  Upsert(canonical_key, stored_value_shell, nested_child_edges)
+  Remove(canonical_key)
+
+SetDelta
+  Add(canonical_item)
+  Remove(canonical_item)
+```
+
+Deltas are ordered by the language's type-directed canonical key order after
+the runtime has applied its source-sequence and same-key conflict rules.
+Identical operations may coalesce exactly as the semantic plan permits; a
+conflict is never resolved by hash or scheduler order. A checkpoint contains
+one canonical entry per structurally equal key/item. Restore rejects duplicate,
+misordered, noncanonical, schema-ineligible, or collision-confused entries.
+Nested child edges are permitted only where the checked authority schema
+allows them; they preserve identity and generation rather than embedding a
+collection snapshot in `stored_value_shell`.
+
+Derived hash tables, direct-address layouts, indexes, and caches belong to
+`PhysicalPlan`. Restore rebuilds them from canonical authority and validates
+their declared bounds before publication. Switching between those physical
+representations changes `physical_layout_hash` only and never triggers a
+semantic migration.
+
 ### Derived Typed List Access Indexes
 
 `TYPED_LIST_PIPELINES_AND_QUERY_REMOVAL_PLAN.md` is authoritative for typed
@@ -575,11 +679,12 @@ are not authoritative tables, another journal, or a second collection model.
 
 Restore or hot activation builds all required indexes into the unpublished
 candidate Session, validates their schema/access-plan identity and bounds, and
-publishes readiness only after they are usable. A physical-plan change rebuilds
-derived indexes without migrating canonical rows. Corrupt authority or a failed
-required-index build fails readiness. Native rebuild runs off the render/input
-thread; browser rebuild is worker-backed or cooperatively yielded and cannot
-freeze the main thread.
+publishes readiness only after they are usable. A `PhysicalPlan` change rebuilds
+derived indexes without migrating canonical rows and changes only
+`physical_layout_hash`. Corrupt authority or a failed required-index build
+fails readiness. Native rebuild runs off the render/input thread; browser
+rebuild is worker-backed or cooperatively yielded and cannot freeze the main
+thread.
 
 After readiness, the same hot deterministic index kernel serves native and
 Wasm. Committed row turns update only affected index entries using typed field
@@ -615,9 +720,9 @@ Refactor `Session` execution into three explicit phases:
 1. **Prepare**
    - ingest source events;
    - evaluate affected equations against the previous committed snapshot;
-   - stage scalar/list/row writes;
+   - stage scalar/list/row/`MAP`/`SET` writes;
    - resolve `LATEST` and other write policies;
-   - validate list mutations and effect intents;
+   - validate collection mutations and effect intents;
    - perform every fallible operation required to decide authority.
 2. **Commit**
    - atomically install staged authority;
@@ -632,6 +737,17 @@ Refactor `Session` execution into three explicit phases:
 
 Preparation failure changes no authority. Settle/output failure is visible but
 does not create a half-committed turn.
+
+`FLUSH` follows the activation-tree semantics in
+`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`. When an activation subtree flushes,
+Prepare discards every candidate authority write, collection operation,
+persistence delta, and staged effect intent owned by that subtree before
+Commit. A whole-collection callback flush discards all candidate changes for
+that operator activation. Successful independent sibling activations and
+already committed earlier pulse microturns keep their ordinary semantics.
+Neither the hidden flush status nor an aborted candidate may enter
+`AuthorityTurn`, checkpoint bytes, migration input, outbox state, or inspector
+data as durable authority.
 
 ### Authority Delta Contract
 
@@ -653,6 +769,10 @@ pub enum AuthorityChange {
     RemoveRow { list: MemoryId, row: StableRowKey },
     MoveRow { list: MemoryId, row: StableRowKey, position: u64 },
     ReplaceListAuthority { list: MemoryId, state: AuthoritativeList },
+    UpsertMapEntry { map: MemoryId, key: DataValue, value: DataValue },
+    RemoveMapEntry { map: MemoryId, key: DataValue },
+    AddSetItem { set: MemoryId, item: DataValue },
+    RemoveSetItem { set: MemoryId, item: DataValue },
 }
 ```
 
@@ -686,16 +806,17 @@ SessionBuilder::new(plan)
 
 Candidate construction phases are fixed:
 
-1. Validate MachinePlan v3, persistence metadata, stable-key uniqueness, type
+1. Validate semantic `MachinePlan`, `semantic_schema_hash`,
+   `physical_layout_hash`, persistence metadata, stable-key uniqueness, type
    fingerprints, migration graph, and effect contracts.
 2. Validate the read-only store image and determine sequential migration
    edges.
 3. Produce an in-memory migrated `RestoreImage` and an exact
    `ActivationBatch`; do not mutate the store.
-4. Allocate raw scalar/list storage and static row identities without demanding
-   derived fields.
-5. Install compatible scalar, list, row, generation, allocator, and touched
-   authority.
+4. Allocate raw scalar/list/`MAP`/`SET` storage and static row identities
+   without demanding derived fields.
+5. Install compatible scalar, list, row, map/set entry, generation, allocator,
+   and touched authority.
 6. Evaluate reconstructable defaults only for memory with no restored touched
    authority; materialized initial authority enters a staged turn.
 7. Rebuild indexes, dynamic dependencies, and dormant source-route metadata.
@@ -773,7 +894,8 @@ contain one or more complete contiguous turns:
 ```rust
 pub struct CheckpointBatch {
     pub application: ApplicationIdentity,
-    pub schema_hash: [u8; 32],
+    pub semantic_schema_hash: [u8; 32],
+    pub physical_layout_hash: [u8; 32],
     pub base_epoch: u64,
     pub next_epoch: u64,
     pub first_turn_seq: u64,
@@ -787,9 +909,10 @@ pub struct ActivationBatch {
     pub application: ApplicationIdentity,
     pub expected_base_epoch: u64,
     pub next_epoch: u64,
-    pub source_schema_hash: [u8; 32],
-    pub target_schema_version: u64,
-    pub target_schema_hash: [u8; 32],
+    pub source_semantic_schema_hash: [u8; 32],
+    pub target_semantic_schema_version: u64,
+    pub target_semantic_schema_hash: [u8; 32],
+    pub target_physical_layout_hash: [u8; 32],
     pub through_turn_seq: u64,
     pub authority_changes: Vec<DurableChange>,
     pub completed_migration_edges: Vec<MigrationEdgeId>,
@@ -797,6 +920,12 @@ pub struct ActivationBatch {
     pub checksum: [u8; 32],
 }
 ```
+
+The physical hash in a checkpoint records which layout produced the batch; it
+is not a restore-compatibility gate. A matching `semantic_schema_hash` with a
+different supported `physical_layout_hash` loads canonical authority, rebuilds
+the current physical structures, and records the new layout hash on the next
+checkpoint. A semantic-schema mismatch requires a declared migration edge.
 
 Coalescing rules:
 
@@ -806,6 +935,9 @@ Coalescing rules:
   touch and final turn sequence;
 - list operations may coalesce only when final order, row generation,
   allocator, and delete semantics remain identical;
+- MAP/SET operations may coalesce only per structurally equal canonical
+  key/item and only when the exact final authority and source-sequence conflict
+  semantics remain identical;
 - migration and outbox transitions may not be dropped;
 - acknowledgements cover an explicit contiguous turn/epoch range;
 - queue saturation applies visible backpressure at a turn boundary rather than
@@ -1106,10 +1238,10 @@ derived views:
 
 ```boon
 active_tasks:
-    tasks |> List/retain(task, if: task.completed |> Bool/not())
+    tasks |> List/retain(task, if: task.status == Active)
 
 completed_tasks:
-    tasks |> List/retain(task, if: task.completed)
+    tasks |> List/retain(task, if: task.status == Completed)
 ```
 
 ### Automatic Changes And Deletion
@@ -1188,14 +1320,16 @@ new default `10`.
 
 **Todo Migration** is the realistic sequence:
 
-1. V1 owns `todos` rows with `title` and `completed`, a preferences record,
-   and obsolete `show_help` state.
+1. V1 owns `todos` rows with `title` and
+   `status: Active | Completed`, a preferences record, and obsolete
+   `show_help` state.
 2. V2 transfers whole-list ownership from `todos` to `tasks`.
 3. V3 finalizes the list rename and adds an untouched `priority` row field.
 4. V4 splits preferences into `theme` and `density` through field drains.
 5. V5 finalizes that split and drains indexed row field `title` to `text`.
-6. V6 finalizes the row rename and purely converts `completed: Bool` into a
-   status variant.
+6. V6 finalizes the row rename and purely converts
+   `status: Active | Completed` into
+   `workflow: Open | Finished`.
 7. V7 finalizes conversion and deletes obsolete `show_help` authority.
 
 The scenario preserves order, hidden row keys, generations, allocator
@@ -1439,13 +1573,16 @@ it later.
 Exit condition: this document contains no contradictory lifetime-role,
 removed-record-retention, or one-turn-per-backend-transaction requirements.
 
-### Phase 1: Semantic Memory And MachinePlan v3
+### Phase 1: Semantic Memory And MachinePlan
 
 - Lower every stateful construct to generic semantic memory nodes.
 - Remove line-number and declaration-order durable identity inputs.
-- Add recursive data type plans/fingerprints.
+- Add recursive data type plans/fingerprints for exact `NUMBER`, `BITS[N]`,
+  ordinary Tags/objects, LIST, MAP, and SET.
+- Freeze separate `semantic_schema_hash` and `physical_layout_hash` contracts.
 - Add stable application, memory, list, row-field, output, and effect metadata.
-- Cut MachinePlan v2 execution compatibility rather than carrying two worlds.
+- Cut the legacy combined semantic/physical plan compatibility rather than
+  carrying two worlds.
 - Add deterministic plan/debug inspection before disk storage.
 
 Exit condition: Counter, Counter without HOLD, TodoMVC, Cells, NovyWave, and
@@ -1456,6 +1593,8 @@ without example-specific branches.
 
 - Implement prepare/commit/settle turn phases.
 - Add staged scalar/list/row writes and rollback-on-prepare-failure.
+- Add activation-owned candidate tracking so `FLUSH` discards its subtree's
+  authority deltas and staged effects before commit.
 - Split authority deltas from derived/debug/render deltas.
 - Preserve equal-value touched writes.
 - Implement `SessionBuilder` and restore publication barrier.
@@ -1467,6 +1606,8 @@ and no output is published before restored authority is current.
 ### Phase 3: Persistence Protocol And In-Memory Driver
 
 - Add target-neutral command/result protocol.
+- Add canonical exact-Number, width-bearing BITS, Tag/object, MAP, and SET
+  encodings and sparse collection deltas.
 - Add checkpoint batching and exact acknowledgement ranges.
 - Implement deterministic in-memory load, commit, barrier, inspect, compact,
   and failure behavior.
@@ -1493,6 +1634,8 @@ acknowledged epoch with bounded startup and no product-frame I/O.
 - Implement touched provenance for root and indexed memory.
 - Persist dynamic list structure, generations, order, allocators, and raw row
   authority.
+- Persist canonical MAP/SET authority and rebuild all hash/direct-address/tree
+  physical representations after restore.
 - Handle empty-but-mutated and static-then-mutated lists.
 - Implement bounded blob storage/reclamation.
 - Add Cells-scale logical-versus-stored diagnostics.
@@ -1581,13 +1724,21 @@ the same restore/currentness boundary.
 - Line numbers, declaration-order IDs, program hashes, and example names never
   appear in storage keys.
 - Recursive type fingerprints are canonical and collision-checked.
+- Exact rational normalization, BITS width, Tag/object field identity, and
+  MAP/SET key eligibility participate in fingerprints and
+  `semantic_schema_hash`.
 - Duplicate/ambiguous semantic memory identities fail compilation.
-- MachinePlan v2 is rejected rather than silently routed through another
-  executor.
+- The legacy combined semantic/physical plan is rejected rather than silently
+  routed through another executor.
+- `semantic_schema_hash` remains stable across physical-only storage/index
+  changes, while `physical_layout_hash` changes and triggers a rebuild.
 
 ### Atomicity And Currentness
 
 - Failure during prepare changes no authority.
+- `FLUSH` discards exactly its activation subtree's staged authority,
+  collection deltas, and effect intents; independent siblings and earlier
+  committed pulse microturns remain intact.
 - Commit installs all turn authority or none.
 - Equal-value first writes become touched authority.
 - Queue saturation rejects before commit and never blocks an interaction frame
@@ -1612,6 +1763,10 @@ the same restore/currentness boundary.
   completion.
 - Removing every list row preserves authoritative empty structure and allocator
   state.
+- MAP/SET checkpoints use canonical structural key order, preserve exact
+  authority across restart, and rebuild backend hash/direct-address layouts.
+- Private absence, engine faults, and the hidden `FLUSH` envelope fail before
+  durable encoding.
 
 ### Migration
 
@@ -1635,6 +1790,8 @@ the same restore/currentness boundary.
 - Stores skipping multiple supported versions apply each edge in order.
 - Unsupported-old or corrupt stores fail before mutation.
 - Repeated migration activation is idempotent.
+- Todo migration converts only ordinary current-language Tag/object schemas;
+  no legacy privileged Boolean/Null/error storage variant is required.
 
 ### Checkpoint And Backend Recovery
 
@@ -1643,12 +1800,16 @@ the same restore/currentness boundary.
 - Fault after acknowledgement restores the acknowledged turn range.
 - Stale, duplicate, non-contiguous, and checksum-invalid batches cannot corrupt
   state.
-- Coalesced batches preserve complete turn order and list semantics.
+- Coalesced batches preserve complete turn order and LIST/MAP/SET semantics.
 - Queue saturation never drops list, migration, deletion, or outbox changes.
 - Native repair preserves the last acknowledged Immediate state.
 - IndexedDB abort/quota/version-change failures map to explicit statuses.
 - Native, Wasm, and in-memory drivers consume the same golden batches and
   produce equivalent restore images.
+- Golden codecs cover normalized positive/negative/zero rationals, large
+  numerators and denominators, rejected noncanonical fractions, every boundary
+  BITS width/byte shape, ordinary `Null`/`True`/`False`/error Tags, canonical
+  objects, and MAP/SET collision fixtures.
 
 ### Critical Effects
 
@@ -1745,12 +1906,22 @@ The implementation goal is complete only when all conditions below are true:
 - Boon has durable-by-default semantic memory with no persistence lifetime
   keywords.
 - Every stateful construct lowers through one generic memory plan.
-- MachinePlan v3 contains stable identities, recursive data schemas,
-  persistence metadata, migration edges, effect contracts, and output roots.
+- Semantic `MachinePlan` contains stable identities, recursive data schemas,
+  persistence metadata, migration edges, effect contracts, and output roots;
+  target-specific storage lives only in parent-linked `PhysicalPlan`.
+- Exact Numbers, width-bearing BITS, ordinary Tags/objects, LIST, MAP, and SET
+  have one canonical native/Wasm storage contract.
+- LIST/MAP/SET authority, including nested authority edges, is stored only in
+  dedicated authority records; no durable nested collection snapshot value
+  creates a second authority model.
+- Private absence, engine faults, and hidden `FLUSH` status are never
+  serializable or durable.
+- A flushed activation publishes no partial authority delta, checkpoint, or
+  outbox intent from its aborted subtree.
 - No line/order/runtime numeric identity reaches durable storage.
 - Session turns are atomic and restore precedes first observable output.
-- Equal-value touched authority, sparse defaults, lists, rows, generations, and
-  allocators restore correctly.
+- Equal-value touched authority, sparse defaults, lists, rows, generations,
+  allocators, canonical maps, and canonical sets restore correctly.
 - Native redb, Rust IndexedDB/Wasm, and deterministic in-memory drivers satisfy
   the same semantic contract.
 - Buffered and Immediate guarantees are honest and visible.
@@ -1799,6 +1970,9 @@ the entire contract above.
 
 Repository contracts and implementation:
 
+- [`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md)
+- [`BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md`](BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md)
+- [`BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md`](BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md)
 - [`../architecture/RUNTIME_MODEL.md`](../architecture/RUNTIME_MODEL.md)
 - [`../architecture/DELTA_PROTOCOL.md`](../architecture/DELTA_PROTOCOL.md)
 - [`../architecture/LANGUAGE_SEMANTICS.md`](../architecture/LANGUAGE_SEMANTICS.md)

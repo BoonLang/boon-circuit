@@ -1,4 +1,4 @@
-# Boon Self-Hosting Language Foundations Plan
+# Boon Language Foundations Plan
 
 Date: 2026-07-26
 
@@ -7,17 +7,22 @@ document defines the intended flag-day language contract. It does not claim
 that the current parser, typechecker, runtime, persistence layer, Wasm target,
 GPU path, or FPGA path already implements that contract.
 
+Under the combined order in [`steps.md`](steps.md), this plan's semantic,
+runtime, target, migration, and deletion work lands before the full formal
+roadmap. Its formal-dependent final acceptance closes only after formal phases
+0–5.
+
 ## Purpose
 
-Define the smallest coherent Boon language foundation that can support:
+Define the smallest coherent universal Boon language foundation that can
+support:
 
-- a compiler written in Boon;
+- the production compiler, verifier, optimizer, and runtime;
 - ordinary server and frontend applications;
 - deterministic persistence and distributed execution;
 - native and Wasm execution;
 - bounded GPU and FPGA lowering;
-- formal verification;
-- later experiments toward a Boon operating system.
+- formal verification.
 
 The plan deliberately avoids copying Rust's surface into Boon. It does not add
 unrestricted pointers, unrestricted recursion, imperative loops, public
@@ -37,6 +42,12 @@ The resulting language has:
 
 Everything else should first be expressed as a library, target profile, or
 compiler lowering.
+
+Self-hosting, a compiler written in Boon, BoonInBoon, and a Boon operating
+system are explicit non-goals and are not prerequisites for this plan's
+completion. A later project may use the resulting language and compiler
+artifacts for those experiments, but this plan neither designs nor validates
+them.
 
 ## Authority And Flag-Day Rule
 
@@ -1344,8 +1355,8 @@ time when provable and otherwise causes a deterministic terminal target error.
 
 `TABLE` is persistent/indexed MAP policy, not a new value kind.
 
-`MEMORY` is a bounded dense LIST/MAP lowering plus target port/latency policy,
-not a new value kind.
+A hardware memory is a bounded dense LIST/MAP lowering plus target
+port/latency policy, not a new value kind or source keyword.
 
 Arena, builder, interner, and worklist performance come from lifetime,
 uniqueness, escape, and access analysis. Function names do not receive secret
@@ -1867,9 +1878,51 @@ This registry is a coverage contract, not a reason to add one showcase
 application per token. Small conformance fixtures may cover low-level syntax;
 user-facing examples cover behavior worth teaching.
 
-## Compiler-Oriented Libraries Without New Types
+## Compiler Artifact Spine
 
-A Boon compiler needs:
+Every compiler and target path uses one authoritative artifact sequence:
+
+```text
+ParsedProgram
+-> CheckedProgram
+-> SemanticProgram
+-> ContractVerifiedProgram
+-> ErasedProgram
+-> MachinePlan
+-> PhysicalPlan or CoreHardwareIR
+```
+
+The boundaries and owners are fixed:
+
+- `boon_parser` produces `ParsedProgram` and owns only syntax, source spans,
+  and lossless source structure.
+- `boon_typecheck` produces `CheckedProgram` with resolved declarations,
+  structural types, flow types, and typed calls.
+- `boon_semantic` produces `SemanticProgram` by expanding contextual
+  functions, validating `OutNet`, assigning semantic ownership, building typed
+  list views and dependency manifests, and recording proof obligations.
+- `boon_verify` is the mandatory gate and produces
+  `ContractVerifiedProgram` only after every mandatory obligation is
+  discharged. Programs without an authored `WHERE` clause still pass through
+  the gate and receive a verified empty-authored-contract record plus all
+  compiler-generated safety obligations; rejection or unsupported mandatory
+  proof produces diagnostics and no verified artifact.
+- `boon_ir` produces `ErasedProgram` by erasing `WHERE`, `OUT`, `PASS`, and
+  transparent wrappers only after verification. It does not rediscover or
+  weaken verified semantics.
+- machine planning consumes only `ErasedProgram`. Portable execution proceeds
+  through `MachinePlan` and target-selected `PhysicalPlan`; eligible hardware
+  proceeds through `CoreHardwareIR`.
+
+No runtime, persistence layer, native/Wasm backend, GPU path, FPGA path, or
+hardware backend may consume parser AST, bypass `ContractVerifiedProgram`, or
+reconstruct contextual semantics. Debug/source provenance may be retained as
+non-authoritative metadata, but executable identity and behavior derive from
+the artifact sequence above.
+
+## General Engine Libraries Without New Types
+
+The compiler and other graph-processing workloads need:
 
 - source scanning;
 - a canonical source formatter/emitter;
@@ -1909,9 +1962,9 @@ NodeId[value: 42]
 SymbolId[value: 7]
 ```
 
-Compiler algorithms live in the standard library or compiler modules. Sorting,
-SCC, topological traversal, union-find, canonical encoding, and queue helpers
-are not syntax and do not receive compiler-name-based shortcuts.
+Graph algorithms live in ordinary engine/library modules. Sorting, SCC,
+topological traversal, union-find, canonical encoding, and queue helpers are
+not syntax and do not receive compiler-name-based shortcuts.
 
 The optimizer may lower non-escaping authorities to:
 
@@ -1930,7 +1983,7 @@ It must prove that:
 - hidden identity remains unobservable;
 - the lowered result and failure trace are equivalent.
 
-## Self-Hosting Stages
+## Foundation Delivery Stages
 
 1. Land canonical Tags-only truth and Tag encoding.
 2. Land fail-closed matching and one-based positions.
@@ -1940,32 +1993,10 @@ It must prove that:
 6. Land BITS.
 7. Land generic escape/uniqueness analysis and transient collection lowering.
 8. Land verified `HOLD + Stream/pulses` fusion.
-9. Implement a Boon lexer over BYTES with one-based spans.
-10. Implement a flat tagged AST arena and parser.
-11. Implement names, scopes, symbol interning, and diagnostics.
-12. Implement type constraints and checked IR.
-13. Implement a canonical Boon source formatter/emitter.
-14. Implement plan generation and canonical serialization.
-15. Bootstrap stage 1 from the Rust seed compiler.
-16. Build stage 2 with stage 1.
 
-Bootstrap acceptance:
-
-- the Rust seed builds Boon compiler stage 1;
-- stage 1 builds stage 2;
-- stage 1 and stage 2 compile the same canonical compiler source and emit
-  byte-identical normalized MachinePlan and compiler-semantic artifacts;
-- diagnostics and one-based spans match the seed corpus;
-- native and Wasm executables are reproducible within each target;
-- cross-target comparison uses normalized semantic artifacts and execution
-  traces, never native-versus-Wasm executable bytes;
-- compiler benchmarks show no full collection snapshot per token/node update;
-- scratch compiler authorities remain transient;
-- only requested compiler artifacts persist.
-
-The compiler is primarily a native/Wasm workload. Pure scanning, hashing,
-encoding, or analysis kernels may later be accelerated. There is no requirement
-to run the whole compiler on GPU or FPGA.
+These stages harden the ordinary compiler/runtime stack; they do not build or
+bootstrap a compiler written in Boon. Their acceptance is the implementation,
+deletion, differential, and target-validation work specified below.
 
 ## Target Contracts
 
@@ -2142,7 +2173,7 @@ MAP is not physical memory.
 FLUSH is not a processor trap.
 
 Those capabilities require a separate resource/effect architecture after the
-self-hosted compiler validates the ordinary language.
+ordinary language and compiler/runtime contracts are stable.
 
 ## Example Migration Portfolio
 
@@ -2309,6 +2340,10 @@ passthrough/no-op behavior.
 ### Phase 0: Freeze And Inventory
 
 - Land this plan.
+- Freeze the authoritative
+  `ParsedProgram -> CheckedProgram -> SemanticProgram ->
+  ContractVerifiedProgram -> ErasedProgram` ownership boundary and inventory
+  every compiler/runtime/backend entry point that bypasses it.
 - Add the parser-owned feature registry design.
 - Add `examples/language_feature_coverage.toml` and its verifier skeleton.
 - Record current parser/type/value/schema fingerprints.
@@ -2437,6 +2472,9 @@ change.
 ### Phase 7: Target And Formal Validation
 
 - Complete native/Wasm differential suites.
+- Prove every compiler entry point passes through
+  `ContractVerifiedProgram`; reject direct parser/checked-program backend
+  lowering and unverified no-WHERE shortcuts.
 - Add exact Number proof summaries.
 - Add BITS/RTL equivalence checks.
 - Add collection invariant checks.
@@ -2445,20 +2483,6 @@ change.
 
 Exit: unsupported regions are reported, never approximated or silently run
 with changed semantics.
-
-### Phase 8: BoonInBoon
-
-- Build lexer, parser, flat arenas, symbol tables, diagnostics, checked IR, and
-  canonical source/plan generation in Boon.
-- Bootstrap seed -> stage 1 -> stage 2.
-- Compile the same canonical compiler source at both stages.
-- Compare normalized MachinePlan/compiler artifacts, diagnostics, spans, and
-  traces.
-- Require executable reproducibility per target; compare native and Wasm by
-  semantic artifacts and traces rather than executable bytes.
-
-Exit: stage 1 and stage 2 emit byte-identical normalized semantic artifacts
-from the same compiler source, and each target build is reproducible.
 
 ## Verification Matrix
 
@@ -2736,10 +2760,13 @@ The foundations work is complete only when all of these hold:
 33. Native/Wasm differential traces agree under the same versioned execution
     profile and budget digest.
 34. GPU/FPGA reject unsupported regions rather than changing semantics.
-35. Stage 1 and stage 2 compile the same canonical compiler source and emit
-    byte-identical normalized MachinePlan/compiler-semantic artifacts.
-36. Native and Wasm executables are reproducible per target; cross-target
-    equality compares semantic artifacts and traces, not executable bytes.
+35. Every accepted program follows
+    `ParsedProgram -> CheckedProgram -> SemanticProgram ->
+    ContractVerifiedProgram -> ErasedProgram`; no authored-contract-free path
+    skips verification.
+36. Machine, persistence, native/Wasm, GPU, FPGA, and hardware backends consume
+    post-verification artifacts and never reinterpret parser AST or recover
+    erased contextual semantics.
 37. Formatting is idempotent, and parser/formatter/inspector spellings agree.
 38. Source `Null` and `Error[...]` round-trip as Tags, while internal absence
     and faults cannot escape as application values.
@@ -2833,11 +2860,14 @@ Prefer Tags, objects, LIST/SET/MAP, BITS, libraries, and target profiles.
 - OS capability/resource types;
 - volatile memory and atomics;
 - additional BITS arithmetic beyond demonstrated workloads;
-- public TABLE or MEMORY syntax.
 
 Deferral is not rejection. Each item requires a concrete workload and a
 semantic argument that the existing foundation cannot express safely or
 efficiently.
+
+Public `TABLE` and `MEMORY` syntax are deliberately not deferred: this
+architecture rejects them. Persistent indexes and hardware memories remain
+physical policies for ordinary typed `MAP`/`LIST` authorities.
 
 ## Primary References
 
@@ -2880,6 +2910,6 @@ acquire representation-width annotations, structural pattern machinery,
 imperative loops, storage-engine types, or target-specific behavior merely to
 make that sophistication possible.
 
-That foundation is sufficient to attempt BoonInBoon. It is intentionally not a
-claim that the same data model already solves safe operating-system resource
+This end state is complete without self-hosting. It intentionally makes no
+claim that the same data model solves safe operating-system resource
 management.

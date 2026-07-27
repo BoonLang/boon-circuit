@@ -21,6 +21,13 @@ keeps every catalog/search/page behavior and bound below, but expresses them
 through typed `List/filter`, `List/sort_by`, `List/then_by`, `List/take`, and
 `List/page` pipelines over one canonical collection authority.
 
+[`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md) owns
+the final value algebra, including exact rational `Number`, ordinary Tags,
+private absence/fault channels, and `BITS[N]`. This plan adds no local legacy
+value profile. All executable artifacts follow the mandatory `ParsedProgram`
+-> `CheckedProgram` -> `SemanticProgram` -> `ContractVerifiedProgram` ->
+`ErasedProgram` -> `MachinePlan` spine.
+
 Reference FjordPulse revision:
 
 ```text
@@ -242,12 +249,17 @@ index without changing the source API or adding a FjordPulse branch.
 
 `boon_typecheck` produces the authoritative `CheckedProgram` with resolved
 declarations, exact typed calls, scope effects, correlations, and collection
-predicates. `boon_ir` elaborates contextual functions in their declaring
-islands, validates output nets, expands transparent wrappers, erases `OUT` and
-`PASS`, and produces the authoritative `ErasedProgram`. Machine, document,
-distributed, persistence, browser/server host, and verifier backends consume
-only `ErasedProgram`; no backend rebinds positional arguments or rediscovers
-context from parser AST or function-name strings.
+predicates. `boon_semantic` elaborates contextual functions in their declaring
+islands, validates output nets, expands transparent wrappers, owns semantic
+collection views and dependencies, and produces `SemanticProgram`.
+`boon_verify` discharges its proof obligations and produces the mandatory
+`ContractVerifiedProgram`, including when no authored `WHERE` clause exists.
+`boon_ir` then erases `WHERE`, `OUT`, `PASS`, and transparent wrapper machinery
+into the authoritative `ErasedProgram`. Machine, document, distributed,
+persistence, browser/server host, and verifier backends consume only derived
+post-verification artifacts; no backend rebinds positional arguments,
+bypasses verification, or rediscovers context from parser AST or function-name
+strings.
 
 ## Target Topology
 
@@ -408,11 +420,12 @@ Application implementation may use a prerequisite only after its independent
 generic fixture, unit/integration suite, and plan verification pass. Concurrent
 or partial worktree changes do not count as completed capability.
 
-Every prerequisite below consumes post-erasure compiler output. The canonical
-OUT/PASS/call/binding migration and authoritative `CheckedProgram` ->
+Every prerequisite below consumes post-verification, post-erasure compiler
+output. The canonical OUT/PASS/call/binding migration and authoritative
+`CheckedProgram` -> `SemanticProgram` -> `ContractVerifiedProgram` ->
 `ErasedProgram` cutover are entry gates; no FjordPulse phase may retain a
-parser-AST, positional binder, runtime-OUT, or legacy island fallback to keep an
-intermediate artifact working.
+parser-AST, positional binder, runtime-OUT, verification bypass, or legacy
+island fallback to keep an intermediate artifact working.
 
 ### P0: Client/Session/Server Islands And Linked Packages
 
@@ -473,38 +486,43 @@ product behavior is added.
 
 ### P1: Real Number
 
-Boon `Number` must represent finite non-integer values consistently across all
-targets. FjordPulse must not encode coordinates, zoom, bearing, distance,
+Boon `Number` must represent non-integer values exactly and consistently across
+all targets. FjordPulse must not encode coordinates, zoom, bearing, distance,
 percentages, durations, or interpolation factors as scaled integers or text.
 
 Canonical contract:
 
-- `Number` is one finite IEEE-754 binary64 semantic type;
-- integer and decimal literals produce the same Number type and runtime value
-  representation;
-- NaN and positive/negative infinity cannot enter a Boon value;
-- negative zero is normalized to positive zero for equality, ordering, hashing,
-  persistence, and protocol identity;
+- `Number` is one arbitrary-precision normalized rational semantic type with a
+  signed numerator and strictly positive denominator;
+- integer, fraction, and decimal literals produce the same Number type and
+  canonical runtime value representation;
+- equal rationals normalize to the same numerator/denominator pair for
+  equality, ordering, hashing, persistence, and protocol identity;
 - parser, typechecker, IR, plan constants, executor slots, indexed fields,
   lists, source payloads, effects, document styles, scenario values, debug
   output, and host outputs all support the same representation;
 - arithmetic, comparisons, min/max, interpolation, rounding, text conversion,
   and JSON conversion have specified checked behavior;
-- division by zero, overflow to non-finite, and invalid text conversion produce
-  typed errors rather than non-finite values;
+- ordinary division by zero terminates through the private engine fault channel
+  and never returns application data; invalid text conversion uses an explicit
+  safe operation that returns ordinary typed Tags;
+- numerator/denominator size and arithmetic-work limits are explicit target
+  budgets; exceeding one fails terminally and never rounds or approximates;
 - list/byte indices and bounded counts require an explicit checked whole-number
   conversion and reject fractional, negative, or out-of-range values;
-- the canonical CBOR codec stores float64 Number values and hashes canonical
-  bits;
-- an old integer-only persisted Number is upgraded only by a generic exact
-  storage-format migration; values that cannot be represented exactly fail with
-  a diagnostic rather than silently round;
-- native and Wasm golden tests compare canonical bits and encoded bytes.
+- the canonical CBOR codec stores the normalized signed numerator and positive
+  denominator and hashes their canonical integer bytes;
+- pre-release integer-only or host-float language encodings are rejected at the
+  flag-day cut and their compatibility decoders are deleted; later product
+  schema migrations operate only on canonical exact rational values;
+- native and Wasm golden tests compare canonical rational pairs and encoded
+  bytes.
 
-Do not leave a permanent split in which some arithmetic uses an integer value
-variant and decimal arithmetic takes a second fallback path. Transitional
-variants are allowed only while the migration is incomplete and must be removed
-before P1 passes.
+The atomic flag-day slice may be temporarily noncompiling while callers and
+fixtures move together, but no executable intermediate tree may contain an
+integer, decimal, or host-float Number variant, compatibility decoder, or
+fallback path. The first compiling result of the slice uses only the canonical
+exact rational representation.
 
 Exit gate: decimal camera/coordinate, persistence, arithmetic, JSON, indexed
 range, and native/Wasm round-trip fixtures all pass; every existing example and
@@ -521,16 +539,28 @@ their internal transport as JSON.
 
 Required semantics:
 
-- JSON null, booleans/tags, finite Number, Text, arrays, and objects map to
-  ordinary structurally inspectable Boon data;
+- JSON null, JSON booleans, JSON numbers, Text, arrays, and objects map to
+  ordinary structurally inspectable Boon Tags/objects; `True` and `False` are
+  ordinary closed Tags, not a privileged public Boolean type;
+- a JSON decimal token decodes to its exact rational value without a host-float
+  round trip;
 - UTF-8, escapes, surrogate handling, exponents, and nested arrays/objects are
   standards-compliant;
 - duplicate object keys are rejected by the strict server/client profile;
 - decoder limits cover input bytes, nesting depth, object fields, array items,
   total nodes, and string bytes;
 - decode returns a typed success or bounded diagnostic with byte location;
-- encode is deterministic, emits valid UTF-8, rejects non-finite Number at the
-  boundary, and uses canonical object-key ordering for fixtures/hashes;
+- encode is deterministic, emits valid UTF-8, and uses canonical object-key
+  ordering for fixtures/hashes;
+- generic JSON number encoding accepts only a rational with an exact finite
+  decimal representation inside the declared byte/digit budget; other
+  rationals fail unless Boon domain-to-wire code first applies the
+  field-specific explicit rounding/formatting required by the pinned external
+  schema;
+- every FjordPulse/Entur coordinate, measurement, percentage, duration, and
+  provider field declares that external boundary conversion in Boon, including
+  decimal scale, tie rule, range, and whether the wire field is a JSON number
+  or text; the host never silently rounds;
 - streaming HTTP bodies and WebSocket messages are bounded before full decode;
 - domain validation and domain-to-wire mapping remain Boon code;
 - JSON schema/OpenAPI checks are test tooling and contract evidence, not a
@@ -651,12 +681,13 @@ AccessPlan
 
 The language-facing API is the ordinary typed list pipeline documented in
 `LANGUAGE_SEMANTICS.md` and the typed-list replacement plan. Physical indexes
-are inferred from the checked/erased expressions and never appear as Boon
-arguments. These constraints are fixed:
+are inferred from verified semantic views and the resulting `ErasedProgram`;
+they never appear as Boon arguments. These constraints are fixed:
 
 - key projections are closed, pure, typed, deterministic, and compiler-known;
-- supported keys are finite Number, ordinal Text, Bool, closed fieldless tags,
-  and compiler-formed compound order chains;
+- supported keys are exact Number, ordinal Text, the closed `True | False` Tag
+  set, other eligible closed fieldless Tags, and compiler-formed compound order
+  chains;
 - normalized whole-field/token keys are ordinary authoritative or pure derived
   row fields, not string normalization declarations;
 - stable ordering preserves semantic source order for equal declared keys;
@@ -1399,9 +1430,10 @@ present.
 
 ### Phase 2: Complete Number And JSON
 
-- Finish one real Number representation end to end.
+- Finish one exact rational Number representation end to end.
 - Version plan/persistence protocols deliberately; remove transition paths.
-- Add bounded JSON data/codec and native/Wasm golden/fuzz coverage.
+- Add bounded JSON data/codec, explicit per-field external rounding/formatting
+  contracts, and native/Wasm golden/fuzz coverage.
 - Re-run every existing compiler, runtime, persistence, migration, document,
   scenario, and native gate.
 
@@ -1589,11 +1621,12 @@ representative happy path passed.
 
 ### Generic Platform Evidence
 
-- CheckedProgram/ErasedProgram exact named-call, order-independent binding,
-  OUT/wrapper-equivalence, PASS-last, typed List/find, and canonical List/chunk
-  fixtures;
+- `CheckedProgram`/`SemanticProgram`/`ContractVerifiedProgram`/`ErasedProgram`
+  exact named-call, order-independent binding, OUT/wrapper-equivalence,
+  PASS-last, proof-gate, typed List/find, and canonical List/chunk fixtures;
 - linked Client/Session/Server plan verification and unrelated two-tab fixtures;
-- Number native/Wasm/persistence/JSON/index golden tests;
+- exact Number native/Wasm/persistence/JSON/index golden tests, including
+  explicit external decimal conversion and forbidden implicit rounding;
 - bounded JSON fuzz/property and fixture tests;
 - external loopback HTTP/WS/outbound transport tests;
 - 60,000-row indexed query planner/no-scan/restart fixture;
@@ -1840,11 +1873,14 @@ one final source revision:
   scenarios, with only the explicitly named backup/restore automation items
   deferred;
 - one production package builds linked Client, indexed Session-template, and
-  global Server `ErasedProgram` artifacts with shared pure contracts, one
-  internal graph/schema contract, and explicit external protocol versions;
+  global Server `ErasedProgram` artifacts derived through the mandatory
+  `SemanticProgram` and `ContractVerifiedProgram` gate, with shared pure
+  contracts, one internal graph/schema contract, and explicit external protocol
+  versions;
 - generic independent gates pass for exact calls, OUT/wrapper erasure,
   final-position PASS, order-independent bindings, typed List/find, canonical
-  List/chunk, Client/Session/Server isolation, real Number, external JSON and
+  List/chunk, Client/Session/Server isolation, exact Number with explicit
+  external decimal conversion, external JSON and
   HTTP/WSS, typed indexed list access, canonical redb collection persistence,
   retained raster MapViewport, and browser WebGPU;
 - every non-deferred semantic, HTTP, WS, visual, responsive, accessibility,

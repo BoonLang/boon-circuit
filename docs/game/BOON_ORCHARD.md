@@ -36,7 +36,9 @@ and progress is not measured by how completely the player replaces a place.
 | **machine lantern** | One deployed processor/server site |
 | **orchard** | The complete network of machine lanterns and living sites |
 | **seed design** | A reusable verified Boon hardware module or processor |
-| **mission** | The useful work assigned to a lantern; deliberately undecided for now |
+| **mission** | The declared work assigned to a lantern; the first useful workload remains open |
+| **`mission.wasm`** | The canonical portable mission behavior |
+| **`ConsolePort`** | Target-neutral logical buttons, switches, indicators, and optional displays |
 
 `Boon Orchard` works because "orchard" means cultivation, patience, variation,
 care, and a collection that becomes more valuable over time. "Boon" is both the
@@ -167,6 +169,12 @@ toward one app before the generic foundations are real.
 The game should make a later mission genuinely useful, but it should not
 pretend that "useful" has already been solved.
 
+The useful application remains open. Its generic execution boundary does not:
+missions are portable, capability-bounded Wasm artifacts; all required
+controls and lantern clusters work locally and virtually; physical FPGA and
+remote-server deployments are optional extensions. The detailed checkpoint is
+[Mission Wasm And Lantern Consoles](./MISSION_WASM_AND_LANTERN_CONSOLES.md).
+
 ## What A Machine Lantern Is
 
 A machine lantern is more than a server icon.
@@ -189,9 +197,11 @@ The lantern can exist at several levels:
 
 | Level | Meaning |
 | --- | --- |
-| Simulated | Runs inside the deterministic game/native simulator |
-| Browser | Runs through the same artifact in Wasm |
-| FPGA | Runs as generated hardware on a physical board |
+| Hardware simulation | The Boon processor/hardware artifact runs in the native or browser-hosted simulator |
+| Direct local mission | Exact `mission.wasm` runs on the local/browser host with virtual I/O |
+| Virtual Heart | RV32I firmware derived from `mission.wasm` runs on the simulated Boon processor |
+| Tethered FPGA console | The mission remains on the host while the FPGA supplies physical I/O |
+| Deployed FPGA Heart | The FPGA RV32I owns mission decisions through derived firmware or a reported onboard Wasm runtime |
 | Server/site | Connects the game representation to an authorized real deployment |
 
 The game world must label which level is active. A simulated lantern cannot be
@@ -201,6 +211,13 @@ real server evidence.
 Moving a processor to another island or world means packaging the same verified
 core with a new target profile, shell, ports, and mission—not rewriting a hidden
 game-only CPU.
+
+The canonical mission may execute directly as Wasm on the local PC, as derived
+RV32I firmware on the simulated or physical Boon processor, or, in a later
+target, as original Wasm bytecode through a runtime on that processor. The game
+must label those placements honestly. Every required physical console has an
+equivalent virtual console, and no board or paid server is a campaign
+prerequisite.
 
 ## Three Scales Of Play
 
@@ -312,7 +329,13 @@ Every major construction milestone corresponds to a real artifact:
 | Processor heartbeat | Mixed program retires correctly |
 | First fruit | Architectural tests and final signature pass |
 | Lantern core | Native/Wasm/RTL artifact digests agree |
+| Console reaction | Checked `ConsolePort` contract plus deterministic input/output trace |
+| Portable mission | Exact `mission.wasm`, profile, capability, and package digests |
+| Virtual Heart | AOT identity, base-RV32I audit, and direct-Wasm/RV32I trace equivalence |
+| First signal | Two-endpoint message trace with request and applied-acknowledgement identities |
+| Partition recovery | Deterministic delay/loss/duplicate/partition report and final state digests |
 | Planted lantern | Target/board or simulator report identifies the exact artifact |
+| Physical mission, when used | Board, bitstream, mission, firmware, and logical-I/O equivalence evidence |
 
 When a gate fails, the game world can dramatize the failure, but it must expose
 the real reason:
@@ -425,7 +448,21 @@ Combine the processor with:
 
 The player chooses where and under what limits the machine will live.
 
-### 8. Orchard: Cooperation
+### 8. Mission: Portable Work
+
+Package one checked `mission.wasm`, bind its one-to-four programmable button
+inputs and optional outputs through `ConsolePort`, and run it first on a local
+virtual lantern. The same mission can then run as derived firmware through the
+Virtual Heart or, optionally, a physical RV32I heart after the required
+mission validator, ABI, AOT path, support runtime, and equivalence fixtures
+exist. Finishing RV32I alone does not provide that toolchain.
+
+The first communication checkpoint sends one bounded message between two local
+islands and distinguishes press, send, acceptance, application, and
+acknowledgement. Delay, duplication, loss, and partition are tested before a
+remote server is involved.
+
+### 9. Orchard: Cooperation
 
 Several lanterns exchange declared messages and state without losing their
 local identity.
@@ -462,6 +499,19 @@ survey site
   -> simulate local conditions
   -> deploy lantern
   -> compare predicted and observed behavior
+```
+
+### Mission Loop
+
+```text
+write mission behavior in Boon or another compatible language
+  -> compile and validate mission.wasm
+  -> bind a virtual ConsolePort
+  -> run deterministic local scenarios
+  -> connect another local lantern
+  -> test delay/loss/partition
+  -> run through the Virtual Heart
+  -> optionally plant on an FPGA or authorized server
 ```
 
 ### Tend Loop
@@ -660,6 +710,21 @@ implementation contract.
 - Real deployments require explicit user authorization and capability limits.
 - No real external action is implied merely by placing a world object.
 - `MAP`, not a new `MEMORY` keyword, is the public bounded keyed authority.
+- Hardware-simulator Wasm and portable `mission.wasm` are distinct artifacts
+  and must be labelled separately.
+- Button meaning belongs to the checked mission; target shells only normalize
+  physical and virtual I/O.
+- Mission guests receive only declared bounded capabilities, not ambient
+  filesystem, network, clock, or external-action authority.
+- Virtual-cluster completion is mandatory; FPGA boards, Pmods, Raspberry Pis,
+  paid hosting, and public servers are optional.
+- A physical console cannot by itself authorize an external server action.
+- An FPGA executes original Wasm bytecode only when an explicit onboard runtime
+  is present and reported. Host-AOT-derived RV32I firmware must be labelled as
+  such.
+- The first fixed FPGA image may embed its mission and initial state. Live
+  planting or unplanting requires a later loader, canonical snapshot ABI, and
+  single-owner migration proof.
 - Self-hosting is neither a game goal nor a prerequisite; pursue it only if it
   later becomes independently useful.
 
@@ -683,6 +748,12 @@ The second slice grows those primitives into the multicycle RV32I core.
 The first deployment slice begins only after the processor proof bundle is
 real.
 
+The first mission slice follows that deployment slice. It contains one
+`mission.wasm`, a one-button virtual `ConsolePort`, two local virtual lanterns,
+one request/acknowledgement exchange, and deterministic delay, loss,
+duplication, and partition fixtures. A compatible physical console and FPGA
+deployment are optional equivalence gates, not prerequisites for progress.
+
 ## Success Criteria
 
 Boon Orchard is on the right path when:
@@ -696,6 +767,13 @@ Boon Orchard is on the right path when:
 - a machine lantern feels like a useful inhabitant of a place;
 - ecological health and machine capability reinforce each other mechanically;
 - the world rewards repair, restraint, legibility, and adaptation;
+- the complete game and server-like lantern cluster run on one local PC without
+  purchased hardware or hosting;
+- one checked mission behaves equivalently with virtual controls and optional
+  compatible physical controls;
+- every visible inter-island message resolves to a real bounded message trace;
+- the game distinguishes direct host Wasm, simulated RV32I, physical RV32I, and
+  authorized server execution;
 - the useful eventual mission can be chosen later without redesigning the
   foundations;
 - the game remains meaningful even if self-hosting never happens.
@@ -710,7 +788,11 @@ Deliberately open:
 - how much direct construction versus source editing each audience uses;
 - the balance between authored campaign and open orchard;
 - multiplayer/cooperative ownership;
-- the exact relationship between simulated and authorized real lanterns;
+- the final mission ABI and fictional name for `mission.wasm`;
+- the authorization, transport, and state-migration policy beyond the required
+  local virtual cluster;
+- when an onboard Wasm runtime, persistent module loader, or network peripheral
+  becomes justified;
 - final art style, characters, and lore;
 - whether a custom Boon-native processor follows RV32I inside the main campaign
   or a later campaign.

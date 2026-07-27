@@ -483,7 +483,6 @@ fn compile_validated_program_artifact(
     request: &ProgramCompileRequest,
 ) -> Result<ProgramArtifact, ProgramDiagnostic> {
     let source_bundle = canonical_source_bundle(request)?;
-    let source_bundle_digest_v1 = source_bundle.digest();
     let units = source_bundle
         .units()
         .iter()
@@ -515,7 +514,7 @@ fn compile_validated_program_artifact(
             diagnostic.with_source_location(location.path, location.line, location.column)
         })
     })?;
-    artifact_from_compiled(request, source_bundle_digest_v1, compiled)
+    artifact_from_compiled(request, compiled)
 }
 
 pub fn compile_distributed_program_bundle(
@@ -595,12 +594,7 @@ fn compile_validated_distributed_program_bundle(
                 )
             })?;
         let request = &requests[request_index];
-        let source_bundle_digest_v1 = source_bundles[request_index].digest();
-        artifacts.push(artifact_from_compiled(
-            request,
-            source_bundle_digest_v1,
-            compiled,
-        )?);
+        artifacts.push(artifact_from_compiled(request, compiled)?);
     }
     DistributedProgramBundle::new(artifacts).map_err(|error| {
         ProgramDiagnostic::new(
@@ -639,9 +633,9 @@ fn source_bundle_digest(
 
 fn artifact_from_compiled(
     request: &ProgramCompileRequest,
-    source_bundle_digest_v1: SourceBundleDigestV1,
     compiled: boon_compiler::CompiledMachinePlanFromSource,
 ) -> Result<ProgramArtifact, ProgramDiagnostic> {
+    let source_bundle_digest_v1 = compiled.ir.source_bundle_digest_v1();
     validate_plan(request.revision, request.capability_profile, &compiled.plan)?;
     let content = encode_program_artifact(
         request.revision,

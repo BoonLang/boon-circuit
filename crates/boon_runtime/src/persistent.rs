@@ -4709,7 +4709,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         .unwrap();
         let plan = Arc::new(
             boon_compiler::compile_runtime_source_units_to_machine_plan_with_persistence_identity(
-                "persistent-cells.bn",
+                &units[0].path,
                 &units,
                 boon_plan::TargetProfile::SoftwareDefault,
                 identity,
@@ -4905,7 +4905,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         .unwrap();
         let plan = Arc::new(
             boon_compiler::compile_runtime_source_units_to_machine_plan_with_persistence_identity(
-                "persistent-novywave.bn",
+                &units[0].path,
                 &units,
                 boon_plan::TargetProfile::SoftwareDefault,
                 identity,

@@ -6,8 +6,9 @@ use std::time::Duration;
 use boon_document_model::{StyleEditorTypeHint, StyleRichTextSpan};
 use boon_parser::{AstToken, AstTokenKind, lex_source, parse_project};
 use boon_typecheck::{
-    CheckedCallEntry, CheckedDeclarationKind, CheckedProgram, CheckedSpan, DeclId,
-    DiagnosticSeverity, SemanticOccurrenceKind as CheckedSemanticOccurrenceKind, TypeDisplayNode,
+    CheckedCallEntry, CheckedContextBinding, CheckedDeclarationKind, CheckedProgram, CheckedSpan,
+    DeclId, DiagnosticSeverity, SemanticOccurrenceKind as CheckedSemanticOccurrenceKind,
+    TypeDisplayNode,
 };
 use futures::channel::mpsc;
 
@@ -287,28 +288,41 @@ fn analyze(job: AnalysisJob) -> LanguageSnapshot {
     let path = active.map_or_else(|| "RUN.bn".to_owned(), |unit| unit.path.clone());
     let source = active.map_or("", |unit| unit.source.as_str());
     let tokens = lex_source(&path, source).unwrap_or_default();
-    let project_tokens = job
-        .units
-        .iter()
-        .map(|unit| lex_source(&unit.path, &unit.source).unwrap_or_default())
-        .collect::<Vec<_>>();
     let mut inspector_hints = Vec::new();
     let mut line_type_hints = Vec::new();
     let mut semantics = Vec::new();
     let mut diagnostics = Vec::new();
 
     match parse_project(
-        "playground",
+        &path,
         job.units
             .iter()
             .map(|unit| (unit.path.clone(), unit.source.clone())),
     ) {
         Ok(program) => {
+            let project_tokens = program
+                .files
+                .iter()
+                .map(|file| lex_source(&file.path, &file.source).unwrap_or_default())
+                .collect::<Vec<_>>();
+            let canonical_to_job_file = program
+                .files
+                .iter()
+                .map(|file| {
+                    job.units.iter().position(|unit| {
+                        boon_contract::normalize_source_path(&unit.path)
+                            .is_ok_and(|path| path == file.path)
+                    })
+                })
+                .collect::<Vec<_>>();
             let output = boon_typecheck::check_program(&program);
             if let Some(checked) = output.program.as_ref() {
                 semantics = semantic_items(&program, checked, &project_tokens);
+                for item in &mut semantics {
+                    remap_source_location(&mut item.location, &canonical_to_job_file);
+                }
             }
-            if let Some(file) = program.files.get(job.file_index) {
+            if let Some(file) = program.files.iter().find(|file| file.path == program.path) {
                 let file_start = byte_offset_for_line(&program.source, file.start_line);
                 let file_end = file_start.saturating_add(file.source.len());
                 for hint in output.report.type_hint_table.entries {
@@ -355,10 +369,13 @@ fn analyze(job: AnalysisJob) -> LanguageSnapshot {
                                 end: diagnostic.end,
                             },
                         )
-                        .map(|location| SemanticDiagnostic {
-                            severity: diagnostic.severity,
-                            location,
-                            message: diagnostic.message,
+                        .map(|mut location| {
+                            remap_source_location(&mut location, &canonical_to_job_file);
+                            SemanticDiagnostic {
+                                severity: diagnostic.severity,
+                                location,
+                                message: diagnostic.message,
+                            }
                         })
                     }),
             );
@@ -386,6 +403,16 @@ fn analyze(job: AnalysisJob) -> LanguageSnapshot {
         semantics,
         diagnostics,
         inline_out_hints: false,
+    }
+}
+
+fn remap_source_location(location: &mut SourceLocation, canonical_to_job_file: &[Option<usize>]) {
+    if let Some(file_index) = canonical_to_job_file
+        .get(location.file_index)
+        .copied()
+        .flatten()
+    {
+        location.file_index = file_index;
     }
 }
 
@@ -599,18 +626,10 @@ fn semantic_description(
                 .calls
                 .iter()
                 .find(|call| call.callable == target && call.span == span)
-                .and_then(|call| {
-                    if call.pass.is_some() {
-                        Some(" with explicit PASS")
-                    } else {
-                        checked
-                            .callables
-                            .iter()
-                            .find(|callable| callable.decl_id == call.callable)
-                            .and_then(|callable| {
-                                callable.requires_pass().then_some(" with inherited PASS")
-                            })
-                    }
+                .and_then(|call| match call.context_binding {
+                    CheckedContextBinding::Explicit { .. } => Some(" with explicit PASS"),
+                    CheckedContextBinding::Inherited { .. } => Some(" with inherited PASS"),
+                    CheckedContextBinding::None => None,
                 })
                 .unwrap_or_default();
             (
@@ -621,9 +640,13 @@ fn semantic_description(
         SemanticKind::Pass => {
             let explicitly_bound = checked.calls.iter().any(|call| {
                 call.callable == target
-                    && call.pass.is_some_and(|pass| {
-                        pass.span.start == span.start && pass.span.end == span.end
-                    })
+                    && matches!(
+                        call.context_binding,
+                        CheckedContextBinding::Explicit {
+                            span: explicit_span,
+                            ..
+                        } if explicit_span.start == span.start && explicit_span.end == span.end
+                    )
             });
             (
                 format!("PASS context for {name}"),
@@ -1152,17 +1175,17 @@ result: wrapper(PASS: [store: [count: 1]])
     fn checked_declaration_identity_navigates_across_project_files() {
         let units = vec![
             SourceUnit {
-                path: "Math.bn".to_owned(),
-                source: "FUNCTION double(value) {\n    value * 2\n}\n".to_owned(),
-            },
-            SourceUnit {
                 path: "RUN.bn".to_owned(),
                 source: "result: Math/double(value: 21)\n".to_owned(),
+            },
+            SourceUnit {
+                path: "Math.bn".to_owned(),
+                source: "FUNCTION double(value) {\n    value * 2\n}\n".to_owned(),
             },
         ];
         let snapshot = analyze(AnalysisJob {
             revision: 9,
-            file_index: 1,
+            file_index: 0,
             units,
         });
         assert!(
@@ -1173,12 +1196,12 @@ result: wrapper(PASS: [store: [count: 1]])
         let call = snapshot
             .semantics
             .iter()
-            .find(|item| item.kind == SemanticKind::Call && item.location.file_index == 1)
+            .find(|item| item.kind == SemanticKind::Call && item.location.file_index == 0)
             .expect("cross-file call occurrence");
         let definition = snapshot
             .definition_at(call.location.start)
             .expect("cross-file source definition");
-        assert_eq!(definition.location.file_index, 0);
+        assert_eq!(definition.location.file_index, 1);
         assert_eq!(definition.location.path, "Math.bn");
         assert_eq!(definition.name, "Math/double");
     }

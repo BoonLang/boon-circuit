@@ -1,4 +1,3 @@
-use super::out_net::{OutCallInstanceId, OutInputValue, OutNet, OutNetId, ScopedCheckedExpr};
 use super::{
     ContextualMaterialization as ConcreteMaterialization,
     ContextualOperationKind as ConcreteContextualOperation,
@@ -13,14 +12,34 @@ use super::{
     ExecutableValueOrigin, ExecutableValueProvenance, MaterializationLocalId,
     MaterializationResultKind, StaticOwnerId,
 };
+use boon_semantic::{
+    OutCallInstanceId, OutInputValue, OutNetId, ProducerFunctionId, ProducerParameterId,
+    ProducerResultStatementId, ResolvedOutGraph as OutNet, ScopedCheckedExpr,
+};
 use boon_typecheck::{
-    CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextualOperation,
-    CheckedDeclarationKind, CheckedExprId, CheckedExpression, CheckedExpressionKind,
-    CheckedProgram, CheckedTextSegment, CheckedValueUse, DeclId, FlowMode, Type,
-    apply_checked_type_substitutions, is_renderable_type,
+    CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
+    CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
+    CheckedExpressionKind, CheckedPassedAccess, CheckedProgram, CheckedTextSegment,
+    CheckedValueUse, ContextFormalId, DeclId, FlowMode, Type, apply_checked_type_substitutions,
+    is_renderable_type,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+fn executable_function_id(id: ProducerFunctionId) -> super::FunctionId {
+    super::FunctionId(id.as_usize())
+}
+
+fn executable_parameter_id(id: ProducerParameterId) -> super::ExecutableParameterId {
+    super::ExecutableParameterId {
+        function: executable_function_id(id.function),
+        ordinal: id.ordinal,
+    }
+}
+
+fn executable_result_statement_id(id: ProducerResultStatementId) -> super::ExecutableStatementId {
+    super::ExecutableStatementId(id.as_usize())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExpansionError {
@@ -42,6 +61,12 @@ pub(crate) enum ExpansionError {
     MissingFunctionResult(DeclId),
     MissingProducerOwner([u8; 32]),
     MissingPassedContext(CheckedExprId),
+    MismatchedPassedFormal {
+        expression: CheckedExprId,
+        expected: ContextFormalId,
+        found: ContextFormalId,
+    },
+    InvalidPassedDrainTarget(CheckedExprId),
     UnboundOutput {
         expression: CheckedExprId,
         target: DeclId,
@@ -142,6 +167,20 @@ impl fmt::Display for ExpansionError {
             Self::MissingPassedContext(expression) => write!(
                 formatter,
                 "checked PASSED expression {} has no concrete PASS context",
+                expression.0
+            ),
+            Self::MismatchedPassedFormal {
+                expression,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "checked PASSED expression {} names context formal {} but its concrete call frame binds formal {}",
+                expression.0, found.0, expected.0
+            ),
+            Self::InvalidPassedDrainTarget(expression) => write!(
+                formatter,
+                "checked DRAIN PASSED expression {} does not resolve to a canonical drainable binding",
                 expression.0
             ),
             Self::UnboundOutput {
@@ -1176,7 +1215,7 @@ pub(crate) fn derive_executable_program(
                     members: vec![ExecutableValueMember {
                         path: Vec::new(),
                         origin: ExecutableValueOrigin::ProducerSource {
-                            function: producer.spec.function,
+                            function: executable_function_id(producer.spec.function),
                             identity: producer.spec.identity,
                             owner,
                         },
@@ -1188,7 +1227,7 @@ pub(crate) fn derive_executable_program(
                 },
             });
             producer_sources.push((
-                producer.spec.function,
+                executable_function_id(producer.spec.function),
                 producer.spec.identity,
                 producer.spec.result_declaration,
                 source,
@@ -1225,7 +1264,7 @@ pub(crate) fn derive_executable_program(
             body
         };
         statements.push(ExecutableStatement {
-            id: producer.spec.result_statement,
+            id: executable_result_statement_id(producer.spec.result_statement),
             declaration: Some(producer.spec.result_declaration),
             flow_type: Some(producer.spec.result_type.clone()),
             kind: ExecutableStatementKind::Field {
@@ -1237,7 +1276,7 @@ pub(crate) fn derive_executable_program(
             children: Vec::new(),
         });
         functions.push(ExecutableFunction {
-            id: producer.spec.function,
+            id: executable_function_id(producer.spec.function),
             identity: producer.spec.identity,
             name: producer.spec.function_name.clone(),
             parameters: producer
@@ -1245,7 +1284,7 @@ pub(crate) fn derive_executable_program(
                 .parameters
                 .iter()
                 .map(|parameter| ExecutableFunctionParameter {
-                    id: parameter.parameter,
+                    id: executable_parameter_id(parameter.parameter),
                     name: parameter.name.clone(),
                     flow_type: parameter.flow_type.clone(),
                 })
@@ -2565,6 +2604,7 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                         } => {
                             flow_type.ty = project_concrete_type(flow_type.ty, &projection)
                                 .unwrap_or(Type::Unknown);
+                            let parameter = executable_parameter_id(parameter);
                             let parameter = self.push(
                                 &expression,
                                 owner,
@@ -2627,18 +2667,50 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                     source,
                 }
             }
-            CheckedExpressionKind::Passed { projection } => {
+            CheckedExpressionKind::Passed {
+                formal,
+                projection,
+                access,
+            } => {
                 let passed = scoped
                     .frame
                     .and_then(|frame| self.out_net.call_instances[frame.as_usize()].passed)
                     .ok_or(ExpansionError::MissingPassedContext(scoped.expression))?;
+                if passed.formal != formal {
+                    return Err(ExpansionError::MismatchedPassedFormal {
+                        expression: scoped.expression,
+                        expected: passed.formal,
+                        found: formal,
+                    });
+                }
                 let argument_owner = self
                     .out_net
                     .owner_for_call_evaluation(passed.evaluation_call);
                 let expanded = self.expand_with_inherited_owner(passed.value, argument_owner)?;
-                return self.project(&expression, owner, expanded, projection);
+                let projected = self.project(&expression, owner, expanded, projection)?;
+                if access == CheckedPassedAccess::Read {
+                    return Ok(projected);
+                }
+                let ConcreteExpressionKind::CanonicalRead {
+                    target,
+                    path,
+                    projection,
+                    ..
+                } = self.expressions[projected.as_usize()].kind.clone()
+                else {
+                    return Err(ExpansionError::InvalidPassedDrainTarget(scoped.expression));
+                };
+                return Ok(self.push(
+                    &expression,
+                    owner,
+                    ConcreteExpressionKind::Drain {
+                        target,
+                        path,
+                        projection,
+                    },
+                ));
             }
-            CheckedExpressionKind::ExternalRead { canonical_path } => {
+            CheckedExpressionKind::ExternalRead { canonical_path, .. } => {
                 if let Some((target, projection)) =
                     self.resolve_ambient_read(scoped.frame, expression.scope_id, &canonical_path)
                 {
@@ -2880,7 +2952,7 @@ impl<'a> ConcreteExpressionBuilder<'a> {
                 call_owner,
             );
         }
-        if checked_call.pass.is_some() {
+        if !matches!(checked_call.context_binding, CheckedContextBinding::None) {
             return Err(ExpansionError::PassOnNonexpandedCall(call_id));
         }
         let inputs = self.out_net.call_instances[instance.as_usize()]
@@ -3457,7 +3529,13 @@ impl<'a> ConcreteExpressionBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::out_net::OutNet;
+
+    fn resolved_out_graph(checked: &CheckedProgram) -> OutNet {
+        boon_semantic::elaborate(checked.clone(), &[])
+            .expect("valid checked fixture has a resolved semantic OUT graph")
+            .resolved_out_graph()
+            .clone()
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum BodyShape {
@@ -3494,10 +3572,9 @@ mod tests {
             output.report.diagnostics
         );
         let checked = output.program.expect("valid source has a checked program");
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let (materializations, expressions) =
-            derive_contextual_materializations(&checked, &out_net.graph).unwrap();
+            derive_contextual_materializations(&checked, &out_net).unwrap();
         let [materialization] = materializations
             .try_into()
             .unwrap_or_else(|values: Vec<_>| {
@@ -3515,13 +3592,11 @@ mod tests {
             output.report.diagnostics
         );
         let checked = output.program.expect("valid source has a checked program");
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let (materializations, expressions) =
-            derive_contextual_materializations(&checked, &out_net.graph).unwrap();
+            derive_contextual_materializations(&checked, &out_net).unwrap();
         let executable =
-            derive_executable_program(&checked, &out_net.graph, &materializations, expressions)
-                .unwrap();
+            derive_executable_program(&checked, &out_net, &materializations, expressions).unwrap();
         let [materialization] = materializations
             .try_into()
             .unwrap_or_else(|values: Vec<_>| {
@@ -3539,13 +3614,11 @@ mod tests {
             output.report.diagnostics
         );
         let checked = output.program.expect("valid source has a checked program");
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let (materializations, expressions) =
-            derive_contextual_materializations(&checked, &out_net.graph).unwrap();
+            derive_contextual_materializations(&checked, &out_net).unwrap();
         let executable =
-            derive_executable_program(&checked, &out_net.graph, &materializations, expressions)
-                .unwrap();
+            derive_executable_program(&checked, &out_net, &materializations, expressions).unwrap();
         (checked, executable)
     }
 
@@ -3809,16 +3882,56 @@ result: outer(PASS: [value: 42])
             output.report.diagnostics
         );
         let checked = output.program.expect("valid source has a checked program");
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let (materializations, expressions) =
-            derive_contextual_materializations(&checked, &out_net.graph).unwrap();
+            derive_contextual_materializations(&checked, &out_net).unwrap();
         assert!(materializations.is_empty());
         let executable =
-            derive_executable_program(&checked, &out_net.graph, &materializations, expressions)
+            derive_executable_program(&checked, &out_net, &materializations, expressions)
                 .expect("nested user calls inherit the outer PASS context");
         assert!(executable.expressions.iter().any(|expression| {
             matches!(&expression.kind, ConcreteExpressionKind::Number(value) if value == "42")
+        }));
+    }
+
+    #[test]
+    fn drain_passed_projects_to_a_concrete_drain() {
+        let parsed = boon_parser::parse_source(
+            "drain-passed-context.bn",
+            r#"
+events: SOURCE
+
+FUNCTION take_event() {
+    DRAIN { PASSED.events }
+}
+
+result: take_event(PASS: [events: events])
+"#,
+        )
+        .unwrap();
+        let output = boon_typecheck::check_program(&parsed);
+        assert!(
+            !output.report.has_errors(),
+            "diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        let checked = output.program.expect("DRAIN PASSED source is checked");
+        let source = checked.sources.first().expect("source resource");
+        let out_net = resolved_out_graph(&checked);
+        let (materializations, expressions) =
+            derive_contextual_materializations(&checked, &out_net).unwrap();
+        let executable =
+            derive_executable_program(&checked, &out_net, &materializations, expressions)
+                .expect("DRAIN PASSED expands");
+        assert!(executable.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                ConcreteExpressionKind::Drain {
+                    target,
+                    projection,
+                    ..
+                } if *target == source.declaration && projection.is_empty()
+            )
         }));
     }
 
@@ -3856,28 +3969,45 @@ result: outer(PASS: [value: 1])
             .iter()
             .find(|call| call.function == "inner")
             .expect("inner call");
-        let inner_pass = inner_call.pass.expect("inner call has an explicit PASS");
-        assert_ne!(
-            outer_call.pass.expect("outer call has PASS").value,
-            inner_pass.value
-        );
+        let (inner_pass, _) = inner_call
+            .context_binding
+            .explicit()
+            .expect("inner call has an explicit PASS");
+        let (outer_pass, _) = outer_call
+            .context_binding
+            .explicit()
+            .expect("outer call has PASS");
+        assert_ne!(outer_pass, inner_pass);
 
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let outer_instance = out_net
-            .graph
             .call_instance_for_checked_call(outer_call.id, None)
             .expect("outer instance");
         let inner_instance = out_net
-            .graph
             .call_instance_for_checked_call(inner_call.id, Some(outer_instance))
             .expect("inner instance");
-        let passed = out_net.graph.call_instances[inner_instance.as_usize()]
+        let passed = out_net.call_instances[inner_instance.as_usize()]
             .passed
             .expect("inner instance owns PASS");
-        assert_eq!(passed.value.expression, inner_pass.value);
+        assert_eq!(passed.value.expression, inner_pass);
         assert_eq!(passed.value.frame, Some(outer_instance));
         assert_eq!(passed.evaluation_call, inner_instance);
+    }
+
+    #[test]
+    fn explicit_unused_pass_is_erased_for_a_noncontextual_user_callable() {
+        let (_, executable) = executable_program(
+            r#"
+FUNCTION identity(value) {
+    value
+}
+
+result: identity(value: 7, PASS: [unused: TEXT { context }])
+"#,
+        );
+        assert!(executable.expressions.iter().any(|expression| {
+            matches!(&expression.kind, ConcreteExpressionKind::Number(value) if value == "7")
+        }));
     }
 
     #[test]
@@ -3926,18 +4056,15 @@ result: outer(PASS: [value: 42])
                 .requires_pass()
         );
 
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let outer_instance = out_net
-            .graph
             .call_instance_for_checked_call(outer_call.id, None)
             .expect("outer instance");
         let nested_instance = out_net
-            .graph
             .call_instance_for_checked_call(nested_call.id, Some(outer_instance))
             .expect("nested passthrough instance");
         assert!(
-            out_net.graph.call_instances[nested_instance.as_usize()]
+            out_net.call_instances[nested_instance.as_usize()]
                 .passed
                 .is_none(),
             "ambient PASS leaked into a callable without a checked requirement"
@@ -3945,7 +4072,7 @@ result: outer(PASS: [value: 42])
     }
 
     #[test]
-    fn malformed_checked_root_requirement_fails_without_ambient_pass() {
+    fn missing_root_context_never_crosses_the_checked_program_boundary() {
         let parsed = boon_parser::parse_source(
             "missing-root-passed-context.bn",
             r#"
@@ -3953,31 +4080,22 @@ FUNCTION contextual() {
     PASSED.value
 }
 
-result: contextual(PASS: [value: 42])
+result: contextual()
 "#,
         )
         .unwrap();
         let output = boon_typecheck::check_program(&parsed);
         assert!(
-            !output.report.has_errors(),
+            output.program.is_none(),
+            "a missing root context must not produce a forgeable CheckedProgram"
+        );
+        assert!(
+            output.report.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("requires a final `PASS:` clause")),
             "diagnostics: {:#?}",
             output.report.diagnostics
         );
-        let mut checked = output.program.expect("valid source has a checked program");
-        checked
-            .calls
-            .iter_mut()
-            .find(|call| call.function == "contextual")
-            .expect("contextual call")
-            .pass = None;
-
-        let out_net = OutNet::build(&checked);
-        assert!(out_net.diagnostics.iter().any(|diagnostic| {
-            matches!(
-                diagnostic,
-                crate::out_net::OutNetDiagnostic::MissingPassedContext { .. }
-            )
-        }));
     }
 
     #[test]
@@ -4179,10 +4297,9 @@ ordered:
             output.report.diagnostics
         );
         let checked = output.program.expect("valid source has a checked program");
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let (materializations, expressions) =
-            derive_contextual_materializations(&checked, &out_net.graph).unwrap();
+            derive_contextual_materializations(&checked, &out_net).unwrap();
         let ordered = materializations
             .iter()
             .find(|materialization| {
@@ -4479,22 +4596,21 @@ result:
             output.report.diagnostics
         );
         let checked = output.program.expect("valid source has a checked program");
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let (materializations, expressions) =
-            derive_contextual_materializations(&checked, &out_net.graph).unwrap();
+            derive_contextual_materializations(&checked, &out_net).unwrap();
         assert_eq!(materializations.len(), 2);
         let outer = &materializations[0];
         let inner = &materializations[1];
         let inner_producer = checked
             .calls
             .iter()
-            .flat_map(|call| out_net.graph.concrete_producers_for_checked_call(call.id))
+            .flat_map(|call| out_net.concrete_producers_for_checked_call(call.id))
             .find(|producer| producer.owner == inner.owner)
             .expect("inner materialization has a concrete OUT producer");
-        let evaluation_owner = out_net.graph.owner_for_call_evaluation(inner_producer.call);
+        let evaluation_owner = out_net.owner_for_call_evaluation(inner_producer.call);
         assert_eq!(
-            out_net.graph.static_owners[inner.owner.as_usize()].parent,
+            out_net.static_owners[inner.owner.as_usize()].parent,
             Some(outer.owner)
         );
         assert_eq!(
@@ -4531,13 +4647,12 @@ store: [
             output.report.diagnostics
         );
         let checked = output.program.expect("valid source has a checked program");
-        let out_net = OutNet::build(&checked);
-        assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
+        let out_net = resolved_out_graph(&checked);
         let (materializations, expressions) =
-            derive_contextual_materializations(&checked, &out_net.graph).unwrap();
+            derive_contextual_materializations(&checked, &out_net).unwrap();
         assert!(materializations.is_empty());
         let executable =
-            derive_executable_program(&checked, &out_net.graph, &materializations, expressions)
+            derive_executable_program(&checked, &out_net, &materializations, expressions)
                 .expect("LATEST branches must form an acyclic executable graph");
         let count = executable
             .statements

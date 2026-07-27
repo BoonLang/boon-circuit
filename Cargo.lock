@@ -691,7 +691,9 @@ dependencies = [
  "boon_ir",
  "boon_parser",
  "boon_plan",
+ "boon_semantic",
  "boon_typecheck",
+ "boon_verify",
  "serde",
  "serde_json",
  "sha2",
@@ -704,6 +706,7 @@ dependencies = [
 name = "boon_contract"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "serde",
  "serde_json",
  "sha2",
@@ -822,9 +825,12 @@ dependencies = [
 name = "boon_ir"
 version = "0.1.0"
 dependencies = [
+ "boon_contract",
  "boon_data",
  "boon_parser",
+ "boon_semantic",
  "boon_typecheck",
+ "boon_verify",
  "serde",
  "web-time",
 ]
@@ -912,8 +918,10 @@ dependencies = [
 name = "boon_parser"
 version = "0.1.0"
 dependencies = [
+ "boon_contract",
  "chumsky",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1011,6 +1019,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_semantic"
+version = "0.1.0"
+dependencies = [
+ "boon_contract",
+ "boon_data",
+ "boon_parser",
+ "boon_typecheck",
+ "serde",
+]
+
+[[package]]
 name = "boon_server_host"
 version = "0.1.0"
 dependencies = [
@@ -1053,6 +1072,7 @@ dependencies = [
 name = "boon_typecheck"
 version = "0.1.0"
 dependencies = [
+ "boon_contract",
  "boon_data",
  "boon_document_model",
  "boon_effect_schema",
@@ -1060,6 +1080,19 @@ dependencies = [
  "ena",
  "serde",
  "web-time",
+]
+
+[[package]]
+name = "boon_verify"
+version = "0.1.0"
+dependencies = [
+ "boon_contract",
+ "boon_parser",
+ "boon_semantic",
+ "boon_typecheck",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -6238,6 +6271,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "syn",
  "toml",
  "wgsl_bindgen",
 ]

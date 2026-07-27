@@ -1,3 +1,4 @@
+use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 use chumsky::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -384,8 +385,48 @@ pub fn language_feature(id: &str) -> Option<&'static LanguageFeatureSpec> {
         .map(|index| &LANGUAGE_FEATURE_REGISTRY[index])
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Opaque parser-produced syntax artifact.
+///
+/// Its fields remain readable through [`ParsedProgramFields`], but callers
+/// cannot mutate them through this wrapper or construct an accepted
+/// `ParsedProgram` from deserialized fields.
+///
+/// ```compile_fail
+/// use boon_parser::{ParsedProgram, ParsedProgramFields};
+///
+/// let fields: ParsedProgramFields = serde_json::from_str("{}").unwrap();
+/// let _ = ParsedProgram { fields };
+/// ```
+///
+/// ```compile_fail
+/// use boon_parser::ParsedProgram;
+///
+/// let _: ParsedProgram = serde_json::from_str("{}").unwrap();
+/// ```
+///
+/// ```compile_fail
+/// use boon_parser::ParsedProgram;
+///
+/// let _: ParsedProgram = Default::default();
+/// ```
+///
+/// ```compile_fail
+/// let mut parsed = boon_parser::parse_source("main.bn", "value: 1").unwrap();
+/// parsed.path.clear();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ParsedProgram {
+    #[serde(flatten)]
+    fields: ParsedProgramFields,
+}
+
+/// Public read-only schema projected by an opaque [`ParsedProgram`].
+///
+/// Deserializing or constructing this DTO never creates a parser-produced
+/// artifact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParsedProgramFields {
+    pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub path: String,
     pub source: String,
     pub files: Vec<ParsedSourceFile>,
@@ -394,6 +435,20 @@ pub struct ParsedProgram {
     pub expressions: Vec<AstExpr>,
     pub functions: Vec<String>,
     pub operators: Vec<String>,
+}
+
+impl std::ops::Deref for ParsedProgram {
+    type Target = ParsedProgramFields;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl ParsedProgram {
+    fn from_parser_fields(fields: ParsedProgramFields) -> Self {
+        Self { fields }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -790,54 +845,77 @@ pub fn parse_source(
     source: impl Into<String>,
 ) -> Result<ParsedProgram, ParseError> {
     let path = path.into();
-    reject_reserved_module_path(&path)?;
     let source = source.into();
-    let files = vec![ParsedSourceFile {
-        path: path.clone(),
-        source: source.clone(),
-        start_line: 1,
-        module: None,
-    }];
-    parse_combined_source(path, source, files)
+    let bundle = CanonicalSourceBundleV1::new(
+        &path,
+        [SourceBundleUnit::new(path.as_str(), source.as_str())],
+    )
+    .map_err(|error| source_bundle_parse_error(&path, error))?;
+    parse_canonical_source_bundle(bundle)
 }
 
+/// Parses a project whose first argument is the logical project-relative path
+/// of the entrypoint unit.
 pub fn parse_project(
-    path: impl Into<String>,
+    entrypoint: impl Into<String>,
     files: impl IntoIterator<Item = (String, String)>,
 ) -> Result<ParsedProgram, ParseError> {
-    let path = path.into();
+    let entrypoint = entrypoint.into();
+    let files = files.into_iter().collect::<Vec<_>>();
+    let bundle = CanonicalSourceBundleV1::new(
+        &entrypoint,
+        files
+            .iter()
+            .map(|(path, source)| SourceBundleUnit::new(path.as_str(), source.as_str())),
+    )
+    .map_err(|error| source_bundle_parse_error(&entrypoint, error))?;
+    parse_canonical_source_bundle(bundle)
+}
+
+fn source_bundle_parse_error(
+    entrypoint: &str,
+    error: boon_contract::SourceBundleError,
+) -> ParseError {
+    ParseError {
+        path: entrypoint.to_owned(),
+        line: None,
+        column: None,
+        message: format!("invalid source bundle: {error}"),
+    }
+}
+
+fn parse_canonical_source_bundle(
+    bundle: CanonicalSourceBundleV1<'_>,
+) -> Result<ParsedProgram, ParseError> {
+    let entrypoint = bundle.entrypoint().to_owned();
+    let source_bundle_digest_v1 = bundle.digest();
     let mut parsed_files = Vec::new();
     let mut source = String::new();
     let mut next_line = 1usize;
-    for (file_path, file_source) in files {
-        reject_reserved_module_path(&file_path)?;
-        if !source.is_empty() && !source.ends_with('\n') {
-            source.push('\n');
-            next_line += 1;
-        }
+    for (index, unit) in bundle.units().iter().enumerate() {
+        let file_path = unit.path();
+        let file_source = unit.source();
+        reject_reserved_module_path(file_path)?;
         let start_line = next_line;
-        source.push_str(&file_source);
-        if !file_source.ends_with('\n') {
+        source.push_str(file_source);
+        if index + 1 < bundle.units().len() && !file_source.ends_with('\n') {
             source.push('\n');
         }
         next_line += file_source.lines().count().max(1);
         parsed_files.push(ParsedSourceFile {
-            module: module_name_for_project_file(&path, &file_path),
-            path: file_path,
-            source: file_source,
+            module: module_name_for_project_file(&entrypoint, file_path),
+            path: file_path.to_owned(),
+            source: file_source.to_owned(),
             start_line,
         });
     }
-    if parsed_files.is_empty() {
-        return Err(ParseError {
-            path,
-            line: None,
-            column: None,
-            message: "project has no source files".to_owned(),
-        });
-    }
-    parse_combined_source(path.clone(), source, parsed_files.clone())
-        .map_err(|error| project_source_error(error, &path, &parsed_files))
+    parse_combined_source(
+        entrypoint.clone(),
+        source,
+        parsed_files.clone(),
+        source_bundle_digest_v1,
+    )
+    .map_err(|error| project_source_error(error, &entrypoint, &parsed_files))
 }
 
 fn project_source_error(
@@ -871,6 +949,7 @@ fn parse_combined_source(
     path: String,
     source: String,
     files: Vec<ParsedSourceFile>,
+    source_bundle_digest_v1: SourceBundleDigestV1,
 ) -> Result<ParsedProgram, ParseError> {
     let mut ast = parse_ast(&path, &source)?;
     namespace_project_modules(&mut ast, &files);
@@ -880,7 +959,8 @@ fn parse_combined_source(
     validate_no_reducer_style_update(&path, &ast)?;
     let kind = detect_program_kind();
     validate_no_hidden_identity_leak(&path, &ast)?;
-    Ok(ParsedProgram {
+    Ok(ParsedProgram::from_parser_fields(ParsedProgramFields {
+        source_bundle_digest_v1,
         expressions: ast.expressions.clone(),
         functions: collect_functions(&ast),
         operators: collect_operators(&ast),
@@ -889,7 +969,7 @@ fn parse_combined_source(
         files,
         kind,
         ast,
-    })
+    }))
 }
 
 fn module_name_for_project_file(entry_path: &str, file_path: &str) -> Option<String> {
@@ -1500,7 +1580,7 @@ fn validate_pipeline_inputs(
     Ok(())
 }
 
-fn materialize_statement_structure(statement: &mut AstStatement, expressions: &mut Vec<AstExpr>) {
+fn materialize_statement_structure(statement: &mut AstStatement, expressions: &mut [AstExpr]) {
     let child_values = statement_sequence_values(&statement.children, expressions);
     let child_result = child_values.last().copied();
     let child_arms = statement
@@ -1588,10 +1668,8 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
                 *fields = record_fields;
             }
         }
-        AstExprKind::ListLiteral { items, .. } => {
-            if items.is_empty() {
-                *items = child_values;
-            }
+        AstExprKind::ListLiteral { items, .. } if items.is_empty() => {
+            *items = child_values;
         }
         _ => {}
     }
@@ -2869,8 +2947,8 @@ fn ast_latest_branches(
     let mut ranges = Vec::new();
     let mut start = 0;
     let mut depth = 0_usize;
-    for index in 0..inner.len() {
-        let token = inner[index].as_str();
+    for (index, token) in inner.iter().enumerate() {
+        let token = token.as_str();
         if depth == 0 && token == "," {
             if start < index {
                 ranges.push(start..index);
@@ -2989,9 +3067,11 @@ fn ast_call_arg(
         });
     }
     let (start, end) = span_for_tokens(tokens, item).unwrap_or((item.start, item.end));
-    let name = (tokens.len() == 1 && is_name(&tokens[0]))
-        .then(|| tokens[0].clone())
-        .unwrap_or_default();
+    let name = if tokens.len() == 1 && is_name(&tokens[0]) {
+        tokens[0].clone()
+    } else {
+        String::new()
+    };
     Some(AstCallArg {
         kind: AstCallArgKind::BareBinding,
         name,
@@ -4559,6 +4639,100 @@ fn error(path: &str, line: usize, column: usize, message: &str) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsed_program_digest_is_order_independent_and_uses_normalized_paths() {
+        let forward = parse_project(
+            "app/main.bn",
+            [
+                ("app/main.bn".to_owned(), "main_value: 1\n".to_owned()),
+                ("app/helper.bn".to_owned(), "helper_value: 2\n".to_owned()),
+            ],
+        )
+        .unwrap();
+        let reverse = parse_project(
+            "app\\main.bn",
+            [
+                ("app\\helper.bn".to_owned(), "helper_value: 2\n".to_owned()),
+                ("app\\main.bn".to_owned(), "main_value: 1\n".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            forward.source_bundle_digest_v1,
+            reverse.source_bundle_digest_v1
+        );
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.path, "app/main.bn");
+        assert_eq!(
+            forward
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["app/helper.bn", "app/main.bn"]
+        );
+    }
+
+    #[test]
+    fn parsed_program_digest_and_parser_input_preserve_exact_source_text() {
+        let without_newline = parse_source("main.bn", "value: 1").unwrap();
+        let with_newline = parse_source("main.bn", "value: 1\n").unwrap();
+
+        assert_eq!(without_newline.source, "value: 1");
+        assert_eq!(without_newline.files[0].source, "value: 1");
+        assert_eq!(with_newline.source, "value: 1\n");
+        assert_ne!(
+            without_newline.source_bundle_digest_v1,
+            with_newline.source_bundle_digest_v1
+        );
+    }
+
+    #[test]
+    fn parse_project_rejects_missing_and_ambiguous_entrypoints() {
+        let missing = parse_project(
+            "missing.bn",
+            [("main.bn".to_owned(), "value: 1\n".to_owned())],
+        )
+        .unwrap_err();
+        assert_eq!(missing.path, "missing.bn");
+        assert!(missing.message.contains("entrypoint `missing.bn`"));
+        assert!(missing.message.contains("not one of its units"));
+
+        let ambiguous = parse_project(
+            "app/main.bn",
+            [
+                ("app/main.bn".to_owned(), "value: 1\n".to_owned()),
+                ("app\\main.bn".to_owned(), "value: 2\n".to_owned()),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(ambiguous.path, "app/main.bn");
+        assert!(
+            ambiguous
+                .message
+                .contains("duplicate normalized path `app/main.bn`")
+        );
+    }
+
+    #[test]
+    fn parsed_program_serialization_includes_unforgeable_provenance_fields() {
+        let parsed = parse_source("app/main.bn", "value: 1\n").unwrap();
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            serialized["source_bundle_digest_v1"],
+            parsed.source_bundle_digest_v1.to_string()
+        );
+        assert_eq!(serialized["path"], "app/main.bn");
+
+        let fields: ParsedProgramFields = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            fields.source_bundle_digest_v1,
+            parsed.source_bundle_digest_v1
+        );
+        assert_eq!(fields.path, parsed.path);
+    }
 
     #[test]
     fn multiline_selectors_retain_owned_match_arms() {

@@ -7,7 +7,7 @@ pub use boon_plan::{
 };
 use serde::de::DeserializeOwned;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
@@ -27,9 +27,34 @@ pub type CompilerResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 pub const COMPILER_ID: &str = concat!("boon-compiler/", env!("CARGO_PKG_VERSION"));
 
+fn verify_and_lower_checked(
+    checked: boon_typecheck::CheckedProgram,
+    producer_requests: &[boon_semantic::ProducerMaterializationRequest],
+) -> Result<ErasedProgram, String> {
+    let semantic = elaborate_checked(checked, producer_requests)?;
+    verify_and_lower_semantic(semantic)
+}
+
+fn elaborate_checked(
+    checked: boon_typecheck::CheckedProgram,
+    producer_requests: &[boon_semantic::ProducerMaterializationRequest],
+) -> Result<boon_semantic::SemanticProgram, String> {
+    boon_semantic::elaborate(checked, producer_requests).map_err(|error| error.to_string())
+}
+
+fn verify_and_lower_semantic(
+    semantic: boon_semantic::SemanticProgram,
+) -> Result<ErasedProgram, String> {
+    let verified =
+        boon_verify::verify_explicit_contracts(semantic).map_err(|error| error.to_string())?;
+    boon_ir::erase_and_lower(verified)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompilerSourceUnit {
+    /// Canonical UTF-8 project-relative path used in source identity.
     pub path: String,
+    /// Exact source bytes decoded as UTF-8, without newline normalization.
     pub source: String,
 }
 
@@ -46,20 +71,19 @@ pub struct CompilerDiagnostic {
 /// Produces structured parser/type diagnostics for a failed runtime compile.
 /// Callers use this only on the error path, so successful compilation does not
 /// repeat parsing or type checking.
+///
+/// `source_label` is the exact project-relative entrypoint path and must name
+/// one of `units`; it is not a diagnostic-only display label.
 pub fn diagnose_runtime_source_units(
     source_label: &str,
     units: &[CompilerSourceUnit],
 ) -> Vec<CompilerDiagnostic> {
-    let parsed = if let [unit] = units {
-        parse_source(unit.path.clone(), unit.source.clone())
-    } else {
-        parse_project(
-            source_label.to_owned(),
-            units
-                .iter()
-                .map(|unit| (unit.path.clone(), unit.source.clone())),
-        )
-    };
+    let parsed = parse_project(
+        source_label.to_owned(),
+        units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.source.clone())),
+    );
     let parsed = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -456,6 +480,8 @@ pub fn compile_runtime_source_text_to_machine_plan_for_role_with_persistence_cat
     )
 }
 
+/// Compiles a source bundle whose `source_label` is its exact canonical
+/// project-relative entrypoint and names one of `units`.
 pub fn compile_source_units_to_machine_plan(
     source_label: &str,
     units: &[CompilerSourceUnit],
@@ -492,6 +518,8 @@ pub fn compile_source_units_to_machine_plan_with_identity(
     )
 }
 
+/// Compiles a runtime source bundle whose `source_label` is its exact
+/// canonical project-relative entrypoint and names one of `units`.
 pub fn compile_runtime_source_units_to_machine_plan(
     source_label: &str,
     units: &[CompilerSourceUnit],
@@ -702,7 +730,7 @@ fn compile_parsed_to_machine_plan(
     let checked = check_output
         .program
         .ok_or_else(|| PlanError::new("typecheck produced no CheckedProgram for valid source"))?;
-    let ir = boon_ir::lower_checked(checked, &[])?;
+    let ir = verify_and_lower_checked(checked, &[])?;
     let lower_ms = elapsed_ms(lower_started);
     let verify_started = Instant::now();
     verify_hidden_identity(&ir)?;
@@ -735,16 +763,12 @@ fn parse_source_units(
     source_label: &str,
     units: &[CompilerSourceUnit],
 ) -> CompilerResult<ParsedProgram> {
-    Ok(if let [unit] = units {
-        parse_source(unit.path.clone(), unit.source.clone())?
-    } else {
-        parse_project(
-            source_label.to_owned(),
-            units
-                .iter()
-                .map(|unit| (unit.path.clone(), unit.source.clone())),
-        )?
-    })
+    Ok(parse_project(
+        source_label.to_owned(),
+        units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.source.clone())),
+    )?)
 }
 
 pub fn compiler_source_units_for_path(path: &Path) -> CompilerResult<Vec<CompilerSourceUnit>> {
@@ -789,12 +813,14 @@ where
 }
 
 fn compiler_source_units_for_files(files: Vec<PathBuf>) -> CompilerResult<Vec<CompilerSourceUnit>> {
+    let logical_paths = compiler_logical_source_paths(&files)?;
     files
         .into_iter()
-        .map(|path| {
+        .zip(logical_paths)
+        .map(|(path, logical_path)| {
             let source = fs::read_to_string(&path)?;
             Ok(CompilerSourceUnit {
-                path: path.display().to_string(),
+                path: logical_path,
                 source,
             })
         })
@@ -802,8 +828,94 @@ fn compiler_source_units_for_files(files: Vec<PathBuf>) -> CompilerResult<Vec<Co
 }
 
 fn parse_source_path_or_manifest_project(source_path: &Path) -> CompilerResult<ParsedProgram> {
-    let units = compiler_source_units_for_path(source_path)?;
-    parse_source_units(&source_path.display().to_string(), &units)
+    let entrypoint = resolve_repo_file(source_path);
+    let files = compiler_source_files_for_path(source_path)?;
+    let entrypoint_index = files
+        .iter()
+        .position(|path| paths_match(path, &entrypoint))
+        .ok_or_else(|| {
+            format!(
+                "source entrypoint `{}` is absent from its compiler source bundle",
+                source_path.display()
+            )
+        })?;
+    let units = compiler_source_units_for_files(files)?;
+    let entrypoint = units
+        .get(entrypoint_index)
+        .map(|unit| unit.path.clone())
+        .ok_or_else(|| "compiler source entrypoint index is stale".to_owned())?;
+    parse_source_units(&entrypoint, &units)
+}
+
+fn compiler_logical_source_paths(files: &[PathBuf]) -> CompilerResult<Vec<String>> {
+    if files.is_empty() {
+        return Err("compiler source bundle has no files".into());
+    }
+    let canonical_files = files
+        .iter()
+        .map(|path| {
+            path.canonicalize()
+                .map_err(|error| format!("cannot canonicalize `{}`: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .ok();
+    let logical_root = workspace_root
+        .filter(|root| canonical_files.iter().all(|path| path.starts_with(root)))
+        .or_else(|| common_source_parent(&canonical_files))
+        .ok_or_else(|| {
+            "compiler source files do not share a non-root logical project directory".to_owned()
+        })?;
+
+    canonical_files
+        .iter()
+        .map(|path| {
+            let relative = path.strip_prefix(&logical_root).map_err(|_| {
+                format!(
+                    "compiler source `{}` is outside logical root `{}`",
+                    path.display(),
+                    logical_root.display()
+                )
+            })?;
+            let mut components = Vec::new();
+            for component in relative.components() {
+                let Component::Normal(component) = component else {
+                    return Err(format!(
+                        "compiler source `{}` has a non-project-relative component",
+                        path.display()
+                    ));
+                };
+                components.push(
+                    component
+                        .to_str()
+                        .ok_or_else(|| {
+                            format!("compiler source `{}` is not UTF-8", path.display())
+                        })?
+                        .to_owned(),
+                );
+            }
+            if components.is_empty() {
+                return Err(format!(
+                    "compiler source `{}` has an empty logical path",
+                    path.display()
+                ));
+            }
+            Ok(components.join("/"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn common_source_parent(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut common = paths.first()?.parent()?.to_path_buf();
+    while !paths.iter().all(|path| path.starts_with(&common)) {
+        if !common.pop() {
+            return None;
+        }
+    }
+    common.parent().is_some().then_some(common)
 }
 
 fn source_files_for_path(source_path: &Path) -> CompilerResult<Vec<PathBuf>> {

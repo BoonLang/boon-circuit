@@ -1244,14 +1244,14 @@ fn validate_intent_constraints(schema: &EffectSchema) -> Result<(), &'static str
             return Err("effect intent constraints must be uniquely ordered by field path");
         }
         previous_path = Some(field_path);
-        let type_matches = match (
-            value_type_at_path(&schema.intent, field_path),
-            expected_type,
-        ) {
+        let type_matches = matches!(
+            (
+                value_type_at_path(&schema.intent, field_path),
+                expected_type,
+            ),
             (Some(ValueType::Number), ValueType::Number)
-            | (Some(ValueType::Bytes { .. }), ValueType::Bytes { .. }) => true,
-            _ => false,
-        };
+                | (Some(ValueType::Bytes { .. }), ValueType::Bytes { .. })
+        );
         if !type_matches {
             return Err(error);
         }

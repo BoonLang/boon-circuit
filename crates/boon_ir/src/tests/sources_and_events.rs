@@ -1,5 +1,22 @@
 // Included by `../tests.rs`; kept in the parent test module for private IR helper access.
 
+fn producer_callable_for_test(
+    parsed: &boon_parser::ParsedProgram,
+    name: &str,
+) -> boon_semantic::SemanticCallableId {
+    let checked = boon_typecheck::check_runtime_program_profiled_with_external_types(
+        parsed,
+        &boon_typecheck::ExternalTypeEnvironment::default(),
+    )
+    .0
+    .program
+    .expect("producer fixture has one authoritative checked program");
+    boon_semantic::elaborate(checked, &[])
+        .expect("producer fixture has one semantic program")
+        .producer_callable(name)
+        .expect("producer fixture names one semantic callable")
+}
+
 #[test]
 fn structural_group_is_erased_without_losing_child_event_flow() {
     let parsed = boon_parser::parse_source(
@@ -165,8 +182,7 @@ store: [
         .find(|state| state.path == "store.workflow")
         .expect("workflow state");
     assert!(ir.state_update_arms.iter().any(|arm| {
-        arm.state == workflow.id
-            && arm.cause == exact_state_cause(&ir, "store.effect_result")
+        arm.state == workflow.id && arm.cause == exact_state_cause(&ir, "store.effect_result")
     }));
 }
 
@@ -550,7 +566,9 @@ document: Document/new(
     )
     .unwrap();
     let mut ir = lower(&parsed).expect("data view read must lower exactly");
+    let missing_read = ErasedReadId(ir.scope_index.reads.len());
     let binding = ir
+        .fields
         .view_bindings
         .iter()
         .find(|binding| binding.attr == "label" && binding.kind == ViewBindingKind::Data)
@@ -568,12 +586,13 @@ document: Document/new(
     assert!(matches!(exact.target, ErasedReadTarget::Binding { .. }));
 
     let binding = ir
+        .fields
         .view_bindings
         .iter_mut()
         .find(|binding| binding.attr == "label" && binding.kind == ViewBindingKind::Data)
         .expect("label data binding");
     binding.target = ViewBindingTarget::Read {
-        read: ErasedReadId(ir.scope_index.reads.len()),
+        read: missing_read,
         additional_projection: Vec::new(),
     };
     assert!(
@@ -1062,10 +1081,8 @@ document: Document/new(
         .view_bindings
         .iter()
         .filter_map(|binding| {
-            (binding.node_kind == "Button" && binding.attr == "press").then_some((
-                binding.path.as_str(),
-                binding.target.clone(),
-            ))
+            (binding.node_kind == "Button" && binding.attr == "press")
+                .then_some((binding.path.as_str(), binding.target.clone()))
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(
@@ -1575,19 +1592,23 @@ seed: 0
     .program
     .expect("valid producer fixture has one authoritative checked program");
     let checked_before_overlay = checked.clone();
+    let combine_callable = producer_callable_for_test(&parsed, "combine");
     let requests = vec![
         ProducerFunctionLoweringRequest {
             identity: [2; 32],
+            callable: combine_callable,
             local_function: "combine".to_owned(),
             mode: ProducerFunctionMode::Current,
         },
         ProducerFunctionLoweringRequest {
             identity: [1; 32],
+            callable: combine_callable,
             local_function: "combine".to_owned(),
             mode: ProducerFunctionMode::Current,
         },
         ProducerFunctionLoweringRequest {
             identity: [1; 32],
+            callable: combine_callable,
             local_function: "combine".to_owned(),
             mode: ProducerFunctionMode::Current,
         },
@@ -1696,11 +1717,13 @@ seed: 0
     )
     .unwrap();
     let identity = [7; 32];
+    let identity_callable = producer_callable_for_test(&parsed, "identity");
     let program = lower_runtime_with_external_types_and_producer_functions(
         &parsed,
         &boon_typecheck::ExternalTypeEnvironment::default(),
         &[ProducerFunctionLoweringRequest {
             identity,
+            callable: identity_callable,
             local_function: "identity".to_owned(),
             mode: ProducerFunctionMode::Invocation,
         }],
@@ -1758,11 +1781,13 @@ seed: 0
 "#,
     )
     .unwrap();
+    let local_resource_callable = producer_callable_for_test(&parsed, "local_resource");
     let program = lower_runtime_with_external_types_and_producer_functions(
         &parsed,
         &boon_typecheck::ExternalTypeEnvironment::default(),
         &[ProducerFunctionLoweringRequest {
             identity: [3; 32],
+            callable: local_resource_callable,
             local_function: "local_resource".to_owned(),
             mode: ProducerFunctionMode::Current,
         }],
@@ -2457,6 +2482,7 @@ FUNCTION new_row(input) {
 fn erased_scope_index_rejects_cyclic_resource_forwarding() {
     let mut ir = resource_only_row_program();
     let local = ir
+        .fields
         .scope_index
         .locals
         .iter_mut()
@@ -2496,16 +2522,14 @@ fn erased_value_binding_rejects_resource_only_field_authority() {
         .map(|field| field.id)
         .expect("nested SOURCE structural field");
     let binding = ir
+        .fields
         .scope_index
         .bindings
         .iter_mut()
         .find(|binding| {
             matches!(
                 binding.target,
-                ErasedBindingTarget::Value {
-                    field: Some(_),
-                    ..
-                }
+                ErasedBindingTarget::Value { field: Some(_), .. }
             )
         })
         .expect("ordinary scalar value binding");
@@ -2529,7 +2553,8 @@ fn derived_value_rejects_resource_only_field_authority() {
         .find(|field| field.resource_only)
         .map(|field| field.id)
         .expect("nested SOURCE structural field");
-    ir.derived_values
+    ir.fields
+        .derived_values
         .first_mut()
         .expect("mapped rows derived value")
         .id = resource;

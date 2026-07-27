@@ -5,7 +5,8 @@ fn typed_http_host_port_injects_closed_structural_request_payload() {
         include_str!("../../../../examples/server_outputs.bn"),
     )
     .unwrap();
-    let report = check(&parsed);
+    let output = check_program(&parsed);
+    let report = &output.report;
     assert!(
         !report.has_errors(),
         "unexpected diagnostics: {:?}",
@@ -13,13 +14,13 @@ fn typed_http_host_port_injects_closed_structural_request_payload() {
     );
 
     let http = report.host_port_table.http.as_ref().unwrap();
-    assert_eq!(http.request_source, "store.request_received");
-    assert_eq!(http.disconnect_source, None);
-    assert_eq!(http.response_output, "api_response");
+    assert_eq!(http.request.diagnostic_path, "store.request_received");
+    assert_eq!(http.disconnect, None);
+    assert_eq!(http.response.diagnostic_name, "api_response");
     let request = report
         .source_payload_shape_table
         .iter()
-        .find(|entry| entry.source_path == http.request_source)
+        .find(|entry| entry.diagnostic_path == http.request.diagnostic_path)
         .unwrap();
     let fields = request
         .fields
@@ -33,6 +34,57 @@ fn typed_http_host_port_injects_closed_structural_request_payload() {
     );
     assert!(
         matches!(fields.get("query"), Some(Type::List(item)) if matches!(item.as_ref(), Type::Object(shape) if !shape.open && shape.fields.contains_key("name") && shape.fields.contains_key("value")))
+    );
+
+    let checked = output.program.expect("host-port fixture is checked");
+    let request_source = checked
+        .sources
+        .iter()
+        .find(|source| source.id == http.request.source)
+        .expect("exact request source");
+    assert_eq!(request_source.payload_type, request.payload_type);
+    assert_eq!(
+        checked
+            .expressions
+            .iter()
+            .find(|expression| expression.id == request_source.expression)
+            .map(|expression| &expression.flow_type.ty),
+        Some(&request.payload_type),
+        "the exact SOURCE expression must carry its refined payload"
+    );
+    let store = checked
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "store")
+        .expect("store declaration");
+    let Type::Object(store_shape) = &store.flow_type.ty else {
+        panic!("store is not a checked record: {:?}", store.flow_type.ty);
+    };
+    assert_eq!(
+        store_shape.fields.get("request_received"),
+        Some(&request.payload_type),
+        "host payload refinement must propagate through ancestor checked records"
+    );
+
+    let mut stale = checked.clone();
+    stale
+        .fields
+        .sources
+        .iter_mut()
+        .find(|source| source.id == http.request.source)
+        .expect("mutable exact request source")
+        .payload_type = exact_empty_object_type();
+    assert!(
+        validate_checked_host_port_source_payload_types(
+            &stale,
+            &host_port_table(&parsed, &SourcePayloadPathLookup::new(&BTreeSet::from([
+                "store.request_received".to_owned(),
+            ])))
+            .0,
+        )
+        .unwrap_err()
+        .contains("differs from its exact host contract"),
+        "a stale host-source payload must fail closed rather than being repaired"
     );
 }
 
@@ -65,7 +117,7 @@ store: [
         .report
         .source_payload_shape_table
         .iter()
-        .find(|entry| entry.source_path == "store.request")
+        .find(|entry| entry.diagnostic_path == "store.request")
         .expect("request payload");
     let query = payload
         .fields
@@ -556,11 +608,11 @@ host_ports: [
         report.diagnostics
     );
     let websocket = report.host_port_table.websocket.as_ref().unwrap();
-    assert_eq!(websocket.message_source, "store.ws_message");
+    assert_eq!(websocket.message.diagnostic_path, "store.ws_message");
     let message = report
         .source_payload_shape_table
         .iter()
-        .find(|entry| entry.source_path == websocket.message_source)
+        .find(|entry| entry.diagnostic_path == websocket.message.diagnostic_path)
         .unwrap();
     assert!(message.fields.iter().any(|field| {
         field.name == "bytes" && matches!(field.ty, Type::Bytes(BytesType::Dynamic))

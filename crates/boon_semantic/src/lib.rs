@@ -1,0 +1,4798 @@
+#![forbid(unsafe_code)]
+
+mod contextual_expansion;
+mod dependency_manifest;
+mod execution;
+mod lowering_contract;
+mod memory_contract;
+mod reactive;
+mod resource;
+mod storage_contract;
+mod view_contract;
+
+#[doc(hidden)]
+pub mod out_net;
+
+pub use dependency_manifest::*;
+pub use execution::*;
+pub use lowering_contract::*;
+pub use memory_contract::*;
+pub use out_net::{
+    DistributedCallOccurrenceRoot, OutCallInstanceId, OutInputValue, OutNetId, ProducerFunctionId,
+    ProducerParameterId, ProducerResultStatementId, ScopedCheckedExpr, StaticOwnerDef,
+    StaticOwnerId,
+};
+pub use reactive::*;
+pub use resource::*;
+pub use storage_contract::*;
+pub use view_contract::*;
+
+use boon_contract::SourceBundleDigestV1;
+use boon_typecheck::{CheckedProgram, DeclId};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+
+pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
+pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
+pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
+    0x0f, 0x92, 0xc1, 0x05, 0xe7, 0x1c, 0xda, 0xaf, 0x64, 0x74, 0xf4, 0xf0, 0x87, 0xca, 0x04, 0x6e,
+    0x5c, 0xaa, 0xf9, 0xb8, 0x30, 0x45, 0x68, 0x8b, 0x7f, 0x3c, 0x14, 0x18, 0xdf, 0x92, 0xb2, 0xee,
+];
+pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
+pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
+pub const MAX_BUNDLE_SEMANTIC_CALL_CROSSINGS_V1: usize = 4_096;
+pub const MAX_BUNDLE_SEMANTIC_CALL_CROSSING_BYTES_V1: usize = 32 * 1024 * 1024;
+pub const MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1: usize = 16_384;
+pub const MAX_BUNDLE_SEMANTIC_VALUE_CROSSING_BYTES_V1: usize = 32 * 1024 * 1024;
+const SEMANTIC_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.semantic-program.v1\0";
+const BUNDLE_SEMANTIC_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.bundle-semantic-program.v1\0";
+const OUT_PORT_SHAPE_DIGEST_DOMAIN: &[u8] = b"boon.out-port-shape.v1\0";
+const PRODUCER_MATERIALIZATION_IDENTITY_DOMAIN: &[u8] =
+    b"boon.producer-materialization-identity.v1\0";
+const DISTRIBUTED_VALUE_OCCURRENCE_IDENTITY_DOMAIN: &[u8] =
+    b"boon.distributed-value-occurrence-identity.v1\0";
+
+macro_rules! digest_type {
+    ($name:ident) => {
+        #[derive(
+            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name([u8; 32]);
+
+        impl $name {
+            pub const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+
+            pub fn to_hex(self) -> String {
+                self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.to_hex())
+            }
+        }
+    };
+}
+
+digest_type!(SemanticProgramDigestV1);
+digest_type!(BundleSemanticProgramDigestV1);
+digest_type!(CheckedProgramDigestV1);
+digest_type!(CallableDependencyManifestDigestV1);
+digest_type!(DependencyClassifierSchemaDigestV1);
+digest_type!(DistributedValueOccurrenceIdentityV1);
+
+pub type ResolvedOutGraph = out_net::OutNet<OutPortContractV1>;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutPortContractV1 {
+    pub flow_type: boon_typecheck::FlowType,
+    pub resolved_type: boon_typecheck::Type,
+    pub shape_digest: [u8; 32],
+    pub lexical_scope: boon_typecheck::LexicalScopeId,
+    pub output_scope: boon_typecheck::LexicalScopeId,
+    pub role: boon_typecheck::ProgramRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_identity: Option<OutGenerationIdentityV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_identity: Option<OutCorrelationIdentityV1>,
+    pub presence: OutPresenceCompatibilityV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutGenerationIdentityV1 {
+    pub owner: StaticOwnerId,
+    pub output_scope: boon_typecheck::LexicalScopeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutCorrelationIdentityV1 {
+    pub net: OutNetId,
+    pub owner: StaticOwnerId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutPresenceCompatibilityV1 {
+    pub mode: boon_typecheck::FlowMode,
+    pub may_be_present: bool,
+    pub may_be_absent: bool,
+}
+
+impl OutPresenceCompatibilityV1 {
+    const fn from_mode(mode: boon_typecheck::FlowMode) -> Self {
+        match mode {
+            boon_typecheck::FlowMode::Continuous => Self {
+                mode,
+                may_be_present: true,
+                may_be_absent: false,
+            },
+            boon_typecheck::FlowMode::TickPresent | boon_typecheck::FlowMode::PresentOrAbsent => {
+                Self {
+                    mode,
+                    may_be_present: true,
+                    may_be_absent: true,
+                }
+            }
+            boon_typecheck::FlowMode::Absent => Self {
+                mode,
+                may_be_present: false,
+                may_be_absent: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerMaterializationMode {
+    Current,
+    Invocation,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ProducerMaterializationRequest {
+    pub identity: [u8; 32],
+    pub callable: SemanticCallableId,
+    pub local_function: String,
+    pub mode: ProducerMaterializationMode,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DistributedCallOccurrence {
+    pub root: DistributedCallOccurrenceRoot,
+    pub call: SemanticCallId,
+    pub callable: SemanticCallableId,
+    pub call_path: Vec<SemanticCallId>,
+    pub occurrence_path: String,
+    pub canonical_function: String,
+    pub producer_role: boon_typecheck::ProgramRole,
+    pub mode: ProducerMaterializationMode,
+    pub producer_materialization_identity: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedValueOccurrence {
+    pub identity: DistributedValueOccurrenceIdentityV1,
+    pub root: DistributedCallOccurrenceRoot,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_path: Vec<SemanticCallId>,
+    pub expression: SemanticExprId,
+    pub value: SemanticValueId,
+    pub checked_expression: boon_typecheck::CheckedExprId,
+    pub external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+    pub producer_role: boon_typecheck::ProgramRole,
+    /// Diagnostic only; excluded from structural occurrence identity.
+    pub occurrence_path: String,
+    /// Diagnostic only; excluded from structural occurrence identity.
+    pub canonical_path: String,
+}
+
+#[derive(Clone)]
+struct DistributedCallAnalysisFrame {
+    owner_callable: Option<SemanticCallableId>,
+    root: DistributedCallOccurrenceRoot,
+    path: String,
+    call_path: Vec<SemanticCallId>,
+    active_callables: Vec<SemanticCallableId>,
+}
+
+fn producer_materialization_identity(
+    program: &SemanticProgram,
+    root: DistributedCallOccurrenceRoot,
+    call_path: &[SemanticCallId],
+    external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+    mode: ProducerMaterializationMode,
+) -> Result<[u8; 32], SemanticError> {
+    canonical_hash(
+        PRODUCER_MATERIALIZATION_IDENTITY_DOMAIN,
+        &(
+            program.source_bundle_digest_v1,
+            program.role(),
+            root,
+            call_path,
+            external_identity,
+            mode,
+        ),
+    )
+}
+
+/// Resolves the complete fixed-point input for distributed producer discovery
+/// exclusively from the validated semantic call/callable inventory.
+pub fn distributed_call_occurrences(
+    program: &SemanticProgram,
+) -> Result<Vec<DistributedCallOccurrence>, SemanticError> {
+    program.validate()?;
+    let execution = program.execution_graph();
+    let mut calls_by_owner = BTreeMap::<Option<SemanticCallableId>, Vec<&SemanticCall>>::new();
+    for call in &execution.calls {
+        calls_by_owner
+            .entry(call.owner_callable)
+            .or_default()
+            .push(call);
+    }
+    for calls in calls_by_owner.values_mut() {
+        calls.sort_by_key(|call| call.id);
+    }
+
+    let mut frames = vec![DistributedCallAnalysisFrame {
+        owner_callable: None,
+        root: DistributedCallOccurrenceRoot::Program,
+        path: "program".to_owned(),
+        call_path: Vec::new(),
+        active_callables: Vec::new(),
+    }];
+    for request in program.producer_materializations.iter().rev() {
+        let callable = execution
+            .callables
+            .get(request.callable.as_usize())
+            .filter(|callable| {
+                callable.id == request.callable
+                    && callable.kind == boon_typecheck::CheckedCallableKind::User
+                    && callable.name == request.local_function
+            })
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "producer request callable {} does not exactly identify `{}`",
+                    request.callable, request.local_function
+                ))
+            })?;
+        frames.push(DistributedCallAnalysisFrame {
+            owner_callable: Some(callable.id),
+            root: DistributedCallOccurrenceRoot::Producer(request.identity),
+            path: format!("producer:{}", digest_hex(&request.identity)),
+            call_path: Vec::new(),
+            active_callables: vec![callable.id],
+        });
+    }
+
+    let mut occurrences = BTreeMap::<String, DistributedCallOccurrence>::new();
+    while let Some(frame) = frames.pop() {
+        let calls = calls_by_owner
+            .get(&frame.owner_callable)
+            .cloned()
+            .unwrap_or_default();
+        for call in calls.into_iter().rev() {
+            let callable = execution
+                .callables
+                .get(call.callable.as_usize())
+                .filter(|callable| callable.id == call.callable)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "semantic call {} references missing callable {}",
+                        call.id, call.callable
+                    ))
+                })?;
+            let path = format!("{}/{}", frame.path, call.occurrence_segment);
+            let mut call_path = frame.call_path.clone();
+            call_path.push(call.id);
+            match callable.kind {
+                boon_typecheck::CheckedCallableKind::User => {
+                    if frame.active_callables.contains(&callable.id) {
+                        return Err(SemanticError::new(format!(
+                            "distributed call analysis encountered recursive callable `{}`",
+                            callable.name
+                        )));
+                    }
+                    let mut active_callables = frame.active_callables.clone();
+                    active_callables.push(callable.id);
+                    frames.push(DistributedCallAnalysisFrame {
+                        owner_callable: Some(callable.id),
+                        root: frame.root,
+                        path,
+                        call_path,
+                        active_callables,
+                    });
+                }
+                boon_typecheck::CheckedCallableKind::External => {
+                    let Some(producer_role) = distributed_function_role(&call.function) else {
+                        continue;
+                    };
+                    let external_identity = call.external_identity.ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "distributed semantic call {} has no sealed external declaration identity",
+                            call.id
+                        ))
+                    })?;
+                    if external_identity.kind
+                        != boon_typecheck::CheckedExternalDeclarationKind::Callable
+                        || external_identity.producer_role != producer_role
+                        || callable.external_identity != Some(external_identity)
+                    {
+                        return Err(SemanticError::new(format!(
+                            "distributed semantic call {} has an incompatible sealed external declaration identity",
+                            call.id
+                        )));
+                    }
+                    let structural_occurrence = DistributedCallOccurrence {
+                        root: frame.root,
+                        call: call.id,
+                        callable: callable.id,
+                        call_path: call_path.clone(),
+                        occurrence_path: path.clone(),
+                        canonical_function: call.function.clone(),
+                        producer_role,
+                        mode: ProducerMaterializationMode::Current,
+                        producer_materialization_identity: [0; 32],
+                    };
+                    let (call_expression, _, _) =
+                        exact_call_expression_for_occurrence(program, &structural_occurrence)?;
+                    let schedules = program
+                        .reactive_graph()
+                        .call_invocations
+                        .iter()
+                        .filter(|schedule| schedule.expression == call_expression.id)
+                        .collect::<Vec<_>>();
+                    let [schedule] = schedules.as_slice() else {
+                        return Err(SemanticError::new(format!(
+                            "distributed semantic call {} expression {} maps to {} invocation schedules",
+                            call.id,
+                            call_expression.id,
+                            schedules.len()
+                        )));
+                    };
+                    if schedule.call != call.id || schedule.value != call_expression.value_id {
+                        return Err(SemanticError::new(format!(
+                            "distributed semantic call {} invocation schedule differs from its concrete semantic expression",
+                            call.id
+                        )));
+                    }
+                    let invocation_arms = program
+                        .reactive_graph()
+                        .invocation_arms_for_call_expression(call_expression.id)
+                        .map_err(|error| SemanticError::new(error.to_string()))?;
+                    let mode = if schedule.current_capable && invocation_arms.is_empty() {
+                        ProducerMaterializationMode::Current
+                    } else {
+                        ProducerMaterializationMode::Invocation
+                    };
+                    let producer_materialization_identity = producer_materialization_identity(
+                        program,
+                        frame.root,
+                        &call_path,
+                        external_identity,
+                        mode,
+                    )?;
+                    if producer_materialization_identity
+                        .iter()
+                        .all(|byte| *byte == 0)
+                    {
+                        return Err(SemanticError::new(format!(
+                            "distributed occurrence `{path}` produced a zero materialization identity"
+                        )));
+                    }
+                    let occurrence = DistributedCallOccurrence {
+                        root: frame.root,
+                        call: call.id,
+                        callable: callable.id,
+                        call_path,
+                        occurrence_path: path.clone(),
+                        canonical_function: call.function.clone(),
+                        producer_role,
+                        mode,
+                        producer_materialization_identity,
+                    };
+                    if let Some(previous) = occurrences.insert(path.clone(), occurrence.clone())
+                        && previous != occurrence
+                    {
+                        return Err(SemanticError::new(format!(
+                            "distributed occurrence `{path}` resolves to conflicting call contracts"
+                        )));
+                    }
+                }
+                boon_typecheck::CheckedCallableKind::Builtin => {}
+            }
+        }
+    }
+    Ok(occurrences.into_values().collect())
+}
+
+fn distributed_value_structural_root(
+    program: &SemanticProgram,
+    frame: Option<OutCallInstanceId>,
+) -> Result<(DistributedCallOccurrenceRoot, Vec<SemanticCallId>), SemanticError> {
+    let Some(frame) = frame else {
+        return Ok((DistributedCallOccurrenceRoot::Program, Vec::new()));
+    };
+    let out_net = program.resolved_out_graph();
+    let mut ancestry = Vec::new();
+    let mut next = Some(frame);
+    let mut remaining = out_net.call_instances.len().saturating_add(1);
+    while let Some(call) = next {
+        if remaining == 0 {
+            return Err(SemanticError::new(format!(
+                "distributed value frame {frame} has cyclic OUT ancestry"
+            )));
+        }
+        remaining -= 1;
+        let instance = out_net
+            .call_instances
+            .get(call.as_usize())
+            .filter(|instance| instance.id == call)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "distributed value frame ancestry references missing OUT call {call}"
+                ))
+            })?;
+        ancestry.push(call);
+        next = instance.parent;
+    }
+    ancestry.reverse();
+
+    let producer_root = ancestry.first().and_then(|root| {
+        out_net
+            .producer_roots()
+            .iter()
+            .find(|producer| producer.call == *root)
+    });
+    let root = producer_root
+        .map(|producer| DistributedCallOccurrenceRoot::Producer(producer.spec.identity))
+        .unwrap_or(DistributedCallOccurrenceRoot::Program);
+    let first_static = usize::from(producer_root.is_some());
+    let mut call_path = Vec::with_capacity(ancestry.len().saturating_sub(first_static));
+    for instance in ancestry.into_iter().skip(first_static) {
+        let checked_call = out_net.call_instances[instance.as_usize()]
+            .provenance
+            .call_id
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "distributed value non-root OUT call {instance} has no checked call identity"
+                ))
+            })?;
+        let matches = program
+            .execution_graph()
+            .calls
+            .iter()
+            .filter(|call| call.checked_call == checked_call)
+            .map(|call| call.id)
+            .collect::<Vec<_>>();
+        let [call] = matches.as_slice() else {
+            return Err(SemanticError::new(format!(
+                "distributed value OUT call {instance} checked identity {} maps to {} semantic calls",
+                checked_call.0,
+                matches.len()
+            )));
+        };
+        call_path.push(*call);
+    }
+    Ok((root, call_path))
+}
+
+fn distributed_value_occurrence_identity(
+    program: &SemanticProgram,
+    root: DistributedCallOccurrenceRoot,
+    call_path: &[SemanticCallId],
+    checked_expression: boon_typecheck::CheckedExprId,
+    external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+) -> Result<DistributedValueOccurrenceIdentityV1, SemanticError> {
+    // Global SemanticExprId/SemanticValueId coordinates are intentionally not
+    // part of this cross-round key: canonically inserting an earlier producer
+    // root may rebase dense IDs without changing this occurrence.
+    Ok(DistributedValueOccurrenceIdentityV1(canonical_hash(
+        DISTRIBUTED_VALUE_OCCURRENCE_IDENTITY_DOMAIN,
+        &(
+            program.source_bundle_digest_v1,
+            program.role(),
+            root,
+            call_path,
+            checked_expression,
+            external_identity,
+        ),
+    )?))
+}
+
+/// Resolve every concrete cross-role value read from semantic identity alone.
+///
+/// Producer roots are part of the structural key, so newly materialized
+/// producer bodies can reveal additional value crossings monotonically during
+/// distributed fixed-point construction.
+pub fn distributed_value_occurrences(
+    program: &SemanticProgram,
+) -> Result<Vec<DistributedValueOccurrence>, SemanticError> {
+    program.validate()?;
+    let execution = program.execution_graph();
+    let mut occurrences = BTreeMap::new();
+    for expression in &execution.expressions {
+        let SemanticExpressionKind::ExternalRead {
+            canonical_path,
+            external_identity,
+        } = &expression.kind
+        else {
+            continue;
+        };
+        let external_identity = external_identity.ok_or_else(|| {
+            SemanticError::new(format!(
+                "{} external value expression {} has no sealed declaration identity",
+                program.role().namespace(),
+                expression.id
+            ))
+        })?;
+        if external_identity.kind != boon_typecheck::CheckedExternalDeclarationKind::Value
+            || external_identity.producer_role == program.role()
+        {
+            return Err(SemanticError::new(format!(
+                "{} external value expression {} has an incompatible sealed declaration identity",
+                program.role().namespace(),
+                expression.id
+            )));
+        }
+        let origin = execution
+            .checked_expression_origins
+            .get(expression.id.as_usize())
+            .filter(|origin| {
+                origin.expression == expression.id
+                    && origin.checked_expression == expression.checked_expr_id
+            })
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "external value expression {} has no exact checked origin",
+                    expression.id
+                ))
+            })?;
+        let (root, call_path) = distributed_value_structural_root(program, origin.call_instance)?;
+        let identity = distributed_value_occurrence_identity(
+            program,
+            root,
+            &call_path,
+            origin.checked_expression,
+            external_identity,
+        )?;
+        if identity.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(SemanticError::new(format!(
+                "external value expression {} produced a zero structural occurrence identity",
+                expression.id
+            )));
+        }
+        let mut occurrence_path = match root {
+            DistributedCallOccurrenceRoot::Program => "program".to_owned(),
+            DistributedCallOccurrenceRoot::Producer(identity) => {
+                format!("producer:{}", digest_hex(&identity))
+            }
+        };
+        for call in &call_path {
+            occurrence_path.push_str(&format!("/call:{}", call.0));
+        }
+        occurrence_path.push_str(&format!(
+            "/value:{}:{}",
+            origin.checked_expression.0, expression.id.0
+        ));
+        let occurrence = DistributedValueOccurrence {
+            identity,
+            root,
+            call_path,
+            expression: expression.id,
+            value: expression.value_id,
+            checked_expression: origin.checked_expression,
+            external_identity,
+            producer_role: external_identity.producer_role,
+            occurrence_path,
+            canonical_path: canonical_path.clone(),
+        };
+        if let Some(previous) = occurrences.insert(identity, occurrence.clone())
+            && previous != occurrence
+        {
+            return Err(SemanticError::new(format!(
+                "distributed value occurrence {} resolves to conflicting semantic reads",
+                identity
+            )));
+        }
+    }
+    Ok(occurrences.into_values().collect())
+}
+
+/// The single pre-backend semantic artifact.
+///
+/// The checked graph remains encapsulated so consumers cannot reinterpret a
+/// `CheckedProgram` as executable IR. Phase 1 moves resolved OUT/contextual
+/// graphs into this crate incrementally; the whole checked graph is already
+/// digest-bound here so no dependency-bearing checked field can disappear from
+/// verification identity during that extraction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticProgram {
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    checked_program: CheckedProgram,
+    producer_materializations: Vec<ProducerMaterializationRequest>,
+    resolved_out_graph: ResolvedOutGraph,
+    execution_graph: SemanticExecutionGraphV1,
+    resource_graph: SemanticResourceGraphV1,
+    reactive_graph: SemanticReactiveGraphV1,
+    lowering_contract: SemanticLoweringContractV1,
+    view_binding_graph: SemanticViewBindingGraphV1,
+    scope_storage_graph: SemanticScopeStorageGraphV1,
+    memory_graph: SemanticMemoryGraphV1,
+    dependency_manifest: CallableDependencyManifestV1,
+    digest: SemanticProgramDigestV1,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct BundleSemanticRoleDigestV1 {
+    pub role: boon_typecheck::ProgramRole,
+    pub semantic_program_digest: SemanticProgramDigestV1,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct BundleProducerMaterializationRequestV1 {
+    pub role: boon_typecheck::ProgramRole,
+    pub request: ProducerMaterializationRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleSemanticRouteScopeV1 {
+    SessionLocal,
+    OriginScoped,
+    SharedSubscription,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BundleSemanticCallArgumentBindingV1 {
+    Explicit {
+        checked_value: boon_typecheck::CheckedExprId,
+        expression: SemanticExprId,
+        value: SemanticValueId,
+        flow_type: boon_typecheck::FlowType,
+        from_pipe: bool,
+    },
+    Omitted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BundleSemanticCallArgumentV1 {
+    pub ordinal: usize,
+    pub name: String,
+    pub consumer_parameter: SemanticParameterId,
+    pub consumer_formal: DeclId,
+    pub producer_parameter: SemanticParameterId,
+    pub producer_formal: DeclId,
+    pub producer_flow_type: boon_typecheck::FlowType,
+    pub requirement: boon_typecheck::CheckedParameterRequirement,
+    pub evaluation_scope: boon_typecheck::CheckedEvaluationScope,
+    pub binding: BundleSemanticCallArgumentBindingV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BundleSemanticCallCrossingV1 {
+    pub consumer_role: boon_typecheck::ProgramRole,
+    pub consumer_call: SemanticCallId,
+    pub consumer_callable: SemanticCallableId,
+    pub consumer_expression: SemanticExprId,
+    pub consumer_value: SemanticValueId,
+    pub consumer_instance: OutCallInstanceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_callable: Option<SemanticCallableId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StaticOwnerId>,
+    pub consumer_scope: SemanticScopeId,
+    pub producer_role: boon_typecheck::ProgramRole,
+    pub producer_callable: SemanticCallableId,
+    pub external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+    pub producer_materialization_identity: [u8; 32],
+    pub root: DistributedCallOccurrenceRoot,
+    pub call_path: Vec<SemanticCallId>,
+    pub occurrence_path: String,
+    pub canonical_function: String,
+    pub local_function: String,
+    pub result: boon_typecheck::FlowType,
+    pub effect: boon_typecheck::CheckedEffectSummary,
+    pub arguments: Vec<BundleSemanticCallArgumentV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invocation_arms: Vec<SemanticTriggerOwnedArmV1>,
+    pub mode: ProducerMaterializationMode,
+    pub route_scope: BundleSemanticRouteScopeV1,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BundleSemanticValueDeliveryV1 {
+    Current,
+    Event {
+        source: SemanticSourceId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        payload_projection: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BundleSemanticValueCrossingV1 {
+    pub occurrence_identity: DistributedValueOccurrenceIdentityV1,
+    pub root: DistributedCallOccurrenceRoot,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_path: Vec<SemanticCallId>,
+    pub checked_expression: boon_typecheck::CheckedExprId,
+    /// Diagnostic only; excluded from structural occurrence identity.
+    pub occurrence_path: String,
+    pub consumer_role: boon_typecheck::ProgramRole,
+    pub consumer_expression: SemanticExprId,
+    pub consumer_value: SemanticValueId,
+    pub consumer_scope: SemanticScopeId,
+    pub producer_role: boon_typecheck::ProgramRole,
+    pub producer_declaration: DeclId,
+    pub producer_expression: SemanticExprId,
+    pub producer_value: SemanticValueId,
+    pub external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+    pub canonical_path: String,
+    pub flow_type: boon_typecheck::FlowType,
+    pub delivery: BundleSemanticValueDeliveryV1,
+    pub route_scope: BundleSemanticRouteScopeV1,
+}
+
+/// Atomic, pre-verification ownership of the exact final Client, Session, and
+/// Server semantic programs and their frozen distributed call closure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BundleSemanticProgramV1 {
+    schema: String,
+    programs: [SemanticProgram; 3],
+    role_digests: Vec<BundleSemanticRoleDigestV1>,
+    producer_requests: Vec<BundleProducerMaterializationRequestV1>,
+    call_crossings: Vec<BundleSemanticCallCrossingV1>,
+    value_crossings: Vec<BundleSemanticValueCrossingV1>,
+    digest: BundleSemanticProgramDigestV1,
+}
+
+impl SemanticProgram {
+    pub fn role(&self) -> boon_typecheck::ProgramRole {
+        self.checked_program.role
+    }
+
+    pub const fn source_bundle_digest_v1(&self) -> SourceBundleDigestV1 {
+        self.source_bundle_digest_v1
+    }
+
+    pub const fn digest(&self) -> SemanticProgramDigestV1 {
+        self.digest
+    }
+
+    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV1 {
+        &self.dependency_manifest
+    }
+
+    pub const fn checked_program_digest(&self) -> CheckedProgramDigestV1 {
+        self.dependency_manifest.checked_program_digest
+    }
+
+    pub const fn resolved_out_graph(&self) -> &ResolvedOutGraph {
+        &self.resolved_out_graph
+    }
+
+    pub const fn execution_graph(&self) -> &SemanticExecutionGraphV1 {
+        &self.execution_graph
+    }
+
+    pub const fn resource_graph(&self) -> &SemanticResourceGraphV1 {
+        &self.resource_graph
+    }
+
+    pub const fn reactive_graph(&self) -> &SemanticReactiveGraphV1 {
+        &self.reactive_graph
+    }
+
+    pub const fn lowering_contract(&self) -> &SemanticLoweringContractV1 {
+        &self.lowering_contract
+    }
+
+    pub const fn scope_storage_graph(&self) -> &SemanticScopeStorageGraphV1 {
+        &self.scope_storage_graph
+    }
+
+    pub const fn view_binding_graph(&self) -> &SemanticViewBindingGraphV1 {
+        &self.view_binding_graph
+    }
+
+    pub const fn memory_graph(&self) -> &SemanticMemoryGraphV1 {
+        &self.memory_graph
+    }
+
+    pub fn producer_materialization_requests(&self) -> &[ProducerMaterializationRequest] {
+        &self.producer_materializations
+    }
+
+    pub fn producer_callable(
+        &self,
+        local_function: &str,
+    ) -> Result<SemanticCallableId, SemanticError> {
+        let matches = self
+            .execution_graph
+            .callables
+            .iter()
+            .filter(|callable| {
+                callable.kind == boon_typecheck::CheckedCallableKind::User
+                    && callable.name == local_function
+            })
+            .map(|callable| callable.id)
+            .collect::<Vec<_>>();
+        let [callable] = matches.as_slice() else {
+            return Err(SemanticError::new(format!(
+                "producer function `{local_function}` resolves to {} semantic user callables",
+                matches.len()
+            )));
+        };
+        Ok(*callable)
+    }
+
+    pub fn validate(&self) -> Result<(), SemanticError> {
+        if self.source_bundle_digest_v1 != self.checked_program.source_bundle_digest_v1 {
+            return Err(SemanticError::new(
+                "semantic source bundle digest does not match its checked program",
+            ));
+        }
+        validate_contextual_bindings(&self.checked_program)?;
+        validate_out_contracts(&self.checked_program, &self.resolved_out_graph)?;
+        contextual_expansion::validate_checked_callable_and_call_inventory(
+            &self.checked_program,
+            &self.execution_graph,
+        )
+        .map_err(SemanticError::new)?;
+        self.execution_graph
+            .validate_checked_roots(&self.checked_program)
+            .map_err(SemanticError::new)?;
+        self.execution_graph
+            .validate(&self.resolved_out_graph)
+            .map_err(SemanticError::new)?;
+        self.resource_graph
+            .validate(&self.execution_graph, &self.resolved_out_graph)
+            .map_err(SemanticError::new)?;
+        self.reactive_graph
+            .validate(
+                &self.execution_graph,
+                &self.resource_graph,
+                &self.resolved_out_graph,
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        self.lowering_contract
+            .validate(
+                &self.checked_program,
+                &self.execution_graph,
+                &self.resource_graph,
+                &self.reactive_graph,
+                &self.resolved_out_graph,
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        self.view_binding_graph
+            .validate(
+                &self.execution_graph,
+                &self.resource_graph,
+                &self.reactive_graph,
+                &self.lowering_contract,
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        self.scope_storage_graph
+            .validate(
+                &self.checked_program,
+                &self.execution_graph,
+                &self.resource_graph,
+                &self.reactive_graph,
+                &self.lowering_contract,
+                &self.resolved_out_graph,
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        self.memory_graph
+            .validate(
+                &self.checked_program,
+                &self.execution_graph,
+                &self.resource_graph,
+                &self.reactive_graph,
+                &self.scope_storage_graph,
+                &self.lowering_contract,
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        resource::validate_checked_list_classification(
+            &self.checked_program,
+            &self.execution_graph,
+            &self.resource_graph,
+        )
+        .map_err(SemanticError::new)?;
+        resource::validate_checked_resource_provenance(
+            &self.checked_program,
+            &self.execution_graph,
+            &self.resource_graph,
+        )
+        .map_err(SemanticError::new)?;
+        self.dependency_manifest
+            .validate_against(
+                DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
+                &self.checked_program,
+                &self.producer_materializations,
+                &self.resolved_out_graph,
+                &self.execution_graph,
+                &self.resource_graph,
+                &self.reactive_graph,
+                &self.lowering_contract,
+                &self.view_binding_graph,
+                &self.scope_storage_graph,
+                &self.memory_graph,
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        let expected = semantic_program_digest(self)?;
+        if self.digest != expected {
+            return Err(SemanticError::new(
+                "semantic program digest does not match its canonical payload",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Consumed only after `boon_verify` has wrapped this artifact in a
+    /// `ContractVerifiedProgram`.
+    #[doc(hidden)]
+    pub fn into_lowering_parts(
+        self,
+    ) -> (
+        SourceBundleDigestV1,
+        SemanticExecutionGraphV1,
+        SemanticResourceGraphV1,
+        SemanticReactiveGraphV1,
+        SemanticLoweringContractV1,
+        SemanticViewBindingGraphV1,
+        SemanticScopeStorageGraphV1,
+        SemanticMemoryGraphV1,
+        SemanticProgramDigestV1,
+        CallableDependencyManifestDigestV1,
+    ) {
+        (
+            self.source_bundle_digest_v1,
+            self.execution_graph,
+            self.resource_graph,
+            self.reactive_graph,
+            self.lowering_contract,
+            self.view_binding_graph,
+            self.scope_storage_graph,
+            self.memory_graph,
+            self.digest,
+            self.dependency_manifest.manifest_digest,
+        )
+    }
+}
+
+impl BundleSemanticProgramV1 {
+    pub fn freeze(programs: [SemanticProgram; 3]) -> Result<Self, SemanticError> {
+        let programs = canonical_bundle_programs(programs)?;
+        let (role_digests, producer_requests, call_crossings, value_crossings) =
+            derive_bundle_call_closure(&programs)?;
+        let mut bundle = Self {
+            schema: BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1.to_owned(),
+            programs,
+            role_digests,
+            producer_requests,
+            call_crossings,
+            value_crossings,
+            digest: BundleSemanticProgramDigestV1([0; 32]),
+        };
+        bundle.digest = bundle_semantic_program_digest(&bundle)?;
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
+    pub const fn digest(&self) -> BundleSemanticProgramDigestV1 {
+        self.digest
+    }
+
+    pub fn role_program(&self, role: boon_typecheck::ProgramRole) -> Option<&SemanticProgram> {
+        self.programs.iter().find(|program| program.role() == role)
+    }
+
+    pub fn role_programs(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (boon_typecheck::ProgramRole, &SemanticProgram)> {
+        self.programs
+            .iter()
+            .map(|program| (program.role(), program))
+    }
+
+    pub fn role_digests(&self) -> &[BundleSemanticRoleDigestV1] {
+        &self.role_digests
+    }
+
+    pub fn producer_requests(&self) -> &[BundleProducerMaterializationRequestV1] {
+        &self.producer_requests
+    }
+
+    pub fn call_crossings(&self) -> &[BundleSemanticCallCrossingV1] {
+        &self.call_crossings
+    }
+
+    pub fn value_crossings(&self) -> &[BundleSemanticValueCrossingV1] {
+        &self.value_crossings
+    }
+
+    pub fn validate(&self) -> Result<(), SemanticError> {
+        if self.schema != BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1 {
+            return Err(SemanticError::new(format!(
+                "unsupported bundle semantic schema `{}`",
+                self.schema
+            )));
+        }
+        validate_bundle_closure_bounds(
+            &self.producer_requests,
+            &self.call_crossings,
+            &self.value_crossings,
+        )?;
+        for program in &self.programs {
+            program.validate()?;
+        }
+        let expected_programs = canonical_bundle_programs(self.programs.clone())?;
+        if expected_programs != self.programs {
+            return Err(SemanticError::new(
+                "bundle semantic programs are not in canonical role order",
+            ));
+        }
+        let (role_digests, producer_requests, call_crossings, value_crossings) =
+            derive_bundle_call_closure(&self.programs)?;
+        if self.role_digests != role_digests {
+            return Err(SemanticError::new(
+                "bundle semantic role digests are stale or incomplete",
+            ));
+        }
+        if self.producer_requests != producer_requests {
+            return Err(SemanticError::new(
+                "bundle semantic producer requests are stale or incomplete",
+            ));
+        }
+        if self.call_crossings != call_crossings {
+            return Err(SemanticError::new(
+                "bundle semantic call crossings are stale or incomplete",
+            ));
+        }
+        if self.value_crossings != value_crossings {
+            return Err(SemanticError::new(
+                "bundle semantic value crossings are stale or incomplete",
+            ));
+        }
+        let expected_digest = bundle_semantic_program_digest(self)?;
+        if self.digest != expected_digest {
+            return Err(SemanticError::new(
+                "bundle semantic digest does not match its canonical payload",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Consumed only by the verified-bundle handoff after bundle verification.
+    #[doc(hidden)]
+    pub fn into_role_programs(self) -> [SemanticProgram; 3] {
+        self.programs
+    }
+}
+
+fn canonical_bundle_programs(
+    programs: [SemanticProgram; 3],
+) -> Result<[SemanticProgram; 3], SemanticError> {
+    let mut by_role = BTreeMap::new();
+    for program in programs {
+        let role = program.role();
+        if by_role.insert(role, program).is_some() {
+            return Err(SemanticError::new(format!(
+                "bundle semantic programs contain duplicate {} role",
+                role.namespace()
+            )));
+        }
+    }
+    let mut take = |role| {
+        by_role.remove(&role).ok_or_else(|| {
+            SemanticError::new(format!(
+                "bundle semantic programs are missing {} role",
+                role.namespace()
+            ))
+        })
+    };
+    let programs = [
+        take(boon_typecheck::ProgramRole::Client)?,
+        take(boon_typecheck::ProgramRole::Session)?,
+        take(boon_typecheck::ProgramRole::Server)?,
+    ];
+    if !by_role.is_empty() {
+        return Err(SemanticError::new(
+            "bundle semantic programs contain an unsupported role",
+        ));
+    }
+    Ok(programs)
+}
+
+fn exact_semantic_scope(
+    program: &SemanticProgram,
+    checked_scope: boon_typecheck::LexicalScopeId,
+    label: &str,
+) -> Result<SemanticScopeId, SemanticError> {
+    let matches = program
+        .execution_graph()
+        .scopes
+        .iter()
+        .filter(|scope| scope.checked_scope == checked_scope)
+        .map(|scope| scope.id)
+        .collect::<Vec<_>>();
+    let [scope] = matches.as_slice() else {
+        return Err(SemanticError::new(format!(
+            "{label} checked scope {} maps to {} semantic scopes",
+            checked_scope.0,
+            matches.len()
+        )));
+    };
+    Ok(*scope)
+}
+
+fn bundle_call_route_scope(
+    consumer: boon_typecheck::ProgramRole,
+    producer: boon_typecheck::ProgramRole,
+) -> Result<BundleSemanticRouteScopeV1, SemanticError> {
+    match (consumer, producer) {
+        (boon_typecheck::ProgramRole::Client, boon_typecheck::ProgramRole::Session)
+        | (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Client) => {
+            Ok(BundleSemanticRouteScopeV1::SessionLocal)
+        }
+        (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Server)
+        | (boon_typecheck::ProgramRole::Server, boon_typecheck::ProgramRole::Session) => {
+            Ok(BundleSemanticRouteScopeV1::OriginScoped)
+        }
+        _ => Err(SemanticError::new(format!(
+            "distributed call route from {} to {} is not an adjacent role edge",
+            consumer.namespace(),
+            producer.namespace()
+        ))),
+    }
+}
+
+fn bundle_value_route_scope(
+    consumer: boon_typecheck::ProgramRole,
+    producer: boon_typecheck::ProgramRole,
+    delivery: &BundleSemanticValueDeliveryV1,
+    producer_origin_scoped: bool,
+) -> Result<BundleSemanticRouteScopeV1, SemanticError> {
+    match (consumer, producer) {
+        (boon_typecheck::ProgramRole::Client, boon_typecheck::ProgramRole::Session)
+        | (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Client) => {
+            Ok(BundleSemanticRouteScopeV1::SessionLocal)
+        }
+        (boon_typecheck::ProgramRole::Server, boon_typecheck::ProgramRole::Session) => {
+            Ok(BundleSemanticRouteScopeV1::OriginScoped)
+        }
+        (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Server) => {
+            Ok(match delivery {
+                BundleSemanticValueDeliveryV1::Event { .. } => {
+                    BundleSemanticRouteScopeV1::OriginScoped
+                }
+                BundleSemanticValueDeliveryV1::Current if producer_origin_scoped => {
+                    BundleSemanticRouteScopeV1::OriginScoped
+                }
+                BundleSemanticValueDeliveryV1::Current => {
+                    BundleSemanticRouteScopeV1::SharedSubscription
+                }
+            })
+        }
+        _ => Err(SemanticError::new(format!(
+            "distributed value route from {} to {} is not an adjacent role edge",
+            consumer.namespace(),
+            producer.namespace()
+        ))),
+    }
+}
+
+fn exact_call_expression_for_occurrence<'a>(
+    program: &'a SemanticProgram,
+    occurrence: &DistributedCallOccurrence,
+) -> Result<
+    (
+        &'a SemanticExpression,
+        &'a SemanticExpressionOrigin,
+        OutCallInstanceId,
+    ),
+    SemanticError,
+> {
+    let mut matches = Vec::new();
+    for expression in &program.execution_graph().expressions {
+        let SemanticExpressionKind::Call {
+            call,
+            callable,
+            function,
+            instance,
+            ..
+        } = &expression.kind
+        else {
+            continue;
+        };
+        if *call != occurrence.call
+            || *callable != occurrence.callable
+            || function != &occurrence.canonical_function
+        {
+            continue;
+        }
+        let (root, occurrence_path) = program
+            .resolved_out_graph()
+            .distributed_call_occurrence(&program.checked_program, *instance)
+            .map_err(SemanticError::new)?;
+        if root == occurrence.root && occurrence_path == occurrence.occurrence_path {
+            let origin = program
+                .execution_graph()
+                .checked_expression_origins
+                .get(expression.id.as_usize())
+                .filter(|origin| origin.expression == expression.id)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "distributed occurrence `{}` expression {} has no exact origin",
+                        occurrence.occurrence_path, expression.id
+                    ))
+                })?;
+            matches.push((expression, origin, *instance));
+        }
+    }
+    let [matched] = matches.as_slice() else {
+        return Err(SemanticError::new(format!(
+            "distributed occurrence `{}` maps to {} concrete semantic call expressions",
+            occurrence.occurrence_path,
+            matches.len()
+        )));
+    };
+    Ok(*matched)
+}
+
+fn exact_bundle_call_arguments(
+    consumer_program: &SemanticProgram,
+    occurrence: &DistributedCallOccurrence,
+    call_definition: &SemanticCall,
+    call_expression: &SemanticExpression,
+    consumer_callable: &SemanticCallable,
+    producer_callable: &SemanticCallable,
+) -> Result<Vec<BundleSemanticCallArgumentV1>, SemanticError> {
+    let SemanticExpressionKind::Call {
+        arguments,
+        parameter_bindings,
+        contexts,
+        result,
+        effect,
+        ..
+    } = &call_expression.kind
+    else {
+        return Err(SemanticError::new(format!(
+            "distributed occurrence `{}` concrete expression is not a call",
+            occurrence.occurrence_path
+        )));
+    };
+    if !contexts.is_empty()
+        || !call_definition.contexts.is_empty()
+        || !matches!(
+            call_definition.context_binding,
+            boon_typecheck::CheckedContextBinding::None
+        )
+    {
+        return Err(SemanticError::new(format!(
+            "distributed occurrence `{}` carries contextual PASS state across a role boundary",
+            occurrence.occurrence_path
+        )));
+    }
+    if call_expression.flow_type != *result
+        || call_definition.result != *result
+        || producer_callable.result != *result
+        || call_expression.effect != *effect
+        || call_definition.effect != *effect
+        || consumer_callable.effect != *effect
+        || producer_callable.effect != *effect
+    {
+        return Err(SemanticError::new(format!(
+            "distributed occurrence `{}` result/effect differs across its consumer and producer semantic definitions",
+            occurrence.occurrence_path
+        )));
+    }
+    if call_definition
+        .entries
+        .iter()
+        .any(|entry| !matches!(entry, SemanticCallEntry::Input { .. }))
+    {
+        return Err(SemanticError::new(format!(
+            "distributed occurrence `{}` exposes OUT across a role boundary",
+            occurrence.occurrence_path
+        )));
+    }
+    if consumer_callable.parameters.len() != producer_callable.parameters.len()
+        || parameter_bindings.len() != consumer_callable.parameters.len()
+    {
+        return Err(SemanticError::new(format!(
+            "distributed occurrence `{}` does not have exact consumer/producer parameter coverage",
+            occurrence.occurrence_path
+        )));
+    }
+
+    let mut consumer_parameters = consumer_callable.parameters.iter().collect::<Vec<_>>();
+    consumer_parameters.sort_by_key(|parameter| parameter.ordinal);
+    let mut producer_parameters = producer_callable.parameters.iter().collect::<Vec<_>>();
+    producer_parameters.sort_by_key(|parameter| parameter.ordinal);
+    let mut bindings = parameter_bindings.iter().collect::<Vec<_>>();
+    bindings.sort_by_key(|binding| binding.ordinal);
+    let mut result_arguments = Vec::with_capacity(bindings.len());
+    for ((consumer_parameter, producer_parameter), binding) in consumer_parameters
+        .into_iter()
+        .zip(producer_parameters)
+        .zip(bindings)
+    {
+        if consumer_parameter.ordinal != producer_parameter.ordinal
+            || consumer_parameter.ordinal != binding.ordinal
+            || consumer_parameter.name != producer_parameter.name
+            || consumer_parameter.name != binding.name
+            || consumer_parameter.formal != binding.formal
+            || consumer_parameter.kind != boon_typecheck::CheckedParameterKind::Value
+            || producer_parameter.kind != boon_typecheck::CheckedParameterKind::Value
+            || consumer_parameter.flow_type != producer_parameter.flow_type
+            || consumer_parameter.requirement != producer_parameter.requirement
+            || consumer_parameter.requirement != binding.requirement
+            || consumer_parameter.evaluation_scope != producer_parameter.evaluation_scope
+        {
+            return Err(SemanticError::new(format!(
+                "distributed occurrence `{}` parameter ordinal {} differs between consumer binding and sealed producer formal",
+                occurrence.occurrence_path, binding.ordinal
+            )));
+        }
+        let matching_arguments = arguments
+            .iter()
+            .filter(|argument| {
+                argument.ordinal == binding.ordinal
+                    && argument.formal == binding.formal
+                    && argument.name == binding.name
+            })
+            .collect::<Vec<_>>();
+        let static_entry = call_definition.entries.iter().find(|entry| {
+            matches!(
+                entry,
+                SemanticCallEntry::Input {
+                    formal,
+                    ordinal,
+                    name,
+                    ..
+                } if *formal == binding.formal
+                    && *ordinal == binding.ordinal
+                    && name == &binding.name
+            )
+        });
+        let binding = match &binding.kind {
+            SemanticCallParameterBindingKind::Explicit {
+                checked_value,
+                value,
+                from_pipe,
+            } => {
+                let [argument] = matching_arguments.as_slice() else {
+                    return Err(SemanticError::new(format!(
+                        "distributed occurrence `{}` explicit parameter ordinal {} maps to {} concrete arguments",
+                        occurrence.occurrence_path,
+                        consumer_parameter.ordinal,
+                        matching_arguments.len()
+                    )));
+                };
+                let Some(SemanticCallEntry::Input {
+                    checked_value: static_checked_value,
+                    value_flow_type,
+                    from_pipe: static_from_pipe,
+                    ..
+                }) = static_entry
+                else {
+                    return Err(SemanticError::new(format!(
+                        "distributed occurrence `{}` explicit parameter ordinal {} has no static input entry",
+                        occurrence.occurrence_path, consumer_parameter.ordinal
+                    )));
+                };
+                let value_definition = consumer_program
+                    .execution_graph()
+                    .expressions
+                    .get(value.as_usize())
+                    .filter(|expression| expression.id == *value)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "distributed occurrence `{}` argument references missing semantic expression {}",
+                            occurrence.occurrence_path, value
+                        ))
+                    })?;
+                if argument.checked_value != *checked_value
+                    || argument.value != *value
+                    || argument.from_pipe != *from_pipe
+                    || static_checked_value != checked_value
+                    || static_from_pipe != from_pipe
+                    || *value_flow_type != value_definition.flow_type
+                {
+                    return Err(SemanticError::new(format!(
+                        "distributed occurrence `{}` explicit parameter ordinal {} has inconsistent value provenance",
+                        occurrence.occurrence_path, consumer_parameter.ordinal
+                    )));
+                }
+                BundleSemanticCallArgumentBindingV1::Explicit {
+                    checked_value: *checked_value,
+                    expression: *value,
+                    value: value_definition.value_id,
+                    flow_type: value_definition.flow_type.clone(),
+                    from_pipe: *from_pipe,
+                }
+            }
+            SemanticCallParameterBindingKind::Omitted => {
+                if !matching_arguments.is_empty()
+                    || static_entry.is_some()
+                    || matches!(
+                        consumer_parameter.requirement,
+                        boon_typecheck::CheckedParameterRequirement::Required
+                    )
+                {
+                    return Err(SemanticError::new(format!(
+                        "distributed occurrence `{}` omitted parameter ordinal {} is not exactly optional and absent",
+                        occurrence.occurrence_path, consumer_parameter.ordinal
+                    )));
+                }
+                BundleSemanticCallArgumentBindingV1::Omitted
+            }
+        };
+        result_arguments.push(BundleSemanticCallArgumentV1 {
+            ordinal: consumer_parameter.ordinal,
+            name: consumer_parameter.name.clone(),
+            consumer_parameter: consumer_parameter.id,
+            consumer_formal: consumer_parameter.formal,
+            producer_parameter: producer_parameter.id,
+            producer_formal: producer_parameter.formal,
+            producer_flow_type: producer_parameter.flow_type.clone(),
+            requirement: producer_parameter.requirement.clone(),
+            evaluation_scope: producer_parameter.evaluation_scope,
+            binding,
+        });
+    }
+    if result_arguments.len() != parameter_bindings.len()
+        || arguments.len()
+            != result_arguments
+                .iter()
+                .filter(|argument| {
+                    matches!(
+                        &argument.binding,
+                        BundleSemanticCallArgumentBindingV1::Explicit { .. }
+                    )
+                })
+                .count()
+    {
+        return Err(SemanticError::new(format!(
+            "distributed occurrence `{}` has extra or missing concrete arguments",
+            occurrence.occurrence_path
+        )));
+    }
+    Ok(result_arguments)
+}
+
+fn append_bundle_event_projection(
+    delivery: BundleSemanticValueDeliveryV1,
+    projection: &[String],
+) -> BundleSemanticValueDeliveryV1 {
+    match delivery {
+        BundleSemanticValueDeliveryV1::Current => BundleSemanticValueDeliveryV1::Current,
+        BundleSemanticValueDeliveryV1::Event {
+            source,
+            mut payload_projection,
+        } => {
+            payload_projection.extend_from_slice(projection);
+            BundleSemanticValueDeliveryV1::Event {
+                source,
+                payload_projection,
+            }
+        }
+    }
+}
+
+fn exact_bundle_value_delivery(
+    program: &SemanticProgram,
+    root: SemanticExprId,
+) -> Result<BundleSemanticValueDeliveryV1, SemanticError> {
+    fn resolve(
+        program: &SemanticProgram,
+        expression_id: SemanticExprId,
+        visited: &mut BTreeSet<SemanticExprId>,
+    ) -> Result<BundleSemanticValueDeliveryV1, SemanticError> {
+        if !visited.insert(expression_id) {
+            return Err(SemanticError::new(format!(
+                "semantic value delivery has an expression cycle at {expression_id}"
+            )));
+        }
+        let execution = program.execution_graph();
+        let expression = execution
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "semantic value delivery references missing expression {expression_id}"
+                ))
+            })?;
+        let direct_sources = execution
+            .sources
+            .iter()
+            .filter(|source| source.expression == expression_id)
+            .map(|source| source.id)
+            .collect::<Vec<_>>();
+        if !direct_sources.is_empty() {
+            let [source] = direct_sources.as_slice() else {
+                return Err(SemanticError::new(format!(
+                    "semantic value expression {expression_id} owns {} source identities",
+                    direct_sources.len()
+                )));
+            };
+            return Ok(BundleSemanticValueDeliveryV1::Event {
+                source: *source,
+                payload_projection: Vec::new(),
+            });
+        }
+
+        let delivery = match &expression.kind {
+            SemanticExpressionKind::CanonicalRead {
+                source: Some(source),
+                ..
+            } => {
+                if !execution
+                    .sources
+                    .iter()
+                    .any(|candidate| candidate.id == source.source)
+                {
+                    return Err(SemanticError::new(format!(
+                        "semantic value expression {expression_id} references missing source {}",
+                        source.source
+                    )));
+                }
+                BundleSemanticValueDeliveryV1::Event {
+                    source: source.source,
+                    payload_projection: source.payload_projection.clone(),
+                }
+            }
+            SemanticExpressionKind::CanonicalRead {
+                target,
+                projection,
+                source: None,
+                ..
+            } => {
+                let origin = execution
+                    .checked_expression_origins
+                    .get(expression_id.as_usize())
+                    .filter(|origin| origin.expression == expression_id)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "semantic value expression {expression_id} has no exact origin"
+                        ))
+                    })?;
+                let producers = execution
+                    .statements
+                    .iter()
+                    .filter(|statement| {
+                        statement.declaration == Some(*target)
+                            && statement.call_instance == origin.call_instance
+                    })
+                    .filter_map(|statement| statement.value)
+                    .collect::<Vec<_>>();
+                match producers.as_slice() {
+                    [producer] if *producer != expression_id => append_bundle_event_projection(
+                        resolve(program, *producer, visited)?,
+                        projection,
+                    ),
+                    [] => BundleSemanticValueDeliveryV1::Current,
+                    _ => {
+                        return Err(SemanticError::new(format!(
+                            "semantic value expression {expression_id} target declaration {} maps to {} exact producer expressions",
+                            target.0,
+                            producers.len()
+                        )));
+                    }
+                }
+            }
+            SemanticExpressionKind::LocalRead {
+                binding,
+                projection,
+                ..
+            } => {
+                let producers = execution
+                    .expressions
+                    .iter()
+                    .flat_map(|expression| match &expression.kind {
+                        SemanticExpressionKind::Block { bindings, .. } => bindings
+                            .iter()
+                            .filter(|candidate| candidate.id == *binding)
+                            .map(|candidate| candidate.value)
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+                let [producer] = producers.as_slice() else {
+                    return Err(SemanticError::new(format!(
+                        "semantic local binding {} maps to {} producer expressions",
+                        binding,
+                        producers.len()
+                    )));
+                };
+                append_bundle_event_projection(resolve(program, *producer, visited)?, projection)
+            }
+            SemanticExpressionKind::Project { input, fields } => {
+                append_bundle_event_projection(resolve(program, *input, visited)?, fields)
+            }
+            SemanticExpressionKind::Block { result, .. } => resolve(program, *result, visited)?,
+            SemanticExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | SemanticExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => resolve(program, *output, visited)?,
+            SemanticExpressionKind::ExternalRead { canonical_path, .. }
+                if expression.flow_type.mode != boon_typecheck::FlowMode::Continuous =>
+            {
+                return Err(SemanticError::new(format!(
+                    "event-valued semantic alias `{canonical_path}` has no exact local source identity"
+                )));
+            }
+            _ => {
+                let direct_source_members = expression
+                    .provenance
+                    .members
+                    .iter()
+                    .filter_map(|member| match member {
+                        SemanticValueMember {
+                            path,
+                            origin: SemanticValueOrigin::Source { source, .. },
+                        } if path.is_empty() => Some(*source),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                match direct_source_members.len() {
+                    0 => BundleSemanticValueDeliveryV1::Current,
+                    1 => {
+                        let source = direct_source_members.first().copied().ok_or_else(|| {
+                            SemanticError::new(format!(
+                                "semantic value expression {expression_id} lost its sole direct event source"
+                            ))
+                        })?;
+                        BundleSemanticValueDeliveryV1::Event {
+                            source,
+                            payload_projection: Vec::new(),
+                        }
+                    }
+                    count => {
+                        return Err(SemanticError::new(format!(
+                            "semantic value expression {expression_id} has {count} direct event sources"
+                        )));
+                    }
+                }
+            }
+        };
+        Ok(delivery)
+    }
+
+    resolve(program, root, &mut BTreeSet::new())
+}
+
+fn semantic_expression_depends_on_role(
+    program: &SemanticProgram,
+    root: SemanticExprId,
+    producer_role: boon_typecheck::ProgramRole,
+) -> Result<bool, SemanticError> {
+    let execution = program.execution_graph();
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let expression = execution
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|expression| expression.id == expression_id)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "semantic dependency closure references missing expression {expression_id}"
+                ))
+            })?;
+        match &expression.kind {
+            SemanticExpressionKind::ExternalRead {
+                external_identity: Some(identity),
+                ..
+            } if identity.producer_role == producer_role => return Ok(true),
+            SemanticExpressionKind::Call {
+                call, arguments, ..
+            } => {
+                let definition = execution
+                    .calls
+                    .get(call.as_usize())
+                    .filter(|definition| definition.id == *call)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "semantic dependency closure references missing call {call}"
+                        ))
+                    })?;
+                if definition
+                    .external_identity
+                    .is_some_and(|identity| identity.producer_role == producer_role)
+                {
+                    return Ok(true);
+                }
+                pending.extend(arguments.iter().map(|argument| argument.value));
+            }
+            SemanticExpressionKind::CanonicalRead { target, .. }
+            | SemanticExpressionKind::Drain { target, .. } => {
+                pending.extend(
+                    execution
+                        .statements
+                        .iter()
+                        .filter(|statement| statement.declaration == Some(*target))
+                        .filter_map(|statement| statement.value),
+                );
+            }
+            SemanticExpressionKind::LocalRead { binding, .. } => {
+                pending.extend(execution.expressions.iter().flat_map(|expression| {
+                    match &expression.kind {
+                        SemanticExpressionKind::Block { bindings, .. } => bindings
+                            .iter()
+                            .filter(|candidate| candidate.id == *binding)
+                            .map(|candidate| candidate.value)
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    }
+                }));
+            }
+            SemanticExpressionKind::TextTemplate { segments } => {
+                pending.extend(segments.iter().filter_map(|segment| match segment {
+                    SemanticTextSegment::Dynamic { value } => Some(*value),
+                    SemanticTextSegment::Static { .. } => None,
+                }));
+            }
+            SemanticExpressionKind::TaggedObject { fields, .. }
+            | SemanticExpressionKind::Object(fields)
+            | SemanticExpressionKind::Record(fields) => {
+                pending.extend(fields.iter().map(|field| field.value));
+            }
+            SemanticExpressionKind::Block { bindings, result } => {
+                pending.extend(bindings.iter().map(|binding| binding.value));
+                pending.push(*result);
+            }
+            SemanticExpressionKind::Materialize { materialization } => {
+                let definition = execution
+                    .materializations
+                    .get(materialization.as_usize())
+                    .filter(|definition| definition.id == *materialization)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "semantic dependency closure references missing materialization {materialization}"
+                        ))
+                    })?;
+                pending.extend(definition.expression_roots());
+            }
+            SemanticExpressionKind::Draining { input }
+            | SemanticExpressionKind::Project { input, .. } => pending.push(*input),
+            SemanticExpressionKind::Hold {
+                initial, updates, ..
+            } => {
+                pending.push(*initial);
+                pending.extend(updates.iter().copied());
+            }
+            SemanticExpressionKind::Latest { branches } => {
+                pending.extend(branches.iter().copied());
+            }
+            SemanticExpressionKind::When { input, arms, .. } => {
+                pending.push(*input);
+                pending.extend(arms.iter().map(|arm| arm.output));
+            }
+            SemanticExpressionKind::Then { input, output } => {
+                pending.push(*input);
+                pending.extend(*output);
+            }
+            SemanticExpressionKind::Infix { left, right, .. } => {
+                pending.push(*left);
+                pending.push(*right);
+            }
+            SemanticExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => pending.push(*output),
+            SemanticExpressionKind::List { items, .. }
+            | SemanticExpressionKind::Bytes { items, .. } => {
+                pending.extend(items.iter().copied());
+            }
+            SemanticExpressionKind::ExternalRead { .. }
+            | SemanticExpressionKind::ElementState { .. }
+            | SemanticExpressionKind::Text(_)
+            | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::BytesByte(_)
+            | SemanticExpressionKind::Bool(_)
+            | SemanticExpressionKind::Tag(_)
+            | SemanticExpressionKind::Source { .. }
+            | SemanticExpressionKind::Delimiter
+            | SemanticExpressionKind::MaterializationLocal { .. }
+            | SemanticExpressionKind::FunctionParameter { .. }
+            | SemanticExpressionKind::MatchArm { output: None, .. } => {}
+        }
+    }
+    Ok(false)
+}
+
+type BundleSemanticClosureV1 = (
+    Vec<BundleSemanticRoleDigestV1>,
+    Vec<BundleProducerMaterializationRequestV1>,
+    Vec<BundleSemanticCallCrossingV1>,
+    Vec<BundleSemanticValueCrossingV1>,
+);
+
+fn derive_bundle_call_closure(
+    programs: &[SemanticProgram; 3],
+) -> Result<BundleSemanticClosureV1, SemanticError> {
+    let role_digests = programs
+        .iter()
+        .map(|program| BundleSemanticRoleDigestV1 {
+            role: program.role(),
+            semantic_program_digest: program.digest(),
+        })
+        .collect::<Vec<_>>();
+    let mut actual_requests = programs
+        .iter()
+        .flat_map(|program| {
+            program
+                .producer_materializations
+                .iter()
+                .cloned()
+                .map(|request| BundleProducerMaterializationRequestV1 {
+                    role: program.role(),
+                    request,
+                })
+        })
+        .collect::<Vec<_>>();
+    actual_requests.sort();
+    validate_bundle_collection_count(
+        "producer requests",
+        actual_requests.len(),
+        MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1,
+    )?;
+    if actual_requests.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(SemanticError::new(
+            "bundle semantic producer request set contains duplicates",
+        ));
+    }
+
+    let mut crossings = Vec::new();
+    let mut expected_requests = Vec::new();
+    let mut crossing_identities = BTreeSet::new();
+    for consumer in programs {
+        let owned_request_identities = consumer
+            .producer_materializations
+            .iter()
+            .map(|request| request.identity)
+            .collect::<BTreeSet<_>>();
+        for occurrence in distributed_call_occurrences(consumer)? {
+            if let DistributedCallOccurrenceRoot::Producer(identity) = occurrence.root
+                && !owned_request_identities.contains(&identity)
+            {
+                return Err(SemanticError::new(format!(
+                    "distributed occurrence `{}` names producer root {} not owned by its {} semantic program",
+                    occurrence.occurrence_path,
+                    digest_hex(&identity),
+                    consumer.role().namespace()
+                )));
+            }
+            if !crossing_identities.insert(occurrence.producer_materialization_identity) {
+                return Err(SemanticError::new(format!(
+                    "distributed occurrence `{}` duplicates producer materialization identity {}",
+                    occurrence.occurrence_path,
+                    digest_hex(&occurrence.producer_materialization_identity)
+                )));
+            }
+            let local_function = occurrence
+                .canonical_function
+                .strip_prefix(&format!("{}/", occurrence.producer_role.namespace()))
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "qualified function `{}` has the wrong producer role prefix",
+                        occurrence.canonical_function
+                    ))
+                })?
+                .to_owned();
+            let producer = programs
+                .iter()
+                .find(|program| program.role() == occurrence.producer_role)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "distributed occurrence `{}` references missing {} producer role",
+                        occurrence.occurrence_path,
+                        occurrence.producer_role.namespace()
+                    ))
+                })?;
+            let call_definition = consumer
+                .execution_graph()
+                .calls
+                .get(occurrence.call.as_usize())
+                .filter(|call| call.id == occurrence.call)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "distributed occurrence `{}` references missing semantic call {}",
+                        occurrence.occurrence_path, occurrence.call
+                    ))
+                })?;
+            let external_identity = call_definition.external_identity.ok_or_else(|| {
+                SemanticError::new(format!(
+                    "distributed call occurrence `{}` has no sealed external identity",
+                    occurrence.occurrence_path
+                ))
+            })?;
+            if external_identity.kind != boon_typecheck::CheckedExternalDeclarationKind::Callable
+                || external_identity.producer_role != occurrence.producer_role
+                || external_identity.producer_source_bundle_digest_v1
+                    != producer.source_bundle_digest_v1()
+            {
+                return Err(SemanticError::new(format!(
+                    "distributed call occurrence `{}` has an incompatible sealed external identity",
+                    occurrence.occurrence_path
+                )));
+            }
+            let producer_callable = producer
+                .execution_graph()
+                .callables
+                .iter()
+                .find(|callable| {
+                    callable.checked_callable == external_identity.producer_declaration
+                })
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "distributed call occurrence `{}` target declaration {} has no producer semantic callable",
+                        occurrence.occurrence_path,
+                        external_identity.producer_declaration.0
+                    ))
+                })?
+                .id;
+            let producer_callable_definition =
+                &producer.execution_graph().callables[producer_callable.as_usize()];
+            if producer_callable_definition.kind != boon_typecheck::CheckedCallableKind::User
+                || producer_callable_definition.name != local_function
+            {
+                return Err(SemanticError::new(format!(
+                    "distributed call occurrence `{}` sealed target {} differs from diagnostic function `{local_function}`",
+                    occurrence.occurrence_path, producer_callable
+                )));
+            }
+            let consumer_callable_definition = consumer
+                .execution_graph()
+                .callables
+                .get(occurrence.callable.as_usize())
+                .filter(|callable| callable.id == occurrence.callable)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "distributed occurrence `{}` references missing consumer callable {}",
+                        occurrence.occurrence_path, occurrence.callable
+                    ))
+                })?;
+            if consumer_callable_definition.kind != boon_typecheck::CheckedCallableKind::External
+                || consumer_callable_definition.external_identity != Some(external_identity)
+            {
+                return Err(SemanticError::new(format!(
+                    "distributed occurrence `{}` consumer callable is not the sealed external target",
+                    occurrence.occurrence_path
+                )));
+            }
+            let (call_expression, call_origin, call_instance) =
+                exact_call_expression_for_occurrence(consumer, &occurrence)?;
+            let arguments = exact_bundle_call_arguments(
+                consumer,
+                &occurrence,
+                call_definition,
+                call_expression,
+                consumer_callable_definition,
+                producer_callable_definition,
+            )?;
+            let consumer_scope = exact_semantic_scope(
+                consumer,
+                call_origin.checked_scope,
+                &format!("distributed occurrence `{}`", occurrence.occurrence_path),
+            )?;
+            let route_scope = bundle_call_route_scope(consumer.role(), occurrence.producer_role)?;
+            let invocation_schedules = consumer
+                .reactive_graph()
+                .call_invocations
+                .iter()
+                .filter(|schedule| schedule.expression == call_expression.id)
+                .collect::<Vec<_>>();
+            let [invocation_schedule] = invocation_schedules.as_slice() else {
+                return Err(SemanticError::new(format!(
+                    "distributed occurrence `{}` maps to {} semantic invocation schedules",
+                    occurrence.occurrence_path,
+                    invocation_schedules.len()
+                )));
+            };
+            let invocation_arms = consumer
+                .reactive_graph()
+                .invocation_arms_for_call_expression(call_expression.id)
+                .map_err(|error| SemanticError::new(error.to_string()))?;
+            let derived_mode = if invocation_schedule.current_capable && invocation_arms.is_empty()
+            {
+                ProducerMaterializationMode::Current
+            } else {
+                ProducerMaterializationMode::Invocation
+            };
+            if invocation_schedule.call != occurrence.call
+                || invocation_schedule.value != call_expression.value_id
+                || derived_mode != occurrence.mode
+            {
+                return Err(SemanticError::new(format!(
+                    "distributed occurrence `{}` mode or invocation schedule differs from its exact semantic dependencies",
+                    occurrence.occurrence_path
+                )));
+            }
+            let request = ProducerMaterializationRequest {
+                identity: occurrence.producer_materialization_identity,
+                callable: producer_callable,
+                local_function: local_function.clone(),
+                mode: derived_mode,
+            };
+            expected_requests.push(BundleProducerMaterializationRequestV1 {
+                role: occurrence.producer_role,
+                request,
+            });
+            validate_bundle_collection_count(
+                "call crossings",
+                crossings.len().saturating_add(1),
+                MAX_BUNDLE_SEMANTIC_CALL_CROSSINGS_V1,
+            )?;
+            crossings.push(BundleSemanticCallCrossingV1 {
+                consumer_role: consumer.role(),
+                consumer_call: occurrence.call,
+                consumer_callable: occurrence.callable,
+                consumer_expression: call_expression.id,
+                consumer_value: call_expression.value_id,
+                consumer_instance: call_instance,
+                owner_callable: call_definition.owner_callable,
+                owner: call_expression.owner,
+                consumer_scope,
+                producer_role: occurrence.producer_role,
+                producer_callable,
+                external_identity,
+                producer_materialization_identity: occurrence.producer_materialization_identity,
+                root: occurrence.root,
+                call_path: occurrence.call_path,
+                occurrence_path: occurrence.occurrence_path,
+                canonical_function: occurrence.canonical_function,
+                local_function,
+                result: call_definition.result.clone(),
+                effect: call_definition.effect,
+                arguments,
+                invocation_arms,
+                mode: derived_mode,
+                route_scope,
+            });
+        }
+    }
+    expected_requests.sort();
+    crossings.sort_by_key(|crossing| {
+        (
+            crossing.consumer_role,
+            crossing.occurrence_path.clone(),
+            crossing.consumer_call,
+            crossing.consumer_expression,
+            crossing.producer_role,
+            crossing.producer_callable,
+        )
+    });
+    if expected_requests != actual_requests {
+        return Err(SemanticError::new(
+            "bundle semantic call crossings and producer requests are not in exact 1:1 correspondence",
+        ));
+    }
+
+    let mut value_crossings = Vec::new();
+    for consumer in programs {
+        for occurrence in distributed_value_occurrences(consumer)? {
+            let expression = consumer
+                .execution_graph()
+                .expressions
+                .get(occurrence.expression.as_usize())
+                .filter(|expression| {
+                    expression.id == occurrence.expression
+                        && expression.value_id == occurrence.value
+                        && expression.checked_expr_id == occurrence.checked_expression
+                })
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "distributed value occurrence {} references a missing or inconsistent consumer expression",
+                        occurrence.identity
+                    ))
+                })?;
+            let canonical_path = occurrence.canonical_path.clone();
+            let external_identity = occurrence.external_identity;
+            if external_identity.kind != boon_typecheck::CheckedExternalDeclarationKind::Value
+                || external_identity.producer_role != occurrence.producer_role
+            {
+                return Err(SemanticError::new(format!(
+                    "{} external value read `{canonical_path}` has a non-value or mismatched identity",
+                    consumer.role().namespace()
+                )));
+            }
+            let SemanticExpressionKind::ExternalRead {
+                canonical_path: expression_path,
+                external_identity: expression_identity,
+            } = &expression.kind
+            else {
+                return Err(SemanticError::new(format!(
+                    "distributed value occurrence {} consumer expression is not an external read",
+                    occurrence.identity
+                )));
+            };
+            if expression_path != &canonical_path || *expression_identity != Some(external_identity)
+            {
+                return Err(SemanticError::new(format!(
+                    "{} external value read `{canonical_path}` differs from its structural occurrence",
+                    consumer.role().namespace()
+                )));
+            }
+            let producer = programs
+                .iter()
+                .find(|program| program.role() == external_identity.producer_role)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "external value read `{canonical_path}` references missing {} producer role",
+                        external_identity.producer_role.namespace()
+                    ))
+                })?;
+            if producer.source_bundle_digest_v1()
+                != external_identity.producer_source_bundle_digest_v1
+            {
+                return Err(SemanticError::new(format!(
+                    "external value read `{canonical_path}` producer source digest is stale"
+                )));
+            }
+            let producer_values = producer
+                .execution_graph()
+                .statements
+                .iter()
+                .filter(|statement| {
+                    statement.declaration == Some(external_identity.producer_declaration)
+                        && statement.call_instance.is_none()
+                })
+                .filter_map(|statement| statement.value)
+                .collect::<Vec<_>>();
+            let [producer_expression] = producer_values.as_slice() else {
+                return Err(SemanticError::new(format!(
+                    "external value read `{canonical_path}` target declaration {} maps to {} producer semantic values",
+                    external_identity.producer_declaration.0,
+                    producer_values.len()
+                )));
+            };
+            let producer_expression_definition = producer
+                .execution_graph()
+                .expressions
+                .get(producer_expression.as_usize())
+                .filter(|candidate| candidate.id == *producer_expression)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "external value read `{canonical_path}` target expression {producer_expression} is missing"
+                    ))
+                })?;
+            if producer_expression_definition.flow_type != expression.flow_type {
+                return Err(SemanticError::new(format!(
+                    "external value read `{canonical_path}` flow type differs from sealed producer value"
+                )));
+            }
+            let consumer_origin = consumer
+                .execution_graph()
+                .checked_expression_origins
+                .get(expression.id.as_usize())
+                .filter(|origin| {
+                    origin.expression == expression.id
+                        && origin.checked_expression == occurrence.checked_expression
+                })
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "external value read `{canonical_path}` has no exact semantic origin"
+                    ))
+                })?;
+            let consumer_scope = exact_semantic_scope(
+                consumer,
+                consumer_origin.checked_scope,
+                &format!("external value read `{canonical_path}`"),
+            )?;
+            let delivery = exact_bundle_value_delivery(producer, *producer_expression)?;
+            let producer_origin_scoped = producer.role() == boon_typecheck::ProgramRole::Server
+                && matches!(delivery, BundleSemanticValueDeliveryV1::Current)
+                && semantic_expression_depends_on_role(
+                    producer,
+                    *producer_expression,
+                    boon_typecheck::ProgramRole::Session,
+                )?;
+            let route_scope = bundle_value_route_scope(
+                consumer.role(),
+                external_identity.producer_role,
+                &delivery,
+                producer_origin_scoped,
+            )?;
+            validate_bundle_collection_count(
+                "value crossings",
+                value_crossings.len().saturating_add(1),
+                MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1,
+            )?;
+            value_crossings.push(BundleSemanticValueCrossingV1 {
+                occurrence_identity: occurrence.identity,
+                root: occurrence.root,
+                call_path: occurrence.call_path,
+                checked_expression: occurrence.checked_expression,
+                occurrence_path: occurrence.occurrence_path,
+                consumer_role: consumer.role(),
+                consumer_expression: expression.id,
+                consumer_value: expression.value_id,
+                consumer_scope,
+                producer_role: external_identity.producer_role,
+                producer_declaration: external_identity.producer_declaration,
+                producer_expression: *producer_expression,
+                producer_value: producer_expression_definition.value_id,
+                external_identity,
+                canonical_path,
+                flow_type: expression.flow_type.clone(),
+                delivery,
+                route_scope,
+            });
+        }
+    }
+    value_crossings.sort_by_key(|crossing| {
+        (
+            crossing.occurrence_identity,
+            crossing.consumer_role,
+            crossing.consumer_expression,
+            crossing.producer_role,
+            crossing.producer_declaration,
+            crossing.producer_expression,
+            crossing.canonical_path.clone(),
+        )
+    });
+    validate_bundle_closure_bounds(&actual_requests, &crossings, &value_crossings)?;
+    Ok((role_digests, actual_requests, crossings, value_crossings))
+}
+
+fn validate_bundle_closure_bounds(
+    producer_requests: &[BundleProducerMaterializationRequestV1],
+    call_crossings: &[BundleSemanticCallCrossingV1],
+    value_crossings: &[BundleSemanticValueCrossingV1],
+) -> Result<(), SemanticError> {
+    validate_bundle_collection(
+        "producer requests",
+        producer_requests,
+        MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1,
+        MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1,
+    )?;
+    validate_bundle_collection(
+        "call crossings",
+        call_crossings,
+        MAX_BUNDLE_SEMANTIC_CALL_CROSSINGS_V1,
+        MAX_BUNDLE_SEMANTIC_CALL_CROSSING_BYTES_V1,
+    )?;
+    validate_bundle_collection(
+        "value crossings",
+        value_crossings,
+        MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1,
+        MAX_BUNDLE_SEMANTIC_VALUE_CROSSING_BYTES_V1,
+    )
+}
+
+fn validate_bundle_collection<T: Serialize>(
+    kind: &str,
+    values: &[T],
+    max_count: usize,
+    max_encoded_bytes: usize,
+) -> Result<(), SemanticError> {
+    validate_bundle_collection_count(kind, values.len(), max_count)?;
+    let encoded = boon_contract::canonical_serde_cbor_v1(values).map_err(|error| {
+        SemanticError::new(format!(
+            "canonical bundle semantic {kind} encoding failed: {error}"
+        ))
+    })?;
+    validate_bundle_collection_encoded_size(kind, encoded.len(), max_encoded_bytes)
+}
+
+fn validate_bundle_collection_count(
+    kind: &str,
+    count: usize,
+    max_count: usize,
+) -> Result<(), SemanticError> {
+    if count > max_count {
+        return Err(SemanticError::new(format!(
+            "bundle semantic {kind} count {count} exceeds V1 limit {max_count}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_bundle_collection_encoded_size(
+    kind: &str,
+    encoded_bytes: usize,
+    max_encoded_bytes: usize,
+) -> Result<(), SemanticError> {
+    if encoded_bytes > max_encoded_bytes {
+        return Err(SemanticError::new(format!(
+            "bundle semantic {kind} canonical encoding is {encoded_bytes} bytes; V1 limit is {max_encoded_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn bundle_semantic_program_digest(
+    bundle: &BundleSemanticProgramV1,
+) -> Result<BundleSemanticProgramDigestV1, SemanticError> {
+    Ok(BundleSemanticProgramDigestV1(canonical_hash(
+        BUNDLE_SEMANTIC_PROGRAM_DIGEST_DOMAIN,
+        &(
+            &bundle.schema,
+            &bundle.role_digests,
+            &bundle.producer_requests,
+            &bundle.call_crossings,
+            &bundle.value_crossings,
+        ),
+    )?))
+}
+
+pub fn elaborate(
+    checked_program: CheckedProgram,
+    producer_materializations: &[ProducerMaterializationRequest],
+) -> Result<SemanticProgram, SemanticError> {
+    let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
+    let producer_materializations = canonical_producer_requests(producer_materializations)?;
+    validate_contextual_bindings(&checked_program)?;
+    let producer_roots = resolve_producer_roots(&checked_program, &producer_materializations)?;
+    let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with(
+        &checked_program,
+        producer_roots,
+        |call, _, entry| provisional_out_port_contract(&checked_program, call, entry),
+        |kind, _, _, _, _| kind == boon_typecheck::CheckedCallableKind::Builtin,
+    )?;
+    if out_net.has_errors() {
+        return Err(SemanticError::new(
+            out_net
+                .diagnostics
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let mut resolved_out_graph = out_net.graph;
+    resolve_out_contracts(&checked_program, &mut resolved_out_graph)?;
+    validate_out_contracts(&checked_program, &resolved_out_graph)?;
+    let (materializations, materialization_expressions) =
+        contextual_expansion::derive_contextual_materializations(
+            &checked_program,
+            &resolved_out_graph,
+        )
+        .map_err(|error| SemanticError::new(error.to_string()))?;
+    let mut execution_graph = contextual_expansion::derive_semantic_execution_graph(
+        &checked_program,
+        &resolved_out_graph,
+        &materializations,
+        materialization_expressions,
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    execution_graph
+        .validate_checked_roots(&checked_program)
+        .map_err(SemanticError::new)?;
+    execution_graph
+        .validate(&resolved_out_graph)
+        .map_err(SemanticError::new)?;
+    let resource_graph = resource::build_semantic_resource_graph(
+        &checked_program,
+        &resolved_out_graph,
+        &mut execution_graph,
+    )
+    .map_err(SemanticError::new)?;
+    execution_graph
+        .validate(&resolved_out_graph)
+        .map_err(SemanticError::new)?;
+    let reactive_graph =
+        build_semantic_reactive_graph(&execution_graph, &resource_graph, &resolved_out_graph)
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+    let lowering_contract = build_semantic_lowering_contract(
+        &checked_program,
+        &execution_graph,
+        &resource_graph,
+        &reactive_graph,
+        &resolved_out_graph,
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    let view_binding_graph = build_semantic_view_binding_graph(
+        &execution_graph,
+        &resource_graph,
+        &reactive_graph,
+        &lowering_contract,
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    let scope_storage_graph = build_semantic_scope_storage_graph(
+        &checked_program,
+        &execution_graph,
+        &resource_graph,
+        &reactive_graph,
+        &lowering_contract,
+        &resolved_out_graph,
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    let memory_graph = build_semantic_memory_graph(
+        &checked_program,
+        &execution_graph,
+        &resource_graph,
+        &reactive_graph,
+        &scope_storage_graph,
+        &lowering_contract,
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    let dependency_manifest = build_callable_dependency_manifest(
+        DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
+        &checked_program,
+        &producer_materializations,
+        &resolved_out_graph,
+        &execution_graph,
+        &resource_graph,
+        &reactive_graph,
+        &lowering_contract,
+        &view_binding_graph,
+        &scope_storage_graph,
+        &memory_graph,
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    let mut semantic = SemanticProgram {
+        source_bundle_digest_v1,
+        checked_program,
+        producer_materializations,
+        resolved_out_graph,
+        execution_graph,
+        resource_graph,
+        reactive_graph,
+        lowering_contract,
+        view_binding_graph,
+        scope_storage_graph,
+        memory_graph,
+        dependency_manifest,
+        digest: SemanticProgramDigestV1([0; 32]),
+    };
+    semantic.digest = semantic_program_digest(&semantic)?;
+    semantic.validate()?;
+    Ok(semantic)
+}
+
+fn provisional_out_port_contract(
+    program: &CheckedProgram,
+    call: &boon_typecheck::CheckedCall,
+    entry: &boon_typecheck::CheckedCallEntry,
+) -> Result<OutPortContractV1, SemanticError> {
+    let formal = match entry {
+        boon_typecheck::CheckedCallEntry::Input { formal, .. }
+        | boon_typecheck::CheckedCallEntry::FreshOut { formal, .. }
+        | boon_typecheck::CheckedCallEntry::ForwardOut { formal, .. } => *formal,
+    };
+    let callable = program
+        .callables
+        .iter()
+        .find(|callable| callable.decl_id == call.callable)
+        .ok_or_else(|| {
+            SemanticError::new(format!(
+                "checked call {} references missing callable {} while constructing its OUT contract",
+                call.id.0, call.callable.0
+            ))
+        })?;
+    let parameter = callable
+        .parameters
+        .iter()
+        .find(|parameter| parameter.decl_id == formal)
+        .ok_or_else(|| {
+            SemanticError::new(format!(
+                "checked call {} references missing formal {} while constructing its OUT contract",
+                call.id.0, formal.0
+            ))
+        })?;
+    let flow_type = boon_typecheck::FlowType {
+        mode: parameter.flow_type.mode,
+        ty: boon_typecheck::apply_checked_type_substitutions(
+            &parameter.flow_type.ty,
+            &call.type_substitutions,
+        ),
+    };
+    let lexical_scope = program
+        .expressions
+        .iter()
+        .find(|expression| expression.id == call.expression)
+        .map(|expression| expression.scope_id)
+        .ok_or_else(|| {
+            SemanticError::new(format!(
+                "checked call {} references missing expression {} while constructing its OUT contract",
+                call.id.0, call.expression.0
+            ))
+        })?;
+    let output_scope = match entry {
+        boon_typecheck::CheckedCallEntry::FreshOut { scope_id, .. } => *scope_id,
+        boon_typecheck::CheckedCallEntry::ForwardOut { target, .. } => {
+            let declaration = program
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == *target)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "checked call {} forwards OUT formal {} to missing declaration {}",
+                        call.id.0, formal.0, target.0
+                    ))
+                })?;
+            declaration.body_scope.ok_or_else(|| {
+                SemanticError::new(format!(
+                    "checked call {} forwards OUT formal {} to declaration {} without an output scope",
+                    call.id.0, formal.0, target.0
+                ))
+            })?
+        }
+        boon_typecheck::CheckedCallEntry::Input { .. } => lexical_scope,
+    };
+    Ok(OutPortContractV1 {
+        resolved_type: flow_type.ty.clone(),
+        shape_digest: [0; 32],
+        lexical_scope,
+        output_scope,
+        role: call.role,
+        generation_identity: None,
+        correlation_identity: None,
+        presence: OutPresenceCompatibilityV1::from_mode(flow_type.mode),
+        flow_type,
+    })
+}
+
+fn resolve_out_contracts(
+    program: &CheckedProgram,
+    graph: &mut ResolvedOutGraph,
+) -> Result<(), SemanticError> {
+    for port_index in 0..graph.ports.len() {
+        let (call_id, formal, net_id) = {
+            let port = &graph.ports[port_index];
+            (port.call, port.formal, port.net)
+        };
+        let instance = graph
+            .call_instances
+            .get(call_id.as_usize())
+            .filter(|instance| instance.id == call_id)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "OUT port {port_index} references missing call instance {call_id}"
+                ))
+            })?;
+        let callable = program
+            .callables
+            .iter()
+            .find(|callable| callable.decl_id == instance.provenance.callable)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "OUT port {port_index} references missing callable {}",
+                    instance.provenance.callable.0
+                ))
+            })?;
+        let parameter = callable
+            .parameters
+            .iter()
+            .find(|parameter| parameter.decl_id == formal)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "OUT port {port_index} references missing formal {}",
+                    formal.0
+                ))
+            })?;
+        let mut substitutions = instance
+            .type_substitutions
+            .iter()
+            .map(|substitution| (substitution.variable, substitution.value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for input in &instance.inputs {
+            let input_parameter = callable
+                .parameters
+                .iter()
+                .find(|parameter| parameter.decl_id == input.formal)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "OUT call instance {call_id} references missing input formal {}",
+                        input.formal.0
+                    ))
+                })?;
+            let actual = match &input.value {
+                out_net::OutInputValue::Checked(scoped) => {
+                    concrete_checked_expression_type(program, graph, *scoped, &mut BTreeSet::new())?
+                }
+                out_net::OutInputValue::ProducerParameter { flow_type, .. } => flow_type.ty.clone(),
+            };
+            unify_out_contract_type(&input_parameter.flow_type.ty, &actual, &mut substitutions)?;
+        }
+        let substitutions = substitutions
+            .into_iter()
+            .map(|(variable, value)| boon_typecheck::CheckedTypeSubstitution { variable, value })
+            .collect::<Vec<_>>();
+        let resolved_type = boon_typecheck::apply_checked_type_substitutions(
+            &parameter.flow_type.ty,
+            &substitutions,
+        );
+        if !out_contract_type_is_resolved(&resolved_type) {
+            return Err(SemanticError::new(format!(
+                "OUT port {port_index} has unresolved type {resolved_type:?}"
+            )));
+        }
+        let flow_type = boon_typecheck::FlowType {
+            mode: parameter.flow_type.mode,
+            ty: resolved_type.clone(),
+        };
+        let lexical_scope = program
+            .expressions
+            .iter()
+            .find(|expression| expression.id == instance.provenance.expression)
+            .map(|expression| expression.scope_id)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "OUT call instance {call_id} references missing provenance expression {}",
+                    instance.provenance.expression.0
+                ))
+            })?;
+        let output_scope = graph.owner_scope_for_net(net_id).ok_or_else(|| {
+            SemanticError::new(format!("OUT net {net_id} has no canonical output scope"))
+        })?;
+        let owner = graph.owner_for_net(net_id).ok_or_else(|| {
+            SemanticError::new(format!(
+                "OUT net {net_id} has no canonical generation owner"
+            ))
+        })?;
+        let role = match instance.provenance.call_id {
+            Some(checked_call) => program
+                .calls
+                .iter()
+                .find(|call| call.id == checked_call)
+                .map(|call| call.role)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "OUT call instance {call_id} references missing checked call {}",
+                        checked_call.0
+                    ))
+                })?,
+            None => callable.role,
+        };
+        graph.ports[port_index].contract = OutPortContractV1 {
+            flow_type: flow_type.clone(),
+            resolved_type: resolved_type.clone(),
+            shape_digest: canonical_hash(OUT_PORT_SHAPE_DIGEST_DOMAIN, &resolved_type)?,
+            lexical_scope,
+            output_scope,
+            role,
+            generation_identity: Some(OutGenerationIdentityV1 {
+                owner,
+                output_scope,
+            }),
+            correlation_identity: Some(OutCorrelationIdentityV1 { net: net_id, owner }),
+            presence: OutPresenceCompatibilityV1::from_mode(flow_type.mode),
+        };
+    }
+    Ok(())
+}
+
+fn concrete_checked_expression_type(
+    program: &CheckedProgram,
+    graph: &ResolvedOutGraph,
+    scoped: ScopedCheckedExpr,
+    visiting: &mut BTreeSet<(boon_typecheck::CheckedExprId, Option<OutCallInstanceId>)>,
+) -> Result<boon_typecheck::Type, SemanticError> {
+    let key = (scoped.expression, scoped.frame);
+    if !visiting.insert(key) {
+        return Err(SemanticError::new(format!(
+            "OUT type resolution contains a cycle at checked expression {} in frame {:?}",
+            scoped.expression.0, scoped.frame
+        )));
+    }
+    let resolved = (|| {
+        let expression = program
+            .expressions
+            .iter()
+            .find(|expression| expression.id == scoped.expression)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "OUT type resolution references missing checked expression {}",
+                    scoped.expression.0
+                ))
+            })?;
+        match &expression.kind {
+            boon_typecheck::CheckedExpressionKind::Passed { projection, .. } => {
+                let frame = scoped.frame.ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "PASSED expression {} has no concrete OUT call frame",
+                        scoped.expression.0
+                    ))
+                })?;
+                let instance = graph
+                    .call_instances
+                    .get(frame.as_usize())
+                    .filter(|instance| instance.id == frame)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "PASSED expression {} references missing OUT call frame {frame}",
+                            scoped.expression.0
+                        ))
+                    })?;
+                let passed = instance.passed.ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "PASSED expression {} has no exact contextual binding in OUT call frame {frame}",
+                        scoped.expression.0
+                    ))
+                })?;
+                let base =
+                    concrete_checked_expression_type(program, graph, passed.value, visiting)?;
+                project_out_contract_type(base, projection)
+            }
+            boon_typecheck::CheckedExpressionKind::Read {
+                target, projection, ..
+            } => {
+                let actual = scoped
+                    .frame
+                    .map(|frame| {
+                        graph
+                            .call_instances
+                            .get(frame.as_usize())
+                            .filter(|instance| instance.id == frame)
+                            .ok_or_else(|| {
+                                SemanticError::new(format!(
+                                    "READ expression {} references missing OUT call frame {frame}",
+                                    scoped.expression.0
+                                ))
+                            })
+                    })
+                    .transpose()?
+                    .and_then(|instance| {
+                        instance.inputs.iter().find(|input| input.formal == *target)
+                    })
+                    .map(|input| match &input.value {
+                        out_net::OutInputValue::Checked(actual) => {
+                            concrete_checked_expression_type(program, graph, *actual, visiting)
+                        }
+                        out_net::OutInputValue::ProducerParameter { flow_type, .. } => {
+                            Ok(flow_type.ty.clone())
+                        }
+                    })
+                    .transpose()?;
+                let base = match actual {
+                    Some(actual) => actual,
+                    None => program
+                        .declarations
+                        .iter()
+                        .find(|declaration| declaration.id == *target)
+                        .map(|declaration| declaration.flow_type.ty.clone())
+                        .ok_or_else(|| {
+                            SemanticError::new(format!(
+                                "READ expression {} references missing declaration {}",
+                                scoped.expression.0, target.0
+                            ))
+                        })?,
+                };
+                project_out_contract_type(base, projection)
+            }
+            _ => {
+                let substitutions = scoped
+                    .frame
+                    .map(|frame| {
+                        graph
+                            .call_instances
+                            .get(frame.as_usize())
+                            .filter(|instance| instance.id == frame)
+                            .map(|instance| instance.type_substitutions.as_slice())
+                            .ok_or_else(|| {
+                                SemanticError::new(format!(
+                                    "expression {} references missing OUT call frame {frame}",
+                                    scoped.expression.0
+                                ))
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(boon_typecheck::apply_checked_type_substitutions(
+                    &expression.flow_type.ty,
+                    substitutions,
+                ))
+            }
+        }
+    })();
+    visiting.remove(&key);
+    resolved
+}
+
+fn project_out_contract_type(
+    mut ty: boon_typecheck::Type,
+    fields: &[String],
+) -> Result<boon_typecheck::Type, SemanticError> {
+    for field in fields {
+        let boon_typecheck::Type::Object(shape) = ty else {
+            return Err(SemanticError::new(format!(
+                "OUT type projection `{field}` requires an object, got {ty:?}"
+            )));
+        };
+        ty = shape.fields.get(field).cloned().ok_or_else(|| {
+            SemanticError::new(format!(
+                "OUT type projection references missing object field `{field}`"
+            ))
+        })?;
+    }
+    Ok(ty)
+}
+
+fn unify_out_contract_type(
+    pattern: &boon_typecheck::Type,
+    actual: &boon_typecheck::Type,
+    substitutions: &mut BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
+) -> Result<(), SemanticError> {
+    if !out_contract_type_is_resolved(actual) {
+        return Err(SemanticError::new(format!(
+            "OUT input has unresolved concrete type {actual:?}"
+        )));
+    }
+    match (pattern, actual) {
+        (boon_typecheck::Type::Var(variable), actual) => match substitutions.get(variable) {
+            Some(existing) if out_contract_type_is_resolved(existing) && existing != actual => {
+                return Err(SemanticError::new(format!(
+                    "OUT type variable {:?} has conflicting concrete types {existing:?} and {actual:?}",
+                    variable
+                )));
+            }
+            _ => {
+                substitutions.insert(*variable, actual.clone());
+            }
+        },
+        (boon_typecheck::Type::List(pattern), boon_typecheck::Type::List(actual)) => {
+            unify_out_contract_type(pattern, actual, substitutions)?;
+        }
+        (boon_typecheck::Type::Object(pattern), boon_typecheck::Type::Object(actual)) => {
+            for (name, pattern) in &pattern.fields {
+                let Some(actual_field) = actual.fields.get(name) else {
+                    if actual.open {
+                        continue;
+                    }
+                    return Err(SemanticError::new(format!(
+                        "OUT input object is missing required field `{name}`"
+                    )));
+                };
+                unify_out_contract_type(pattern, actual_field, substitutions)?;
+            }
+        }
+        (
+            boon_typecheck::Type::VariantSet(pattern_variants),
+            boon_typecheck::Type::VariantSet(actual_variants),
+        ) => {
+            for actual_variant in actual_variants {
+                let matching = pattern_variants.iter().find(|pattern_variant| {
+                    matches!(
+                        (pattern_variant, actual_variant),
+                        (
+                            boon_typecheck::Variant::Tag(pattern),
+                            boon_typecheck::Variant::Tag(actual)
+                        ) if pattern == actual
+                    ) || matches!(
+                        (pattern_variant, actual_variant),
+                        (
+                            boon_typecheck::Variant::Tagged {
+                                tag: pattern,
+                                ..
+                            },
+                            boon_typecheck::Variant::Tagged { tag: actual, .. }
+                        ) if pattern == actual
+                    )
+                });
+                let Some(matching) = matching else {
+                    return Err(SemanticError::new(format!(
+                        "OUT input variant {actual_variant:?} is not admitted by expected type {pattern:?}"
+                    )));
+                };
+                let (
+                    boon_typecheck::Variant::Tagged {
+                        fields: pattern_fields,
+                        ..
+                    },
+                    boon_typecheck::Variant::Tagged {
+                        fields: actual_fields,
+                        ..
+                    },
+                ) = (matching, actual_variant)
+                else {
+                    continue;
+                };
+                for (name, pattern) in &pattern_fields.fields {
+                    let Some(actual) = actual_fields.fields.get(name) else {
+                        if actual_fields.open {
+                            continue;
+                        }
+                        return Err(SemanticError::new(format!(
+                            "OUT input tagged variant is missing required field `{name}`"
+                        )));
+                    };
+                    unify_out_contract_type(pattern, actual, substitutions)?;
+                }
+            }
+        }
+        (
+            boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic),
+            boon_typecheck::Type::Bytes(_),
+        ) => {}
+        (
+            boon_typecheck::Type::Function {
+                args: pattern_args,
+                result: pattern_result,
+            },
+            boon_typecheck::Type::Function {
+                args: actual_args,
+                result: actual_result,
+            },
+        ) => {
+            if pattern_args.len() != actual_args.len() {
+                return Err(SemanticError::new(format!(
+                    "OUT input function has {} arguments; expected {}",
+                    actual_args.len(),
+                    pattern_args.len()
+                )));
+            }
+            if pattern_result.mode != actual_result.mode {
+                return Err(SemanticError::new(format!(
+                    "OUT input function result mode {:?} differs from expected {:?}",
+                    actual_result.mode, pattern_result.mode
+                )));
+            }
+            for (pattern, actual) in pattern_args.iter().zip(actual_args) {
+                unify_out_contract_type(pattern, actual, substitutions)?;
+            }
+            unify_out_contract_type(&pattern_result.ty, &actual_result.ty, substitutions)?;
+        }
+        (pattern, actual) if pattern == actual => {}
+        (pattern, actual) => {
+            return Err(SemanticError::new(format!(
+                "OUT input type {actual:?} is incompatible with expected type {pattern:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_contextual_bindings(program: &CheckedProgram) -> Result<(), SemanticError> {
+    let callables = program
+        .callables
+        .iter()
+        .map(|callable| (callable.decl_id, callable))
+        .collect::<BTreeMap<_, _>>();
+    if callables.len() != program.callables.len() {
+        return Err(SemanticError::new(
+            "checked callable table contains duplicate declaration IDs",
+        ));
+    }
+
+    let mut formals_by_id = BTreeMap::new();
+    let mut formals_by_callable = BTreeMap::new();
+    for formal in &program.context_formals {
+        if formals_by_id.insert(formal.id, formal).is_some() {
+            return Err(SemanticError::new(format!(
+                "checked contextual formal table contains duplicate formal {}",
+                formal.id.0
+            )));
+        }
+        if formals_by_callable
+            .insert(formal.callable, formal)
+            .is_some()
+        {
+            return Err(SemanticError::new(format!(
+                "checked callable {} owns more than one contextual formal",
+                formal.callable.0
+            )));
+        }
+        let callable = callables.get(&formal.callable).ok_or_else(|| {
+            SemanticError::new(format!(
+                "contextual formal {} references missing callable {}",
+                formal.id.0, formal.callable.0
+            ))
+        })?;
+        if callable.kind != boon_typecheck::CheckedCallableKind::User {
+            return Err(SemanticError::new(format!(
+                "non-user callable {} owns contextual formal {}",
+                formal.callable.0, formal.id.0
+            )));
+        }
+        if callable.context_formal != Some(formal.id) {
+            return Err(SemanticError::new(format!(
+                "contextual formal {} is not the declared formal of callable {}",
+                formal.id.0, formal.callable.0
+            )));
+        }
+    }
+    for callable in &program.callables {
+        match callable.context_formal {
+            Some(formal) => {
+                let definition = formals_by_id.get(&formal).ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "callable {} references missing contextual formal {}",
+                        callable.decl_id.0, formal.0
+                    ))
+                })?;
+                if definition.callable != callable.decl_id {
+                    return Err(SemanticError::new(format!(
+                        "callable {} references contextual formal {} owned by callable {}",
+                        callable.decl_id.0, formal.0, definition.callable.0
+                    )));
+                }
+            }
+            None if formals_by_callable.contains_key(&callable.decl_id) => {
+                return Err(SemanticError::new(format!(
+                    "callable {} owns a contextual formal but does not declare it",
+                    callable.decl_id.0
+                )));
+            }
+            None => {}
+        }
+    }
+
+    let expressions = program
+        .expressions
+        .iter()
+        .map(|expression| expression.id)
+        .collect::<BTreeSet<_>>();
+    for call in &program.calls {
+        let callable = callables.get(&call.callable).ok_or_else(|| {
+            SemanticError::new(format!(
+                "checked call {} references missing callable {}",
+                call.id.0, call.callable.0
+            ))
+        })?;
+        let target_formal = callable.context_formal;
+        match call.context_binding {
+            boon_typecheck::CheckedContextBinding::Explicit { value, .. } => {
+                if target_formal.is_none() {
+                    return Err(SemanticError::new(format!(
+                        "checked call {} has explicit PASS context for noncontextual callable {}",
+                        call.id.0, call.callable.0
+                    )));
+                }
+                if !expressions.contains(&value) {
+                    return Err(SemanticError::new(format!(
+                        "checked call {} explicit PASS context references missing expression {}",
+                        call.id.0, value.0
+                    )));
+                }
+            }
+            boon_typecheck::CheckedContextBinding::Inherited { formal } => {
+                if target_formal.is_none() {
+                    return Err(SemanticError::new(format!(
+                        "checked call {} inherits PASS context for noncontextual callable {}",
+                        call.id.0, call.callable.0
+                    )));
+                }
+                let owner = call.owner_callable.ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "root checked call {} cannot inherit contextual formal {}",
+                        call.id.0, formal.0
+                    ))
+                })?;
+                let owner_callable = callables.get(&owner).ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "checked call {} inherits from missing owner callable {}",
+                        call.id.0, owner.0
+                    ))
+                })?;
+                if owner_callable.context_formal != Some(formal)
+                    || formals_by_id
+                        .get(&formal)
+                        .is_none_or(|definition| definition.callable != owner)
+                {
+                    return Err(SemanticError::new(format!(
+                        "checked call {} inherits contextual formal {} outside owner callable {}",
+                        call.id.0, formal.0, owner.0
+                    )));
+                }
+            }
+            boon_typecheck::CheckedContextBinding::None => {
+                if let Some(formal) = target_formal {
+                    return Err(SemanticError::new(format!(
+                        "checked call {} to contextual callable {} has no explicit or inherited binding for formal {}",
+                        call.id.0, call.callable.0, formal.0
+                    )));
+                }
+            }
+        }
+
+        let mut substitutions = BTreeSet::new();
+        for substitution in &call.contextual_substitutions {
+            let Some(formal) = target_formal else {
+                return Err(SemanticError::new(format!(
+                    "checked call {} has contextual substitutions for noncontextual callable {}",
+                    call.id.0, call.callable.0
+                )));
+            };
+            if substitution.formal != formal
+                || formals_by_id
+                    .get(&substitution.formal)
+                    .is_none_or(|definition| definition.callable != call.callable)
+            {
+                return Err(SemanticError::new(format!(
+                    "checked call {} contextual substitution formal {} is not owned by callable {}",
+                    call.id.0, substitution.formal.0, call.callable.0
+                )));
+            }
+            if !substitutions.insert((substitution.formal, substitution.variable)) {
+                return Err(SemanticError::new(format!(
+                    "checked call {} repeats contextual substitution formal {} variable {:?}",
+                    call.id.0, substitution.formal.0, substitution.variable
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_out_contracts(
+    program: &CheckedProgram,
+    graph: &ResolvedOutGraph,
+) -> Result<(), SemanticError> {
+    for net in &graph.nets {
+        let owner = graph.owner_for_net(net.id).ok_or_else(|| {
+            SemanticError::new(format!("OUT net {} has no generation owner", net.id))
+        })?;
+        let output_scope = graph
+            .owner_scope_for_net(net.id)
+            .ok_or_else(|| SemanticError::new(format!("OUT net {} has no output scope", net.id)))?;
+        let expected_generation = Some(OutGenerationIdentityV1 {
+            owner,
+            output_scope,
+        });
+        let expected_correlation = Some(OutCorrelationIdentityV1 { net: net.id, owner });
+        let Some(first_port_id) = net.ports.first().copied() else {
+            return Err(SemanticError::new(format!(
+                "OUT net {} has no ports",
+                net.id
+            )));
+        };
+        let baseline = &graph.ports[first_port_id.as_usize()].contract;
+        for port_id in &net.ports {
+            let port = graph
+                .ports
+                .get(port_id.as_usize())
+                .filter(|port| port.id == *port_id && port.net == net.id)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "OUT net {} references noncanonical port {}",
+                        net.id, port_id
+                    ))
+                })?;
+            let contract = &port.contract;
+            if contract.flow_type.ty != contract.resolved_type
+                || contract.resolved_type != baseline.resolved_type
+            {
+                return Err(out_contract_mismatch(net.id, *port_id, "type"));
+            }
+            let expected_shape =
+                canonical_hash(OUT_PORT_SHAPE_DIGEST_DOMAIN, &contract.resolved_type)?;
+            if contract.shape_digest != expected_shape
+                || contract.shape_digest != baseline.shape_digest
+            {
+                return Err(out_contract_mismatch(net.id, *port_id, "shape"));
+            }
+            if contract.output_scope != output_scope
+                || contract.output_scope != baseline.output_scope
+                || !program
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.id == contract.lexical_scope)
+                || !program.scopes.iter().any(|scope| {
+                    scope.id == contract.output_scope
+                        && scope.kind == boon_typecheck::CheckedScopeKind::RepeatedOutput
+                })
+            {
+                return Err(out_contract_mismatch(net.id, *port_id, "scope"));
+            }
+            if contract.role != baseline.role {
+                return Err(out_contract_mismatch(net.id, *port_id, "role"));
+            }
+            if contract.generation_identity != expected_generation
+                || contract.generation_identity != baseline.generation_identity
+            {
+                return Err(out_contract_mismatch(net.id, *port_id, "generation"));
+            }
+            if contract.correlation_identity != expected_correlation
+                || contract.correlation_identity != baseline.correlation_identity
+            {
+                return Err(out_contract_mismatch(net.id, *port_id, "correlation"));
+            }
+            let expected_presence = OutPresenceCompatibilityV1::from_mode(contract.flow_type.mode);
+            if contract.presence != expected_presence || contract.presence != baseline.presence {
+                return Err(out_contract_mismatch(net.id, *port_id, "presence"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn out_contract_mismatch(
+    net: OutNetId,
+    port: out_net::OutPortId,
+    dimension: &str,
+) -> SemanticError {
+    SemanticError::new(format!(
+        "OUT net {net} port {port} has incompatible {dimension} contract"
+    ))
+}
+
+fn out_contract_type_is_resolved(ty: &boon_typecheck::Type) -> bool {
+    match ty {
+        boon_typecheck::Type::Var(_)
+        | boon_typecheck::Type::Unknown
+        | boon_typecheck::Type::UnresolvedShape { .. } => false,
+        boon_typecheck::Type::List(item) => out_contract_type_is_resolved(item),
+        boon_typecheck::Type::Function { args, result } => {
+            args.iter().all(out_contract_type_is_resolved)
+                && out_contract_type_is_resolved(&result.ty)
+        }
+        boon_typecheck::Type::Object(shape) => {
+            shape.fields.values().all(out_contract_type_is_resolved)
+        }
+        boon_typecheck::Type::VariantSet(variants) => {
+            variants.iter().all(|variant| match variant {
+                boon_typecheck::Variant::Tag(_) => true,
+                boon_typecheck::Variant::Tagged { fields, .. } => {
+                    fields.fields.values().all(out_contract_type_is_resolved)
+                }
+            })
+        }
+        boon_typecheck::Type::Text
+        | boon_typecheck::Type::Number
+        | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Skip
+        | boon_typecheck::Type::RenderContract => true,
+    }
+}
+
+fn canonical_producer_requests(
+    requests: &[ProducerMaterializationRequest],
+) -> Result<Vec<ProducerMaterializationRequest>, SemanticError> {
+    let mut requests = requests.to_vec();
+    requests.sort();
+    requests.dedup();
+    for request in &requests {
+        if request.identity.iter().all(|byte| *byte == 0) {
+            return Err(SemanticError::new(
+                "producer materialization identity must be nonzero",
+            ));
+        }
+        if request.local_function.is_empty() {
+            return Err(SemanticError::new(
+                "producer materialization function must be nonempty",
+            ));
+        }
+    }
+    for pair in requests.windows(2) {
+        if pair[0].identity == pair[1].identity {
+            return Err(SemanticError::new(format!(
+                "producer materialization identity {} names both `{}` and `{}`",
+                digest_hex(&pair[0].identity),
+                pair[0].local_function,
+                pair[1].local_function
+            )));
+        }
+    }
+    Ok(requests)
+}
+
+fn resolve_producer_roots(
+    program: &CheckedProgram,
+    requests: &[ProducerMaterializationRequest],
+) -> Result<Vec<out_net::ProducerRootSpec>, SemanticError> {
+    let first_statement = program
+        .statements
+        .iter()
+        .map(|statement| statement.id.0 as usize)
+        .max()
+        .map_or(0, |id| id.saturating_add(1));
+    requests
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(ordinal, request)| {
+            let callable = exact_producer_callable(program, &request)?;
+            if callable.result.mode != boon_typecheck::FlowMode::Continuous {
+                return Err(SemanticError::new(format!(
+                    "producer function `{}` result must be continuous, found {:?}",
+                    request.local_function, callable.result.mode
+                )));
+            }
+            let out_parameters = callable
+                .parameters
+                .iter()
+                .filter(|parameter| parameter.kind != boon_typecheck::CheckedParameterKind::Value)
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>();
+            if !out_parameters.is_empty() {
+                return Err(SemanticError::new(format!(
+                    "producer function `{}` has unsupported OUT parameter(s): {}",
+                    request.local_function,
+                    out_parameters.join(", ")
+                )));
+            }
+            if callable.requires_pass() {
+                return Err(SemanticError::new(format!(
+                    "producer function `{}` has an unsupported PASS-in-signature requirement",
+                    request.local_function
+                )));
+            }
+            if callable.result_expression.is_none() {
+                return Err(SemanticError::new(format!(
+                    "producer function `{}` has no checked result expression",
+                    request.local_function
+                )));
+            }
+            if callable
+                .parameters
+                .iter()
+                .any(|parameter| runtime_type_contains_var(&parameter.flow_type.ty))
+                || runtime_type_contains_var(&callable.result.ty)
+            {
+                return Err(SemanticError::new(format!(
+                    "producer function `{}` has no concrete distributed boundary specialization",
+                    request.local_function
+                )));
+            }
+            let function = ProducerFunctionId(ordinal);
+            let mut parameters = callable.parameters.clone();
+            parameters.sort_by_key(|parameter| parameter.ordinal);
+            let parameters = parameters
+                .into_iter()
+                .map(|parameter| out_net::ProducerRootParameter {
+                    formal: parameter.decl_id,
+                    parameter: ProducerParameterId {
+                        function,
+                        ordinal: parameter.ordinal,
+                    },
+                    name: parameter.name,
+                    flow_type: parameter.flow_type,
+                })
+                .collect();
+            let invocation = request.mode == ProducerMaterializationMode::Invocation;
+            Ok(out_net::ProducerRootSpec {
+                identity: request.identity,
+                mode: request.mode,
+                callable: callable.decl_id,
+                function,
+                function_name: callable.name.clone(),
+                result_statement: ProducerResultStatementId(
+                    first_statement.saturating_add(ordinal),
+                ),
+                result_declaration: callable.decl_id,
+                result_path: format!("@producer/{}/result", digest_hex(&request.identity)),
+                result_type: if invocation {
+                    boon_typecheck::FlowType {
+                        mode: boon_typecheck::FlowMode::PresentOrAbsent,
+                        ty: callable.result.ty.clone(),
+                    }
+                } else {
+                    callable.result.clone()
+                },
+                parameters,
+            })
+        })
+        .collect()
+}
+
+fn exact_producer_callable<'a>(
+    program: &'a CheckedProgram,
+    request: &ProducerMaterializationRequest,
+) -> Result<&'a boon_typecheck::CheckedCallableSignature, SemanticError> {
+    let Some(callable) = program.callables.get(request.callable.as_usize()) else {
+        return Err(SemanticError::new(format!(
+            "producer request references missing semantic callable {}",
+            request.callable
+        )));
+    };
+    if callable.kind != boon_typecheck::CheckedCallableKind::User
+        || callable.name != request.local_function
+    {
+        return Err(SemanticError::new(format!(
+            "producer request callable {} does not exactly identify user function `{}`",
+            request.callable, request.local_function
+        )));
+    }
+    Ok(callable)
+}
+
+pub(crate) fn temporally_gated_checked_expressions(
+    program: &CheckedProgram,
+) -> BTreeSet<boon_typecheck::CheckedExprId> {
+    let expressions = program
+        .expressions
+        .iter()
+        .map(|expression| (expression.id, expression))
+        .collect::<BTreeMap<_, _>>();
+    let calls = program
+        .calls
+        .iter()
+        .map(|call| (call.id, call))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = Vec::new();
+    for expression in &program.expressions {
+        match &expression.kind {
+            boon_typecheck::CheckedExpressionKind::Then {
+                output: Some(output),
+                ..
+            } => pending.push(*output),
+            boon_typecheck::CheckedExpressionKind::When { input, arms }
+            | boon_typecheck::CheckedExpressionKind::While { input, arms }
+                if expressions.get(input).is_some_and(|input| {
+                    input.flow_type.mode != boon_typecheck::FlowMode::Continuous
+                }) =>
+            {
+                pending.extend(arms.iter().copied());
+            }
+            _ => {}
+        }
+    }
+    let mut gated = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        if !gated.insert(expression) {
+            continue;
+        }
+        let Some(expression) = expressions.get(&expression) else {
+            continue;
+        };
+        pending.extend(checked_expression_children_for_call_analysis(
+            &expression.kind,
+            &calls,
+        ));
+    }
+    gated
+}
+
+fn checked_expression_children_for_call_analysis(
+    kind: &boon_typecheck::CheckedExpressionKind,
+    calls: &BTreeMap<boon_typecheck::CheckedCallId, &boon_typecheck::CheckedCall>,
+) -> Vec<boon_typecheck::CheckedExprId> {
+    use boon_typecheck::CheckedExpressionKind as Kind;
+    match kind {
+        Kind::TextTemplate { segments } => segments
+            .iter()
+            .filter_map(|segment| match segment {
+                boon_typecheck::CheckedTextSegment::Dynamic { value } => Some(*value),
+                boon_typecheck::CheckedTextSegment::Static { .. } => None,
+            })
+            .collect(),
+        Kind::TaggedObject { fields, .. } | Kind::Object { fields } | Kind::Record { fields } => {
+            fields.iter().map(|field| field.value).collect()
+        }
+        Kind::Call { call } => calls
+            .get(call)
+            .into_iter()
+            .flat_map(|call| {
+                call.entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        boon_typecheck::CheckedCallEntry::Input { value, .. } => Some(*value),
+                        _ => None,
+                    })
+                    .chain(call.context_binding.explicit().map(|(value, _)| value))
+            })
+            .collect(),
+        Kind::Draining { input } => vec![*input],
+        Kind::Hold { initial, .. } => vec![*initial],
+        Kind::Latest { branches } => branches.clone(),
+        Kind::When { input, arms } | Kind::While { input, arms } => {
+            let mut children = vec![*input];
+            children.extend(arms.iter().copied());
+            children
+        }
+        Kind::Then { input, output } => {
+            let mut children = vec![*input];
+            children.extend(*output);
+            children
+        }
+        Kind::Infix { left, right, .. } => vec![*left, *right],
+        Kind::MatchArm { output, .. } => output.iter().copied().collect(),
+        Kind::Block { bindings, result } => bindings
+            .iter()
+            .map(|binding| binding.value)
+            .chain(result.iter().copied())
+            .collect(),
+        Kind::List { items, .. } | Kind::Bytes { items, .. } => items.clone(),
+        Kind::Read { .. }
+        | Kind::Passed { .. }
+        | Kind::ExternalRead { .. }
+        | Kind::Drain { .. }
+        | Kind::Text { .. }
+        | Kind::Number { .. }
+        | Kind::BytesByte { .. }
+        | Kind::Bool { .. }
+        | Kind::Tag { .. }
+        | Kind::Source
+        | Kind::Delimiter
+        | Kind::Invalid { .. } => Vec::new(),
+    }
+}
+
+fn distributed_function_role(function: &str) -> Option<boon_typecheck::ProgramRole> {
+    match function.split_once('/')?.0 {
+        "Client" => Some(boon_typecheck::ProgramRole::Client),
+        "Session" => Some(boon_typecheck::ProgramRole::Session),
+        "Server" => Some(boon_typecheck::ProgramRole::Server),
+        _ => None,
+    }
+}
+
+fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
+    match ty {
+        boon_typecheck::Type::Var(_) => true,
+        boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
+        boon_typecheck::Type::Function { args, result } => {
+            args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
+        }
+        boon_typecheck::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
+        boon_typecheck::Type::VariantSet(variants) => {
+            variants.iter().any(|variant| match variant {
+                boon_typecheck::Variant::Tag(_) => false,
+                boon_typecheck::Variant::Tagged { fields, .. } => {
+                    fields.fields.values().any(runtime_type_contains_var)
+                }
+            })
+        }
+        boon_typecheck::Type::Text
+        | boon_typecheck::Type::Number
+        | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Skip
+        | boon_typecheck::Type::RenderContract
+        | boon_typecheck::Type::UnresolvedShape { .. }
+        | boon_typecheck::Type::Unknown => false,
+    }
+}
+
+fn semantic_program_digest(
+    program: &SemanticProgram,
+) -> Result<SemanticProgramDigestV1, SemanticError> {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        schema: &'static str,
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        checked: &'a CheckedProgram,
+        producer_materializations: &'a [ProducerMaterializationRequest],
+        resolved_out_graph: &'a ResolvedOutGraph,
+        execution_graph: &'a SemanticExecutionGraphV1,
+        resource_graph: &'a SemanticResourceGraphV1,
+        reactive_graph: &'a SemanticReactiveGraphV1,
+        lowering_contract: &'a SemanticLoweringContractV1,
+        view_binding_graph: &'a SemanticViewBindingGraphV1,
+        scope_storage_graph: &'a SemanticScopeStorageGraphV1,
+        memory_graph: &'a SemanticMemoryGraphV1,
+        dependency_manifest_digest: CallableDependencyManifestDigestV1,
+    }
+    Ok(SemanticProgramDigestV1(canonical_hash(
+        SEMANTIC_PROGRAM_DIGEST_DOMAIN,
+        &Payload {
+            schema: SEMANTIC_PROGRAM_SCHEMA_V1,
+            source_bundle_digest_v1: program.source_bundle_digest_v1,
+            checked: &program.checked_program,
+            producer_materializations: &program.producer_materializations,
+            resolved_out_graph: &program.resolved_out_graph,
+            execution_graph: &program.execution_graph,
+            resource_graph: &program.resource_graph,
+            reactive_graph: &program.reactive_graph,
+            lowering_contract: &program.lowering_contract,
+            view_binding_graph: &program.view_binding_graph,
+            scope_storage_graph: &program.scope_storage_graph,
+            memory_graph: &program.memory_graph,
+            dependency_manifest_digest: program.dependency_manifest.manifest_digest,
+        },
+    )?))
+}
+
+fn canonical_hash<T: Serialize + ?Sized>(
+    domain: &[u8],
+    value: &T,
+) -> Result<[u8; 32], SemanticError> {
+    boon_contract::canonical_serde_hash_v1(domain, value)
+        .map_err(|error| SemanticError::new(format!("canonical semantic encoding failed: {error}")))
+}
+
+fn digest_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticError {
+    message: String,
+}
+
+impl SemanticError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for SemanticError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for SemanticError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boon_typecheck::{
+        CheckedEffectSummary, CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind,
+        CheckedProgram, ExternalFunctionArgument, ExternalFunctionType, ExternalTypeEnvironment,
+        FlowMode, FlowType, ProgramRole, Type,
+    };
+
+    fn continuous(ty: Type) -> FlowType {
+        FlowType {
+            mode: FlowMode::Continuous,
+            ty,
+        }
+    }
+
+    fn checked_role(
+        label: &str,
+        source: &str,
+        environment: &ExternalTypeEnvironment,
+    ) -> CheckedProgram {
+        let parsed = boon_parser::parse_source(label, source).expect("bundle fixture parses");
+        let (output, _) = boon_typecheck::check_runtime_program_profiled_with_external_types(
+            &parsed,
+            environment,
+        );
+        assert!(
+            !output.report.has_errors(),
+            "bundle fixture diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        output.program.expect("bundle fixture checks")
+    }
+
+    fn frozen_call_bundle() -> BundleSemanticProgramV1 {
+        let session_checked = checked_role(
+            "session-bundle.bn",
+            r#"
+store: [
+    count: 1
+]
+
+FUNCTION add(value) {
+    value + 1
+}
+"#,
+            &ExternalTypeEnvironment::empty(ProgramRole::Session),
+        );
+        let session_add = session_checked
+            .callables
+            .iter()
+            .find(|callable| callable.name == "add")
+            .expect("session add callable");
+        let session_count = session_checked
+            .declarations
+            .iter()
+            .find(|declaration| {
+                session_checked.declaration_path(declaration.id).as_deref() == Some("store.count")
+            })
+            .expect("session count declaration");
+        let mut client_environment = ExternalTypeEnvironment::sealed(ProgramRole::Client);
+        client_environment
+            .values
+            .insert("Session/store.count".to_owned(), continuous(Type::Number));
+        client_environment.functions.insert(
+            "Session/add".to_owned(),
+            ExternalFunctionType {
+                args: vec![ExternalFunctionArgument {
+                    name: "value".to_owned(),
+                    flow_type: continuous(Type::Number),
+                }],
+                result: continuous(Type::Number),
+                effect: CheckedEffectSummary::default(),
+            },
+        );
+        client_environment.external_identities.insert(
+            "Session/store.count".to_owned(),
+            CheckedExternalDeclarationIdentityV1 {
+                producer_role: ProgramRole::Session,
+                producer_source_bundle_digest_v1: session_checked.source_bundle_digest_v1,
+                producer_declaration: session_count.id,
+                kind: CheckedExternalDeclarationKind::Value,
+            },
+        );
+        client_environment.external_identities.insert(
+            "Session/add".to_owned(),
+            CheckedExternalDeclarationIdentityV1 {
+                producer_role: ProgramRole::Session,
+                producer_source_bundle_digest_v1: session_checked.source_bundle_digest_v1,
+                producer_declaration: session_add.decl_id,
+                kind: CheckedExternalDeclarationKind::Callable,
+            },
+        );
+        let client_checked = checked_role(
+            "client-bundle.bn",
+            "count: Session/store.count\nresult: Session/add(value: count)\n",
+            &client_environment,
+        );
+        let server_checked = checked_role(
+            "server-bundle.bn",
+            "",
+            &ExternalTypeEnvironment::empty(ProgramRole::Server),
+        );
+
+        let client = elaborate(client_checked, &[]).expect("client semantic program");
+        let session_without_request =
+            elaborate(session_checked.clone(), &[]).expect("session semantic program");
+        let occurrences =
+            distributed_call_occurrences(&client).expect("client distributed occurrence");
+        let [occurrence] = occurrences.as_slice() else {
+            panic!("expected exactly one distributed call occurrence");
+        };
+        let request = ProducerMaterializationRequest {
+            identity: occurrence.producer_materialization_identity,
+            callable: session_without_request
+                .producer_callable("add")
+                .expect("session producer callable"),
+            local_function: "add".to_owned(),
+            mode: occurrence.mode,
+        };
+        let session = elaborate(session_checked, &[request]).expect("requested session semantic");
+        let server = elaborate(server_checked, &[]).expect("server semantic program");
+        BundleSemanticProgramV1::freeze([server, client, session]).expect("bundle freezes")
+    }
+
+    fn frozen_invocation_bundle() -> BundleSemanticProgramV1 {
+        let server_checked = checked_role(
+            "server-invocation-bundle.bn",
+            r#"
+FUNCTION add(value) {
+    value + 1
+}
+"#,
+            &ExternalTypeEnvironment::empty(ProgramRole::Server),
+        );
+        let server_add = server_checked
+            .callables
+            .iter()
+            .find(|callable| callable.name == "add")
+            .expect("server add callable");
+        let mut session_environment = ExternalTypeEnvironment::sealed(ProgramRole::Session);
+        session_environment.functions.insert(
+            "Server/add".to_owned(),
+            ExternalFunctionType {
+                args: vec![ExternalFunctionArgument {
+                    name: "value".to_owned(),
+                    flow_type: continuous(Type::Number),
+                }],
+                result: continuous(Type::Number),
+                effect: CheckedEffectSummary::default(),
+            },
+        );
+        session_environment.external_identities.insert(
+            "Server/add".to_owned(),
+            CheckedExternalDeclarationIdentityV1 {
+                producer_role: ProgramRole::Server,
+                producer_source_bundle_digest_v1: server_checked.source_bundle_digest_v1,
+                producer_declaration: server_add.decl_id,
+                kind: CheckedExternalDeclarationKind::Callable,
+            },
+        );
+        let session_checked = checked_role(
+            "session-invocation-bundle.bn",
+            r#"
+store: [
+    invoke: SOURCE
+    result:
+        invoke |> THEN { Server/add(value: 7) }
+]
+"#,
+            &session_environment,
+        );
+        let client_checked = checked_role(
+            "client-invocation-bundle.bn",
+            "",
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        );
+
+        let session = elaborate(session_checked, &[]).expect("session semantic program");
+        let server_without_request =
+            elaborate(server_checked.clone(), &[]).expect("server semantic program");
+        let occurrences =
+            distributed_call_occurrences(&session).expect("session distributed occurrence");
+        let [occurrence] = occurrences.as_slice() else {
+            panic!("expected exactly one invocation occurrence");
+        };
+        assert_eq!(occurrence.mode, ProducerMaterializationMode::Invocation);
+        let request = ProducerMaterializationRequest {
+            identity: occurrence.producer_materialization_identity,
+            callable: server_without_request
+                .producer_callable("add")
+                .expect("server producer callable"),
+            local_function: "add".to_owned(),
+            mode: occurrence.mode,
+        };
+        let server =
+            elaborate(server_checked, &[request]).expect("requested server semantic program");
+        let client = elaborate(client_checked, &[]).expect("client semantic program");
+        BundleSemanticProgramV1::freeze([server, session, client])
+            .expect("invocation bundle freezes")
+    }
+
+    fn frozen_event_value_bundle() -> BundleSemanticProgramV1 {
+        let client_checked = checked_role(
+            "client-event-value-bundle.bn",
+            "store: [\n    submit: SOURCE\n]\n",
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        );
+        let client_submit = client_checked
+            .declarations
+            .iter()
+            .find(|declaration| {
+                client_checked.declaration_path(declaration.id).as_deref() == Some("store.submit")
+            })
+            .expect("client submit declaration");
+        let submit_flow = client_submit.flow_type.clone();
+        let mut session_environment = ExternalTypeEnvironment::sealed(ProgramRole::Session);
+        session_environment
+            .values
+            .insert("Client/store.submit".to_owned(), submit_flow);
+        session_environment.external_identities.insert(
+            "Client/store.submit".to_owned(),
+            CheckedExternalDeclarationIdentityV1 {
+                producer_role: ProgramRole::Client,
+                producer_source_bundle_digest_v1: client_checked.source_bundle_digest_v1,
+                producer_declaration: client_submit.id,
+                kind: CheckedExternalDeclarationKind::Value,
+            },
+        );
+        let session_checked = checked_role(
+            "session-event-value-bundle.bn",
+            "submit: Client/store.submit\n",
+            &session_environment,
+        );
+        let server_checked = checked_role(
+            "server-event-value-bundle.bn",
+            "",
+            &ExternalTypeEnvironment::empty(ProgramRole::Server),
+        );
+        let client = elaborate(client_checked, &[]).expect("client semantic program");
+        let session = elaborate(session_checked, &[]).expect("session semantic program");
+        let server = elaborate(server_checked, &[]).expect("server semantic program");
+        BundleSemanticProgramV1::freeze([session, server, client])
+            .expect("event value bundle freezes")
+    }
+
+    #[test]
+    fn semantic_callable_and_call_inventories_are_exact_and_fail_closed() {
+        let bundle = frozen_call_bundle();
+        for (_, program) in bundle.role_programs() {
+            assert_eq!(
+                program.execution_graph().callables.len(),
+                program.checked_program.callables.len()
+            );
+            assert_eq!(
+                program.execution_graph().calls.len(),
+                program.checked_program.calls.len()
+            );
+            for (index, callable) in program.execution_graph().callables.iter().enumerate() {
+                assert_eq!(callable.id, SemanticCallableId(index));
+            }
+            for (index, call) in program.execution_graph().calls.iter().enumerate() {
+                assert_eq!(call.id, SemanticCallId(index));
+            }
+        }
+
+        let mut client = bundle
+            .role_program(ProgramRole::Client)
+            .expect("client role")
+            .clone();
+        client.execution_graph.callables.pop();
+        client
+            .validate()
+            .expect_err("missing semantic callable coverage must fail");
+
+        let mut client = bundle
+            .role_program(ProgramRole::Client)
+            .expect("client role")
+            .clone();
+        client.execution_graph.calls[0]
+            .function
+            .push_str("/mutated");
+        client
+            .validate()
+            .expect_err("mutated semantic call provenance must fail");
+
+        let mut client = bundle
+            .role_program(ProgramRole::Client)
+            .expect("client role")
+            .clone();
+        let external = client
+            .execution_graph
+            .callables
+            .iter()
+            .position(|callable| callable.kind == boon_typecheck::CheckedCallableKind::External)
+            .expect("external callable");
+        client.execution_graph.callables[external].external_identity = None;
+        client
+            .validate()
+            .expect_err("erased external callable identity must fail");
+    }
+
+    #[test]
+    fn distributed_materialization_identity_is_structural_and_diagnostic_invariant() {
+        let bundle = frozen_call_bundle();
+        let client = bundle
+            .role_program(ProgramRole::Client)
+            .expect("client role");
+        let occurrences = distributed_call_occurrences(client).expect("distributed occurrences");
+        let [occurrence] = occurrences.as_slice() else {
+            panic!("expected one distributed occurrence");
+        };
+        let call = &client.execution_graph().calls[occurrence.call.as_usize()];
+        let external_identity = call.external_identity.expect("sealed call identity");
+        let baseline = producer_materialization_identity(
+            client,
+            occurrence.root,
+            &occurrence.call_path,
+            external_identity,
+            occurrence.mode,
+        )
+        .unwrap();
+        assert_eq!(baseline, occurrence.producer_materialization_identity);
+        assert_eq!(
+            call.occurrence_segment,
+            format!("call:{}", call.checked_call.0)
+        );
+
+        let mut diagnostics_mutated = client.clone();
+        let diagnostic_call =
+            &mut diagnostics_mutated.execution_graph.calls[occurrence.call.as_usize()];
+        diagnostic_call.function = "Session/renamed_diagnostic".to_owned();
+        diagnostic_call.span.line = diagnostic_call.span.line.saturating_add(100);
+        diagnostic_call.span.start = diagnostic_call.span.start.saturating_add(1000);
+        diagnostic_call.span.end = diagnostic_call.span.end.saturating_add(1000);
+        diagnostics_mutated.execution_graph.callables[occurrence.callable.as_usize()].name =
+            "renamed_diagnostic".to_owned();
+        assert_eq!(
+            producer_materialization_identity(
+                &diagnostics_mutated,
+                occurrence.root,
+                &occurrence.call_path,
+                external_identity,
+                occurrence.mode,
+            )
+            .unwrap(),
+            baseline
+        );
+
+        let first_checked = boon_typecheck::check_program(
+            &boon_parser::parse_source(
+                "structural-call-first.bn",
+                "FUNCTION first(value) {\n    value\n}\nresult: first(value: 1)\n",
+            )
+            .unwrap(),
+        )
+        .program
+        .expect("first structural call fixture");
+        let renamed_checked = boon_typecheck::check_program(
+            &boon_parser::parse_source(
+                "structural-call-renamed.bn",
+                "\n\nFUNCTION renamed(value) {\n    value\n}\n\nresult:\n    renamed(value: 1)\n",
+            )
+            .unwrap(),
+        )
+        .program
+        .expect("renamed structural call fixture");
+        let [first_call] = first_checked.calls.as_slice() else {
+            panic!("expected one first call");
+        };
+        let [renamed_call] = renamed_checked.calls.as_slice() else {
+            panic!("expected one renamed call");
+        };
+        assert_ne!(first_call.function, renamed_call.function);
+        assert_ne!(first_call.span, renamed_call.span);
+        assert_eq!(first_call.id, renamed_call.id);
+        assert_eq!(
+            crate::out_net::checked_call_occurrence_segment(&first_checked, first_call.id).unwrap(),
+            crate::out_net::checked_call_occurrence_segment(&renamed_checked, renamed_call.id,)
+                .unwrap()
+        );
+
+        let mut changed_path = occurrence.call_path.clone();
+        changed_path.push(SemanticCallId(usize::MAX));
+        assert_ne!(
+            producer_materialization_identity(
+                client,
+                occurrence.root,
+                &changed_path,
+                external_identity,
+                occurrence.mode,
+            )
+            .unwrap(),
+            baseline
+        );
+        let mut changed_identity = external_identity;
+        changed_identity.producer_declaration =
+            DeclId(changed_identity.producer_declaration.0.saturating_add(1));
+        assert_ne!(
+            producer_materialization_identity(
+                client,
+                occurrence.root,
+                &occurrence.call_path,
+                changed_identity,
+                occurrence.mode,
+            )
+            .unwrap(),
+            baseline
+        );
+        let changed_mode = match occurrence.mode {
+            ProducerMaterializationMode::Current => ProducerMaterializationMode::Invocation,
+            ProducerMaterializationMode::Invocation => ProducerMaterializationMode::Current,
+        };
+        assert_ne!(
+            producer_materialization_identity(
+                client,
+                occurrence.root,
+                &occurrence.call_path,
+                external_identity,
+                changed_mode,
+            )
+            .unwrap(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn distributed_value_occurrences_include_producer_roots_and_are_structural() {
+        let session_checked = checked_role(
+            "session-value-occurrence.bn",
+            "store: [\n    count: 1\n]\n",
+            &ExternalTypeEnvironment::empty(ProgramRole::Session),
+        );
+        let session_count = session_checked
+            .declarations
+            .iter()
+            .find(|declaration| {
+                session_checked.declaration_path(declaration.id).as_deref() == Some("store.count")
+            })
+            .expect("session count declaration");
+        let external_identity = CheckedExternalDeclarationIdentityV1 {
+            producer_role: ProgramRole::Session,
+            producer_source_bundle_digest_v1: session_checked.source_bundle_digest_v1,
+            producer_declaration: session_count.id,
+            kind: CheckedExternalDeclarationKind::Value,
+        };
+        let mut server_environment = ExternalTypeEnvironment::sealed(ProgramRole::Server);
+        server_environment
+            .values
+            .insert("Session/store.count".to_owned(), continuous(Type::Number));
+        server_environment
+            .external_identities
+            .insert("Session/store.count".to_owned(), external_identity);
+        let server_checked = checked_role(
+            "server-value-occurrence.bn",
+            r#"
+FUNCTION add_session(value) {
+    value + Session/store.count
+}
+
+FUNCTION add_session_twice(value) {
+    value + Session/store.count + Session/store.count
+}
+"#,
+            &server_environment,
+        );
+        let without_request =
+            elaborate(server_checked.clone(), &[]).expect("server semantic program");
+        assert!(
+            distributed_value_occurrences(&without_request)
+                .unwrap()
+                .is_empty(),
+            "unmaterialized callable body must not invent a value crossing"
+        );
+        let request = ProducerMaterializationRequest {
+            identity: [200; 32],
+            callable: without_request
+                .producer_callable("add_session")
+                .expect("producer callable"),
+            local_function: "add_session".to_owned(),
+            mode: ProducerMaterializationMode::Current,
+        };
+        let earlier_request = ProducerMaterializationRequest {
+            identity: [1; 32],
+            callable: without_request
+                .producer_callable("add_session_twice")
+                .expect("second producer callable"),
+            local_function: "add_session_twice".to_owned(),
+            mode: ProducerMaterializationMode::Current,
+        };
+        let with_request = elaborate(server_checked.clone(), std::slice::from_ref(&request))
+            .expect("materialized server semantic program");
+        let occurrences =
+            distributed_value_occurrences(&with_request).expect("distributed value occurrences");
+        let [occurrence] = occurrences.as_slice() else {
+            panic!("expected one producer-root value occurrence");
+        };
+        assert_eq!(
+            occurrence.root,
+            DistributedCallOccurrenceRoot::Producer([200; 32])
+        );
+        assert!(occurrence.call_path.is_empty());
+        assert_eq!(occurrence.external_identity, external_identity);
+        assert_eq!(occurrence.producer_role, ProgramRole::Session);
+        assert_eq!(
+            distributed_value_occurrence_identity(
+                &with_request,
+                occurrence.root,
+                &occurrence.call_path,
+                occurrence.checked_expression,
+                occurrence.external_identity,
+            )
+            .unwrap(),
+            occurrence.identity
+        );
+
+        let with_earlier_request = elaborate(server_checked, &[request, earlier_request])
+            .expect("two materialized server producers");
+        let rebased_occurrences = distributed_value_occurrences(&with_earlier_request)
+            .expect("rebased distributed value occurrences");
+        let rebased = rebased_occurrences
+            .iter()
+            .find(|candidate| candidate.root == DistributedCallOccurrenceRoot::Producer([200; 32]))
+            .expect("existing producer occurrence survives canonical insertion");
+        assert_ne!(
+            occurrence.expression, rebased.expression,
+            "earlier canonical producer insertion should rebase dense expression IDs"
+        );
+        assert_eq!(occurrence.checked_expression, rebased.checked_expression);
+        assert_eq!(occurrence.identity, rebased.identity);
+
+        let mut diagnostics_mutated = with_request.clone();
+        let expression =
+            &mut diagnostics_mutated.execution_graph.expressions[occurrence.expression.as_usize()];
+        let SemanticExpressionKind::ExternalRead { canonical_path, .. } = &mut expression.kind
+        else {
+            panic!("occurrence expression is external");
+        };
+        canonical_path.push_str(".renamed_diagnostic");
+        diagnostics_mutated
+            .execution_graph
+            .checked_expression_origins[occurrence.expression.as_usize()]
+        .checked_span
+        .line += 100;
+        assert_eq!(
+            distributed_value_occurrence_identity(
+                &diagnostics_mutated,
+                occurrence.root,
+                &occurrence.call_path,
+                occurrence.checked_expression,
+                occurrence.external_identity,
+            )
+            .unwrap(),
+            occurrence.identity
+        );
+        assert_ne!(
+            distributed_value_occurrence_identity(
+                &with_request,
+                occurrence.root,
+                &occurrence.call_path,
+                boon_typecheck::CheckedExprId(u32::MAX),
+                occurrence.external_identity,
+            )
+            .unwrap(),
+            occurrence.identity
+        );
+    }
+
+    #[test]
+    fn bundle_invocation_crossing_binds_exact_semantic_trigger_arms() {
+        let bundle = frozen_invocation_bundle();
+        bundle.validate().unwrap();
+        let [crossing] = bundle.call_crossings() else {
+            panic!("expected one invocation crossing");
+        };
+        assert_eq!(crossing.mode, ProducerMaterializationMode::Invocation);
+        assert_eq!(
+            crossing.route_scope,
+            BundleSemanticRouteScopeV1::OriginScoped
+        );
+        let [arm] = crossing.invocation_arms.as_slice() else {
+            panic!("expected one exact invocation arm");
+        };
+        assert!(matches!(arm.cause, SemanticEventCauseV1::Source(_)));
+        let session = bundle
+            .role_program(ProgramRole::Session)
+            .expect("session role");
+        assert_eq!(
+            session
+                .reactive_graph()
+                .invocation_arms_for_call_expression(crossing.consumer_expression)
+                .unwrap(),
+            crossing.invocation_arms
+        );
+
+        macro_rules! reject_invocation_mutation {
+            ($mutation:expr) => {{
+                let mut mutated = bundle.clone();
+                ($mutation)(&mut mutated.call_crossings[0].invocation_arms[0]);
+                mutated
+                    .validate()
+                    .expect_err("invocation-arm mutation must fail");
+            }};
+        }
+        reject_invocation_mutation!(|arm: &mut SemanticTriggerOwnedArmV1| {
+            arm.id = SemanticTriggerArmId(usize::MAX);
+        });
+        reject_invocation_mutation!(|arm: &mut SemanticTriggerOwnedArmV1| {
+            arm.gate_expression = SemanticExprId(usize::MAX);
+        });
+        reject_invocation_mutation!(|arm: &mut SemanticTriggerOwnedArmV1| {
+            arm.gate_value = SemanticValueId(usize::MAX);
+        });
+        reject_invocation_mutation!(|arm: &mut SemanticTriggerOwnedArmV1| {
+            arm.owner = Some(StaticOwnerId(usize::MAX));
+        });
+        reject_invocation_mutation!(|arm: &mut SemanticTriggerOwnedArmV1| {
+            arm.route_scope = SemanticScopeId(usize::MAX);
+        });
+        reject_invocation_mutation!(|arm: &mut SemanticTriggerOwnedArmV1| {
+            arm.row_scope = Some(SemanticRowScopeId(usize::MAX));
+        });
+        reject_invocation_mutation!(|arm: &mut SemanticTriggerOwnedArmV1| {
+            arm.output_expression = SemanticExprId(usize::MAX);
+        });
+        reject_invocation_mutation!(|arm: &mut SemanticTriggerOwnedArmV1| {
+            arm.output_value = SemanticValueId(usize::MAX);
+        });
+    }
+
+    #[test]
+    fn bundle_event_value_crossing_binds_exact_source_and_projection() {
+        let bundle = frozen_event_value_bundle();
+        bundle.validate().unwrap();
+        assert!(bundle.call_crossings().is_empty());
+        let [crossing] = bundle.value_crossings() else {
+            panic!("expected one event value crossing");
+        };
+        let BundleSemanticValueDeliveryV1::Event {
+            source,
+            payload_projection,
+        } = &crossing.delivery
+        else {
+            panic!("SOURCE crossing must use event delivery");
+        };
+        assert!(payload_projection.is_empty());
+        assert_eq!(
+            crossing.route_scope,
+            BundleSemanticRouteScopeV1::SessionLocal
+        );
+        let client = bundle
+            .role_program(ProgramRole::Client)
+            .expect("client role");
+        assert!(client.resource_graph().sources.iter().any(|candidate| {
+            candidate.id == *source
+                && candidate.declaration == crossing.producer_declaration
+                && candidate.expression == crossing.producer_expression
+        }));
+
+        let mut mutated = bundle.clone();
+        let BundleSemanticValueDeliveryV1::Event {
+            source,
+            payload_projection,
+        } = &mut mutated.value_crossings[0].delivery
+        else {
+            panic!("SOURCE crossing must use event delivery");
+        };
+        *source = SemanticSourceId(usize::MAX);
+        payload_projection.push("mutated".to_owned());
+        mutated
+            .validate()
+            .expect_err("event source/projection mutation must fail");
+    }
+
+    #[test]
+    fn bundle_semantic_freeze_owns_three_roles_and_rejects_mutations() {
+        let bundle = frozen_call_bundle();
+        bundle.validate().unwrap();
+        assert_eq!(
+            bundle
+                .role_programs()
+                .map(|(role, _)| role)
+                .collect::<Vec<_>>(),
+            vec![
+                ProgramRole::Client,
+                ProgramRole::Session,
+                ProgramRole::Server
+            ]
+        );
+        assert_eq!(bundle.call_crossings().len(), 1);
+        assert_eq!(bundle.value_crossings().len(), 1);
+        assert_eq!(bundle.producer_requests().len(), 1);
+        let crossing = &bundle.call_crossings()[0];
+        let request = &bundle.producer_requests()[0];
+        assert_eq!(
+            crossing.producer_materialization_identity,
+            request.request.identity
+        );
+        assert_eq!(crossing.producer_callable, request.request.callable);
+        assert_eq!(
+            crossing.route_scope,
+            BundleSemanticRouteScopeV1::SessionLocal
+        );
+        assert_eq!(crossing.mode, ProducerMaterializationMode::Current);
+        assert!(crossing.invocation_arms.is_empty());
+        let [argument] = crossing.arguments.as_slice() else {
+            panic!("expected one exact call argument");
+        };
+        assert_eq!(argument.ordinal, 0);
+        assert_eq!(argument.name, "value");
+        assert!(matches!(
+            argument.binding,
+            BundleSemanticCallArgumentBindingV1::Explicit { .. }
+        ));
+        let value_crossing = &bundle.value_crossings()[0];
+        assert_eq!(
+            value_crossing.delivery,
+            BundleSemanticValueDeliveryV1::Current
+        );
+        assert_eq!(
+            value_crossing.route_scope,
+            BundleSemanticRouteScopeV1::SessionLocal
+        );
+
+        let client = bundle
+            .role_program(ProgramRole::Client)
+            .expect("client role")
+            .clone();
+        let server = bundle
+            .role_program(ProgramRole::Server)
+            .expect("server role")
+            .clone();
+        BundleSemanticProgramV1::freeze([client.clone(), client, server])
+            .expect_err("duplicate Client and missing Session must fail");
+
+        macro_rules! reject_bundle_mutation {
+            ($mutation:expr) => {{
+                let mut mutated = bundle.clone();
+                ($mutation)(&mut mutated);
+                mutated
+                    .validate()
+                    .expect_err("bundle semantic mutation must fail");
+            }};
+        }
+
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.role_digests[0].role = ProgramRole::Server;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.role_digests[0].semantic_program_digest =
+                bundle.role_digests[1].semantic_program_digest;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.producer_requests[0].request.identity[0] ^= 0xff;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.producer_requests[0].request.callable = SemanticCallableId(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0]
+                .occurrence_path
+                .push_str("/mutated");
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].canonical_function = "Server/other".to_owned();
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].producer_role = ProgramRole::Server;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].producer_callable = SemanticCallableId(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].consumer_expression = SemanticExprId(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].consumer_value = SemanticValueId(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].consumer_instance = OutCallInstanceId::from_usize(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].owner_callable = Some(SemanticCallableId(usize::MAX));
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].owner = Some(StaticOwnerId(usize::MAX));
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].consumer_scope = SemanticScopeId(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].result.mode = FlowMode::PresentOrAbsent;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].effect.invokes_host =
+                !bundle.call_crossings[0].effect.invokes_host;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].arguments[0].producer_formal = DeclId(u32::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].arguments[0]
+                .producer_parameter
+                .ordinal = usize::MAX;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            let BundleSemanticCallArgumentBindingV1::Explicit {
+                expression,
+                value,
+                flow_type,
+                from_pipe,
+                ..
+            } = &mut bundle.call_crossings[0].arguments[0].binding
+            else {
+                panic!("fixture argument is explicit");
+            };
+            *expression = SemanticExprId(usize::MAX);
+            *value = SemanticValueId(usize::MAX);
+            flow_type.mode = FlowMode::PresentOrAbsent;
+            *from_pipe = !*from_pipe;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].mode = match bundle.call_crossings[0].mode {
+                ProducerMaterializationMode::Current => ProducerMaterializationMode::Invocation,
+                ProducerMaterializationMode::Invocation => ProducerMaterializationMode::Current,
+            };
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].root = DistributedCallOccurrenceRoot::Producer([9; 32]);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings[0].route_scope = BundleSemanticRouteScopeV1::OriginScoped;
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.call_crossings.clear();
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0]
+                .canonical_path
+                .push_str(".mutated");
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0].occurrence_identity =
+                DistributedValueOccurrenceIdentityV1([9; 32]);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0].root = DistributedCallOccurrenceRoot::Producer([9; 32]);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0]
+                .call_path
+                .push(SemanticCallId(usize::MAX));
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0].checked_expression = boon_typecheck::CheckedExprId(u32::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0]
+                .occurrence_path
+                .push_str("/mutated");
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0].consumer_scope = SemanticScopeId(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0].producer_expression = SemanticExprId(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0].producer_value = SemanticValueId(usize::MAX);
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0].delivery = BundleSemanticValueDeliveryV1::Event {
+                source: SemanticSourceId(usize::MAX),
+                payload_projection: vec!["mutated".to_owned()],
+            };
+        });
+        reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
+            bundle.value_crossings[0].route_scope = BundleSemanticRouteScopeV1::OriginScoped;
+        });
+    }
+
+    fn wrapped_out_contract_fixture() -> (CheckedProgram, ResolvedOutGraph, usize) {
+        let parsed = boon_parser::parse_source(
+            "semantic-out-contract.bn",
+            r#"
+FUNCTION wrapped(list, entry: OUT, new) {
+    list
+    |> List/map(
+        item: entry
+        new: new
+    )
+}
+
+rows: LIST { [value: 1] }
+result:
+    rows
+    |> wrapped(
+        entry
+        new: entry.value + 1
+    )
+"#,
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed)
+            .program
+            .expect("valid wrapped OUT fixture has one checked program");
+        let semantic =
+            elaborate(checked, &[]).expect("valid wrapped OUT fixture has semantic contracts");
+        let checked = semantic.checked_program.clone();
+        let graph = semantic.resolved_out_graph.clone();
+        let port = graph
+            .nets
+            .iter()
+            .find(|net| net.ports.len() > 1)
+            .and_then(|net| net.ports.get(1))
+            .expect("wrapped OUT fixture has two unified ports")
+            .as_usize();
+        (checked, graph, port)
+    }
+
+    fn assert_contract_rejection(
+        checked: &CheckedProgram,
+        graph: &ResolvedOutGraph,
+        port: usize,
+        dimension: &str,
+        mutate: impl FnOnce(&mut OutPortContractV1),
+    ) {
+        let mut invalid = graph.clone();
+        mutate(&mut invalid.ports[port].contract);
+        let error = validate_out_contracts(checked, &invalid)
+            .expect_err("mutated OUT contract must be rejected");
+        assert!(
+            error.to_string().contains(dimension),
+            "expected {dimension} rejection, got {error}"
+        );
+    }
+
+    #[test]
+    fn minimal_checked_program_has_stable_complete_manifest() {
+        let parsed = boon_parser::parse_source("semantic-empty.bn", "").unwrap();
+        let checked = boon_typecheck::check_program(&parsed)
+            .program
+            .expect("valid source has one checked program");
+        let source_bundle_digest_v1 = checked.source_bundle_digest_v1;
+        let first = elaborate(checked.clone(), &[]).unwrap();
+        let second = elaborate(checked, &[]).unwrap();
+        assert_eq!(first.source_bundle_digest_v1(), source_bundle_digest_v1);
+        assert_eq!(second.source_bundle_digest_v1(), source_bundle_digest_v1);
+        assert_eq!(first.digest(), second.digest());
+        assert_eq!(
+            first.dependency_manifest().checked_program_digest,
+            second.dependency_manifest().checked_program_digest
+        );
+        assert_eq!(
+            first.dependency_manifest().callable_entries,
+            second.dependency_manifest().callable_entries
+        );
+        first.validate().unwrap();
+    }
+
+    #[test]
+    fn producer_identity_is_canonical_and_fail_closed() {
+        let parsed = boon_parser::parse_source(
+            "semantic-producer.bn",
+            r#"
+FUNCTION serve(value) {
+    value + 0
+}
+
+seed: 0
+"#,
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed)
+            .program
+            .expect("valid producer fixture has one authoritative checked program");
+        let callable = SemanticCallableId(
+            checked
+                .callables
+                .iter()
+                .position(|callable| callable.name == "serve")
+                .expect("serve callable identity"),
+        );
+        let request = ProducerMaterializationRequest {
+            identity: [7; 32],
+            callable,
+            local_function: "serve".to_owned(),
+            mode: ProducerMaterializationMode::Current,
+        };
+        let first = elaborate(checked.clone(), std::slice::from_ref(&request)).unwrap();
+        let duplicate = elaborate(checked.clone(), &[request.clone(), request]).unwrap();
+        assert_eq!(first.digest(), duplicate.digest());
+        assert!(
+            elaborate(
+                checked,
+                &[ProducerMaterializationRequest {
+                    identity: [0; 32],
+                    callable,
+                    local_function: "serve".to_owned(),
+                    mode: ProducerMaterializationMode::Current,
+                }],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn resolved_out_contract_carries_complete_compatibility_identity() {
+        let (checked, graph, _) = wrapped_out_contract_fixture();
+        validate_out_contracts(&checked, &graph).unwrap();
+        for port in &graph.ports {
+            assert_eq!(port.contract.flow_type.ty, port.contract.resolved_type);
+            assert_ne!(port.contract.shape_digest, [0; 32]);
+            assert!(port.contract.generation_identity.is_some());
+            assert!(port.contract.correlation_identity.is_some());
+            assert!(
+                checked
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.id == port.contract.lexical_scope)
+            );
+            assert!(
+                checked
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.id == port.contract.output_scope)
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_digest_binds_the_complete_resolved_out_graph() {
+        let (checked, _, _) = wrapped_out_contract_fixture();
+        let mut semantic = elaborate(checked, &[]).unwrap();
+        semantic.resolved_out_graph.static_owners[0].child_ordinal =
+            semantic.resolved_out_graph.static_owners[0]
+                .child_ordinal
+                .saturating_add(1);
+        semantic.execution_graph.static_owners[0].child_ordinal =
+            semantic.resolved_out_graph.static_owners[0].child_ordinal;
+        let error = semantic
+            .validate()
+            .expect_err("mutated resolved graph must invalidate semantic digest");
+        assert!(
+            error
+                .to_string()
+                .contains("semantic program digest does not match"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resolved_out_contract_rejects_incompatible_type_and_shape() {
+        let (checked, graph, port) = wrapped_out_contract_fixture();
+        assert_contract_rejection(&checked, &graph, port, "type", |contract| {
+            contract.flow_type.ty = boon_typecheck::Type::Text;
+            contract.resolved_type = boon_typecheck::Type::Text;
+            contract.shape_digest =
+                canonical_hash(OUT_PORT_SHAPE_DIGEST_DOMAIN, &contract.resolved_type).unwrap();
+        });
+        assert_contract_rejection(&checked, &graph, port, "shape", |contract| {
+            contract.shape_digest[0] ^= 0xff
+        });
+    }
+
+    #[test]
+    fn resolved_out_contract_rejects_incompatible_scope_and_role() {
+        let (checked, graph, port) = wrapped_out_contract_fixture();
+        assert_contract_rejection(&checked, &graph, port, "scope", |contract| {
+            contract.output_scope = boon_typecheck::LexicalScopeId(u32::MAX);
+        });
+        assert_contract_rejection(&checked, &graph, port, "role", |contract| {
+            contract.role = match contract.role {
+                boon_typecheck::ProgramRole::Client => boon_typecheck::ProgramRole::Server,
+                boon_typecheck::ProgramRole::Session | boon_typecheck::ProgramRole::Server => {
+                    boon_typecheck::ProgramRole::Client
+                }
+            };
+        });
+    }
+
+    #[test]
+    fn resolved_out_contract_rejects_incompatible_generation_correlation_and_presence() {
+        let (checked, graph, port) = wrapped_out_contract_fixture();
+        assert_contract_rejection(&checked, &graph, port, "generation", |contract| {
+            contract
+                .generation_identity
+                .as_mut()
+                .expect("resolved generation identity")
+                .owner = StaticOwnerId(usize::MAX);
+        });
+        assert_contract_rejection(&checked, &graph, port, "correlation", |contract| {
+            contract
+                .correlation_identity
+                .as_mut()
+                .expect("resolved correlation identity")
+                .net = OutNetId(usize::MAX);
+        });
+        assert_contract_rejection(&checked, &graph, port, "presence", |contract| {
+            contract.presence.may_be_absent = !contract.presence.may_be_absent;
+        });
+    }
+
+    #[test]
+    fn bundle_semantic_v1_count_and_encoded_size_limits_are_inclusive() {
+        for (kind, limit) in [
+            (
+                "producer requests",
+                MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1,
+            ),
+            ("call crossings", MAX_BUNDLE_SEMANTIC_CALL_CROSSINGS_V1),
+            ("value crossings", MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1),
+        ] {
+            validate_bundle_collection_count(kind, limit, limit)
+                .expect("the exact V1 count limit is admitted");
+            assert!(
+                validate_bundle_collection_count(kind, limit.saturating_add(1), limit).is_err(),
+                "{kind} must reject the first count over its V1 limit"
+            );
+        }
+        for (kind, limit) in [
+            (
+                "producer requests",
+                MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1,
+            ),
+            ("call crossings", MAX_BUNDLE_SEMANTIC_CALL_CROSSING_BYTES_V1),
+            (
+                "value crossings",
+                MAX_BUNDLE_SEMANTIC_VALUE_CROSSING_BYTES_V1,
+            ),
+        ] {
+            validate_bundle_collection_encoded_size(kind, limit, limit)
+                .expect("the exact V1 encoded-byte limit is admitted");
+            assert!(
+                validate_bundle_collection_encoded_size(kind, limit.saturating_add(1), limit)
+                    .is_err(),
+                "{kind} must reject the first encoded byte over its V1 limit"
+            );
+        }
+
+        let encoded_fixture = vec!["semantic-boundary".to_owned()];
+        let encoded_len = boon_contract::canonical_serde_cbor_v1(&encoded_fixture)
+            .expect("fixture has canonical bytes")
+            .len();
+        validate_bundle_collection(
+            "encoded fixture",
+            &encoded_fixture,
+            encoded_fixture.len(),
+            encoded_len,
+        )
+        .expect("canonical encoded size is admitted at the exact boundary");
+        assert!(
+            validate_bundle_collection(
+                "encoded fixture",
+                &encoded_fixture,
+                encoded_fixture.len(),
+                encoded_len.saturating_sub(1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bundle_validation_rejects_collections_over_v1_count_limits() {
+        let mut requests = frozen_call_bundle();
+        let request = requests.producer_requests[0].clone();
+        requests.producer_requests = vec![request; MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1 + 1];
+        assert!(requests.validate().is_err());
+
+        let mut calls = frozen_call_bundle();
+        let crossing = calls.call_crossings[0].clone();
+        calls.call_crossings = vec![crossing; MAX_BUNDLE_SEMANTIC_CALL_CROSSINGS_V1 + 1];
+        assert!(calls.validate().is_err());
+
+        let mut values = frozen_event_value_bundle();
+        let crossing = values.value_crossings[0].clone();
+        values.value_crossings = vec![crossing; MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1 + 1];
+        assert!(values.validate().is_err());
+    }
+}

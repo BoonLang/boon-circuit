@@ -219,14 +219,14 @@ FUNCTION identity(value) {
         metadata.source_units,
         vec![
             CheckedSourceUnitMetadata {
-                path: "Client/RUN.bn".to_owned(),
-                module: None,
+                path: "Client/Presentation.bn".to_owned(),
+                module: Some("Presentation".to_owned()),
                 start_line: 1,
                 line_count: parsed.files[0].source.lines().count().max(1),
             },
             CheckedSourceUnitMetadata {
-                path: "Client/Presentation.bn".to_owned(),
-                module: Some("Presentation".to_owned()),
+                path: "Client/RUN.bn".to_owned(),
+                module: None,
                 start_line: parsed.files[1].start_line,
                 line_count: parsed.files[1].source.lines().count().max(1),
             },
@@ -240,11 +240,13 @@ FUNCTION identity(value) {
         metadata.source_payload_shape_table,
         output.report.source_payload_shape_table
     );
-    assert!(metadata
-        .source_payload_shape_table
-        .iter()
-        .any(|entry| entry.source_path == "store.submitted"
-            && entry.fields.iter().any(|field| field.name == "text")));
+    assert!(
+        metadata
+            .source_payload_shape_table
+            .iter()
+            .any(|entry| entry.diagnostic_path == "store.submitted"
+                && entry.fields.iter().any(|field| field.name == "text"))
+    );
     assert_eq!(metadata.host_port_table, output.report.host_port_table);
     assert_eq!(metadata.output_root_types, output.report.output_root_types);
     assert_eq!(metadata.expr_type_table, output.report.expr_type_table);
@@ -256,6 +258,21 @@ FUNCTION identity(value) {
         metadata.named_value_type_table,
         output.report.named_value_type_table
     );
+    let repeated_submitted_text_sites = metadata
+        .named_value_type_table
+        .entries
+        .iter()
+        .filter(|entry| entry.path == "store.submitted_text")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        repeated_submitted_text_sites.len(),
+        2,
+        "the field and its nested HOLD are distinct exact sites with one diagnostic path"
+    );
+    assert_ne!(
+        repeated_submitted_text_sites[0].origins,
+        repeated_submitted_text_sites[1].origins
+    );
     assert_eq!(metadata.render_slot_table, output.report.render_slot_table);
     assert_eq!(
         metadata.checked_expression_count,
@@ -266,10 +283,146 @@ FUNCTION identity(value) {
         output.report.dynamic_fallback_count
     );
     assert_eq!(metadata.diagnostics, output.report.diagnostics);
-    assert!(metadata
-        .output_root_types
-        .iter()
-        .any(|output| output.name == "remote_title" && output.ty == Type::Text));
+    assert!(
+        metadata
+            .output_root_types
+            .iter()
+            .any(|output| output.name == "remote_title" && output.ty == Type::Text)
+    );
+    validate_structural_lowering_metadata(
+        &checked,
+        &metadata.source_payload_shape_table,
+        &metadata.function_type_table,
+        &metadata.named_value_type_table,
+        &metadata.output_root_types,
+        &metadata.host_port_table,
+    )
+    .expect("fresh lowering metadata is structurally exact");
+
+    let mut stale_functions = metadata.function_type_table.clone();
+    stale_functions.entries[0].callable = DeclId(u32::MAX);
+    assert!(
+        validate_structural_lowering_metadata(
+            &checked,
+            &metadata.source_payload_shape_table,
+            &stale_functions,
+            &metadata.named_value_type_table,
+            &metadata.output_root_types,
+            &metadata.host_port_table,
+        )
+        .unwrap_err()
+        .contains("function type identity"),
+        "a stale callable identity must fail closed"
+    );
+
+    let mut stale_output = metadata.output_root_types.clone();
+    stale_output[0].statement = CheckedStatementId(u32::MAX);
+    assert!(
+        validate_structural_lowering_metadata(
+            &checked,
+            &metadata.source_payload_shape_table,
+            &metadata.function_type_table,
+            &metadata.named_value_type_table,
+            &stale_output,
+            &metadata.host_port_table,
+        )
+        .unwrap_err()
+        .contains("missing checked statement"),
+        "a stale output statement identity must fail closed"
+    );
+
+    let mut stale_source_payloads = metadata.source_payload_shape_table.clone();
+    stale_source_payloads[0].checked_sources[0] = CheckedSourceId(u32::MAX);
+    assert!(
+        validate_structural_lowering_metadata(
+            &checked,
+            &stale_source_payloads,
+            &metadata.function_type_table,
+            &metadata.named_value_type_table,
+            &metadata.output_root_types,
+            &metadata.host_port_table,
+        )
+        .unwrap_err()
+        .contains("missing checked source"),
+        "a stale source payload identity must fail closed"
+    );
+
+    let mut missing_named_site = metadata.named_value_type_table.clone();
+    missing_named_site.entries.remove(0);
+    assert!(
+        validate_structural_lowering_metadata(
+            &checked,
+            &metadata.source_payload_shape_table,
+            &metadata.function_type_table,
+            &missing_named_site,
+            &metadata.output_root_types,
+            &metadata.host_port_table,
+        )
+        .unwrap_err()
+        .contains("do not exactly cover checked statement sites"),
+        "a missing named-value exact site must fail closed"
+    );
+
+    let mut empty_named_origin = metadata.named_value_type_table.clone();
+    empty_named_origin.entries[0].origins.clear();
+    assert!(
+        validate_structural_lowering_metadata(
+            &checked,
+            &metadata.source_payload_shape_table,
+            &metadata.function_type_table,
+            &empty_named_origin,
+            &metadata.output_root_types,
+            &metadata.host_port_table,
+        )
+        .unwrap_err()
+        .contains("has no structural origins"),
+        "an empty named-value exact origin must fail closed"
+    );
+
+    let mut duplicate_named_site = metadata.named_value_type_table.clone();
+    duplicate_named_site
+        .entries
+        .push(duplicate_named_site.entries[0].clone());
+    duplicate_named_site.entries.sort_by(|left, right| {
+        left.origins
+            .cmp(&right.origins)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    assert!(
+        validate_structural_lowering_metadata(
+            &checked,
+            &metadata.source_payload_shape_table,
+            &metadata.function_type_table,
+            &duplicate_named_site,
+            &metadata.output_root_types,
+            &metadata.host_port_table,
+        )
+        .unwrap_err()
+        .contains("duplicates an exact checked site"),
+        "a duplicate named-value exact site must fail closed"
+    );
+
+    let mut stale_named_statement = metadata.named_value_type_table.clone();
+    stale_named_statement.entries[0].origins[0].statement =
+        Some(CheckedStatementId(u32::MAX));
+    stale_named_statement.entries.sort_by(|left, right| {
+        left.origins
+            .cmp(&right.origins)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    assert!(
+        validate_structural_lowering_metadata(
+            &checked,
+            &metadata.source_payload_shape_table,
+            &metadata.function_type_table,
+            &stale_named_statement,
+            &metadata.output_root_types,
+            &metadata.host_port_table,
+        )
+        .unwrap_err()
+        .contains("missing statement origin"),
+        "a stale named-value statement identity must fail closed"
+    );
 }
 
 #[test]
@@ -364,7 +517,7 @@ fn provisional_distributed_check_preserves_external_reads_and_named_calls() {
     assert!(checked.expressions.iter().any(|expression| {
         matches!(
             &expression.kind,
-            CheckedExpressionKind::ExternalRead { canonical_path }
+            CheckedExpressionKind::ExternalRead { canonical_path, .. }
                 if canonical_path == "Session/store.count"
         )
     }));
@@ -377,6 +530,156 @@ fn provisional_distributed_check_preserves_external_reads_and_named_calls() {
         call.entries.as_slice(),
         [CheckedCallEntry::Input { name, .. }] if name == "value"
     ));
+}
+
+#[test]
+fn sealed_distributed_check_records_source_bound_external_identities() {
+    let producer = boon_parser::parse_source(
+        "session-producer.bn",
+        "store: [count: 1]\nFUNCTION add(value) { value }\n",
+    )
+    .unwrap();
+    let parsed = boon_parser::parse_source(
+        "client-consumer.bn",
+        "count: Session/store.count\nnext: Session/add(value: count)\n",
+    )
+    .unwrap();
+    let value_identity = CheckedExternalDeclarationIdentityV1 {
+        producer_role: ProgramRole::Session,
+        producer_source_bundle_digest_v1: producer.source_bundle_digest_v1,
+        producer_declaration: DeclId(41),
+        kind: CheckedExternalDeclarationKind::Value,
+    };
+    let callable_identity = CheckedExternalDeclarationIdentityV1 {
+        producer_role: ProgramRole::Session,
+        producer_source_bundle_digest_v1: producer.source_bundle_digest_v1,
+        producer_declaration: DeclId(42),
+        kind: CheckedExternalDeclarationKind::Callable,
+    };
+    let mut environment = ExternalTypeEnvironment::sealed(ProgramRole::Client);
+    environment.values.insert(
+        "Session/store.count".to_owned(),
+        distributed_continuous(Type::Number),
+    );
+    environment.functions.insert(
+        "Session/add".to_owned(),
+        distributed_function(&[("value", Type::Number)], Type::Number),
+    );
+    environment
+        .external_identities
+        .insert("Session/store.count".to_owned(), value_identity);
+    environment
+        .external_identities
+        .insert("Session/add".to_owned(), callable_identity);
+
+    let (output, _) = check_runtime_program_profiled_with_external_types(&parsed, &environment);
+    assert!(
+        !output.report.has_errors(),
+        "{:#?}",
+        output.report.diagnostics
+    );
+    let checked = output.program.expect("sealed checked program");
+    assert!(checked.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            CheckedExpressionKind::ExternalRead {
+                canonical_path,
+                external_identity: Some(identity),
+            } if canonical_path == "Session/store.count" && *identity == value_identity
+        )
+    }));
+    assert_eq!(
+        checked
+            .callables
+            .iter()
+            .find(|callable| callable.name == "Session/add")
+            .and_then(|callable| callable.external_identity),
+        Some(callable_identity)
+    );
+}
+
+#[test]
+fn sealed_distributed_check_rejects_missing_or_mismatched_external_identities() {
+    let parsed = boon_parser::parse_source(
+        "client-consumer.bn",
+        "count: Session/store.count\nnext: Session/add(value: count)\n",
+    )
+    .unwrap();
+    let mut environment = ExternalTypeEnvironment::sealed(ProgramRole::Client);
+    environment.values.insert(
+        "Session/store.count".to_owned(),
+        distributed_continuous(Type::Number),
+    );
+    environment.functions.insert(
+        "Session/add".to_owned(),
+        distributed_function(&[("value", Type::Number)], Type::Number),
+    );
+    environment.external_identities.insert(
+        "Session/add".to_owned(),
+        CheckedExternalDeclarationIdentityV1 {
+            producer_role: ProgramRole::Server,
+            producer_source_bundle_digest_v1: parsed.source_bundle_digest_v1,
+            producer_declaration: DeclId(42),
+            kind: CheckedExternalDeclarationKind::Value,
+        },
+    );
+
+    let report = check_with_external_types(&parsed, &environment);
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("missing its source-bound producer identity")
+    }));
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("which does not match its qualified role")
+    }));
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected Callable"))
+    );
+}
+
+#[test]
+fn sealed_distributed_check_rejects_duplicate_producer_declaration_identity() {
+    let parsed = boon_parser::parse_source(
+        "client-consumer.bn",
+        "count: Session/store.count\nnext: Session/add(value: count)\n",
+    )
+    .unwrap();
+    let mut environment = ExternalTypeEnvironment::sealed(ProgramRole::Client);
+    environment.values.insert(
+        "Session/store.count".to_owned(),
+        distributed_continuous(Type::Number),
+    );
+    environment.functions.insert(
+        "Session/add".to_owned(),
+        distributed_function(&[("value", Type::Number)], Type::Number),
+    );
+    for (name, kind) in [
+        ("Session/store.count", CheckedExternalDeclarationKind::Value),
+        ("Session/add", CheckedExternalDeclarationKind::Callable),
+    ] {
+        environment.external_identities.insert(
+            name.to_owned(),
+            CheckedExternalDeclarationIdentityV1 {
+                producer_role: ProgramRole::Session,
+                producer_source_bundle_digest_v1: parsed.source_bundle_digest_v1,
+                producer_declaration: DeclId(42),
+                kind,
+            },
+        );
+    }
+
+    let report = check_with_external_types(&parsed, &environment);
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("select the same producer declaration")
+    }));
 }
 
 #[test]
@@ -658,7 +961,9 @@ fn distributed_calls_preserve_event_argument_flow() {
         "diagnostics: {:#?}",
         output.report.diagnostics
     );
-    let program = output.program.expect("event-valued external call is checked");
+    let program = output
+        .program
+        .expect("event-valued external call is checked");
     let call = program
         .calls
         .iter()
@@ -668,7 +973,7 @@ fn distributed_calls_preserve_event_argument_flow() {
 }
 
 #[test]
-fn named_value_type_table_contains_only_canonical_declaration_paths() {
+fn named_value_type_table_contains_canonical_paths_ordered_by_exact_site() {
     let parsed = boon_parser::parse_source(
         "named-values.bn",
         r#"
@@ -724,7 +1029,11 @@ FUNCTION add(value) {
             .named_value_type_table
             .entries
             .windows(2)
-            .all(|entries| entries[0].path < entries[1].path)
+            .all(|entries| {
+                entries[0].origins < entries[1].origins
+                    || entries[0].origins == entries[1].origins
+                        && entries[0].path < entries[1].path
+            })
     );
     let function = report
         .function_type_table
@@ -732,7 +1041,24 @@ FUNCTION add(value) {
         .iter()
         .find(|function| function.name == "add")
         .expect("runtime-profiled function interface");
-    assert_eq!(function.args, ["value"]);
-    assert_eq!(function.arg_flows, [distributed_continuous(Type::Number)]);
+    assert_eq!(
+        function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>(),
+        ["value"]
+    );
+    assert_eq!(
+        function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.flow_type.clone())
+            .collect::<Vec<_>>(),
+        [distributed_continuous(Type::Number)]
+    );
+    assert_eq!(function.parameters[0].ordinal, 0);
+    assert_ne!(function.parameters[0].formal, DeclId(u32::MAX));
+    assert_ne!(function.callable, DeclId(u32::MAX));
     assert_eq!(function.result, distributed_continuous(Type::Number));
 }

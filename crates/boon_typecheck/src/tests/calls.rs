@@ -1,4 +1,18 @@
 #[test]
+fn checked_program_preserves_the_exact_parser_source_bundle_digest() {
+    let parsed = boon_parser::parse_source(
+        "checked-source-provenance.bn",
+        "value: TEXT { exact source }\n",
+    )
+    .unwrap();
+    let expected = parsed.source_bundle_digest_v1;
+    let checked = check_program(&parsed)
+        .program
+        .expect("valid source has a checked program");
+    assert_eq!(checked.source_bundle_digest_v1, expected);
+}
+
+#[test]
 fn checked_when_consumes_the_comparison_result() {
     let parsed = boon_parser::parse_source(
         "checked-comparison-when.bn",
@@ -144,9 +158,9 @@ store: [
     );
     assert!(program.statements.iter().any(|statement| {
         statement.id == source.statement
-            && statement.resources.contains(&CheckedResourceBinding::Source {
-                source: source.id,
-            })
+            && statement
+                .resources
+                .contains(&CheckedResourceBinding::Source { source: source.id })
     }));
 }
 
@@ -182,7 +196,10 @@ store: [
         Some("store.sources.station_input.events.change")
     );
     let Type::Object(payload) = &source.payload_type else {
-        panic!("nested source payload is not a record: {:?}", source.payload_type);
+        panic!(
+            "nested source payload is not a record: {:?}",
+            source.payload_type
+        );
     };
     assert_eq!(payload.fields.get("text"), Some(&Type::Text));
     assert!(program.expressions.iter().any(|expression| {
@@ -430,8 +447,8 @@ result:
 }
 
 #[test]
-fn checked_program_rejects_a_multiline_pipeline_without_its_parser_link() {
-    let mut parsed = boon_parser::parse_source(
+fn opaque_parser_product_keeps_the_multiline_pipeline_link() {
+    let parsed = boon_parser::parse_source(
         "checked-missing-pipeline-link.bn",
         r#"
 result:
@@ -442,36 +459,18 @@ result:
     .unwrap();
     let pipeline = parsed
         .expressions
-        .iter_mut()
+        .iter()
         .find(|expression| {
             matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/ceil")
         })
         .expect("multiline Number/ceil pipeline");
-    assert!(pipeline.linked_input.take().is_some());
+    assert!(pipeline.linked_input.is_some());
 
     let output = check_program(&parsed);
-    assert!(output.program.is_none());
-    assert_eq!(
-        output
-            .report
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| {
-                diagnostic.message == "pipeline continuation is missing its exact linked input"
-            })
-            .count(),
-        1,
-        "diagnostics: {:#?}",
-        output.report.diagnostics
-    );
-
-    let provisional = check_program_with_external_types(
-        &parsed,
-        &ExternalTypeEnvironment::provisional(ProgramRole::Client),
-    );
     assert!(
-        provisional.program.is_none(),
-        "structurally malformed linkage must not enter a provisional CheckedProgram"
+        output.program.is_some(),
+        "parser-linked multiline pipeline must cross the checked boundary: {:#?}",
+        output.report.diagnostics
     );
 }
 
@@ -574,7 +573,7 @@ FUNCTION render_button(element) {
     assert!(!program.expressions.iter().any(|expression| {
         matches!(
             &expression.kind,
-            CheckedExpressionKind::ExternalRead { canonical_path }
+            CheckedExpressionKind::ExternalRead { canonical_path, .. }
                 if canonical_path == "element.hovered"
         )
     }));
@@ -726,11 +725,47 @@ store: [
         "File/read_stream",
         &["file", "chunk_bytes", "retain_content"],
     );
-    assert!(
-        checked_callable(&program, "File/read_stream")
-            .effect
-            .invokes_host
+    let signature = checked_callable(&program, "File/read_stream");
+    assert_eq!(
+        signature
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.name.as_str(), parameter.requirement.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("file", CheckedParameterRequirement::Required),
+            (
+                "chunk_bytes",
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::ExactInteger {
+                        value: boon_effect_schema::FILE_STREAM_DEFAULT_CHUNK_BYTES,
+                    },
+                },
+            ),
+            ("retain_content", CheckedParameterRequirement::Required),
+        ]
     );
+    let call = program
+        .calls
+        .iter()
+        .find(|call| call.function == "File/read_stream")
+        .expect("checked host-effect call");
+    let chunk_formal = signature
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "chunk_bytes")
+        .expect("chunk_bytes parameter")
+        .decl_id;
+    assert!(
+        !call.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                CheckedCallEntry::Input { formal, .. } if *formal == chunk_formal
+            )
+        }),
+        "omitted schema default must remain distinguishable from an explicit argument"
+    );
+    assert!(signature.effect.invokes_host);
     assert_no_unbound_calls(&parsed, &program);
 }
 
@@ -891,10 +926,9 @@ fn numeric_infix_operators_reject_text_coercion() {
 
         assert!(
             report.diagnostics.iter().any(|diagnostic| {
-                diagnostic
-                    .message
-                    .contains(&format!("operator `{operator}` operand has incompatible type"))
-                    && diagnostic.message.contains("expected: NUMBER")
+                diagnostic.message.contains(&format!(
+                    "operator `{operator}` operand has incompatible type"
+                )) && diagnostic.message.contains("expected: NUMBER")
                     && diagnostic.message.contains("found: TEXT")
             }),
             "operator `{operator}` diagnostics: {:#?}",
@@ -990,6 +1024,18 @@ spot: Light/spot(
         "Light/spot",
         &["target", "color", "intensity", "radius", "softness"],
     );
+    assert_eq!(
+        checked_callable(&program, "List/sort_by")
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "direction")
+            .map(|parameter| parameter.requirement.clone()),
+        Some(CheckedParameterRequirement::Optional {
+            default: CheckedParameterDefault::CallableProfile {
+                profile: BUILTIN_OPTIONAL_PARAMETER_PROFILE_V1.to_owned(),
+            },
+        })
+    );
 
     let remove = checked_callable(&program, "List/remove");
     let item = remove
@@ -1003,6 +1049,7 @@ spot: Light/spot(
         .find(|parameter| parameter.name == "when")
         .expect("remove predicate");
     assert_eq!(item.kind, CheckedParameterKind::Out);
+    assert_eq!(item.requirement, CheckedParameterRequirement::Required);
     assert_eq!(
         when.evaluation_scope,
         CheckedEvaluationScope::Output {
@@ -1148,10 +1195,7 @@ fn program_support_source_records_reject_all_caller_digest_fields() {
         ("support_sources", "source_digest"),
         ("support_sources", "source_bundle_digest_v1"),
         ("bootstrap_support_sources", "source_digest"),
-        (
-            "bootstrap_support_sources",
-            "source_bundle_digest_v1",
-        ),
+        ("bootstrap_support_sources", "source_bundle_digest_v1"),
     ] {
         let source = format!(
             r#"
@@ -1564,11 +1608,21 @@ result: LIST { 1 } |> first(entry, new: entry)
     )
     .unwrap();
     let report = check(&parsed);
-    assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| { diagnostic.message.contains("OUT forwarding cycle") })
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("OUT forwarding cycle"))
+        .unwrap_or_else(|| {
+            panic!(
+                "missing OUT forwarding cycle diagnostic: {:#?}",
+                report.diagnostics
+            )
+        });
+    assert!(diagnostic.line > 1);
+    assert!(diagnostic.start < diagnostic.end);
+    assert_eq!(
+        &parsed.source[diagnostic.start..diagnostic.end],
+        "entry: OUT"
     );
 }
 
@@ -1602,11 +1656,7 @@ FUNCTION render(value) {
 
 result: render(value: 1, PASS: [store: [count: 2]])
 "#;
-    let parsed = boon_parser::parse_source(
-        "checked-pass.bn",
-        source,
-    )
-    .unwrap();
+    let parsed = boon_parser::parse_source("checked-pass.bn", source).unwrap();
     let output = check_program(&parsed);
     let program = output.program.expect("valid source has a checked program");
     let call = program
@@ -1615,13 +1665,19 @@ result: render(value: 1, PASS: [store: [count: 2]])
         .find(|call| call.function == "render")
         .expect("render call is checked");
     assert_eq!(call.entries.len(), 1);
-    let pass = call.pass.expect("explicit PASS clause is preserved");
-    assert_eq!(&source[pass.span.start..pass.span.end], "PASS: [store: [count: 2]]");
+    let (pass_value, pass_span) = call
+        .context_binding
+        .explicit()
+        .expect("explicit PASS clause is preserved");
+    assert_eq!(
+        &source[pass_span.start..pass_span.end],
+        "PASS: [store: [count: 2]]"
+    );
     assert_eq!(
         program
             .expressions
             .iter()
-            .find(|expression| expression.id == pass.value)
+            .find(|expression| expression.id == pass_value)
             .map(|expression| &expression.flow_type.ty),
         Some(&Type::Object(ObjectShape::from_ordered_fields(
             [(
@@ -1640,15 +1696,13 @@ result: render(value: 1, PASS: [store: [count: 2]])
     );
 }
 
-fn checked_pass_requirement_type<'a>(
-    program: &'a CheckedProgram,
-    callable: &str,
-) -> &'a Type {
-    &checked_callable(program, callable)
-        .pass_requirement
-        .as_ref()
+fn checked_pass_requirement_type<'a>(program: &'a CheckedProgram, callable: &str) -> &'a Type {
+    let signature = checked_callable(program, callable);
+    &program
+        .callable_context_formal(signature.decl_id)
         .unwrap_or_else(|| panic!("`{callable}` does not require PASS"))
         .scheme
+        .flow_type
         .ty
 }
 
@@ -1671,7 +1725,7 @@ FUNCTION contextual_value() {
     PASSED.value
 }
 
-number: contextual_value(PASS: [value: 1])
+number: contextual_value(PASS: [value: 1, ignored: TEXT { extra }])
 text: contextual_value(PASS: [value: TEXT { one }])
 "#,
     )
@@ -1685,12 +1739,28 @@ text: contextual_value(PASS: [value: TEXT { one }])
     let program = output.program.expect("polymorphic PASS calls are checked");
     let signature = checked_callable(&program, "contextual_value");
     assert!(signature.requires_pass());
+    let formal = signature.context_formal.expect("stable context formal");
+    assert_eq!(
+        formal,
+        ContextFormalId(signature.decl_id.0),
+        "context formal identity is derived from lexical callable identity"
+    );
+    let scheme = program
+        .context_formal(formal)
+        .expect("context formal table entry")
+        .scheme
+        .clone();
+    assert_eq!(scheme.projections, vec![vec!["value".to_owned()]]);
     let Type::Object(context) = checked_pass_requirement_type(&program, "contextual_value") else {
         panic!("direct PASSED projection must infer a structural context");
     };
     assert!(
         matches!(context.fields.get("value"), Some(Type::Var(_))),
         "unconstrained PASSED leaf must remain polymorphic: {context:?}"
+    );
+    assert!(
+        !context.fields.contains_key("ignored"),
+        "extra actual PASS fields must not be captured by the lexical scheme"
     );
 
     let calls = program
@@ -1701,13 +1771,85 @@ text: contextual_value(PASS: [value: TEXT { one }])
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].result.ty, Type::Number);
     assert_eq!(calls[1].result.ty, Type::Text);
+    assert!(calls.iter().all(|call| {
+        call.contextual_substitutions.len() == 1
+            && call.contextual_substitutions[0].formal == formal
+    }));
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.contextual_substitutions[0].value.clone())
+            .collect::<Vec<_>>(),
+        vec![Type::Number, Type::Text]
+    );
     assert!(program.expressions.iter().any(|expression| {
         matches!(
             &expression.kind,
-            CheckedExpressionKind::Passed { projection }
-                if projection == &["value".to_owned()]
+            CheckedExpressionKind::Passed {
+                formal: expression_formal,
+                projection,
+                access: CheckedPassedAccess::Read,
+            } if *expression_formal == formal && projection == &["value".to_owned()]
         ) && matches!(expression.flow_type.ty, Type::Var(_))
     }));
+
+    let reordered = boon_parser::parse_source(
+        "checked-polymorphic-pass-reordered.bn",
+        r#"
+FUNCTION contextual_value() {
+    PASSED.value
+}
+
+text: contextual_value(PASS: [value: TEXT { one }])
+number: contextual_value(PASS: [value: 1, ignored: TEXT { extra }])
+"#,
+    )
+    .unwrap();
+    let reordered = check_program(&reordered)
+        .program
+        .expect("reordered polymorphic PASS calls are checked");
+    let reordered_signature = checked_callable(&reordered, "contextual_value");
+    let reordered_formal = reordered_signature
+        .context_formal
+        .expect("reordered stable context formal");
+    assert_eq!(reordered_formal, formal);
+    assert_eq!(
+        reordered
+            .context_formal(reordered_formal)
+            .expect("reordered context scheme")
+            .scheme,
+        scheme,
+        "unrelated call-site order must not widen or renumber the lexical scheme"
+    );
+}
+
+#[test]
+fn checked_program_rejects_conflicting_lexical_pass_constraints() {
+    let parsed = boon_parser::parse_source(
+        "checked-conflicting-pass-scheme.bn",
+        r#"
+FUNCTION conflicting() {
+    [
+        number: PASSED.value + 1
+        text: PASSED.value |> Text/trim()
+    ]
+}
+
+result: conflicting(PASS: [value: 1])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.program.is_none());
+    assert!(
+        output.report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("has no principal PASSED context scheme")
+        }),
+        "incompatible lexical constraints must reject instead of widening: {:#?}",
+        output.report.diagnostics
+    );
 }
 
 #[test]
@@ -1963,6 +2105,8 @@ result: outer(PASS: [store: [count: 2]])
 FUNCTION leaf() {
     PASSED.store.count + 1
 }
+
+rounded: 1 |> Number/ceil()
 "#,
     )
     .unwrap();
@@ -1983,13 +2127,112 @@ FUNCTION leaf() {
         assert_pass_count_requirement(&program, callable);
     }
     assert!(program.calls.iter().any(|call| {
-        call.function == "middle" && call.owner_callable.is_some() && call.pass.is_none()
+        call.function == "middle"
+            && call.owner_callable.is_some()
+            && matches!(
+                call.context_binding,
+                CheckedContextBinding::Inherited { .. }
+            )
     }));
     assert!(program.calls.iter().any(|call| {
-        call.function == "leaf" && call.owner_callable.is_some() && call.pass.is_none()
+        call.function == "leaf"
+            && call.owner_callable.is_some()
+            && matches!(
+                call.context_binding,
+                CheckedContextBinding::Inherited { .. }
+            )
     }));
     assert!(program.calls.iter().any(|call| {
-        call.function == "outer" && call.owner_callable.is_none() && call.pass.is_some()
+        call.function == "outer"
+            && call.owner_callable.is_none()
+            && matches!(call.context_binding, CheckedContextBinding::Explicit { .. })
+    }));
+    assert!(program.calls.iter().any(|call| {
+        call.function == "Number/ceil"
+            && matches!(call.context_binding, CheckedContextBinding::None)
+    }));
+}
+
+#[test]
+fn inherited_polymorphic_context_uses_formal_keyed_substitutions() {
+    let parsed = boon_parser::parse_source(
+        "checked-inherited-polymorphic-context.bn",
+        r#"
+FUNCTION wrapper() {
+    leaf()
+}
+
+FUNCTION leaf() {
+    PASSED.value
+}
+
+number: wrapper(PASS: [value: 1])
+text: wrapper(PASS: [value: TEXT { one }])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("polymorphic wrapper is checked");
+    let leaf_formal = checked_callable(&program, "leaf")
+        .context_formal
+        .expect("leaf context formal");
+    let inherited = program
+        .calls
+        .iter()
+        .find(|call| call.function == "leaf")
+        .expect("inherited leaf call");
+    assert!(matches!(
+        inherited.context_binding,
+        CheckedContextBinding::Inherited { .. }
+    ));
+    assert!(
+        !inherited.contextual_substitutions.is_empty()
+            && inherited
+                .contextual_substitutions
+                .iter()
+                .all(|substitution| substitution.formal == leaf_formal)
+    );
+}
+
+#[test]
+fn checked_program_preserves_drain_passed_access_and_formal_identity() {
+    let parsed = boon_parser::parse_source(
+        "checked-drain-passed.bn",
+        r#"
+events: SOURCE
+
+FUNCTION take_event() {
+    DRAIN { PASSED.events }
+}
+
+result: take_event(PASS: [events: events])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("DRAIN PASSED is checked");
+    let formal = checked_callable(&program, "take_event")
+        .context_formal
+        .expect("draining callable context formal");
+    assert!(program.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            CheckedExpressionKind::Passed {
+                formal: expression_formal,
+                projection,
+                access: CheckedPassedAccess::Drain,
+            } if *expression_formal == formal && projection == &["events".to_owned()]
+        )
     }));
 }
 
@@ -2023,7 +2266,9 @@ result: wrapper()
         "an explicit PASS must cut requirement propagation"
     );
     assert!(program.calls.iter().any(|call| {
-        call.function == "leaf" && call.owner_callable.is_some() && call.pass.is_some()
+        call.function == "leaf"
+            && call.owner_callable.is_some()
+            && matches!(call.context_binding, CheckedContextBinding::Explicit { .. })
     }));
 }
 
@@ -2137,13 +2382,16 @@ result: leaf(PASS: [store: [count: TEXT { wrong }]])
     .unwrap();
     let output = check_program(&parsed);
     assert!(output.program.is_none());
-    assert!(output.report.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .contains("`FUNCTION leaf` PASS context field `store.count` has an incompatible type")
-            && diagnostic.message.contains("count: NUMBER")
-            && diagnostic.message.contains("found:")
-    }), "diagnostics: {:#?}", output.report.diagnostics);
+    assert!(
+        output.report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains(
+                "`FUNCTION leaf` PASS context field `store.count` has an incompatible type",
+            ) && diagnostic.message.contains("count: NUMBER")
+                && diagnostic.message.contains("found:")
+        }),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
 }
 
 #[test]
@@ -2170,7 +2418,11 @@ document: Document/new(root: button(element: []))
         output.report.diagnostics
     );
     let program = output.program.expect("element context wrapper is checked");
-    assert!(!checked_callable(&program, "Element/button").contexts.is_empty());
+    assert!(
+        !checked_callable(&program, "Element/button")
+            .contexts
+            .is_empty()
+    );
     assert!(!checked_callable(&program, "Element/button").requires_pass());
     assert!(!checked_callable(&program, "button").requires_pass());
 }
@@ -2556,7 +2808,7 @@ result: recover(input: Ready[value: 1])
     assert!(!program.expressions.iter().any(|expression| {
         matches!(
             &expression.kind,
-            CheckedExpressionKind::ExternalRead { canonical_path }
+            CheckedExpressionKind::ExternalRead { canonical_path, .. }
                 if canonical_path == "fallback"
         )
     }));
@@ -3119,7 +3371,7 @@ result: entry_view(entry: [id: 1])
 }
 
 #[test]
-fn checked_record_field_initializer_reads_a_same_name_outer_parameter() {
+fn checked_record_field_initializer_rejects_a_same_name_outer_parameter_capture() {
     let parsed = boon_parser::parse_source(
         "checked-record-parameter-shadow.bn",
         r#"
@@ -3134,38 +3386,25 @@ result: wrapped(value: TEXT { ok })
     )
     .unwrap();
     let output = check_program(&parsed);
-    assert!(
-        !output.report.has_errors(),
-        "diagnostics: {:#?}",
-        output.report.diagnostics
-    );
-    let program = output
-        .program
-        .expect("same-name outer parameter is checked");
-    let signature = checked_callable(&program, "wrapped");
-    let parameter = signature.parameters.first().expect("value parameter");
-    let result = signature.result_expression.expect("record result");
-    let field_value = program
-        .expressions
+    assert!(output.program.is_none());
+    let diagnostic = output
+        .report
+        .diagnostics
         .iter()
-        .find(|expression| expression.id == result)
-        .and_then(|expression| match &expression.kind {
-            CheckedExpressionKind::Record { fields } => fields.first().map(|field| field.value),
-            _ => None,
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("canonical checked value contains an expansion cycle")
         })
-        .expect("record field value");
-    assert!(matches!(
-        program
-            .expressions
-            .iter()
-            .find(|expression| expression.id == field_value)
-            .map(|expression| &expression.kind),
-        Some(CheckedExpressionKind::Read {
-            target,
-            projection,
-            ..
-        }) if *target == parameter.decl_id && projection.is_empty()
-    ));
+        .unwrap_or_else(|| {
+            panic!(
+                "missing same-name record self-cycle diagnostic: {:#?}",
+                output.report.diagnostics
+            )
+        });
+    assert_eq!(diagnostic.line, 4);
+    assert!(diagnostic.start < diagnostic.end);
+    assert_eq!(&parsed.source[diagnostic.start..diagnostic.end], "value");
 }
 
 #[test]
@@ -3214,6 +3453,63 @@ result: wrapped(input: TEXT { ok })
             target, projection, ..
         })
             if *target == parameter.decl_id && projection.is_empty()
+    ));
+    assert_no_unbound_calls(&parsed, &program);
+}
+
+#[test]
+fn checked_record_fields_resolve_forward_references_across_the_whole_scope() {
+    let parsed = boon_parser::parse_source(
+        "checked-record-forward-reference.bn",
+        r#"
+FUNCTION wrapped(input) {
+    [
+        first: second
+        second: input
+    ]
+}
+
+result: wrapped(input: TEXT { ok })
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output
+        .program
+        .expect("order-independent record fields are checked");
+    let signature = checked_callable(&program, "wrapped");
+    let result = signature.result_expression.expect("record result");
+    let record = program
+        .expressions
+        .iter()
+        .find(|expression| expression.id == result)
+        .expect("record result expression");
+    let CheckedExpressionKind::Record { fields } = &record.kind else {
+        panic!("record wrapper result is not a checked record: {record:?}");
+    };
+    let first = fields
+        .iter()
+        .find(|field| field.name == "first")
+        .expect("first field");
+    let second = fields
+        .iter()
+        .find(|field| field.name == "second")
+        .expect("second field");
+    let second_declaration = second.declaration.expect("second field declaration");
+    assert!(matches!(
+        program
+            .expressions
+            .iter()
+            .find(|expression| expression.id == first.value)
+            .map(|expression| &expression.kind),
+        Some(CheckedExpressionKind::Read {
+            target, projection, ..
+        }) if *target == second_declaration && projection.is_empty()
     ));
     assert_no_unbound_calls(&parsed, &program);
 }
@@ -3408,7 +3704,7 @@ rows:
     assert!(
         !program.expressions.iter().any(|expression| matches!(
             &expression.kind,
-            CheckedExpressionKind::ExternalRead { canonical_path } if canonical_path == "draft"
+            CheckedExpressionKind::ExternalRead { canonical_path, .. } if canonical_path == "draft"
         )),
         "named HOLD alias escaped as an ambient read: {:#?}",
         program.expressions
@@ -3916,7 +4212,9 @@ FUNCTION row_label(row) {
 
     assert!(report.has_errors());
     assert!(report.diagnostics.iter().any(|diagnostic| {
-        diagnostic.message.contains("object is missing field `name`")
+        diagnostic
+            .message
+            .contains("object is missing field `name`")
     }));
 }
 
@@ -4030,7 +4328,10 @@ FUNCTION preserve(value) {
         ],
     )
     .expect("first event field");
-    assert_ne!(completed, &events, "unrelated projections share one type variable");
+    assert_ne!(
+        completed, &events,
+        "unrelated projections share one type variable"
+    );
 }
 
 #[test]

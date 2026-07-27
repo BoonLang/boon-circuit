@@ -1,4 +1,5 @@
 mod architecture;
+mod dependency_classifier;
 mod fjordpulse_traceability;
 mod gates;
 mod language_surface;

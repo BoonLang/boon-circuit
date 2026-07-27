@@ -1,4 +1,11 @@
+#[cfg(test)]
 use boon_parser::ParsedProgram;
+use boon_semantic::out_net;
+pub use boon_semantic::{
+    ProducerMaterializationMode as ProducerFunctionMode,
+    ProducerMaterializationRequest as ProducerFunctionLoweringRequest, StaticOwnerDef,
+    StaticOwnerId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -8,13 +15,45 @@ use std::time::Instant;
 use web_time::Instant;
 
 mod contextual_expansion;
-mod out_net;
+mod semantic_mapping;
 mod semantic_migration;
 
 pub use semantic_migration::*;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Opaque executable IR whose complete provenance is fixed at the sole
+/// verification-gated lowering boundary.
+///
+/// External crates cannot construct the wrapper:
+///
+/// ```compile_fail
+/// use boon_ir::{ErasedProgram, ErasedProgramFields};
+///
+/// fn forge(fields: ErasedProgramFields) -> ErasedProgram {
+///     ErasedProgram {
+///         fields,
+///         source_bundle_digest_v1: todo!(),
+///         semantic_program_digest: todo!(),
+///         verification_manifest_digest: todo!(),
+///     }
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ErasedProgram {
+    #[serde(flatten)]
+    fields: ErasedProgramFields,
+    source_bundle_digest_v1: boon_contract::SourceBundleDigestV1,
+    semantic_program_digest: boon_semantic::SemanticProgramDigestV1,
+    verification_manifest_digest: boon_verify::VerificationManifestDigestV1,
+}
+
+/// Public read-only schema projected by an opaque `ErasedProgram`.
+///
+/// Callers may inspect or serialize these fields, but only `erase_and_lower`
+/// can wrap them in the executable artifact accepted by compiler backends.
+/// Deserializing or constructing this DTO never creates an `ErasedProgram`.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ErasedProgramFields {
     pub executable: ExecutableProgram,
     pub scope_index: ErasedScopeIndex,
     pub expression_count: usize,
@@ -52,6 +91,144 @@ pub struct ErasedProgram {
     pub named_value_types: boon_typecheck::NamedValueTypeTable,
     pub hidden_identity_verified: bool,
     pub static_schedule_verified: bool,
+}
+
+impl std::ops::Deref for ErasedProgram {
+    type Target = ErasedProgramFields;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl ErasedProgram {
+    pub const fn source_bundle_digest_v1(&self) -> boon_contract::SourceBundleDigestV1 {
+        self.source_bundle_digest_v1
+    }
+
+    pub const fn executable(&self) -> &ExecutableProgram {
+        &self.fields.executable
+    }
+
+    pub const fn scope_index(&self) -> &ErasedScopeIndex {
+        &self.fields.scope_index
+    }
+
+    pub const fn expression_count(&self) -> usize {
+        self.fields.expression_count
+    }
+
+    pub const fn expression_coverage(&self) -> &ExpressionCoverage {
+        &self.fields.expression_coverage
+    }
+
+    pub const fn distributed_references(&self) -> &DistributedReferences {
+        &self.fields.distributed_references
+    }
+
+    pub fn producer_function_instances(&self) -> &[ProducerFunctionInstance] {
+        &self.fields.producer_function_instances
+    }
+
+    pub const fn semantic_index(&self) -> &SemanticIndex {
+        &self.fields.semantic_index
+    }
+
+    pub const fn graph_node_count(&self) -> usize {
+        self.fields.graph_node_count
+    }
+
+    pub fn row_scopes(&self) -> &[RowScope] {
+        &self.fields.row_scopes
+    }
+
+    pub fn sources(&self) -> &[SourcePort] {
+        &self.fields.sources
+    }
+
+    pub fn host_ports(&self) -> &[HostPortDeclaration] {
+        &self.fields.host_ports
+    }
+
+    pub fn state_cells(&self) -> &[StateCell] {
+        &self.fields.state_cells
+    }
+
+    pub fn lists(&self) -> &[ListMemory] {
+        &self.fields.lists
+    }
+
+    pub fn semantic_memory(&self) -> &[SemanticMemory] {
+        &self.fields.semantic_memory
+    }
+
+    pub fn migration_edges(&self) -> &[MigrationEdge] {
+        &self.fields.migration_edges
+    }
+
+    pub fn output_values(&self) -> &[OutputRootValue] {
+        &self.fields.output_values
+    }
+
+    pub fn derived_values(&self) -> &[DerivedValue] {
+        &self.fields.derived_values
+    }
+
+    pub fn dependencies(&self) -> &[DependencyEdge] {
+        &self.fields.dependencies
+    }
+
+    pub fn possible_causes(&self) -> &[PossibleCause] {
+        &self.fields.possible_causes
+    }
+
+    pub fn state_update_arms(&self) -> &[StateUpdateArm] {
+        &self.fields.state_update_arms
+    }
+
+    pub fn list_mutations(&self) -> &[ListMutation] {
+        &self.fields.list_mutations
+    }
+
+    pub fn list_projections(&self) -> &[ListProjection] {
+        &self.fields.list_projections
+    }
+
+    pub fn materializations(&self) -> &[ContextualMaterialization] {
+        &self.fields.materializations
+    }
+
+    pub fn view_bindings(&self) -> &[ViewBinding] {
+        &self.fields.view_bindings
+    }
+
+    pub const fn expression_types(&self) -> &boon_typecheck::ExprTypeTable {
+        &self.fields.expression_types
+    }
+
+    pub const fn function_types(&self) -> &boon_typecheck::FunctionTypeTable {
+        &self.fields.function_types
+    }
+
+    pub const fn named_value_types(&self) -> &boon_typecheck::NamedValueTypeTable {
+        &self.fields.named_value_types
+    }
+
+    pub const fn hidden_identity_verified(&self) -> bool {
+        self.fields.hidden_identity_verified
+    }
+
+    pub const fn static_schedule_verified(&self) -> bool {
+        self.fields.static_schedule_verified
+    }
+
+    pub const fn semantic_program_digest(&self) -> boon_semantic::SemanticProgramDigestV1 {
+        self.semantic_program_digest
+    }
+
+    pub const fn verification_manifest_digest(&self) -> boon_verify::VerificationManifestDigestV1 {
+        self.verification_manifest_digest
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -113,13 +290,6 @@ pub struct ProducerFunctionInstance {
     pub arguments: Vec<ProducerFunctionArgument>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProducerFunctionMode {
-    Current,
-    Invocation,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProducerFunctionArgument {
     pub name: String,
@@ -127,317 +297,6 @@ pub struct ProducerFunctionArgument {
     pub flow_type: boon_typecheck::FlowType,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_expressions: Vec<ExecutableExprId>,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ProducerFunctionLoweringRequest {
-    pub identity: [u8; 32],
-    pub local_function: String,
-    pub mode: ProducerFunctionMode,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum DistributedCallOccurrenceRoot {
-    Program,
-    Producer([u8; 32]),
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct DistributedCallOccurrence {
-    pub root: DistributedCallOccurrenceRoot,
-    pub occurrence_path: String,
-    pub canonical_function: String,
-    pub producer_role: boon_typecheck::ProgramRole,
-    pub mode: ProducerFunctionMode,
-}
-
-#[derive(Clone)]
-struct DistributedCallAnalysisFrame {
-    owner_callable: Option<boon_typecheck::DeclId>,
-    root: DistributedCallOccurrenceRoot,
-    path: String,
-    active_callables: Vec<boon_typecheck::DeclId>,
-    invocation_context: bool,
-}
-
-pub fn distributed_call_occurrences(
-    program: &boon_typecheck::CheckedProgram,
-    producer_requests: &[ProducerFunctionLoweringRequest],
-) -> Result<Vec<DistributedCallOccurrence>, String> {
-    let mut requests = producer_requests.to_vec();
-    requests.sort();
-    requests.dedup();
-    for request in &requests {
-        if request.identity.iter().all(|byte| *byte == 0) {
-            return Err("producer function lowering request identity must be nonzero".to_owned());
-        }
-    }
-    for pair in requests.windows(2) {
-        if pair[0].identity == pair[1].identity {
-            return Err(format!(
-                "producer function identity {} is requested for both `{}` and `{}`",
-                producer_identity_text(pair[0].identity),
-                pair[0].local_function,
-                pair[1].local_function,
-            ));
-        }
-    }
-
-    let mut calls_by_owner =
-        BTreeMap::<Option<boon_typecheck::DeclId>, Vec<&boon_typecheck::CheckedCall>>::new();
-    for call in &program.calls {
-        calls_by_owner
-            .entry(call.owner_callable)
-            .or_default()
-            .push(call);
-    }
-    for calls in calls_by_owner.values_mut() {
-        calls.sort_by_key(|call| (call.span.line, call.span.start, call.span.end, call.id));
-    }
-
-    let mut frames = vec![DistributedCallAnalysisFrame {
-        owner_callable: None,
-        root: DistributedCallOccurrenceRoot::Program,
-        path: "program".to_owned(),
-        active_callables: Vec::new(),
-        invocation_context: false,
-    }];
-    for request in requests.into_iter().rev() {
-        let callable = exact_producer_callable(program, &request.local_function)?;
-        frames.push(DistributedCallAnalysisFrame {
-            owner_callable: Some(callable.decl_id),
-            root: DistributedCallOccurrenceRoot::Producer(request.identity),
-            path: format!("producer:{}", producer_identity_text(request.identity)),
-            active_callables: vec![callable.decl_id],
-            invocation_context: request.mode == ProducerFunctionMode::Invocation,
-        });
-    }
-
-    let expressions = program
-        .expressions
-        .iter()
-        .map(|expression| (expression.id, expression))
-        .collect::<BTreeMap<_, _>>();
-    let callables = program
-        .callables
-        .iter()
-        .map(|callable| (callable.decl_id, callable))
-        .collect::<BTreeMap<_, _>>();
-    let temporally_gated = temporally_gated_checked_expressions(program);
-    let mut occurrences = BTreeMap::<String, DistributedCallOccurrence>::new();
-    while let Some(frame) = frames.pop() {
-        let calls = calls_by_owner
-            .get(&frame.owner_callable)
-            .cloned()
-            .unwrap_or_default();
-        for call in calls.into_iter().rev() {
-            let callable = callables.get(&call.callable).copied().ok_or_else(|| {
-                format!(
-                    "checked call {} references missing callable {}",
-                    call.id.0, call.callable.0
-                )
-            })?;
-            let segment = out_net::checked_call_occurrence_segment(program, call.id)?;
-            let path = format!("{}/{}", frame.path, segment);
-            let invocation_context =
-                frame.invocation_context || temporally_gated.contains(&call.expression);
-            match callable.kind {
-                boon_typecheck::CheckedCallableKind::User => {
-                    if frame.active_callables.contains(&callable.decl_id) {
-                        return Err(format!(
-                            "distributed call analysis encountered recursive callable `{}`",
-                            callable.name
-                        ));
-                    }
-                    let mut active_callables = frame.active_callables.clone();
-                    active_callables.push(callable.decl_id);
-                    frames.push(DistributedCallAnalysisFrame {
-                        owner_callable: Some(callable.decl_id),
-                        root: frame.root,
-                        path,
-                        active_callables,
-                        invocation_context,
-                    });
-                }
-                boon_typecheck::CheckedCallableKind::External => {
-                    let Some(producer_role) = distributed_function_role(&call.function) else {
-                        continue;
-                    };
-                    let current_capable = !invocation_context
-                        && call.result.mode == boon_typecheck::FlowMode::Continuous
-                        && call.entries.iter().all(|entry| match entry {
-                            boon_typecheck::CheckedCallEntry::Input { value, .. } => {
-                                expressions.get(value).is_some_and(|expression| {
-                                    expression.flow_type.mode
-                                        == boon_typecheck::FlowMode::Continuous
-                                })
-                            }
-                            _ => false,
-                        })
-                        && !callable.effect.emits_source
-                        && !callable.effect.invokes_host;
-                    let occurrence = DistributedCallOccurrence {
-                        root: frame.root,
-                        occurrence_path: path.clone(),
-                        canonical_function: call.function.clone(),
-                        producer_role,
-                        mode: if current_capable {
-                            ProducerFunctionMode::Current
-                        } else {
-                            ProducerFunctionMode::Invocation
-                        },
-                    };
-                    if let Some(previous) = occurrences.insert(path.clone(), occurrence.clone())
-                        && previous != occurrence
-                    {
-                        return Err(format!(
-                            "distributed occurrence `{path}` resolves to conflicting call contracts"
-                        ));
-                    }
-                }
-                boon_typecheck::CheckedCallableKind::Builtin => {}
-            }
-        }
-    }
-    Ok(occurrences.into_values().collect())
-}
-
-fn temporally_gated_checked_expressions(
-    program: &boon_typecheck::CheckedProgram,
-) -> BTreeSet<boon_typecheck::CheckedExprId> {
-    let expressions = program
-        .expressions
-        .iter()
-        .map(|expression| (expression.id, expression))
-        .collect::<BTreeMap<_, _>>();
-    let calls = program
-        .calls
-        .iter()
-        .map(|call| (call.id, call))
-        .collect::<BTreeMap<_, _>>();
-    let mut pending = Vec::new();
-    for expression in &program.expressions {
-        match &expression.kind {
-            boon_typecheck::CheckedExpressionKind::Then {
-                output: Some(output),
-                ..
-            } => {
-                pending.push(*output);
-            }
-            boon_typecheck::CheckedExpressionKind::When { input, arms }
-            | boon_typecheck::CheckedExpressionKind::While { input, arms }
-                if expressions.get(input).is_some_and(|input| {
-                    input.flow_type.mode != boon_typecheck::FlowMode::Continuous
-                }) =>
-            {
-                pending.extend(arms.iter().copied());
-            }
-            _ => {}
-        }
-    }
-    let mut gated = BTreeSet::new();
-    while let Some(expression) = pending.pop() {
-        if !gated.insert(expression) {
-            continue;
-        }
-        let Some(expression) = expressions.get(&expression) else {
-            continue;
-        };
-        pending.extend(checked_expression_children_for_call_analysis(
-            &expression.kind,
-            &calls,
-        ));
-    }
-    gated
-}
-
-fn checked_expression_children_for_call_analysis(
-    kind: &boon_typecheck::CheckedExpressionKind,
-    calls: &BTreeMap<boon_typecheck::CheckedCallId, &boon_typecheck::CheckedCall>,
-) -> Vec<boon_typecheck::CheckedExprId> {
-    use boon_typecheck::CheckedExpressionKind as Kind;
-    match kind {
-        Kind::TextTemplate { segments } => segments
-            .iter()
-            .filter_map(|segment| match segment {
-                boon_typecheck::CheckedTextSegment::Dynamic { value } => Some(*value),
-                boon_typecheck::CheckedTextSegment::Static { .. } => None,
-            })
-            .collect(),
-        Kind::TaggedObject { fields, .. } | Kind::Object { fields } | Kind::Record { fields } => {
-            fields.iter().map(|field| field.value).collect()
-        }
-        Kind::Call { call } => calls
-            .get(call)
-            .into_iter()
-            .flat_map(|call| {
-                call.entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        boon_typecheck::CheckedCallEntry::Input { value, .. } => Some(*value),
-                        _ => None,
-                    })
-                    .chain(call.pass.map(|pass| pass.value))
-            })
-            .collect(),
-        Kind::Draining { input } => vec![*input],
-        Kind::Hold { initial, .. } => vec![*initial],
-        Kind::Latest { branches } => branches.clone(),
-        Kind::When { input, arms } | Kind::While { input, arms } => {
-            let mut children = vec![*input];
-            children.extend(arms.iter().copied());
-            children
-        }
-        Kind::Then { input, output } => {
-            let mut children = vec![*input];
-            children.extend(*output);
-            children
-        }
-        Kind::Infix { left, right, .. } => vec![*left, *right],
-        Kind::MatchArm { output, .. } => output.iter().copied().collect(),
-        Kind::Block { bindings, result } => bindings
-            .iter()
-            .map(|binding| binding.value)
-            .chain(result.iter().copied())
-            .collect(),
-        Kind::List { items, .. } | Kind::Bytes { items, .. } => items.clone(),
-        Kind::Read { .. }
-        | Kind::Passed { .. }
-        | Kind::ExternalRead { .. }
-        | Kind::Drain { .. }
-        | Kind::Text { .. }
-        | Kind::Number { .. }
-        | Kind::BytesByte { .. }
-        | Kind::Bool { .. }
-        | Kind::Tag { .. }
-        | Kind::Source
-        | Kind::Delimiter
-        | Kind::Invalid { .. } => Vec::new(),
-    }
-}
-
-fn exact_producer_callable<'a>(
-    program: &'a boon_typecheck::CheckedProgram,
-    local_function: &str,
-) -> Result<&'a boon_typecheck::CheckedCallableSignature, String> {
-    let matches = program
-        .callables
-        .iter()
-        .filter(|callable| {
-            callable.kind == boon_typecheck::CheckedCallableKind::User
-                && callable.name == local_function
-        })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [callable] => Ok(*callable),
-        [] => Err(format!(
-            "producer function `{local_function}` does not resolve to a user function"
-        )),
-        _ => Err(format!(
-            "producer function `{local_function}` resolves ambiguously to {} user functions",
-            matches.len()
-        )),
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -499,7 +358,6 @@ typed_usize_ids!(
     ViewBindingId,
     SourceUnitId,
     FunctionId,
-    StaticOwnerId,
     ErasedBindingId,
     ErasedReadId,
     DiagnosticSpanId,
@@ -1836,14 +1694,6 @@ impl ContextualMaterialization {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StaticOwnerDef {
-    pub id: StaticOwnerId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<StaticOwnerId>,
-    pub child_ordinal: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DependencyEdge {
     pub from: String,
     pub to: String,
@@ -1913,29 +1763,77 @@ pub enum ViewBindingKind {
     Target,
 }
 
-pub fn lower(program: &ParsedProgram) -> Result<ErasedProgram, String> {
+/// The sole production semantic-to-executable lowering boundary.
+///
+/// `ContractVerifiedProgram` has private construction in `boon_verify`, so a
+/// checked or semantic program cannot reach executable IR without first
+/// passing the completeness-checked verification manifest.
+pub fn erase_and_lower(
+    verified: boon_verify::ContractVerifiedProgram,
+) -> Result<ErasedProgram, String> {
+    let (semantic, verification_manifest_digest) = verified.into_lowering_parts();
+    semantic.validate().map_err(|error| error.to_string())?;
+    let (
+        source_bundle_digest_v1,
+        execution_graph,
+        resource_graph,
+        reactive_graph,
+        lowering_contract,
+        view_binding_graph,
+        scope_storage_graph,
+        memory_graph,
+        semantic_program_digest,
+        _dependency_manifest_digest,
+    ) = semantic.into_lowering_parts();
+    let fields = lower_verified_semantic_execution(
+        execution_graph,
+        resource_graph,
+        reactive_graph,
+        lowering_contract,
+        view_binding_graph,
+        scope_storage_graph,
+        memory_graph,
+    )?;
+    let erased = ErasedProgram {
+        fields,
+        source_bundle_digest_v1,
+        semantic_program_digest,
+        verification_manifest_digest,
+    };
+    verify_erased_scope_index(&erased)?;
+    verify_static_schedule(&erased)?;
+    verify_hidden_identity(&erased)?;
+    Ok(erased)
+}
+
+#[cfg(test)]
+fn lower(program: &ParsedProgram) -> Result<ErasedProgram, String> {
     lower_with_external_types(program, &boon_typecheck::ExternalTypeEnvironment::default())
 }
 
-pub fn lower_runtime(program: &ParsedProgram) -> Result<ErasedProgram, String> {
+#[cfg(test)]
+fn lower_runtime(program: &ParsedProgram) -> Result<ErasedProgram, String> {
     lower_runtime_with_external_types(program, &boon_typecheck::ExternalTypeEnvironment::default())
 }
 
-pub fn lower_with_external_types(
+#[cfg(test)]
+fn lower_with_external_types(
     program: &ParsedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
 ) -> Result<ErasedProgram, String> {
     lower_with_typecheck(program, external_types, true, &[])
 }
 
-pub fn lower_runtime_with_external_types(
+#[cfg(test)]
+fn lower_runtime_with_external_types(
     program: &ParsedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
 ) -> Result<ErasedProgram, String> {
     lower_with_typecheck(program, external_types, false, &[])
 }
 
-pub fn lower_runtime_with_external_types_and_producer_functions(
+#[cfg(test)]
+fn lower_runtime_with_external_types_and_producer_functions(
     program: &ParsedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
     requests: &[ProducerFunctionLoweringRequest],
@@ -1947,123 +1845,26 @@ fn producer_identity_text(identity: [u8; 32]) -> String {
     identity.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn resolve_producer_function_roots(
-    program: &boon_typecheck::CheckedProgram,
-    requests: &[ProducerFunctionLoweringRequest],
-) -> Result<Vec<out_net::ProducerRootSpec>, String> {
-    let mut requests = requests.to_vec();
-    requests.sort();
-    requests.dedup();
-    for request in &requests {
-        if request.identity.iter().all(|byte| *byte == 0) {
-            return Err("producer function lowering request identity must be nonzero".to_owned());
-        }
-    }
-    for pair in requests.windows(2) {
-        if pair[0].identity == pair[1].identity {
-            return Err(format!(
-                "producer function identity {} is requested for both `{}` and `{}`",
-                producer_identity_text(pair[0].identity),
-                pair[0].local_function,
-                pair[1].local_function,
-            ));
-        }
-    }
-    let first_statement = program
-        .statements
-        .iter()
-        .map(|statement| statement.id.0 as usize)
-        .max()
-        .map_or(0, |id| id.saturating_add(1));
-    requests
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, request)| {
-            let callable = exact_producer_callable(program, &request.local_function)?;
-            if callable.result.mode != boon_typecheck::FlowMode::Continuous {
-                return Err(format!(
-                    "producer function `{}` result must be continuous, found {:?}",
-                    request.local_function, callable.result.mode
-                ));
-            }
-            let out_parameters = callable
-                .parameters
-                .iter()
-                .filter(|parameter| parameter.kind != boon_typecheck::CheckedParameterKind::Value)
-                .map(|parameter| parameter.name.as_str())
-                .collect::<Vec<_>>();
-            if !out_parameters.is_empty() {
-                return Err(format!(
-                    "producer function `{}` has unsupported OUT parameter(s): {}",
-                    request.local_function,
-                    out_parameters.join(", ")
-                ));
-            }
-            if callable.requires_pass() {
-                return Err(format!(
-                    "producer function `{}` has an unsupported PASS-in-signature requirement",
-                    request.local_function
-                ));
-            }
-            if callable.result_expression.is_none() {
-                return Err(format!(
-                    "producer function `{}` has no checked result expression",
-                    request.local_function
-                ));
-            }
-            if callable
-                .parameters
-                .iter()
-                .any(|parameter| runtime_type_contains_var(&parameter.flow_type.ty))
-                || runtime_type_contains_var(&callable.result.ty)
-            {
-                return Err(format!(
-                    "producer function `{}` has no concrete distributed boundary specialization",
-                    request.local_function
-                ));
-            }
-            let function = FunctionId(ordinal);
-            let mut parameters = callable.parameters.clone();
-            parameters.sort_by_key(|parameter| parameter.ordinal);
-            let parameters = parameters
-                .into_iter()
-                .map(|parameter| out_net::ProducerRootParameter {
-                    formal: parameter.decl_id,
-                    parameter: ExecutableParameterId {
-                        function,
-                        ordinal: parameter.ordinal,
-                    },
-                    name: parameter.name,
-                    flow_type: parameter.flow_type,
-                })
-                .collect();
-            let invocation = request.mode == ProducerFunctionMode::Invocation;
-            Ok(out_net::ProducerRootSpec {
-                identity: request.identity,
-                mode: request.mode,
-                callable: callable.decl_id,
-                function,
-                function_name: callable.name.clone(),
-                result_statement: ExecutableStatementId(first_statement.saturating_add(ordinal)),
-                result_declaration: callable.decl_id,
-                result_path: format!(
-                    "@producer/{}/result",
-                    producer_identity_text(request.identity)
-                ),
-                result_type: if invocation {
-                    boon_typecheck::FlowType {
-                        mode: boon_typecheck::FlowMode::PresentOrAbsent,
-                        ty: callable.result.ty.clone(),
-                    }
-                } else {
-                    callable.result.clone()
-                },
-                parameters,
-            })
-        })
-        .collect()
+fn executable_producer_function_id(id: boon_semantic::ProducerFunctionId) -> FunctionId {
+    FunctionId(id.as_usize())
 }
 
+fn executable_producer_parameter_id(
+    id: boon_semantic::ProducerParameterId,
+) -> ExecutableParameterId {
+    ExecutableParameterId {
+        function: executable_producer_function_id(id.function),
+        ordinal: id.ordinal,
+    }
+}
+
+fn executable_producer_result_statement_id(
+    id: boon_semantic::ProducerResultStatementId,
+) -> ExecutableStatementId {
+    ExecutableStatementId(id.as_usize())
+}
+
+#[cfg(test)]
 fn lower_with_typecheck(
     program: &ParsedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
@@ -2147,10 +1948,55 @@ fn lower_with_typecheck(
     lower_checked(checked_program, producer_requests)
 }
 
-pub fn lower_checked(
+#[cfg(test)]
+fn lower_checked(
     checked_program: boon_typecheck::CheckedProgram,
     producer_requests: &[ProducerFunctionLoweringRequest],
 ) -> Result<ErasedProgram, String> {
+    let semantic = boon_semantic::elaborate(checked_program, producer_requests)
+        .map_err(|error| error.to_string())?;
+    let verified =
+        boon_verify::verify_explicit_contracts(semantic).map_err(|error| error.to_string())?;
+    erase_and_lower(verified)
+}
+
+fn lower_verified_semantic_execution(
+    execution_graph: boon_semantic::SemanticExecutionGraphV1,
+    resource_graph: boon_semantic::SemanticResourceGraphV1,
+    reactive_graph: boon_semantic::SemanticReactiveGraphV1,
+    lowering_contract: boon_semantic::SemanticLoweringContractV1,
+    view_binding_graph: boon_semantic::SemanticViewBindingGraphV1,
+    scope_storage_graph: boon_semantic::SemanticScopeStorageGraphV1,
+    memory_graph: boon_semantic::SemanticMemoryGraphV1,
+) -> Result<ErasedProgramFields, String> {
+    let mapped = semantic_mapping::map_semantic_execution(&execution_graph, &resource_graph)?;
+    mapped.validate_totality()?;
+    let resources = semantic_mapping::map_semantic_resources(
+        &execution_graph,
+        &resource_graph,
+        &mapped.id_map,
+    )?;
+    Err(format!(
+        "semantic reactive graph extraction is incomplete after mapping {} expressions, {} materializations, {} static owners, {} lists, {} sources, {} states, {} reactive dependencies, {} output contracts, {} semantic view bindings, {} semantic storage fields, and {} semantic memories",
+        mapped.executable.expressions.len(),
+        mapped.materializations.len(),
+        mapped.static_owners.len(),
+        resources.lists.len(),
+        resources.sources.len(),
+        resources.state_cells.len(),
+        reactive_graph.dependencies.len(),
+        lowering_contract.output_contracts.len(),
+        view_binding_graph.bindings.len(),
+        scope_storage_graph.fields.len(),
+        memory_graph.memories.len(),
+    ))
+}
+
+#[allow(dead_code)]
+fn legacy_checked_semantic_lowering_pending_extraction(
+    checked_program: boon_typecheck::CheckedProgram,
+    out_net: boon_semantic::ResolvedOutGraph,
+) -> Result<ErasedProgramFields, String> {
     let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
     let trace_phase = |phase: &str, elapsed_ms: f64| {
         if trace_lower {
@@ -2161,16 +2007,6 @@ pub fn lower_checked(
     let source_expression_count = checked_program
         .lowering_metadata
         .original_source_expression_count;
-    let producer_roots = resolve_producer_function_roots(&checked_program, producer_requests)?;
-    let out_net = out_net::OutNet::build_with_producer_roots(&checked_program, producer_roots);
-    if out_net.has_errors() {
-        return Err(out_net
-            .diagnostics
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; "));
-    }
     let pending_distributed_references =
         distributed_references(&checked_program, &checked_program.external_types)?;
     let mut distributed_references = DistributedReferences {
@@ -2252,7 +2088,7 @@ pub fn lower_checked(
     let mut lists = Vec::new();
     let contextual_materializations_started = Instant::now();
     let (mut materializations, materialization_expressions) =
-        contextual_materializations(&checked_program, &out_net.graph)?;
+        contextual_materializations(&checked_program, &out_net)?;
     trace_phase(
         "contextual_materializations",
         lower_elapsed_ms(contextual_materializations_started),
@@ -2260,7 +2096,7 @@ pub fn lower_checked(
     let executable_started = Instant::now();
     let executable = contextual_expansion::derive_executable_program(
         &checked_program,
-        &out_net.graph,
+        &out_net,
         &materializations,
         materialization_expressions,
     )
@@ -2271,7 +2107,7 @@ pub fn lower_checked(
     );
     distributed_references.calls = concrete_distributed_calls(
         &checked_program,
-        &out_net.graph,
+        &out_net,
         &executable,
         &materializations,
         &pending_distributed_references.calls,
@@ -2297,7 +2133,7 @@ pub fn lower_checked(
         &executable,
         &materializations,
         &derived_list_storage,
-        &out_net.graph.static_owners,
+        &out_net.static_owners,
     )?;
     bind_contextual_materialization_targets(
         &materialization_target_lists,
@@ -2330,10 +2166,10 @@ pub fn lower_checked(
         &mut sources,
     )?;
     merge_resource_aliases(&mut resource_aliases, source_aliases)?;
-    resource_aliases.bind_owner_parents(&out_net.graph.static_owners)?;
-    let producer_result_owners = producer_result_owners(&out_net.graph)?;
+    resource_aliases.bind_owner_parents(&out_net.static_owners)?;
+    let producer_result_owners = producer_result_owners(&out_net)?;
     bind_producer_invocation_source_owners(
-        &out_net.graph,
+        &out_net,
         &executable,
         &producer_result_owners,
         &mut sources,
@@ -2366,7 +2202,7 @@ pub fn lower_checked(
     )?;
     let mut erased_locals = build_erased_locals(
         &executable,
-        &out_net.graph.static_owners,
+        &out_net.static_owners,
         &materializations,
         &erased_fields,
         &sources,
@@ -2376,7 +2212,7 @@ pub fn lower_checked(
     resolve_executable_source_provenance(
         ExecutableSourceProvenanceContext {
             executable: &executable,
-            static_owners: &out_net.graph.static_owners,
+            static_owners: &out_net.static_owners,
             sources: &sources,
             states: &state_cells,
             materializations: &materializations,
@@ -2387,7 +2223,7 @@ pub fn lower_checked(
     )?;
     let source_authority = ExecutableSourceAuthorityIndex::build(
         &executable,
-        &out_net.graph.static_owners,
+        &out_net.static_owners,
         &sources,
         &state_cells,
         &materializations,
@@ -2415,7 +2251,7 @@ pub fn lower_checked(
     )?;
     erased_locals = build_erased_locals(
         &executable,
-        &out_net.graph.static_owners,
+        &out_net.static_owners,
         &materializations,
         &erased_fields,
         &sources,
@@ -2423,17 +2259,13 @@ pub fn lower_checked(
         &lists,
     )?;
     source_authority.apply_local_resources(&mut erased_locals)?;
-    let producer_function_instances = concrete_producer_function_instances(
-        &out_net.graph,
-        &executable,
-        &erased_fields,
-        &sources,
-    )?;
+    let producer_function_instances =
+        concrete_producer_function_instances(&out_net, &executable, &erased_fields, &sources)?;
     let derived_values_started = Instant::now();
     let mut derived_values = derived_values(DerivedValueContext {
         checked: &checked_program,
         executable: &executable,
-        static_owners: &out_net.graph.static_owners,
+        static_owners: &out_net.static_owners,
         derived_list_storage: &derived_list_storage,
         erased_fields: &erased_fields,
         state_cells: &state_cells,
@@ -2480,7 +2312,7 @@ pub fn lower_checked(
     let mut scope_index = build_erased_scope_index(
         ErasedScopeBuildContext {
             executable: &executable,
-            static_owners: &out_net.graph.static_owners,
+            static_owners: &out_net.static_owners,
             materializations: &materializations,
             sources: &sources,
             states: &state_cells,
@@ -2512,11 +2344,11 @@ pub fn lower_checked(
         &executable,
         &materializations,
         &scope_index,
-        &out_net.graph.static_owners,
+        &out_net.static_owners,
     )?;
     scope_index.reads = build_erased_read_bindings(
         &executable,
-        &out_net.graph.static_owners,
+        &out_net.static_owners,
         &materializations,
         &sources,
         &scope_index,
@@ -2598,7 +2430,7 @@ pub fn lower_checked(
     let semantic_migration_ms = lower_elapsed_ms(semantic_migration_started);
     trace_phase("semantic_memory_and_migrations", semantic_migration_ms);
     let graph_node_count = executable.expressions.len();
-    let typed = ErasedProgram {
+    let fields = ErasedProgramFields {
         executable,
         scope_index,
         expression_count: source_expression_count,
@@ -2635,20 +2467,11 @@ pub fn lower_checked(
         hidden_identity_verified: true,
         static_schedule_verified: true,
     };
-    let verify_static_started = Instant::now();
-    verify_erased_scope_index(&typed)?;
-    verify_static_schedule(&typed)?;
-    let verify_static_ms = lower_elapsed_ms(verify_static_started);
-    trace_phase("verify_static_schedule", verify_static_ms);
-    let verify_hidden_started = Instant::now();
-    verify_hidden_identity(&typed)?;
-    let verify_hidden_ms = lower_elapsed_ms(verify_hidden_started);
-    trace_phase("verify_hidden_identity", verify_hidden_ms);
-    Ok(typed)
+    Ok(fields)
 }
 
 fn producer_result_owners(
-    out_net: &out_net::OutNet,
+    out_net: &boon_semantic::ResolvedOutGraph,
 ) -> Result<BTreeMap<ExecutableStatementId, StaticOwnerId>, String> {
     out_net
         .producer_roots()
@@ -2671,7 +2494,10 @@ fn producer_result_owners(
                     producer_identity_text(root.spec.identity)
                 )
             })?;
-            Ok((root.spec.result_statement, owner))
+            Ok((
+                executable_producer_result_statement_id(root.spec.result_statement),
+                owner,
+            ))
         })
         .collect()
 }
@@ -2684,7 +2510,7 @@ fn producer_invocation_source_id(
     let function = executable
         .functions
         .iter()
-        .find(|function| function.id == producer.spec.function)
+        .find(|function| function.id == executable_producer_function_id(producer.spec.function))
         .ok_or_else(|| {
             format!(
                 "producer function identity {} has no executable function",
@@ -2730,7 +2556,7 @@ fn producer_invocation_source_id(
 }
 
 fn bind_producer_invocation_source_owners(
-    out_net: &out_net::OutNet,
+    out_net: &boon_semantic::ResolvedOutGraph,
     executable: &ExecutableProgram,
     result_owners: &BTreeMap<ExecutableStatementId, StaticOwnerId>,
     sources: &mut [SourcePort],
@@ -2739,7 +2565,7 @@ fn bind_producer_invocation_source_owners(
         let Some(source_id) = producer_invocation_source_id(producer, executable, sources)? else {
             continue;
         };
-        let statement = producer.spec.result_statement;
+        let statement = executable_producer_result_statement_id(producer.spec.result_statement);
         let owner = result_owners.get(&statement).copied().ok_or_else(|| {
             format!(
                 "producer function identity {} invocation SOURCE has no call-site owner",
@@ -2756,7 +2582,7 @@ fn bind_producer_invocation_source_owners(
 }
 
 fn concrete_producer_function_instances(
-    out_net: &out_net::OutNet,
+    out_net: &boon_semantic::ResolvedOutGraph,
     executable: &ExecutableProgram,
     fields: &[ErasedFieldDef],
     sources: &[SourcePort],
@@ -2765,7 +2591,7 @@ fn concrete_producer_function_instances(
     let mut instances = Vec::with_capacity(out_net.producer_roots().len());
     for producer in out_net.producer_roots() {
         let spec = &producer.spec;
-        let statement_id = spec.result_statement;
+        let statement_id = executable_producer_result_statement_id(spec.result_statement);
         let statement = executable
             .statements
             .iter()
@@ -2807,7 +2633,7 @@ fn concrete_producer_function_instances(
         let function = executable
             .functions
             .iter()
-            .find(|function| function.id == spec.function)
+            .find(|function| function.id == executable_producer_function_id(spec.function))
             .ok_or_else(|| {
                 format!(
                     "producer function identity {} has no concrete function {}",
@@ -2825,6 +2651,7 @@ fn concrete_producer_function_instances(
             .parameters
             .iter()
             .map(|parameter| {
+                let parameter_id = executable_producer_parameter_id(parameter.parameter);
                 let mut input_expressions = executable
                     .expressions
                     .iter()
@@ -2832,7 +2659,7 @@ fn concrete_producer_function_instances(
                         ExecutableExpressionKind::FunctionParameter {
                             parameter: candidate,
                             ..
-                        } if candidate == parameter.parameter => Some(expression.id),
+                        } if candidate == parameter_id => Some(expression.id),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -2840,7 +2667,7 @@ fn concrete_producer_function_instances(
                 input_expressions.dedup();
                 ProducerFunctionArgument {
                     name: parameter.name.clone(),
-                    parameter: parameter.parameter,
+                    parameter: parameter_id,
                     flow_type: parameter.flow_type.clone(),
                     input_expressions,
                 }
@@ -2849,7 +2676,7 @@ fn concrete_producer_function_instances(
         instances.push(ProducerFunctionInstance {
             identity: spec.identity,
             owner,
-            function: spec.function,
+            function: executable_producer_function_id(spec.function),
             function_name: spec.function_name.clone(),
             result_field,
             result_path: spec.result_path.clone(),
@@ -9478,6 +9305,43 @@ fn validate_checked_program_for_lowering(
         .iter()
         .map(|callable| callable.decl_id)
         .collect::<BTreeSet<_>>();
+    let mut context_formals = BTreeMap::new();
+    for formal in &program.context_formals {
+        if context_formals.insert(formal.id, formal).is_some() {
+            return Err(format!(
+                "checked program contains duplicate context formal {}",
+                formal.id.0
+            ));
+        }
+        let Some(callable) = program
+            .callables
+            .iter()
+            .find(|callable| callable.decl_id == formal.callable)
+        else {
+            return Err(format!(
+                "checked context formal {} references missing callable {}",
+                formal.id.0, formal.callable.0
+            ));
+        };
+        if callable.context_formal != Some(formal.id) {
+            return Err(format!(
+                "checked context formal {} is not the declared formal of callable `{}`",
+                formal.id.0, callable.name
+            ));
+        }
+    }
+    for callable in &program.callables {
+        if let Some(formal) = callable.context_formal
+            && context_formals
+                .get(&formal)
+                .is_none_or(|candidate| candidate.callable != callable.decl_id)
+        {
+            return Err(format!(
+                "checked callable `{}` references missing context formal {}",
+                callable.name, formal.0
+            ));
+        }
+    }
     for call in &program.calls {
         if !expressions.contains(&call.expression) {
             return Err(format!(
@@ -9567,42 +9431,62 @@ fn validate_checked_program_for_lowering(
             .iter()
             .find(|callable| callable.decl_id == call.callable)
             .expect("callable membership was checked above");
-        if let Some(pass) = call.pass {
-            if callable.kind != boon_typecheck::CheckedCallableKind::User {
+        match call.context_binding {
+            boon_typecheck::CheckedContextBinding::Explicit { value, .. } => {
+                if callable.kind != boon_typecheck::CheckedCallableKind::User {
+                    return Err(format!(
+                        "checked call {} supplies PASS to non-user callable `{}`",
+                        call.id.0, callable.name
+                    ));
+                }
+                if !expressions.contains(&value) {
+                    return Err(format!(
+                        "checked call {} has a missing PASS expression",
+                        call.id.0
+                    ));
+                }
+            }
+            boon_typecheck::CheckedContextBinding::Inherited { formal } => {
+                let Some(owner) = call.owner_callable else {
+                    return Err(format!(
+                        "checked root call {} to `{}` cannot inherit PASS",
+                        call.id.0, callable.name
+                    ));
+                };
+                let owner = program
+                    .callables
+                    .iter()
+                    .find(|candidate| candidate.decl_id == owner)
+                    .ok_or_else(|| {
+                        format!(
+                            "checked call {} inherits PASS from missing owner callable {}",
+                            call.id.0, owner.0
+                        )
+                    })?;
+                if callable.context_formal.is_none() || owner.context_formal != Some(formal) {
+                    return Err(format!(
+                        "checked call {} to `{}` has an invalid inherited context formal {}",
+                        call.id.0, callable.name, formal.0
+                    ));
+                }
+            }
+            boon_typecheck::CheckedContextBinding::None if callable.requires_pass() => {
                 return Err(format!(
-                    "checked call {} supplies PASS to non-user callable `{}`",
+                    "checked call {} to `{}` requires explicit or inherited PASS",
                     call.id.0, callable.name
                 ));
             }
-            if !expressions.contains(&pass.value) {
-                return Err(format!(
-                    "checked call {} has a missing PASS expression",
-                    call.id.0
-                ));
-            }
-        } else if callable.requires_pass() {
-            let Some(owner) = call.owner_callable else {
-                return Err(format!(
-                    "checked root call {} to `{}` requires PASS",
-                    call.id.0, callable.name
-                ));
-            };
-            let owner = program
-                .callables
-                .iter()
-                .find(|candidate| candidate.decl_id == owner)
-                .ok_or_else(|| {
-                    format!(
-                        "checked call {} inherits PASS from missing owner callable {}",
-                        call.id.0, owner.0
-                    )
-                })?;
-            if !owner.requires_pass() {
-                return Err(format!(
-                    "checked call {} to `{}` requires PASS but owner callable `{}` does not",
-                    call.id.0, callable.name, owner.name
-                ));
-            }
+            boon_typecheck::CheckedContextBinding::None => {}
+        }
+        if call
+            .contextual_substitutions
+            .iter()
+            .any(|substitution| callable.context_formal != Some(substitution.formal))
+        {
+            return Err(format!(
+                "checked call {} contains a contextual substitution for another formal",
+                call.id.0
+            ));
         }
     }
     for expression in &program.expressions {
@@ -9628,6 +9512,14 @@ fn validate_checked_program_for_lowering(
                     expression.id.0
                 ));
             }
+            boon_typecheck::CheckedExpressionKind::Passed { formal, .. }
+                if !context_formals.contains_key(formal) =>
+            {
+                return Err(format!(
+                    "checked expression {} references missing context formal {}",
+                    expression.id.0, formal.0
+                ));
+            }
             _ => {}
         }
     }
@@ -9647,7 +9539,7 @@ fn distributed_references(
     let mut calls = Vec::new();
     for expr in &program.expressions {
         match &expr.kind {
-            boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path } => {
+            boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path, .. } => {
                 let Some(producer_role) = distributed_function_role(canonical_path) else {
                     continue;
                 };
@@ -9758,7 +9650,7 @@ fn distributed_references(
 
 fn concrete_distributed_calls(
     checked: &boon_typecheck::CheckedProgram,
-    out_net: &out_net::OutNet,
+    out_net: &boon_semantic::ResolvedOutGraph,
     executable: &ExecutableProgram,
     materializations: &[ContextualMaterialization],
     pending: &[PendingDistributedCall],
@@ -9962,7 +9854,7 @@ fn semantic_index(
     let payload_shape_by_source = typecheck_report
         .source_payload_shape_table
         .iter()
-        .map(|entry| (entry.source_path.as_str(), entry.fields.len()))
+        .map(|entry| (entry.diagnostic_path.as_str(), entry.fields.len()))
         .collect::<BTreeMap<_, _>>();
     let function_types = typecheck_report
         .function_type_table
@@ -10339,19 +10231,25 @@ fn output_root_declarations(
                 boon_typecheck::CheckedStatementKind::List { declaration, .. } => declaration,
                 _ => None,
             };
-            let Some(name) = output_declaration.and_then(|declaration| {
-                program
-                    .declarations
-                    .iter()
-                    .find(|candidate| candidate.id == declaration)
-                    .map(|declaration| declaration.name.as_str())
-            }) else {
+            let Some(output_declaration) = output_declaration else {
+                continue;
+            };
+            let Some(name) = program
+                .declarations
+                .iter()
+                .find(|candidate| candidate.id == output_declaration)
+                .map(|declaration| declaration.name.as_str())
+            else {
                 continue;
             };
             let data_type = typecheck_report
                 .output_root_types
                 .iter()
-                .find(|entry| entry.statement_id == output.id.0 as usize && entry.name == name)
+                .find(|entry| {
+                    entry.statement == output.id
+                        && entry.declaration == output_declaration
+                        && entry.name == name
+                })
                 .map(|entry| semantic_data_type(&entry.ty));
             declarations.push(OutputRootDeclaration {
                 root: name.to_owned(),
@@ -13100,7 +12998,7 @@ fn bind_distributed_reference_aliases(
             })?;
         if !matches!(
             &expression.kind,
-            boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path }
+            boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path, .. }
                 if canonical_path == &reference.canonical_path
         ) {
             return Err(format!(
@@ -13631,19 +13529,22 @@ fn host_port_declarations(
     if let Some(http) = &report.host_port_table.http {
         declarations.push(HostPortDeclaration::HttpServer {
             line: http.line,
-            request_source: http.request_source.clone(),
-            disconnect_source: http.disconnect_source.clone(),
-            response_output: http.response_output.clone(),
+            request_source: http.request.diagnostic_path.clone(),
+            disconnect_source: http
+                .disconnect
+                .as_ref()
+                .map(|binding| binding.diagnostic_path.clone()),
+            response_output: http.response.diagnostic_name.clone(),
         });
     }
     if let Some(websocket) = &report.host_port_table.websocket {
         declarations.push(HostPortDeclaration::WebSocketServer {
             line: websocket.line,
-            open_source: websocket.open_source.clone(),
-            message_source: websocket.message_source.clone(),
-            close_source: websocket.close_source.clone(),
-            error_source: websocket.error_source.clone(),
-            actions_output: websocket.actions_output.clone(),
+            open_source: websocket.open.diagnostic_path.clone(),
+            message_source: websocket.message.diagnostic_path.clone(),
+            close_source: websocket.close.diagnostic_path.clone(),
+            error_source: websocket.error.diagnostic_path.clone(),
+            actions_output: websocket.actions.diagnostic_name.clone(),
         });
     }
     declarations
@@ -13651,7 +13552,7 @@ fn host_port_declarations(
 
 fn contextual_materializations(
     checked: &boon_typecheck::CheckedProgram,
-    out_graph: &out_net::OutNet,
+    out_graph: &boon_semantic::ResolvedOutGraph,
 ) -> Result<(Vec<ContextualMaterialization>, Vec<ExecutableExpression>), String> {
     contextual_expansion::derive_contextual_materializations(checked, out_graph)
         .map_err(|error| error.to_string())

@@ -8,6 +8,60 @@ use std::fmt;
 use std::str::FromStr;
 
 pub const SOURCE_BUNDLE_DIGEST_V1_DOMAIN: &[u8] = b"boon.source-bundle.v1\0";
+pub const CANONICAL_SERDE_CBOR_V1: &str = "boon.canonical-serde-cbor.v1";
+
+/// Canonical bytes for compiler-owned, ordered serde DTOs.
+///
+/// V1 admits structs, sequences and maps whose Rust representation already
+/// defines a stable order (notably `Vec` and `BTreeMap`). Schema owners must
+/// never feed an unordered map into this boundary. `ciborium` emits the
+/// shortest deterministic scalar representation; schema/domain separation is
+/// supplied by the caller's digest domain.
+pub fn canonical_serde_cbor_v1<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<Vec<u8>, CanonicalEncodingError> {
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(value, &mut bytes)
+        .map_err(|error| CanonicalEncodingError::new(error.to_string()))?;
+    Ok(bytes)
+}
+
+pub fn canonical_serde_hash_v1<T: Serialize + ?Sized>(
+    domain: &[u8],
+    value: &T,
+) -> Result<[u8; 32], CanonicalEncodingError> {
+    let bytes = canonical_serde_cbor_v1(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(
+        u64::try_from(bytes.len())
+            .map_err(|_| CanonicalEncodingError::new("canonical payload exceeds u64"))?
+            .to_be_bytes(),
+    );
+    hasher.update(bytes);
+    Ok(hasher.finalize().into())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalEncodingError {
+    message: String,
+}
+
+impl CanonicalEncodingError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for CanonicalEncodingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for CanonicalEncodingError {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SourceBundleDigestV1([u8; 32]);
@@ -402,6 +456,42 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SourceBundleDigestV1>(&json).unwrap(),
             digest
+        );
+    }
+
+    #[test]
+    fn canonical_serde_cbor_is_deterministic_and_domain_separated() {
+        let value = std::collections::BTreeMap::from([
+            ("alpha".to_owned(), vec![1_u64, 2, 3]),
+            ("beta".to_owned(), vec![5_u64, 8]),
+        ]);
+        let first = canonical_serde_cbor_v1(&value).unwrap();
+        let second = canonical_serde_cbor_v1(&value).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            vec![
+                0xa2, 0x65, b'a', b'l', b'p', b'h', b'a', 0x83, 0x01, 0x02, 0x03, 0x64, b'b', b'e',
+                b't', b'a', 0x82, 0x05, 0x08,
+            ],
+            "canonical CBOR V1 bytes changed"
+        );
+        assert_eq!(
+            canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),
+            canonical_serde_hash_v1(b"first-domain\0", &value).unwrap()
+        );
+        assert_eq!(
+            canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),
+            [
+                0xa6, 0xcf, 0x3b, 0x79, 0x59, 0xdb, 0x82, 0x10, 0x33, 0x69, 0x9a, 0x5a, 0x9d, 0x3b,
+                0x87, 0xf2, 0x87, 0xd7, 0x9b, 0x01, 0x48, 0xdc, 0x1c, 0x03, 0x18, 0xd7, 0x32, 0xc3,
+                0xfc, 0x2a, 0x25, 0x46,
+            ],
+            "canonical CBOR V1 domain hash changed"
+        );
+        assert_ne!(
+            canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),
+            canonical_serde_hash_v1(b"second-domain\0", &value).unwrap()
         );
     }
 }

@@ -6,5 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+boon_contract.workspace = true
 chumsky.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

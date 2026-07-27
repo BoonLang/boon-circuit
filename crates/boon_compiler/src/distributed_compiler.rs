@@ -16,9 +16,10 @@ use boon_plan::{
     SourceRoute, TargetProfile, ValueRef, verify_plan,
 };
 use boon_typecheck::{
-    CheckedCallEntry, CheckedCallableKind, CheckedParameterKind, CheckedProgram,
-    ExternalFunctionArgument, ExternalFunctionType, ExternalTypeEnvironment, FlowMode, FlowType,
-    FunctionTypeEntry, ObjectShape, Type, TypeCheckReport, Variant,
+    CheckedCallEntry, CheckedCallableKind, CheckedContextBinding,
+    CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
+    CheckedProgram, ExternalFunctionArgument, ExternalFunctionType, ExternalTypeEnvironment,
+    FlowMode, FlowType, FunctionTypeEntry, ObjectShape, Type, TypeCheckReport, Variant,
 };
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(target_arch = "wasm32"))]
@@ -76,7 +77,7 @@ struct SolvedBundleInterfaces {
 }
 
 #[derive(Clone, Debug)]
-struct BundleValueReference {
+struct ProvisionalValueInterfaceDemand {
     consumer_role: ProgramRole,
     producer_role: ProgramRole,
     canonical_path: String,
@@ -84,7 +85,7 @@ struct BundleValueReference {
 }
 
 #[derive(Clone, Debug)]
-struct BundleCallReference {
+struct ProvisionalCallInterfaceDemand {
     consumer_role: ProgramRole,
     producer_role: ProgramRole,
     canonical_function: String,
@@ -93,9 +94,9 @@ struct BundleCallReference {
 }
 
 #[derive(Clone, Debug, Default)]
-struct BundleReferences {
-    values: Vec<BundleValueReference>,
-    calls: Vec<BundleCallReference>,
+struct ProvisionalBundleInterfaceDemands {
+    values: Vec<ProvisionalValueInterfaceDemand>,
+    calls: Vec<ProvisionalCallInterfaceDemand>,
 }
 
 #[derive(Clone)]
@@ -197,11 +198,18 @@ pub fn compile_distributed_runtime_source_programs(
         .into_iter()
         .map(|program| (program.request.role, program))
         .collect::<BTreeMap<_, _>>();
-    let references = collect_bundle_references(&parsed)?;
-    let mut solved = solve_bundle_interfaces(&parsed, &references)?;
+    let references = collect_provisional_bundle_interface_demands(&parsed)?;
+    let solved = solve_bundle_interfaces(&parsed, &references)?;
     let prelude = distributed_graph_prelude(&requests)?;
-    let (producer_requests, prelinked_calls) =
-        resolve_distributed_producer_closure(&solved.checked, &prelude)?;
+    let DistributedSemanticFixedPoint {
+        bundle,
+        prelinked_calls,
+    } = resolve_distributed_semantic_fixed_point(&solved.checked, &prelude)?;
+    let mut semantic_programs = bundle
+        .into_role_programs()
+        .into_iter()
+        .map(|program| (program.role(), program))
+        .collect::<BTreeMap<_, _>>();
     let mut lowered = BTreeMap::<ProgramRole, LoweredRole>::new();
     for role in [
         ProgramRole::Client,
@@ -210,14 +218,9 @@ pub fn compile_distributed_runtime_source_programs(
     ] {
         let program = lower_parsed_role(
             parsed.get(&role).expect("validated parsed role"),
-            solved
-                .checked
+            semantic_programs
                 .remove(&role)
-                .expect("solved checked role authority"),
-            producer_requests
-                .get(&role)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
+                .expect("fixed-point semantic role authority"),
         )?;
         lowered.insert(role, program);
     }
@@ -320,163 +323,463 @@ fn distributed_graph_prelude(
     })
 }
 
-type DistributedProducerClosure = (
-    BTreeMap<ProgramRole, Vec<boon_ir::ProducerFunctionLoweringRequest>>,
-    BTreeMap<(ProgramRole, String), PrelinkedCallSite>,
-);
+struct DistributedSemanticFixedPoint {
+    bundle: boon_semantic::BundleSemanticProgramV1,
+    prelinked_calls: BTreeMap<(ProgramRole, String), PrelinkedCallSite>,
+}
 
-fn resolve_distributed_producer_closure(
+fn resolve_distributed_semantic_fixed_point(
     checked: &BTreeMap<ProgramRole, CheckedProgram>,
     prelude: &DistributedGraphPrelude,
-) -> CompilerResult<DistributedProducerClosure> {
-    let mut requests =
-        BTreeMap::<ProgramRole, BTreeSet<boon_ir::ProducerFunctionLoweringRequest>>::new();
-    let mut producer_lineages = BTreeMap::<[u8; 32], Vec<(ProgramRole, String)>>::new();
-    let mut prelinked = BTreeMap::<(ProgramRole, String), PrelinkedCallSite>::new();
+) -> CompilerResult<DistributedSemanticFixedPoint> {
+    let roles = [
+        ProgramRole::Client,
+        ProgramRole::Session,
+        ProgramRole::Server,
+    ];
+    let mut requests = roles
+        .into_iter()
+        .map(|role| (role, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut producer_lineages =
+        BTreeMap::<[u8; 32], Vec<(ProgramRole, boon_semantic::SemanticCallableId)>>::new();
+    let mut call_crossings = DistributedSemanticCallSnapshot::new();
+    let mut value_crossings = DistributedSemanticValueSnapshot::new();
+    let producer_callable_count = checked
+        .values()
+        .flat_map(|program| &program.callables)
+        .filter(|callable| callable.kind == CheckedCallableKind::User)
+        .count();
+    let max_rounds = producer_callable_count.saturating_add(1);
 
-    loop {
-        let mut added_request = false;
-        for consumer_role in [
-            ProgramRole::Client,
-            ProgramRole::Session,
-            ProgramRole::Server,
-        ] {
-            let role_requests = requests
-                .get(&consumer_role)
-                .map(|requests| requests.iter().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let occurrences = boon_ir::distributed_call_occurrences(
-                checked.get(&consumer_role).expect("checked role"),
-                &role_requests,
-            )?;
-            for occurrence in occurrences {
-                let local_function = strip_role_function_prefix(
-                    &occurrence.canonical_function,
-                    occurrence.producer_role,
-                )?;
-                let stable_identity = DistributedDeclarationId::from_semantic_path(
-                    role_namespace(consumer_role),
-                    &format!("call:{}", occurrence.occurrence_path),
-                )?;
-                let call_site_id = RemoteCallSiteId::from_identity(
-                    prelude.graph_identity.graph_id,
-                    prelude
-                        .endpoints
-                        .get(&consumer_role)
-                        .expect("consumer endpoint")
-                        .endpoint_id,
-                    stable_identity,
-                )?;
-                let mode = match occurrence.mode {
-                    boon_ir::ProducerFunctionMode::Current => DistributedCallMode::Current,
-                    boon_ir::ProducerFunctionMode::Invocation => DistributedCallMode::Invocation,
-                };
-                let site = PrelinkedCallSite {
-                    consumer_role,
-                    occurrence_path: occurrence.occurrence_path.clone(),
-                    canonical_function: occurrence.canonical_function.clone(),
-                    producer_role: occurrence.producer_role,
-                    stable_identity,
-                    call_site_id,
-                    mode,
-                };
-                let site_key = (consumer_role, occurrence.occurrence_path.clone());
-                if let Some(previous) = prelinked.insert(site_key.clone(), site.clone())
-                    && (previous.canonical_function != site.canonical_function
-                        || previous.producer_role != site.producer_role
-                        || previous.call_site_id != site.call_site_id
-                        || previous.mode != site.mode)
-                {
-                    return Err(PlanError::new(format!(
-                        "distributed occurrence `{}` changed while resolving producer closure",
-                        occurrence.occurrence_path
-                    ))
-                    .into());
-                }
-
-                let mut lineage = match occurrence.root {
-                    boon_ir::DistributedCallOccurrenceRoot::Program => Vec::new(),
-                    boon_ir::DistributedCallOccurrenceRoot::Producer(identity) => {
-                        producer_lineages.get(&identity).cloned().ok_or_else(|| {
-                            PlanError::new(format!(
-                                "distributed producer {} has no closure lineage",
-                                identity
-                                    .iter()
-                                    .map(|byte| format!("{byte:02x}"))
-                                    .collect::<String>()
-                            ))
-                        })?
-                    }
-                };
-                let target = (occurrence.producer_role, local_function.clone());
-                if lineage.contains(&target) {
-                    let mut cycle = lineage
-                        .iter()
-                        .map(|(role, function)| format!("{}/{}", role.namespace(), function))
-                        .collect::<Vec<_>>();
-                    cycle.push(format!(
-                        "{}/{}",
-                        occurrence.producer_role.namespace(),
-                        local_function
-                    ));
-                    return Err(PlanError::new(format!(
-                        "distributed producer expansion is recursive: {}",
-                        cycle.join(" -> ")
-                    ))
-                    .into());
-                }
-                lineage.push(target);
-                let request = boon_ir::ProducerFunctionLoweringRequest {
-                    identity: call_site_id.0,
-                    local_function,
-                    mode: occurrence.mode,
-                };
-                let role_requests = requests.entry(occurrence.producer_role).or_default();
-                if role_requests.insert(request.clone()) {
-                    if let Some(previous) =
-                        producer_lineages.insert(request.identity, lineage.clone())
-                        && previous != lineage
-                    {
-                        return Err(PlanError::new(
-                            "distributed producer identity has conflicting closure ancestry",
-                        )
-                        .into());
-                    }
-                    added_request = true;
-                } else if producer_lineages
-                    .get(&request.identity)
-                    .is_some_and(|previous| previous != &lineage)
-                {
-                    return Err(PlanError::new(
-                        "distributed producer identity has conflicting closure ancestry",
-                    )
-                    .into());
-                }
+    for round in 0..max_rounds {
+        let programs = elaborate_distributed_roles(checked, &requests)?;
+        let (next_requests, next_lineages, next_call_crossings, next_value_crossings) =
+            derive_distributed_producer_requests(&programs, &producer_lineages)?;
+        if next_requests.values().map(BTreeSet::len).sum::<usize>()
+            > boon_semantic::MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1
+        {
+            return Err(PlanError::new(format!(
+                "distributed producer closure exceeds the V1 limit of {} requests",
+                boon_semantic::MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1
+            ))
+            .into());
+        }
+        for role in roles {
+            let current = requests.get(&role).expect("canonical current request set");
+            let next = next_requests
+                .get(&role)
+                .expect("canonical next request set");
+            if !current.is_subset(next) {
+                return Err(PlanError::new(format!(
+                    "{} distributed producer request set changed non-monotonically in round {round}",
+                    role.namespace()
+                ))
+                .into());
             }
         }
-        if !added_request {
-            break;
+        for (identity, crossing) in &call_crossings {
+            if next_call_crossings.get(identity) != Some(crossing) {
+                return Err(PlanError::new(format!(
+                    "distributed semantic call crossing {} changed non-monotonically in round {round}",
+                    distributed_identity_hex(identity)
+                ))
+                .into());
+            }
         }
+        for (identity, crossing) in &value_crossings {
+            if next_value_crossings.get(identity) != Some(crossing) {
+                return Err(PlanError::new(format!(
+                    "distributed semantic value crossing {identity} changed non-monotonically in round {round}"
+                ))
+                .into());
+            }
+        }
+        if next_requests == requests {
+            let stable_bundle =
+                boon_semantic::BundleSemanticProgramV1::freeze(semantic_program_array(programs)?)?;
+            let confirmed_programs = elaborate_distributed_roles(checked, &requests)?;
+            let (
+                confirmed_requests,
+                confirmed_lineages,
+                confirmed_call_crossings,
+                confirmed_value_crossings,
+            ) = derive_distributed_producer_requests(&confirmed_programs, &next_lineages)?;
+            if confirmed_requests != requests
+                || confirmed_lineages != next_lineages
+                || confirmed_call_crossings != next_call_crossings
+                || confirmed_value_crossings != next_value_crossings
+            {
+                return Err(PlanError::new(
+                    "distributed semantic fixed point changed during its confirmation pass",
+                )
+                .into());
+            }
+            let confirmed_bundle = boon_semantic::BundleSemanticProgramV1::freeze(
+                semantic_program_array(confirmed_programs)?,
+            )?;
+            if confirmed_bundle != stable_bundle {
+                return Err(PlanError::new(
+                    "distributed semantic bundle is not deterministic across its confirmation pass",
+                )
+                .into());
+            }
+            let prelinked_calls = prelinked_calls_from_semantic_bundle(&confirmed_bundle, prelude)?;
+            return Ok(DistributedSemanticFixedPoint {
+                bundle: confirmed_bundle,
+                prelinked_calls,
+            });
+        }
+        requests = next_requests;
+        producer_lineages = next_lineages;
+        call_crossings = next_call_crossings;
+        value_crossings = next_value_crossings;
     }
+    Err(PlanError::new(format!(
+        "distributed semantic producer closure exceeded its {max_rounds}-round callable bound"
+    ))
+    .into())
+}
 
-    let requests = [
+fn elaborate_distributed_roles(
+    checked: &BTreeMap<ProgramRole, CheckedProgram>,
+    requests: &BTreeMap<ProgramRole, BTreeSet<boon_semantic::ProducerMaterializationRequest>>,
+) -> CompilerResult<BTreeMap<ProgramRole, boon_semantic::SemanticProgram>> {
+    [
         ProgramRole::Client,
         ProgramRole::Session,
         ProgramRole::Server,
     ]
     .into_iter()
     .map(|role| {
-        (
-            role,
-            requests
-                .remove(&role)
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<Vec<_>>(),
-        )
+        let role_requests = requests
+            .get(&role)
+            .expect("canonical request set exists for every role")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let semantic = super::elaborate_checked(
+            checked.get(&role).expect("checked role authority").clone(),
+            &role_requests,
+        )?;
+        Ok((role, semantic))
     })
-    .collect();
-    Ok((requests, prelinked))
+    .collect()
+}
+
+type DistributedProducerRequestSets =
+    BTreeMap<ProgramRole, BTreeSet<boon_semantic::ProducerMaterializationRequest>>;
+type DistributedProducerLineages =
+    BTreeMap<[u8; 32], Vec<(ProgramRole, boon_semantic::SemanticCallableId)>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DistributedSemanticCallContract {
+    consumer_role: ProgramRole,
+    root: boon_semantic::DistributedCallOccurrenceRoot,
+    call: boon_semantic::SemanticCallId,
+    callable: boon_semantic::SemanticCallableId,
+    call_path: Vec<boon_semantic::SemanticCallId>,
+    producer_role: ProgramRole,
+    mode: boon_semantic::ProducerMaterializationMode,
+}
+
+type DistributedSemanticCallSnapshot = BTreeMap<[u8; 32], DistributedSemanticCallContract>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DistributedSemanticValueContract {
+    consumer_role: ProgramRole,
+    root: boon_semantic::DistributedCallOccurrenceRoot,
+    call_path: Vec<boon_semantic::SemanticCallId>,
+    checked_expression: boon_typecheck::CheckedExprId,
+    external_identity: CheckedExternalDeclarationIdentityV1,
+    producer_role: ProgramRole,
+}
+
+type DistributedSemanticValueSnapshot =
+    BTreeMap<boon_semantic::DistributedValueOccurrenceIdentityV1, DistributedSemanticValueContract>;
+
+fn derive_distributed_producer_requests(
+    programs: &BTreeMap<ProgramRole, boon_semantic::SemanticProgram>,
+    previous_lineages: &DistributedProducerLineages,
+) -> CompilerResult<(
+    DistributedProducerRequestSets,
+    DistributedProducerLineages,
+    DistributedSemanticCallSnapshot,
+    DistributedSemanticValueSnapshot,
+)> {
+    let roles = [
+        ProgramRole::Client,
+        ProgramRole::Session,
+        ProgramRole::Server,
+    ];
+    let mut requests = roles
+        .into_iter()
+        .map(|role| (role, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut lineages = BTreeMap::new();
+    let mut call_crossings = DistributedSemanticCallSnapshot::new();
+    let mut value_crossings = DistributedSemanticValueSnapshot::new();
+    let mut requests_by_identity =
+        BTreeMap::<[u8; 32], (ProgramRole, boon_semantic::ProducerMaterializationRequest)>::new();
+
+    for consumer_role in roles {
+        let consumer = programs
+            .get(&consumer_role)
+            .expect("semantic program exists for every role");
+        for occurrence in boon_semantic::distributed_call_occurrences(consumer)? {
+            let crossing = DistributedSemanticCallContract {
+                consumer_role,
+                root: occurrence.root,
+                call: occurrence.call,
+                callable: occurrence.callable,
+                call_path: occurrence.call_path.clone(),
+                producer_role: occurrence.producer_role,
+                mode: occurrence.mode,
+            };
+            if let Some(previous) = call_crossings.insert(
+                occurrence.producer_materialization_identity,
+                crossing.clone(),
+            ) && previous != crossing
+            {
+                return Err(PlanError::new(
+                    "distributed semantic call identity resolves to conflicting crossings",
+                )
+                .into());
+            }
+            let call = consumer
+                .execution_graph()
+                .calls
+                .get(occurrence.call.as_usize())
+                .filter(|call| call.id == occurrence.call)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "distributed occurrence `{}` references missing semantic call {}",
+                        occurrence.occurrence_path, occurrence.call
+                    ))
+                })?;
+            let external_identity = call.external_identity.ok_or_else(|| {
+                PlanError::new(format!(
+                    "distributed occurrence `{}` has no sealed external callable identity",
+                    occurrence.occurrence_path
+                ))
+            })?;
+            if external_identity.kind != CheckedExternalDeclarationKind::Callable
+                || external_identity.producer_role != occurrence.producer_role
+            {
+                return Err(PlanError::new(format!(
+                    "distributed occurrence `{}` has an incompatible producer identity",
+                    occurrence.occurrence_path
+                ))
+                .into());
+            }
+            let producer = programs.get(&occurrence.producer_role).ok_or_else(|| {
+                PlanError::new(format!(
+                    "distributed occurrence `{}` references missing {} producer role",
+                    occurrence.occurrence_path,
+                    occurrence.producer_role.namespace()
+                ))
+            })?;
+            if producer.source_bundle_digest_v1()
+                != external_identity.producer_source_bundle_digest_v1
+            {
+                return Err(PlanError::new(format!(
+                    "distributed occurrence `{}` has a stale producer source identity",
+                    occurrence.occurrence_path
+                ))
+                .into());
+            }
+            let producer_callable = producer
+                .execution_graph()
+                .callables
+                .iter()
+                .find(|callable| {
+                    callable.checked_callable == external_identity.producer_declaration
+                })
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "distributed occurrence `{}` target declaration {} has no semantic callable",
+                        occurrence.occurrence_path,
+                        external_identity.producer_declaration.0
+                    ))
+                })?;
+            if producer_callable.kind != CheckedCallableKind::User {
+                return Err(PlanError::new(format!(
+                    "distributed occurrence `{}` does not target a user callable",
+                    occurrence.occurrence_path
+                ))
+                .into());
+            }
+            let local_function = strip_role_function_prefix(
+                &occurrence.canonical_function,
+                occurrence.producer_role,
+            )?;
+            if producer_callable.name != local_function {
+                return Err(PlanError::new(format!(
+                    "distributed occurrence `{}` diagnostic name `{local_function}` differs from sealed callable {}",
+                    occurrence.occurrence_path, producer_callable.id
+                ))
+                .into());
+            }
+
+            let mut lineage = match occurrence.root {
+                boon_semantic::DistributedCallOccurrenceRoot::Program => Vec::new(),
+                boon_semantic::DistributedCallOccurrenceRoot::Producer(identity) => {
+                    previous_lineages.get(&identity).cloned().ok_or_else(|| {
+                        PlanError::new(format!(
+                            "distributed producer {} has no closure lineage",
+                            distributed_identity_hex(&identity)
+                        ))
+                    })?
+                }
+            };
+            let target = (occurrence.producer_role, producer_callable.id);
+            if lineage.contains(&target) {
+                let mut cycle = lineage
+                    .iter()
+                    .map(|(role, callable)| format!("{}/{}", role.namespace(), callable))
+                    .collect::<Vec<_>>();
+                cycle.push(format!(
+                    "{}/{}",
+                    occurrence.producer_role.namespace(),
+                    producer_callable.id
+                ));
+                return Err(PlanError::new(format!(
+                    "distributed producer expansion is recursive: {}",
+                    cycle.join(" -> ")
+                ))
+                .into());
+            }
+            lineage.push(target);
+            let request = boon_semantic::ProducerMaterializationRequest {
+                identity: occurrence.producer_materialization_identity,
+                callable: producer_callable.id,
+                local_function,
+                mode: occurrence.mode,
+            };
+            if let Some((previous_role, previous)) = requests_by_identity.insert(
+                request.identity,
+                (occurrence.producer_role, request.clone()),
+            ) && (previous_role != occurrence.producer_role || previous != request)
+            {
+                return Err(PlanError::new(
+                    "distributed semantic producer identity resolves to conflicting requests",
+                )
+                .into());
+            }
+            if let Some(previous) = lineages.insert(request.identity, lineage.clone())
+                && previous != lineage
+            {
+                return Err(PlanError::new(
+                    "distributed producer identity has conflicting closure ancestry",
+                )
+                .into());
+            }
+            requests
+                .get_mut(&occurrence.producer_role)
+                .expect("canonical producer request set")
+                .insert(request);
+        }
+        for occurrence in boon_semantic::distributed_value_occurrences(consumer)? {
+            let crossing = DistributedSemanticValueContract {
+                consumer_role,
+                root: occurrence.root,
+                call_path: occurrence.call_path,
+                checked_expression: occurrence.checked_expression,
+                external_identity: occurrence.external_identity,
+                producer_role: occurrence.producer_role,
+            };
+            if let Some(previous) = value_crossings.insert(occurrence.identity, crossing.clone())
+                && previous != crossing
+            {
+                return Err(PlanError::new(
+                    "distributed semantic value identity resolves to conflicting crossings",
+                )
+                .into());
+            }
+        }
+    }
+    Ok((requests, lineages, call_crossings, value_crossings))
+}
+
+fn semantic_program_array(
+    mut programs: BTreeMap<ProgramRole, boon_semantic::SemanticProgram>,
+) -> Result<[boon_semantic::SemanticProgram; 3], PlanError> {
+    let mut take = |role: ProgramRole| {
+        programs.remove(&role).ok_or_else(|| {
+            PlanError::new(format!(
+                "distributed semantic fixed point is missing {} role",
+                role.namespace()
+            ))
+        })
+    };
+    let result = [
+        take(ProgramRole::Client)?,
+        take(ProgramRole::Session)?,
+        take(ProgramRole::Server)?,
+    ];
+    if !programs.is_empty() {
+        return Err(PlanError::new(
+            "distributed semantic fixed point contains an unsupported role",
+        ));
+    }
+    Ok(result)
+}
+
+fn prelinked_calls_from_semantic_bundle(
+    bundle: &boon_semantic::BundleSemanticProgramV1,
+    prelude: &DistributedGraphPrelude,
+) -> Result<BTreeMap<(ProgramRole, String), PrelinkedCallSite>, PlanError> {
+    let mut prelinked = BTreeMap::new();
+    for crossing in bundle.call_crossings() {
+        let stable_identity = DistributedDeclarationId::from_semantic_path(
+            role_namespace(crossing.consumer_role),
+            &format!(
+                "semantic-call-site:{}",
+                distributed_identity_hex(&crossing.producer_materialization_identity)
+            ),
+        )?;
+        let call_site_id = RemoteCallSiteId::from_identity(
+            prelude.graph_identity.graph_id,
+            prelude
+                .endpoints
+                .get(&crossing.consumer_role)
+                .expect("consumer endpoint")
+                .endpoint_id,
+            stable_identity,
+        )?;
+        let mode = match crossing.mode {
+            boon_semantic::ProducerMaterializationMode::Current => DistributedCallMode::Current,
+            boon_semantic::ProducerMaterializationMode::Invocation => {
+                DistributedCallMode::Invocation
+            }
+        };
+        let site = PrelinkedCallSite {
+            consumer_role: crossing.consumer_role,
+            occurrence_path: crossing.occurrence_path.clone(),
+            canonical_function: crossing.canonical_function.clone(),
+            producer_role: crossing.producer_role,
+            stable_identity,
+            call_site_id,
+            mode,
+        };
+        let key = (crossing.consumer_role, crossing.occurrence_path.clone());
+        if let Some(previous) = prelinked.insert(key, site.clone())
+            && (previous.canonical_function != site.canonical_function
+                || previous.producer_role != site.producer_role
+                || previous.call_site_id != site.call_site_id
+                || previous.mode != site.mode)
+        {
+            return Err(PlanError::new(format!(
+                "semantic bundle occurrence `{}` has conflicting executable call-site projections",
+                crossing.occurrence_path
+            )));
+        }
+    }
+    Ok(prelinked)
+}
+
+fn distributed_identity_hex(identity: &[u8; 32]) -> String {
+    identity.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn parse_role(request: &DistributedCompilerProgram) -> CompilerResult<ParsedRole> {
@@ -509,11 +812,10 @@ fn parse_role(request: &DistributedCompilerProgram) -> CompilerResult<ParsedRole
 
 fn lower_parsed_role(
     program: &ParsedRole,
-    checked: CheckedProgram,
-    producer_requests: &[boon_ir::ProducerFunctionLoweringRequest],
+    semantic: boon_semantic::SemanticProgram,
 ) -> CompilerResult<LoweredRole> {
     let lower_started = Instant::now();
-    let ir = boon_ir::lower_checked(checked, producer_requests)?;
+    let ir = super::verify_and_lower_semantic(semantic)?;
     let lower_ms = elapsed_ms(lower_started);
     let verify_started = Instant::now();
     verify_hidden_identity(&ir)?;
@@ -537,15 +839,19 @@ fn program_role_for_namespace(namespace: &str) -> Option<ProgramRole> {
     })
 }
 
-fn collect_bundle_references(
+/// Collects only the checked interface-demand seed used by the type solver.
+///
+/// This is deliberately discarded after sealing checked producer identities;
+/// final distributed crossings are derived exclusively from SemanticPrograms.
+fn collect_provisional_bundle_interface_demands(
     programs: &BTreeMap<ProgramRole, ParsedRole>,
-) -> Result<BundleReferences, PlanError> {
-    let mut references = BundleReferences::default();
+) -> Result<ProvisionalBundleInterfaceDemands, PlanError> {
+    let mut references = ProvisionalBundleInterfaceDemands::default();
     let mut seen_values = BTreeSet::new();
 
     for (consumer_role, program) in programs {
         for expression in &program.checked.expressions {
-            let boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path } =
+            let boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path, .. } =
                 &expression.kind
             else {
                 continue;
@@ -564,7 +870,7 @@ fn collect_bundle_references(
                 )));
             }
             if seen_values.insert((*consumer_role, canonical_path.clone())) {
-                references.values.push(BundleValueReference {
+                references.values.push(ProvisionalValueInterfaceDemand {
                     consumer_role: *consumer_role,
                     producer_role,
                     canonical_path: canonical_path.clone(),
@@ -586,7 +892,7 @@ fn collect_bundle_references(
                     call.function
                 )));
             }
-            if call.pass.is_some() {
+            if !matches!(call.context_binding, CheckedContextBinding::None) {
                 return Err(PlanError::new(format!(
                     "distributed function `{}` cannot carry PASS across a runtime island",
                     call.function
@@ -607,7 +913,7 @@ fn collect_bundle_references(
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            references.calls.push(BundleCallReference {
+            references.calls.push(ProvisionalCallInterfaceDemand {
                 consumer_role: *consumer_role,
                 producer_role,
                 canonical_function: call.function.clone(),
@@ -658,7 +964,7 @@ fn validate_distributed_reference_roles(
 
 fn solve_bundle_interfaces(
     programs: &BTreeMap<ProgramRole, ParsedRole>,
-    references: &BundleReferences,
+    references: &ProvisionalBundleInterfaceDemands,
 ) -> Result<SolvedBundleInterfaces, PlanError> {
     let mut value_types = references
         .values
@@ -723,6 +1029,7 @@ fn solve_bundle_interfaces(
             &function_types,
             &local_requirements,
             true,
+            None,
         );
         let checks = programs
             .iter()
@@ -774,27 +1081,27 @@ fn solve_bundle_interfaces(
             else {
                 continue;
             };
-            if candidate.args
-                != signature
-                    .args
-                    .iter()
-                    .map(|arg| arg.name.clone())
-                    .collect::<Vec<_>>()
-                || candidate.args.len() != candidate.arg_flows.len()
+            if candidate
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .ne(signature.args.iter().map(|argument| argument.name.as_str()))
             {
                 return Err(PlanError::new(format!(
                     "distributed function `{}/{local_function}` has an inconsistent checked signature",
                     producer_role.namespace()
                 )));
             }
-            for (argument, candidate_flow) in signature.args.iter_mut().zip(&candidate.arg_flows) {
-                if argument.flow_type.mode != candidate_flow.mode {
-                    argument.flow_type.mode = candidate_flow.mode;
+            for (argument, candidate_parameter) in
+                signature.args.iter_mut().zip(&candidate.parameters)
+            {
+                if argument.flow_type.mode != candidate_parameter.flow_type.mode {
+                    argument.flow_type.mode = candidate_parameter.flow_type.mode;
                     progress = true;
                 }
                 progress |= merge_interface_type(
                     &mut argument.flow_type.ty,
-                    &candidate_flow.ty,
+                    &candidate_parameter.flow_type.ty,
                     &format!(
                         "distributed function `{}/{local_function}` argument `{}`",
                         producer_role.namespace(),
@@ -882,16 +1189,18 @@ fn solve_bundle_interfaces(
         )));
     }
 
+    let settled_checks = settled_checks.ok_or_else(|| {
+        PlanError::new("distributed interface solver exceeded its bounded fixed-point passes")
+    })?;
+    let external_identities = resolve_bundle_external_identities(references, &settled_checks)?;
     let environments = build_bundle_environments(
         references,
         &value_types,
         &function_types,
         &local_requirements,
         false,
+        Some(&external_identities),
     );
-    settled_checks.ok_or_else(|| {
-        PlanError::new("distributed interface solver exceeded its bounded fixed-point passes")
-    })?;
     let checked = seal_solved_bundle_checks(programs, &environments)?;
     Ok(SolvedBundleInterfaces { checked })
 }
@@ -942,12 +1251,85 @@ fn seal_solved_bundle_checks(
         .collect()
 }
 
+fn resolve_bundle_external_identities(
+    references: &ProvisionalBundleInterfaceDemands,
+    checks: &BTreeMap<ProgramRole, boon_typecheck::CheckOutput>,
+) -> Result<BTreeMap<(ProgramRole, String), CheckedExternalDeclarationIdentityV1>, PlanError> {
+    let producer_program = |role: ProgramRole| -> Result<&CheckedProgram, PlanError> {
+        let output = checks.get(&role).ok_or_else(|| {
+            PlanError::new(format!("missing {} interface check", role.namespace()))
+        })?;
+        if output.report.has_errors() {
+            return Err(PlanError::new(format!(
+                "{} provisional interface check still contains errors",
+                role.namespace()
+            )));
+        }
+        output.program.as_ref().ok_or_else(|| {
+            PlanError::new(format!(
+                "{} provisional interface check produced no CheckedProgram",
+                role.namespace()
+            ))
+        })
+    };
+    let mut identities =
+        BTreeMap::<(ProgramRole, String), CheckedExternalDeclarationIdentityV1>::new();
+    let mut insert = |consumer_role: ProgramRole,
+                      name: &str,
+                      identity: CheckedExternalDeclarationIdentityV1|
+     -> Result<(), PlanError> {
+        let key = (consumer_role, name.to_owned());
+        if let Some(previous) = identities.insert(key, identity)
+            && previous != identity
+        {
+            return Err(PlanError::new(format!(
+                "distributed interface `{name}` resolved to inconsistent producer declarations"
+            )));
+        }
+        Ok(())
+    };
+
+    for reference in &references.values {
+        let producer = producer_program(reference.producer_role)?;
+        let producer_declaration = declared_value_declaration(producer, &reference.local_path)?;
+        insert(
+            reference.consumer_role,
+            &reference.canonical_path,
+            CheckedExternalDeclarationIdentityV1 {
+                producer_role: reference.producer_role,
+                producer_source_bundle_digest_v1: producer.source_bundle_digest_v1,
+                producer_declaration,
+                kind: CheckedExternalDeclarationKind::Value,
+            },
+        )?;
+    }
+    for reference in &references.calls {
+        let producer = producer_program(reference.producer_role)?;
+        let producer_declaration =
+            declared_function_signature(producer, &reference.local_function)?.decl_id;
+        insert(
+            reference.consumer_role,
+            &reference.canonical_function,
+            CheckedExternalDeclarationIdentityV1 {
+                producer_role: reference.producer_role,
+                producer_source_bundle_digest_v1: producer.source_bundle_digest_v1,
+                producer_declaration,
+                kind: CheckedExternalDeclarationKind::Callable,
+            },
+        )?;
+    }
+    Ok(identities)
+}
+
 fn build_bundle_environments(
-    references: &BundleReferences,
+    references: &ProvisionalBundleInterfaceDemands,
     value_types: &BTreeMap<(ProgramRole, String), FlowType>,
     function_types: &BTreeMap<(ProgramRole, String), ExternalFunctionType>,
     local_requirements: &BTreeMap<(ProgramRole, String), BTreeMap<String, Type>>,
     provisional: bool,
+    external_identities: Option<
+        &BTreeMap<(ProgramRole, String), CheckedExternalDeclarationIdentityV1>,
+    >,
 ) -> BTreeMap<ProgramRole, ExternalTypeEnvironment> {
     let mut environments = [
         ProgramRole::Client,
@@ -959,7 +1341,7 @@ fn build_bundle_environments(
         let environment = if provisional {
             ExternalTypeEnvironment::provisional(role)
         } else {
-            ExternalTypeEnvironment::empty(role)
+            ExternalTypeEnvironment::sealed(role)
         };
         (role, environment)
     })
@@ -998,7 +1380,41 @@ fn build_bundle_environments(
             .local_function_requirements
             .insert(function.clone(), requirements.clone());
     }
+    if let Some(external_identities) = external_identities {
+        for ((consumer_role, name), identity) in external_identities {
+            environments
+                .get_mut(consumer_role)
+                .expect("consumer environment")
+                .external_identities
+                .insert(name.clone(), *identity);
+        }
+    }
     environments
+}
+
+fn declared_value_declaration(
+    program: &CheckedProgram,
+    local_path: &str,
+) -> Result<boon_typecheck::DeclId, PlanError> {
+    let matches = program
+        .declarations
+        .iter()
+        .filter(|declaration| {
+            program
+                .declaration_path(declaration.id)
+                .is_some_and(|path| path == local_path)
+        })
+        .map(|declaration| declaration.id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [declaration] => Ok(*declaration),
+        [] => Err(PlanError::new(format!(
+            "distributed value `{local_path}` has no exact producer declaration"
+        ))),
+        _ => Err(PlanError::new(format!(
+            "distributed value `{local_path}` has an ambiguous producer declaration"
+        ))),
+    }
 }
 
 fn declared_function_signature<'a>(
@@ -1692,13 +2108,11 @@ fn link_lowered_roles(
     for function in function_links.values() {
         let parameters = function
             .signature
-            .args
+            .parameters
             .iter()
-            .cloned()
-            .zip(function.signature.arg_flows.iter())
-            .map(|(name, flow)| {
-                type_to_data_plan(&flow.ty)
-                    .map(|data_type| (name, data_type))
+            .map(|parameter| {
+                type_to_data_plan(&parameter.flow_type.ty)
+                    .map(|data_type| (parameter.name.clone(), data_type))
                     .ok_or_else(|| {
                         PlanError::new(format!(
                             "distributed function `{}` argument is not a closed boundary type",

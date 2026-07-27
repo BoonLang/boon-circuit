@@ -8,6 +8,8 @@ members = [
     "crates/boon_example_manifest",
     "crates/boon_parser",
     "crates/boon_typecheck",
+    "crates/boon_semantic",
+    "crates/boon_verify",
     "crates/boon_ir",
     "crates/boon_plan",
     "crates/boon_list_access",
@@ -53,6 +55,8 @@ boon_effect_schema = { path = "crates/boon_effect_schema" }
 boon_example_manifest = { path = "crates/boon_example_manifest" }
 boon_parser = { path = "crates/boon_parser" }
 boon_typecheck = { path = "crates/boon_typecheck" }
+boon_semantic = { path = "crates/boon_semantic" }
+boon_verify = { path = "crates/boon_verify" }
 boon_ir = { path = "crates/boon_ir" }
 boon_plan = { path = "crates/boon_plan" }
 boon_list_access = { path = "crates/boon_list_access" }
@@ -126,6 +130,7 @@ url = "2.5.7"
 wasm-bindgen-cli-support = "=0.2.121"
 zeroize = "1.8.2"
 static_assertions = "1.1.0"
+syn = { version = "2.0.117", features = ["full", "visit"] }
 
 [profile.dev.package.boon_document]
 opt-level = 2

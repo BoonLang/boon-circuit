@@ -103,7 +103,10 @@ fn qualified_distributed_values_and_calls_have_explicit_typed_metadata() {
         .find(|call| call.canonical_function == "Server/add")
         .unwrap();
     assert_eq!(add.producer_role, boon_typecheck::ProgramRole::Server);
-    assert_eq!(add.result, distributed_test_flow(boon_typecheck::Type::Number));
+    assert_eq!(
+        add.result,
+        distributed_test_flow(boon_typecheck::Type::Number)
+    );
     assert_eq!(add.arguments.len(), 1);
     assert_eq!(add.arguments[0].name, "value");
     assert_eq!(
@@ -129,7 +132,10 @@ fn qualified_distributed_values_and_calls_have_explicit_typed_metadata() {
         .find(|call| call.canonical_function == "Server/Module/format")
         .unwrap();
     assert_eq!(format.producer_role, boon_typecheck::ProgramRole::Server);
-    assert_eq!(format.result, distributed_test_flow(boon_typecheck::Type::Text));
+    assert_eq!(
+        format.result,
+        distributed_test_flow(boon_typecheck::Type::Text)
+    );
     assert_eq!(format.arguments.len(), 1);
     assert_eq!(format.arguments[0].name, "value");
     assert_eq!(
@@ -186,6 +192,24 @@ store: [
             boon_typecheck::Type::Number,
         ),
     );
+    environment.external_identities.insert(
+        "Client/store.increment".to_owned(),
+        boon_typecheck::CheckedExternalDeclarationIdentityV1 {
+            producer_role: boon_typecheck::ProgramRole::Client,
+            producer_source_bundle_digest_v1: parsed.source_bundle_digest_v1,
+            producer_declaration: boon_typecheck::DeclId(41),
+            kind: boon_typecheck::CheckedExternalDeclarationKind::Value,
+        },
+    );
+    environment.external_identities.insert(
+        "Server/double".to_owned(),
+        boon_typecheck::CheckedExternalDeclarationIdentityV1 {
+            producer_role: boon_typecheck::ProgramRole::Server,
+            producer_source_bundle_digest_v1: parsed.source_bundle_digest_v1,
+            producer_declaration: boon_typecheck::DeclId(42),
+            kind: boon_typecheck::CheckedExternalDeclarationKind::Callable,
+        },
+    );
 
     let ir = lower_with_external_types(&parsed, &environment).unwrap();
     let [call] = ir.distributed_references.calls.as_slice() else {
@@ -240,14 +264,13 @@ store: [
         ),
     );
 
-    let checked = boon_typecheck::check_runtime_program_profiled_with_external_types(
-        &parsed,
-        &environment,
-    )
-    .0
-    .program
-    .expect("valid distributed THEN fixture");
-    let occurrences = distributed_call_occurrences(&checked, &[]).unwrap();
+    let checked =
+        boon_typecheck::check_runtime_program_profiled_with_external_types(&parsed, &environment)
+            .0
+            .program
+            .expect("valid distributed THEN fixture");
+    let semantic = boon_semantic::elaborate(checked.clone(), &[]).unwrap();
+    let occurrences = boon_semantic::distributed_call_occurrences(&semantic).unwrap();
     let [occurrence] = occurrences.as_slice() else {
         panic!("expected one distributed call occurrence")
     };

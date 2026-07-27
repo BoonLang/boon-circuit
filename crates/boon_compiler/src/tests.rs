@@ -24,6 +24,36 @@ struct SourceBundleGoldenUnit {
 }
 
 #[test]
+fn source_compilation_is_bound_to_semantic_and_verification_manifests() {
+    let first = compile_fixture_source_text_to_machine_plan(
+        "verified-spine.bn",
+        "value: 1\n",
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let second = compile_fixture_source_text_to_machine_plan(
+        "verified-spine.bn",
+        "value: 1\n",
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let semantic = first.ir.semantic_program_digest();
+    let verification = first.ir.verification_manifest_digest();
+    let source_bundle = CanonicalSourceBundleV1::new(
+        "verified-spine.bn",
+        [SourceBundleUnit::new("verified-spine.bn", "value: 1\n")],
+    )
+    .unwrap()
+    .digest();
+    assert_eq!(first.ir.source_bundle_digest_v1(), source_bundle);
+    assert_eq!(second.ir.source_bundle_digest_v1(), source_bundle);
+    assert!(semantic.as_bytes().iter().any(|byte| *byte != 0));
+    assert!(verification.as_bytes().iter().any(|byte| *byte != 0));
+    assert_eq!(second.ir.semantic_program_digest(), semantic);
+    assert_eq!(second.ir.verification_manifest_digest(), verification);
+}
+
+#[test]
 fn nested_effect_guards_lower_to_bounded_selector_conjunctions() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "nested-effect-guards.bn",
@@ -6928,8 +6958,9 @@ document: Document/new(
 fn cells_scoped_source_routes_publish_complete_structural_owners() {
     let path = example_path("examples/cells.bn");
     let units = compiler_source_units_for_path(&path).unwrap();
+    assert_eq!(units[0].path, "examples/cells.bn");
     let compiled = compile_runtime_source_units_to_machine_plan_with_persistence_identity(
-        "typed-cells-route-indexes.bn",
+        &units[0].path,
         &units,
         TargetProfile::SoftwareDefault,
         ApplicationIdentity::new("dev.boon.cells-route-indexes", "test", "local"),
@@ -7368,6 +7399,33 @@ fn shared_source_bundle_digest_v1_golden_compiles_canonical_client_bundle() {
         }
     );
     assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn source_unit_entrypoint_must_name_an_exact_canonical_unit() {
+    let units = vec![CompilerSourceUnit {
+        path: "app/RUN.bn".to_owned(),
+        source: "value: 1\n".to_owned(),
+    }];
+    let error = compile_source_units_to_machine_plan(
+        "diagnostic-label-only",
+        &units,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("entrypoint `diagnostic-label-only` is not one of its units"),
+        "{error}"
+    );
+    let diagnostics = diagnose_runtime_source_units("diagnostic-label-only", &units);
+    assert_eq!(diagnostics.len(), 1);
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("entrypoint `diagnostic-label-only` is not one of its units")
+    );
 }
 
 #[test]

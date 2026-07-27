@@ -128,7 +128,11 @@ fn lower_rejects_duplicate_direct_latest_source_branches() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples/bytes_indexed_duplicate_update_conflict_plan_ops.bn");
     let source = std::fs::read_to_string(&fixture).unwrap();
-    let parsed = boon_parser::parse_source(fixture.display().to_string(), &source).unwrap();
+    let parsed = boon_parser::parse_source(
+        "examples/bytes_indexed_duplicate_update_conflict_plan_ops.bn",
+        &source,
+    )
+    .unwrap();
     let error = lower(&parsed)
         .expect_err("semantic IR lowering must not silently drop duplicate LATEST branches");
     assert!(

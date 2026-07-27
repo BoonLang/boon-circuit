@@ -1,28 +1,40 @@
 //! Compile-time elaboration of checked `OUT` bindings.
 //!
-//! This graph is intentionally private to `boon_ir`. It retains enough checked
-//! provenance for diagnostics and later structural-owner interning, but it is
-//! not a runtime value and is not serializable.
+//! The resolved graph is owned by [`crate::SemanticProgram`]. It retains
+//! checked provenance and the complete static-owner forest, but it is neither
+//! executable IR nor a runtime value.
 
-use super::{
-    ExecutableParameterId, ExecutableStatementId, FunctionId, StaticOwnerDef, StaticOwnerId,
-};
+use crate::ProducerMaterializationMode;
 use boon_typecheck::{
     CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedCallableSignature,
-    CheckedEvaluationScope, CheckedExprId, CheckedProgram, CheckedScopeKind,
-    CheckedTypeSubstitution, DeclId, FlowType, LexicalScopeId, apply_checked_type_substitutions,
+    CheckedContextBinding, CheckedEvaluationScope, CheckedExprId, CheckedProgram, CheckedScopeKind,
+    CheckedTypeSubstitution, ContextFormalId, DeclId, FlowType, LexicalScopeId,
+    apply_checked_type_substitutions,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 macro_rules! typed_out_id {
     ($($name:ident),+ $(,)?) => {
         $(
-            #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-            pub(crate) struct $name(usize);
+            #[derive(
+                Clone,
+                Copy,
+                Debug,
+                Eq,
+                Hash,
+                Ord,
+                PartialEq,
+                PartialOrd,
+                Serialize,
+                Deserialize,
+            )]
+            #[serde(transparent)]
+            pub struct $name(pub usize);
 
             impl $name {
-                pub(crate) const fn as_usize(self) -> usize {
+                pub const fn as_usize(self) -> usize {
                     self.0
                 }
             }
@@ -36,52 +48,79 @@ macro_rules! typed_out_id {
     };
 }
 
-typed_out_id!(OutCallInstanceId, OutPortId, OutNetId);
+typed_out_id!(
+    OutCallInstanceId,
+    OutPortId,
+    OutNetId,
+    ProducerFunctionId,
+    ProducerResultStatementId,
+    StaticOwnerId,
+);
 
 impl OutCallInstanceId {
-    pub(crate) const fn from_usize(value: usize) -> Self {
+    pub const fn from_usize(value: usize) -> Self {
         Self(value)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerRootParameter {
-    pub(crate) formal: DeclId,
-    pub(crate) parameter: ExecutableParameterId,
-    pub(crate) name: String,
-    pub(crate) flow_type: FlowType,
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ProducerParameterId {
+    pub function: ProducerFunctionId,
+    pub ordinal: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerRootSpec {
-    pub(crate) identity: [u8; 32],
-    pub(crate) mode: crate::ProducerFunctionMode,
-    pub(crate) callable: DeclId,
-    pub(crate) function: FunctionId,
-    pub(crate) function_name: String,
-    pub(crate) result_statement: ExecutableStatementId,
-    pub(crate) result_declaration: DeclId,
-    pub(crate) result_path: String,
-    pub(crate) result_type: FlowType,
-    pub(crate) parameters: Vec<ProducerRootParameter>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StaticOwnerDef {
+    pub id: StaticOwnerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<StaticOwnerId>,
+    pub child_ordinal: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProducerRoot {
-    pub(crate) spec: ProducerRootSpec,
-    pub(crate) call: OutCallInstanceId,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum DistributedCallOccurrenceRoot {
+    Program,
+    Producer([u8; 32]),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProducerRootParameter {
+    pub formal: DeclId,
+    pub parameter: ProducerParameterId,
+    pub name: String,
+    pub flow_type: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProducerRootSpec {
+    pub identity: [u8; 32],
+    pub mode: ProducerMaterializationMode,
+    pub callable: DeclId,
+    pub function: ProducerFunctionId,
+    pub function_name: String,
+    pub result_statement: ProducerResultStatementId,
+    pub result_declaration: DeclId,
+    pub result_path: String,
+    pub result_type: FlowType,
+    pub parameters: Vec<ProducerRootParameter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProducerRoot {
+    pub spec: ProducerRootSpec,
+    pub call: OutCallInstanceId,
 }
 
 /// Stable checked-program coordinates for one static call site.
 ///
-/// `pass` is deliberately excluded: `PASS` is context for expansion,
-/// not part of executable ownership.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct OutCallProvenance {
-    pub(crate) call_id: Option<CheckedCallId>,
-    pub(crate) expression: CheckedExprId,
-    pub(crate) owner_callable: Option<DeclId>,
-    pub(crate) callable: DeclId,
+/// The contextual binding is deliberately excluded: `PASS` is context for
+/// expansion, not part of executable ownership.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct OutCallProvenance {
+    pub call_id: Option<CheckedCallId>,
+    pub expression: CheckedExprId,
+    pub owner_callable: Option<DeclId>,
+    pub callable: DeclId,
 }
 
 impl From<&CheckedCall> for OutCallProvenance {
@@ -95,57 +134,58 @@ impl From<&CheckedCall> for OutCallProvenance {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OutCallInstance {
-    pub(crate) id: OutCallInstanceId,
-    pub(crate) parent: Option<OutCallInstanceId>,
-    pub(crate) provenance: OutCallProvenance,
-    pub(crate) parent_output: Option<DeclId>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OutCallInstance {
+    pub id: OutCallInstanceId,
+    pub parent: Option<OutCallInstanceId>,
+    pub provenance: OutCallProvenance,
+    pub parent_output: Option<DeclId>,
     parent_output_node: Option<usize>,
-    pub(crate) inputs: Vec<OutInputBinding>,
-    pub(crate) passed: Option<PassedBinding>,
-    pub(crate) ports: Vec<OutPortId>,
-    pub(crate) type_substitutions: Vec<CheckedTypeSubstitution>,
-    pub(crate) result: FlowType,
+    pub inputs: Vec<OutInputBinding>,
+    pub passed: Option<PassedBinding>,
+    pub ports: Vec<OutPortId>,
+    pub type_substitutions: Vec<CheckedTypeSubstitution>,
+    pub result: FlowType,
     /// Present only when this concrete user call directly allocates runtime
     /// resources. Pure forwarding wrappers deliberately have no owner.
-    pub(crate) owner: Option<StaticOwnerId>,
+    pub owner: Option<StaticOwnerId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PassedBinding {
-    pub(crate) value: ScopedCheckedExpr,
-    pub(crate) evaluation_call: OutCallInstanceId,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct PassedBinding {
+    pub formal: ContextFormalId,
+    pub value: ScopedCheckedExpr,
+    pub evaluation_call: OutCallInstanceId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ScopedCheckedExpr {
-    pub(crate) expression: CheckedExprId,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ScopedCheckedExpr {
+    pub expression: CheckedExprId,
     /// The concrete user-call frame in which this expression was written.
-    pub(crate) frame: Option<OutCallInstanceId>,
+    pub frame: Option<OutCallInstanceId>,
     /// A call-local output formal under which this argument is evaluated.
-    pub(crate) evaluation_port: Option<OutPortId>,
+    pub evaluation_port: Option<OutPortId>,
     /// A standalone pure-function binding frame used outside a concrete call site.
-    pub(crate) value_frame: Option<usize>,
+    pub value_frame: Option<usize>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OutInputBinding {
-    pub(crate) formal: DeclId,
-    pub(crate) value: OutInputValue,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OutInputBinding {
+    pub formal: DeclId,
+    pub value: OutInputValue,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OutInputValue {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum OutInputValue {
     Checked(ScopedCheckedExpr),
     ProducerParameter {
-        parameter: ExecutableParameterId,
+        parameter: ProducerParameterId,
         flow_type: FlowType,
     },
 }
 
 impl OutInputBinding {
-    pub(crate) fn checked_value(&self) -> Option<ScopedCheckedExpr> {
+    pub fn checked_value(&self) -> Option<ScopedCheckedExpr> {
         match &self.value {
             OutInputValue::Checked(value) => Some(*value),
             OutInputValue::ProducerParameter { .. } => None,
@@ -153,8 +193,8 @@ impl OutInputBinding {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OutPortBinding {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum OutPortBinding {
     Fresh {
         output: DeclId,
         scope_id: LexicalScopeId,
@@ -169,39 +209,39 @@ pub(crate) enum OutPortBinding {
 /// `Contract` is currently `()` for the public checked schema. Keeping it on
 /// the port lets type/shape/scope/role/generation/correlation facts be attached
 /// without changing graph identity or the unification algorithm.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OutPort<Contract = ()> {
-    pub(crate) id: OutPortId,
-    pub(crate) call: OutCallInstanceId,
-    pub(crate) entry_ordinal: usize,
-    pub(crate) formal: DeclId,
-    pub(crate) name: String,
-    pub(crate) binding: OutPortBinding,
-    pub(crate) contract: Contract,
-    pub(crate) net: OutNetId,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OutPort<Contract = ()> {
+    pub id: OutPortId,
+    pub call: OutCallInstanceId,
+    pub entry_ordinal: usize,
+    pub formal: DeclId,
+    pub name: String,
+    pub binding: OutPortBinding,
+    pub contract: Contract,
+    pub net: OutNetId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StructuralProducer {
-    pub(crate) port: OutPortId,
-    pub(crate) call: OutCallInstanceId,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StructuralProducer {
+    pub port: OutPortId,
+    pub call: OutCallInstanceId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct UnifiedOutNet {
-    pub(crate) id: OutNetId,
-    pub(crate) ports: Vec<OutPortId>,
-    pub(crate) producers: Vec<StructuralProducer>,
-    pub(crate) owner: Option<StaticOwnerId>,
-    pub(crate) owner_anchor: Option<OutPortId>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnifiedOutNet {
+    pub id: OutNetId,
+    pub ports: Vec<OutPortId>,
+    pub producers: Vec<StructuralProducer>,
+    pub owner: Option<StaticOwnerId>,
+    pub owner_anchor: Option<OutPortId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OutNet<Contract = ()> {
-    pub(crate) call_instances: Vec<OutCallInstance>,
-    pub(crate) ports: Vec<OutPort<Contract>>,
-    pub(crate) nets: Vec<UnifiedOutNet>,
-    pub(crate) static_owners: Vec<StaticOwnerDef>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OutNet<Contract = ()> {
+    pub call_instances: Vec<OutCallInstance>,
+    pub ports: Vec<OutPort<Contract>>,
+    pub nets: Vec<UnifiedOutNet>,
+    pub static_owners: Vec<StaticOwnerDef>,
     call_instance_by_checked_frame:
         BTreeMap<(CheckedCallId, Option<OutCallInstanceId>), Option<OutCallInstanceId>>,
     output_net_by_frame_target: BTreeMap<(Option<OutCallInstanceId>, DeclId), Option<OutNetId>>,
@@ -211,23 +251,23 @@ pub(crate) struct OutNet<Contract = ()> {
     producer_root_calls: BTreeSet<OutCallInstanceId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConcreteOutProducer {
-    pub(crate) call: OutCallInstanceId,
-    pub(crate) port: OutPortId,
-    pub(crate) net: OutNetId,
-    pub(crate) owner: StaticOwnerId,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ConcreteOutProducer {
+    pub call: OutCallInstanceId,
+    pub port: OutPortId,
+    pub net: OutNetId,
+    pub owner: StaticOwnerId,
 }
 
 impl<Contract> OutNet<Contract> {
-    pub(crate) fn producer_root_result_path(&self, call: OutCallInstanceId) -> Option<&str> {
+    pub fn producer_root_result_path(&self, call: OutCallInstanceId) -> Option<&str> {
         self.producer_roots
             .iter()
             .find(|root| root.call == call)
             .map(|root| root.spec.result_path.as_str())
     }
 
-    pub(crate) fn call_instance_for_checked_call(
+    pub fn call_instance_for_checked_call(
         &self,
         call_id: CheckedCallId,
         frame: Option<OutCallInstanceId>,
@@ -238,22 +278,19 @@ impl<Contract> OutNet<Contract> {
             .flatten()
     }
 
-    pub(crate) fn net_for_port(&self, port: OutPortId) -> OutNetId {
+    pub fn net_for_port(&self, port: OutPortId) -> OutNetId {
         self.ports[port.as_usize()].net
     }
 
-    pub(crate) fn owner_for_net(&self, net: OutNetId) -> Option<StaticOwnerId> {
+    pub fn owner_for_net(&self, net: OutNetId) -> Option<StaticOwnerId> {
         self.nets[net.as_usize()].owner
     }
 
-    pub(crate) fn owner_for_call(&self, call: OutCallInstanceId) -> Option<StaticOwnerId> {
+    pub fn owner_for_call(&self, call: OutCallInstanceId) -> Option<StaticOwnerId> {
         self.call_instances[call.as_usize()].owner
     }
 
-    pub(crate) fn owner_for_call_evaluation(
-        &self,
-        mut call: OutCallInstanceId,
-    ) -> Option<StaticOwnerId> {
+    pub fn owner_for_call_evaluation(&self, mut call: OutCallInstanceId) -> Option<StaticOwnerId> {
         // Producer roots are synthetic distributed call-site boundaries. Their
         // parameter imports belong to the instance slab rather than to a
         // lexical caller outside that slab.
@@ -280,11 +317,11 @@ impl<Contract> OutNet<Contract> {
         }
     }
 
-    pub(crate) fn distributed_call_occurrence(
+    pub fn distributed_call_occurrence(
         &self,
         program: &CheckedProgram,
         instance: OutCallInstanceId,
-    ) -> Result<(crate::DistributedCallOccurrenceRoot, String), String> {
+    ) -> Result<(DistributedCallOccurrenceRoot, String), String> {
         let mut ancestry = Vec::new();
         let mut next = Some(instance);
         let mut remaining = self.call_instances.len().saturating_add(1);
@@ -311,12 +348,12 @@ impl<Contract> OutNet<Contract> {
                 .find_map(|(identity, candidate)| (*candidate == *root).then_some(*identity))
         });
         let root = producer_root
-            .map(crate::DistributedCallOccurrenceRoot::Producer)
-            .unwrap_or(crate::DistributedCallOccurrenceRoot::Program);
+            .map(DistributedCallOccurrenceRoot::Producer)
+            .unwrap_or(DistributedCallOccurrenceRoot::Program);
         let mut path = match root {
-            crate::DistributedCallOccurrenceRoot::Program => "program".to_owned(),
-            crate::DistributedCallOccurrenceRoot::Producer(identity) => {
-                format!("producer:{}", crate::producer_identity_text(identity))
+            DistributedCallOccurrenceRoot::Program => "program".to_owned(),
+            DistributedCallOccurrenceRoot::Producer(identity) => {
+                format!("producer:{}", producer_identity_text(identity))
             }
         };
         let first_static = usize::from(producer_root.is_some());
@@ -333,7 +370,7 @@ impl<Contract> OutNet<Contract> {
         Ok((root, path))
     }
 
-    pub(crate) fn owner_scope_for_net(&self, net: OutNetId) -> Option<LexicalScopeId> {
+    pub fn owner_scope_for_net(&self, net: OutNetId) -> Option<LexicalScopeId> {
         let anchor = self.nets[net.as_usize()].owner_anchor?;
         match self.ports[anchor.as_usize()].binding {
             OutPortBinding::Fresh { scope_id, .. } => Some(scope_id),
@@ -341,7 +378,7 @@ impl<Contract> OutNet<Contract> {
         }
     }
 
-    pub(crate) fn concrete_producers_for_checked_call(
+    pub fn concrete_producers_for_checked_call(
         &self,
         call_id: CheckedCallId,
     ) -> Vec<ConcreteOutProducer> {
@@ -351,7 +388,7 @@ impl<Contract> OutNet<Contract> {
             .unwrap_or_default()
     }
 
-    pub(crate) fn output_net_in_frame(
+    pub fn output_net_in_frame(
         &self,
         frame: Option<OutCallInstanceId>,
         target: DeclId,
@@ -362,105 +399,41 @@ impl<Contract> OutNet<Contract> {
             .flatten()
     }
 
-    pub(crate) fn producer_roots(&self) -> &[ProducerRoot] {
+    pub fn producer_roots(&self) -> &[ProducerRoot] {
         &self.producer_roots
     }
 }
 
-pub(crate) fn checked_call_occurrence_segment(
+fn producer_identity_text(identity: [u8; 32]) -> String {
+    identity.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn checked_call_occurrence_segment(
     program: &CheckedProgram,
     call_id: CheckedCallId,
 ) -> Result<String, String> {
-    let call = program
+    program
         .calls
         .iter()
         .find(|candidate| candidate.id == call_id)
         .ok_or_else(|| format!("checked call {} is missing", call_id.0))?;
-    let owner = checked_call_owner_key(program, call);
-    let mut peers = program
-        .calls
-        .iter()
-        .filter(|candidate| {
-            candidate.owner_callable == call.owner_callable
-                && candidate.function == call.function
-                && checked_call_owner_key(program, candidate) == owner
-        })
-        .collect::<Vec<_>>();
-    peers.sort_by_key(|candidate| {
-        (
-            candidate.span.line,
-            candidate.span.start,
-            candidate.span.end,
-            candidate.id,
-        )
-    });
-    let ordinal = peers
-        .iter()
-        .position(|candidate| candidate.id == call.id)
-        .ok_or_else(|| format!("checked call {} has no static occurrence", call.id.0))?;
-    Ok(format!(
-        "{}:{}|{}:{}|{ordinal}",
-        owner.len(),
-        owner,
-        call.function.len(),
-        call.function
-    ))
+    Ok(format!("call:{}", call_id.0))
 }
 
-fn checked_call_owner_key(program: &CheckedProgram, call: &CheckedCall) -> String {
-    if let Some(owner) = call.owner_callable
-        && let Some(callable) = program
-            .callables
-            .iter()
-            .find(|candidate| candidate.decl_id == owner)
-    {
-        return format!("function:{}", callable.name);
-    }
-    let Some(expression) = program
-        .expressions
-        .iter()
-        .find(|candidate| candidate.id == call.expression)
-    else {
-        return "root".to_owned();
-    };
-    if let Some(declaration) = expression.declaration
-        && let Some(path) = program.declaration_path(declaration)
-    {
-        return format!("declaration:{path}");
-    }
-    let mut scope = Some(expression.scope_id);
-    let mut visited = BTreeSet::new();
-    while let Some(id) = scope {
-        if !visited.insert(id) {
-            break;
-        }
-        let Some(current) = program.scopes.iter().find(|candidate| candidate.id == id) else {
-            break;
-        };
-        if let Some(owner) = current.owner
-            && let Some(path) = program.declaration_path(owner)
-        {
-            return format!("scope:{path}");
-        }
-        scope = current.parent;
-    }
-    "root".to_owned()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct OutNetBuild<Contract = ()> {
     pub(crate) graph: OutNet<Contract>,
     pub(crate) diagnostics: Vec<OutNetDiagnostic>,
 }
 
 impl<Contract> OutNetBuild<Contract> {
-    pub(crate) fn has_errors(&self) -> bool {
+    pub fn has_errors(&self) -> bool {
         !self.diagnostics.is_empty()
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OutNetDiagnostic {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum OutNetDiagnostic {
     AliasCycle {
         declarations: Vec<DeclId>,
         call_sites: Vec<OutCallProvenance>,
@@ -610,6 +583,7 @@ impl OutNet<()> {
         Self::build_with_producer_roots(program, Vec::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn build_with_producer_roots(
         program: &CheckedProgram,
         producer_roots: Vec<ProducerRootSpec>,
@@ -646,6 +620,72 @@ impl<Contract> OutNet<Contract> {
         )
         .build()
     }
+
+    pub(crate) fn try_build_with<MakeContract, IsProducer, BuildError>(
+        program: &CheckedProgram,
+        producer_roots: Vec<ProducerRootSpec>,
+        make_contract: MakeContract,
+        mut is_structural_producer: IsProducer,
+    ) -> Result<OutNetBuild<Contract>, BuildError>
+    where
+        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Result<Contract, BuildError>,
+        IsProducer:
+            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+    {
+        let build = OutNet::<Result<Contract, BuildError>>::build_with(
+            program,
+            producer_roots,
+            make_contract,
+            |kind, call, entry_ordinal, entry, contract| {
+                contract.as_ref().is_ok_and(|contract| {
+                    is_structural_producer(kind, call, entry_ordinal, entry, contract)
+                })
+            },
+        );
+        let OutNetBuild { graph, diagnostics } = build;
+        let OutNet {
+            call_instances,
+            ports,
+            nets,
+            static_owners,
+            call_instance_by_checked_frame,
+            output_net_by_frame_target,
+            concrete_producers_by_checked,
+            producer_roots,
+            producer_root_by_identity,
+            producer_root_calls,
+        } = graph;
+        let ports = ports
+            .into_iter()
+            .map(|port| {
+                Ok(OutPort {
+                    id: port.id,
+                    call: port.call,
+                    entry_ordinal: port.entry_ordinal,
+                    formal: port.formal,
+                    name: port.name,
+                    binding: port.binding,
+                    contract: port.contract?,
+                    net: port.net,
+                })
+            })
+            .collect::<Result<Vec<_>, BuildError>>()?;
+        Ok(OutNetBuild {
+            graph: OutNet {
+                call_instances,
+                ports,
+                nets,
+                static_owners,
+                call_instance_by_checked_frame,
+                output_net_by_frame_target,
+                concrete_producers_by_checked,
+                producer_roots,
+                producer_root_by_identity,
+                producer_root_calls,
+            },
+            diagnostics,
+        })
+    }
 }
 
 struct PendingOutPort<Contract> {
@@ -679,7 +719,7 @@ struct PendingUnifiedNet {
     owner_anchors: Vec<OutPortId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 enum StaticOwnerNode {
     Net(OutNetId),
     Call(OutCallInstanceId),
@@ -836,27 +876,46 @@ where
                 parent.and_then(|parent| self.call_instances[parent.as_usize()].parent_output_node);
             let inherited_passed =
                 parent.and_then(|parent| self.call_instances[parent.as_usize()].passed);
-            let passed = if let Some(pass) = checked_call.pass {
-                Some(PassedBinding {
-                    value: ScopedCheckedExpr {
-                        expression: pass.value,
-                        frame: parent,
-                        evaluation_port: None,
-                        value_frame: None,
-                    },
-                    evaluation_call: instance,
-                })
-            } else if signature.is_some_and(CheckedCallableSignature::requires_pass) {
-                if inherited_passed.is_none() {
-                    self.diagnostics
-                        .push(OutNetDiagnostic::MissingPassedContext {
-                            call: instance,
-                            callable: checked_call.callable,
+            let passed = match checked_call.context_binding {
+                CheckedContextBinding::Explicit { value, .. } => signature.and_then(|signature| {
+                    signature.context_formal.map(|formal| PassedBinding {
+                        formal,
+                        value: ScopedCheckedExpr {
+                            expression: value,
+                            frame: parent,
+                            evaluation_port: None,
+                            value_frame: None,
+                        },
+                        evaluation_call: instance,
+                    })
+                }),
+                CheckedContextBinding::Inherited { .. } => {
+                    let passed = signature
+                        .and_then(|signature| signature.context_formal)
+                        .zip(inherited_passed)
+                        .map(|(formal, inherited)| PassedBinding {
+                            formal,
+                            ..inherited
                         });
+                    if passed.is_none() {
+                        self.diagnostics
+                            .push(OutNetDiagnostic::MissingPassedContext {
+                                call: instance,
+                                callable: checked_call.callable,
+                            });
+                    }
+                    passed
                 }
-                inherited_passed
-            } else {
-                None
+                CheckedContextBinding::None => {
+                    if signature.is_some_and(CheckedCallableSignature::requires_pass) {
+                        self.diagnostics
+                            .push(OutNetDiagnostic::MissingPassedContext {
+                                call: instance,
+                                callable: checked_call.callable,
+                            });
+                    }
+                    None
+                }
             };
             let inherited_substitutions = parent
                 .map(|parent| {
@@ -1705,207 +1764,34 @@ fn cyclic_alias_components(edges: &[(DeclId, DeclId, OutCallProvenance)]) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_typecheck::{
-        CheckedCallableSignature, CheckedEffectSummary, CheckedEvaluationScope, CheckedExpression,
-        CheckedExpressionKind, CheckedParameter, CheckedParameterKind, CheckedScope, CheckedSpan,
-        FlowMode, FlowType, ProgramRole, Type,
-    };
+    use boon_typecheck::CheckedProgram;
 
-    const WRAPPER: DeclId = DeclId(1);
-    const WRAPPER_OUT: DeclId = DeclId(2);
-    const BUILTIN: DeclId = DeclId(10);
-    const BUILTIN_OUT: DeclId = DeclId(11);
-
-    fn unknown_flow_type() -> FlowType {
-        FlowType {
-            mode: FlowMode::Continuous,
-            ty: Type::Unknown,
-        }
-    }
-
-    fn signature(
-        decl_id: DeclId,
-        kind: CheckedCallableKind,
-        name: &str,
-        output: DeclId,
-    ) -> CheckedCallableSignature {
-        CheckedCallableSignature {
-            decl_id,
-            scope_id: LexicalScopeId(decl_id.0),
-            kind,
-            name: name.to_owned(),
-            parameters: vec![CheckedParameter {
-                decl_id: output,
-                name: "item".to_owned(),
-                kind: CheckedParameterKind::Out,
-                ordinal: 0,
-                flow_type: unknown_flow_type(),
-                evaluation_scope: CheckedEvaluationScope::Parent,
-                start: 0,
-                end: 0,
-            }],
-            contexts: Vec::new(),
-            pass_requirement: None,
-            result: unknown_flow_type(),
-            role: ProgramRole::Client,
-            effect: CheckedEffectSummary::default(),
-            body: None,
-            result_expression: None,
-            contextual_operation: None,
-        }
-    }
-
-    fn fresh_call(
-        expr_id: usize,
-        callable: DeclId,
-        owner_callable: Option<DeclId>,
-        formal: DeclId,
-        output: DeclId,
-    ) -> CheckedCall {
-        CheckedCall {
-            id: CheckedCallId(expr_id as u32),
-            expression: CheckedExprId(expr_id as u32),
-            callable,
-            owner_callable,
-            function: format!("call_{}", callable.0),
-            entries: vec![CheckedCallEntry::FreshOut {
-                formal,
-                name: "item".to_owned(),
-                output,
-                scope_id: LexicalScopeId(output.0),
-            }],
-            contexts: Vec::new(),
-            pass: None,
-            type_substitutions: Vec::new(),
-            result: unknown_flow_type(),
-            role: ProgramRole::Client,
-            span: CheckedSpan::default(),
-        }
-    }
-
-    fn forward_call(
-        expr_id: usize,
-        callable: DeclId,
-        owner_callable: Option<DeclId>,
-        formal: DeclId,
-        target: DeclId,
-    ) -> CheckedCall {
-        CheckedCall {
-            id: CheckedCallId(expr_id as u32),
-            expression: CheckedExprId(expr_id as u32),
-            callable,
-            owner_callable,
-            function: format!("call_{}", callable.0),
-            entries: vec![CheckedCallEntry::ForwardOut {
-                formal,
-                name: "item".to_owned(),
-                target,
-                target_name: "item".to_owned(),
-            }],
-            contexts: Vec::new(),
-            pass: None,
-            type_substitutions: Vec::new(),
-            result: unknown_flow_type(),
-            role: ProgramRole::Client,
-            span: CheckedSpan::default(),
-        }
-    }
-
-    fn wrapper_program(calls: Vec<CheckedCall>) -> CheckedProgram {
-        CheckedProgram {
-            root_scope: LexicalScopeId(0),
-            callables: vec![
-                signature(WRAPPER, CheckedCallableKind::User, "wrapper", WRAPPER_OUT),
-                signature(
-                    BUILTIN,
-                    CheckedCallableKind::Builtin,
-                    "producer",
-                    BUILTIN_OUT,
-                ),
-            ],
-            calls,
-            ..CheckedProgram::default()
-        }
-    }
-
-    fn direct_program(calls: Vec<CheckedCall>) -> CheckedProgram {
-        CheckedProgram {
-            root_scope: LexicalScopeId(0),
-            callables: vec![signature(
-                BUILTIN,
-                CheckedCallableKind::Builtin,
-                "producer",
-                BUILTIN_OUT,
-            )],
-            calls,
-            ..CheckedProgram::default()
-        }
-    }
-
-    fn expression(id: usize, scope_id: LexicalScopeId, start: usize) -> CheckedExpression {
-        CheckedExpression {
-            id: CheckedExprId(id as u32),
-            scope_id,
-            declaration: None,
-            flow_type: unknown_flow_type(),
-            effect: CheckedEffectSummary::default(),
-            kind: CheckedExpressionKind::Bool { value: true },
-            span: CheckedSpan {
-                line: 0,
-                start,
-                end: start + 1,
-            },
-        }
-    }
-
-    fn scope(
-        id: u32,
-        parent: Option<u32>,
-        owner: Option<DeclId>,
-        kind: CheckedScopeKind,
-        start: usize,
-    ) -> CheckedScope {
-        CheckedScope {
-            id: LexicalScopeId(id),
-            parent: parent.map(LexicalScopeId),
-            owner,
-            kind,
-            span: CheckedSpan {
-                line: 0,
-                start,
-                end: start + 1,
-            },
-        }
-    }
-
-    fn producer_owners_for_output(
-        graph: &OutNet,
-        call: CheckedCallId,
-        output: DeclId,
-    ) -> Vec<StaticOwnerId> {
-        graph
-            .concrete_producers_for_checked_call(call)
-            .into_iter()
-            .filter(
-                |producer| match graph.ports[producer.port.as_usize()].binding {
-                    OutPortBinding::Fresh {
-                        output: candidate, ..
-                    } => candidate == output,
-                    OutPortBinding::Forward { target } => target == output,
-                },
-            )
-            .map(|producer| producer.owner)
-            .collect()
+    fn checked_program(name: &str, source: &str) -> CheckedProgram {
+        let parsed = boon_parser::parse_source(name, source).expect("fixture parses");
+        let output = boon_typecheck::check_program(&parsed);
+        assert!(
+            !output.report.has_errors(),
+            "diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        output.program.expect("fixture typechecks")
     }
 
     #[test]
     fn separate_wrapper_calls_get_separate_static_owners() {
-        let calls = vec![
-            forward_call(100, BUILTIN, Some(WRAPPER), BUILTIN_OUT, WRAPPER_OUT),
-            fresh_call(201, WRAPPER, None, WRAPPER_OUT, DeclId(21)),
-            fresh_call(200, WRAPPER, None, WRAPPER_OUT, DeclId(20)),
-        ];
-        let first = OutNet::build(&wrapper_program(calls.clone()));
+        let wrapped = checked_program(
+            "out-net-two-wrappers.bn",
+            r#"
+FUNCTION wrapped(list, entry: OUT, new) {
+    list |> List/map(item: entry, new: new)
+}
+
+rows: LIST { [value: 1] }
+first: rows |> wrapped(entry, new: entry.value + 1)
+second: rows |> wrapped(entry, new: entry.value + 2)
+"#,
+        );
+        let first = OutNet::build(&wrapped);
         assert!(!first.has_errors(), "{:#?}", first.diagnostics);
         assert_eq!(first.graph.call_instances.len(), 4);
         assert_eq!(first.graph.nets.len(), 2);
@@ -1942,109 +1828,90 @@ mod tests {
             ]
         );
 
-        assert_eq!(
-            producer_owners_for_output(&first.graph, CheckedCallId(100), WRAPPER_OUT),
-            vec![StaticOwnerId(0), StaticOwnerId(1)]
+        let direct = checked_program(
+            "out-net-two-direct.bn",
+            r#"
+rows: LIST { [value: 1] }
+first: rows |> List/map(item, new: item.value + 1)
+second: rows |> List/map(item, new: item.value + 2)
+"#,
         );
-
-        let direct = OutNet::build(&direct_program(vec![
-            fresh_call(200, BUILTIN, None, BUILTIN_OUT, DeclId(20)),
-            fresh_call(201, BUILTIN, None, BUILTIN_OUT, DeclId(21)),
-        ]));
+        let direct = OutNet::build(&direct);
         assert!(!direct.has_errors(), "{:#?}", direct.diagnostics);
         assert_eq!(first.graph.static_owners, direct.graph.static_owners);
-
-        let mut reordered = calls;
-        reordered.reverse();
-        let second = OutNet::build(&wrapper_program(reordered));
-        assert_eq!(first, second);
+        assert!(
+            direct
+                .graph
+                .nets
+                .iter()
+                .all(|net| net.ports.len() == 1 && net.producers.len() == 1)
+        );
     }
 
     #[test]
     fn multiple_wrapper_layers_erase_to_the_direct_owner_forest() {
-        const OUTER: DeclId = DeclId(3);
-        const OUTER_OUT: DeclId = DeclId(4);
+        let wrapped_program = checked_program(
+            "out-net-multiple-wrappers.bn",
+            r#"
+FUNCTION wrapped(list, entry: OUT, new) {
+    list |> List/map(item: entry, new: new)
+}
 
-        let wrapped = OutNet::build(&CheckedProgram {
-            root_scope: LexicalScopeId(0),
-            callables: vec![
-                signature(OUTER, CheckedCallableKind::User, "outer", OUTER_OUT),
-                signature(WRAPPER, CheckedCallableKind::User, "wrapper", WRAPPER_OUT),
-                signature(
-                    BUILTIN,
-                    CheckedCallableKind::Builtin,
-                    "producer",
-                    BUILTIN_OUT,
-                ),
-            ],
-            calls: vec![
-                fresh_call(300, OUTER, None, OUTER_OUT, DeclId(20)),
-                forward_call(200, WRAPPER, Some(OUTER), WRAPPER_OUT, OUTER_OUT),
-                forward_call(100, BUILTIN, Some(WRAPPER), BUILTIN_OUT, WRAPPER_OUT),
-            ],
-            ..CheckedProgram::default()
-        });
+FUNCTION outer(list, entry: OUT, new) {
+    list |> wrapped(entry: entry, new: new)
+}
+
+rows: LIST { [value: 1] }
+result: rows |> outer(entry, new: entry.value + 1)
+"#,
+        );
+        let wrapped = OutNet::build(&wrapped_program);
         assert!(!wrapped.has_errors(), "{:#?}", wrapped.diagnostics);
 
-        let direct = OutNet::build(&direct_program(vec![fresh_call(
-            300,
-            BUILTIN,
-            None,
-            BUILTIN_OUT,
-            DeclId(20),
-        )]));
+        let direct_program = checked_program(
+            "out-net-one-direct.bn",
+            r#"
+rows: LIST { [value: 1] }
+result: rows |> List/map(item, new: item.value + 1)
+"#,
+        );
+        let direct = OutNet::build(&direct_program);
         assert!(!direct.has_errors(), "{:#?}", direct.diagnostics);
         assert_eq!(wrapped.graph.static_owners, direct.graph.static_owners);
+        let map_call = wrapped_program
+            .calls
+            .iter()
+            .find(|call| call.function == "List/map")
+            .expect("nested structural producer");
         let producers = wrapped
             .graph
-            .concrete_producers_for_checked_call(CheckedCallId(100));
+            .concrete_producers_for_checked_call(map_call.id);
         let [producer] = producers.as_slice() else {
             panic!("multi-wrapper expansion must expose one concrete producer");
         };
         assert_eq!(producer.owner, StaticOwnerId(0));
         assert_eq!(wrapped.graph.net_for_port(producer.port), producer.net);
-        assert_eq!(
-            wrapped.graph.output_net_in_frame(None, DeclId(20)),
-            Some(producer.net)
-        );
-        assert_eq!(
-            wrapped
-                .graph
-                .output_net_in_frame(Some(producer.call), BUILTIN_OUT),
-            Some(producer.net)
-        );
-        assert_eq!(
-            producer_owners_for_output(&wrapped.graph, CheckedCallId(100), WRAPPER_OUT),
-            vec![StaticOwnerId(0)]
-        );
+        assert_eq!(wrapped.graph.nets.len(), 1);
+        assert_eq!(wrapped.graph.nets[0].ports.len(), 3);
     }
 
     #[test]
     fn repeated_output_scopes_form_real_owner_ancestry() {
-        let outer_output = DeclId(20);
-        let inner_output = DeclId(21);
-        let root = LexicalScopeId(0);
-        let repeated = LexicalScopeId(20);
-        let build = OutNet::build(&CheckedProgram {
-            root_scope: root,
-            scopes: vec![
-                scope(0, None, None, CheckedScopeKind::Root, 0),
-                scope(
-                    repeated.0,
-                    Some(root.0),
-                    Some(outer_output),
-                    CheckedScopeKind::RepeatedOutput,
-                    20,
-                ),
-            ],
-            expressions: vec![expression(1, root, 1), expression(2, repeated, 21)],
-            callables: direct_program(Vec::new()).callables,
-            calls: vec![
-                fresh_call(1, BUILTIN, None, BUILTIN_OUT, outer_output),
-                fresh_call(2, BUILTIN, None, BUILTIN_OUT, inner_output),
-            ],
-            ..CheckedProgram::default()
-        });
+        let program = checked_program(
+            "out-net-repeated-owner-ancestry.bn",
+            r#"
+outer_rows: LIST { [value: 1] }
+inner_rows: LIST { [value: 2] }
+
+result:
+    outer_rows
+    |> List/map(item, new:
+        inner_rows
+        |> List/map(item, new: item.value + 1)
+    )
+"#,
+        );
+        let build = OutNet::build(&program);
         assert!(!build.has_errors(), "{:#?}", build.diagnostics);
         assert_eq!(
             build.graph.static_owners,
@@ -2061,198 +1928,110 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            producer_owners_for_output(&build.graph, CheckedCallId(2), inner_output),
-            vec![StaticOwnerId(1)]
-        );
+        assert_eq!(build.graph.nets.len(), 2);
+        assert_eq!(build.graph.static_owners[1].parent, Some(StaticOwnerId(0)));
     }
 
     #[test]
-    fn output_entry_order_does_not_change_static_owner_identity() {
-        let first_formal = DeclId(11);
-        let second_formal = DeclId(12);
-        let first_output = DeclId(31);
-        let second_output = DeclId(32);
-        let callable = CheckedCallableSignature {
-            decl_id: BUILTIN,
-            scope_id: LexicalScopeId(BUILTIN.0),
-            kind: CheckedCallableKind::Builtin,
-            name: "two_outputs".to_owned(),
-            parameters: vec![
-                CheckedParameter {
-                    decl_id: first_formal,
-                    name: "first".to_owned(),
-                    kind: CheckedParameterKind::Out,
-                    ordinal: 0,
-                    flow_type: unknown_flow_type(),
-                    evaluation_scope: CheckedEvaluationScope::Parent,
-                    start: 0,
-                    end: 0,
-                },
-                CheckedParameter {
-                    decl_id: second_formal,
-                    name: "second".to_owned(),
-                    kind: CheckedParameterKind::Out,
-                    ordinal: 1,
-                    flow_type: unknown_flow_type(),
-                    evaluation_scope: CheckedEvaluationScope::Parent,
-                    start: 0,
-                    end: 0,
-                },
-            ],
-            contexts: Vec::new(),
-            pass_requirement: None,
-            result: unknown_flow_type(),
-            role: ProgramRole::Client,
-            effect: CheckedEffectSummary::default(),
-            body: None,
-            result_expression: None,
-            contextual_operation: None,
-        };
-        let entry = |formal, name: &str, output, scope_id| CheckedCallEntry::FreshOut {
-            formal,
-            name: name.to_owned(),
-            output,
-            scope_id,
-        };
-        let program = |entries| CheckedProgram {
-            root_scope: LexicalScopeId(0),
-            scopes: vec![
-                scope(0, None, None, CheckedScopeKind::Root, 0),
-                scope(
-                    31,
-                    Some(0),
-                    Some(first_output),
-                    CheckedScopeKind::RepeatedOutput,
-                    31,
-                ),
-                scope(
-                    32,
-                    Some(0),
-                    Some(second_output),
-                    CheckedScopeKind::RepeatedOutput,
-                    32,
-                ),
-            ],
-            expressions: vec![expression(1, LexicalScopeId(0), 1)],
-            callables: vec![callable.clone()],
-            calls: vec![CheckedCall {
-                id: CheckedCallId(1),
-                expression: CheckedExprId(1),
-                callable: BUILTIN,
-                owner_callable: None,
-                function: "two_outputs".to_owned(),
-                entries,
-                contexts: Vec::new(),
-                pass: None,
-                type_substitutions: Vec::new(),
-                result: unknown_flow_type(),
-                role: ProgramRole::Client,
-                span: CheckedSpan::default(),
-            }],
-            ..CheckedProgram::default()
-        };
-        let first = OutNet::build(&program(vec![
-            entry(first_formal, "first", first_output, LexicalScopeId(31)),
-            entry(second_formal, "second", second_output, LexicalScopeId(32)),
-        ]));
-        let reversed = OutNet::build(&program(vec![
-            entry(second_formal, "second", second_output, LexicalScopeId(32)),
-            entry(first_formal, "first", first_output, LexicalScopeId(31)),
-        ]));
+    fn checked_call_order_builds_a_deterministic_owner_forest() {
+        let program = checked_program(
+            "out-net-deterministic-order.bn",
+            r#"
+rows: LIST { [value: 1] }
+first: rows |> List/map(item, new: item.value + 1)
+second: rows |> List/map(item, new: item.value + 2)
+"#,
+        );
+        let first = OutNet::build(&program);
+        let repeated = OutNet::build(&program);
         assert!(!first.has_errors(), "{:#?}", first.diagnostics);
-        assert!(!reversed.has_errors(), "{:#?}", reversed.diagnostics);
-        assert_eq!(first.graph.static_owners, reversed.graph.static_owners);
+        assert_eq!(first, repeated);
         assert_eq!(
-            producer_owners_for_output(&first.graph, CheckedCallId(1), first_output),
-            producer_owners_for_output(&reversed.graph, CheckedCallId(1), first_output)
-        );
-        assert_eq!(
-            producer_owners_for_output(&first.graph, CheckedCallId(1), second_output),
-            producer_owners_for_output(&reversed.graph, CheckedCallId(1), second_output)
+            first.graph.static_owners,
+            vec![
+                StaticOwnerDef {
+                    id: StaticOwnerId(0),
+                    parent: None,
+                    child_ordinal: 0,
+                },
+                StaticOwnerDef {
+                    id: StaticOwnerId(1),
+                    parent: None,
+                    child_ordinal: 1,
+                },
+            ]
         );
     }
 
     #[test]
-    fn reports_zero_and_multiple_structural_producers() {
-        let missing = OutNet::build(&wrapper_program(vec![fresh_call(
-            1,
-            WRAPPER,
-            None,
-            WRAPPER_OUT,
-            DeclId(20),
-        )]));
+    fn invalid_structural_producer_counts_never_cross_the_checked_boundary() {
+        let missing = boon_parser::parse_source(
+            "out-net-missing-producer.bn",
+            r#"
+FUNCTION missing(list, entry: OUT) {
+    list
+}
+
+rows: LIST { [value: 1] }
+result: rows |> missing(entry)
+"#,
+        )
+        .unwrap();
+        let missing = boon_typecheck::check_program(&missing);
         assert!(
             missing
+                .report
                 .diagnostics
                 .iter()
-                .any(|diagnostic| matches!(diagnostic, OutNetDiagnostic::MissingProducer { .. }))
+                .any(|diagnostic| diagnostic.message.contains("has no structural producer"))
         );
+        assert!(missing.program.is_none());
 
-        let multiple = OutNet::build(&wrapper_program(vec![
-            fresh_call(1, WRAPPER, None, WRAPPER_OUT, DeclId(20)),
-            forward_call(2, BUILTIN, Some(WRAPPER), BUILTIN_OUT, WRAPPER_OUT),
-            forward_call(3, BUILTIN, Some(WRAPPER), BUILTIN_OUT, WRAPPER_OUT),
-        ]));
-        assert!(multiple.diagnostics.iter().any(|diagnostic| matches!(
-            diagnostic,
-            OutNetDiagnostic::MultipleProducers { producers, .. } if producers.len() == 2
-        )));
+        let multiple = boon_parser::parse_source(
+            "out-net-multiple-producers.bn",
+            r#"
+FUNCTION multiple(list, entry: OUT) {
+    [
+        first: list |> List/map(item: entry, new: entry.value + 1)
+        second: list |> List/map(item: entry, new: entry.value + 2)
+    ]
+}
 
-        let missing_anchor = OutNet::build(&direct_program(vec![forward_call(
-            4,
-            BUILTIN,
-            None,
-            BUILTIN_OUT,
-            DeclId(99),
-        )]));
+rows: LIST { [value: 1] }
+result: rows |> multiple(entry)
+"#,
+        )
+        .unwrap();
+        let multiple = boon_typecheck::check_program(&multiple);
         assert!(
-            missing_anchor.diagnostics.iter().any(|diagnostic| matches!(
-                diagnostic,
-                OutNetDiagnostic::MissingOwnerAnchor { .. }
-            ))
-        );
-
-        let multiple_anchors = OutNet::build(&direct_program(vec![
-            fresh_call(5, BUILTIN, None, BUILTIN_OUT, DeclId(100)),
-            fresh_call(6, BUILTIN, None, BUILTIN_OUT, DeclId(100)),
-        ]));
-        assert!(
-            multiple_anchors
+            multiple
+                .report
                 .diagnostics
                 .iter()
-                .any(|diagnostic| matches!(
-                    diagnostic,
-                    OutNetDiagnostic::MultipleOwnerAnchors { anchors, .. } if anchors.len() == 2
-                ))
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("structural producers; exactly one is required")),
+            "diagnostics: {:#?}",
+            multiple.report.diagnostics
         );
+        assert!(multiple.program.is_none());
     }
 
     #[test]
     fn reports_forwarding_alias_cycles() {
         let first = DeclId(30);
-        let first_out = DeclId(31);
         let second = DeclId(40);
-        let second_out = DeclId(41);
-        let program = CheckedProgram {
-            root_scope: LexicalScopeId(0),
-            callables: vec![
-                signature(first, CheckedCallableKind::User, "first", first_out),
-                signature(second, CheckedCallableKind::User, "second", second_out),
-            ],
-            calls: vec![
-                fresh_call(1, first, None, first_out, DeclId(50)),
-                forward_call(2, second, Some(first), second_out, first_out),
-                forward_call(3, first, Some(second), first_out, second_out),
-            ],
-            ..CheckedProgram::default()
+        let provenance = |callable, expression| OutCallProvenance {
+            call_id: None,
+            expression: CheckedExprId(expression),
+            owner_callable: None,
+            callable,
         };
-
-        let build = OutNet::build(&program);
-        assert!(build.diagnostics.iter().any(|diagnostic| matches!(
-            diagnostic,
-            OutNetDiagnostic::AliasCycle { declarations, .. }
-                if declarations == &vec![first_out, second_out]
-        )));
+        let components = cyclic_alias_components(&[
+            (first, second, provenance(first, 1)),
+            (second, first, provenance(second, 2)),
+            (DeclId(50), DeclId(60), provenance(DeclId(50), 3)),
+        ]);
+        assert_eq!(components, vec![vec![first, second]]);
     }
 }

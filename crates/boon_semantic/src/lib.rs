@@ -4656,6 +4656,38 @@ seed: 0
                 .saturating_add(1);
         semantic.execution_graph.static_owners[0].child_ordinal =
             semantic.resolved_out_graph.static_owners[0].child_ordinal;
+        semantic.scope_storage_graph = build_semantic_scope_storage_graph(
+            &semantic.checked_program,
+            &semantic.execution_graph,
+            &semantic.resource_graph,
+            &semantic.reactive_graph,
+            &semantic.lowering_contract,
+            &semantic.resolved_out_graph,
+        )
+        .expect("mutated OUT owner has a fresh deterministic storage graph");
+        semantic.memory_graph = build_semantic_memory_graph(
+            &semantic.checked_program,
+            &semantic.execution_graph,
+            &semantic.resource_graph,
+            &semantic.reactive_graph,
+            &semantic.scope_storage_graph,
+            &semantic.lowering_contract,
+        )
+        .expect("mutated OUT owner has a fresh deterministic memory graph");
+        semantic.dependency_manifest = build_callable_dependency_manifest(
+            DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
+            &semantic.checked_program,
+            &semantic.producer_materializations,
+            &semantic.resolved_out_graph,
+            &semantic.execution_graph,
+            &semantic.resource_graph,
+            &semantic.reactive_graph,
+            &semantic.lowering_contract,
+            &semantic.view_binding_graph,
+            &semantic.scope_storage_graph,
+            &semantic.memory_graph,
+        )
+        .expect("mutated OUT owner has a fresh dependency manifest");
         let error = semantic
             .validate()
             .expect_err("mutated resolved graph must invalidate semantic digest");

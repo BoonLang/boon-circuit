@@ -165,6 +165,53 @@ FUNCTION decorate(item) {
 }
 
 #[test]
+fn runtime_checked_program_covers_every_contextual_wrapper_expression() {
+    let parsed = boon_parser::parse_source(
+        "runtime-contextual-wrapper-coverage.bn",
+        r#"
+FUNCTION doubled(list, entry: OUT, new) {
+    list
+    |> List/map(
+        item: entry
+        new: new * 2
+    )
+}
+
+rows: LIST { [value: 1] }
+result:
+    rows
+    |> doubled(
+        entry
+        new: entry.value + 1
+    )
+"#,
+    )
+    .unwrap();
+    assert_eq!(parsed.expressions.len(), 17, "fixture expression shape");
+
+    let (output, _) = check_runtime_program_profiled_with_external_types(
+        &parsed,
+        &ExternalTypeEnvironment::empty(ProgramRole::Client),
+    );
+    assert!(
+        !output.report.has_errors(),
+        "{:#?}",
+        output.report.diagnostics
+    );
+    assert_eq!(
+        output.report.checked_expression_count,
+        output.report.expression_count,
+        "runtime compilation must typecheck the complete parser expression graph"
+    );
+    let checked = output.program.expect("checked runtime wrapper program");
+    assert_eq!(
+        checked.lowering_metadata.checked_expression_count,
+        checked.expressions.len(),
+        "lowering metadata must describe the complete opaque checked graph"
+    );
+}
+
+#[test]
 fn checked_program_retains_final_lowering_metadata_and_external_environment() {
     let parsed = boon_parser::parse_project(
         "Client/RUN.bn",

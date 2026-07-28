@@ -150,6 +150,14 @@ pub enum SemanticViewBindingTargetV1 {
     Event { source: SemanticSourceId },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticViewBindingKindV1 {
+    Data,
+    Source,
+    Target,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticViewBindingV1 {
     pub id: SemanticViewBindingId,
@@ -160,6 +168,12 @@ pub struct SemanticViewBindingV1 {
     pub expression: SemanticExprId,
     pub value: SemanticValueId,
     pub target: SemanticViewBindingTargetV1,
+    pub kind: SemanticViewBindingKindV1,
+    /// Exact retained-view attribute selected at the semantic leaf.
+    pub canonical_attribute: String,
+    /// Projection applied after the exact semantic read captured by `target`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_projection: Vec<String>,
     pub route_scope: SemanticScopeId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<SemanticRowBinding>,
@@ -489,21 +503,41 @@ fn derive_semantic_view_binding_graph(
                                 })
                         })
                         .transpose()?;
-                    bindings.push(SemanticViewBindingV1 {
-                        id: SemanticViewBindingId(bindings.len()),
-                        root: root_id,
-                        node: node_id,
-                        argument: argument_id,
-                        capture: capture.id,
-                        expression: capture.expression,
-                        value: capture.value,
-                        target,
-                        route_scope,
-                        row,
-                        diagnostic_node: function.clone(),
-                        diagnostic_attribute: parameter.name.clone(),
-                        diagnostic_path,
-                    });
+                    let leaf_bindings = binding_leaf_metadata(
+                        execution,
+                        call_argument.value,
+                        capture.expression,
+                        capture.target,
+                        &parameter.name,
+                        &diagnostic_path,
+                        output.contract,
+                    )?;
+                    if leaf_bindings.is_empty() {
+                        return Err(SemanticViewBindingError::new(format!(
+                            "view capture {} has no exact retained-view leaf under argument {}",
+                            capture.id, parameter.name
+                        )));
+                    }
+                    for leaf in leaf_bindings {
+                        bindings.push(SemanticViewBindingV1 {
+                            id: SemanticViewBindingId(bindings.len()),
+                            root: root_id,
+                            node: node_id,
+                            argument: argument_id,
+                            capture: capture.id,
+                            expression: capture.expression,
+                            value: capture.value,
+                            target,
+                            kind: leaf.kind,
+                            canonical_attribute: leaf.canonical_attribute,
+                            additional_projection: leaf.additional_projection,
+                            route_scope,
+                            row,
+                            diagnostic_node: function.clone(),
+                            diagnostic_attribute: parameter.name.clone(),
+                            diagnostic_path: diagnostic_path.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -624,6 +658,266 @@ fn binding_input_expressions(
         pending.extend(expression_children(execution, &expression.kind)?);
     }
     Ok(reachable)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemanticViewBindingLeaf {
+    kind: SemanticViewBindingKindV1,
+    canonical_attribute: String,
+    additional_projection: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BindingLeafMode {
+    Data {
+        attribute: String,
+        kind: SemanticViewBindingKindV1,
+    },
+    Element,
+    Style {
+        attribute: String,
+    },
+    Events {
+        attribute: Option<String>,
+    },
+}
+
+struct BindingLeafTraversal<'a> {
+    execution: &'a SemanticExecutionGraphV1,
+    capture: SemanticExprId,
+    capture_target: SemanticViewCaptureTargetV1,
+    source_fallback_attribute: &'a str,
+    contract: SemanticOutputContractKindV1,
+    result: BTreeSet<SemanticViewBindingLeaf>,
+    visiting: BTreeSet<SemanticExprId>,
+}
+
+fn binding_leaf_metadata(
+    execution: &SemanticExecutionGraphV1,
+    root: SemanticExprId,
+    capture: SemanticExprId,
+    capture_target: SemanticViewCaptureTargetV1,
+    argument: &str,
+    diagnostic_path: &str,
+    contract: SemanticOutputContractKindV1,
+) -> Result<Vec<SemanticViewBindingLeaf>, SemanticViewBindingError> {
+    let mode = match argument {
+        "element" => BindingLeafMode::Element,
+        "style" => BindingLeafMode::Style {
+            attribute: argument.to_owned(),
+        },
+        "target" => BindingLeafMode::Data {
+            attribute: argument.to_owned(),
+            kind: SemanticViewBindingKindV1::Target,
+        },
+        _ => BindingLeafMode::Data {
+            attribute: argument.to_owned(),
+            kind: SemanticViewBindingKindV1::Data,
+        },
+    };
+    let source_fallback_attribute = diagnostic_path
+        .rsplit('.')
+        .next()
+        .filter(|attribute| !attribute.is_empty())
+        .unwrap_or("event");
+    let mut traversal = BindingLeafTraversal {
+        execution,
+        capture,
+        capture_target,
+        source_fallback_attribute,
+        contract,
+        result: BTreeSet::new(),
+        visiting: BTreeSet::new(),
+    };
+    traversal.visit(root, mode, Vec::new(), true)?;
+    Ok(traversal.result.into_iter().collect())
+}
+
+impl BindingLeafTraversal<'_> {
+    fn visit(
+        &mut self,
+        id: SemanticExprId,
+        mode: BindingLeafMode,
+        additional_projection: Vec<String>,
+        is_root: bool,
+    ) -> Result<(), SemanticViewBindingError> {
+        if !self.visiting.insert(id) {
+            return Ok(());
+        }
+        let expression = require_expression(self.execution, id)?;
+        if !is_root
+            && matches!(
+                &expression.kind,
+                SemanticExpressionKind::Call { function, .. }
+                    if exact_view_constructor(self.contract, function)
+            )
+        {
+            self.visiting.remove(&id);
+            return Ok(());
+        }
+        if let SemanticExpressionKind::Project { input, fields } = &expression.kind {
+            let mut projection = fields.clone();
+            projection.extend(additional_projection);
+            self.visit(*input, mode, projection, false)?;
+            self.visiting.remove(&id);
+            return Ok(());
+        }
+        if let SemanticExpressionKind::Call {
+            function,
+            arguments,
+            ..
+        } = &expression.kind
+            && let Some(field_path) = function.strip_prefix("Field/")
+        {
+            let inputs = arguments
+                .iter()
+                .filter(|argument| argument.name == "input")
+                .collect::<Vec<_>>();
+            let [input] = inputs.as_slice() else {
+                return Err(SemanticViewBindingError::new(format!(
+                    "semantic field projection {id} resolves to {} exact input arguments",
+                    inputs.len()
+                )));
+            };
+            let mut projection = field_path
+                .split('/')
+                .filter(|field| !field.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if projection.is_empty() {
+                return Err(SemanticViewBindingError::new(format!(
+                    "semantic field projection {id} has no canonical fields"
+                )));
+            }
+            projection.extend(additional_projection);
+            self.visit(input.value, mode, projection, false)?;
+            self.visiting.remove(&id);
+            return Ok(());
+        }
+        if id == self.capture {
+            let (attribute, read_kind) = match &mode {
+                BindingLeafMode::Data { attribute, kind } => (attribute.as_str(), *kind),
+                BindingLeafMode::Element => ("element", SemanticViewBindingKindV1::Data),
+                BindingLeafMode::Style { attribute } => {
+                    (attribute.as_str(), SemanticViewBindingKindV1::Data)
+                }
+                BindingLeafMode::Events { attribute } => (
+                    attribute
+                        .as_deref()
+                        .unwrap_or(self.source_fallback_attribute),
+                    SemanticViewBindingKindV1::Data,
+                ),
+            };
+            let (kind, canonical_attribute) = match self.capture_target {
+                SemanticViewCaptureTargetV1::Source { .. } => (
+                    SemanticViewBindingKindV1::Source,
+                    canonical_event_attribute(attribute).to_owned(),
+                ),
+                SemanticViewCaptureTargetV1::Read { .. } => (read_kind, attribute.to_owned()),
+                SemanticViewCaptureTargetV1::Field { .. } => {
+                    self.visiting.remove(&id);
+                    return Ok(());
+                }
+            };
+            self.result.insert(SemanticViewBindingLeaf {
+                kind,
+                canonical_attribute,
+                additional_projection,
+            });
+            self.visiting.remove(&id);
+            return Ok(());
+        }
+
+        match (&mode, &expression.kind) {
+            (
+                BindingLeafMode::Element,
+                SemanticExpressionKind::Object(fields)
+                | SemanticExpressionKind::Record(fields)
+                | SemanticExpressionKind::TaggedObject { fields, .. },
+            ) => {
+                for field in fields {
+                    let child_mode = if field.spread {
+                        Some(BindingLeafMode::Element)
+                    } else if field.name == "events" {
+                        Some(BindingLeafMode::Events { attribute: None })
+                    } else if field.name == "target" {
+                        Some(BindingLeafMode::Data {
+                            attribute: field.name.clone(),
+                            kind: SemanticViewBindingKindV1::Target,
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(child_mode) = child_mode {
+                        self.visit(
+                            field.value,
+                            child_mode,
+                            additional_projection.clone(),
+                            false,
+                        )?;
+                    }
+                }
+            }
+            (
+                BindingLeafMode::Style { .. },
+                SemanticExpressionKind::Object(fields)
+                | SemanticExpressionKind::Record(fields)
+                | SemanticExpressionKind::TaggedObject { fields, .. },
+            ) => {
+                for field in fields {
+                    let child_mode = if field.spread {
+                        mode.clone()
+                    } else {
+                        BindingLeafMode::Style {
+                            attribute: field.name.clone(),
+                        }
+                    };
+                    self.visit(
+                        field.value,
+                        child_mode,
+                        additional_projection.clone(),
+                        false,
+                    )?;
+                }
+            }
+            (
+                BindingLeafMode::Events { attribute },
+                SemanticExpressionKind::Object(fields)
+                | SemanticExpressionKind::Record(fields)
+                | SemanticExpressionKind::TaggedObject { fields, .. },
+            ) => {
+                for field in fields {
+                    self.visit(
+                        field.value,
+                        BindingLeafMode::Events {
+                            attribute: if field.spread {
+                                attribute.clone()
+                            } else {
+                                Some(field.name.clone())
+                            },
+                        },
+                        additional_projection.clone(),
+                        false,
+                    )?;
+                }
+            }
+            _ => {
+                for child in expression_children(self.execution, &expression.kind)? {
+                    self.visit(child, mode.clone(), additional_projection.clone(), false)?;
+                }
+            }
+        }
+        self.visiting.remove(&id);
+        Ok(())
+    }
+}
+
+fn canonical_event_attribute(attribute: &str) -> &str {
+    if attribute == "key_down" {
+        "submit"
+    } else {
+        attribute
+    }
 }
 
 fn expression_children(
@@ -934,6 +1228,9 @@ document: Document/new(
             .find(|binding| matches!(binding.target, SemanticViewBindingTargetV1::Data { .. }))
             .expect("label read is an exact data binding");
         let argument = &graph.arguments[data.argument.as_usize()];
+        assert_eq!(data.kind, SemanticViewBindingKindV1::Data);
+        assert_eq!(data.canonical_attribute, "label");
+        assert!(data.additional_projection.is_empty());
         assert_eq!(
             argument.formal,
             semantic.execution_graph().callables[argument.callable.as_usize()].parameters
@@ -995,6 +1292,84 @@ document: Document/new(
             semantic.reactive_graph().view_captures[event.0.capture.as_usize()].target,
             SemanticViewCaptureTargetV1::Source { source: event.1 }
         );
+        assert_eq!(event.0.kind, SemanticViewBindingKindV1::Source);
+        assert_eq!(event.0.canonical_attribute, "click");
+        assert!(event.0.additional_projection.is_empty());
+    }
+
+    #[test]
+    fn nested_target_and_style_bindings_preserve_exact_leaf_kind_and_attribute() {
+        let semantic = crate::elaborate(
+            checked(
+                r#"
+store: [
+    target: TEXT { target }
+    size: 14
+]
+document: Document/new(
+    root: Element/label(
+        element: [
+            target: store.target
+        ]
+        style: [
+            font: [
+                size: store.size
+            ]
+        ]
+        label: TEXT { Label }
+    )
+)
+"#,
+            ),
+            &[],
+        )
+        .expect("semantic target/style document");
+        let graph = semantic.view_binding_graph();
+        let target = graph
+            .bindings
+            .iter()
+            .find(|binding| binding.canonical_attribute == "target")
+            .expect("nested element target binding");
+        assert_eq!(target.kind, SemanticViewBindingKindV1::Target);
+        let size = graph
+            .bindings
+            .iter()
+            .find(|binding| binding.canonical_attribute == "size")
+            .expect("nested style leaf binding");
+        assert_eq!(size.kind, SemanticViewBindingKindV1::Data);
+    }
+
+    #[test]
+    fn projected_binding_preserves_projection_after_the_exact_semantic_read() {
+        let semantic = crate::elaborate(
+            checked(
+                r#"
+FUNCTION wrap(value) {
+    [leaf: value]
+}
+store: [
+    value: TEXT { projected }
+]
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: wrap(value: store.value).leaf
+    )
+)
+"#,
+            ),
+            &[],
+        )
+        .expect("semantic projected document");
+        let binding = semantic
+            .view_binding_graph()
+            .bindings
+            .iter()
+            .find(|binding| binding.canonical_attribute == "label")
+            .expect("projected label binding");
+        assert_eq!(binding.kind, SemanticViewBindingKindV1::Data);
+        assert_eq!(binding.additional_projection, ["leaf"]);
     }
 
     #[test]

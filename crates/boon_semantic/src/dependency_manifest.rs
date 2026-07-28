@@ -741,6 +741,20 @@ impl DependencyOwnerIndex {
             call_owner.push(owner);
         }
 
+        let mut producer_root_owner = BTreeMap::new();
+        for producer in out.producer_roots() {
+            let owner = semantic_owner_for_checked(
+                Some(producer.spec.callable),
+                &format!("producer root {:?}", producer.spec.identity),
+            )?;
+            if producer_root_owner.insert(producer.call, owner).is_some() {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "producer OUT call {} is rooted more than once",
+                    producer.call
+                )));
+            }
+        }
+
         let mut out_call_owner = Vec::with_capacity(out.call_instances.len());
         for (index, call) in out.call_instances.iter().enumerate() {
             if call.id != OutCallInstanceId(index) {
@@ -749,10 +763,36 @@ impl DependencyOwnerIndex {
                     call.id
                 )));
             }
-            out_call_owner.push(semantic_owner_for_checked(
-                call.provenance.owner_callable,
-                &format!("OUT call instance {}", call.id),
-            )?);
+            let mut root = call.id;
+            let mut visited = BTreeSet::new();
+            loop {
+                if !visited.insert(root) {
+                    return Err(CallableDependencyManifestError::new(format!(
+                        "OUT call instance {} has cyclic concrete ancestry at {root}",
+                        call.id
+                    )));
+                }
+                let concrete = out
+                    .call_instances
+                    .get(root.as_usize())
+                    .filter(|candidate| candidate.id == root)
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "OUT call instance {} ancestry references missing call {root}",
+                            call.id
+                        ))
+                    })?;
+                let Some(parent) = concrete.parent else {
+                    break;
+                };
+                root = parent;
+            }
+            out_call_owner.push(
+                producer_root_owner
+                    .get(&root)
+                    .copied()
+                    .unwrap_or(SemanticDependencyOwnerV1::ProgramRoot),
+            );
         }
 
         let mut static_owner = BTreeMap::new();
@@ -809,6 +849,63 @@ impl DependencyOwnerIndex {
                     "static owner {} has no exact call/net anchor; dependency ownership requires an engine identity",
                     owner.id
                 )));
+            }
+        }
+
+        // A semantic expression is an executable occurrence, not merely its
+        // checked lexical definition. Its concrete call-root owns the
+        // occurrence: the program root for ordinary expansion, or the producer
+        // callable for a synthetic producer root. Static and frame coordinates
+        // must agree whenever both are present. The checked expression remains
+        // a referenced definition dependency under its lexical callable.
+        for expression in &execution.expressions {
+            let origin = execution
+                .checked_expression_origins
+                .get(expression.id.as_usize())
+                .filter(|origin| origin.expression == expression.id)
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "semantic expression {} has no exact checked origin",
+                        expression.id
+                    ))
+                })?;
+            let static_primary = expression
+                .owner
+                .map(|owner| {
+                    static_owner.get(&owner).copied().ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "semantic expression {} references unanchored static owner {owner}",
+                            expression.id
+                        ))
+                    })
+                })
+                .transpose()?;
+            let frame_primary = origin
+                .call_instance
+                .map(|frame| {
+                    out_call_owner
+                        .get(frame.as_usize())
+                        .copied()
+                        .ok_or_else(|| {
+                            CallableDependencyManifestError::new(format!(
+                                "semantic expression {} references missing call frame {frame}",
+                                expression.id
+                            ))
+                        })
+                })
+                .transpose()?;
+            let concrete_primary = match (static_primary, frame_primary) {
+                (Some(static_owner), Some(frame_owner)) if static_owner != frame_owner => {
+                    return Err(CallableDependencyManifestError::new(format!(
+                        "semantic expression {} has conflicting static {static_owner:?} and call-frame {frame_owner:?} occurrence owners",
+                        expression.id
+                    )));
+                }
+                (Some(owner), _) | (None, Some(owner)) => Some(owner),
+                (None, None) => None,
+            };
+            if let Some(owner) = concrete_primary {
+                expression_owner[expression.id.as_usize()] = owner;
             }
         }
 
@@ -1169,8 +1266,8 @@ fn exact_owner(
     let candidates = candidates.iter().copied().collect::<Vec<_>>();
     let [owner] = candidates.as_slice() else {
         return Err(CallableDependencyManifestError::new(format!(
-            "{context} resolves to {} primary callable/root owners; an explicit engine identity is required",
-            candidates.len()
+            "{context} resolves to {} primary callable/root owners {candidates:?}; an explicit engine identity is required",
+            candidates.len(),
         )));
     };
     Ok(*owner)
@@ -1521,6 +1618,13 @@ fn callable_entity(callable: SemanticCallableId) -> SemanticDependencyEntityV1 {
 fn call_entity(call: SemanticCallId) -> SemanticDependencyEntityV1 {
     indexed_entity(
         SemanticDependencyEntityDomainV1::SemanticCall,
+        call.as_usize(),
+    )
+}
+
+fn out_call_entity(call: OutCallInstanceId) -> SemanticDependencyEntityV1 {
+    indexed_entity(
+        SemanticDependencyEntityDomainV1::OutCallInstance,
         call.as_usize(),
     )
 }
@@ -3391,6 +3495,16 @@ fn inventory_execution(
     }
 
     for expression in &execution.expressions {
+        let origin = execution
+            .checked_expression_origins
+            .get(expression.id.as_usize())
+            .filter(|origin| origin.expression == expression.id)
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "semantic expression {} has no exact checked origin",
+                    expression.id
+                ))
+            })?;
         let expression_owner = owners.expression(expression.id)?;
         let owner = if let Some(static_owner) = expression.owner {
             exact_owner(
@@ -3400,8 +3514,30 @@ fn inventory_execution(
         } else {
             expression_owner
         };
-        let (channel, roles, projection, references) =
+        let (channel, roles, projection, mut references) =
             semantic_expression_dependency(expression, owners)?;
+        references.push(dependency_entity(SemanticDependencyEntityV1::checked(
+            SemanticDependencyEntityDomainV1::CheckedExpression,
+            expression.checked_expr_id.0,
+        )));
+        references.extend(
+            origin
+                .owning_statement
+                .map(statement_entity)
+                .map(dependency_entity),
+        );
+        references.extend(
+            origin
+                .call_instance
+                .map(out_call_entity)
+                .map(dependency_entity),
+        );
+        references.extend(
+            expression
+                .owner
+                .map(static_owner_entity)
+                .map(dependency_entity),
+        );
         collect_dependency!(
             collector,
             owner,
@@ -3414,6 +3550,7 @@ fn inventory_execution(
             SemanticDependencySemanticsV1 {
                 projection,
                 flow_type: Some(expression.flow_type.clone()),
+                call_instance: origin.call_instance,
                 static_owner: expression.owner,
                 phase: semantic_expression_phase(&expression.kind),
                 multiplicity: semantic_expression_multiplicity(&expression.kind),
@@ -3635,16 +3772,6 @@ fn inventory_execution(
             SemanticDependencySemanticsV1 {
                 flow_type: Some(call.result.clone()),
                 program_role: Some(call.role),
-                call_instance: execution.expressions.iter().find_map(
-                    |expression| match &expression.kind {
-                        SemanticExpressionKind::Call {
-                            call: candidate,
-                            instance,
-                            ..
-                        } if *candidate == call.id => Some(*instance),
-                        _ => None,
-                    },
-                ),
                 lifetime: SemanticDependencyLifetimeV1::Call,
                 ..SemanticDependencySemanticsV1::default()
             },
@@ -4026,11 +4153,13 @@ fn semantic_expression_dependency(
         SemanticExpressionKind::Call {
             call,
             callable,
+            instance,
             arguments,
             parameter_bindings,
             ..
         } => {
             references.push(dependency_entity(call_entity(*call)));
+            references.push(dependency_entity(out_call_entity(*instance)));
             references.push(dependency_owner(SemanticDependencyOwnerV1::Callable {
                 callable: *callable,
             }));
@@ -6027,7 +6156,6 @@ fn inventory_view(
             vec![
                 view_root_owner(view, node.root, execution, owners)?,
                 owners.expression(node.expression)?,
-                owners.call(node.call)?,
             ],
             &format!("view node {}", node.id),
         )?;
@@ -6073,7 +6201,6 @@ fn inventory_view(
                 view_root_owner(view, argument.root, execution, owners)?,
                 view_node_owner(view, argument.node, execution, owners)?,
                 owners.expression(argument.expression)?,
-                owners.call(argument.call)?,
             ],
             &format!("view argument {}", argument.id),
         )?;
@@ -6329,7 +6456,6 @@ fn view_node_owner(
         vec![
             view_root_owner(view, node.root, execution, owners)?,
             owners.expression(node.expression)?,
-            owners.call(node.call)?,
         ],
         &format!("view node {}", node.id),
     )
@@ -6355,7 +6481,6 @@ fn view_argument_owner(
             view_root_owner(view, argument.root, execution, owners)?,
             view_node_owner(view, argument.node, execution, owners)?,
             owners.expression(argument.expression)?,
-            owners.call(argument.call)?,
         ],
         &format!("view argument {}", argument.id),
     )
@@ -7178,8 +7303,26 @@ fn inventory_memory(
 mod tests {
     use super::*;
 
+    fn checked_fixture(
+        name: &str,
+        source: &str,
+        role: ProgramRole,
+    ) -> boon_typecheck::CheckedProgram {
+        let parsed = boon_parser::parse_source(name, source).expect("fixture parses");
+        let (output, _) = boon_typecheck::check_program_profiled_with_external_types(
+            &parsed,
+            &boon_typecheck::ExternalTypeEnvironment::empty(role),
+        );
+        assert!(
+            !output.report.has_errors(),
+            "fixture diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        output.program.expect("fixture checks")
+    }
+
     fn semantic_program_fixture() -> SemanticProgram {
-        let parsed = boon_parser::parse_source(
+        let checked = checked_fixture(
             "dependency-manifest.bn",
             r#"
 store: [
@@ -7190,22 +7333,29 @@ FUNCTION add(value) {
     value + 1
 }
 "#,
-        )
-        .expect("dependency manifest fixture parses");
-        let (output, _) = boon_typecheck::check_runtime_program_profiled_with_external_types(
-            &parsed,
-            &boon_typecheck::ExternalTypeEnvironment::empty(ProgramRole::Session),
+            ProgramRole::Session,
         );
-        assert!(
-            !output.report.has_errors(),
-            "dependency manifest fixture diagnostics: {:#?}",
-            output.report.diagnostics
-        );
-        elaborate(
-            output.program.expect("dependency manifest fixture checks"),
-            &[],
-        )
-        .expect("dependency manifest fixture elaborates")
+        elaborate(checked, &[]).expect("dependency manifest fixture elaborates")
+    }
+
+    fn manifest_record(
+        program: &SemanticProgram,
+        kind: SemanticDependencySubjectKindV1,
+        identity: SemanticDependencyEntityV1,
+    ) -> &SemanticDependencyRecordV1 {
+        let matches = program
+            .dependency_manifest
+            .dependencies
+            .iter()
+            .filter(|record| record.subject.kind == kind && record.subject.identity == identity)
+            .collect::<Vec<_>>();
+        let [record] = matches.as_slice() else {
+            panic!(
+                "manifest subject {kind:?}/{identity:?} resolves to {} records",
+                matches.len()
+            );
+        };
+        record
     }
 
     fn assert_manifest_mutation_rejected(
@@ -7370,6 +7520,178 @@ FUNCTION add(value) {
         let changed =
             implementation_dependency_digest(root, &closure[&root], &mutated).expect("digest");
         assert_ne!(original, changed);
+    }
+
+    #[test]
+    fn contextual_occurrence_is_owned_by_its_concrete_root_and_links_its_definition() {
+        let checked = checked_fixture(
+            "dependency-contextual-owner.bn",
+            r#"
+FUNCTION doubled(list, entry: OUT, new) {
+    list
+    |> List/map(
+        item: entry
+        new: new * 2
+    )
+}
+
+rows: LIST { [value: 1] }
+result:
+    rows
+    |> doubled(
+        entry
+        new: entry.value + 1
+    )
+"#,
+            ProgramRole::Client,
+        );
+        let program = elaborate(checked, &[]).expect("contextual fixture elaborates");
+        let materialization = program
+            .execution_graph
+            .materializations
+            .first()
+            .expect("fixture has one materialization");
+        let expression = &program.execution_graph.expressions[materialization.body.as_usize()];
+        let origin = &program.execution_graph.checked_expression_origins[expression.id.as_usize()];
+        let occurrence = manifest_record(
+            &program,
+            SemanticDependencySubjectKindV1::ExecutionExpression,
+            expression_entity(expression.id),
+        );
+        assert_eq!(
+            occurrence.owner,
+            SemanticDependencyOwnerV1::ProgramRoot,
+            "expanded wrapper work belongs to its ordinary concrete call root"
+        );
+        let definition = manifest_record(
+            &program,
+            SemanticDependencySubjectKindV1::CheckedExpression,
+            SemanticDependencyEntityV1::checked(
+                SemanticDependencyEntityDomainV1::CheckedExpression,
+                expression.checked_expr_id.0,
+            ),
+        );
+        assert_eq!(definition.owner, owner(0));
+        assert!(occurrence.referenced_dependencies.contains(&definition.id));
+
+        let static_owner = expression.owner.expect("body has exact static owner");
+        let static_record = manifest_record(
+            &program,
+            SemanticDependencySubjectKindV1::ExecutionStaticOwner,
+            static_owner_entity(static_owner),
+        );
+        assert!(
+            occurrence
+                .referenced_dependencies
+                .contains(&static_record.id)
+        );
+        let frame = origin.call_instance.expect("body has exact call frame");
+        let frame_record = manifest_record(
+            &program,
+            SemanticDependencySubjectKindV1::OutCallInstance,
+            out_call_entity(frame),
+        );
+        assert!(
+            occurrence
+                .referenced_dependencies
+                .contains(&frame_record.id)
+        );
+    }
+
+    #[test]
+    fn producer_occurrence_owner_uses_the_synthetic_root_callable_and_fails_on_axis_drift() {
+        let checked = checked_fixture(
+            "dependency-producer-owner.bn",
+            r#"
+FUNCTION serve(value) {
+    value + 0
+}
+
+ordinary: serve(value: 1)
+"#,
+            ProgramRole::Session,
+        );
+        let callable = SemanticCallableId(
+            checked
+                .callables
+                .iter()
+                .position(|callable| callable.name == "serve")
+                .expect("serve callable"),
+        );
+        let program = elaborate(
+            checked,
+            &[ProducerMaterializationRequest {
+                identity: [7; 32],
+                callable,
+                local_function: "serve".to_owned(),
+                mode: ProducerMaterializationMode::Current,
+            }],
+        )
+        .expect("producer fixture elaborates");
+        let function = program
+            .execution_graph
+            .functions
+            .first()
+            .expect("fixture has one producer function");
+        assert_eq!(function.callable, callable);
+        let occurrence = manifest_record(
+            &program,
+            SemanticDependencySubjectKindV1::ExecutionExpression,
+            expression_entity(function.root),
+        );
+        assert_eq!(occurrence.owner, owner(callable.as_usize()));
+        let producer_root = program
+            .resolved_out_graph
+            .producer_roots()
+            .first()
+            .expect("fixture has one producer root");
+        let root_record = manifest_record(
+            &program,
+            SemanticDependencySubjectKindV1::OutCallInstance,
+            out_call_entity(producer_root.call),
+        );
+        assert_eq!(root_record.owner, owner(callable.as_usize()));
+
+        let mut frame_only = program.execution_graph.clone();
+        frame_only.expressions[function.root.as_usize()].owner = None;
+        let frame_only_index = DependencyOwnerIndex::derive(
+            &program.checked_program,
+            &program.resolved_out_graph,
+            &frame_only,
+            &program.resource_graph,
+            &program.reactive_graph,
+            &program.scope_storage_graph,
+            &program.memory_graph,
+        )
+        .expect("call frame alone retains the producer occurrence owner");
+        assert_eq!(
+            frame_only_index
+                .expression(function.root)
+                .expect("producer expression owner"),
+            owner(callable.as_usize())
+        );
+
+        let ordinary_root = program
+            .resolved_out_graph
+            .call_instances
+            .iter()
+            .find(|call| call.parent.is_none() && call.id != producer_root.call)
+            .expect("fixture has an ordinary program-root call")
+            .id;
+        let mut conflicting = program.execution_graph.clone();
+        conflicting.checked_expression_origins[function.root.as_usize()].call_instance =
+            Some(ordinary_root);
+        let error = DependencyOwnerIndex::derive(
+            &program.checked_program,
+            &program.resolved_out_graph,
+            &conflicting,
+            &program.resource_graph,
+            &program.reactive_graph,
+            &program.scope_storage_graph,
+            &program.memory_graph,
+        )
+        .expect_err("static and call-root occurrence axes must agree");
+        assert!(error.to_string().contains("conflicting static"), "{error}");
     }
 
     #[test]

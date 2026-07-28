@@ -945,6 +945,7 @@ fn collect_demanded_read_outputs(
         ir::ErasedReadTarget::SourcePayload { .. }
         | ir::ErasedReadTarget::StateProjection { .. }
         | ir::ErasedReadTarget::ExternalValue { .. }
+        | ir::ErasedReadTarget::ElementState { .. }
         | ir::ErasedReadTarget::MaterializationLocal { .. }
         | ir::ErasedReadTarget::FunctionParameter { .. } => {}
     }
@@ -11126,7 +11127,8 @@ impl<'a> ExecutableRowLowerer<'a> {
                     })?;
                 self.value_ref(value)
             }
-            ir::ErasedReadTarget::MaterializationLocal { .. }
+            ir::ErasedReadTarget::ElementState { .. }
+            | ir::ErasedReadTarget::MaterializationLocal { .. }
             | ir::ErasedReadTarget::FunctionParameter { .. } => Err(PlanError::new(format!(
                 "executable read {expression} reached an invalid indirect contextual target {:?}",
                 read.target

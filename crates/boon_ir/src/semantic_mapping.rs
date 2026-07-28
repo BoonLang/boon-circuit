@@ -8299,6 +8299,1586 @@ const fn map_result_kind(kind: SemanticMaterializationResultKind) -> Materializa
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finish_verified_semantic_lowering(
+    execution_graph: &SemanticExecutionGraphV1,
+    resource_graph: &SemanticResourceGraphV1,
+    reactive_graph: &SemanticReactiveGraphV1,
+    lowering_contract: &SemanticLoweringContractV1,
+    view_binding_graph: &boon_semantic::SemanticViewBindingGraphV1,
+    scope_storage_graph: &SemanticScopeStorageGraphV1,
+    memory_graph: &boon_semantic::SemanticMemoryGraphV1,
+    mapped: MappedSemanticExecution,
+    resources: MappedSemanticResources,
+) -> Result<crate::ErasedProgramFields, String> {
+    let reactive = map_semantic_reactive(
+        execution_graph,
+        resource_graph,
+        reactive_graph,
+        &mapped.id_map,
+        &resources,
+    )?;
+    let storage = map_semantic_storage_join(
+        execution_graph,
+        resource_graph,
+        reactive_graph,
+        scope_storage_graph,
+        lowering_contract,
+        &mapped.id_map,
+        &resources,
+        &reactive,
+    )?;
+    if mapped.static_owners.len() != storage.owners.len()
+        || mapped
+            .static_owners
+            .iter()
+            .zip(&storage.owners)
+            .any(|(semantic, erased)| {
+                (semantic.id, semantic.parent, semantic.child_ordinal)
+                    != (erased.id, erased.parent, erased.child_ordinal)
+            })
+    {
+        return Err(
+            "semantic execution and storage mappings disagree on the exact static-owner forest"
+                .to_owned(),
+        );
+    }
+    let (distributed_references, external_value_references, external_call_references) =
+        map_distributed_references(execution_graph, &mapped, &storage)?;
+    let reads = finalize_storage_reads(&storage, &resources, &external_value_references)?;
+    let dependency_uses = finalize_storage_dependency_uses(&storage, &external_call_references)?;
+    let output_values = map_output_values(lowering_contract, &mapped.id_map, &storage.id_map)?;
+    let host_ports = map_host_ports(lowering_contract);
+    let view_bindings = map_view_bindings(
+        view_binding_graph,
+        &mapped.id_map,
+        &storage.id_map,
+        &storage,
+    )?;
+    let (semantic_memory, migration_edges) = map_semantic_memory(
+        execution_graph,
+        reactive_graph,
+        memory_graph,
+        &mapped.id_map,
+        &storage.id_map,
+    )?;
+    let expression_types = map_expression_types(&lowering_contract.metadata);
+    let function_types = map_function_types(&lowering_contract.metadata);
+    let named_value_types = map_named_value_types(&lowering_contract.metadata);
+    let expression_coverage =
+        map_expression_coverage(&lowering_contract.metadata, &distributed_references);
+    let semantic_index = map_semantic_index(
+        execution_graph,
+        lowering_contract,
+        &mapped.id_map,
+        &resources,
+        &storage,
+        &output_values,
+        &view_bindings,
+    )?;
+
+    let MappedSemanticExecution {
+        executable,
+        materializations,
+        ..
+    } = mapped;
+    let MappedSemanticResources {
+        row_scopes,
+        lists,
+        sources,
+        state_cells,
+        list_projections,
+        ..
+    } = resources;
+    let MappedSemanticStorage {
+        owners,
+        locals,
+        fields,
+        bindings,
+        sources: storage_sources,
+        row_values,
+        row_source_projections,
+        producer_function_instances,
+        derived_values,
+        state_update_arms,
+        list_mutations,
+        dependencies,
+        possible_causes,
+        ..
+    } = storage;
+    let graph_node_count = executable.expressions.len();
+
+    Ok(crate::ErasedProgramFields {
+        executable,
+        scope_index: crate::ErasedScopeIndex {
+            owners,
+            locals,
+            fields,
+            bindings,
+            sources: storage_sources,
+            reads,
+            row_values,
+            row_source_projections,
+            dependencies: dependency_uses,
+        },
+        expression_count: lowering_contract.metadata.original_source_expression_count,
+        expression_coverage,
+        distributed_references,
+        producer_function_instances,
+        semantic_index,
+        graph_node_count,
+        row_scopes,
+        sources,
+        host_ports,
+        state_cells,
+        lists,
+        semantic_memory,
+        migration_edges,
+        output_values,
+        derived_values,
+        dependencies,
+        possible_causes,
+        state_update_arms,
+        list_mutations,
+        list_projections,
+        materializations,
+        view_bindings,
+        expression_types,
+        function_types,
+        named_value_types,
+        hidden_identity_verified: true,
+        static_schedule_verified: true,
+    })
+}
+
+type ExternalReferenceMap = BTreeMap<SemanticStorageExternalReferenceId, usize>;
+
+fn map_distributed_references(
+    execution: &SemanticExecutionGraphV1,
+    mapped: &MappedSemanticExecution,
+    storage: &MappedSemanticStorage,
+) -> Result<
+    (
+        crate::DistributedReferences,
+        ExternalReferenceMap,
+        ExternalReferenceMap,
+    ),
+    String,
+> {
+    let mut value_references = Vec::new();
+    let mut calls = Vec::new();
+    let mut value_ids = BTreeMap::new();
+    let mut call_ids = BTreeMap::new();
+
+    for reference in &storage.external_references {
+        let identity_role = reference
+            .external_identity
+            .map(|identity| identity.producer_role);
+        let producer_role = identity_role
+            .or_else(|| distributed_role_from_path(&reference.canonical_path))
+            .ok_or_else(|| {
+                format!(
+                    "semantic external reference {} (`{}`) has neither a sealed producer role nor a canonical role namespace",
+                    reference.id, reference.canonical_path
+                )
+            })?;
+        match reference.kind {
+            MappedSemanticExternalReferenceKind::Read {
+                expression,
+                semantic_read: _,
+                read: _,
+            } => {
+                if reference
+                    .external_identity
+                    .is_some_and(|identity| identity.kind != CheckedExternalDeclarationKind::Value)
+                {
+                    return Err(format!(
+                        "semantic external value reference {} carries a callable identity",
+                        reference.id
+                    ));
+                }
+                let executable = mapped
+                    .executable
+                    .expressions
+                    .get(expression.as_usize())
+                    .filter(|candidate| candidate.id == expression)
+                    .ok_or_else(|| {
+                        format!(
+                            "semantic external value reference {} maps to missing executable expression {expression}",
+                            reference.id
+                        )
+                    })?;
+                if !matches!(
+                    executable.kind,
+                    ExecutableExpressionKind::ExternalRead { .. }
+                ) {
+                    return Err(format!(
+                        "semantic external value reference {} maps to non-read executable expression {expression}",
+                        reference.id
+                    ));
+                }
+                let index = value_references.len();
+                if value_ids.insert(reference.id, index).is_some() {
+                    return Err(format!(
+                        "semantic external value reference {} is mapped more than once",
+                        reference.id
+                    ));
+                }
+                value_references.push(crate::DistributedValueReference {
+                    expr_id: ExprId(executable.checked_expr_id.0 as usize),
+                    canonical_path: reference.canonical_path.clone(),
+                    local_alias_paths: Vec::new(),
+                    producer_role,
+                    flow_mode: executable.flow_type.mode,
+                    value_type: executable.flow_type.ty.clone(),
+                });
+            }
+            MappedSemanticExternalReferenceKind::Call { call, expression } => {
+                if reference.external_identity.is_some_and(|identity| {
+                    identity.kind != CheckedExternalDeclarationKind::Callable
+                }) {
+                    return Err(format!(
+                        "semantic external call reference {} carries a value identity",
+                        reference.id
+                    ));
+                }
+                let semantic_call = execution
+                    .calls
+                    .get(call.as_usize())
+                    .filter(|candidate| candidate.id == call)
+                    .ok_or_else(|| {
+                        format!(
+                            "semantic external call reference {} maps to missing call {call}",
+                            reference.id
+                        )
+                    })?;
+                let executable = mapped
+                    .executable
+                    .expressions
+                    .get(expression.as_usize())
+                    .filter(|candidate| candidate.id == expression)
+                    .ok_or_else(|| {
+                        format!(
+                            "semantic external call reference {} maps to missing executable expression {expression}",
+                            reference.id
+                        )
+                    })?;
+                let ExecutableExpressionKind::Call {
+                    callable_kind: ExecutableCallableKind::External,
+                    name,
+                    arguments,
+                    ..
+                } = &executable.kind
+                else {
+                    return Err(format!(
+                        "semantic external call reference {} maps to non-external executable expression {expression}",
+                        reference.id
+                    ));
+                };
+                if name != &reference.canonical_path
+                    || semantic_call.function != reference.canonical_path
+                    || semantic_call.result != executable.flow_type
+                {
+                    return Err(format!(
+                        "semantic external call reference {} differs from its exact executable call",
+                        reference.id
+                    ));
+                }
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| {
+                        let value = mapped
+                            .executable
+                            .expressions
+                            .get(argument.value.as_usize())
+                            .filter(|candidate| candidate.id == argument.value)
+                            .ok_or_else(|| {
+                                format!(
+                                    "semantic external call {call} argument `{}` maps to missing executable value {}",
+                                    argument.name, argument.value
+                                )
+                            })?;
+                        Ok(crate::DistributedCallArgument {
+                            name: argument.name.clone(),
+                            value: argument.value,
+                            flow_type: value.flow_type.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let schedules = storage
+                    .call_invocations
+                    .iter()
+                    .filter(|schedule| schedule.call == call && schedule.expression == expression)
+                    .collect::<Vec<_>>();
+                let [schedule] = schedules.as_slice() else {
+                    return Err(format!(
+                        "semantic external call {call} expression {expression} maps to {} final invocation schedules",
+                        schedules.len()
+                    ));
+                };
+                let index = calls.len();
+                if call_ids.insert(reference.id, index).is_some() {
+                    return Err(format!(
+                        "semantic external call reference {} is mapped more than once",
+                        reference.id
+                    ));
+                }
+                calls.push(crate::DistributedCall {
+                    expression,
+                    owner: executable.owner,
+                    occurrence_path: format!(
+                        "semantic-call:{}/expression:{}",
+                        call.as_usize(),
+                        expression.as_usize()
+                    ),
+                    canonical_function: reference.canonical_path.clone(),
+                    producer_role,
+                    result: semantic_call.result.clone(),
+                    effect: semantic_call.effect,
+                    arguments,
+                    invocation_arms: schedule.invocation_arms.clone(),
+                });
+            }
+        }
+    }
+
+    if value_ids.len() + call_ids.len() != storage.external_references.len() {
+        return Err(
+            "semantic external references were not partitioned exactly into value and call domains"
+                .to_owned(),
+        );
+    }
+    Ok((
+        crate::DistributedReferences {
+            value_references,
+            calls,
+        },
+        value_ids,
+        call_ids,
+    ))
+}
+
+fn distributed_role_from_path(path: &str) -> Option<boon_typecheck::ProgramRole> {
+    let namespace = path.split('/').next()?;
+    match namespace {
+        "Client" => Some(boon_typecheck::ProgramRole::Client),
+        "Session" => Some(boon_typecheck::ProgramRole::Session),
+        "Server" => Some(boon_typecheck::ProgramRole::Server),
+        _ => None,
+    }
+}
+
+fn finalize_storage_reads(
+    storage: &MappedSemanticStorage,
+    resources: &MappedSemanticResources,
+    external_values: &ExternalReferenceMap,
+) -> Result<Vec<crate::ErasedReadBinding>, String> {
+    storage
+        .reads
+        .iter()
+        .map(|read| {
+            let target = match &read.target {
+                MappedSemanticStorageReadTarget::Binding {
+                    binding,
+                    projection,
+                } => crate::ErasedReadTarget::Binding {
+                    binding: *binding,
+                    projection: projection.clone(),
+                },
+                MappedSemanticStorageReadTarget::SourcePayload {
+                    binding,
+                    source,
+                    payload_projection,
+                    projection,
+                } => {
+                    let source_port = resources
+                        .sources
+                        .get(source.as_usize())
+                        .filter(|candidate| candidate.id == *source)
+                        .ok_or_else(|| {
+                            format!(
+                                "mapped semantic read {} references missing source {source}",
+                                read.id
+                            )
+                        })?;
+                    let combined = payload_projection
+                        .iter()
+                        .chain(projection)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let Some((field_name, projection)) = combined.split_first() else {
+                        return Ok(crate::ErasedReadBinding {
+                            id: read.id,
+                            expression: read.expression,
+                            target: crate::ErasedReadTarget::Binding {
+                                binding: *binding,
+                                projection: Vec::new(),
+                            },
+                        });
+                    };
+                    let fields = source_port
+                        .payload_schema
+                        .fields
+                        .iter()
+                        .filter(|field| field.name() == field_name)
+                        .collect::<Vec<_>>();
+                    let [field] = fields.as_slice() else {
+                        return Err(format!(
+                            "mapped semantic source read {} payload field `{field_name}` resolves to {} exact source fields",
+                            read.id,
+                            fields.len()
+                        ));
+                    };
+                    crate::ErasedReadTarget::SourcePayload {
+                        binding: *binding,
+                        source: *source,
+                        field: (*field).clone(),
+                        projection: projection.to_vec(),
+                    }
+                }
+                MappedSemanticStorageReadTarget::StateProjection {
+                    binding,
+                    state,
+                    projection,
+                } => {
+                    if projection.is_empty() {
+                        crate::ErasedReadTarget::Binding {
+                            binding: *binding,
+                            projection: Vec::new(),
+                        }
+                    } else {
+                        crate::ErasedReadTarget::StateProjection {
+                            binding: *binding,
+                            state: *state,
+                            fields: projection.clone(),
+                        }
+                    }
+                }
+                MappedSemanticStorageReadTarget::Local {
+                    binding,
+                    declaration,
+                    producer,
+                    projection,
+                } => crate::ErasedReadTarget::Local {
+                    binding: *binding,
+                    declaration: *declaration,
+                    value: *producer,
+                    projection: projection.clone(),
+                },
+                MappedSemanticStorageReadTarget::BundleExternal { reference } => {
+                    let reference = external_values.get(reference).copied().ok_or_else(|| {
+                        format!(
+                            "mapped semantic read {} external identity {reference} has no value-reference allocation",
+                            read.id
+                        )
+                    })?;
+                    crate::ErasedReadTarget::ExternalValue { reference }
+                }
+                MappedSemanticStorageReadTarget::ElementState {
+                    context,
+                    projection,
+                } => crate::ErasedReadTarget::ElementState {
+                    context: *context,
+                    projection: projection.clone(),
+                },
+                MappedSemanticStorageReadTarget::MaterializationLocal {
+                    owner,
+                    local,
+                    projection,
+                } => crate::ErasedReadTarget::MaterializationLocal {
+                    owner: *owner,
+                    local: *local,
+                    projection: projection.clone(),
+                },
+                MappedSemanticStorageReadTarget::FunctionParameter {
+                    parameter,
+                    projection,
+                } => crate::ErasedReadTarget::FunctionParameter {
+                    parameter: *parameter,
+                    projection: projection.clone(),
+                },
+            };
+            Ok(crate::ErasedReadBinding {
+                id: read.id,
+                expression: read.expression,
+                target,
+            })
+        })
+        .collect()
+}
+
+fn finalize_storage_dependency_uses(
+    storage: &MappedSemanticStorage,
+    external_calls: &ExternalReferenceMap,
+) -> Result<Vec<crate::ErasedDependencyUse>, String> {
+    storage
+        .dependency_uses
+        .iter()
+        .map(|dependency| {
+            let target = match dependency.target {
+                MappedSemanticStorageDependencyTarget::BundleExternalRead { read, .. } => {
+                    crate::ErasedDependencyTarget::ExternalRead { read }
+                }
+                MappedSemanticStorageDependencyTarget::BundleExternalCall { reference } => {
+                    let reference = external_calls.get(&reference).copied().ok_or_else(|| {
+                        format!(
+                            "mapped semantic dependency expression {} external identity {reference} has no call allocation",
+                            dependency.expression
+                        )
+                    })?;
+                    crate::ErasedDependencyTarget::ExternalCall { reference }
+                }
+            };
+            Ok(crate::ErasedDependencyUse {
+                dependent: dependency.dependent,
+                expression: dependency.expression,
+                target,
+                timing: dependency.timing.clone(),
+            })
+        })
+        .collect()
+}
+
+fn map_output_values(
+    lowering: &SemanticLoweringContractV1,
+    ids: &SemanticToExecutableMap,
+    storage_ids: &SemanticStorageToErasedMap,
+) -> Result<Vec<crate::OutputRootValue>, String> {
+    lowering
+        .output_contracts
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            if output.id.as_usize() != index || output.ordinal != index {
+                return Err(format!(
+                    "semantic output contract {} is not canonical at index {index}",
+                    output.id
+                ));
+            }
+            let contract = match output.contract {
+                boon_semantic::SemanticOutputContractKindV1::RetainedVisualDocument => {
+                    crate::SemanticOutputContractKind::RetainedVisual {
+                        kind: crate::SemanticRetainedVisualKind::Document,
+                    }
+                }
+                boon_semantic::SemanticOutputContractKindV1::RetainedVisualScene => {
+                    crate::SemanticOutputContractKind::RetainedVisual {
+                        kind: crate::SemanticRetainedVisualKind::Scene,
+                    }
+                }
+                boon_semantic::SemanticOutputContractKindV1::HostValue => {
+                    crate::SemanticOutputContractKind::HostValue
+                }
+            };
+            let demand = match output.demand {
+                boon_semantic::SemanticOutputDemandPolicyV1::HostDemanded => {
+                    crate::SemanticOutputDemandPolicy::HostDemanded
+                }
+            };
+            Ok(crate::OutputRootValue {
+                root: output.root.clone(),
+                value_path: output.value_path.clone(),
+                contract,
+                demand,
+                data_type: output.data_type.as_ref().map(crate::semantic_data_type),
+                statement_id: output.checked_statement.0 as usize,
+                executable_statement_id: ids.statement(output.statement)?,
+                value_expression_id: ids.expression(output.expression)?,
+                binding_id: storage_ids
+                    .binding(MappedReactiveBindingId(output.binding.as_usize()))?,
+                line: output.line,
+                typed_contract_known: output.typed_contract_known,
+            })
+        })
+        .collect()
+}
+
+fn map_host_ports(lowering: &SemanticLoweringContractV1) -> Vec<crate::HostPortDeclaration> {
+    lowering
+        .host_ports
+        .iter()
+        .map(|port| match &port.kind {
+            boon_semantic::SemanticHostPortKindV1::HttpServer {
+                request,
+                disconnect,
+                response,
+            } => crate::HostPortDeclaration::HttpServer {
+                line: port.line,
+                request_source: request.diagnostic_path.clone(),
+                disconnect_source: disconnect
+                    .as_ref()
+                    .map(|binding| binding.diagnostic_path.clone()),
+                response_output: response.diagnostic_name.clone(),
+            },
+            boon_semantic::SemanticHostPortKindV1::WebSocketServer {
+                open,
+                message,
+                close,
+                error,
+                actions,
+            } => crate::HostPortDeclaration::WebSocketServer {
+                line: port.line,
+                open_source: open.diagnostic_path.clone(),
+                message_source: message.diagnostic_path.clone(),
+                close_source: close.diagnostic_path.clone(),
+                error_source: error.diagnostic_path.clone(),
+                actions_output: actions.diagnostic_name.clone(),
+            },
+        })
+        .collect()
+}
+
+fn map_view_bindings(
+    graph: &boon_semantic::SemanticViewBindingGraphV1,
+    ids: &SemanticToExecutableMap,
+    storage_ids: &SemanticStorageToErasedMap,
+    storage: &MappedSemanticStorage,
+) -> Result<Vec<crate::ViewBinding>, String> {
+    graph
+        .bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            if binding.id.as_usize() != index {
+                return Err(format!(
+                    "semantic view binding {} is not canonical at index {index}",
+                    binding.id
+                ));
+            }
+            let node = graph
+                .nodes
+                .get(binding.node.as_usize())
+                .filter(|candidate| candidate.id == binding.node)
+                .ok_or_else(|| {
+                    format!(
+                        "semantic view binding {} references missing node {}",
+                        binding.id, binding.node
+                    )
+                })?;
+            graph
+                .arguments
+                .get(binding.argument.as_usize())
+                .filter(|candidate| candidate.id == binding.argument)
+                .ok_or_else(|| {
+                    format!(
+                        "semantic view binding {} references missing argument {}",
+                        binding.id, binding.argument
+                    )
+                })?;
+            let path = match binding.target {
+                boon_semantic::SemanticViewBindingTargetV1::Data { read } => mapped_view_read_path(
+                    storage,
+                    storage_ids.read(MappedReactiveReadId(read.as_usize()))?,
+                )
+                .unwrap_or_else(|| binding.diagnostic_path.clone()),
+                boon_semantic::SemanticViewBindingTargetV1::Event { .. } => {
+                    binding.diagnostic_path.clone()
+                }
+            };
+            let target = match binding.target {
+                boon_semantic::SemanticViewBindingTargetV1::Data { read } => {
+                    crate::ViewBindingTarget::Read {
+                        read: storage_ids.read(MappedReactiveReadId(read.as_usize()))?,
+                        additional_projection: binding.additional_projection.clone(),
+                    }
+                }
+                boon_semantic::SemanticViewBindingTargetV1::Event { source } => {
+                    crate::ViewBindingTarget::Source {
+                        source: ids.runtime_source(source)?,
+                    }
+                }
+            };
+            let kind = match binding.kind {
+                boon_semantic::SemanticViewBindingKindV1::Data => crate::ViewBindingKind::Data,
+                boon_semantic::SemanticViewBindingKindV1::Source => crate::ViewBindingKind::Source,
+                boon_semantic::SemanticViewBindingKindV1::Target => crate::ViewBindingKind::Target,
+            };
+            Ok(crate::ViewBinding {
+                id: crate::ViewBindingId(index),
+                node_kind: node.diagnostic_kind.clone(),
+                attr: binding.canonical_attribute.clone(),
+                path,
+                target,
+                kind,
+                scope_id: binding
+                    .row
+                    .map(|row| ids.row_scope(row.scope))
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
+fn mapped_view_read_path(storage: &MappedSemanticStorage, read: ErasedReadId) -> Option<String> {
+    let read = storage
+        .reads
+        .get(read.as_usize())
+        .filter(|candidate| candidate.id == read)?;
+    let binding_path = |binding: ErasedBindingId, projection: &[String]| {
+        let binding = storage
+            .bindings
+            .get(binding.as_usize())
+            .filter(|candidate| candidate.id == binding)?;
+        Some(join_diagnostic_projection(
+            &binding.diagnostic_path,
+            projection,
+        ))
+    };
+    match &read.target {
+        MappedSemanticStorageReadTarget::Binding {
+            binding,
+            projection,
+        } => binding_path(*binding, projection),
+        MappedSemanticStorageReadTarget::SourcePayload {
+            binding,
+            payload_projection,
+            projection,
+            ..
+        } => {
+            let combined = payload_projection
+                .iter()
+                .chain(projection)
+                .cloned()
+                .collect::<Vec<_>>();
+            binding_path(*binding, &combined)
+        }
+        MappedSemanticStorageReadTarget::StateProjection {
+            binding,
+            projection,
+            ..
+        } => binding_path(*binding, projection),
+        MappedSemanticStorageReadTarget::Local {
+            declaration,
+            producer,
+            projection,
+            ..
+        } => {
+            let fields = storage
+                .fields
+                .iter()
+                .filter(|field| {
+                    field.declaration == Some(*declaration) && field.producer == Some(*producer)
+                })
+                .collect::<Vec<_>>();
+            let [field] = fields.as_slice() else {
+                return None;
+            };
+            Some(join_diagnostic_projection(
+                &field.diagnostic_path,
+                projection,
+            ))
+        }
+        MappedSemanticStorageReadTarget::BundleExternal { reference } => storage
+            .external_references
+            .get(reference.as_usize())
+            .filter(|candidate| candidate.id == *reference)
+            .map(|reference| reference.canonical_path.clone()),
+        MappedSemanticStorageReadTarget::ElementState { projection, .. } => {
+            Some(join_diagnostic_projection("element_state", projection))
+        }
+        MappedSemanticStorageReadTarget::MaterializationLocal { .. }
+        | MappedSemanticStorageReadTarget::FunctionParameter { .. } => None,
+    }
+}
+
+fn join_diagnostic_projection(base: &str, projection: &[String]) -> String {
+    if projection.is_empty() {
+        base.to_owned()
+    } else if base.is_empty() {
+        projection.join(".")
+    } else {
+        format!("{base}.{}", projection.join("."))
+    }
+}
+
+fn map_expression_types(
+    metadata: &boon_semantic::SemanticLoweringMetadataV1,
+) -> boon_typecheck::ExprTypeTable {
+    boon_typecheck::ExprTypeTable {
+        entries: metadata
+            .expression_types
+            .iter()
+            .map(|entry| boon_typecheck::ExprTypeEntry {
+                expr_id: entry.checked_expression.0 as usize,
+                flow_type: entry.flow_type.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn map_function_types(
+    metadata: &boon_semantic::SemanticLoweringMetadataV1,
+) -> boon_typecheck::FunctionTypeTable {
+    boon_typecheck::FunctionTypeTable {
+        entries: metadata
+            .function_types
+            .iter()
+            .map(|entry| boon_typecheck::FunctionTypeEntry {
+                callable: entry.checked_callable,
+                name: entry.name.clone(),
+                parameters: entry
+                    .parameters
+                    .iter()
+                    .map(|parameter| boon_typecheck::FunctionTypeParameterEntry {
+                        formal: parameter.formal,
+                        ordinal: parameter.ordinal,
+                        name: parameter.name.clone(),
+                        flow_type: parameter.flow_type.clone(),
+                    })
+                    .collect(),
+                result: entry.result.clone(),
+                effect: entry.effect,
+            })
+            .collect(),
+    }
+}
+
+fn map_named_value_types(
+    metadata: &boon_semantic::SemanticLoweringMetadataV1,
+) -> boon_typecheck::NamedValueTypeTable {
+    boon_typecheck::NamedValueTypeTable {
+        checked_statement_sites: metadata
+            .named_value_types
+            .iter()
+            .map(|entry| entry.checked_statement)
+            .collect(),
+        entries: metadata
+            .named_value_types
+            .iter()
+            .map(|entry| boon_typecheck::NamedValueTypeEntry {
+                path: entry.diagnostic_path.clone(),
+                origins: entry
+                    .origins
+                    .iter()
+                    .map(|origin| origin.checked.clone())
+                    .collect(),
+                flow_type: entry.flow_type.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn map_expression_coverage(
+    metadata: &boon_semantic::SemanticLoweringMetadataV1,
+    distributed: &crate::DistributedReferences,
+) -> crate::ExpressionCoverage {
+    crate::ExpressionCoverage {
+        computed_from: "verified_semantic_program".to_owned(),
+        ast_expression_count: metadata.original_source_expression_count,
+        distributed_reference_expression_count: distributed.value_references.len()
+            + distributed.calls.len(),
+        unknown_ast_expression_count: 0,
+        ignored_unknown_ast_expression_count: 0,
+        unknown_list_initializer_count: 0,
+        unknown_list_initial_value_count: 0,
+        unknown_list_predicate_count: 0,
+        unknown_derived_value_count: 0,
+        unknown_labels: Vec::new(),
+        ignored_unknown_labels: Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_semantic_index(
+    execution: &SemanticExecutionGraphV1,
+    lowering: &SemanticLoweringContractV1,
+    ids: &SemanticToExecutableMap,
+    resources: &MappedSemanticResources,
+    storage: &MappedSemanticStorage,
+    output_values: &[crate::OutputRootValue],
+    view_bindings: &[crate::ViewBinding],
+) -> Result<crate::SemanticIndex, String> {
+    let metadata = &lowering.metadata;
+    let source_units = metadata
+        .source_units
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| {
+            if unit.id.as_usize() != index {
+                return Err(format!(
+                    "semantic source unit {} is not canonical at index {index}",
+                    unit.id
+                ));
+            }
+            Ok(crate::SemanticSourceUnit {
+                id: crate::SourceUnitId(index),
+                path: unit.path.clone(),
+                module: unit.module.clone(),
+                start_line: unit.start_line,
+                line_count: unit.line_count,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let output_roots = output_values
+        .iter()
+        .map(|output| crate::SemanticOutputRootEntry {
+            root: output.root.clone(),
+            contract: output.contract,
+            demand: output.demand,
+            data_type: output.data_type.clone(),
+            statement_id: output.statement_id,
+            line: output.line,
+            typed_contract_known: output.typed_contract_known,
+        })
+        .collect::<Vec<_>>();
+    let payload_sources = metadata
+        .source_payload_shapes
+        .iter()
+        .flat_map(|shape| shape.sources.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let sources = resources
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| crate::SemanticSourceEntry {
+            id: source.id,
+            path: source.path.clone(),
+            scoped: source.scoped,
+            scope_id: source.scope_id,
+            payload_schema_known: payload_sources.contains(&SemanticSourceId(index)),
+            payload_field_count: source.payload_schema.fields.len(),
+        })
+        .collect::<Vec<_>>();
+    let lists = resources
+        .lists
+        .iter()
+        .map(|list| crate::SemanticListEntry {
+            id: list.id,
+            name: list.name.clone(),
+            row_scope_id: list.row_scope_id,
+            capacity: list.capacity,
+            initializer_known: !matches!(list.initializer, ListInitializer::Unknown { .. }),
+        })
+        .collect::<Vec<_>>();
+    let row_scopes = resources
+        .row_scopes
+        .iter()
+        .map(|scope| crate::SemanticRowScopeEntry {
+            id: scope.id,
+            list: scope.list.clone(),
+            function: scope.function.clone(),
+            row_scope: scope.row_scope.clone(),
+        })
+        .collect::<Vec<_>>();
+    let functions = metadata
+        .function_types
+        .iter()
+        .map(|function| {
+            let callable = execution
+                .callables
+                .get(function.callable.as_usize())
+                .filter(|candidate| candidate.id == function.callable)
+                .ok_or_else(|| {
+                    format!(
+                        "semantic function type for `{}` references missing callable {}",
+                        function.name, function.callable
+                    )
+                })?;
+            let statement = callable.body.and_then(|body| {
+                execution.statements.iter().find(|statement| {
+                    matches!(
+                        statement.origin,
+                        boon_semantic::SemanticStatementOrigin::Checked { statement }
+                            if statement == body
+                    )
+                })
+            });
+            Ok(crate::SemanticFunctionEntry {
+                id: ids.callable(function.callable)?,
+                name: function.name.clone(),
+                args: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect(),
+                statement_id: callable
+                    .body
+                    .map_or(usize::MAX, |statement| statement.0 as usize),
+                line: statement.map_or(0, |statement| statement.span.line),
+                type_known: true,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let fields = map_semantic_field_entries(
+        &storage.fields,
+        &storage.derived_values,
+        &resources.state_cells,
+    );
+    let semantic_view_bindings = view_bindings
+        .iter()
+        .map(|binding| crate::SemanticViewBindingEntry {
+            id: binding.id,
+            node_kind: binding.node_kind.clone(),
+            attr: binding.attr.clone(),
+            path: binding.path.clone(),
+            kind: binding.kind,
+            scope_id: binding.scope_id,
+            source_id: match binding.target {
+                crate::ViewBindingTarget::Source { source } => Some(source),
+                crate::ViewBindingTarget::Read { .. } => None,
+            },
+            render_contract_known: true,
+        })
+        .collect::<Vec<_>>();
+    let diagnostic_spans = metadata
+        .diagnostics
+        .iter()
+        .enumerate()
+        .map(|(index, diagnostic)| crate::SemanticDiagnosticSpan {
+            id: crate::DiagnosticSpanId(index),
+            line: diagnostic.line,
+            start: diagnostic.start,
+            end: diagnostic.end,
+            severity: format!("{:?}", diagnostic.severity).to_ascii_lowercase(),
+            message: diagnostic.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    let symbols = map_semantic_symbols(
+        execution,
+        &source_units,
+        &output_roots,
+        &sources,
+        &lists,
+        &row_scopes,
+        &functions,
+        &fields,
+        &semantic_view_bindings,
+    );
+    let readiness = map_semantic_index_readiness(metadata, &sources, &lists, &row_scopes);
+
+    Ok(crate::SemanticIndex {
+        version: 1,
+        computed_from: "verified_semantic_program".to_owned(),
+        parser_policy_phase: "verified_semantics_only".to_owned(),
+        reuse_key: metadata.digest.to_string(),
+        output_roots,
+        source_units,
+        sources,
+        lists,
+        row_scopes,
+        functions,
+        fields,
+        view_bindings: semantic_view_bindings,
+        diagnostic_spans,
+        symbols,
+        readiness,
+        reuse: crate::SemanticIndexReuse {
+            parser_reused_by_ir: false,
+            typecheck_reused_by_ir: false,
+            runtime_reports_reuse_index: true,
+            shared_tables: vec![
+                "SemanticLoweringMetadataV1".to_owned(),
+                "SemanticResourceGraphV1".to_owned(),
+                "SemanticScopeStorageGraphV1".to_owned(),
+                "SemanticViewBindingGraphV1".to_owned(),
+            ],
+        },
+    })
+}
+
+fn map_semantic_field_entries(
+    fields: &[ErasedFieldDef],
+    derived_values: &[DerivedValue],
+    state_cells: &[StateCell],
+) -> Vec<crate::SemanticFieldEntry> {
+    fields
+        .iter()
+        .filter(|field| field.role.is_value())
+        .map(|field| crate::SemanticFieldEntry {
+            id: field.id,
+            path: field.diagnostic_path.clone(),
+            local_name: field.name.clone(),
+            parent_path: field
+                .parent
+                .and_then(|parent| fields.get(parent.as_usize()))
+                .map_or_else(String::new, |parent| parent.diagnostic_path.clone()),
+            scope_id: field.row.map(|row| row.scope),
+            statement_id: field.statement.map_or(usize::MAX, |statement| statement.0),
+            line: field
+                .statement
+                .and_then(|statement| {
+                    state_cells
+                        .iter()
+                        .find(|state| state.statement_id == statement.as_usize())
+                })
+                .map_or(0, |state| state.source_line),
+            kind: if state_cells.iter().any(|state| {
+                field
+                    .statement
+                    .is_some_and(|statement| state.statement_id == statement.as_usize())
+            }) {
+                "state".to_owned()
+            } else if let Some(derived) =
+                derived_values.iter().find(|derived| derived.id == field.id)
+            {
+                match derived.kind {
+                    DerivedValueKind::SourceEventTransform => "source_event_transform",
+                    DerivedValueKind::ListView => "list_view",
+                    DerivedValueKind::Aggregate => "aggregate",
+                    DerivedValueKind::Pure => "pure",
+                    DerivedValueKind::Unknown => "unknown",
+                }
+                .to_owned()
+            } else if field.row.is_some() {
+                "materialized_field".to_owned()
+            } else {
+                "field".to_owned()
+            },
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_semantic_symbols(
+    execution: &SemanticExecutionGraphV1,
+    source_units: &[crate::SemanticSourceUnit],
+    output_roots: &[crate::SemanticOutputRootEntry],
+    sources: &[crate::SemanticSourceEntry],
+    lists: &[crate::SemanticListEntry],
+    row_scopes: &[crate::SemanticRowScopeEntry],
+    functions: &[crate::SemanticFunctionEntry],
+    fields: &[crate::SemanticFieldEntry],
+    view_bindings: &[crate::SemanticViewBindingEntry],
+) -> Vec<crate::SemanticSymbolEntry> {
+    let mut symbols = BTreeSet::<(String, String)>::new();
+    let mut insert = |category: &str, text: &str| {
+        if !text.is_empty() {
+            symbols.insert((category.to_owned(), text.to_owned()));
+        }
+    };
+    for unit in source_units {
+        insert("source_unit_path", &unit.path);
+        if let Some(module) = &unit.module {
+            insert("module_path", module);
+        }
+    }
+    for output in output_roots {
+        insert("output_root", &output.root);
+        insert("output_kind", output.contract.as_str());
+    }
+    for source in sources {
+        insert("source_label", &source.path);
+        for segment in source.path.split('.') {
+            insert("source_label_segment", segment);
+        }
+    }
+    for list in lists {
+        insert("list_name", &list.name);
+    }
+    for scope in row_scopes {
+        insert("row_scope", &scope.row_scope);
+        insert("row_scope_function", &scope.function);
+    }
+    for function in functions {
+        insert("function_name", &function.name);
+        for argument in &function.args {
+            insert("function_arg", argument);
+        }
+    }
+    for field in fields {
+        insert("field_path", &field.path);
+        insert("field_name", &field.local_name);
+    }
+    for expression in &execution.expressions {
+        match &expression.kind {
+            SemanticExpressionKind::Tag(name) => insert("tag", name),
+            SemanticExpressionKind::TaggedObject { tag, fields } => {
+                insert("tag", tag);
+                for field in fields {
+                    insert("document_attr", &field.name);
+                }
+            }
+            SemanticExpressionKind::Object(fields) | SemanticExpressionKind::Record(fields) => {
+                for field in fields {
+                    insert("document_attr", &field.name);
+                    insert("style_attr", &field.name);
+                }
+            }
+            _ => {}
+        }
+    }
+    for call in &execution.calls {
+        insert("operator_name", &call.function);
+        for entry in &call.entries {
+            let name = match entry {
+                SemanticCallEntry::Input { name, .. }
+                | SemanticCallEntry::FreshOut { name, .. }
+                | SemanticCallEntry::ForwardOut { name, .. } => name,
+            };
+            insert("document_attr", name);
+        }
+    }
+    for binding in view_bindings {
+        insert("document_attr", &binding.attr);
+        insert("view_node_kind", &binding.node_kind);
+    }
+    symbols
+        .into_iter()
+        .enumerate()
+        .map(|(index, (category, text))| crate::SemanticSymbolEntry {
+            id: crate::SemanticSymbolId(index),
+            category,
+            text,
+        })
+        .collect()
+}
+
+fn map_semantic_index_readiness(
+    metadata: &boon_semantic::SemanticLoweringMetadataV1,
+    sources: &[crate::SemanticSourceEntry],
+    lists: &[crate::SemanticListEntry],
+    row_scopes: &[crate::SemanticRowScopeEntry],
+) -> crate::SemanticIndexReadiness {
+    let source_fallbacks = sources
+        .iter()
+        .filter(|source| !source.payload_schema_known)
+        .map(|source| format!("{} has no semantic payload shape", source.path))
+        .collect::<Vec<_>>();
+    let row_fallbacks = if !lists.is_empty() && row_scopes.is_empty() {
+        vec!["semantic lists exist without row scopes".to_owned()]
+    } else {
+        Vec::new()
+    };
+    let render_fallbacks = metadata
+        .render_slots
+        .iter()
+        .filter(|slot| !slot.diagnostics.is_empty())
+        .map(|slot| {
+            format!(
+                "render slot `{}` has {} diagnostics",
+                slot.slot_name,
+                slot.diagnostics.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    let route_fallbacks = (metadata.dynamic_fallback_count > 0)
+        .then(|| {
+            format!(
+                "{} semantic expressions retain dynamic fallback",
+                metadata.dynamic_fallback_count
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let known = |known_count| crate::SemanticKnowledgeStatus {
+        known_count,
+        fallback_count: 0,
+        fallback_reasons: Vec::new(),
+    };
+    crate::SemanticIndexReadiness {
+        source_payload_schemas: crate::SemanticKnowledgeStatus {
+            known_count: sources.len().saturating_sub(source_fallbacks.len()),
+            fallback_count: source_fallbacks.len(),
+            fallback_reasons: source_fallbacks,
+        },
+        source_completions: known(sources.len()),
+        route_critical_unknowns: crate::SemanticKnowledgeStatus {
+            known_count: metadata.checked_expression_count,
+            fallback_count: route_fallbacks.len(),
+            fallback_reasons: route_fallbacks,
+        },
+        row_scopes: crate::SemanticKnowledgeStatus {
+            known_count: row_scopes.len(),
+            fallback_count: row_fallbacks.len(),
+            fallback_reasons: row_fallbacks,
+        },
+        row_scope_ambiguity: known(row_scopes.len()),
+        selectors: known(lists.len()),
+        selector_index_ambiguity: known(lists.len()),
+        render_contracts: crate::SemanticKnowledgeStatus {
+            known_count: metadata
+                .render_slots
+                .len()
+                .saturating_sub(render_fallbacks.len()),
+            fallback_count: render_fallbacks.len(),
+            fallback_reasons: render_fallbacks,
+        },
+        bridge_page_descriptors: known(0),
+        dynamic_fallback_count: metadata.dynamic_fallback_count,
+    }
+}
+
+fn map_semantic_memory(
+    execution: &SemanticExecutionGraphV1,
+    reactive: &SemanticReactiveGraphV1,
+    graph: &boon_semantic::SemanticMemoryGraphV1,
+    ids: &SemanticToExecutableMap,
+    storage_ids: &SemanticStorageToErasedMap,
+) -> Result<(Vec<crate::SemanticMemory>, Vec<crate::MigrationEdge>), String> {
+    let memories = graph
+        .memories
+        .iter()
+        .enumerate()
+        .map(|(index, memory)| {
+            if memory.id.as_usize() != index {
+                return Err(format!(
+                    "semantic memory {} is not canonical at index {index}",
+                    memory.id
+                ));
+            }
+            let kind = map_semantic_memory_kind(memory.identity.kind);
+            let runtime_backing = match memory.backing {
+                boon_semantic::SemanticMemoryBackingV1::State {
+                    storage_field,
+                    state,
+                    row,
+                    ..
+                } => {
+                    let state_id = ids.runtime_state(state)?;
+                    let field_id = Some(storage_ids.storage_field(storage_field)?);
+                    match (kind, row) {
+                        (crate::SemanticMemoryKind::RootScalar, None) => {
+                            crate::SemanticMemoryRuntimeBacking::RootState { state_id, field_id }
+                        }
+                        (crate::SemanticMemoryKind::IndexedField, Some(row)) => {
+                            let row = map_row_binding(ids, row)?;
+                            crate::SemanticMemoryRuntimeBacking::IndexedState {
+                                state_id,
+                                field_id,
+                                scope_id: row.scope,
+                                list_id: Some(row.list),
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "semantic memory {} kind {:?} has incompatible state row {:?}",
+                                memory.id, memory.identity.kind, row
+                            ));
+                        }
+                    }
+                }
+                boon_semantic::SemanticMemoryBackingV1::List {
+                    storage_field,
+                    list,
+                    row,
+                    ..
+                } => {
+                    if kind != crate::SemanticMemoryKind::ListOwner {
+                        return Err(format!(
+                            "semantic memory {} has list backing for non-list kind {:?}",
+                            memory.id, memory.identity.kind
+                        ));
+                    }
+                    storage_ids.storage_field(storage_field)?;
+                    let row = map_row_binding(ids, row)?;
+                    let list_id = ids.list(list)?;
+                    if row.list != list_id {
+                        return Err(format!(
+                            "semantic memory {} list backing differs from its row identity",
+                            memory.id
+                        ));
+                    }
+                    crate::SemanticMemoryRuntimeBacking::List {
+                        list_id,
+                        row_scope_id: Some(row.scope),
+                    }
+                }
+            };
+            let status = match memory.status {
+                boon_semantic::SemanticMemoryStatusV1::Active => {
+                    crate::SemanticMemoryStatus::Active
+                }
+                boon_semantic::SemanticMemoryStatusV1::Draining { marker } => {
+                    let migration = reactive
+                        .migration_inputs
+                        .get(marker.as_usize())
+                        .filter(|candidate| candidate.id == marker)
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic memory {} references missing migration marker {marker}",
+                                memory.id
+                            )
+                        })?;
+                    let marker = semantic_execution_expression(execution, migration.marker)?;
+                    crate::SemanticMemoryStatus::Draining {
+                        marker_expr_id: ExprId(marker.checked_expr_id.0 as usize),
+                    }
+                }
+            };
+            Ok(crate::SemanticMemory {
+                id: crate::SemanticMemoryId(index),
+                identity: crate::SemanticMemoryIdentity {
+                    canonical_module: memory.identity.canonical_module.clone(),
+                    owner_path: memory.identity.owner_path.clone(),
+                    semantic_path: memory.identity.semantic_path.clone(),
+                    kind,
+                },
+                data_type: crate::semantic_data_type(&memory.data_type),
+                leaves: memory
+                    .leaves
+                    .iter()
+                    .map(|leaf| crate::SemanticMemoryLeaf {
+                        semantic_path: semantic_region_path(
+                            &memory.identity.semantic_path,
+                            &leaf.projection,
+                        ),
+                        data_type: crate::semantic_data_type(&leaf.data_type),
+                    })
+                    .collect(),
+                status,
+                runtime_backing,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let migration_edges = graph
+        .migration_edges
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| {
+            if edge.id.as_usize() != index {
+                return Err(format!(
+                    "semantic migration edge {} is not canonical at index {index}",
+                    edge.id
+                ));
+            }
+            let source_leaves = edge
+                .inputs
+                .iter()
+                .map(|input| {
+                    let memory = semantic_memory_record(graph, input.source.memory)?;
+                    let data_type =
+                        semantic_region_type(&memory.data_type, &input.source.projection)?;
+                    let expression = semantic_execution_expression(execution, input.expression)?;
+                    Ok(crate::MigrationSourceLeaf {
+                        memory_id: crate::SemanticMemoryId(input.source.memory.as_usize()),
+                        semantic_path: semantic_region_path(
+                            &memory.identity.semantic_path,
+                            &input.source.projection,
+                        ),
+                        data_type: crate::semantic_data_type(data_type),
+                        drain_expr_id: ExprId(expression.checked_expr_id.0 as usize),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let destination_memory = semantic_memory_record(graph, edge.destination.memory)?;
+            let destination_type =
+                semantic_region_type(&destination_memory.data_type, &edge.destination.projection)?;
+            let transfer_kind = match edge.transfer {
+                boon_semantic::SemanticMigrationTransferV1::Scalar => {
+                    crate::MigrationTransferKind::Scalar
+                }
+                boon_semantic::SemanticMigrationTransferV1::IndexedField { owner } => {
+                    map_row_binding(ids, owner)?;
+                    crate::MigrationTransferKind::IndexedField
+                }
+                boon_semantic::SemanticMigrationTransferV1::List {
+                    source,
+                    destination,
+                } => {
+                    map_row_binding(ids, source)?;
+                    map_row_binding(ids, destination)?;
+                    crate::MigrationTransferKind::List
+                }
+            };
+            let transform = match edge.transform {
+                boon_semantic::SemanticMigrationTransformV1::Identity { input } => {
+                    semantic_execution_expression(execution, input)?;
+                    crate::MigrationTransform::Identity
+                }
+                boon_semantic::SemanticMigrationTransformV1::PureExpression { root } => {
+                    let root = semantic_execution_expression(execution, root)?;
+                    crate::MigrationTransform::PureExpression {
+                        expression_root: ExprId(root.checked_expr_id.0 as usize),
+                        pipeline: Vec::new(),
+                    }
+                }
+            };
+            Ok(crate::MigrationEdge {
+                source_leaves,
+                destination: crate::MigrationDestination {
+                    memory_id: crate::SemanticMemoryId(edge.destination.memory.as_usize()),
+                    semantic_path: semantic_region_path(
+                        &destination_memory.identity.semantic_path,
+                        &edge.destination.projection,
+                    ),
+                    data_type: crate::semantic_data_type(destination_type),
+                },
+                transfer_kind,
+                transform,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((memories, migration_edges))
+}
+
+const fn map_semantic_memory_kind(
+    kind: boon_semantic::SemanticMemoryKindV1,
+) -> crate::SemanticMemoryKind {
+    match kind {
+        boon_semantic::SemanticMemoryKindV1::RootScalar => crate::SemanticMemoryKind::RootScalar,
+        boon_semantic::SemanticMemoryKindV1::IndexedField => {
+            crate::SemanticMemoryKind::IndexedField
+        }
+        boon_semantic::SemanticMemoryKindV1::ListOwner => crate::SemanticMemoryKind::ListOwner,
+    }
+}
+
+fn semantic_memory_record(
+    graph: &boon_semantic::SemanticMemoryGraphV1,
+    id: boon_semantic::SemanticMemoryId,
+) -> Result<&boon_semantic::SemanticMemoryV1, String> {
+    graph
+        .memories
+        .get(id.as_usize())
+        .filter(|candidate| candidate.id == id)
+        .ok_or_else(|| format!("missing semantic memory {id}"))
+}
+
+fn semantic_region_path(base: &str, projection: &[String]) -> String {
+    if projection.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}.{}", projection.join("."))
+    }
+}
+
+fn semantic_region_type<'a>(
+    root: &'a boon_typecheck::Type,
+    projection: &[String],
+) -> Result<&'a boon_typecheck::Type, String> {
+    let mut current = root;
+    for field in projection {
+        current = match current {
+            boon_typecheck::Type::Object(shape) => shape.fields.get(field).ok_or_else(|| {
+                format!(
+                    "semantic memory type projection `{}` has no field `{field}`",
+                    projection.join(".")
+                )
+            })?,
+            boon_typecheck::Type::VariantSet(variants) => {
+                let projected = variants
+                    .iter()
+                    .filter_map(|variant| match variant {
+                        boon_typecheck::Variant::Tagged { fields, .. } => fields.fields.get(field),
+                        boon_typecheck::Variant::Tag(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let Some(first) = projected.first().copied() else {
+                    return Err(format!(
+                        "semantic variant memory projection `{}` has no field `{field}`",
+                        projection.join(".")
+                    ));
+                };
+                if projected.iter().any(|candidate| *candidate != first) {
+                    return Err(format!(
+                        "semantic variant memory projection `{}` has inconsistent field `{field}` types",
+                        projection.join(".")
+                    ));
+                }
+                first
+            }
+            other => {
+                return Err(format!(
+                    "semantic memory projection `{}` traverses non-record type {other:?}",
+                    projection.join(".")
+                ));
+            }
+        };
+    }
+    Ok(current)
+}
+
 fn require_exact_identity_set<T: Copy + Ord>(
     expected: impl IntoIterator<Item = T>,
     emitted: impl IntoIterator<Item = T>,

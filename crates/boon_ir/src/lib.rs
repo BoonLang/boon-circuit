@@ -1528,6 +1528,11 @@ pub enum ErasedReadTarget {
     ExternalValue {
         reference: usize,
     },
+    ElementState {
+        context: ExecutableCallContextId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projection: Vec<String>,
+    },
     MaterializationLocal {
         owner: StaticOwnerId,
         local: MaterializationLocalId,
@@ -1976,20 +1981,17 @@ fn lower_verified_semantic_execution(
         &resource_graph,
         &mapped.id_map,
     )?;
-    Err(format!(
-        "semantic reactive graph extraction is incomplete after mapping {} expressions, {} materializations, {} static owners, {} lists, {} sources, {} states, {} reactive dependencies, {} output contracts, {} semantic view bindings, {} semantic storage fields, and {} semantic memories",
-        mapped.executable.expressions.len(),
-        mapped.materializations.len(),
-        mapped.static_owners.len(),
-        resources.lists.len(),
-        resources.sources.len(),
-        resources.state_cells.len(),
-        reactive_graph.dependencies.len(),
-        lowering_contract.output_contracts.len(),
-        view_binding_graph.bindings.len(),
-        scope_storage_graph.fields.len(),
-        memory_graph.memories.len(),
-    ))
+    semantic_mapping::finish_verified_semantic_lowering(
+        &execution_graph,
+        &resource_graph,
+        &reactive_graph,
+        &lowering_contract,
+        &view_binding_graph,
+        &scope_storage_graph,
+        &memory_graph,
+        mapped,
+        resources,
+    )
 }
 
 #[allow(dead_code)]
@@ -7379,6 +7381,7 @@ impl ErasedRowValueResolver<'_> {
             ErasedReadTarget::SourcePayload { .. }
             | ErasedReadTarget::StateProjection { .. }
             | ErasedReadTarget::ExternalValue { .. }
+            | ErasedReadTarget::ElementState { .. }
             | ErasedReadTarget::MaterializationLocal { .. }
             | ErasedReadTarget::FunctionParameter { .. } => Ok(BTreeMap::new()),
         }
@@ -8708,6 +8711,7 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                 | ExecutableExpressionKind::Drain { .. }
                 | ExecutableExpressionKind::MaterializationLocal { .. }
                 | ExecutableExpressionKind::FunctionParameter { .. }
+                | ExecutableExpressionKind::ElementState { .. }
         ) {
             return Err(format!(
                 "erased read {} targets non-read expression {}",
@@ -8858,6 +8862,23 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                     return Err(format!(
                         "erased read {} references missing external value {reference}",
                         read.id
+                    ));
+                }
+            }
+            ErasedReadTarget::ElementState {
+                context,
+                projection,
+            } => {
+                if !matches!(
+                    &expression.kind,
+                    ExecutableExpressionKind::ElementState {
+                        context: expression_context,
+                        projection: expression_projection,
+                    } if expression_context == context && expression_projection == projection
+                ) {
+                    return Err(format!(
+                        "erased read {} element-state target differs from expression {}",
+                        read.id, read.expression
                     ));
                 }
             }

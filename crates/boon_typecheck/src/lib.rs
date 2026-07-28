@@ -12387,10 +12387,12 @@ impl<'a> Checker<'a> {
         if trace_typecheck {
             eprintln!("boon_typecheck ensure_all_expressions:start");
         }
-        if include_type_hints {
-            for expr in &self.program.expressions {
-                self.ensure_expr(expr.id);
-            }
+        // Runtime compilation omits editor-only type hints, but it still
+        // produces a complete CheckedProgram. Every parser expression must
+        // therefore enter the authoritative typecheck before lowering
+        // metadata records checked-expression coverage.
+        for expr in &self.program.expressions {
+            self.ensure_expr(expr.id);
         }
         let ensure_all_expressions_ms = typecheck_elapsed_ms(ensure_all_expressions_started);
         trace_phase("ensure_all_expressions", ensure_all_expressions_ms);

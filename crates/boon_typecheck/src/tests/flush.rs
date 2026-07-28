@@ -94,6 +94,36 @@ fn boundary_union_unification_selects_the_compatible_structural_arm() {
 }
 
 #[test]
+fn resolved_structural_assignability_preserves_authority_and_narrowing() {
+    let truth = Type::VariantSet(vec![
+        Variant::Tag("False".to_owned()),
+        Variant::Tag("True".to_owned()),
+    ]);
+    let false_only = closed_tag("False");
+    let authority = closed_record([
+        ("completed", truth.clone()),
+        ("title", Type::Text),
+    ]);
+    let narrower = Type::Object(ObjectShape::from_ordered_fields(
+        [
+            ("completed".to_owned(), false_only.clone()),
+            ("title".to_owned(), Type::Text),
+            ("extra".to_owned(), Type::Number),
+        ],
+        false,
+    ));
+
+    assert!(resolved_type_is_assignable_to(&false_only, &truth));
+    assert!(!resolved_type_is_assignable_to(&truth, &false_only));
+    assert!(resolved_type_is_assignable_to(&narrower, &authority));
+    assert!(!resolved_type_is_assignable_to(&authority, &narrower));
+    assert!(!resolved_type_is_assignable_to(
+        &Type::Object(ObjectShape::from_ordered_fields([], true)),
+        &authority,
+    ));
+}
+
+#[test]
 fn named_flush_boundary_reports_the_exposed_payload_union() {
     let parsed = boon_parser::parse_source(
         "named-flush-boundary.bn",

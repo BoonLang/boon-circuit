@@ -784,19 +784,18 @@ fn append_list_authority_fields(
         {
             let mutation_value = mutation_value_types.get(&(list.id, path.clone()));
             if let Some(exact) = mutation_value {
-                if data_type != *exact
-                    && !matches!(
-                        data_type,
-                        Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_)
-                    )
-                {
+                if matches!(
+                    data_type,
+                    Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_)
+                ) {
+                    data_type = exact.clone();
+                } else if !boon_typecheck::resolved_type_is_assignable_to(exact, &data_type) {
                     return Err(SemanticScopeStorageError::new(format!(
                         "list {} mutation value field `{}` has type {exact:?}, but its authority schema has type {data_type:?}",
                         list.id,
                         path.join(".")
                     )));
                 }
-                data_type = exact.clone();
                 matched_mutation_values.insert((list.id, path.clone()));
             }
             let name = path.last().cloned().ok_or_else(|| {

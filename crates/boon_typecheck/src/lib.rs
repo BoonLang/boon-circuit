@@ -21009,6 +21009,100 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
     }
 }
 
+/// Returns whether one fully resolved checked type is a structural refinement
+/// of another.
+///
+/// This is the strict cross-artifact relation used after inference. Unlike the
+/// inference-time assignability helper, it does not treat unknown variables,
+/// unresolved shapes, or open-object placeholders as compatible with arbitrary
+/// concrete types. Extra object fields and narrower closed variant sets remain
+/// valid refinements.
+pub fn resolved_type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
+    if actual == expected {
+        return true;
+    }
+    match (actual, expected) {
+        (Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }, _)
+        | (_, Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }) => false,
+        (Type::Union(actual), _) if actual.is_empty() => false,
+        (_, Type::Union(expected)) if expected.is_empty() => false,
+        (Type::Union(actual), Type::Union(expected)) => actual.iter().all(|actual| {
+            expected
+                .iter()
+                .any(|expected| resolved_type_is_assignable_to(actual, expected))
+        }),
+        (Type::Union(actual), expected) => actual
+            .iter()
+            .all(|actual| resolved_type_is_assignable_to(actual, expected)),
+        (actual, Type::Union(expected)) => expected
+            .iter()
+            .any(|expected| resolved_type_is_assignable_to(actual, expected)),
+        (Type::Text, Type::Text)
+        | (Type::Number, Type::Number)
+        | (Type::Absent, Type::Absent)
+        | (Type::RenderContract, Type::RenderContract) => true,
+        (Type::Bytes(actual), Type::Bytes(expected)) => bytes_type_assignable(actual, expected),
+        (actual, Type::RenderContract) => is_renderable_type(actual),
+        (Type::List(actual), Type::List(expected)) => {
+            resolved_type_is_assignable_to(actual, expected)
+        }
+        (Type::Object(actual), Type::Object(expected)) => {
+            expected.fields.iter().all(|(field, expected_field)| {
+                actual.fields.get(field).is_some_and(|actual_field| {
+                    resolved_type_is_assignable_to(actual_field, expected_field)
+                })
+            })
+        }
+        (Type::VariantSet(actual), Type::VariantSet(expected)) => actual.iter().all(|actual| {
+            expected
+                .iter()
+                .any(|expected| resolved_variant_is_assignable_to(actual, expected))
+        }),
+        (
+            Type::Function {
+                args: actual_args,
+                result: actual_result,
+            },
+            Type::Function {
+                args: expected_args,
+                result: expected_result,
+            },
+        ) => {
+            actual_args.len() == expected_args.len()
+                && actual_result.mode == expected_result.mode
+                && expected_args
+                    .iter()
+                    .zip(actual_args)
+                    .all(|(expected, actual)| resolved_type_is_assignable_to(expected, actual))
+                && resolved_type_is_assignable_to(&actual_result.ty, &expected_result.ty)
+        }
+        _ => false,
+    }
+}
+
+fn resolved_variant_is_assignable_to(actual: &Variant, expected: &Variant) -> bool {
+    match (actual, expected) {
+        (Variant::Tag(actual), Variant::Tag(expected)) => actual == expected,
+        (
+            Variant::Tagged {
+                tag: actual_tag,
+                fields: actual_fields,
+            },
+            Variant::Tagged {
+                tag: expected_tag,
+                fields: expected_fields,
+            },
+        ) => {
+            actual_tag == expected_tag
+                && resolved_type_is_assignable_to(
+                    &Type::Object(actual_fields.clone()),
+                    &Type::Object(expected_fields.clone()),
+                )
+        }
+        _ => false,
+    }
+}
+
 fn bytes_type_assignable(actual: &BytesType, expected: &BytesType) -> bool {
     match (actual, expected) {
         (_, BytesType::Dynamic) => true,

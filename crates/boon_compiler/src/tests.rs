@@ -2,8 +2,8 @@ use super::*;
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleUnit};
 use boon_plan::{
     DistributedRouteScopePlan, HostPortPlan, ListInitializerKind, PlanInfixOp,
-    PlanListAccessSelection, PlanListProjection, PlanListRowFieldRole, PlanRowBuiltin,
-    SourcePayloadField, distributed_graph_schema_hash,
+    PlanListAccessSelection, PlanListMutation, PlanListProjection, PlanListRowFieldRole,
+    PlanRowBuiltin, SourcePayloadField, distributed_graph_schema_hash,
 };
 use std::collections::BTreeSet;
 
@@ -51,6 +51,139 @@ fn source_compilation_is_bound_to_semantic_and_verification_manifests() {
     assert!(verification.as_bytes().iter().any(|byte| *byte != 0));
     assert_eq!(second.ir.semantic_program_digest(), semantic);
     assert_eq!(second.ir.verification_manifest_digest(), verification);
+}
+
+#[test]
+fn nested_row_fields_with_repeated_leaf_names_keep_distinct_authorities() {
+    let parsed = parse_source(
+        "nested-row-authority-fields.bn",
+        r#"
+store: [
+    rows:
+        LIST {
+            [
+                left: [value: 1]
+                right: [value: TEXT { distinct }]
+            ]
+        }
+]
+
+document: Document/new(
+    root: Element/text(element: [], text: TEXT { ready })
+)
+"#,
+    )
+    .unwrap();
+    let checked = boon_typecheck::check_program(&parsed);
+    assert!(!checked.report.has_errors(), "{:#?}", checked.report);
+    let ir = verify_and_lower_checked(checked.program.unwrap(), &[]).unwrap();
+    let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault)
+        .expect("nested structural fields are keyed by authority path, not leaf spelling");
+    let list = plan
+        .storage_layout
+        .list_slots
+        .first()
+        .expect("nested row list slot");
+    assert!(
+        list.row_fields.iter().any(|field| field.name == "left"),
+        "{:#?}",
+        list.row_fields
+    );
+    assert!(
+        list.row_fields.iter().any(|field| field.name == "right"),
+        "{:#?}",
+        list.row_fields
+    );
+}
+
+#[test]
+fn appended_refinement_and_indexed_state_keep_distinct_persistence_leaves() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "indexed-append-authority.bn",
+        r#"
+store: [
+    append: SOURCE
+    rows:
+        LIST {
+            [title: TEXT { first }, completed: False]
+            [title: TEXT { second }, completed: True]
+        }
+        |> List/append(item:
+            append |> THEN {
+                [title: TEXT { third }, completed: False]
+            }
+        )
+        |> List/map(item, new: stateful_row(row: item))
+]
+
+FUNCTION stateful_row(row) {
+    [
+        sources: [toggle: SOURCE]
+        title: row.title
+        completed:
+            row.completed |> HOLD completed {
+                sources.toggle |> THEN { completed |> Bool/not() }
+            }
+    ]
+}
+
+document: Document/new(
+    root: Element/text(element: [], text: TEXT { ready })
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("indexed state and its list-input authority have distinct stable leaves");
+    let verification = boon_plan::verify_plan(&compiled.plan).unwrap();
+    assert_eq!(verification.status, "pass", "{:#?}", verification.checks);
+    let persistent = compiled
+        .plan
+        .persistence
+        .lists
+        .iter()
+        .find(|list| list.semantic_path == "store.rows")
+        .expect("persistent rows authority");
+    let paths = persistent
+        .row_fields
+        .iter()
+        .map(|field| field.semantic_path.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(paths.contains("store.rows.completed"), "{paths:#?}");
+    assert!(
+        paths.contains("store.rows.@authority:completed"),
+        "{paths:#?}"
+    );
+    let stable_fields = persistent
+        .row_fields
+        .iter()
+        .filter_map(|field| field.runtime_field_id)
+        .collect::<BTreeSet<_>>();
+    let append = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::ListMutation {
+                mutation: PlanListMutation::Append(append),
+            } => Some(append),
+            _ => None,
+        })
+        .expect("append operation");
+    assert_eq!(
+        append
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["completed", "title"])
+    );
+    assert!(
+        append
+            .fields
+            .iter()
+            .all(|field| stable_fields.contains(&field.field_id))
+    );
 }
 
 #[test]

@@ -3825,10 +3825,12 @@ fn unify_out_contract_type(
     match (pattern, actual) {
         (boon_typecheck::Type::Var(variable), actual) => match substitutions.get(variable) {
             Some(existing) if out_contract_type_is_resolved(existing) && existing != actual => {
-                return Err(SemanticError::new(format!(
-                    "OUT type variable {:?} has conflicting concrete types {existing:?} and {actual:?}",
-                    variable
-                )));
+                if !boon_typecheck::resolved_type_is_assignable_to(actual, existing) {
+                    return Err(SemanticError::new(format!(
+                        "OUT type variable {:?} has conflicting concrete types {existing:?} and {actual:?}",
+                        variable
+                    )));
+                }
             }
             _ => {
                 substitutions.insert(*variable, actual.clone());
@@ -5760,6 +5762,67 @@ FUNCTION decorate(segment, signal) {
                 .ports
                 .iter()
                 .all(|port| out_contract_type_is_resolved(&port.contract.resolved_type))
+        );
+    }
+
+    #[test]
+    fn generic_out_substitution_accepts_a_narrower_appended_item() {
+        let parsed = boon_parser::parse_source(
+            "semantic-generic-variant-refinement.bn",
+            r#"
+store: [
+    rows:
+        LIST {
+            [title: TEXT { first }, completed: False]
+            [title: TEXT { second }, completed: True]
+        }
+        |> List/append(item:
+            [title: TEXT { third }, completed: False]
+        )
+        |> List/map(item, new: item)
+]
+"#,
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "generic variant refinement fixture must typecheck: {:#?}",
+            checked.report.diagnostics
+        );
+        let semantic = elaborate(
+            checked
+                .program
+                .expect("generic variant refinement fixture has a checked program"),
+            &[],
+        )
+        .expect("a singleton variant item must refine its list authority type");
+        assert!(
+            semantic
+                .resolved_out_graph()
+                .ports
+                .iter()
+                .all(|port| out_contract_type_is_resolved(&port.contract.resolved_type))
+        );
+        let completed_authority = semantic
+            .scope_storage_graph()
+            .fields
+            .iter()
+            .find(|field| {
+                matches!(
+                    &field.origin,
+                    SemanticStorageFieldOriginV1::ListAuthority { item_path, .. }
+                        if item_path == &["completed".to_owned()]
+                )
+            })
+            .expect("completed list authority field");
+        assert_eq!(
+            completed_authority.flow_type.ty,
+            Type::VariantSet(vec![
+                boon_typecheck::Variant::Tag("False".to_owned()),
+                boon_typecheck::Variant::Tag("True".to_owned()),
+            ]),
+            "the storage schema must retain the full authority type"
         );
     }
 

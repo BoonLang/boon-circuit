@@ -2184,6 +2184,16 @@ fn semantic_list_memory_plan(
             )
         })
         .collect::<Vec<_>>();
+    let indexed_runtime_fields = indexed_memory
+        .iter()
+        .filter_map(|memory| match memory.runtime_backing {
+            ir::SemanticMemoryRuntimeBacking::IndexedState {
+                field_id: Some(field_id),
+                ..
+            } => Some(plan_field_id(field_id)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let has_indexed_memory = !indexed_memory.is_empty();
     let semantic_list_type = semantic_data_type_plan(&memory.data_type).canonicalized();
     let DataTypePlan::List { item } = semantic_list_type.clone() else {
@@ -2196,7 +2206,16 @@ fn semantic_list_memory_plan(
         DataTypePlan::Record { fields, .. } => fields,
         _ => Vec::new(),
     };
-    let authority_field_types = list_authority_field_types(program, list)?;
+    let authority_fields = program
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.row.map(|row| row.list) == Some(list.id)
+                && field.role.is_authority()
+                && slot.contains_row_field(plan_field_id(field.id))
+        })
+        .collect::<Vec<_>>();
     let mut row_fields = Vec::new();
     if !has_indexed_memory {
         for field in &semantic_row_fields {
@@ -2213,62 +2232,48 @@ fn semantic_list_memory_plan(
                 field.data_type.clone(),
             )?);
         }
-        for ((_, field_name), runtime_field_id) in
-            authority_field_ids
-                .iter()
-                .filter(|((list_name, _), field_id)| {
-                    list_name == &list.name && slot.contains_row_field(**field_id)
-                })
-        {
+        for field in &authority_fields {
+            let runtime_field_id = plan_field_id(field.id);
             if row_fields
                 .iter()
-                .any(|field| field.runtime_field_id == Some(*runtime_field_id))
+                .any(|field| field.runtime_field_id == Some(runtime_field_id))
             {
                 continue;
             }
-            let field_type = semantic_row_fields
-                .iter()
-                .find(|field| field.name == *field_name)
-                .map(|field| field.data_type.clone())
-                .or_else(|| list_initializer_field_type(list, field_name))
-                .or_else(|| authority_field_types.get(field_name).cloned())
-                .ok_or_else(|| {
+            let field_type =
+                data_type_plan_from_typecheck_type(&field.flow_type.ty).ok_or_else(|| {
                     PlanError::new(format!(
-                        "authoritative constructor field `{}.{field_name}` has no canonical row type",
-                        list.name
+                        "authoritative field `{}` has no canonical checked type",
+                        field.diagnostic_path
                     ))
                 })?;
             row_fields.push(MemoryLeafPlan::new(
                 memory_id,
-                Some(*runtime_field_id),
-                format!("{}.{}", memory.identity.semantic_path, field_name),
+                Some(runtime_field_id),
+                field.diagnostic_path.clone(),
                 field_type,
             )?);
         }
     } else {
-        for ((_, field_name), runtime_field_id) in
-            authority_field_ids
-                .iter()
-                .filter(|((list_name, _), field_id)| {
-                    list_name == &list.name && slot.contains_row_field(**field_id)
-                })
+        for field in authority_fields
+            .iter()
+            .filter(|field| !indexed_runtime_fields.contains(&plan_field_id(field.id)))
         {
-            let field_type = semantic_row_fields
-                .iter()
-                .find(|field| field.name == *field_name)
-                .map(|field| field.data_type.clone())
-                .or_else(|| list_initializer_field_type(list, field_name))
-                .or_else(|| authority_field_types.get(field_name).cloned())
-                .ok_or_else(|| {
+            let runtime_field_id = plan_field_id(field.id);
+            let field_type =
+                data_type_plan_from_typecheck_type(&field.flow_type.ty).ok_or_else(|| {
                     PlanError::new(format!(
-                        "authoritative constructor field `{}.{field_name}` has no canonical row type",
-                        list.name
+                        "authoritative field `{}` has no canonical checked type",
+                        field.diagnostic_path
                     ))
                 })?;
             row_fields.push(MemoryLeafPlan::new(
                 memory_id,
-                Some(*runtime_field_id),
-                format!("{}.@authority:{field_name}", memory.identity.semantic_path),
+                Some(runtime_field_id),
+                list_authority_persistence_path(
+                    &memory.identity.semantic_path,
+                    &field.diagnostic_path,
+                ),
                 field_type,
             )?);
         }
@@ -2313,6 +2318,17 @@ fn semantic_list_memory_plan(
             memory.identity.semantic_path
         )));
     }
+    let mut persistence_paths = BTreeMap::new();
+    for field in &row_fields {
+        if let Some(previous) =
+            persistence_paths.insert(field.semantic_path.clone(), field.runtime_field_id)
+        {
+            return Err(PlanError::new(format!(
+                "semantic list `{}` maps persistence path `{}` to both {previous:?} and {:?}",
+                memory.identity.semantic_path, field.semantic_path, field.runtime_field_id
+            )));
+        }
+    }
     row_fields.sort_by_key(|field| field.leaf_id);
     let row_type = DataTypePlan::Record {
         fields: row_fields
@@ -2345,75 +2361,6 @@ fn semantic_list_memory_plan(
         list.has_generation,
         row_fields,
     )
-}
-
-fn data_type_plan_from_initial_value(value: &InitialValue) -> Option<DataTypePlan> {
-    Some(match value {
-        InitialValue::Text { .. } => DataTypePlan::Text,
-        InitialValue::Number { .. } => DataTypePlan::Number,
-        InitialValue::Bytes { fixed_len, .. } => DataTypePlan::Bytes {
-            fixed_len: fixed_len.map(|len| len as u64),
-        },
-        InitialValue::Tag { name } => DataTypePlan::Variant {
-            variants: vec![DataVariantPlan {
-                tag: name.clone(),
-                fields: Vec::new(),
-                open: false,
-            }],
-        },
-        InitialValue::Data { value } => data_type_plan_from_data(value),
-        InitialValue::RootInitialField { .. }
-        | InitialValue::RowInitialField { .. }
-        | InitialValue::Unknown { .. } => return None,
-    })
-}
-
-fn list_initializer_field_type(
-    list: &boon_ir::ListMemory,
-    field_name: &str,
-) -> Option<DataTypePlan> {
-    match &list.initializer {
-        ListInitializer::Range { .. } if matches!(field_name, "index" | "value") => {
-            Some(DataTypePlan::Number)
-        }
-        ListInitializer::RecordLiteral { rows } => rows
-            .iter()
-            .flat_map(|row| &row.fields)
-            .find(|field| field.name == field_name)
-            .and_then(|field| data_type_plan_from_initial_value(&field.value)),
-        ListInitializer::Empty
-        | ListInitializer::Unknown { .. }
-        | ListInitializer::Range { .. } => None,
-    }
-}
-
-fn list_authority_field_types(
-    program: &ErasedProgram,
-    list: &boon_ir::ListMemory,
-) -> Result<BTreeMap<String, DataTypePlan>, PlanError> {
-    let mut field_types = BTreeMap::new();
-    for field in
-        program.scope_index.fields.iter().filter(|field| {
-            field.row.map(|row| row.list) == Some(list.id) && field.role.is_authority()
-        })
-    {
-        let data_type =
-            data_type_plan_from_typecheck_type(&field.flow_type.ty).ok_or_else(|| {
-                PlanError::new(format!(
-                    "authoritative field `{}.{}` has no canonical checked type",
-                    list.name, field.name
-                ))
-            })?;
-        if let Some(previous) = field_types.insert(field.name.clone(), data_type.clone())
-            && previous != data_type
-        {
-            return Err(PlanError::new(format!(
-                "authoritative field `{}.{}` has conflicting checked types",
-                list.name, field.name
-            )));
-        }
-    }
-    Ok(field_types)
 }
 
 fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataTypePlan> {
@@ -2484,6 +2431,28 @@ fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataT
         }
         .canonicalized(),
     )
+}
+
+fn append_item_field_names(ty: &boon_typecheck::Type) -> Vec<String> {
+    let boon_typecheck::Type::Object(shape) = ty else {
+        return vec!["value".to_owned()];
+    };
+    let mut names = Vec::new();
+    let mut seen = BTreeSet::new();
+    for name in shape.field_order.iter().chain(shape.fields.keys()) {
+        if shape.fields.contains_key(name) && seen.insert(name.as_str()) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+fn list_authority_persistence_path(list_path: &str, field_path: &str) -> String {
+    let relative = field_path
+        .strip_prefix(list_path)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .unwrap_or(field_path);
+    format!("{list_path}.@authority:{}", relative.replace('.', "/"))
 }
 
 fn plan_value_type_for_value_ref(
@@ -4537,6 +4506,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
             let output = Some(ValueRef::List(plan_list_id(list_mutation.list_id)));
             let mutation = match &list_mutation.kind {
                 ListMutationKind::Append { gate, item } => {
+                    let append_item_expression = *item;
                     let gate = ExecutableRowLowerer::new(
                         program,
                         &index,
@@ -4569,19 +4539,46 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                         ))
                     })?;
                     let source_list = item_lowerer.direct_row_source(item)?;
-                    let fields = program
-                        .scope_index
-                        .fields
+                    let target_list = program
+                        .lists
                         .iter()
-                        .filter(|field| {
-                            field.row.map(|row| row.list) == Some(list_mutation.list_id)
-                                && field.role.is_authority()
+                        .find(|list| list.id == list_mutation.list_id)
+                        .ok_or_else(|| {
+                            PlanError::new(format!(
+                                "list append references missing list {}",
+                                list_mutation.list_id
+                            ))
+                        })?;
+                    let append_item_type = program
+                        .executable
+                        .expressions
+                        .get(append_item_expression.as_usize())
+                        .filter(|expression| expression.id == append_item_expression)
+                        .map(|expression| &expression.flow_type.ty)
+                        .ok_or_else(|| {
+                            PlanError::new(format!(
+                                "list {} append references missing item expression {}",
+                                list_mutation.list_id, append_item_expression.0
+                            ))
+                        })?;
+                    let fields = append_item_field_names(append_item_type)
+                        .into_iter()
+                        .map(|name| {
+                            let field_id = storage_input_field_id(
+                                program,
+                                &target_list.name,
+                                &name,
+                                &authority_field_ids,
+                            )
+                            .ok_or_else(|| {
+                                PlanError::new(format!(
+                                    "list {} append item field `{name}` has no exact authority identity",
+                                    list_mutation.list_id
+                                ))
+                            })?;
+                            Ok(PlanListAppendField { name, field_id })
                         })
-                        .map(|field| PlanListAppendField {
-                            name: field.name.clone(),
-                            field_id: plan_field_id(field.id),
-                        })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>, PlanError>>()?;
                     let row_field_copies = source_list
                         .into_iter()
                         .flat_map(|source_list| {
@@ -6321,46 +6318,6 @@ fn plan_value_type_is_concrete(value_type: PlanValueType) -> bool {
     )
 }
 
-fn data_type_plan_from_data(value: &boon_data::Value) -> DataTypePlan {
-    match value {
-        boon_data::Value::Number(_) => DataTypePlan::Number,
-        boon_data::Value::Text(_) => DataTypePlan::Text,
-        boon_data::Value::Bytes(_) => DataTypePlan::Bytes { fixed_len: None },
-        boon_data::Value::List(values) => {
-            let item = values
-                .first()
-                .map(data_type_plan_from_data)
-                .unwrap_or(DataTypePlan::Unknown);
-            DataTypePlan::List {
-                item: Box::new(item),
-            }
-        }
-        boon_data::Value::Object(fields) => DataTypePlan::Record {
-            fields: fields
-                .iter()
-                .map(|(name, value)| DataTypeFieldPlan {
-                    name: name.clone(),
-                    data_type: data_type_plan_from_data(value),
-                })
-                .collect(),
-            open: false,
-        },
-        boon_data::Value::Tag { tag, fields } => DataTypePlan::Variant {
-            variants: vec![DataVariantPlan {
-                tag: tag.clone(),
-                fields: fields
-                    .iter()
-                    .map(|(name, value)| DataTypeFieldPlan {
-                        name: name.clone(),
-                        data_type: data_type_plan_from_data(value),
-                    })
-                    .collect(),
-                open: false,
-            }],
-        },
-    }
-}
-
 fn derived_value_output_type(
     program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
@@ -6736,12 +6693,42 @@ fn row_field_id_for_list_field(
         .scope_index
         .fields
         .iter()
-        .find(|field| {
+        .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| row.list) == Some(list)
                 && field.name == field_name
         })
+        .min_by_key(|field| (erased_row_field_depth(program, field), field.id))
         .map(|field| plan_field_id(field.id))
+}
+
+fn erased_row_field_depth(program: &ErasedProgram, field: &ir::ErasedFieldDef) -> usize {
+    let Some(row) = field.row else {
+        return usize::MAX;
+    };
+    let mut depth = 0usize;
+    let mut parent = field.parent;
+    let mut remaining = program.scope_index.fields.len().saturating_add(1);
+    while let Some(parent_id) = parent {
+        if remaining == 0 {
+            return usize::MAX;
+        }
+        remaining -= 1;
+        let Some(parent_field) = program
+            .scope_index
+            .fields
+            .get(parent_id.as_usize())
+            .filter(|candidate| candidate.id == parent_id)
+        else {
+            return usize::MAX;
+        };
+        if parent_field.row != Some(row) {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        parent = parent_field.parent;
+    }
+    depth
 }
 
 fn erased_field_is_runtime_row_storage(
@@ -6820,22 +6807,51 @@ fn list_row_fields(program: &ErasedProgram, list: &boon_ir::ListMemory) -> Vec<P
 }
 
 fn list_authority_field_ids(program: &ErasedProgram) -> BTreeMap<(String, String), FieldId> {
-    program
+    let indexed_fields = program
+        .semantic_memory
+        .iter()
+        .filter_map(|memory| match memory.runtime_backing {
+            ir::SemanticMemoryRuntimeBacking::IndexedState {
+                field_id: Some(field_id),
+                ..
+            } => Some(plan_field_id(field_id)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut fields = BTreeMap::<(String, String), (u8, usize, FieldId)>::new();
+    for field in program
         .scope_index
         .fields
         .iter()
         .filter(|field| field.role.is_authority())
-        .filter_map(|field| {
-            let row = field.row?;
-            let list = program
-                .lists
-                .get(row.list.as_usize())
-                .filter(|list| list.id == row.list)?;
-            Some((
-                (list.name.clone(), field.name.clone()),
-                plan_field_id(field.id),
-            ))
-        })
+    {
+        let Some(row) = field.row else {
+            continue;
+        };
+        let Some(list) = program
+            .lists
+            .get(row.list.as_usize())
+            .filter(|list| list.id == row.list)
+        else {
+            continue;
+        };
+        let key = (list.name.clone(), field.name.clone());
+        let field_id = plan_field_id(field.id);
+        let candidate = (
+            u8::from(!indexed_fields.contains(&field_id)),
+            erased_row_field_depth(program, field),
+            field_id,
+        );
+        match fields.get(&key) {
+            Some(current) if *current <= candidate => {}
+            _ => {
+                fields.insert(key, candidate);
+            }
+        }
+    }
+    fields
+        .into_iter()
+        .map(|(key, (_, _, field))| (key, field))
         .collect()
 }
 

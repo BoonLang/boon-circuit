@@ -3767,6 +3767,19 @@ fn named_text_pairs_type() -> DataTypePlan {
     }
 }
 
+fn truth_data_type() -> DataTypePlan {
+    DataTypePlan::Variant {
+        variants: ["False", "True"]
+            .into_iter()
+            .map(|tag| DataVariantPlan {
+                tag: tag.to_owned(),
+                fields: Vec::new(),
+                open: false,
+            })
+            .collect(),
+    }
+}
+
 fn websocket_open_schema() -> BTreeMap<SourcePayloadField, DataTypePlan> {
     let pairs = named_text_pairs_type();
     BTreeMap::from([
@@ -3819,7 +3832,7 @@ fn websocket_message_schema() -> BTreeMap<SourcePayloadField, DataTypePlan> {
 
 fn websocket_close_schema() -> BTreeMap<SourcePayloadField, DataTypePlan> {
     BTreeMap::from([
-        (named_payload_field("clean"), DataTypePlan::Bool),
+        (named_payload_field("clean"), truth_data_type()),
         (named_payload_field("code"), DataTypePlan::Number),
         (named_payload_field("reason"), DataTypePlan::Text),
     ])
@@ -3829,7 +3842,7 @@ fn websocket_error_schema() -> BTreeMap<SourcePayloadField, DataTypePlan> {
     BTreeMap::from([
         (named_payload_field("code"), DataTypePlan::Text),
         (named_payload_field("message"), DataTypePlan::Text),
-        (named_payload_field("retryable"), DataTypePlan::Bool),
+        (named_payload_field("retryable"), truth_data_type()),
     ])
 }
 
@@ -3841,7 +3854,7 @@ fn websocket_action_type() -> DataTypePlan {
         ("bytes", DataTypePlan::Bytes { fixed_len: None }),
         ("code", DataTypePlan::Number),
         ("frame_kind", DataTypePlan::Text),
-        ("include_current", DataTypePlan::Bool),
+        ("include_current", truth_data_type()),
         ("kind", DataTypePlan::Text),
         ("reason", DataTypePlan::Text),
         ("room", DataTypePlan::Text),
@@ -4105,7 +4118,7 @@ fn websocket_message_payload(text: Option<String>, bytes: Option<Vec<u8>>) -> So
         text: Some(text),
         fields: BTreeMap::from([
             ("bytes".to_owned(), Value::Bytes(bytes.into())),
-            ("kind".to_owned(), Value::Text(kind.to_owned())),
+            ("kind".to_owned(), Value::tag(kind)),
         ]),
         ..SourcePayload::default()
     }
@@ -4119,7 +4132,7 @@ fn websocket_close_payload(close: Option<WebSocketClose>) -> Result<SourcePayloa
         .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidRequest, error))?;
     Ok(SourcePayload {
         fields: BTreeMap::from([
-            ("clean".to_owned(), Value::Bool(clean)),
+            ("clean".to_owned(), Value::truth(clean)),
             ("code".to_owned(), code),
             ("reason".to_owned(), Value::Text(reason)),
         ]),
@@ -4151,7 +4164,7 @@ fn websocket_transport_error_payload(error: WebSocketTransportError) -> SourcePa
         fields: BTreeMap::from([
             ("code".to_owned(), Value::Text(code.to_owned())),
             ("message".to_owned(), Value::Text(message.to_owned())),
-            ("retryable".to_owned(), Value::Bool(retryable)),
+            ("retryable".to_owned(), Value::truth(retryable)),
         ]),
         ..SourcePayload::default()
     }
@@ -4453,8 +4466,8 @@ fn take_action_bool(
     name: &str,
     index: usize,
 ) -> Result<bool, AdapterError> {
-    match fields.remove(name) {
-        Some(Value::Bool(value)) => Ok(value),
+    match fields.remove(name).and_then(|value| value.as_truth()) {
+        Some(value) => Ok(value),
         _ => Err(invalid_action(index, format_args!("`{name}` is not Bool"))),
     }
 }

@@ -88,10 +88,6 @@ pub const STANDARD_ROOTS: &[StandardRoot] = &[
         kind: StandardRootKind::Library,
     },
     StandardRoot {
-        name: "Error",
-        kind: StandardRootKind::Library,
-    },
-    StandardRoot {
         name: "Field",
         kind: StandardRootKind::Library,
     },
@@ -4594,8 +4590,6 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "Light/directional"
             | "Light/ambient"
             | "Light/spot"
-            | "Error/new"
-            | "Error/text"
     )
 }
 

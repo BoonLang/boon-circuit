@@ -2150,15 +2150,15 @@ fn scenario_name_matches(label: &str, expected: &str) -> bool {
 
 fn scenario_value_text(value: &Value) -> RuntimeResult<String> {
     match value {
-        Value::Null => Ok(String::new()),
-        Value::Bool(value) => Ok(if *value { "True" } else { "False" }.to_owned()),
         Value::Number(value) => Ok(value.to_string()),
         Value::Text(value) => Ok(value.clone()),
         Value::Bytes(value) => Ok(String::from_utf8(value.to_vec())?),
-        Value::Error { code } => Ok(code.clone()),
-        Value::List(_) | Value::Record(_) | Value::MappedRow { .. } | Value::Row { .. } => {
-            Err("scenario text expectation targeted a structured value".into())
-        }
+        Value::Tag { tag, fields } if fields.is_empty() => Ok(tag.clone()),
+        Value::List(_)
+        | Value::Record(_)
+        | Value::Tag { .. }
+        | Value::MappedRow { .. }
+        | Value::Row { .. } => Err("scenario text expectation targeted a structured value".into()),
         Value::HostBound { .. } => {
             Err("scenario text expectation targeted a process-local host value".into())
         }

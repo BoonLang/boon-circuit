@@ -1229,13 +1229,12 @@ fn server_context_switch_clears_absent_origin_imports_without_leakage() {
             .unwrap(),
         Value::integer(17).unwrap()
     );
-    assert!(matches!(
+    assert!(
         server
             .bind(&mut server_machine)
             .root_value_current(second, "store.mirrored_count")
-            .unwrap(),
-        Value::Error { code } if code == "remote_not_current"
-    ));
+            .is_err()
+    );
     assert_eq!(
         server
             .bind(&mut server_machine)
@@ -2047,7 +2046,7 @@ fn client_disconnect_cancels_exact_owned_effects_before_marking_stale() {
     assert_eq!(client.pending_transient_effect_count(), 0);
     assert!(
         client
-            .complete_transient_effect(invocation.call_id, Value::Null)
+            .complete_transient_effect(invocation.call_id, Value::tag("Ignored"))
             .is_err(),
         "a completion from the disconnected generation must be rejected"
     );
@@ -2199,7 +2198,7 @@ fn origin_effect_completion_routes_each_nested_invocation_once() {
         runtime
             .server
             .bind(&mut runtime.server_machine)
-            .complete_transient_effect(effect.call_id, Value::Null)
+            .complete_transient_effect(effect.call_id, Value::tag("Ignored"))
             .is_err(),
         "a completed effect cannot replay its nested Invocation"
     );

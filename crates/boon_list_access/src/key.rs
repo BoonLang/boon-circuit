@@ -3,12 +3,11 @@ use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-pub const KEY_CODEC_VERSION: u8 = 1;
+pub const KEY_CODEC_VERSION: u8 = 2;
 pub const MAX_KEY_COMPONENTS: usize = 8;
 
 const NUMBER_MARKER: u8 = 0x11;
 const TEXT_MARKER: u8 = 0x22;
-const BOOL_MARKER: u8 = 0x33;
 const CLOSED_TAG_MARKER: u8 = 0x44;
 const SIGN_BIT: u64 = 1 << 63;
 
@@ -117,7 +116,6 @@ impl ClosedTag {
 pub enum StructuralValue {
     Number(FiniteNumber),
     Text(String),
-    Bool(bool),
     ClosedTag(ClosedTag),
 }
 
@@ -134,7 +132,6 @@ impl StructuralValue {
         match self {
             Self::Number(_) => KeyKind::Number,
             Self::Text(_) => KeyKind::Text,
-            Self::Bool(_) => KeyKind::Bool,
             Self::ClosedTag(value) => KeyKind::ClosedTag(value.type_id()),
         }
     }
@@ -145,7 +142,6 @@ impl StructuralValue {
         match self {
             Self::Number(_) => 8,
             Self::Text(value) => usize_to_u64(value.len()),
-            Self::Bool(_) => 1,
             Self::ClosedTag(_) => 20,
         }
     }
@@ -155,7 +151,6 @@ impl StructuralValue {
 pub enum KeyKind {
     Number,
     Text,
-    Bool,
     ClosedTag(TagTypeId),
 }
 
@@ -385,10 +380,6 @@ fn encode_component(
             if terminate_text {
                 output.extend_from_slice(&[0, 0]);
             }
-        }
-        StructuralValue::Bool(value) => {
-            output.push(BOOL_MARKER);
-            output.push(u8::from(*value));
         }
         StructuralValue::ClosedTag(value) => {
             output.push(CLOSED_TAG_MARKER);

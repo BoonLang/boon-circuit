@@ -260,7 +260,7 @@ pub fn effect_cancellation_rejects_late_publication() -> Result<(), String> {
         return Err("current effect could not be cancelled".to_owned());
     }
     if machine
-        .complete_transient_effect(call_id, Value::Null)
+        .complete_transient_effect(call_id, Value::tag("Ignored"))
         .is_ok()
     {
         return Err("late completion published after cancellation".to_owned());

@@ -11,12 +11,12 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 
-const TOKEN_VERSION: u8 = 5;
+const TOKEN_VERSION: u8 = 6;
 const PAYLOAD_MAGIC: &[u8; 4] = b"BPGC";
 const NONCE_BYTES: usize = 12;
 const AEAD_TAG_BYTES: usize = 16;
 const MAX_CURSOR_BYTES: usize = 4_096;
-const TOKEN_AAD: &[u8] = b"boon.page-cursor.token.v5\0";
+const TOKEN_AAD: &[u8] = b"boon.page-cursor.token.v6\0";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct CursorSealingKey([u8; 32]);
@@ -289,12 +289,8 @@ fn encode_semantic_key(output: &mut Vec<u8>, key: &StructuralKey) -> Result<(), 
                 output.extend_from_slice(&length.to_be_bytes());
                 output.extend_from_slice(value.as_bytes());
             }
-            StructuralValue::Bool(value) => {
-                output.push(2);
-                output.push(u8::from(*value));
-            }
             StructuralValue::ClosedTag(value) => {
-                output.push(3);
+                output.push(2);
                 output.extend_from_slice(value.type_id().as_bytes());
                 output.extend_from_slice(&value.ordinal().to_be_bytes());
             }
@@ -321,12 +317,7 @@ fn decode_semantic_key(reader: &mut Reader<'_>) -> Result<StructuralKey, CursorE
                     std::str::from_utf8(reader.take(length)?).map_err(|_| CursorError::Invalid)?;
                 StructuralValue::text(value)
             }
-            2 => match reader.u8()? {
-                0 => StructuralValue::Bool(false),
-                1 => StructuralValue::Bool(true),
-                _ => return Err(CursorError::Invalid),
-            },
-            3 => StructuralValue::ClosedTag(ClosedTag::new(
+            2 => StructuralValue::ClosedTag(ClosedTag::new(
                 TagTypeId::from_bytes(reader.array()?),
                 reader.u32()?,
             )),
@@ -343,22 +334,24 @@ fn hash_value(
     identities: &impl CursorIdentityResolver,
 ) -> Result<(), CursorError> {
     match value {
-        Value::Null => hasher.update([0]),
-        Value::Bool(value) => hasher.update([1, u8::from(*value)]),
         Value::Number(value) => {
-            hasher.update([2]);
+            hasher.update([0]);
             hasher.update(value.get().to_bits().to_be_bytes());
         }
-        Value::Text(value) => hash_bytes(hasher, 3, value.as_bytes()),
-        Value::Bytes(value) => hash_bytes(hasher, 4, value),
+        Value::Text(value) => hash_bytes(hasher, 1, value.as_bytes()),
+        Value::Bytes(value) => hash_bytes(hasher, 2, value),
         Value::List(values) => {
-            hasher.update([5]);
+            hasher.update([3]);
             hasher.update((values.len() as u64).to_be_bytes());
             for value in values {
                 hash_value(hasher, value, identities)?;
             }
         }
-        Value::Record(fields) => hash_record(hasher, 6, fields, identities)?,
+        Value::Record(fields) => hash_record(hasher, 4, fields, identities)?,
+        Value::Tag { tag, fields } => {
+            hash_bytes(hasher, 5, tag.as_bytes());
+            hash_record(hasher, 6, fields, identities)?;
+        }
         Value::MappedRow { id, fields } => {
             hasher.update([7]);
             hash_semantic_row_id(
@@ -399,9 +392,8 @@ fn hash_value(
                 hash_value(hasher, value, identities)?;
             }
         }
-        Value::Error { code } => hash_bytes(hasher, 10, code.as_bytes()),
         Value::HostBound { visible, .. } => {
-            hasher.update([11]);
+            hasher.update([10]);
             hash_value(hasher, visible, identities)?;
         }
     }
@@ -417,7 +409,7 @@ fn hash_record(
     hasher.update([marker]);
     hasher.update((fields.len() as u64).to_be_bytes());
     for (name, value) in fields {
-        hash_bytes(hasher, 12, name.as_bytes());
+        hash_bytes(hasher, 11, name.as_bytes());
         hash_value(hasher, value, identities)?;
     }
     Ok(())
@@ -496,7 +488,7 @@ mod tests {
             row_id: RowId::from_u128(0x5152_5354_5556_5758_6162_6364_6566_6768),
         };
         let mut expected = b"BPGC".to_vec();
-        expected.push(5);
+        expected.push(6);
         expected.extend_from_slice(&[0x11; 32]);
         expected.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes());
         expected.extend_from_slice(&[0x22; 32]);
@@ -520,7 +512,7 @@ mod tests {
             semantic_key: StructuralKey::new(vec![
                 StructuralValue::text("secret-key"),
                 StructuralValue::number(42.5).unwrap(),
-                StructuralValue::Bool(true),
+                StructuralValue::ClosedTag(ClosedTag::new(TagTypeId::from_u128(7), 1)),
                 StructuralValue::ClosedTag(ClosedTag::new(TagTypeId::from_u128(8), 3)),
             ])
             .unwrap(),
@@ -623,7 +615,7 @@ mod tests {
             None,
             None,
             &[first_row],
-            &Value::Null,
+            &Value::tag("Capture"),
             [&first_capture],
             &first,
         )
@@ -633,7 +625,7 @@ mod tests {
             None,
             None,
             &[shifted_row],
-            &Value::Null,
+            &Value::tag("Capture"),
             [&shifted_capture],
             &shifted,
         )
@@ -655,7 +647,7 @@ mod tests {
                 None,
                 None,
                 &[shifted_row],
-                &Value::Null,
+                &Value::tag("Capture"),
                 [&shifted_capture],
                 &changed,
             )

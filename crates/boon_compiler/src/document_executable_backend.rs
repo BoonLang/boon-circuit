@@ -1577,7 +1577,7 @@ impl<'a> DocumentCompiler<'a> {
             ));
         }
         let name = self.intern_name(value);
-        Ok(self.constant_expr(compiler_id, DocumentConstantValue::Enum { name }))
+        Ok(self.constant_expr(compiler_id, DocumentConstantValue::Tag { name }))
     }
 
     fn compile_erased_read(
@@ -2426,8 +2426,6 @@ fn document_builtin(function: &str) -> Option<DocumentBuiltin> {
         "Bytes/starts_with" => DocumentBuiltin::BytesStartsWith,
         "Bytes/to_text" => DocumentBuiltin::BytesToText,
         "Directory/entries" => DocumentBuiltin::DirectoryEntries,
-        "Error/new" => DocumentBuiltin::ErrorNew,
-        "Error/text" => DocumentBuiltin::ErrorText,
         "Light/ambient" => DocumentBuiltin::LightAmbient,
         "Light/directional" => DocumentBuiltin::LightDirectional,
         "Light/spot" => DocumentBuiltin::LightSpot,

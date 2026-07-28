@@ -1447,15 +1447,11 @@ fn plan_value_type_from_semantic_data_type(data_type: &DataTypePlan) -> PlanValu
     match data_type {
         DataTypePlan::Text => PlanValueType::Text,
         DataTypePlan::Number => PlanValueType::Number,
-        DataTypePlan::Bool => PlanValueType::Bool,
         DataTypePlan::Bytes { fixed_len } => PlanValueType::Bytes {
             fixed_len: *fixed_len,
         },
-        DataTypePlan::Variant { .. } => PlanValueType::Enum,
-        DataTypePlan::Null
-        | DataTypePlan::Record { .. }
-        | DataTypePlan::List { .. }
-        | DataTypePlan::Error { .. } => PlanValueType::Data,
+        DataTypePlan::Variant { .. } => PlanValueType::Tag,
+        DataTypePlan::Record { .. } | DataTypePlan::List { .. } => PlanValueType::Data,
         DataTypePlan::Unknown => PlanValueType::Unknown,
     }
 }
@@ -1468,7 +1464,6 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
         DataTypePlan::Number => Some(PlanConstantValue::Number {
             value: FiniteReal::ZERO,
         }),
-        DataTypePlan::Bool => Some(PlanConstantValue::Bool { value: false }),
         DataTypePlan::Bytes {
             fixed_len: None | Some(0),
         } => {
@@ -1481,16 +1476,11 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
             })
         }
         DataTypePlan::Variant { variants } => {
-            variants.first().map(|variant| PlanConstantValue::Enum {
-                value: variant.tag.clone(),
+            variants.first().map(|variant| PlanConstantValue::Tag {
+                name: variant.tag.clone(),
             })
         }
-        DataTypePlan::Null => Some(PlanConstantValue::Data {
-            value: boon_data::Value::tag("Null"),
-        }),
-        DataTypePlan::Record { .. } | DataTypePlan::List { .. } | DataTypePlan::Error { .. } => {
-            None
-        }
+        DataTypePlan::Record { .. } | DataTypePlan::List { .. } => None,
         DataTypePlan::Bytes { fixed_len: Some(_) } | DataTypePlan::Unknown => None,
     }
 }
@@ -1809,7 +1799,6 @@ fn plan_row_expression_static_data(
             match &constant.value {
                 PlanConstantValue::Text { value } => Some(boon_data::Value::Text(value.clone())),
                 PlanConstantValue::Number { value } => Some(boon_data::Value::Number(*value)),
-                PlanConstantValue::Bool { value } => Some(boon_data::Value::truth(*value)),
                 PlanConstantValue::Bytes {
                     inline_bytes: Some(bytes),
                     ..
@@ -1817,7 +1806,7 @@ fn plan_row_expression_static_data(
                 PlanConstantValue::Bytes {
                     inline_bytes: None, ..
                 } => None,
-                PlanConstantValue::Enum { value } => Some(boon_data::Value::tag(value)),
+                PlanConstantValue::Tag { name } => Some(boon_data::Value::tag(name)),
                 PlanConstantValue::Data { value } => Some(value.clone()),
             }
         }
@@ -1908,8 +1897,6 @@ fn state_only_authority_map_is_noop(
 
 fn semantic_data_type_plan(value: &ir::SemanticDataType) -> DataTypePlan {
     match value {
-        ir::SemanticDataType::Null => DataTypePlan::Null,
-        ir::SemanticDataType::Bool => DataTypePlan::Bool,
         ir::SemanticDataType::Number => DataTypePlan::Number,
         ir::SemanticDataType::Text => DataTypePlan::Text,
         ir::SemanticDataType::Bytes { fixed_len } => DataTypePlan::Bytes {
@@ -2423,11 +2410,6 @@ fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataT
             Type::Bytes(BytesType::Fixed(len)) => DataTypePlan::Bytes {
                 fixed_len: Some((*len).try_into().ok()?),
             },
-            Type::VariantSet(variants)
-                if boon_typecheck::variants_use_boolean_runtime_representation(variants) =>
-            {
-                DataTypePlan::Bool
-            }
             Type::VariantSet(variants) => DataTypePlan::Variant {
                 variants: variants
                     .iter()
@@ -2503,7 +2485,7 @@ fn plan_value_type_for_value_ref(
         } => plan_value_type_from_semantic_data_type(
             &index.state_projection_data_type(*state_id, field_path)?,
         ),
-        ValueRef::Source(_) => PlanValueType::Bool,
+        ValueRef::Source(_) => PlanValueType::Tag,
         ValueRef::SourcePayload { source_id, field } => {
             let source = program
                 .sources
@@ -5988,9 +5970,7 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
                 inline_bytes: (bytes.len() <= INLINE_BYTE_CONSTANT_LIMIT).then(|| bytes.clone()),
             })
         }
-        InitialValue::Tag { name } => Some(PlanConstantValue::Enum {
-            value: name.clone(),
-        }),
+        InitialValue::Tag { name } => Some(PlanConstantValue::Tag { name: name.clone() }),
         InitialValue::Data { value } => Some(PlanConstantValue::Data {
             value: value.clone(),
         }),
@@ -6054,8 +6034,8 @@ fn constant_executable_expression_value_inner(
             .ok()
             .map(|value| PlanConstantValue::Number { value }),
         ir::ExecutableExpressionKind::BytesByte(value) => bytes_plan_constant(&[*value]),
-        ir::ExecutableExpressionKind::Tag(value) => Some(PlanConstantValue::Enum {
-            value: value.clone(),
+        ir::ExecutableExpressionKind::Tag(value) => Some(PlanConstantValue::Tag {
+            name: value.clone(),
         }),
         ir::ExecutableExpressionKind::Bytes { .. } => {
             bytes_plan_constant(&executable_static_bytes(program, expression_id)?)
@@ -6304,9 +6284,8 @@ fn plan_value_type_is_concrete(value_type: PlanValueType) -> bool {
         value_type,
         PlanValueType::Text
             | PlanValueType::Number
-            | PlanValueType::Bool
             | PlanValueType::Bytes { .. }
-            | PlanValueType::Enum
+            | PlanValueType::Tag
             | PlanValueType::Data
     )
 }
@@ -6398,7 +6377,7 @@ fn inferred_executable_expression_value_type_inner(
             Some(PlanValueType::Bytes { fixed_len: Some(1) })
         }
         ir::ExecutableExpressionKind::Tag(_)
-        | ir::ExecutableExpressionKind::TaggedObject { .. } => Some(PlanValueType::Enum),
+        | ir::ExecutableExpressionKind::TaggedObject { .. } => Some(PlanValueType::Tag),
         ir::ExecutableExpressionKind::Bytes {
             fixed_size: Some(len),
             ..
@@ -6487,7 +6466,6 @@ fn inferred_builtin_call_value_type(function: &str) -> Option<PlanValueType> {
         | "Bytes/to_text"
         | "Bytes/to_hex"
         | "Bytes/to_base64"
-        | "Error/text"
         | "File/write_bytes"
         | "File/read_text"
         | "Router/route"
@@ -6519,7 +6497,7 @@ fn inferred_builtin_call_value_type(function: &str) -> Option<PlanValueType> {
         "Bool/not" | "Bool/and" | "Bool/or" | "Bool/toggle" | "Text/is_empty"
         | "Text/is_not_empty" | "Text/starts_with" | "Text/contains" | "Text/all_chars_in"
         | "Bytes/is_empty" | "Bytes/equal" | "Bytes/starts_with" | "Bytes/ends_with" => {
-            Some(PlanValueType::Bool)
+            Some(PlanValueType::Tag)
         }
         "Bytes/set"
         | "Bytes/slice"
@@ -6549,12 +6527,7 @@ fn plan_value_type_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<Plan
                 fixed_len: Some(*len as u64),
             })
         }
-        boon_typecheck::Type::VariantSet(variants)
-            if boon_typecheck::variants_use_boolean_runtime_representation(variants) =>
-        {
-            Some(PlanValueType::Bool)
-        }
-        boon_typecheck::Type::VariantSet(_) => Some(PlanValueType::Enum),
+        boon_typecheck::Type::VariantSet(_) => Some(PlanValueType::Tag),
         _ => None,
     }
 }
@@ -8137,8 +8110,8 @@ fn build_directional_access_expression(
                 .cloned()
                 .collect::<Vec<_>>();
             arms.push(PlanRowSelectArm {
-                pattern: PlanRowSelectPattern::Text {
-                    value: label.to_owned(),
+                pattern: PlanRowSelectPattern::Tag {
+                    name: label.to_owned(),
                 },
                 value: build(arena, selectors, depth + 1, &selected)?,
             });
@@ -8168,8 +8141,7 @@ fn plan_typed_list_index_key(
             match row_expression_value_type(program, value_index, arena, constants, expression)? {
                 Some(PlanValueType::Number) => (PlanListIndexKeyKind::Number, Vec::new()),
                 Some(PlanValueType::Text) => (PlanListIndexKeyKind::Text, Vec::new()),
-                Some(PlanValueType::Bool) => (PlanListIndexKeyKind::Bool, Vec::new()),
-                Some(PlanValueType::Enum) => {
+                Some(PlanValueType::Tag) => {
                     let Some(tags) = closed_tag_index_tags(value_index, arena, expression)? else {
                         return Ok(None);
                     };
@@ -8190,7 +8162,6 @@ fn plan_typed_list_index_key(
             match item.as_ref() {
                 DataTypePlan::Number => (PlanListIndexKeyKind::Number, Vec::new()),
                 DataTypePlan::Text => (PlanListIndexKeyKind::Text, Vec::new()),
-                DataTypePlan::Bool => (PlanListIndexKeyKind::Bool, Vec::new()),
                 data_type @ DataTypePlan::Variant { .. } => {
                     let Some(tags) = closed_tag_index_tags_for_data_type(data_type) else {
                         return Ok(None);
@@ -8200,11 +8171,9 @@ fn plan_typed_list_index_key(
                     };
                     (PlanListIndexKeyKind::ClosedTag { type_id }, tags)
                 }
-                DataTypePlan::Null
-                | DataTypePlan::Bytes { .. }
+                DataTypePlan::Bytes { .. }
                 | DataTypePlan::Record { .. }
                 | DataTypePlan::List { .. }
-                | DataTypePlan::Error { .. }
                 | DataTypePlan::Unknown => return Ok(None),
             }
         }
@@ -8392,10 +8361,10 @@ fn static_order_direction(
         return Ok(None);
     };
     Ok(match value {
-        PlanConstantValue::Enum { value } if value == "Ascending" => {
+        PlanConstantValue::Tag { name } if name == "Ascending" => {
             Some(PlanOrderDirection::Ascending)
         }
-        PlanConstantValue::Enum { value } if value == "Descending" => {
+        PlanConstantValue::Tag { name } if name == "Descending" => {
             Some(PlanOrderDirection::Descending)
         }
         _ => None,
@@ -9623,7 +9592,6 @@ fn source_event_transform_fresh_value(
         Some(PlanValueType::Number) => PlanConstantValue::Number {
             value: FiniteReal::ZERO,
         },
-        Some(PlanValueType::Bool) => PlanConstantValue::Bool { value: false },
         Some(PlanValueType::Bytes { fixed_len }) => {
             let bytes = vec![0; fixed_len.unwrap_or_default() as usize];
             let mut hasher = Sha256::new();
@@ -9634,7 +9602,7 @@ fn source_event_transform_fresh_value(
                 inline_bytes: Some(bytes),
             }
         }
-        Some(PlanValueType::Enum) => {
+        Some(PlanValueType::Tag) => {
             let mut fresh = None;
             for (_, value) in arms {
                 let PlanRowExpressionNode::Constant { constant_id } = arena.node(*value)? else {
@@ -9644,7 +9612,7 @@ fn source_event_transform_fresh_value(
                     .iter()
                     .find(|constant| constant.id == *constant_id)
                     .and_then(|constant| match &constant.value {
-                        PlanConstantValue::Enum { .. } => Some(constant.value.clone()),
+                        PlanConstantValue::Tag { .. } => Some(constant.value.clone()),
                         _ => None,
                     });
                 if fresh.is_some() {
@@ -9682,7 +9650,9 @@ fn source_event_transform_fresh_value(
                 }
             }
             if all_bool_constants {
-                PlanConstantValue::Bool { value: false }
+                PlanConstantValue::Tag {
+                    name: "False".to_owned(),
+                }
             } else {
                 PlanConstantValue::Text {
                     value: String::new(),
@@ -9704,7 +9674,12 @@ fn plan_row_expression_is_bool_constant(
     Ok(constants
         .iter()
         .find(|constant| constant.id == *constant_id)
-        .is_some_and(|constant| matches!(constant.value, PlanConstantValue::Bool { .. })))
+        .is_some_and(|constant| {
+            matches!(
+                &constant.value,
+                PlanConstantValue::Tag { name } if matches!(name.as_str(), "False" | "True")
+            )
+        }))
 }
 
 struct ExecutableRowLowerer<'a> {
@@ -10197,7 +10172,9 @@ impl<'a> ExecutableRowLowerer<'a> {
         inherited_owner: Option<PlanStaticOwnerId>,
     ) -> Result<PlanRowExpressionId, PlanError> {
         if root == target {
-            return self.constant(PlanConstantValue::Bool { value: true });
+            return self.constant(PlanConstantValue::Tag {
+                name: "True".to_owned(),
+            });
         }
         let expression = self
             .program
@@ -10224,7 +10201,9 @@ impl<'a> ExecutableRowLowerer<'a> {
                 let value = if reaches {
                     self.lower_reachability_gate_scoped(arm.output, target, owner)?
                 } else {
-                    self.constant(PlanConstantValue::Bool { value: false })?
+                    self.constant(PlanConstantValue::Tag {
+                        name: "False".to_owned(),
+                    })?
                 };
                 lowered_arms.push(PlanRowSelectArm { pattern, value });
             }
@@ -10236,7 +10215,9 @@ impl<'a> ExecutableRowLowerer<'a> {
             if !has_wildcard {
                 lowered_arms.push(PlanRowSelectArm {
                     pattern: PlanRowSelectPattern::Wildcard,
-                    value: self.constant(PlanConstantValue::Bool { value: false })?,
+                    value: self.constant(PlanConstantValue::Tag {
+                        name: "False".to_owned(),
+                    })?,
                 });
             }
             return self.intern(PlanRowExpressionNode::Select {
@@ -10363,7 +10344,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             }
             ir::ExecutableExpressionKind::BytesByte(value) => self.bytes_constant(vec![value])?,
             ir::ExecutableExpressionKind::Tag(value) => {
-                self.constant(PlanConstantValue::Enum { value })?
+                self.constant(PlanConstantValue::Tag { name: value })?
             }
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
                 let fields = self.lower_fields(fields, owner)?;
@@ -11642,9 +11623,7 @@ fn executable_select_pattern(
             value: value.clone(),
         },
         CheckedMatchPattern::NaN => PlanRowSelectPattern::NaN,
-        CheckedMatchPattern::Tag { name } => PlanRowSelectPattern::Text {
-            value: name.clone(),
-        },
+        CheckedMatchPattern::Tag { name } => PlanRowSelectPattern::Tag { name: name.clone() },
         CheckedMatchPattern::Unknown { tokens } => {
             return Err(PlanError::new(format!(
                 "unknown checked match pattern `{}`",
@@ -11925,7 +11904,7 @@ fn row_expression_value_type(
     expression: PlanRowExpressionId,
 ) -> Result<Option<PlanValueType>, PlanError> {
     Ok(match arena.node(expression)? {
-        PlanRowExpressionNode::Intrinsic { .. } => Some(PlanValueType::Enum),
+        PlanRowExpressionNode::Intrinsic { .. } => Some(PlanValueType::Tag),
         PlanRowExpressionNode::Field { input } => {
             plan_value_type_for_value_ref(program, index, input)
         }
@@ -11935,12 +11914,11 @@ fn row_expression_value_type(
             .and_then(|constant| match &constant.value {
                 PlanConstantValue::Text { .. } => Some(PlanValueType::Text),
                 PlanConstantValue::Number { .. } => Some(PlanValueType::Number),
-                PlanConstantValue::Bool { .. } => Some(PlanValueType::Bool),
                 PlanConstantValue::Bytes { byte_len, .. } => Some(PlanValueType::Bytes {
                     fixed_len: Some(*byte_len),
                 }),
-                PlanConstantValue::Enum { value } if value == "SKIP" => None,
-                PlanConstantValue::Enum { .. } => Some(PlanValueType::Enum),
+                PlanConstantValue::Tag { name } if name == "SKIP" => None,
+                PlanConstantValue::Tag { .. } => Some(PlanValueType::Tag),
                 PlanConstantValue::Data { .. } => Some(PlanValueType::Data),
             }),
         PlanRowExpressionNode::TextTrim { .. }
@@ -11963,7 +11941,7 @@ fn row_expression_value_type(
             Some(PlanValueType::Bytes { fixed_len: None })
         }
         PlanRowExpressionNode::NumberInfix { op, .. } if op.is_comparison() => {
-            Some(PlanValueType::Bool)
+            Some(PlanValueType::Tag)
         }
         PlanRowExpressionNode::BytesLength { .. }
         | PlanRowExpressionNode::BytesFind { .. }
@@ -11979,7 +11957,7 @@ fn row_expression_value_type(
         | PlanRowExpressionNode::BytesEndsWith { .. }
         | PlanRowExpressionNode::BytesEqual { .. }
         | PlanRowExpressionNode::TextIsEmpty { .. }
-        | PlanRowExpressionNode::TextStartsWith { .. } => Some(PlanValueType::Bool),
+        | PlanRowExpressionNode::TextStartsWith { .. } => Some(PlanValueType::Tag),
         PlanRowExpressionNode::BuiltinCall { function, .. } => function.fixed_result_type(),
         PlanRowExpressionNode::Select { arms, .. } => {
             let mut arm_types = Vec::new();
@@ -12637,7 +12615,7 @@ fn resolve_path(
 
 fn effect_intent_default_constant(value: &EffectIntentDefaultValuePlan) -> PlanConstantValue {
     match value {
-        EffectIntentDefaultValuePlan::Bool { value } => PlanConstantValue::Bool { value: *value },
+        EffectIntentDefaultValuePlan::Tag { name } => PlanConstantValue::Tag { name: name.clone() },
         EffectIntentDefaultValuePlan::Number { value } => {
             PlanConstantValue::Number { value: *value }
         }
@@ -13059,7 +13037,7 @@ fn project_data_type(data_type: &DataTypePlan, field_path: &[String]) -> Option<
         return Some(data_type.clone());
     };
     let projected = match data_type {
-        DataTypePlan::Record { fields, .. } | DataTypePlan::Error { fields, .. } => fields
+        DataTypePlan::Record { fields, .. } => fields
             .iter()
             .find(|candidate| candidate.name == *field)
             .map(|candidate| candidate.data_type.clone()),

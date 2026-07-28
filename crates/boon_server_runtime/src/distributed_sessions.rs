@@ -3665,7 +3665,7 @@ store: [
                     payload: DistributedMessagePayload::Current {
                         export_id: shared_edge.export_id,
                         revision: 2,
-                        value: DataValue::Bool(true),
+                        value: DataValue::truth(true),
                     },
                 },
             })
@@ -3756,7 +3756,7 @@ store: [
                     payload: DistributedMessagePayload::Current {
                         export_id: edge.export_id,
                         revision: 2,
-                        value: DataValue::Bool(false),
+                        value: DataValue::truth(false),
                     },
                 },
             })
@@ -3777,7 +3777,7 @@ store: [
                 .unwrap()
                 .root_value_current("store.server_ready")
                 .unwrap(),
-            Value::Bool(false)
+            Value::truth(false)
         );
     }
 
@@ -3837,7 +3837,7 @@ store: [
                     payload: DistributedMessagePayload::Event {
                         export_id,
                         sequence: 1,
-                        value: DataValue::Null,
+                        value: None,
                     },
                 },
             })
@@ -3861,7 +3861,7 @@ store: [
                     payload: DistributedMessagePayload::Event {
                         export_id,
                         sequence: 2,
-                        value: DataValue::Null,
+                        value: None,
                     },
                 },
             })
@@ -3960,7 +3960,7 @@ store: [
             payload: DistributedMessagePayload::Event {
                 export_id,
                 sequence,
-                value: DataValue::Null,
+                value: None,
             },
         };
 

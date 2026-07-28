@@ -115,7 +115,7 @@ async fn compiled_boon_uses_typed_clock_random_secret_hmac_and_deadline_services
     apply_immediate(&mut program, &mut adapter, verify_secret);
     assert_eq!(
         program.output_value_current("secret_match").unwrap(),
-        Value::Bool(true)
+        Value::truth(true)
     );
 
     let message = b"session-id.expiry".to_vec();
@@ -145,7 +145,7 @@ async fn compiled_boon_uses_typed_clock_random_secret_hmac_and_deadline_services
     apply_immediate(&mut program, &mut adapter, verify_hmac);
     assert_eq!(
         program.output_value_current("hmac_match").unwrap(),
-        Value::Bool(true)
+        Value::truth(true)
     );
 
     let deadline = invocation(

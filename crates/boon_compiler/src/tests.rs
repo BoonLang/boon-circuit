@@ -160,7 +160,7 @@ store: [
             .iter()
             .find(|constant| constant.id == true_constant)
             .map(|constant| &constant.value),
-        Some(PlanConstantValue::Bool { value: true })
+        Some(PlanConstantValue::Tag { name }) if name == "True"
     ));
 }
 
@@ -3546,8 +3546,12 @@ status:
             .map(|arm| arm.pattern.clone())
             .collect::<Vec<_>>(),
         vec![
-            boon_plan::PlanRowSelectPattern::Bool { value: false },
-            boon_plan::PlanRowSelectPattern::Bool { value: true },
+            boon_plan::PlanRowSelectPattern::Tag {
+                name: "False".to_owned(),
+            },
+            boon_plan::PlanRowSelectPattern::Tag {
+                name: "True".to_owned(),
+            },
         ]
     );
     assert!(format!("{:?}", bound.plan.regions).find("Drain").is_none());
@@ -3827,12 +3831,12 @@ fn indexed_migrations_reconstruct_untouched_row_defaults() {
     ));
     assert_eq!(arms.len(), 2);
     assert!(arms.iter().any(|arm| matches!(
-        arm.pattern,
-        boon_plan::PlanRowSelectPattern::Bool { value: false }
+        &arm.pattern,
+        boon_plan::PlanRowSelectPattern::Tag { name } if name == "False"
     )));
     assert!(arms.iter().any(|arm| matches!(
-        arm.pattern,
-        boon_plan::PlanRowSelectPattern::Bool { value: true }
+        &arm.pattern,
+        boon_plan::PlanRowSelectPattern::Tag { name } if name == "True"
     )));
 }
 
@@ -4798,8 +4802,8 @@ store: [
         .expect("reset constant");
     assert_eq!(
         constant.value,
-        boon_plan::PlanConstantValue::Enum {
-            value: "Hexadecimal".to_owned()
+        boon_plan::PlanConstantValue::Tag {
+            name: "Hexadecimal".to_owned()
         }
     );
 }

@@ -301,8 +301,6 @@ pub struct MemoryOwnerPath {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DataTypePlan {
-    Null,
-    Bool,
     Number,
     Text,
     Bytes {
@@ -318,10 +316,6 @@ pub enum DataTypePlan {
     },
     List {
         item: Box<DataTypePlan>,
-    },
-    Error {
-        fields: Vec<DataTypeFieldPlan>,
-        open: bool,
     },
     Unknown,
 }
@@ -345,16 +339,7 @@ impl DataTypePlan {
             Self::List { item } => Self::List {
                 item: Box::new(item.canonicalized()),
             },
-            Self::Error { fields, open } => Self::Error {
-                fields: canonical_data_type_fields(fields),
-                open: *open,
-            },
-            Self::Null
-            | Self::Bool
-            | Self::Number
-            | Self::Text
-            | Self::Bytes { .. }
-            | Self::Unknown => self.clone(),
+            Self::Number | Self::Text | Self::Bytes { .. } | Self::Unknown => self.clone(),
         }
     }
 
@@ -1353,16 +1338,10 @@ fn distributed_data_type_is_supported(data_type: &DataTypePlan) -> bool {
                 && !variant.open
                 && fields_supported(&variant.fields)
         }),
-        DataTypePlan::Record { fields, open } | DataTypePlan::Error { fields, open } => {
-            !open && fields_supported(fields)
-        }
+        DataTypePlan::Record { fields, open } => !open && fields_supported(fields),
         DataTypePlan::List { item } => distributed_data_type_is_supported(item),
         DataTypePlan::Unknown => false,
-        DataTypePlan::Null
-        | DataTypePlan::Bool
-        | DataTypePlan::Number
-        | DataTypePlan::Text
-        | DataTypePlan::Bytes { .. } => true,
+        DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => true,
     }
 }
 
@@ -2736,7 +2715,7 @@ pub struct EffectIntentDefaultPlan {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectIntentDefaultValuePlan {
-    Bool { value: bool },
+    Tag { name: String },
     Number { value: FiniteReal },
     Text { value: String },
 }
@@ -3022,19 +3001,14 @@ fn validate_effect_intent_defaults(schema: &EffectSchemaPlan) -> Result<(), Plan
                 "effect intent default field must exist in the intent schema",
             ));
         };
-        let type_matches = matches!(
-            (&default.value, field_type),
-            (
-                EffectIntentDefaultValuePlan::Bool { .. },
-                DataTypePlan::Bool
-            ) | (
-                EffectIntentDefaultValuePlan::Number { .. },
-                DataTypePlan::Number
-            ) | (
-                EffectIntentDefaultValuePlan::Text { .. },
-                DataTypePlan::Text
-            )
-        );
+        let type_matches = match (&default.value, field_type) {
+            (EffectIntentDefaultValuePlan::Tag { name }, data_type) => {
+                data_type_accepts_fieldless_tag(data_type, name)
+            }
+            (EffectIntentDefaultValuePlan::Number { .. }, DataTypePlan::Number)
+            | (EffectIntentDefaultValuePlan::Text { .. }, DataTypePlan::Text) => true,
+            _ => false,
+        };
         if !type_matches {
             return Err(PlanError::new(
                 "effect intent default value must match its field type",
@@ -3189,8 +3163,10 @@ fn effect_schema_to_plan(
         .iter()
         .map(|default| {
             let value = match default.value {
-                boon_effect_schema::IntentDefaultValueSpec::Bool(value) => {
-                    EffectIntentDefaultValuePlan::Bool { value }
+                boon_effect_schema::IntentDefaultValueSpec::Tag(name) => {
+                    EffectIntentDefaultValuePlan::Tag {
+                        name: name.to_owned(),
+                    }
                 }
                 boon_effect_schema::IntentDefaultValueSpec::ExactInteger(value) => {
                     EffectIntentDefaultValuePlan::Number {
@@ -3267,7 +3243,6 @@ pub fn builtin_effect_outbox_schema(
 
 fn effect_schema_type_to_plan(value_type: &boon_effect_schema::ValueType) -> DataTypePlan {
     match value_type {
-        boon_effect_schema::ValueType::Bool => DataTypePlan::Bool,
         boon_effect_schema::ValueType::Number => DataTypePlan::Number,
         boon_effect_schema::ValueType::Text => DataTypePlan::Text,
         boon_effect_schema::ValueType::Bytes { fixed_len } => DataTypePlan::Bytes {
@@ -3315,15 +3290,11 @@ fn data_type_contains_unknown(data_type: &DataTypePlan) -> bool {
                 .iter()
                 .any(|field| data_type_contains_unknown(&field.data_type))
         }),
-        DataTypePlan::Record { fields, .. } | DataTypePlan::Error { fields, .. } => fields
+        DataTypePlan::Record { fields, .. } => fields
             .iter()
             .any(|field| data_type_contains_unknown(&field.data_type)),
         DataTypePlan::List { item } => data_type_contains_unknown(item),
-        DataTypePlan::Null
-        | DataTypePlan::Bool
-        | DataTypePlan::Number
-        | DataTypePlan::Text
-        | DataTypePlan::Bytes { .. } => false,
+        DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => false,
     }
 }
 
@@ -3618,9 +3589,6 @@ pub enum MigrationExpressionPlan {
     },
     Number {
         value: FiniteReal,
-    },
-    Bool {
-        value: bool,
     },
     Variant {
         tag: String,
@@ -4140,7 +4108,6 @@ fn canonicalize_migration_expression(
         | MigrationExpressionPlan::Parameter { .. }
         | MigrationExpressionPlan::Text { .. }
         | MigrationExpressionPlan::Number { .. }
-        | MigrationExpressionPlan::Bool { .. }
         | MigrationExpressionPlan::Variant { .. } => {}
     }
     Ok(())
@@ -4440,7 +4407,6 @@ fn validate_migration_expression(
         }
         MigrationExpressionPlan::Text { .. }
         | MigrationExpressionPlan::Number { .. }
-        | MigrationExpressionPlan::Bool { .. }
         | MigrationExpressionPlan::Variant { .. } => {}
     }
     Ok(())
@@ -5285,17 +5251,14 @@ pub enum PlanConstantValue {
     Number {
         value: FiniteReal,
     },
-    Bool {
-        value: bool,
-    },
     Bytes {
         byte_len: u64,
         sha256: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inline_bytes: Option<Vec<u8>>,
     },
-    Enum {
-        value: String,
+    Tag {
+        name: String,
     },
     Data {
         value: boon_data::Value,
@@ -5442,12 +5405,11 @@ impl PlanInitialListFieldInitializer {
 pub enum PlanValueType {
     Text,
     Number,
-    Bool,
     Bytes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fixed_len: Option<u64>,
     },
-    Enum,
+    Tag,
     Data,
     Unknown,
 }
@@ -5830,7 +5792,6 @@ pub enum PlanOrderOperationKind {
 pub enum PlanListIndexKeyKind {
     Number,
     Text,
-    Bool,
     ClosedTag { type_id: [u8; 16] },
 }
 
@@ -6835,8 +6796,6 @@ static BUILTIN_PARAMS_NUMBER_PROJECT_WIDTH: &[PlanRowBuiltinParameter] = &[
     PlanRowBuiltinParameter::required("fallback"),
     PlanRowBuiltinParameter::optional("zoom"),
 ];
-static BUILTIN_PARAMS_ERROR_NEW: &[PlanRowBuiltinParameter] =
-    &[PlanRowBuiltinParameter::optional("code")];
 static BUILTIN_PARAMS_LIST: &[PlanRowBuiltinParameter] =
     &[PlanRowBuiltinParameter::required_receiver("list")];
 static BUILTIN_PARAMS_LIST_GET: &[PlanRowBuiltinParameter] = &[
@@ -6963,8 +6922,6 @@ pub enum PlanRowBuiltin {
     NumberProjectOffset,
     NumberProjectTime,
     NumberProjectWidth,
-    ErrorNew,
-    ErrorText,
     ListGet,
     ListLatest,
     ListCount,
@@ -7001,8 +6958,6 @@ impl PlanRowBuiltin {
         Self::NumberProjectOffset,
         Self::NumberProjectTime,
         Self::NumberProjectWidth,
-        Self::ErrorNew,
-        Self::ErrorText,
         Self::ListGet,
         Self::ListLatest,
         Self::ListCount,
@@ -7046,8 +7001,6 @@ impl PlanRowBuiltin {
             Self::NumberProjectOffset => "Number/project_offset",
             Self::NumberProjectTime => "Number/project_time",
             Self::NumberProjectWidth => "Number/project_width",
-            Self::ErrorNew => "Error/new",
-            Self::ErrorText => "Error/text",
             Self::ListGet => "List/get",
             Self::ListLatest => "List/latest",
             Self::ListCount => "List/count",
@@ -7066,8 +7019,7 @@ impl PlanRowBuiltin {
             | Self::TextJoinLines
             | Self::TextTimeRangeLabel
             | Self::NumberToText
-            | Self::NumberToAsciiText
-            | Self::ErrorText => Some(PlanValueType::Text),
+            | Self::NumberToAsciiText => Some(PlanValueType::Text),
             Self::NumberBitWidth
             | Self::NumberCeil
             | Self::NumberFloor
@@ -7088,8 +7040,7 @@ impl PlanRowBuiltin {
             | Self::TextContains
             | Self::TextIsNotEmpty
             | Self::TextAllCharsIn
-            | Self::ListIsNotEmpty => Some(PlanValueType::Bool),
-            Self::ErrorNew => Some(PlanValueType::Data),
+            | Self::ListIsNotEmpty => Some(PlanValueType::Tag),
             Self::ListGet | Self::ListLatest | Self::ListTake => None,
         }
     }
@@ -7101,8 +7052,7 @@ impl PlanRowBuiltin {
             | Self::NumberCeil
             | Self::NumberFloor
             | Self::NumberRound
-            | Self::NumberTruncate
-            | Self::ErrorText => BUILTIN_PARAMS_VALUE,
+            | Self::NumberTruncate => BUILTIN_PARAMS_VALUE,
             Self::BoolAnd | Self::BoolOr | Self::NumberMin | Self::NumberMax => {
                 BUILTIN_PARAMS_BOOL_BINARY
             }
@@ -7122,7 +7072,6 @@ impl PlanRowBuiltin {
             Self::NumberProjectOffset => BUILTIN_PARAMS_NUMBER_PROJECT_OFFSET,
             Self::NumberProjectTime => BUILTIN_PARAMS_NUMBER_PROJECT_TIME,
             Self::NumberProjectWidth => BUILTIN_PARAMS_NUMBER_PROJECT_WIDTH,
-            Self::ErrorNew => BUILTIN_PARAMS_ERROR_NEW,
             Self::ListGet => BUILTIN_PARAMS_LIST_GET,
             Self::ListLatest | Self::ListCount | Self::ListLength | Self::ListIsNotEmpty => {
                 BUILTIN_PARAMS_LIST
@@ -8639,7 +8588,7 @@ pub struct PlanRowSelectArm {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanRowSelectPattern {
-    Bool { value: bool },
+    Tag { name: String },
     Text { value: String },
     Number { value: FiniteReal },
     NaN,
@@ -9617,12 +9566,12 @@ fn plan_value_type_matches_data_type(actual: PlanValueType, expected: &DataTypeP
     match actual {
         PlanValueType::Text => matches!(expected, DataTypePlan::Text),
         PlanValueType::Number => matches!(expected, DataTypePlan::Number),
-        PlanValueType::Bool => matches!(expected, DataTypePlan::Bool),
         PlanValueType::Bytes { fixed_len } => {
             matches!(expected, DataTypePlan::Bytes { fixed_len: expected_len }
                 if expected_len.is_none() || *expected_len == fixed_len)
         }
-        PlanValueType::Enum | PlanValueType::Data | PlanValueType::Unknown => true,
+        PlanValueType::Tag => matches!(expected, DataTypePlan::Variant { .. }),
+        PlanValueType::Data | PlanValueType::Unknown => true,
     }
 }
 
@@ -9630,13 +9579,23 @@ fn constant_value_matches_data_type(actual: &PlanConstantValue, expected: &DataT
     match actual {
         PlanConstantValue::Text { .. } => matches!(expected, DataTypePlan::Text),
         PlanConstantValue::Number { .. } => matches!(expected, DataTypePlan::Number),
-        PlanConstantValue::Bool { .. } => matches!(expected, DataTypePlan::Bool),
         PlanConstantValue::Bytes { byte_len, .. } => {
             matches!(expected, DataTypePlan::Bytes { fixed_len }
                 if fixed_len.is_none() || *fixed_len == Some(*byte_len))
         }
-        PlanConstantValue::Enum { .. } | PlanConstantValue::Data { .. } => true,
+        PlanConstantValue::Tag { name } => data_type_accepts_fieldless_tag(expected, name),
+        PlanConstantValue::Data { .. } => true,
     }
+}
+
+fn data_type_accepts_fieldless_tag(data_type: &DataTypePlan, name: &str) -> bool {
+    matches!(
+        data_type,
+        DataTypePlan::Variant { variants }
+            if variants
+                .iter()
+                .any(|variant| variant.tag == name && variant.fields.is_empty())
+    )
 }
 
 fn distributed_event_route_failure(plan: &MachinePlan) -> Option<String> {
@@ -10426,9 +10385,7 @@ fn typed_list_access_failure(plan: &MachinePlan) -> Option<String> {
                         index.id.0
                     ));
                 }
-                PlanListIndexKeyKind::Number
-                | PlanListIndexKeyKind::Text
-                | PlanListIndexKeyKind::Bool
+                PlanListIndexKeyKind::Number | PlanListIndexKeyKind::Text
                     if !key.closed_tags.is_empty() =>
                 {
                     return Some(format!(
@@ -10438,8 +10395,7 @@ fn typed_list_access_failure(plan: &MachinePlan) -> Option<String> {
                 }
                 PlanListIndexKeyKind::ClosedTag { .. }
                 | PlanListIndexKeyKind::Number
-                | PlanListIndexKeyKind::Text
-                | PlanListIndexKeyKind::Bool => {}
+                | PlanListIndexKeyKind::Text => {}
             }
         }
     }
@@ -11599,7 +11555,7 @@ fn output_roots_failure(plan: &MachinePlan) -> Option<String> {
 fn data_type_is_closed(data_type: &DataTypePlan) -> bool {
     match data_type {
         DataTypePlan::Unknown => false,
-        DataTypePlan::Record { fields, open } | DataTypePlan::Error { fields, open } => {
+        DataTypePlan::Record { fields, open } => {
             !open
                 && fields
                     .iter()
@@ -11613,11 +11569,7 @@ fn data_type_is_closed(data_type: &DataTypePlan) -> bool {
                     .all(|field| data_type_is_closed(&field.data_type))
         }),
         DataTypePlan::List { item } => data_type_is_closed(item),
-        DataTypePlan::Null
-        | DataTypePlan::Bool
-        | DataTypePlan::Number
-        | DataTypePlan::Text
-        | DataTypePlan::Bytes { .. } => true,
+        DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => true,
     }
 }
 
@@ -12453,7 +12405,7 @@ fn cpu_plan_executor_supports_derived_value_op(
                 input,
                 ValueRef::State(state_id)
                     if plan_value_type_for_state_slots(scalar_slots, *state_id)
-                        == Some(&PlanValueType::Bool)
+                        == Some(&PlanValueType::Tag)
                         && scalar_slots
                             .iter()
                             .find(|slot| slot.state_id == *state_id)
@@ -12600,8 +12552,7 @@ fn byte_constants_match_hashes(constants: &[PlanConstant]) -> bool {
         } => true,
         PlanConstantValue::Text { .. }
         | PlanConstantValue::Number { .. }
-        | PlanConstantValue::Bool { .. }
-        | PlanConstantValue::Enum { .. }
+        | PlanConstantValue::Tag { .. }
         | PlanConstantValue::Data { .. } => true,
     })
 }
@@ -13665,8 +13616,7 @@ fn constant_value_matches_plan_type(value: &PlanConstantValue, value_type: &Plan
     match (value, value_type) {
         (PlanConstantValue::Text { .. }, PlanValueType::Text) => true,
         (PlanConstantValue::Number { .. }, PlanValueType::Number) => true,
-        (PlanConstantValue::Bool { .. }, PlanValueType::Bool) => true,
-        (PlanConstantValue::Enum { .. }, PlanValueType::Enum) => true,
+        (PlanConstantValue::Tag { .. }, PlanValueType::Tag) => true,
         (PlanConstantValue::Data { .. }, PlanValueType::Data) => true,
         (
             PlanConstantValue::Bytes { byte_len, .. },

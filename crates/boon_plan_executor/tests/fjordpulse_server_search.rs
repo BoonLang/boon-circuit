@@ -271,7 +271,7 @@ fn fjordpulse_server_search_executes_the_typed_pipeline() {
     let Value::Record(search) = session.output_value_current("search_contract").unwrap() else {
         panic!("search contract must remain structural")
     };
-    assert_eq!(search["ok"], Value::Bool(true));
+    assert_eq!(search["ok"], Value::truth(true));
     assert_eq!(search["query"], Value::Text("ber".to_owned()));
     assert_eq!(search["indexedResultCount"], number(1));
 

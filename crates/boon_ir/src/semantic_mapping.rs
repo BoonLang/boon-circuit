@@ -71,12 +71,9 @@ fn semantic_data_type(value: &boon_typecheck::Type) -> crate::SemanticDataType {
                 fixed_len: Some(*fixed_len),
             }
         }
-        boon_typecheck::Type::Skip => crate::SemanticDataType::Null,
-        boon_typecheck::Type::VariantSet(variants)
-            if boon_typecheck::variants_use_boolean_runtime_representation(variants) =>
-        {
-            crate::SemanticDataType::Bool
-        }
+        boon_typecheck::Type::Skip => crate::SemanticDataType::Unknown {
+            reason: "private absence is not semantic data".to_owned(),
+        },
         boon_typecheck::Type::VariantSet(variants) => {
             let mut variants = variants
                 .iter()

@@ -108,10 +108,11 @@ fn typed_index_has_one_native_and_wasm_golden_behavior() {
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn typed_key_codec_has_one_native_and_wasm_byte_layout() {
     let tag_type = boon_list_access::TagTypeId::from_u128(0x1020_3040_5060_7080);
+    let truth_type = boon_list_access::TagTypeId::from_u128(0x1122_3344_5566_7788);
     let schema = KeySchema::new(vec![
         KeyComponent::new(KeyKind::Number, Direction::Asc),
         KeyComponent::new(KeyKind::Text, Direction::Asc),
-        KeyComponent::new(KeyKind::Bool, Direction::Asc),
+        KeyComponent::new(KeyKind::ClosedTag(truth_type), Direction::Asc),
         KeyComponent::new(KeyKind::ClosedTag(tag_type), Direction::Asc),
     ])
     .unwrap();
@@ -120,7 +121,7 @@ fn typed_key_codec_has_one_native_and_wasm_byte_layout() {
             &StructuralKey::new(vec![
                 number(0),
                 StructuralValue::text("a\0"),
-                StructuralValue::Bool(true),
+                StructuralValue::ClosedTag(boon_list_access::ClosedTag::new(truth_type, 1)),
                 StructuralValue::ClosedTag(boon_list_access::ClosedTag::new(tag_type, 7)),
             ])
             .unwrap(),
@@ -143,10 +144,11 @@ fn typed_key_codec_has_one_native_and_wasm_byte_layout() {
         u8::MAX,
         0,
         0,
-        0x33,
-        1,
-        0x44,
     ];
+    expected.push(0x44);
+    expected.extend_from_slice(truth_type.as_bytes());
+    expected.extend_from_slice(&1_u32.to_be_bytes());
+    expected.push(0x44);
     expected.extend_from_slice(tag_type.as_bytes());
     expected.extend_from_slice(&7_u32.to_be_bytes());
     assert_eq!(encoded.as_bytes(), expected);

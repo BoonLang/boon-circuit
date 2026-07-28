@@ -973,7 +973,7 @@ impl From<AstParameterKind> for CheckedParameterKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckedParameterDefault {
     CallableProfile { profile: String },
-    Bool { value: bool },
+    Tag { name: String },
     ExactInteger { value: i64 },
     Text { value: String },
 }
@@ -11222,8 +11222,10 @@ fn host_effect_signature(operation: &str) -> Option<HostEffectSignature> {
                 .iter()
                 .find(|default| default.field_name == field.name)
                 .map(|default| match &default.value {
-                    boon_effect_schema::IntentDefaultValueSpec::Bool(value) => {
-                        CheckedParameterDefault::Bool { value: *value }
+                    boon_effect_schema::IntentDefaultValueSpec::Tag(name) => {
+                        CheckedParameterDefault::Tag {
+                            name: (*name).to_owned(),
+                        }
                     }
                     boon_effect_schema::IntentDefaultValueSpec::ExactInteger(value) => {
                         CheckedParameterDefault::ExactInteger { value: *value }
@@ -11248,7 +11250,6 @@ pub fn is_typed_host_effect(operation: &str) -> bool {
 
 fn effect_schema_type_to_type(value_type: &boon_effect_schema::ValueType) -> Type {
     match value_type {
-        boon_effect_schema::ValueType::Bool => true_false_type(),
         boon_effect_schema::ValueType::Number => Type::Number,
         boon_effect_schema::ValueType::Text => Type::Text,
         boon_effect_schema::ValueType::Bytes { fixed_len } => {
@@ -18020,7 +18021,7 @@ fn checked_parameter_default_matches_type(
 ) -> bool {
     match default {
         CheckedParameterDefault::CallableProfile { profile } => !profile.is_empty(),
-        CheckedParameterDefault::Bool { .. } => type_is_assignable_to(&true_false_type(), expected),
+        CheckedParameterDefault::Tag { name } => type_is_assignable_to(&tag_type(name), expected),
         CheckedParameterDefault::ExactInteger { .. } => {
             type_is_assignable_to(&Type::Number, expected)
         }
@@ -18185,12 +18186,6 @@ impl Default for BuiltinSignatureRegistry {
                 optional_parameter("separator", Type::Text),
                 optional_parameter("empty", Type::Text),
             ],
-            None,
-        );
-        register(
-            "Error/text",
-            Type::Text,
-            vec![required_parameter("value", Type::Unknown)],
             None,
         );
         register("Ulid/generate", Type::Text, Vec::new(), None);
@@ -18714,16 +18709,6 @@ impl Default for BuiltinSignatureRegistry {
             vec![required_parameter("duration", Type::Unknown)],
             None,
         );
-        register(
-            "Error/new",
-            Type::VariantSet(vec![Variant::Tagged {
-                tag: "Error".to_owned(),
-                fields: ObjectShape::new(BTreeMap::new(), true),
-            }]),
-            vec![optional_parameter("code", Type::Text)],
-            None,
-        );
-
         register("Router/route", Type::Text, Vec::new(), None);
         register(
             "Router/go_to",
@@ -19941,8 +19926,6 @@ fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
         (Type::Unknown, _) | (_, Type::Unknown) => false,
         (Type::UnresolvedShape { .. }, _) | (_, Type::UnresolvedShape { .. }) => false,
         (Type::Skip, _) | (_, Type::Skip) => false,
-        (left, _) if is_propagating_error_type(left) => false,
-        (_, right) if is_propagating_error_type(right) => false,
         (left, _) if is_open_object_type(left) => false,
         (_, right) if is_open_object_type(right) => false,
         (Type::Text, Type::Text)
@@ -19986,7 +19969,6 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
     match (actual, expected) {
         (_, Type::Unknown) | (Type::Unknown, _) | (Type::Var(_), _) | (_, Type::Var(_)) => true,
         (Type::UnresolvedShape { .. }, _) | (_, Type::UnresolvedShape { .. }) => true,
-        (actual, _) if is_propagating_error_type(actual) => true,
         (_, expected) if is_open_object_type(expected) => true,
         (actual, _) if is_open_object_type(actual) => true,
         (Type::Text, Type::Text) | (Type::Number, Type::Number) => true,
@@ -21237,7 +21219,6 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Number/to_text"
                     | "Number/to_codepoint_text"
                     | "Number/to_ascii_text"
-                    | "Error/text"
                     | "Router/route"
                     | "Router/go_to"
                     | "Ulid/generate"
@@ -23154,12 +23135,6 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
     if is_value_placeholder_type(right) {
         return left.clone();
     }
-    if is_propagating_error_type(left) {
-        return right.clone();
-    }
-    if is_propagating_error_type(right) {
-        return left.clone();
-    }
     match (left, right) {
         (Type::VariantSet(left), Type::VariantSet(right)) => {
             let mut variants = left.clone();
@@ -23201,18 +23176,6 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
         }
         _ => open_object_type(),
     }
-}
-
-fn is_propagating_error_type(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::VariantSet(variants)
-            if !variants.is_empty()
-                && variants.iter().all(|variant| matches!(
-                    variant,
-                    Variant::Tag(tag) | Variant::Tagged { tag, .. } if tag == "Error"
-                ))
-    )
 }
 
 fn widen_hold_type(current: &Type, update: &Type) -> Type {

@@ -3293,11 +3293,6 @@ fn type_to_data_plan(ty: &Type) -> Option<DataTypePlan> {
         Type::List(item) => Some(DataTypePlan::List {
             item: Box::new(type_to_data_plan(item)?),
         }),
-        Type::VariantSet(variants)
-            if boon_typecheck::variants_use_boolean_runtime_representation(variants) =>
-        {
-            Some(DataTypePlan::Bool)
-        }
         Type::VariantSet(variants) => Some(DataTypePlan::Variant {
             variants: variants
                 .iter()

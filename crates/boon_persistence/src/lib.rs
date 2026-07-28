@@ -1549,10 +1549,6 @@ fn validate_stored_value_type(
     path: &str,
 ) -> Result<(), StoreError> {
     let valid = match (value, data_type) {
-        (StoredValue::Tag { tag, fields }, DataTypePlan::Null) => {
-            tag == "Null" && fields.is_empty()
-        }
-        (value, DataTypePlan::Bool) => value.as_truth().is_some(),
         (StoredValue::Number(_), DataTypePlan::Number)
         | (StoredValue::Text(_), DataTypePlan::Text) => true,
         (StoredValue::Bytes(value), DataTypePlan::Bytes { fixed_len }) => {
@@ -1578,16 +1574,6 @@ fn validate_stored_value_type(
                     ))
                 })?;
             validate_stored_fields(fields, &variant.fields, variant.open, path)?;
-            true
-        }
-        (
-            StoredValue::Tag { fields, .. },
-            DataTypePlan::Error {
-                fields: expected,
-                open,
-            },
-        ) => {
-            validate_stored_fields(fields, expected, *open, path)?;
             true
         }
         (_, DataTypePlan::Unknown) => false,

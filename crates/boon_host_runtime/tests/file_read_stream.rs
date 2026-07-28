@@ -371,7 +371,7 @@ async fn nonretained_stream_finishes_without_advertising_unresolvable_content() 
     let Value::Record(intent) = &mut invocation.intent else {
         panic!("stream intent must be a record");
     };
-    intent.insert("retain_content".to_owned(), Value::Bool(false));
+    intent.insert("retain_content".to_owned(), Value::truth(false));
     adapter.submit(invocation).unwrap();
 
     loop {

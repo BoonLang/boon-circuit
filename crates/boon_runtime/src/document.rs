@@ -996,6 +996,9 @@ impl DocumentRuntime {
             Delta::SetDistributedImport { import_id, .. } => self
                 .structural_dependencies
                 .contains(&DocumentDependency::DistributedImport(*import_id)),
+            Delta::ClearDistributedImport { import_id } => self
+                .structural_dependencies
+                .contains(&DocumentDependency::DistributedImport(*import_id)),
             Delta::InsertRow { row } => {
                 self.structural_lists.contains(&row.id.list)
                     || self.structural_dependencies.iter().any(|dependency| {
@@ -1101,6 +1104,10 @@ impl DocumentRuntime {
                 affected.extend(dependents.iter().cloned());
                 continue;
             };
+            let Some(value) = value else {
+                affected.extend(dependents.iter().cloned());
+                continue;
+            };
             let Some(guarded) = self.scalar_guarded_dependents.get(&target) else {
                 affected.extend(dependents.iter().cloned());
                 continue;
@@ -1123,7 +1130,14 @@ impl DocumentRuntime {
     fn record_delta_values(&mut self, deltas: &[Delta]) {
         for delta in deltas {
             if let Some((dependency, value)) = delta_dependency(delta) {
-                self.target_values.insert(dependency, value.clone());
+                match value {
+                    Some(value) => {
+                        self.target_values.insert(dependency, value.clone());
+                    }
+                    None => {
+                        self.target_values.remove(&dependency);
+                    }
+                }
             }
         }
     }
@@ -1461,11 +1475,17 @@ struct MaterializationPatchUndo {
     scoped_materialization_identities: ScopedMaterializationIdentities,
 }
 
-fn delta_dependency(delta: &Delta) -> Option<(DocumentDependency, &Value)> {
+fn delta_dependency(delta: &Delta) -> Option<(DocumentDependency, Option<&Value>)> {
     match delta {
-        Delta::SetValue { target, value } => Some((DocumentDependency::Value(*target), value)),
-        Delta::SetDistributedImport { import_id, value } => {
-            Some((DocumentDependency::DistributedImport(*import_id), value))
+        Delta::SetValue { target, value } => {
+            Some((DocumentDependency::Value(*target), Some(value)))
+        }
+        Delta::SetDistributedImport { import_id, value } => Some((
+            DocumentDependency::DistributedImport(*import_id),
+            Some(value),
+        )),
+        Delta::ClearDistributedImport { import_id } => {
+            Some((DocumentDependency::DistributedImport(*import_id), None))
         }
         Delta::InsertRow { .. }
         | Delta::RemoveRow { .. }
@@ -1476,18 +1496,17 @@ fn delta_dependency(delta: &Delta) -> Option<(DocumentDependency, &Value)> {
 
 #[derive(Clone, Debug, PartialEq)]
 enum EvalValue {
-    Null,
-    Bool(bool),
+    Absent,
+    Truth(bool),
     Number(f64),
     Text(String),
     Bytes(Bytes),
-    Enum(String),
     Record(BTreeMap<String, EvalValue>),
     MappedRow {
         id: RowId,
         fields: BTreeMap<String, EvalValue>,
     },
-    Tagged(String, BTreeMap<String, EvalValue>),
+    Tag(String, BTreeMap<String, EvalValue>),
     List(Vec<EvalValue>),
     RuntimeList {
         list: ListId,
@@ -1832,7 +1851,7 @@ impl<'a> Evaluator<'a> {
                         record.insert(self.name(name)?.to_owned(), value);
                     }
                 }
-                Ok(EvalValue::Tagged(self.name(*tag)?.to_owned(), record))
+                Ok(EvalValue::Tag(self.name(*tag)?.to_owned(), record))
             }
             DocumentExprOp::List { items } => {
                 let mut list = Vec::new();
@@ -1906,16 +1925,16 @@ impl<'a> Evaluator<'a> {
                         return self.eval(arm.output, &mut arm_env);
                     }
                 }
-                Ok(EvalValue::Null)
+                Ok(EvalValue::Absent)
             }
             DocumentExprOp::Latest { branches } => {
                 for branch in branches {
                     let value = self.eval(*branch, env)?;
-                    if !matches!(value, EvalValue::Null) {
+                    if !matches!(value, EvalValue::Absent) {
                         return Ok(value);
                     }
                 }
-                Ok(EvalValue::Null)
+                Ok(EvalValue::Absent)
             }
             DocumentExprOp::Then { input, output } => {
                 let input = self.eval(*input, env)?;
@@ -1924,7 +1943,7 @@ impl<'a> Evaluator<'a> {
                         .map(|value| self.eval(value, env))
                         .unwrap_or(Ok(input))
                 } else {
-                    Ok(EvalValue::Null)
+                    Ok(EvalValue::Absent)
                 }
             }
             DocumentExprOp::Constructor {
@@ -1971,17 +1990,17 @@ impl<'a> Evaluator<'a> {
             DocumentBuiltin::ListCount | DocumentBuiltin::ListLength => {
                 Ok(EvalValue::Number(logical_len as f64))
             }
-            DocumentBuiltin::ListIsNotEmpty => Ok(EvalValue::Bool(logical_len != 0)),
+            DocumentBuiltin::ListIsNotEmpty => Ok(EvalValue::Truth(logical_len != 0)),
             DocumentBuiltin::ListGet => {
                 let index = named_number(&arguments, "index").unwrap_or(0.0);
                 if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
-                    return Ok(EvalValue::Null);
+                    return Ok(EvalValue::Absent);
                 }
                 self.runtime_list_row(list, logical_len, index as u64)
             }
             DocumentBuiltin::ListLatest => {
                 if logical_len == 0 {
-                    Ok(EvalValue::Null)
+                    Ok(EvalValue::Absent)
                 } else {
                     self.runtime_list_row(list, logical_len, logical_len - 1)
                 }
@@ -2000,7 +2019,7 @@ impl<'a> Evaluator<'a> {
         index: u64,
     ) -> Result<EvalValue, DocumentError> {
         if index >= logical_len {
-            return Ok(EvalValue::Null);
+            return Ok(EvalValue::Absent);
         }
         let end = index.checked_add(1).ok_or_else(|| {
             DocumentError::Evaluation("document list index overflowed".to_owned())
@@ -2015,7 +2034,7 @@ impl<'a> Evaluator<'a> {
             ));
         }
         let Some(row) = rows.pop() else {
-            return Ok(EvalValue::Null);
+            return Ok(EvalValue::Absent);
         };
         Ok(EvalValue::Row {
             id: Some(row.id),
@@ -2133,9 +2152,10 @@ impl<'a> Evaluator<'a> {
             DocumentConstantValue::Number { coefficient, scale } => {
                 EvalValue::Number(*coefficient as f64 / 10f64.powi(*scale as i32))
             }
-            DocumentConstantValue::Bool { value } => EvalValue::Bool(*value),
             DocumentConstantValue::Bytes { value } => EvalValue::Bytes(value.clone().into()),
-            DocumentConstantValue::Enum { name } => EvalValue::Enum(self.name(*name)?.to_owned()),
+            DocumentConstantValue::Tag { name } => {
+                EvalValue::Tag(self.name(*name)?.to_owned(), BTreeMap::new())
+            }
         })
     }
 
@@ -2188,11 +2208,11 @@ impl<'a> Evaluator<'a> {
                 env.parameters
                     .get(&parameter)
                     .cloned()
-                    .unwrap_or(EvalValue::Null),
+                    .unwrap_or(EvalValue::Absent),
                 &projection,
             )),
             DocumentRead::Local { local, projection } => Ok(self.project(
-                env.locals.get(&local).cloned().unwrap_or(EvalValue::Null),
+                env.locals.get(&local).cloned().unwrap_or(EvalValue::Absent),
                 &projection,
             )),
             DocumentRead::Matched {
@@ -2202,7 +2222,7 @@ impl<'a> Evaluator<'a> {
                 env.matched
                     .get(&selector)
                     .cloned()
-                    .unwrap_or(EvalValue::Null),
+                    .unwrap_or(EvalValue::Absent),
                 &projection,
             )),
             DocumentRead::Row {
@@ -2230,7 +2250,7 @@ impl<'a> Evaluator<'a> {
                             fields: snapshot.fields.clone(),
                             provenance: snapshot.provenance,
                         })
-                        .unwrap_or(EvalValue::Null);
+                        .unwrap_or(EvalValue::Absent);
                     Ok(self.project(snapshot, &projection))
                 }
             }
@@ -2245,10 +2265,10 @@ impl<'a> Evaluator<'a> {
                     )));
                 }
                 let state = EvalValue::Record(BTreeMap::from([
-                    ("focused".to_owned(), EvalValue::Bool(false)),
-                    ("hovered".to_owned(), EvalValue::Bool(false)),
-                    ("pressed".to_owned(), EvalValue::Bool(false)),
-                    ("selected".to_owned(), EvalValue::Bool(false)),
+                    ("focused".to_owned(), EvalValue::Truth(false)),
+                    ("hovered".to_owned(), EvalValue::Truth(false)),
+                    ("pressed".to_owned(), EvalValue::Truth(false)),
+                    ("selected".to_owned(), EvalValue::Truth(false)),
                 ]));
                 Ok(self.project(state, &projection))
             }
@@ -2661,14 +2681,14 @@ impl<'a> Evaluator<'a> {
         }
         for name in path {
             let Ok(name) = self.name(*name).map(str::to_owned) else {
-                return EvalValue::Null;
+                return EvalValue::Absent;
             };
             value = match value {
-                EvalValue::Record(mut fields) | EvalValue::Tagged(_, mut fields) => {
-                    fields.remove(&name).unwrap_or(EvalValue::Null)
+                EvalValue::Record(mut fields) | EvalValue::Tag(_, mut fields) => {
+                    fields.remove(&name).unwrap_or(EvalValue::Absent)
                 }
                 EvalValue::MappedRow { mut fields, .. } => {
-                    fields.remove(&name).unwrap_or(EvalValue::Null)
+                    fields.remove(&name).unwrap_or(EvalValue::Absent)
                 }
                 EvalValue::Row { id, fields, .. } => {
                     let field = fields.keys().find(|field| {
@@ -2708,9 +2728,9 @@ impl<'a> Evaluator<'a> {
                                 .then(|| id.map(|id| EvalValue::Number(id.key as f64)))
                                 .flatten()
                         })
-                        .unwrap_or(EvalValue::Null)
+                        .unwrap_or(EvalValue::Absent)
                 }
-                _ => EvalValue::Null,
+                _ => EvalValue::Absent,
             };
         }
         value
@@ -2724,23 +2744,23 @@ impl<'a> Evaluator<'a> {
                 .get(&field)
                 .and_then(|names| names.last())
                 .and_then(|name| fields.remove(name))
-                .unwrap_or(EvalValue::Null),
+                .unwrap_or(EvalValue::Absent),
             EvalValue::Row { id, fields, .. } => id
                 .and_then(|row| self.read_target(ValueTarget::RowField { row, field }).ok())
                 .or_else(|| fields.get(&field).cloned().map(|value| self.value(value)))
-                .unwrap_or(EvalValue::Null),
+                .unwrap_or(EvalValue::Absent),
             value => self
                 .runtime
                 .field_names
                 .get(&field)
                 .and_then(|names| names.last())
                 .and_then(|name| match value {
-                    EvalValue::Record(mut fields) | EvalValue::Tagged(_, mut fields) => {
+                    EvalValue::Record(mut fields) | EvalValue::Tag(_, mut fields) => {
                         fields.remove(name)
                     }
                     _ => None,
                 })
-                .unwrap_or(EvalValue::Null),
+                .unwrap_or(EvalValue::Absent),
         }
     }
 
@@ -2779,9 +2799,7 @@ impl<'a> Evaluator<'a> {
             }
             DocumentPattern::Tag { tag } => {
                 let tag = self.name(tag)?;
-                matches!(input, EvalValue::Enum(value) if value == tag)
-                    || matches!(input, EvalValue::Tagged(value, _) if value == tag)
-                    || matches!(input, EvalValue::Text(value) if value == tag)
+                matches!(input, EvalValue::Tag(value, _) if value == tag)
             }
             DocumentPattern::Wildcard => true,
         })
@@ -2895,7 +2913,7 @@ impl<'a> Evaluator<'a> {
                         })?;
                         (MaterializationSourceRows::Values(items), logical_item_count)
                     }
-                    EvalValue::Null => (MaterializationSourceRows::Values(Vec::new()), 0),
+                    EvalValue::Absent => (MaterializationSourceRows::Values(Vec::new()), 0),
                     value => (MaterializationSourceRows::Values(vec![value]), 1),
                 }
             }
@@ -3136,7 +3154,7 @@ impl<'a> Evaluator<'a> {
                     .parameters
                     .get(&parameter)
                     .cloned()
-                    .unwrap_or(EvalValue::Null);
+                    .unwrap_or(EvalValue::Absent);
                 if let EvalValue::Row { id: Some(row), .. } = value {
                     self.read_target(ValueTarget::RowField { row, field })
                 } else {
@@ -3150,7 +3168,7 @@ impl<'a> Evaluator<'a> {
                 env.parameters
                     .get(&parameter)
                     .cloned()
-                    .unwrap_or(EvalValue::Null),
+                    .unwrap_or(EvalValue::Absent),
                 &projection,
             )),
             DocumentMaterializationSource::Expression { expression } => self.eval(expression, env),
@@ -3542,7 +3560,7 @@ fn apply_argument(
         .ok_or_else(|| DocumentError::InvalidPlan(format!("name {} is missing", name.0)))?;
     match role {
         DocumentArgumentRole::StaticStyle | DocumentArgumentRole::DynamicStyle => {
-            if let EvalValue::Record(style) | EvalValue::Tagged(_, style) = value {
+            if let EvalValue::Record(style) | EvalValue::Tag(_, style) = value {
                 lower_style_record(&style, &mut node.style);
             }
         }
@@ -3636,7 +3654,7 @@ fn resolve_semantic_metadata<'a>(
 fn semantic_scalar_text(value: &EvalValue) -> Option<String> {
     matches!(
         value,
-        EvalValue::Bool(_) | EvalValue::Number(_) | EvalValue::Text(_) | EvalValue::Enum(_)
+        EvalValue::Truth(_) | EvalValue::Number(_) | EvalValue::Text(_) | EvalValue::Tag(_, _)
     )
     .then(|| value.text())
 }
@@ -3724,10 +3742,10 @@ fn retained_value_affects_structure(role: DocumentArgumentRole, value: &EvalValu
 impl EvalValue {
     fn text(&self) -> String {
         match self {
-            Self::Null => String::new(),
-            Self::Bool(value) => if *value { "True" } else { "False" }.to_owned(),
+            Self::Absent => String::new(),
+            Self::Truth(value) => if *value { "True" } else { "False" }.to_owned(),
             Self::Number(value) => format_number(*value),
-            Self::Text(value) | Self::Enum(value) => value.clone(),
+            Self::Text(value) => value.clone(),
             Self::Bytes(value) => String::from_utf8_lossy(value).into_owned(),
             Self::Record(fields) => fields
                 .get("text")
@@ -3737,7 +3755,8 @@ impl EvalValue {
                 .get("text")
                 .map(Self::text)
                 .unwrap_or_else(|| format_record(None, fields)),
-            Self::Tagged(tag, fields) => format_record(Some(tag), fields),
+            Self::Tag(tag, fields) if fields.is_empty() => tag.clone(),
+            Self::Tag(tag, fields) => format_record(Some(tag), fields),
             Self::List(values) => values.iter().map(Self::text).collect::<Vec<_>>().join(""),
             Self::RuntimeList { .. } => String::new(),
             Self::Row { .. } => String::new(),
@@ -3748,17 +3767,19 @@ impl EvalValue {
 
     fn truthy(&self) -> bool {
         match self {
-            Self::Bool(value) => *value,
+            Self::Truth(value) => *value,
             Self::Number(value) => *value != 0.0,
-            Self::Text(value) | Self::Enum(value) => !value.is_empty(),
+            Self::Text(value) => !value.is_empty(),
             Self::Bytes(value) => !value.is_empty(),
-            Self::Record(value) | Self::Tagged(_, value) => !value.is_empty(),
+            Self::Tag(tag, fields) if fields.is_empty() && tag == "False" => false,
+            Self::Tag(tag, fields) if fields.is_empty() && tag == "True" => true,
+            Self::Record(value) | Self::Tag(_, value) => !value.is_empty(),
             Self::MappedRow { fields, .. } => !fields.is_empty(),
             Self::List(value) => !value.is_empty(),
             Self::RuntimeList { logical_len, .. } => *logical_len != 0,
             Self::Nodes(value) => !value.is_empty(),
             Self::Row { .. } => true,
-            Self::Null | Self::Source(_) => false,
+            Self::Absent | Self::Source(_) => false,
         }
     }
 
@@ -3781,15 +3802,14 @@ impl EvalValue {
 
 fn inline_content_text(value: &EvalValue) -> Option<String> {
     match value {
-        EvalValue::Bool(_)
-        | EvalValue::Number(_)
-        | EvalValue::Text(_)
-        | EvalValue::Bytes(_)
-        | EvalValue::Enum(_) => Some(value.text()),
-        EvalValue::Null
+        EvalValue::Truth(_) | EvalValue::Number(_) | EvalValue::Text(_) | EvalValue::Bytes(_) => {
+            Some(value.text())
+        }
+        EvalValue::Tag(_, fields) if fields.is_empty() => Some(value.text()),
+        EvalValue::Absent
         | EvalValue::Record(_)
         | EvalValue::MappedRow { .. }
-        | EvalValue::Tagged(_, _)
+        | EvalValue::Tag(_, _)
         | EvalValue::List(_)
         | EvalValue::RuntimeList { .. }
         | EvalValue::Row { .. }
@@ -3823,10 +3843,10 @@ fn inherit_inline_text_style(parent: &StyleMap, child: &mut StyleMap) {
 
 fn guard_value(value: &EvalValue) -> Option<Value> {
     match value {
-        EvalValue::Null => Some(Value::Null),
-        EvalValue::Bool(value) => Some(Value::Bool(*value)),
+        EvalValue::Absent => None,
+        EvalValue::Truth(value) => Some(Value::truth(*value)),
         EvalValue::Number(value) => FiniteReal::new(*value).ok().map(Value::Number),
-        EvalValue::Text(value) | EvalValue::Enum(value) => Some(Value::Text(value.clone())),
+        EvalValue::Text(value) => Some(Value::Text(value.clone())),
         EvalValue::Bytes(value) => Some(Value::Bytes(value.clone())),
         EvalValue::Record(fields) => fields
             .iter()
@@ -3851,18 +3871,15 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
             id: *id,
             fields: fields.clone(),
         }),
-        EvalValue::Tagged(tag, fields) => {
-            let mut record = fields
+        EvalValue::Tag(tag, fields) => {
+            let fields = fields
                 .iter()
                 .map(|(name, value)| Some((name.clone(), guard_value(value)?)))
                 .collect::<Option<BTreeMap<_, _>>>()?;
-            if record
-                .insert("$tag".to_owned(), Value::Text(tag.clone()))
-                .is_some()
-            {
-                return None;
-            }
-            Some(Value::Record(record))
+            Some(Value::Tag {
+                tag: tag.clone(),
+                fields,
+            })
         }
         EvalValue::RuntimeList { .. }
         | EvalValue::Row { id: None, .. }
@@ -3873,28 +3890,25 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
 
 fn machine_value_to_eval(value: Value) -> EvalValue {
     match value {
-        Value::Null => EvalValue::Null,
-        Value::Bool(value) => EvalValue::Bool(value),
         Value::Number(value) => EvalValue::Number(value.get()),
         Value::Text(value) => EvalValue::Text(value),
         Value::Bytes(value) => EvalValue::Bytes(value),
         Value::List(values) => {
             EvalValue::List(values.into_iter().map(machine_value_to_eval).collect())
         }
-        Value::Record(values) => {
-            let mut fields = values
+        Value::Record(values) => EvalValue::Record(
+            values
                 .into_iter()
                 .map(|(name, value)| (name, machine_value_to_eval(value)))
-                .collect::<BTreeMap<_, _>>();
-            match fields.remove("$tag") {
-                Some(EvalValue::Text(tag)) => EvalValue::Tagged(tag, fields),
-                Some(value) => {
-                    fields.insert("$tag".to_owned(), value);
-                    EvalValue::Record(fields)
-                }
-                None => EvalValue::Record(fields),
-            }
-        }
+                .collect(),
+        ),
+        Value::Tag { tag, fields } => EvalValue::Tag(
+            tag,
+            fields
+                .into_iter()
+                .map(|(name, value)| (name, machine_value_to_eval(value)))
+                .collect(),
+        ),
         Value::MappedRow { id, fields } => EvalValue::MappedRow {
             id,
             fields: fields
@@ -3907,7 +3921,6 @@ fn machine_value_to_eval(value: Value) -> EvalValue {
             fields,
             provenance: BTreeMap::new(),
         },
-        Value::Error { code } => EvalValue::Text(code),
         Value::HostBound { visible, .. } => machine_value_to_eval(*visible),
     }
 }
@@ -3916,7 +3929,7 @@ fn spread_record(record: &mut BTreeMap<String, EvalValue>, value: EvalValue) {
     match value {
         EvalValue::Record(fields)
         | EvalValue::MappedRow { fields, .. }
-        | EvalValue::Tagged(_, fields) => record.extend(fields),
+        | EvalValue::Tag(_, fields) => record.extend(fields),
         _ => {}
     }
 }
@@ -3936,7 +3949,7 @@ fn eval_scalar(
     left: EvalValue,
     right: Option<EvalValue>,
 ) -> EvalValue {
-    let right = right.unwrap_or(EvalValue::Null);
+    let right = right.unwrap_or(EvalValue::Absent);
     match operation {
         DocumentScalarOp::Add => match (left.number(), right.number()) {
             (Some(left), Some(right)) => EvalValue::Number(left + right),
@@ -3962,27 +3975,23 @@ fn eval_scalar(
                 },
             )
         }
-        DocumentScalarOp::Equal => EvalValue::Bool(eval_values_equal(&left, &right)),
-        DocumentScalarOp::NotEqual => EvalValue::Bool(!eval_values_equal(&left, &right)),
+        DocumentScalarOp::Equal => EvalValue::Truth(eval_values_equal(&left, &right)),
+        DocumentScalarOp::NotEqual => EvalValue::Truth(!eval_values_equal(&left, &right)),
         DocumentScalarOp::Less => compare_binary(left, right, |ordering| ordering.is_lt()),
         DocumentScalarOp::LessOrEqual => compare_binary(left, right, |ordering| ordering.is_le()),
         DocumentScalarOp::Greater => compare_binary(left, right, |ordering| ordering.is_gt()),
         DocumentScalarOp::GreaterOrEqual => {
             compare_binary(left, right, |ordering| ordering.is_ge())
         }
-        DocumentScalarOp::And => EvalValue::Bool(left.truthy() && right.truthy()),
-        DocumentScalarOp::Or => EvalValue::Bool(left.truthy() || right.truthy()),
+        DocumentScalarOp::And => EvalValue::Truth(left.truthy() && right.truthy()),
+        DocumentScalarOp::Or => EvalValue::Truth(left.truthy() || right.truthy()),
         DocumentScalarOp::Negate => EvalValue::Number(-left.number().unwrap_or(0.0)),
-        DocumentScalarOp::Not => EvalValue::Bool(!left.truthy()),
+        DocumentScalarOp::Not => EvalValue::Truth(!left.truthy()),
     }
 }
 
 fn eval_values_equal(left: &EvalValue, right: &EvalValue) -> bool {
-    match (left, right) {
-        (EvalValue::Text(left), EvalValue::Enum(right))
-        | (EvalValue::Enum(left), EvalValue::Text(right)) => left == right,
-        _ => left == right,
-    }
+    left == right
 }
 
 fn numeric_binary(left: EvalValue, right: EvalValue, apply: impl Fn(f64, f64) -> f64) -> EvalValue {
@@ -4001,7 +4010,7 @@ fn compare_binary(
         (Some(left), Some(right)) => left.total_cmp(&right),
         _ => left.text().cmp(&right.text()),
     };
-    EvalValue::Bool(apply(ordering))
+    EvalValue::Truth(apply(ordering))
 }
 
 fn eval_builtin(
@@ -4013,14 +4022,14 @@ fn eval_builtin(
     let mut values = input
         .into_iter()
         .chain(arguments.iter().map(|(_, value)| value.clone()));
-    let first = values.next().unwrap_or(EvalValue::Null);
+    let first = values.next().unwrap_or(EvalValue::Absent);
     match builtin {
         DocumentBuiltin::BoolAnd => {
-            EvalValue::Bool(first.truthy() && values.all(|value| value.truthy()))
+            EvalValue::Truth(first.truthy() && values.all(|value| value.truthy()))
         }
-        DocumentBuiltin::BoolNot | DocumentBuiltin::BoolToggle => EvalValue::Bool(!first.truthy()),
+        DocumentBuiltin::BoolNot | DocumentBuiltin::BoolToggle => EvalValue::Truth(!first.truthy()),
         DocumentBuiltin::BytesFind => {
-            let needle = values.next().unwrap_or(EvalValue::Null).text();
+            let needle = values.next().unwrap_or(EvalValue::Absent).text();
             EvalValue::Number(first.text().find(&needle).unwrap_or(usize::MAX) as f64)
         }
         DocumentBuiltin::BytesSlice | DocumentBuiltin::TextSubstring => {
@@ -4039,10 +4048,10 @@ fn eval_builtin(
                     .collect(),
             )
         }
-        DocumentBuiltin::BytesStartsWith | DocumentBuiltin::TextStartsWith => EvalValue::Bool(
+        DocumentBuiltin::BytesStartsWith | DocumentBuiltin::TextStartsWith => EvalValue::Truth(
             first
                 .text()
-                .starts_with(&values.next().unwrap_or(EvalValue::Null).text()),
+                .starts_with(&values.next().unwrap_or(EvalValue::Absent).text()),
         ),
         DocumentBuiltin::BytesToText => EvalValue::Text(first.text()),
         DocumentBuiltin::NumberToAsciiText => EvalValue::Text(
@@ -4058,20 +4067,10 @@ fn eval_builtin(
                 })
                 .unwrap_or_else(|| "?".to_owned()),
         ),
-        DocumentBuiltin::ErrorNew => EvalValue::Tagged(
-            "Error".to_owned(),
-            BTreeMap::from([("text".to_owned(), first)]),
-        ),
-        DocumentBuiltin::ErrorText => match first {
-            EvalValue::Tagged(_, mut fields) | EvalValue::Record(mut fields) => {
-                fields.remove("text").unwrap_or(EvalValue::Null)
-            }
-            value => EvalValue::Text(value.text()),
-        },
         DocumentBuiltin::ListAppend => {
             let mut list = match first {
                 EvalValue::List(values) => values,
-                EvalValue::Null => Vec::new(),
+                EvalValue::Absent => Vec::new(),
                 value => vec![value],
             };
             list.extend(values);
@@ -4099,15 +4098,15 @@ fn eval_builtin(
             let index = named_number(&arguments, "index").unwrap_or(0.0) as usize;
             match first {
                 EvalValue::List(mut values) if index < values.len() => values.remove(index),
-                _ => EvalValue::Null,
+                _ => EvalValue::Absent,
             }
         }
-        DocumentBuiltin::ListIsNotEmpty => EvalValue::Bool(match first {
+        DocumentBuiltin::ListIsNotEmpty => EvalValue::Truth(match first {
             EvalValue::List(values) => !values.is_empty(),
             _ => false,
         }),
         DocumentBuiltin::ListLatest => match first {
-            EvalValue::List(mut values) => values.pop().unwrap_or(EvalValue::Null),
+            EvalValue::List(mut values) => values.pop().unwrap_or(EvalValue::Absent),
             value => value,
         },
         DocumentBuiltin::ListRange => {
@@ -4174,13 +4173,13 @@ fn eval_builtin(
                 .and_then(|value| FiniteReal::new(value).ok())
                 .and_then(|value| format_number_text(value, format).ok())
                 .map(EvalValue::Text)
-                .unwrap_or(EvalValue::Null)
+                .unwrap_or(EvalValue::Absent)
         }
         DocumentBuiltin::NumberRound => EvalValue::Number(first.number().unwrap_or(0.0).round()),
         DocumentBuiltin::NumberTruncate => EvalValue::Number(first.number().unwrap_or(0.0).trunc()),
         DocumentBuiltin::TextAllCharsIn => {
-            let allowed = values.next().unwrap_or(EvalValue::Null).text();
-            EvalValue::Bool(
+            let allowed = values.next().unwrap_or(EvalValue::Absent).text();
+            EvalValue::Truth(
                 first
                     .text()
                     .chars()
@@ -4201,13 +4200,13 @@ fn eval_builtin(
             );
             EvalValue::Text(parts.join(&separator))
         }
-        DocumentBuiltin::TextContains => EvalValue::Bool(
+        DocumentBuiltin::TextContains => EvalValue::Truth(
             first
                 .text()
-                .contains(&values.next().unwrap_or(EvalValue::Null).text()),
+                .contains(&values.next().unwrap_or(EvalValue::Absent).text()),
         ),
         DocumentBuiltin::TextEmpty => EvalValue::Text(String::new()),
-        DocumentBuiltin::TextIsEmpty => EvalValue::Bool(first.text().is_empty()),
+        DocumentBuiltin::TextIsEmpty => EvalValue::Truth(first.text().is_empty()),
         DocumentBuiltin::TextJoin => {
             let separator = named_value(&arguments, "separator")
                 .map(EvalValue::text)
@@ -4471,7 +4470,7 @@ fn embedded_program_source_units(value: &EvalValue) -> Vec<EmbeddedProgramSource
         .iter()
         .map(|value| {
             let fields = match value {
-                EvalValue::Record(fields) | EvalValue::Tagged(_, fields) => Some(fields),
+                EvalValue::Record(fields) | EvalValue::Tag(_, fields) => Some(fields),
                 EvalValue::MappedRow { fields, .. } => Some(fields),
                 _ => None,
             };
@@ -4639,7 +4638,7 @@ fn map_overlays(value: &EvalValue) -> Result<Vec<MapOverlayDescriptor>, Document
 
 fn map_overlay(value: &EvalValue, index: usize) -> Result<MapOverlayDescriptor, DocumentError> {
     let path = format!("overlays[{index}]");
-    let EvalValue::Tagged(kind, fields) = value else {
+    let EvalValue::Tag(kind, fields) = value else {
         return Err(map_evaluation_error(
             &path,
             "must be a Point, Cluster, Polyline, Polygon, or Label tagged record",
@@ -4835,14 +4834,17 @@ fn map_number(value: &EvalValue, path: &str) -> Result<f64, DocumentError> {
 
 fn map_text(value: &EvalValue, path: &str) -> Result<String, DocumentError> {
     match value {
-        EvalValue::Text(value) | EvalValue::Enum(value) => Ok(value.clone()),
+        EvalValue::Text(value) => Ok(value.clone()),
+        EvalValue::Tag(tag, fields) if fields.is_empty() => Ok(tag.clone()),
         _ => Err(map_evaluation_error(path, "must be text")),
     }
 }
 
 fn map_bool(value: &EvalValue, path: &str) -> Result<bool, DocumentError> {
     match value {
-        EvalValue::Bool(value) => Ok(*value),
+        EvalValue::Truth(value) => Ok(*value),
+        EvalValue::Tag(tag, fields) if fields.is_empty() && tag == "True" => Ok(true),
+        EvalValue::Tag(tag, fields) if fields.is_empty() && tag == "False" => Ok(false),
         _ => Err(map_evaluation_error(path, "must be a boolean")),
     }
 }
@@ -4948,7 +4950,7 @@ fn lower_style_record(record: &BTreeMap<String, EvalValue>, style: &mut StyleMap
             _ => {
                 if let Some(value) = scalar_style_value(value) {
                     style.insert(name.clone(), value);
-                } else if let EvalValue::Record(fields) | EvalValue::Tagged(_, fields) = value {
+                } else if let EvalValue::Record(fields) | EvalValue::Tag(_, fields) = value {
                     for (nested, value) in fields {
                         if let Some(value) = scalar_style_value(value) {
                             style.insert(format!("{name}_{nested}"), value);
@@ -5172,10 +5174,10 @@ fn lower_nested_scalars(prefix: &str, value: &EvalValue, style: &mut StyleMap) {
 
 fn scalar_style_value(value: &EvalValue) -> Option<StyleValue> {
     match value {
-        EvalValue::Bool(value) => Some(StyleValue::Bool(*value)),
+        EvalValue::Truth(value) => Some(StyleValue::Bool(*value)),
         EvalValue::Number(value) => Some(StyleValue::Number(*value)),
-        EvalValue::Text(value) | EvalValue::Enum(value) => Some(StyleValue::Text(value.clone())),
-        EvalValue::Tagged(_, _) => Some(StyleValue::Text(value.text())),
+        EvalValue::Text(value) => Some(StyleValue::Text(value.clone())),
+        EvalValue::Tag(_, _) => Some(StyleValue::Text(value.text())),
         _ => None,
     }
 }
@@ -5184,7 +5186,7 @@ fn record_fields(value: &EvalValue) -> Option<&BTreeMap<String, EvalValue>> {
     match value {
         EvalValue::Record(fields)
         | EvalValue::MappedRow { fields, .. }
-        | EvalValue::Tagged(_, fields) => Some(fields),
+        | EvalValue::Tag(_, fields) => Some(fields),
         _ => None,
     }
 }
@@ -5240,7 +5242,7 @@ fn collect_sources(
         }
         EvalValue::Record(fields)
         | EvalValue::MappedRow { fields, .. }
-        | EvalValue::Tagged(_, fields) => {
+        | EvalValue::Tag(_, fields) => {
             for (name, value) in fields {
                 let explicit_intent = host_source_intent(name).then_some(name.as_str());
                 let intent = explicit_intent.or(inherited_intent);
@@ -5759,7 +5761,7 @@ mod tests {
             ("$tag".to_owned(), Value::Text("Found".to_owned())),
             ("value".to_owned(), Value::Text("current".to_owned())),
         ]));
-        let expected = EvalValue::Tagged(
+        let expected = EvalValue::Tag(
             "Found".to_owned(),
             BTreeMap::from([("value".to_owned(), EvalValue::Text("current".to_owned()))]),
         );
@@ -5885,14 +5887,14 @@ mod tests {
                 EvalValue::Text(format!("hit-{id}")),
             ),
             ("z_order".to_owned(), EvalValue::Number(3.0)),
-            ("selected".to_owned(), EvalValue::Bool(false)),
+            ("selected".to_owned(), EvalValue::Truth(false)),
         ]);
         fields.extend(
             geometry
                 .into_iter()
                 .map(|(name, value)| (name.to_owned(), value)),
         );
-        EvalValue::Tagged(kind.to_owned(), fields)
+        EvalValue::Tag(kind.to_owned(), fields)
     }
 
     #[test]
@@ -5995,10 +5997,10 @@ mod tests {
             (
                 DocumentArgumentRole::MapInteraction,
                 eval_record([
-                    ("pan", EvalValue::Bool(true)),
-                    ("wheel_zoom", EvalValue::Bool(true)),
-                    ("pinch_zoom", EvalValue::Bool(true)),
-                    ("keyboard_zoom", EvalValue::Bool(true)),
+                    ("pan", EvalValue::Truth(true)),
+                    ("wheel_zoom", EvalValue::Truth(true)),
+                    ("pinch_zoom", EvalValue::Truth(true)),
+                    ("keyboard_zoom", EvalValue::Truth(true)),
                 ]),
             ),
         ])
@@ -6201,11 +6203,11 @@ mod tests {
                 "target".to_owned(),
                 EvalValue::Text("waveform canvas".to_owned()),
             ),
-            ("address".to_owned(), EvalValue::Bool(true)),
+            ("address".to_owned(), EvalValue::Truth(true)),
             ("unrelated".to_owned(), EvalValue::Text("hidden".to_owned())),
         ]));
         let explicit_target = EvalValue::Number(7.0);
-        let explicit_address = EvalValue::Enum("row-7".to_owned());
+        let explicit_address = EvalValue::Tag("row-7".to_owned(), BTreeMap::new());
         let forward = resolve_semantic_metadata([
             ("style", DocumentArgumentRole::StaticStyle, &style),
             ("element", DocumentArgumentRole::EventBindings, &events),
@@ -6273,7 +6275,7 @@ mod tests {
                 EvalValue::Text("style fallback address".to_owned()),
             ),
         ]));
-        let nonscalar_target = EvalValue::Null;
+        let nonscalar_target = EvalValue::Absent;
         let metadata = resolve_semantic_metadata([
             ("style", DocumentArgumentRole::StaticStyle, &style),
             ("element", DocumentArgumentRole::EventBindings, &events),
@@ -6402,7 +6404,10 @@ mod tests {
         lower_dimension(
             "width",
             &EvalValue::Record(BTreeMap::from([
-                ("sizing".to_owned(), EvalValue::Enum("Fill".to_owned())),
+                (
+                    "sizing".to_owned(),
+                    EvalValue::Tag("Fill".to_owned(), BTreeMap::new()),
+                ),
                 ("minimum".to_owned(), EvalValue::Number(230.0)),
                 ("maximum".to_owned(), EvalValue::Number(552.0)),
             ])),

@@ -3849,7 +3849,7 @@ fn compiled_program_payload(artifact: &ProgramArtifact, bootstrap: bool) -> Sour
     }
     payload
         .fields
-        .insert("bootstrap".to_owned(), Value::Bool(bootstrap));
+        .insert("bootstrap".to_owned(), Value::truth(bootstrap));
     payload
 }
 
@@ -4397,7 +4397,7 @@ scene: Scene/Element/program(
                 "label".to_owned(),
                 Value::Text("Test credential".to_owned()),
             ),
-            ("workspace_grant_bound".to_owned(), Value::Bool(true)),
+            ("workspace_grant_bound".to_owned(), Value::truth(true)),
         ]))
     }
 
@@ -5170,7 +5170,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
                 Value::Text("temperature=12.4".to_owned()),
             ),
             ("store.connection_status", Value::Text("Online".to_owned())),
-            ("store.snapshot_stale", Value::Bool(false)),
+            ("store.snapshot_stale", Value::truth(false)),
         ] {
             assert_eq!(restored.runtime.root_value_current(path).unwrap(), expected);
         }

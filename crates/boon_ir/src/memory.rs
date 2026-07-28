@@ -62,8 +62,6 @@ pub enum SemanticMemoryRuntimeBacking {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticDataType {
-    Null,
-    Bool,
     Number,
     Text,
     Bytes {

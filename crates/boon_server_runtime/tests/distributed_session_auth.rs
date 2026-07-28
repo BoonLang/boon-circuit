@@ -258,7 +258,7 @@ async fn expect_client_text(socket: &mut ClientSocket, expected: &str) {
         if matches!(
             frame,
             ClientSessionFrame::Data {
-                payload: boon_data::Value::Text(value),
+                payload: Some(boon_data::Value::Text(value)),
                 ..
             } if value == expected
         ) {
@@ -284,7 +284,7 @@ async fn expect_client_text_without_secret(
         if matches!(
             frame,
             ClientSessionFrame::Data {
-                payload: boon_data::Value::Text(value),
+                payload: Some(boon_data::Value::Text(value)),
                 ..
             } if value == expected
         ) {

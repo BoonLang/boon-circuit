@@ -41,6 +41,14 @@ fn number_constant(value: i64) -> PlanConstantValue {
     }
 }
 
+fn tag_constant(name: impl Into<String>) -> PlanConstantValue {
+    PlanConstantValue::Tag { name: name.into() }
+}
+
+fn truth_constant(value: bool) -> PlanConstantValue {
+    tag_constant(if value { "True" } else { "False" })
+}
+
 fn initial(value: PlanConstantValue) -> PlanInitialListFieldInitializer {
     PlanInitialListFieldInitializer::Constant { value }
 }
@@ -264,9 +272,8 @@ fn test_data_type(value_type: PlanValueType) -> DataTypePlan {
     match value_type {
         PlanValueType::Text => DataTypePlan::Text,
         PlanValueType::Number => DataTypePlan::Number,
-        PlanValueType::Bool => DataTypePlan::Bool,
         PlanValueType::Bytes { fixed_len } => DataTypePlan::Bytes { fixed_len },
-        PlanValueType::Enum => DataTypePlan::Variant {
+        PlanValueType::Tag => DataTypePlan::Variant {
             variants: Vec::new(),
         },
         PlanValueType::Data => DataTypePlan::Unknown,
@@ -526,12 +533,12 @@ fn root_value_comparison_tracks_both_state_inputs() {
 
     assert_eq!(
         session.root_value_current("store.same").unwrap(),
-        Value::Bool(true)
+        Value::truth(true)
     );
     session.apply(event(&session, 1, 0, None)).unwrap();
     assert_eq!(
         session.root_value_current("store.same").unwrap(),
-        Value::Bool(false)
+        Value::truth(false)
     );
 }
 
@@ -776,7 +783,7 @@ fn contextual_any_evaluates_typed_local_projections() {
         fields: vec![PlanInitialListField {
             name: "selected".into(),
             field_id: Some(FieldId(10)),
-            initializer: initial(PlanConstantValue::Bool { value: selected }),
+            initializer: initial(truth_constant(selected)),
         }],
     };
     let list = ListStorageSlot {
@@ -828,7 +835,7 @@ fn contextual_any_evaluates_typed_local_projections() {
 
     assert_eq!(
         session.snapshot().unwrap().fields[&FieldId(20)],
-        Value::Bool(true)
+        Value::truth(true)
     );
 }
 
@@ -845,7 +852,7 @@ fn contextual_collection_operations_cover_map_filter_retain_every_any_and_find()
             PlanInitialListField {
                 name: "keep".into(),
                 field_id: Some(FieldId(11)),
-                initializer: initial(PlanConstantValue::Bool { value: keep }),
+                initializer: initial(truth_constant(keep)),
             },
         ],
     };
@@ -910,7 +917,7 @@ fn contextual_collection_operations_cover_map_filter_retain_every_any_and_find()
         plan(
             RootOutputDemand::All,
             row_expressions,
-            vec![constant(0, PlanConstantValue::Bool { value: false })],
+            vec![constant(0, truth_constant(false))],
             Vec::new(),
             Vec::new(),
             vec![list],
@@ -950,28 +957,22 @@ fn contextual_collection_operations_cover_map_filter_retain_every_any_and_find()
         Value::List(expected_rows.clone())
     );
     assert_eq!(snapshot.fields[&FieldId(22)], Value::List(expected_rows));
-    assert_eq!(snapshot.fields[&FieldId(23)], Value::Bool(false));
-    assert_eq!(snapshot.fields[&FieldId(24)], Value::Bool(true));
+    assert_eq!(snapshot.fields[&FieldId(23)], Value::truth(false));
+    assert_eq!(snapshot.fields[&FieldId(24)], Value::truth(true));
     assert_eq!(
         snapshot.fields[&FieldId(25)],
-        Value::Record(BTreeMap::from([
-            ("$tag".to_owned(), Value::Text("Found".to_owned())),
-            (
+        Value::tagged(
+            "Found",
+            BTreeMap::from([(
                 "value".to_owned(),
                 Value::Row {
                     id: snapshot.lists[&ListId(0)][1].id,
                     fields: BTreeMap::new(),
                 },
-            ),
-        ]))
+            )]),
+        )
     );
-    assert_eq!(
-        snapshot.fields[&FieldId(26)],
-        Value::Record(BTreeMap::from([(
-            "$tag".to_owned(),
-            Value::Text("NotFound".to_owned()),
-        )]))
-    );
+    assert_eq!(snapshot.fields[&FieldId(26)], Value::tag("NotFound"));
 }
 
 #[test]
@@ -1257,7 +1258,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
                 PlanInitialListField {
                     name: "initial".into(),
                     field_id: Some(FieldId(12)),
-                    initializer: initial(PlanConstantValue::Bool { value: false }),
+                    initializer: initial(truth_constant(false)),
                 },
             ],
         }],
@@ -1304,7 +1305,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
                 list: ListId(0),
             }],
         },
-        value_type: PlanValueType::Bool,
+        value_type: PlanValueType::Tag,
         scope_id: Some(ScopeId(0)),
         indexed: true,
         indexed_field_id: Some(FieldId(11)),
@@ -1387,7 +1388,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
     let mut machine_plan = plan(
         RootOutputDemand::All,
         row_expressions,
-        vec![constant(0, PlanConstantValue::Bool { value: true })],
+        vec![constant(0, truth_constant(true))],
         vec![select_route],
         vec![selected_state],
         vec![source_rows, projected_rows],
@@ -1498,9 +1499,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
             PlanInitialListField {
                 name: "initial".into(),
                 field_id: Some(FieldId(12)),
-                initializer: initial(PlanConstantValue::Enum {
-                    value: "Hexadecimal".into(),
-                }),
+                initializer: initial(tag_constant("Hexadecimal")),
             },
         ],
     };
@@ -1543,7 +1542,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
                 list: ListId(0),
             }],
         },
-        value_type: PlanValueType::Enum,
+        value_type: PlanValueType::Tag,
         scope_id: Some(ScopeId(0)),
         indexed: true,
         indexed_field_id: Some(FieldId(11)),
@@ -1587,7 +1586,9 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
             input: is_active,
             arms: vec![
                 PlanRowSelectArm {
-                    pattern: PlanRowSelectPattern::Bool { value: true },
+                    pattern: PlanRowSelectPattern::Tag {
+                        name: "True".to_owned(),
+                    },
                     value: toggled,
                 },
                 PlanRowSelectArm {
@@ -1650,12 +1651,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
                         value: "ref".into(),
                     },
                 ),
-                constant(
-                    7,
-                    PlanConstantValue::Enum {
-                        value: "Binary".into(),
-                    },
-                ),
+                constant(7, tag_constant("Binary")),
                 constant(8, PlanConstantValue::Text { value: "__".into() }),
                 constant(
                     9,
@@ -6672,22 +6668,19 @@ fn non_monotonic_source_sequences_are_rejected() {
 #[test]
 fn durable_variants_round_trip_tag_only_and_structured_values() {
     assert_eq!(
-        crate::machine::runtime_value(boon_persistence::StoredValue::Variant {
+        crate::machine::runtime_value(boon_persistence::StoredValue::Tag {
             tag: "Done".to_owned(),
             fields: BTreeMap::new(),
         })
         .unwrap(),
-        Value::Text("Done".to_owned())
+        Value::tag("Done")
     );
 
-    let runtime = Value::Record(BTreeMap::from([
-        ("$tag".to_owned(), Value::Text("Ready".to_owned())),
-        ("count".to_owned(), number(4)),
-    ]));
+    let runtime = Value::tagged("Ready", BTreeMap::from([("count".to_owned(), number(4))]));
     let stored = crate::machine::stored_value(&runtime).unwrap();
     assert!(matches!(
         &stored,
-        boon_persistence::StoredValue::Variant { tag, fields }
+        boon_persistence::StoredValue::Tag { tag, fields }
             if tag == "Ready" && fields["count"] == stored_number(4)
     ));
     assert_eq!(crate::machine::runtime_value(stored).unwrap(), runtime);
@@ -7238,29 +7231,19 @@ store: [
 }
 
 #[test]
-fn text_to_number_propagates_an_input_error_without_stringifying_it() {
-    let compiled = compile_server_source(
-        "text-to-number-error-propagation-executor.bn",
-        r#"
+fn removed_error_builtins_are_rejected() {
+    assert!(
+        compile_server_source(
+            "text-to-number-error-propagation-executor.bn",
+            r#"
 store: [
     value: Error/new(code: TEXT { upstream_failure }) |> Text/to_number()
     error: Error/text(value: value)
 ]
 "#,
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
-
-    assert_eq!(
-        session.root_value_current("store.value").unwrap(),
-        Value::Error {
-            code: "upstream_failure".to_owned()
-        }
-    );
-    assert_eq!(
-        session.root_value_current("store.error").unwrap(),
-        Value::Text("upstream_failure".to_owned())
+            TargetProfile::SoftwareDefault,
+        )
+        .is_err()
     );
 }
 
@@ -8937,7 +8920,7 @@ store: [
                 ("start_time", number(0)),
                 ("end_time", number(10)),
                 ("offset", number(0)),
-                ("has_more", Value::Bool(false)),
+                ("has_more", Value::truth(false)),
                 ("next_offset", number(1)),
                 ("total_rows", number(1)),
                 (
@@ -10588,7 +10571,7 @@ fn result_variant(
     tag: &str,
     fields: impl IntoIterator<Item = (&'static str, boon_persistence::StoredValue)>,
 ) -> boon_persistence::StoredValue {
-    boon_persistence::StoredValue::Variant {
+    boon_persistence::StoredValue::Tag {
         tag: tag.to_owned(),
         fields: fields
             .into_iter()
@@ -10613,12 +10596,12 @@ fn apply_register_effect(
         })
         .unwrap();
     let pending = enqueue_item(&turn);
-    let boon_persistence::StoredValue::Record(intent) = &pending.intent else {
+    let boon_persistence::StoredValue::Object(intent) = &pending.intent else {
         panic!("effect intent must be a durable record");
     };
     assert_eq!(
         intent["simulation"],
-        boon_persistence::StoredValue::Variant {
+        boon_persistence::StoredValue::Tag {
             tag: "Success".to_owned(),
             fields: BTreeMap::new(),
         }
@@ -10691,7 +10674,7 @@ store: [
                     ),
                     (
                         "workspace_grant_bound",
-                        boon_persistence::StoredValue::Bool(true),
+                        boon_persistence::StoredValue::truth(true),
                     ),
                 ],
             ),
@@ -10733,7 +10716,7 @@ fn correlated_effect_completion_routes_each_registration_variant_with_typed_fiel
                     ),
                     (
                         "workspace_grant_bound",
-                        boon_persistence::StoredValue::Bool(true),
+                        boon_persistence::StoredValue::truth(true),
                     ),
                 ],
             ),
@@ -10760,11 +10743,11 @@ fn correlated_effect_completion_routes_each_registration_variant_with_typed_fiel
                         "message",
                         boon_persistence::StoredValue::Text("Not allowed".to_owned()),
                     ),
-                    ("retryable", boon_persistence::StoredValue::Bool(true)),
+                    ("retryable", boon_persistence::StoredValue::truth(true)),
                 ],
             ),
             "RegistrationFailed",
-            Some(("store.failure_retryable", Value::Bool(true))),
+            Some(("store.failure_retryable", Value::truth(true))),
         ),
         (
             result_variant(
@@ -10966,7 +10949,7 @@ fn reconciliation_completion_routes_result_after_session_restart() {
             ),
             (
                 "workspace_grant_bound",
-                boon_persistence::StoredValue::Bool(true),
+                boon_persistence::StoredValue::truth(true),
             ),
         ],
     );
@@ -11207,7 +11190,7 @@ store: [
             route: route_token(&session, add, None),
             target: None,
             payload: SourcePayload {
-                fields: BTreeMap::from([("value".to_owned(), Value::Bool(false))]),
+                fields: BTreeMap::from([("value".to_owned(), Value::truth(false))]),
                 ..SourcePayload::default()
             },
         })
@@ -11223,7 +11206,7 @@ store: [
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].fields.values().next(),
-        Some(&Value::Bool(false)),
+        Some(&Value::truth(false)),
         "THEN is gated by event presence, not by the transitioned value's truthiness"
     );
 }
@@ -11459,11 +11442,11 @@ fn session_info_intrinsics_default_to_current_and_anonymous_without_hidden_ident
     let mut session = MachineInstance::new(session_info_plan(), SessionOptions::default()).unwrap();
     assert_eq!(
         session.output_value_current("status").unwrap(),
-        Value::Text("Current".to_owned())
+        Value::tag("Current")
     );
     assert_eq!(
         session.output_value_current("principal").unwrap(),
-        Value::Text("Anonymous".to_owned())
+        Value::tag("Anonymous")
     );
 }
 
@@ -11484,21 +11467,23 @@ fn session_info_context_updates_are_current_and_canonical() {
 
     assert_eq!(
         session.output_value_current("status").unwrap(),
-        Value::Text("Connecting".to_owned())
+        Value::tag("Connecting")
     );
     assert_eq!(
         session.output_value_current("principal").unwrap(),
-        Value::Record(BTreeMap::from([
-            ("$tag".to_owned(), Value::Text("Authenticated".to_owned()),),
-            ("subject".to_owned(), Value::Text("person-42".to_owned()),),
-            (
-                "roles".to_owned(),
-                Value::List(vec![
-                    Value::Text("operator".to_owned()),
-                    Value::Text("viewer".to_owned()),
-                ]),
-            ),
-        ]))
+        Value::tagged(
+            "Authenticated",
+            BTreeMap::from([
+                ("subject".to_owned(), Value::Text("person-42".to_owned()),),
+                (
+                    "roles".to_owned(),
+                    Value::List(vec![
+                        Value::Text("operator".to_owned()),
+                        Value::Text("viewer".to_owned()),
+                    ]),
+                ),
+            ]),
+        )
     );
 
     assert!(
@@ -11514,17 +11499,17 @@ fn session_info_context_updates_are_current_and_canonical() {
     );
     assert_eq!(
         session.output_value_current("status").unwrap(),
-        Value::Record(BTreeMap::from([
-            ("$tag".to_owned(), Value::Text("Failed".to_owned())),
-            (
+        Value::tagged(
+            "Failed",
+            BTreeMap::from([(
                 "code".to_owned(),
                 Value::Text("transport_timeout".to_owned()),
-            ),
-        ]))
+            ),]),
+        )
     );
     assert_eq!(
         session.output_value_current("principal").unwrap(),
-        Value::Text("Anonymous".to_owned())
+        Value::tag("Anonymous")
     );
 }
 
@@ -12165,32 +12150,22 @@ fn distributed_context_value(
     ]))
 }
 
-fn remote_not_current() -> Value {
-    Value::Error {
-        code: "remote_not_current".to_owned(),
-    }
-}
-
-fn session_scope_unavailable() -> Value {
-    Value::Error {
-        code: "session_scope_unavailable".to_owned(),
-    }
-}
-
 fn authenticated_principal_value(subject: &str, roles: &[&str]) -> Value {
-    Value::Record(BTreeMap::from([
-        ("$tag".to_owned(), Value::Text("Authenticated".to_owned())),
-        ("subject".to_owned(), Value::Text(subject.to_owned())),
-        (
-            "roles".to_owned(),
-            Value::List(
-                roles
-                    .iter()
-                    .map(|role| Value::Text((*role).to_owned()))
-                    .collect(),
+    Value::tagged(
+        "Authenticated",
+        BTreeMap::from([
+            ("subject".to_owned(), Value::Text(subject.to_owned())),
+            (
+                "roles".to_owned(),
+                Value::List(
+                    roles
+                        .iter()
+                        .map(|role| Value::Text((*role).to_owned()))
+                        .collect(),
+                ),
             ),
-        ),
-    ]))
+        ]),
+    )
 }
 
 fn update_atomic_call_result(
@@ -12228,24 +12203,6 @@ fn distributed_context_transaction_recomputes_dependents_once_with_the_complete_
     )
     .unwrap();
     let principal = SessionPrincipal::authenticated("person-42", ["operator", "viewer"]).unwrap();
-    let expected = distributed_context_value(
-        Value::Text("Current".to_owned()),
-        Value::Record(BTreeMap::from([
-            ("$tag".to_owned(), Value::Text("Authenticated".to_owned())),
-            (
-                "roles".to_owned(),
-                Value::List(vec![
-                    Value::Text("operator".to_owned()),
-                    Value::Text("viewer".to_owned()),
-                ]),
-            ),
-            ("subject".to_owned(), Value::Text("person-42".to_owned())),
-        ])),
-        number(11),
-        number(22),
-        remote_not_current(),
-    );
-
     let turn = session
         .update_distributed_context(
             SessionConnectionStatus::Current,
@@ -12265,7 +12222,7 @@ fn distributed_context_transaction_recomputes_dependents_once_with_the_complete_
         turn.metrics.recomputed_targets,
         vec![ValueTarget::Field(FieldId(0))]
     );
-    assert_eq!(
+    assert!(
         turn.deltas
             .iter()
             .filter_map(|delta| match delta {
@@ -12275,8 +12232,8 @@ fn distributed_context_transaction_recomputes_dependents_once_with_the_complete_
                 } => Some(value.clone()),
                 _ => None,
             })
-            .collect::<Vec<_>>(),
-        vec![expected.clone()]
+            .next()
+            .is_none()
     );
     assert_eq!(
         turn.deltas
@@ -12287,11 +12244,10 @@ fn distributed_context_transaction_recomputes_dependents_once_with_the_complete_
     );
     assert!(turn.transient_effects.is_empty());
     assert!(turn.cancelled_transient_effects.is_empty());
-    assert_eq!(
+    assert!(
         session
             .root_value_current("store.distributed_context")
-            .unwrap(),
-        expected
+            .is_err()
     );
     assert_eq!(
         session.distributed_import_revision(fixture.first_import_id),
@@ -12337,8 +12293,8 @@ fn distributed_context_patch_makes_session_available_and_preserves_omitted_impor
             .root_value_current("store.distributed_context")
             .unwrap(),
         distributed_context_value(
-            Value::Text("Stale".to_owned()),
-            Value::Text("Anonymous".to_owned()),
+            Value::tag("Stale"),
+            Value::tag("Anonymous"),
             number(11),
             number(22),
             number(33),
@@ -12425,17 +12381,10 @@ fn distributed_context_argument_change_invalidates_result_and_restarts_its_revis
         "call identity is stable while argument freshness is tracked separately"
     );
     assert_ne!(changed_instance.arguments, original_instance.arguments);
-    assert_eq!(
+    assert!(
         session
             .root_value_current("store.distributed_context")
-            .unwrap(),
-        distributed_context_value(
-            Value::Text("Current".to_owned()),
-            authenticated_principal_value("origin-a", &["viewer"]),
-            number(44),
-            number(22),
-            remote_not_current(),
-        )
+            .is_err()
     );
 
     update_atomic_call_result(&mut session, fixture.call_site_id, 1, number(55));
@@ -12444,7 +12393,7 @@ fn distributed_context_argument_change_invalidates_result_and_restarts_its_revis
             .root_value_current("store.distributed_context")
             .unwrap(),
         distributed_context_value(
-            Value::Text("Current".to_owned()),
+            Value::tag("Current"),
             authenticated_principal_value("origin-a", &["viewer"]),
             number(44),
             number(22),
@@ -12472,13 +12421,6 @@ fn distributed_context_replacement_resets_omitted_bindings_and_the_revision_name
         .expect("origin A must install a complete context");
     update_atomic_call_result(&mut session, fixture.call_site_id, 5, number(33));
 
-    let expected = distributed_context_value(
-        Value::Text("Current".to_owned()),
-        authenticated_principal_value("origin-b", &["operator"]),
-        remote_not_current(),
-        number(222),
-        remote_not_current(),
-    );
     let turn = session
         .replace_distributed_context(
             SessionContext::Available {
@@ -12498,13 +12440,19 @@ fn distributed_context_replacement_resets_omitted_bindings_and_the_revision_name
     assert_eq!(
         turn.deltas
             .iter()
-            .filter(|delta| matches!(delta, Delta::SetDistributedImport { .. }))
+            .filter(|delta| {
+                matches!(
+                    delta,
+                    Delta::SetDistributedImport { .. } | Delta::ClearDistributedImport { .. }
+                )
+            })
             .count(),
         2
     );
-    assert_eq!(
-        session.distributed_import_value_current(fixture.first_import_id),
-        Ok(remote_not_current())
+    assert!(
+        session
+            .distributed_import_value_current(fixture.first_import_id)
+            .is_err()
     );
     assert_eq!(
         session.distributed_import_revision(fixture.first_import_id),
@@ -12518,11 +12466,10 @@ fn distributed_context_replacement_resets_omitted_bindings_and_the_revision_name
         session.distributed_import_revision(fixture.call_result_import_id),
         None
     );
-    assert_eq!(
+    assert!(
         session
             .root_value_current("store.distributed_context")
-            .unwrap(),
-        expected
+            .is_err()
     );
 }
 
@@ -12579,23 +12526,13 @@ fn unavailable_distributed_context_clears_all_imports_and_session_info() {
         .unwrap()
         .expect("the global context must clear origin A");
     assert_eq!(turn.metrics.recomputed_field_count, 1);
-    assert_eq!(
+    assert!(
         session
             .root_value_current("store.distributed_context")
-            .unwrap(),
-        distributed_context_value(
-            session_scope_unavailable(),
-            session_scope_unavailable(),
-            remote_not_current(),
-            remote_not_current(),
-            remote_not_current(),
-        )
+            .is_err()
     );
     for import_id in [fixture.first_import_id, fixture.second_import_id] {
-        assert_eq!(
-            session.distributed_import_value_current(import_id),
-            Ok(remote_not_current())
-        );
+        assert!(session.distributed_import_value_current(import_id).is_err());
         assert_eq!(session.distributed_import_revision(import_id), None);
     }
 }
@@ -12605,7 +12542,7 @@ fn distributed_context_replacement_rejects_a_batch_without_exposing_its_valid_pr
     let fixture = atomic_distributed_context_fixture();
     let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
     let initial = distributed_context_value(
-        Value::Text("Current".to_owned()),
+        Value::tag("Current"),
         authenticated_principal_value("origin-a", &["viewer"]),
         number(11),
         number(22),
@@ -12663,7 +12600,7 @@ fn distributed_context_replacement_rejects_a_batch_without_exposing_its_valid_pr
 fn distributed_context_replacement_rolls_back_context_values_and_revisions_together() {
     let fixture = atomic_distributed_context_fixture();
     let initial = distributed_context_value(
-        Value::Text("Current".to_owned()),
+        Value::tag("Current"),
         authenticated_principal_value("origin-a", &["viewer"]),
         number(11),
         number(22),
@@ -12729,19 +12666,11 @@ fn distributed_import_updates_are_current_monotonic_and_idempotent() {
     let mut session = MachineInstance::new(fixture.plan, SessionOptions::default()).unwrap();
 
     assert_eq!(session.distributed_import_revision(fixture.import_id), None);
-    assert_eq!(
-        session.root_value_current("store.remote_count").unwrap(),
-        Value::Error {
-            code: "remote_not_current".to_owned(),
-        }
-    );
-    assert_eq!(
+    assert!(session.root_value_current("store.remote_count").is_err());
+    assert!(
         session
             .distributed_export_value_current(fixture.value_export_id)
-            .unwrap(),
-        Value::Error {
-            code: "remote_not_current".to_owned(),
-        }
+            .is_err()
     );
 
     assert!(matches!(
@@ -13256,10 +13185,7 @@ FUNCTION add(value) {
         .expect("first result update");
     let current_rows = client.list_row_snapshots_current(rows_list).unwrap();
     assert_eq!(current_rows[0].fields.get(&result_field), Some(&number(11)));
-    assert!(matches!(
-        current_rows[1].fields.get(&result_field),
-        Some(Value::Error { code }) if code == "remote_not_current"
-    ));
+    assert_eq!(current_rows[1].fields.get(&result_field), None);
 
     client
         .apply(SourceEvent {
@@ -13448,16 +13374,14 @@ FUNCTION double(value) {
     .unwrap();
 
     for (instance, value) in [(first_outer, 3), (second_outer, 4)] {
-        let initial = session
-            .evaluate_distributed_function_instance(
-                outer_call.call_site_id,
-                instance,
-                outer_call.function_export_id,
-                1,
-                BTreeMap::from([(outer_argument, number(value))]),
-            )
-            .unwrap();
-        assert!(matches!(initial, Value::Error { code } if code == "remote_not_current"));
+        let initial = session.evaluate_distributed_function_instance(
+            outer_call.call_site_id,
+            instance,
+            outer_call.function_export_id,
+            1,
+            BTreeMap::from([(outer_argument, number(value))]),
+        );
+        assert!(initial.is_err());
     }
 
     let nested = session
@@ -13502,12 +13426,11 @@ FUNCTION double(value) {
             .unwrap(),
         number(6)
     );
-    assert!(matches!(
+    assert!(
         session
             .distributed_producer_call_result_current(outer_call.call_site_id, second_outer)
-            .unwrap(),
-        Value::Error { code } if code == "remote_not_current"
-    ));
+            .is_err()
+    );
 
     session
         .update_distributed_call_result(
@@ -13993,7 +13916,6 @@ fn detached_state_capture_is_published_before_indexed_state_initialization() {
             .fields
             .get(&FieldId(22))
             .expect("indexed state initialized from capture");
-        assert_ne!(captured, &Value::Null);
         assert_eq!(initialized, captured);
     }
 }

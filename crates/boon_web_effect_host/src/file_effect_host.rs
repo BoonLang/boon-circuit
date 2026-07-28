@@ -581,14 +581,13 @@ impl BrowserFileEffectHost {
                         "read-stream chunk_bytes is outside the canonical bounded range",
                     ));
                 }
-                let retain_content = match required_field(fields, "retain_content")? {
-                    Value::Bool(value) => *value,
-                    _ => {
-                        return Err(FileFailure::invalid(
-                            "read-stream retain_content must be Bool",
-                        ));
-                    }
-                };
+                let retain_content = required_field(fields, "retain_content")?
+                    .as_truth()
+                    .ok_or_else(|| {
+                        FileFailure::invalid(
+                            "read-stream retain_content must be the True or False tag",
+                        )
+                    })?;
                 Ok(DecodedOperation::ReadStream {
                     source,
                     chunk_bytes,
@@ -611,18 +610,14 @@ impl BrowserFileEffectHost {
     }
 
     fn resolve_source(&self, value: &Value) -> Result<ResolvedFileSource, FileFailure> {
-        let fields = exact_record(
-            value.visible(),
-            match value.visible() {
-                Value::Record(fields) if matches!(fields.get("$tag"), Some(Value::Text(tag)) if tag == "PackageAsset") => {
-                    &["$tag", "url"]
-                }
-                _ => &["$tag"],
-            },
-            "browser file source",
-        )?;
-        match fields.get("$tag") {
-            Some(Value::Text(tag)) if tag == "FileSelected" => {
+        let Value::Tag { tag, fields } = value.visible() else {
+            return Err(FileFailure::invalid(
+                "file input must be FileSelected or PackageAsset",
+            ));
+        };
+        match tag.as_str() {
+            "FileSelected" => {
+                exact_fields(fields, &[], "selected file capability")?;
                 let binding = value
                     .host_binding()
                     .ok_or_else(|| FileFailure::invalid("selected file has no host binding"))?;
@@ -637,7 +632,8 @@ impl BrowserFileEffectHost {
                     )),
                 }
             }
-            Some(Value::Text(tag)) if tag == "PackageAsset" => {
+            "PackageAsset" => {
+                exact_fields(fields, &["url"], "package asset")?;
                 if value.host_binding().is_some() {
                     return Err(FileFailure::invalid(
                         "package assets must not carry a host binding",
@@ -4065,6 +4061,15 @@ fn exact_record<'a>(
     let Value::Record(fields) = value else {
         return Err(FileFailure::invalid(format!("{context} must be a record")));
     };
+    exact_fields(fields, expected, context)?;
+    Ok(fields)
+}
+
+fn exact_fields(
+    fields: &BTreeMap<String, Value>,
+    expected: &[&str],
+    context: &str,
+) -> Result<(), FileFailure> {
     let actual = fields.keys().map(String::as_str).collect::<BTreeSet<_>>();
     let expected = expected.iter().copied().collect::<BTreeSet<_>>();
     if actual != expected {
@@ -4072,7 +4077,7 @@ fn exact_record<'a>(
             "{context} fields differ from the canonical typed contract"
         )));
     }
-    Ok(fields)
+    Ok(())
 }
 
 fn required_field<'a>(
@@ -4097,9 +4102,8 @@ fn positive_usize(fields: &BTreeMap<String, Value>, name: &str) -> Result<usize,
 }
 
 fn validate_bound_tag(value: &Value, expected_tag: &str) -> Result<(), FileFailure> {
-    let fields = exact_record(value.visible(), &["$tag"], "browser file capability")?;
-    match fields.get("$tag") {
-        Some(Value::Text(tag)) if tag == expected_tag => Ok(()),
+    match value.visible() {
+        Value::Tag { tag, fields } if tag == expected_tag && fields.is_empty() => Ok(()),
         _ => Err(FileFailure::invalid(format!(
             "browser file capability must be {expected_tag}"
         ))),
@@ -4138,9 +4142,8 @@ fn started_import_outcome(
     ))
 }
 
-fn tagged(tag: &str, mut fields: BTreeMap<String, Value>) -> Value {
-    fields.insert("$tag".to_owned(), Value::Text(tag.to_owned()));
-    Value::Record(fields)
+fn tagged(tag: &str, fields: BTreeMap<String, Value>) -> Value {
+    Value::tagged(tag, fields)
 }
 
 fn number(value: u64) -> Result<Value, FileFailure> {
@@ -4174,10 +4177,15 @@ fn value_payload_bytes(value: &Value) -> usize {
             .iter()
             .map(|(name, value)| name.len().saturating_add(value_payload_bytes(value)))
             .sum(),
+        Value::Tag { tag, fields } => tag.len().saturating_add(
+            fields
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(value_payload_bytes(value)))
+                .sum(),
+        ),
         Value::Row { fields, .. } => fields.values().map(value_payload_bytes).sum(),
         Value::HostBound { visible, .. } => value_payload_bytes(visible),
-        Value::Error { code } => code.len(),
-        Value::Null | Value::Bool(_) | Value::Number(_) => 16,
+        Value::Number(_) => 16,
     }
 }
 
@@ -4401,11 +4409,8 @@ mod tests {
     }
 
     fn outcome_tag(value: &Value) -> &str {
-        let Value::Record(fields) = value else {
-            panic!("effect outcome must be a tagged record");
-        };
-        let Some(Value::Text(tag)) = fields.get("$tag") else {
-            panic!("effect outcome must contain a Text tag");
+        let Value::Tag { tag, .. } = value else {
+            panic!("effect outcome must be a tag");
         };
         tag
     }
@@ -4455,7 +4460,7 @@ mod tests {
                     Value::integer(FILE_STREAM_DEFAULT_CHUNK_BYTES as i64).unwrap(),
                 ),
                 ("file".to_owned(), selected),
-                ("retain_content".to_owned(), Value::Bool(false)),
+                ("retain_content".to_owned(), Value::truth(false)),
             ])),
         );
         let call_id = stream.call_id;
@@ -4478,7 +4483,7 @@ mod tests {
         assert_eq!(timed_out.result_sequence, Some(5));
         assert!(timed_out.terminal);
         assert_eq!(outcome_tag(&timed_out.outcome), "Failed");
-        let Value::Record(fields) = timed_out.outcome else {
+        let Value::Tag { fields, .. } = timed_out.outcome else {
             unreachable!();
         };
         assert_eq!(fields["code"], Value::Text("timeout".to_owned()));
@@ -4525,7 +4530,7 @@ mod tests {
         assert!(completion.terminal);
         assert_eq!(completion.result_sequence, None);
         assert_eq!(outcome_tag(&completion.outcome), "BytesRead");
-        let Value::Record(fields) = completion.outcome else {
+        let Value::Tag { fields, .. } = completion.outcome else {
             unreachable!();
         };
         let Value::Bytes(bytes) = &fields["bytes"] else {
@@ -4604,7 +4609,11 @@ mod tests {
         let imported = next_notification(&mut host).await;
         assert!(imported.terminal);
         assert_eq!(outcome_tag(&imported.outcome), "Imported");
-        let Value::Record(imported_fields) = imported.outcome else {
+        let Value::Tag {
+            fields: imported_fields,
+            ..
+        } = imported.outcome
+        else {
             unreachable!();
         };
         let content = imported_fields["content"].clone();
@@ -4697,7 +4706,11 @@ mod tests {
             assert!(active.abort_started);
         }
 
-        let replacement = test_invocation(BrowserFileEffectOperation::WriteBytes, 52, Value::Null);
+        let replacement = test_invocation(
+            BrowserFileEffectOperation::WriteBytes,
+            52,
+            Value::tag("Invalid"),
+        );
         host.submit(BrowserFileEffectOperation::WriteBytes, replacement)
             .unwrap();
         let busy = next_notification(&mut host).await;
@@ -4709,7 +4722,7 @@ mod tests {
         assert_eq!(timed_out.call_id, call_id);
         assert!(timed_out.terminal);
         assert_eq!(outcome_tag(&timed_out.outcome), "Failed");
-        let Value::Record(fields) = timed_out.outcome else {
+        let Value::Tag { fields, .. } = timed_out.outcome else {
             unreachable!();
         };
         assert_eq!(fields["code"], Value::Text("timeout".to_owned()));
@@ -4776,7 +4789,11 @@ mod tests {
         assert_eq!(imported.result_sequence, Some(6));
         assert!(imported.terminal);
         assert_eq!(outcome_tag(&imported.outcome), "Imported");
-        let Value::Record(imported_fields) = &imported.outcome else {
+        let Value::Tag {
+            fields: imported_fields,
+            ..
+        } = &imported.outcome
+        else {
             unreachable!();
         };
         let content = ContentRef::from_value(&imported_fields["content"]).unwrap();
@@ -4800,7 +4817,7 @@ mod tests {
                     Value::integer(FILE_STREAM_DEFAULT_CHUNK_BYTES as i64).unwrap(),
                 ),
                 ("file".to_owned(), selected),
-                ("retain_content".to_owned(), Value::Bool(true)),
+                ("retain_content".to_owned(), Value::truth(true)),
             ])),
         );
         let stream_call = stream.call_id;
@@ -4826,13 +4843,21 @@ mod tests {
         assert_eq!(finished.result_sequence, Some(6));
         assert!(finished.terminal);
         assert_eq!(outcome_tag(&finished.outcome), "Finished");
-        let Value::Record(finished_fields) = &finished.outcome else {
+        let Value::Tag {
+            fields: finished_fields,
+            ..
+        } = &finished.outcome
+        else {
             unreachable!();
         };
-        let Value::Record(retained_fields) = &finished_fields["retained"] else {
-            panic!("retained result must be a tagged record");
+        let Value::Tag {
+            tag,
+            fields: retained_fields,
+        } = &finished_fields["retained"]
+        else {
+            panic!("retained result must be a tag");
         };
-        assert_eq!(retained_fields["$tag"], Value::Text("Retained".to_owned()));
+        assert_eq!(tag, "Retained");
         assert_eq!(
             ContentRef::from_value(&retained_fields["content"]).unwrap(),
             content

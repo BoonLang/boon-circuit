@@ -440,7 +440,7 @@ async fn real_content_drives_bounded_typed_pages_and_survives_parser_cache_evict
         panic!("transition value must be a closed variant");
     };
     assert!(matches!(value.get("$tag"), Some(Value::Text(tag)) if tag.ends_with("Value")));
-    assert_eq!(signal_page["has_more"], Value::Bool(true));
+    assert_eq!(signal_page["has_more"], Value::truth(true));
     assert_eq!(integer(&signal_page["next_offset"]), 1);
 
     let next_signal_page = submit_waveform(

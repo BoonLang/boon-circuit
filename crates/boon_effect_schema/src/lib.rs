@@ -37,7 +37,6 @@ pub enum DeliveryCardinalitySpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValueType {
-    Bool,
     Number,
     Text,
     Bytes { fixed_len: Option<u64> },
@@ -74,7 +73,7 @@ pub struct IntentDefaultSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IntentDefaultValueSpec {
-    Bool(bool),
+    Tag(&'static str),
     ExactInteger(i64),
     Text(&'static str),
 }
@@ -356,7 +355,7 @@ fn wellen_hierarchy_page() -> HostEffectSpec {
                             field("start_time", ValueType::Number),
                             field("end_time", ValueType::Number),
                             field("offset", ValueType::Number),
-                            field("has_more", ValueType::Bool),
+                            field("has_more", truth_type()),
                             field("next_offset", ValueType::Number),
                             field("total_rows", ValueType::Number),
                             field(
@@ -440,7 +439,7 @@ fn wellen_signal_page() -> HostEffectSpec {
                             field("start_time", ValueType::Number),
                             field("end_time", ValueType::Number),
                             field("offset", ValueType::Number),
-                            field("has_more", ValueType::Bool),
+                            field("has_more", truth_type()),
                             field("next_offset", ValueType::Number),
                             field(
                                 "signals",
@@ -590,7 +589,7 @@ fn secret_verify() -> HostEffectSpec {
         ]),
         ValueType::Variant {
             variants: vec![
-                variant("SecretVerified", [field("matches", ValueType::Bool)]),
+                variant("SecretVerified", [field("matches", truth_type())]),
                 host_service_failure(),
             ],
         },
@@ -638,7 +637,7 @@ fn hmac_sha256_verify() -> HostEffectSpec {
         ]),
         ValueType::Variant {
             variants: vec![
-                variant("HmacVerified", [field("matches", ValueType::Bool)]),
+                variant("HmacVerified", [field("matches", truth_type())]),
                 host_service_failure(),
             ],
         },
@@ -836,7 +835,7 @@ fn file_read_stream() -> HostEffectSpec {
             intent: record([
                 field("file", file_selection_type()),
                 field("chunk_bytes", ValueType::Number),
-                field("retain_content", ValueType::Bool),
+                field("retain_content", truth_type()),
             ]),
             result: ValueType::Variant {
                 variants: vec![
@@ -936,7 +935,7 @@ fn development_passkey_registration() -> HostEffectSpec {
                             field("account_id", ValueType::Text),
                             field("credential_id", ValueType::Text),
                             field("label", ValueType::Text),
-                            field("workspace_grant_bound", ValueType::Bool),
+                            field("workspace_grant_bound", truth_type()),
                         ],
                     ),
                     variant("RegistrationCancelled", []),
@@ -945,7 +944,7 @@ fn development_passkey_registration() -> HostEffectSpec {
                         [
                             field("code", ValueType::Text),
                             field("message", ValueType::Text),
-                            field("retryable", ValueType::Bool),
+                            field("retryable", truth_type()),
                         ],
                     ),
                     variant(
@@ -991,7 +990,7 @@ fn development_passkey_authentication() -> HostEffectSpec {
                         [
                             field("code", ValueType::Text),
                             field("message", ValueType::Text),
-                            field("retryable", ValueType::Bool),
+                            field("retryable", truth_type()),
                         ],
                     ),
                 ],
@@ -1066,9 +1065,9 @@ fn outbound_http_request() -> HostEffectSpec {
                             field("endpoint", ValueType::Text),
                             field("code", ValueType::Text),
                             field("diagnostic", ValueType::Text),
-                            field("retryable", ValueType::Bool),
-                            field("timed_out", ValueType::Bool),
-                            field("cancelled", ValueType::Bool),
+                            field("retryable", truth_type()),
+                            field("timed_out", truth_type()),
+                            field("cancelled", truth_type()),
                         ],
                     ),
                 ],
@@ -1177,12 +1176,14 @@ fn validate_intent_defaults(schema: &EffectSchema) -> Result<(), &'static str> {
         let Some(field) = fields.iter().find(|field| field.name == default.field_name) else {
             return Err("effect intent default field must exist in the intent schema");
         };
-        let type_matches = matches!(
-            (&default.value, &field.value_type),
-            (IntentDefaultValueSpec::Bool(_), ValueType::Bool)
-                | (IntentDefaultValueSpec::ExactInteger(_), ValueType::Number)
-                | (IntentDefaultValueSpec::Text(_), ValueType::Text)
-        );
+        let type_matches = match (&default.value, &field.value_type) {
+            (IntentDefaultValueSpec::Tag(tag), ValueType::Variant { variants }) => variants
+                .iter()
+                .any(|variant| variant.tag == *tag && variant.fields.is_empty()),
+            (IntentDefaultValueSpec::ExactInteger(_), ValueType::Number)
+            | (IntentDefaultValueSpec::Text(_), ValueType::Text) => true,
+            _ => false,
+        };
         if !type_matches {
             return Err("effect intent default value must match its field type");
         }
@@ -1292,6 +1293,12 @@ fn record<const N: usize>(fields: [Field; N]) -> ValueType {
     }
 }
 
+fn truth_type() -> ValueType {
+    ValueType::Variant {
+        variants: vec![variant("False", []), variant("True", [])],
+    }
+}
+
 fn field(name: &'static str, value_type: ValueType) -> Field {
     Field { name, value_type }
 }
@@ -1375,7 +1382,7 @@ mod tests {
             .find(|variant| variant.tag == "RegistrationSucceeded")
             .unwrap();
         assert!(success.fields.iter().any(|field| {
-            field.name == "workspace_grant_bound" && field.value_type == ValueType::Bool
+            field.name == "workspace_grant_bound" && field.value_type == truth_type()
         }));
     }
 
@@ -1689,12 +1696,12 @@ mod tests {
 
     #[test]
     fn intent_defaults_are_generic_typed_and_constraint_checked() {
-        let mut bool_default = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
-        bool_default.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
+        let mut tag_default = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
+        tag_default.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
             field_name: "retain_content",
-            value: IntentDefaultValueSpec::Bool(false),
+            value: IntentDefaultValueSpec::Tag("False"),
         }];
-        assert_eq!(bool_default.validate(), Ok(()));
+        assert_eq!(tag_default.validate(), Ok(()));
 
         let mut text_default = host_effect_spec(OUTBOUND_HTTP_REQUEST_OPERATION).unwrap();
         text_default.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
@@ -1726,7 +1733,7 @@ mod tests {
         let mut wrong_type = host_effect_spec(FILE_READ_STREAM_OPERATION).unwrap();
         wrong_type.schema.as_mut().unwrap().intent_defaults = vec![IntentDefaultSpec {
             field_name: "chunk_bytes",
-            value: IntentDefaultValueSpec::Bool(false),
+            value: IntentDefaultValueSpec::Tag("False"),
         }];
         assert!(wrong_type.validate().is_err());
 

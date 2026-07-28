@@ -835,7 +835,6 @@ fn evaluate_expression(
             Ok(StoredValue::Text(text))
         }
         MigrationExpressionPlan::Number { value } => Ok(StoredValue::Number(*value)),
-        MigrationExpressionPlan::Bool { value } => Ok(StoredValue::truth(*value)),
         MigrationExpressionPlan::Variant { tag } => Ok(StoredValue::tag(tag)),
         MigrationExpressionPlan::Tagged { tag, fields } => Ok(StoredValue::Tag {
             tag: tag.clone(),
@@ -964,15 +963,14 @@ fn stored_value_matches_pattern(
 ) -> bool {
     match pattern {
         boon_plan::PlanRowSelectPattern::Wildcard => true,
-        boon_plan::PlanRowSelectPattern::Bool { value: expected } => {
-            value.as_truth() == Some(*expected)
+        boon_plan::PlanRowSelectPattern::Tag { name } => {
+            matches!(value, StoredValue::Tag { tag, fields } if tag == name && fields.is_empty())
         }
         boon_plan::PlanRowSelectPattern::Number { value: expected } => {
             value == &StoredValue::Number(*expected)
         }
         boon_plan::PlanRowSelectPattern::Text { value: expected } => {
             matches!(value, StoredValue::Text(value) if value == expected)
-                || matches!(value, StoredValue::Tag { tag, .. } if tag == expected)
         }
         boon_plan::PlanRowSelectPattern::NaN => {
             matches!(value, StoredValue::Text(value) if value == "NaN")
@@ -1231,10 +1229,6 @@ fn stored_tag(value: &StoredValue) -> &str {
 fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<(), MigrationError> {
     let valid = match (value, data_type) {
         (_, DataTypePlan::Unknown) => true,
-        (StoredValue::Tag { tag, fields }, DataTypePlan::Null) => {
-            tag == "Null" && fields.is_empty()
-        }
-        (value, DataTypePlan::Bool) => value.as_truth().is_some(),
         (StoredValue::Number(_), DataTypePlan::Number) => true,
         (StoredValue::Text(_), DataTypePlan::Text) => true,
         (StoredValue::Bytes(value), DataTypePlan::Bytes { fixed_len }) => {
@@ -1265,14 +1259,6 @@ fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<()
         (StoredValue::List(values), DataTypePlan::List { item }) => values
             .iter()
             .all(|value| ensure_value_type(value, item).is_ok()),
-        (StoredValue::Tag { fields: values, .. }, DataTypePlan::Error { fields, open }) => {
-            (*open || values.len() == fields.len())
-                && fields.iter().all(|field| {
-                    values
-                        .get(&field.name)
-                        .is_some_and(|value| ensure_value_type(value, &field.data_type).is_ok())
-                })
-        }
         _ => false,
     };
     valid.then_some(()).ok_or_else(|| {

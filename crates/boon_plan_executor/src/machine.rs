@@ -111,13 +111,15 @@ impl fmt::Debug for HostValueBinding {
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[cfg_attr(not(feature = "phase0-instrumentation"), derive(Clone))]
 pub enum Value {
-    Null,
-    Bool(bool),
     Number(FiniteReal),
     Text(String),
     Bytes(Bytes),
     List(Vec<Value>),
     Record(BTreeMap<String, Value>),
+    Tag {
+        tag: String,
+        fields: BTreeMap<String, Value>,
+    },
     MappedRow {
         id: RowId,
         fields: BTreeMap<String, Value>,
@@ -125,9 +127,6 @@ pub enum Value {
     Row {
         id: RowId,
         fields: BTreeMap<FieldId, Value>,
-    },
-    Error {
-        code: String,
     },
     #[serde(skip)]
     HostBound {
@@ -247,8 +246,6 @@ fn sized_payload_bytes(len: usize) -> u64 {
 fn value_tree_stats(value: &Value) -> ValueTreeStats {
     fn visit(value: &Value, stats: &mut ValueTreeStats) {
         match value {
-            Value::Null => stats.add_value(0),
-            Value::Bool(_) => stats.add_value(1),
             Value::Number(_) => stats.add_value(8),
             Value::Text(value) => stats.add_value(sized_payload_bytes(value.len())),
             Value::Bytes(value) => stats.add_value(sized_payload_bytes(value.len())),
@@ -260,6 +257,15 @@ fn value_tree_stats(value: &Value) -> ValueTreeStats {
             }
             Value::Record(fields) => {
                 stats.add_value(8);
+                for (name, value) in fields {
+                    stats.logical_payload_bytes = stats
+                        .logical_payload_bytes
+                        .saturating_add(sized_payload_bytes(name.len()));
+                    visit(value, stats);
+                }
+            }
+            Value::Tag { tag, fields } => {
+                stats.add_value(sized_payload_bytes(tag.len()).saturating_add(8));
                 for (name, value) in fields {
                     stats.logical_payload_bytes = stats
                         .logical_payload_bytes
@@ -283,7 +289,6 @@ fn value_tree_stats(value: &Value) -> ValueTreeStats {
                     visit(value, stats);
                 }
             }
-            Value::Error { code } => stats.add_value(sized_payload_bytes(code.len())),
             Value::HostBound { visible, .. } => {
                 // Opaque host bindings are 32-byte issuer + 32-byte handle +
                 // 4-byte generation. The visible child is counted recursively.
@@ -304,6 +309,7 @@ fn value_is_recursive(value: &Value) -> bool {
         value,
         Value::List(_)
             | Value::Record(_)
+            | Value::Tag { .. }
             | Value::MappedRow { .. }
             | Value::Row { .. }
             | Value::HostBound { .. }
@@ -342,13 +348,15 @@ impl Clone for Value {
         // allocation/copy shape. The depth guard only suppresses accounting for
         // recursive Value::clone calls made by those collection clones.
         let cloned = match self {
-            Value::Null => Value::Null,
-            Value::Bool(value) => Value::Bool(value.clone()),
             Value::Number(value) => Value::Number(value.clone()),
             Value::Text(value) => Value::Text(value.clone()),
             Value::Bytes(value) => Value::Bytes(value.clone()),
             Value::List(values) => Value::List(values.clone()),
             Value::Record(fields) => Value::Record(fields.clone()),
+            Value::Tag { tag, fields } => Value::Tag {
+                tag: tag.clone(),
+                fields: fields.clone(),
+            },
             Value::MappedRow { id, fields } => Value::MappedRow {
                 id: id.clone(),
                 fields: fields.clone(),
@@ -357,7 +365,6 @@ impl Clone for Value {
                 id: id.clone(),
                 fields: fields.clone(),
             },
-            Value::Error { code } => Value::Error { code: code.clone() },
             Value::HostBound { visible, binding } => Value::HostBound {
                 visible: visible.clone(),
                 binding: binding.clone(),
@@ -453,6 +460,32 @@ impl Value {
         runtime_value_from_data(value)
     }
 
+    pub fn tag(tag: impl Into<String>) -> Self {
+        Self::Tag {
+            tag: tag.into(),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    pub fn tagged(tag: impl Into<String>, fields: BTreeMap<String, Value>) -> Self {
+        Self::Tag {
+            tag: tag.into(),
+            fields,
+        }
+    }
+
+    pub fn truth(value: bool) -> Self {
+        Self::tag(if value { "True" } else { "False" })
+    }
+
+    pub fn as_truth(&self) -> Option<bool> {
+        match self.visible() {
+            Self::Tag { tag, fields } if fields.is_empty() && tag == "True" => Some(true),
+            Self::Tag { tag, fields } if fields.is_empty() && tag == "False" => Some(false),
+            _ => None,
+        }
+    }
+
     pub fn to_data(&self) -> Result<boon_data::Value, Error> {
         runtime_value_to_data(self)
     }
@@ -482,16 +515,11 @@ impl Value {
         match self {
             Self::HostBound { .. } => true,
             Self::List(values) => values.iter().any(Self::contains_host_binding),
-            Self::Record(fields) | Self::MappedRow { fields, .. } => {
+            Self::Record(fields) | Self::MappedRow { fields, .. } | Self::Tag { fields, .. } => {
                 fields.values().any(Self::contains_host_binding)
             }
             Self::Row { fields, .. } => fields.values().any(Self::contains_host_binding),
-            Self::Null
-            | Self::Bool(_)
-            | Self::Number(_)
-            | Self::Text(_)
-            | Self::Bytes(_)
-            | Self::Error { .. } => false,
+            Self::Number(_) | Self::Text(_) | Self::Bytes(_) => false,
         }
     }
 
@@ -507,6 +535,13 @@ impl Value {
                     .map(|(name, value)| (name, value.into_visible_facade()))
                     .collect(),
             ),
+            Self::Tag { tag, fields } => Self::Tag {
+                tag,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| (name, value.into_visible_facade()))
+                    .collect(),
+            },
             Self::MappedRow { id, fields } => Self::MappedRow {
                 id,
                 fields: fields
@@ -521,12 +556,7 @@ impl Value {
                     .map(|(field, value)| (field, value.into_visible_facade()))
                     .collect(),
             },
-            value @ (Self::Null
-            | Self::Bool(_)
-            | Self::Number(_)
-            | Self::Text(_)
-            | Self::Bytes(_)
-            | Self::Error { .. }) => value,
+            value @ (Self::Number(_) | Self::Text(_) | Self::Bytes(_)) => value,
         }
     }
 }
@@ -950,6 +980,9 @@ pub enum Delta {
     SetDistributedImport {
         import_id: ImportId,
         value: Value,
+    },
+    ClearDistributedImport {
+        import_id: ImportId,
     },
     InsertRow {
         row: RowSnapshot,
@@ -1434,9 +1467,13 @@ pub struct SessionOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RecoveryDistributedImport {
-    pub revision: Option<u64>,
-    pub value: boon_data::Value,
+#[serde(tag = "currentness", rename_all = "snake_case")]
+pub enum RecoveryDistributedImport {
+    NotCurrent,
+    Current {
+        revision: u64,
+        value: boon_data::Value,
+    },
 }
 
 /// Host-private execution state needed to resume one exact compiled machine.
@@ -3663,7 +3700,6 @@ fn ordered_index_schema(plan: &PlanListIndex) -> Result<KeySchema, Error> {
             let kind = match key.kind {
                 PlanListIndexKeyKind::Number => AccessKeyKind::Number,
                 PlanListIndexKeyKind::Text => AccessKeyKind::Text,
-                PlanListIndexKeyKind::Bool => AccessKeyKind::Bool,
                 PlanListIndexKeyKind::ClosedTag { type_id } => {
                     AccessKeyKind::ClosedTag(boon_list_access::TagTypeId::from_bytes(type_id))
                 }
@@ -3685,8 +3721,9 @@ fn structural_index_value(plan: &PlanListIndexKey, value: Value) -> Result<Struc
                 .map_err(|error| Error::Evaluation(error.to_string()))
         }
         (PlanListIndexKeyKind::Text, Value::Text(value)) => Ok(StructuralValue::text(value)),
-        (PlanListIndexKeyKind::Bool, Value::Bool(value)) => Ok(StructuralValue::Bool(value)),
-        (PlanListIndexKeyKind::ClosedTag { type_id }, Value::Text(value)) => {
+        (PlanListIndexKeyKind::ClosedTag { type_id }, Value::Tag { tag: value, fields })
+            if fields.is_empty() =>
+        {
             let ordinal = plan
                 .closed_tags
                 .binary_search(&value)
@@ -5011,12 +5048,10 @@ fn local_name(label: &str) -> &str {
 
 fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
     match value {
-        PlanConstantValue::Text { value } | PlanConstantValue::Enum { value } => {
-            Ok(Value::Text(value.clone()))
-        }
+        PlanConstantValue::Text { value } => Ok(Value::Text(value.clone())),
+        PlanConstantValue::Tag { name } => Ok(Value::tag(name)),
         PlanConstantValue::Data { value } => Ok(runtime_value_from_data(value)),
         PlanConstantValue::Number { value } => Ok(Value::Number(*value)),
-        PlanConstantValue::Bool { value } => Ok(Value::Bool(*value)),
         PlanConstantValue::Bytes {
             byte_len,
             inline_bytes,
@@ -5050,36 +5085,18 @@ fn runtime_value_from_data(value: &boon_data::Value) -> Value {
                 .map(|(name, value)| (name.clone(), runtime_value_from_data(value)))
                 .collect(),
         ),
-        boon_data::Value::Tag { tag, fields } => {
-            if fields.is_empty() && tag == "True" {
-                Value::Bool(true)
-            } else if fields.is_empty() && tag == "False" {
-                Value::Bool(false)
-            } else if fields.is_empty() {
-                Value::Text(tag.clone())
-            } else {
-                Value::Record(
-                    std::iter::once(("$tag".to_owned(), Value::Text(tag.clone())))
-                        .chain(
-                            fields.iter().map(|(name, value)| {
-                                (name.clone(), runtime_value_from_data(value))
-                            }),
-                        )
-                        .collect(),
-                )
-            }
-        }
+        boon_data::Value::Tag { tag, fields } => Value::Tag {
+            tag: tag.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, value)| (name.clone(), runtime_value_from_data(value)))
+                .collect(),
+        },
     }
 }
 
 fn runtime_value_to_data(value: &Value) -> Result<boon_data::Value, Error> {
     Ok(match value {
-        Value::Null => {
-            return Err(Error::Evaluation(
-                "private runtime absence cannot cross an ordinary data boundary".to_owned(),
-            ));
-        }
-        Value::Bool(value) => boon_data::Value::truth(*value),
         Value::Number(value) => boon_data::Value::Number(*value),
         Value::Text(value) => boon_data::Value::Text(value.clone()),
         Value::Bytes(value) => boon_data::Value::Bytes(value.clone()),
@@ -5089,31 +5106,19 @@ fn runtime_value_to_data(value: &Value) -> Result<boon_data::Value, Error> {
                 .map(runtime_value_to_data)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Value::Record(fields) => {
-            let tag = runtime_string_map_get(fields, "$tag");
-            let values = fields
+        Value::Record(fields) => boon_data::Value::Object(
+            fields
                 .iter()
-                .filter(|(name, _)| name.as_str() != "$tag")
                 .map(|(name, value)| Ok((name.clone(), runtime_value_to_data(value)?)))
-                .collect::<Result<BTreeMap<_, _>, Error>>()?;
-            match tag {
-                Some(Value::Text(tag)) => boon_data::Value::Tag {
-                    tag: tag.clone(),
-                    fields: values,
-                },
-                Some(_) => {
-                    return Err(Error::Evaluation(
-                        "tagged runtime object has a non-text `$tag` field".to_owned(),
-                    ));
-                }
-                None => boon_data::Value::Object(values),
-            }
-        }
-        Value::Error { .. } => {
-            return Err(Error::Evaluation(
-                "private runtime faults cannot cross an ordinary data boundary".to_owned(),
-            ));
-        }
+                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+        ),
+        Value::Tag { tag, fields } => boon_data::Value::Tag {
+            tag: tag.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), runtime_value_to_data(value)?)))
+                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+        },
         Value::MappedRow { .. } | Value::Row { .. } => {
             return Err(Error::Evaluation(
                 "ordinary data boundaries cannot contain runtime row handles".to_owned(),
@@ -5255,10 +5260,6 @@ fn durable_owner_for_rows(
 
 pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValue, Error> {
     match value {
-        Value::Null => Err(Error::Evaluation(
-            "private runtime absence cannot be persisted".to_owned(),
-        )),
-        Value::Bool(value) => Ok(boon_persistence::StoredValue::truth(*value)),
         Value::Number(value) => Ok(boon_persistence::StoredValue::Number(*value)),
         Value::Text(value) => Ok(boon_persistence::StoredValue::Text(value.clone())),
         Value::Bytes(value) => Ok(boon_persistence::StoredValue::Bytes(value.clone())),
@@ -5267,26 +5268,18 @@ pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValu
             .map(stored_value)
             .collect::<Result<Vec<_>, _>>()
             .map(boon_persistence::StoredValue::List),
-        Value::Record(fields) => {
-            let mut stored = fields
+        Value::Record(fields) => fields
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), stored_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(boon_persistence::StoredValue::Object),
+        Value::Tag { tag, fields } => Ok(boon_persistence::StoredValue::Tag {
+            tag: tag.clone(),
+            fields: fields
                 .iter()
-                .filter(|(name, _)| name.as_str() != "$tag")
                 .map(|(name, value)| Ok((name.clone(), stored_value(value)?)))
-                .collect::<Result<BTreeMap<_, _>, Error>>()?;
-            match runtime_string_map_get(fields, "$tag") {
-                Some(Value::Text(tag)) => Ok(boon_persistence::StoredValue::Tag {
-                    tag: tag.clone(),
-                    fields: std::mem::take(&mut stored),
-                }),
-                Some(_) => Err(Error::Evaluation(
-                    "tagged runtime record has a non-text `$tag` field".to_owned(),
-                )),
-                None => Ok(boon_persistence::StoredValue::Object(stored)),
-            }
-        }
-        Value::Error { .. } => Err(Error::Evaluation(
-            "private runtime faults cannot be persisted".to_owned(),
-        )),
+                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+        }),
         Value::MappedRow { .. } | Value::Row { .. } => Err(Error::Evaluation(
             "row handles and derived mapped rows are not durable authority".to_owned(),
         )),
@@ -5325,27 +5318,8 @@ fn durable_owner_value(owner: &boon_persistence::DurableOwner) -> boon_persisten
 
 fn stored_value_for_data_type(
     value: &Value,
-    data_type: &boon_plan::DataTypePlan,
+    _data_type: &boon_plan::DataTypePlan,
 ) -> Result<boon_persistence::StoredValue, Error> {
-    if let (Value::Text(tag), boon_plan::DataTypePlan::Variant { variants }) = (value, data_type) {
-        let variant = variants
-            .iter()
-            .find(|variant| variant.tag == *tag)
-            .ok_or_else(|| {
-                Error::Evaluation(format!(
-                    "variant tag `{tag}` is not declared by the durable value schema"
-                ))
-            })?;
-        if !variant.fields.is_empty() {
-            return Err(Error::Evaluation(format!(
-                "structured variant `{tag}` requires named fields"
-            )));
-        }
-        return Ok(boon_persistence::StoredValue::Tag {
-            tag: tag.clone(),
-            fields: BTreeMap::new(),
-        });
-    }
     stored_value(value)
 }
 
@@ -5361,10 +5335,7 @@ fn validate_value_for_data_type(
     }
 
     match (value, data_type) {
-        (Value::Null, DataTypePlan::Null)
-        | (Value::Bool(_), DataTypePlan::Bool)
-        | (Value::Number(_), DataTypePlan::Number)
-        | (Value::Text(_), DataTypePlan::Text) => Ok(()),
+        (Value::Number(_), DataTypePlan::Number) | (Value::Text(_), DataTypePlan::Text) => Ok(()),
         (Value::Bytes(value), DataTypePlan::Bytes { fixed_len })
             if fixed_len
                 .is_none_or(|expected| u64::try_from(value.len()).ok() == Some(expected)) =>
@@ -5380,41 +5351,21 @@ fn validate_value_for_data_type(
         (Value::Record(values), DataTypePlan::Record { fields, open }) => {
             validate_record_for_data_type(values, fields, *open, path)
         }
-        (Value::Text(tag), DataTypePlan::Variant { variants }) => {
+        (
+            Value::Tag {
+                tag,
+                fields: values,
+            },
+            DataTypePlan::Variant { variants },
+        ) => {
             let variant = variants
                 .iter()
                 .find(|variant| variant.tag == *tag)
                 .ok_or_else(|| {
                     Error::Evaluation(format!("{path} has undeclared variant `{tag}`"))
                 })?;
-            if variant.fields.is_empty() {
-                Ok(())
-            } else {
-                Err(Error::Evaluation(format!(
-                    "{path} variant `{tag}` requires named fields"
-                )))
-            }
+            validate_record_for_data_type(values, &variant.fields, variant.open, path)
         }
-        (Value::Record(values), DataTypePlan::Variant { variants }) => {
-            let Some(Value::Text(tag)) = runtime_string_map_get(values, "$tag") else {
-                return Err(Error::Evaluation(format!(
-                    "{path} structured variant has no text `$tag`"
-                )));
-            };
-            let variant = variants
-                .iter()
-                .find(|variant| variant.tag == *tag)
-                .ok_or_else(|| {
-                    Error::Evaluation(format!("{path} has undeclared variant `{tag}`"))
-                })?;
-            let fields = values
-                .iter()
-                .filter(|(name, _)| name.as_str() != "$tag")
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect::<BTreeMap<_, _>>();
-            validate_record_for_data_type(&fields, &variant.fields, variant.open, path)
-        }
-        (Value::Error { .. }, DataTypePlan::Error { fields, .. }) if fields.is_empty() => Ok(()),
         (_, DataTypePlan::Unknown) => Err(Error::InvalidPlan(format!(
             "{path} has an unknown data type"
         ))),
@@ -5427,16 +5378,14 @@ fn validate_value_for_data_type(
 
 fn runtime_value_kind(value: &Value) -> &'static str {
     match value {
-        Value::Null => "Null",
-        Value::Bool(_) => "Bool",
         Value::Number(_) => "Number",
         Value::Text(_) => "Text",
         Value::Bytes(_) => "Bytes",
         Value::List(_) => "List",
         Value::Record(_) => "Record",
+        Value::Tag { .. } => "Tag",
         Value::MappedRow { .. } => "MappedRow",
         Value::Row { .. } => "Row",
-        Value::Error { .. } => "Error",
         Value::HostBound { visible, .. } => runtime_value_kind(visible),
     }
 }
@@ -5450,12 +5399,6 @@ fn validate_distributed_boundary_value(
         return Err(Error::Evaluation(format!(
             "{path} contains a process-local host binding"
         )));
-    }
-    // Cross-role reads preserve Boon's normal value type while allowing a
-    // generated transport/currentness error to flow through existing error
-    // propagation. Applications do not serialize or inspect transport frames.
-    if matches!(value, Value::Error { .. }) {
-        return Ok(());
     }
     validate_value_for_data_type(value, data_type, path)
 }
@@ -5499,24 +5442,13 @@ pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Valu
             .map(|(name, value)| Ok((name, runtime_value(value)?)))
             .collect::<Result<BTreeMap<_, _>, Error>>()
             .map(Value::Record),
-        boon_persistence::StoredValue::Tag { tag, fields } if fields.is_empty() => {
-            Ok(match tag.as_str() {
-                "True" => Value::Bool(true),
-                "False" => Value::Bool(false),
-                _ => Value::Text(tag),
-            })
-        }
-        boon_persistence::StoredValue::Tag { tag, mut fields } => {
-            if fields
-                .insert("$tag".to_owned(), boon_persistence::StoredValue::Text(tag))
-                .is_some()
-            {
-                return Err(Error::Evaluation(
-                    "stored variant contains reserved `$tag` field".to_owned(),
-                ));
-            }
-            runtime_value(boon_persistence::StoredValue::Object(fields))
-        }
+        boon_persistence::StoredValue::Tag { tag, fields } => Ok(Value::Tag {
+            tag,
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| Ok((name, runtime_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+        }),
     }
 }
 
@@ -5974,10 +5906,15 @@ fn instantiate_plan_owner(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EvalValue {
+    Absent,
     Value(Value),
     Row(RowId),
     List(Vec<EvalValue>),
     Record(BTreeMap<String, EvalValue>),
+    Tag {
+        tag: String,
+        fields: BTreeMap<String, EvalValue>,
+    },
     MappedRow {
         id: RowId,
         fields: BTreeMap<String, EvalValue>,
@@ -5998,6 +5935,7 @@ enum EvalMaterializationCollection {
         remaining: std::collections::btree_map::IntoIter<String, EvalValue>,
         output: BTreeMap<String, Value>,
         mapped_row: Option<RowId>,
+        tag: Option<String>,
     },
     OrderedList {
         remaining: std::vec::IntoIter<OrderedEvalItem>,
@@ -6630,6 +6568,7 @@ struct ObjectMaterializationState<'event, 'plan> {
     next_field: usize,
     values: std::vec::IntoIter<EvalValue>,
     record: BTreeMap<String, EvalValue>,
+    tag: Option<String>,
     context: ExpressionContext<'event>,
 }
 
@@ -8464,19 +8403,7 @@ impl MachineInstanceBuilder {
     fn from_template(template: MachineTemplate, options: SessionOptions) -> Result<Self, Error> {
         validate_session_options(&options)?;
         let MachineTemplate { plan, metadata } = template;
-        let distributed_imports = metadata
-            .distributed_import_types
-            .keys()
-            .copied()
-            .map(|import_id| {
-                (
-                    import_id,
-                    Value::Error {
-                        code: "remote_not_current".to_owned(),
-                    },
-                )
-            })
-            .collect();
+        let distributed_imports = BTreeMap::new();
         let turn_work = Work::with_limit(options.max_work_units_per_transaction);
         let launch_epoch = next_session_launch_epoch()?;
         let cursor_ephemeral_launch_epoch =
@@ -8568,36 +8495,32 @@ impl MachineInstanceBuilder {
         let mut distributed_imports = self.session.distributed_imports.clone();
         let mut distributed_import_revisions = self.session.distributed_import_revisions.clone();
         for (import_id, recovered) in image.distributed_imports {
-            if recovered.revision == Some(0) {
-                return Err(Error::InvalidPlan(
-                    "machine recovery import revision must be positive".to_owned(),
-                ));
-            }
-            let value = runtime_value_from_data(&recovered.value);
-            if recovered.revision.is_none()
-                && !matches!(&value, Value::Error { code } if code == "remote_not_current")
-            {
-                return Err(Error::InvalidPlan(
-                    "machine recovery import without a revision must be remote_not_current"
-                        .to_owned(),
-                ));
-            }
-            if recovered.revision.is_some() {
-                let data_type = self
-                    .session
-                    .metadata
-                    .distributed_import_types
-                    .get(&import_id)
-                    .expect("recovered import set was matched against compiled imports");
-                validate_distributed_boundary_value(
-                    &value,
-                    data_type,
-                    "machine recovery distributed import",
-                )?;
-            }
-            distributed_imports.insert(import_id, value);
-            if let Some(revision) = recovered.revision {
-                distributed_import_revisions.insert(import_id, revision);
+            match recovered {
+                RecoveryDistributedImport::NotCurrent => {
+                    distributed_imports.remove(&import_id);
+                    distributed_import_revisions.remove(&import_id);
+                }
+                RecoveryDistributedImport::Current { revision, value } => {
+                    if revision == 0 {
+                        return Err(Error::InvalidPlan(
+                            "machine recovery import revision must be positive".to_owned(),
+                        ));
+                    }
+                    let value = runtime_value_from_data(&value);
+                    let data_type = self
+                        .session
+                        .metadata
+                        .distributed_import_types
+                        .get(&import_id)
+                        .expect("recovered import set was matched against compiled imports");
+                    validate_distributed_boundary_value(
+                        &value,
+                        data_type,
+                        "machine recovery distributed import",
+                    )?;
+                    distributed_imports.insert(import_id, value);
+                    distributed_import_revisions.insert(import_id, revision);
+                }
             }
         }
 
@@ -10013,15 +9936,9 @@ impl MachineInstance {
                 self.distributed_import_revisions
                     .remove(&argument.import_id),
             );
-            self.distributed_imports.insert(
-                argument.import_id,
-                lease
-                    .distributed_imports
-                    .remove(&argument.import_id)
-                    .unwrap_or(Value::Error {
-                        code: "remote_not_current".to_owned(),
-                    }),
-            );
+            if let Some(value) = lease.distributed_imports.remove(&argument.import_id) {
+                self.distributed_imports.insert(argument.import_id, value);
+            }
             if let Some(revision) = lease
                 .distributed_import_revisions
                 .remove(&argument.import_id)
@@ -10513,20 +10430,7 @@ impl MachineInstance {
         let mut seen_imports = BTreeSet::new();
         let mut next_imports = match install {
             DistributedContextInstall::Patch => self.distributed_imports.clone(),
-            DistributedContextInstall::Replace => self
-                .metadata
-                .distributed_import_types
-                .keys()
-                .copied()
-                .map(|import_id| {
-                    (
-                        import_id,
-                        Value::Error {
-                            code: "remote_not_current".to_owned(),
-                        },
-                    )
-                })
-                .collect(),
+            DistributedContextInstall::Replace => BTreeMap::new(),
         };
         let mut next_revisions = match install {
             DistributedContextInstall::Patch => self.distributed_import_revisions.clone(),
@@ -10663,13 +10567,14 @@ impl MachineInstance {
             self.row_owned_call_results.clear();
         }
         for import_id in &changed_imports {
-            self.distributed_imports.insert(
-                *import_id,
-                next_imports
-                    .get(import_id)
-                    .cloned()
-                    .expect("every declared distributed import has a replacement value"),
-            );
+            match next_imports.get(import_id).cloned() {
+                Some(value) => {
+                    self.distributed_imports.insert(*import_id, value);
+                }
+                None => {
+                    self.distributed_imports.remove(import_id);
+                }
+            }
             match next_revisions.get(import_id).copied() {
                 Some(content_revision) => {
                     self.distributed_import_revisions
@@ -10687,14 +10592,14 @@ impl MachineInstance {
                 self.invalidate_session_info_fields(&mut work);
             }
             for import_id in changed_imports.iter().copied() {
-                work.deltas.push(Delta::SetDistributedImport {
-                    import_id,
-                    value: self
-                        .distributed_imports
-                        .get(&import_id)
-                        .cloned()
-                        .expect("updated distributed import exists"),
-                });
+                match self.distributed_imports.get(&import_id).cloned() {
+                    Some(value) => work
+                        .deltas
+                        .push(Delta::SetDistributedImport { import_id, value }),
+                    None => work
+                        .deltas
+                        .push(Delta::ClearDistributedImport { import_id }),
+                }
                 self.invalidate_distributed_import(import_id, &mut work);
             }
             for (import_id, call_instance_id) in reset_call_result_keys.iter().copied() {
@@ -10813,6 +10718,15 @@ impl MachineInstance {
     }
 
     pub fn distributed_import_value_current(&self, import_id: ImportId) -> Result<Value, Error> {
+        if !self
+            .metadata
+            .distributed_import_types
+            .contains_key(&import_id)
+        {
+            return Err(Error::InvalidEvent(
+                "distributed import is not declared by this endpoint".to_owned(),
+            ));
+        }
         let leased = self
             .metadata
             .producer_function_instances
@@ -10836,11 +10750,7 @@ impl MachineInstance {
             .cloned();
         leased
             .or_else(|| self.distributed_imports.get(&import_id).cloned())
-            .ok_or_else(|| {
-                Error::InvalidEvent(
-                    "distributed import is not declared by this endpoint".to_owned(),
-                )
-            })
+            .ok_or_else(|| Error::Evaluation("distributed import is not current".to_owned()))
     }
 
     /// Installs a producer-owned value without fabricating a local SOURCE event.
@@ -11548,19 +11458,14 @@ impl MachineInstance {
                     work,
                 )?;
                 let gate = self.materialize_eval(gate)?;
-                match gate {
-                    Value::Bool(false) => continue,
-                    Value::Bool(true) if admitted => {
+                match value_to_bool(&gate)? {
+                    false => continue,
+                    true if admitted => {
                         return Err(Error::InvalidPlan(
                             "distributed invocation admitted more than one trigger arm".to_owned(),
                         ));
                     }
-                    Value::Bool(true) => admitted = true,
-                    _value => {
-                        return Err(Error::InvalidPlan(
-                            "distributed invocation gate produced a non-Bool value".to_owned(),
-                        ));
-                    }
+                    true => admitted = true,
                 }
             }
             if !admitted {
@@ -12301,21 +12206,27 @@ impl MachineInstance {
             ));
         }
         let distributed_imports = self
-            .distributed_imports
+            .metadata
+            .recoverable_distributed_imports
             .iter()
-            .filter(|(import_id, _)| {
-                self.metadata
-                    .recoverable_distributed_imports
-                    .contains(import_id)
-            })
-            .map(|(import_id, value)| {
-                Ok((
-                    *import_id,
-                    RecoveryDistributedImport {
-                        revision: self.distributed_import_revisions.get(import_id).copied(),
+            .copied()
+            .map(|import_id| {
+                let recovered = match self.distributed_imports.get(&import_id) {
+                    Some(value) => RecoveryDistributedImport::Current {
+                        revision: self
+                            .distributed_import_revisions
+                            .get(&import_id)
+                            .copied()
+                            .ok_or_else(|| {
+                                Error::Evaluation(
+                                    "current distributed import has no revision".to_owned(),
+                                )
+                            })?,
                         value: runtime_value_to_data(value)?,
                     },
-                ))
+                    None => RecoveryDistributedImport::NotCurrent,
+                };
+                Ok((import_id, recovered))
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
         Ok(MachineRecoveryImage {
@@ -18748,6 +18659,11 @@ impl MachineInstance {
         while let Some(task) = tasks.pop() {
             match task {
                 EvalMaterializationTask::Evaluate(value) => match value {
+                    EvalValue::Absent => {
+                        return Err(Error::Evaluation(
+                            "private absence reached a data materialization boundary".to_owned(),
+                        ));
+                    }
                     EvalValue::Value(value) => values.push(value),
                     EvalValue::Row(row) => values.push(row_identity_value(row)),
                     EvalValue::List(items) => {
@@ -18775,6 +18691,22 @@ impl MachineInstance {
                                 remaining: fields.into_iter(),
                                 output: BTreeMap::new(),
                                 mapped_row: None,
+                                tag: None,
+                            },
+                        ));
+                    }
+                    EvalValue::Tag { tag, fields } => {
+                        ensure_value_continuation_capacity(
+                            &tasks,
+                            1,
+                            "evaluation materialization",
+                        )?;
+                        tasks.push(EvalMaterializationTask::Continue(
+                            EvalMaterializationCollection::Record {
+                                remaining: fields.into_iter(),
+                                output: BTreeMap::new(),
+                                mapped_row: None,
+                                tag: Some(tag),
                             },
                         ));
                     }
@@ -18789,6 +18721,7 @@ impl MachineInstance {
                                 remaining: fields.into_iter(),
                                 output: BTreeMap::new(),
                                 mapped_row: Some(id),
+                                tag: None,
                             },
                         ));
                     }
@@ -18836,13 +18769,29 @@ impl MachineInstance {
                             EvalMaterializationCollection::Record {
                                 output,
                                 mapped_row: Some(id),
+                                tag: None,
                                 ..
                             } => Value::MappedRow { id, fields: output },
                             EvalMaterializationCollection::Record {
                                 output,
                                 mapped_row: None,
+                                tag: Some(tag),
+                                ..
+                            } => Value::Tag {
+                                tag,
+                                fields: output,
+                            },
+                            EvalMaterializationCollection::Record {
+                                output,
+                                mapped_row: None,
+                                tag: None,
                                 ..
                             } => Value::Record(output),
+                            EvalMaterializationCollection::Record {
+                                mapped_row: Some(_),
+                                tag: Some(_),
+                                ..
+                            } => unreachable!("tagged mapped-row materialization is impossible"),
                         };
                         values.push(value);
                     }
@@ -19654,7 +19603,7 @@ impl MachineInstance {
                             match node {
                                 PlanRowExpressionNode::Intrinsic { intrinsic } => stack
                                     .push_value(EvalValue::Value(
-                                        self.eval_intrinsic(*intrinsic),
+                                        self.eval_intrinsic(*intrinsic)?,
                                     ))?,
                                 PlanRowExpressionNode::Field {
                                     input: ValueRef::DistributedImport(import_id),
@@ -20050,14 +19999,11 @@ impl MachineInstance {
                                         fields.len()
                                     )));
                                 }
-                                let record = match node {
+                                let tag = match node {
                                     PlanRowExpressionNode::TaggedObject { tag, .. } => {
-                                        BTreeMap::from([(
-                                            "$tag".to_owned(),
-                                            EvalValue::Value(Value::Text(tag.clone())),
-                                        )])
+                                        Some(tag.clone())
                                     }
-                                    PlanRowExpressionNode::Object { .. } => BTreeMap::new(),
+                                    PlanRowExpressionNode::Object { .. } => None,
                                     _ => unreachable!(),
                                 };
                                 stack.push_task(ExpressionTask::ObjectMaterializeNext {
@@ -20065,7 +20011,8 @@ impl MachineInstance {
                                         fields,
                                         next_field: 0,
                                         values: values.into_iter(),
-                                        record,
+                                        record: BTreeMap::new(),
+                                        tag,
                                         context,
                                     }),
                                 })?;
@@ -20088,7 +20035,14 @@ impl MachineInstance {
                                         "object materialization left unused operands".to_owned(),
                                     ));
                                 }
-                                stack.push_value(EvalValue::Record(state.record))?;
+                                let value = match state.tag {
+                                    Some(tag) => EvalValue::Tag {
+                                        tag,
+                                        fields: state.record,
+                                    },
+                                    None => EvalValue::Record(state.record),
+                                };
+                                stack.push_value(value)?;
                                 return Ok(());
                             };
                             let value = state.values.next().ok_or_else(|| {
@@ -20103,13 +20057,16 @@ impl MachineInstance {
                                 return Ok(());
                             }
                             match value {
-                                EvalValue::Record(fields) | EvalValue::MappedRow { fields, .. } => {
+                                EvalValue::Record(fields)
+                                | EvalValue::Tag { fields, .. }
+                                | EvalValue::MappedRow { fields, .. } => {
                                     state.record.extend(fields);
                                     stack.push_task(ExpressionTask::ObjectMaterializeNext {
                                         state,
                                     })?;
                                 }
                                 EvalValue::Value(Value::Record(fields))
+                                | EvalValue::Value(Value::Tag { fields, .. })
                                 | EvalValue::Value(Value::MappedRow { fields, .. }) => {
                                     state.record.extend(
                                         fields
@@ -20181,11 +20138,11 @@ impl MachineInstance {
                                     skip_empty,
                                 } => {
                                     let Some(event) = context.event else {
-                                        stack.push_value(EvalValue::Value(Value::Null))?;
+                                        stack.push_value(EvalValue::Absent)?;
                                         return Ok(());
                                     };
                                     if event.source != *source_id {
-                                        stack.push_value(EvalValue::Value(Value::Null))?;
+                                        stack.push_value(EvalValue::Absent)?;
                                         return Ok(());
                                     }
                                     let key = source_payload_value(&event.payload, key_field)
@@ -20193,7 +20150,7 @@ impl MachineInstance {
                                         .transpose()?
                                         .unwrap_or_default();
                                     if key != *required_key {
-                                        stack.push_value(EvalValue::Value(Value::Null))?;
+                                        stack.push_value(EvalValue::Absent)?;
                                         return Ok(());
                                     }
                                     stack.push_task(
@@ -20357,11 +20314,9 @@ impl MachineInstance {
                             } = materialization;
                             work.active_value_list_authorities.truncate(authority_depth);
                             let value = match stack.pop_value()? {
-                                EvalValue::Value(Value::Null) => EvalValue::List(Vec::new()),
-                                EvalValue::Value(Value::Text(value)) if value == "SKIP" => {
-                                    EvalValue::List(Vec::new())
-                                }
+                                EvalValue::Absent => EvalValue::List(Vec::new()),
                                 value @ (EvalValue::Record(_)
+                                | EvalValue::Tag { .. }
                                 | EvalValue::MappedRow { .. }
                                 | EvalValue::Row(_)
                                 | EvalValue::Value(Value::Record(_))
@@ -20553,20 +20508,20 @@ impl MachineInstance {
                         ExpressionTask::DerivedSourceKeyAfterValue { skip_empty } => {
                             let text = eval_to_text(&stack.pop_value()?)?.trim().to_owned();
                             let value = if skip_empty && text.is_empty() {
-                                Value::Null
+                                EvalValue::Absent
                             } else {
-                                Value::Text(text)
+                                EvalValue::Value(Value::Text(text))
                             };
-                            stack.push_value(EvalValue::Value(value))?;
+                            stack.push_value(value)?;
                         }
                         ExpressionTask::DerivedBoolNotAfterValue => {
                             let value = !eval_to_bool(&stack.pop_value()?)?;
-                            stack.push_value(EvalValue::Value(Value::Bool(value)))?;
+                            stack.push_value(EvalValue::Value(Value::truth(value)))?;
                         }
                         ExpressionTask::DerivedNumberCompareAfterValue { op, right } => {
                             let left = eval_to_numeric(&stack.pop_value()?)?;
                             let value = numeric_compare(left, op, right)?;
-                            stack.push_value(EvalValue::Value(Value::Bool(value)))?;
+                            stack.push_value(EvalValue::Value(Value::truth(value)))?;
                         }
                         ExpressionTask::DerivedValueCompareAfterLeft { op, right, context } => {
                             let left = stack.pop_value()?;
@@ -20592,7 +20547,7 @@ impl MachineInstance {
                                 ));
                             };
                             let value = compare_update_values(&left, op, &right)?;
-                            stack.push_value(EvalValue::Value(Value::Bool(value)))?;
+                            stack.push_value(EvalValue::Value(Value::truth(value)))?;
                         }
                         ExpressionTask::BeginRowOwnedCall { import_id, context } => {
                             let call = metadata.row_owned_call_results.get(&import_id).ok_or_else(
@@ -20681,10 +20636,9 @@ impl MachineInstance {
                                     .get(&(state.import_id, state.call_instance_id))
                                     .filter(|result| result.arguments == result_arguments)
                                     .map(|result| result.value.clone())
-                                    .unwrap_or_else(|| Value::Error {
-                                        code: "remote_not_current".to_owned(),
-                                    });
-                                stack.push_value(EvalValue::Value(value))?;
+                                    .map(EvalValue::Value)
+                                    .unwrap_or(EvalValue::Absent);
+                                stack.push_value(value)?;
                                 return Ok(());
                             };
                             let expression = argument.value;
@@ -20753,7 +20707,7 @@ impl MachineInstance {
                             };
                             match value_ref {
                                 ValueRef::Source(source) => {
-                                    stack.push_value(EvalValue::Value(Value::Bool(
+                                    stack.push_value(EvalValue::Value(Value::truth(
                                         context.event.is_some_and(|event| event.source == *source),
                                     )))?
                                 }
@@ -20764,8 +20718,9 @@ impl MachineInstance {
                                         .and_then(|event| {
                                             source_payload_value(&event.payload, field)
                                         })
-                                        .unwrap_or(Value::Null);
-                                    stack.push_value(EvalValue::Value(value))?;
+                                        .map(EvalValue::Value)
+                                        .unwrap_or(EvalValue::Absent);
+                                    stack.push_value(value)?;
                                 }
                                 ValueRef::Constant(constant) => {
                                     let value = self
@@ -20799,12 +20754,7 @@ impl MachineInstance {
                                             .get(import_id)
                                             .cloned()
                                             .map(EvalValue::Value)
-                                            .ok_or_else(|| {
-                                                Error::InvalidPlan(
-                                                "value ref uses an undeclared distributed import"
-                                                    .to_owned(),
-                                            )
-                                            })?;
+                                            .unwrap_or(EvalValue::Absent);
                                         stack.push_value(value)?;
                                     }
                                 }
@@ -20881,7 +20831,7 @@ impl MachineInstance {
                                         if self.row_field_availability(row, *field)
                                             == RowFieldAvailability::Missing
                                         {
-                                            stack.push_value(EvalValue::Value(Value::Null))?;
+                                            stack.push_value(EvalValue::Absent)?;
                                         } else {
                                             stack.push_task(ExpressionTask::EnsureRow {
                                                 row,
@@ -21646,7 +21596,7 @@ impl MachineInstance {
                             if self.row_field_availability(row, field)
                                 == RowFieldAvailability::Missing
                             {
-                                stack.push_value(EvalValue::Value(Value::Null))?;
+                                stack.push_value(EvalValue::Absent)?;
                             } else {
                                 stack.push_task(ExpressionTask::EnsureRow {
                                     row,
@@ -22584,9 +22534,10 @@ impl MachineInstance {
                             let mut trailing_captures = intrinsics
                                 .into_iter()
                                 .map(|intrinsic| {
-                                    PageTrailingCapture::Value(self.eval_intrinsic(intrinsic))
+                                    self.eval_intrinsic(intrinsic)
+                                        .map(PageTrailingCapture::Value)
                                 })
-                                .collect::<Vec<_>>();
+                                .collect::<Result<Vec<_>, Error>>()?;
                             for ((owner, local), value) in bindings.iter() {
                                 let referenced = page
                                     .access
@@ -22739,7 +22690,7 @@ impl MachineInstance {
                                 .transpose()?
                                 .unwrap_or_default();
                             let principal_scope =
-                                self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal);
+                                self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal)?;
                             let capture_fingerprint = capture_fingerprint(
                                 page.view_fingerprint,
                                 self.cursor_ephemeral_launch_epoch,
@@ -23552,7 +23503,7 @@ impl MachineInstance {
                                 .transpose()?
                                 .unwrap_or_default();
                             let principal_scope =
-                                self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal);
+                                self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal)?;
                             let capture_fingerprint = capture_fingerprint(
                                 page.view_fingerprint,
                                 self.cursor_ephemeral_launch_epoch,
@@ -24407,7 +24358,7 @@ impl MachineInstance {
                                 }
                             };
                             if short_circuit {
-                                stack.push_value(EvalValue::Value(Value::Bool(left)))?;
+                                stack.push_value(EvalValue::Value(Value::truth(left)))?;
                             } else {
                                 stack.push_task(ExpressionTask::BuiltinBoolAfterRight)?;
                                 stack.push_task(ExpressionTask::Evaluate {
@@ -24418,7 +24369,7 @@ impl MachineInstance {
                         }
                         ExpressionTask::BuiltinBoolAfterRight => {
                             let right = eval_to_bool(&stack.pop_value()?)?;
-                            stack.push_value(EvalValue::Value(Value::Bool(right)))?;
+                            stack.push_value(EvalValue::Value(Value::truth(right)))?;
                         }
                         ExpressionTask::ContextualCollectionAfterSource {
                             expression,
@@ -24488,17 +24439,15 @@ impl MachineInstance {
                                         eval_ordered_items(state.output, state.directions)
                                     }
                                     PlanContextualOperationKind::Every => {
-                                        EvalValue::Value(Value::Bool(true))
+                                        EvalValue::Value(Value::truth(true))
                                     }
                                     PlanContextualOperationKind::Any => {
-                                        EvalValue::Value(Value::Bool(false))
+                                        EvalValue::Value(Value::truth(false))
                                     }
-                                    PlanContextualOperationKind::Find => {
-                                        EvalValue::Record(BTreeMap::from([(
-                                            "$tag".to_owned(),
-                                            EvalValue::Value(Value::Text("NotFound".to_owned())),
-                                        )]))
-                                    }
+                                    PlanContextualOperationKind::Find => EvalValue::Tag {
+                                        tag: "NotFound".to_owned(),
+                                        fields: BTreeMap::new(),
+                                    },
                                 };
                                 stack.push_value(value)?;
                                 return Ok(());
@@ -24583,21 +24532,18 @@ impl MachineInstance {
                                     }
                                 }
                                 PlanContextualOperationKind::Every if !matches => {
-                                    stack.push_value(EvalValue::Value(Value::Bool(false)))?;
+                                    stack.push_value(EvalValue::Value(Value::truth(false)))?;
                                     return Ok(());
                                 }
                                 PlanContextualOperationKind::Any if matches => {
-                                    stack.push_value(EvalValue::Value(Value::Bool(true)))?;
+                                    stack.push_value(EvalValue::Value(Value::truth(true)))?;
                                     return Ok(());
                                 }
                                 PlanContextualOperationKind::Find if matches => {
-                                    stack.push_value(EvalValue::Record(BTreeMap::from([
-                                        (
-                                            "$tag".to_owned(),
-                                            EvalValue::Value(Value::Text("Found".to_owned())),
-                                        ),
-                                        ("value".to_owned(), item.value),
-                                    ])))?;
+                                    stack.push_value(EvalValue::Tag {
+                                        tag: "Found".to_owned(),
+                                        fields: BTreeMap::from([("value".to_owned(), item.value)]),
+                                    })?;
                                     return Ok(());
                                 }
                                 PlanContextualOperationKind::Map => {
@@ -24830,13 +24776,13 @@ impl MachineInstance {
                                         (EvalValue::List(state.retained), result_count)
                                     }
                                     PlanContextualOperationKind::Any => {
-                                        (EvalValue::Value(Value::Bool(false)), 0)
+                                        (EvalValue::Value(Value::truth(false)), 0)
                                     }
                                     PlanContextualOperationKind::Find => (
-                                        EvalValue::Record(BTreeMap::from([(
-                                            "$tag".to_owned(),
-                                            EvalValue::Value(Value::Text("NotFound".to_owned())),
-                                        )])),
+                                        EvalValue::Tag {
+                                            tag: "NotFound".to_owned(),
+                                            fields: BTreeMap::new(),
+                                        },
                                         0,
                                     ),
                                     operation => {
@@ -24883,19 +24829,19 @@ impl MachineInstance {
                                     PlanContextualOperationKind::Any => {
                                         work.metrics.access_result_count =
                                             work.metrics.access_result_count.saturating_add(1);
-                                        stack.push_value(EvalValue::Value(Value::Bool(true)))?;
+                                        stack.push_value(EvalValue::Value(Value::truth(true)))?;
                                         return Ok(());
                                     }
                                     PlanContextualOperationKind::Find => {
                                         work.metrics.access_result_count =
                                             work.metrics.access_result_count.saturating_add(1);
-                                        stack.push_value(EvalValue::Record(BTreeMap::from([
-                                            (
-                                                "$tag".to_owned(),
-                                                EvalValue::Value(Value::Text("Found".to_owned())),
-                                            ),
-                                            ("value".to_owned(), EvalValue::Row(candidate)),
-                                        ])))?;
+                                        stack.push_value(EvalValue::Tag {
+                                            tag: "Found".to_owned(),
+                                            fields: BTreeMap::from([(
+                                                "value".to_owned(),
+                                                EvalValue::Row(candidate),
+                                            )]),
+                                        })?;
                                         return Ok(());
                                     }
                                     operation => {
@@ -25061,12 +25007,12 @@ impl MachineInstance {
                 EvalValue::Value(Value::Text(eval_to_text(&next()?)?.trim().to_owned()))
             }
             PlanRowExpressionNode::TextIsEmpty { .. } => {
-                EvalValue::Value(Value::Bool(eval_to_text(&next()?)?.is_empty()))
+                EvalValue::Value(Value::truth(eval_to_text(&next()?)?.is_empty()))
             }
             PlanRowExpressionNode::TextStartsWith { .. } => {
                 let input = next()?;
                 let prefix = next()?;
-                EvalValue::Value(Value::Bool(
+                EvalValue::Value(Value::truth(
                     eval_to_text(&input)?.starts_with(&eval_to_text(&prefix)?),
                 ))
             }
@@ -25075,15 +25021,11 @@ impl MachineInstance {
             )?),
             PlanRowExpressionNode::TextToNumber { .. } => {
                 let input = next()?;
-                if matches!(input, EvalValue::Value(Value::Error { .. })) {
-                    input
-                } else {
-                    let text = eval_to_text(&input)?;
-                    EvalValue::Value(match text.trim().parse::<FiniteReal>() {
-                        Ok(value) => Value::Number(value),
-                        Err(_) => Value::Text("NaN".to_owned()),
-                    })
-                }
+                let text = eval_to_text(&input)?;
+                EvalValue::Value(match text.trim().parse::<FiniteReal>() {
+                    Ok(value) => Value::Number(value),
+                    Err(_) => Value::Text("NaN".to_owned()),
+                })
             }
             PlanRowExpressionNode::TextSubstring { .. } => {
                 let input = next()?;
@@ -25129,7 +25071,7 @@ impl MachineInstance {
                 EvalValue::Value(Value::Bytes(decode_base64(&eval_to_text(&next()?)?)?))
             }
             PlanRowExpressionNode::BytesIsEmpty { .. } => {
-                EvalValue::Value(Value::Bool(eval_to_bytes(&next()?)?.is_empty()))
+                EvalValue::Value(Value::truth(eval_to_bytes(&next()?)?.is_empty()))
             }
             PlanRowExpressionNode::BytesLength { .. } => {
                 EvalValue::Value(Value::integer(eval_to_bytes(&next()?)?.len() as i64)?)
@@ -25217,12 +25159,12 @@ impl MachineInstance {
             PlanRowExpressionNode::BytesStartsWith { .. } => {
                 let input = eval_to_bytes(&next()?)?;
                 let prefix = eval_to_bytes(&next()?)?;
-                EvalValue::Value(Value::Bool(input.starts_with(&prefix)))
+                EvalValue::Value(Value::truth(input.starts_with(&prefix)))
             }
             PlanRowExpressionNode::BytesEndsWith { .. } => {
                 let input = eval_to_bytes(&next()?)?;
                 let suffix = eval_to_bytes(&next()?)?;
-                EvalValue::Value(Value::Bool(input.ends_with(&suffix)))
+                EvalValue::Value(Value::truth(input.ends_with(&suffix)))
             }
             PlanRowExpressionNode::BytesConcat { .. } => {
                 let left = eval_to_bytes(&next()?)?;
@@ -25232,7 +25174,7 @@ impl MachineInstance {
                 joined.extend_from_slice(&right);
                 EvalValue::Value(Value::Bytes(joined.into()))
             }
-            PlanRowExpressionNode::BytesEqual { .. } => EvalValue::Value(Value::Bool(
+            PlanRowExpressionNode::BytesEqual { .. } => EvalValue::Value(Value::truth(
                 eval_to_bytes(&next()?)? == eval_to_bytes(&next()?)?,
             )),
             PlanRowExpressionNode::NumberInfix { op, .. } => {
@@ -25422,36 +25364,34 @@ impl MachineInstance {
         ))
     }
 
-    fn eval_intrinsic(&self, intrinsic: PlanIntrinsic) -> Value {
+    fn eval_intrinsic(&self, intrinsic: PlanIntrinsic) -> Result<Value, Error> {
         let SessionContext::Available { status, principal } = &self.options.session_context else {
-            return Value::Error {
-                code: "session_scope_unavailable".to_owned(),
-            };
+            return Err(Error::Evaluation("session scope is unavailable".to_owned()));
         };
-        match intrinsic {
+        Ok(match intrinsic {
             PlanIntrinsic::SessionInfoStatus => match status {
-                SessionConnectionStatus::Connecting => Value::Text("Connecting".to_owned()),
-                SessionConnectionStatus::Current => Value::Text("Current".to_owned()),
-                SessionConnectionStatus::Stale => Value::Text("Stale".to_owned()),
-                SessionConnectionStatus::Failed { code } => Value::Record(BTreeMap::from([
-                    ("$tag".to_owned(), Value::Text("Failed".to_owned())),
-                    ("code".to_owned(), Value::Text(code.clone())),
-                ])),
+                SessionConnectionStatus::Connecting => Value::tag("Connecting"),
+                SessionConnectionStatus::Current => Value::tag("Current"),
+                SessionConnectionStatus::Stale => Value::tag("Stale"),
+                SessionConnectionStatus::Failed { code } => Value::tagged(
+                    "Failed",
+                    BTreeMap::from([("code".to_owned(), Value::Text(code.clone()))]),
+                ),
             },
             PlanIntrinsic::SessionInfoPrincipal => match principal {
-                SessionPrincipal::Authenticated { subject, roles } => {
-                    Value::Record(BTreeMap::from([
-                        ("$tag".to_owned(), Value::Text("Authenticated".to_owned())),
+                SessionPrincipal::Authenticated { subject, roles } => Value::tagged(
+                    "Authenticated",
+                    BTreeMap::from([
                         ("subject".to_owned(), Value::Text(subject.clone())),
                         (
                             "roles".to_owned(),
                             Value::List(roles.iter().cloned().map(Value::Text).collect()),
                         ),
-                    ]))
-                }
-                SessionPrincipal::Anonymous => Value::Text("Anonymous".to_owned()),
+                    ]),
+                ),
+                SessionPrincipal::Anonymous => Value::tag("Anonymous"),
             },
-        }
+        })
     }
 
     fn eval_object_field(
@@ -25471,6 +25411,10 @@ impl MachineInstance {
                 let keys = record.keys().cloned().collect();
                 runtime_string_map_remove(&mut record, field).ok_or_else(|| missing(keys))
             }
+            EvalValue::Tag { mut fields, .. } => {
+                let keys = fields.keys().cloned().collect();
+                runtime_string_map_remove(&mut fields, field).ok_or_else(|| missing(keys))
+            }
             EvalValue::MappedRow { mut fields, .. } => {
                 let keys = fields.keys().cloned().collect();
                 runtime_string_map_remove(&mut fields, field).ok_or_else(|| missing(keys))
@@ -25478,6 +25422,12 @@ impl MachineInstance {
             EvalValue::Value(Value::Record(mut record)) => {
                 let keys = record.keys().cloned().collect();
                 runtime_string_map_remove(&mut record, field)
+                    .map(EvalValue::Value)
+                    .ok_or_else(|| missing(keys))
+            }
+            EvalValue::Value(Value::Tag { mut fields, .. }) => {
+                let keys = fields.keys().cloned().collect();
+                runtime_string_map_remove(&mut fields, field)
                     .map(EvalValue::Value)
                     .ok_or_else(|| missing(keys))
             }
@@ -25516,7 +25466,7 @@ impl MachineInstance {
         };
         let value = match function {
             PlanRowBuiltin::BoolNot => {
-                EvalValue::Value(Value::Bool(!eval_to_bool(&require_input(input)?)?))
+                EvalValue::Value(Value::truth(!eval_to_bool(&require_input(input)?)?))
             }
             PlanRowBuiltin::BoolAnd | PlanRowBuiltin::BoolOr => {
                 return Err(Error::InvalidPlan(format!(
@@ -25530,7 +25480,7 @@ impl MachineInstance {
                     .map(|when| eval_to_bool(&when))
                     .transpose()?
                     .unwrap_or(true);
-                EvalValue::Value(Value::Bool(if when { !value } else { value }))
+                EvalValue::Value(Value::truth(if when { !value } else { value }))
             }
             PlanRowBuiltin::TextEmpty => EvalValue::Value(Value::Text(String::new())),
             PlanRowBuiltin::TextToLowercase => EvalValue::Value(Value::Text(
@@ -25542,18 +25492,18 @@ impl MachineInstance {
             PlanRowBuiltin::TextContains => {
                 let input = require_input(input)?;
                 let needle = take_required_builtin_arg(&mut args, "needle", function)?;
-                EvalValue::Value(Value::Bool(
+                EvalValue::Value(Value::truth(
                     eval_to_text(&input)?.contains(&eval_to_text(&needle)?),
                 ))
             }
-            PlanRowBuiltin::TextIsNotEmpty => EvalValue::Value(Value::Bool(
+            PlanRowBuiltin::TextIsNotEmpty => EvalValue::Value(Value::truth(
                 !eval_to_text(&require_input(input)?)?.is_empty(),
             )),
             PlanRowBuiltin::TextAllCharsIn => {
                 let input = eval_to_text(&require_input(input)?)?;
                 let allowed =
                     eval_to_text(&take_required_builtin_arg(&mut args, "chars", function)?)?;
-                EvalValue::Value(Value::Bool(
+                EvalValue::Value(Value::truth(
                     input.chars().all(|character| allowed.contains(character)),
                 ))
             }
@@ -25601,20 +25551,6 @@ impl MachineInstance {
                     .map(|width| eval_to_number(&width))
                     .transpose()?;
                 EvalValue::Value(Value::Text(format_number_ascii_text(value, width)))
-            }
-            PlanRowBuiltin::ErrorNew => {
-                let code = take_optional_builtin_arg(&mut args, "code")
-                    .map(|value| eval_to_text(&value))
-                    .transpose()?
-                    .unwrap_or_else(|| "error".to_owned());
-                EvalValue::Value(Value::Error { code })
-            }
-            PlanRowBuiltin::ErrorText => {
-                let code = match require_input(input)? {
-                    EvalValue::Value(Value::Error { code }) => code,
-                    _ => String::new(),
-                };
-                EvalValue::Value(Value::Text(code))
             }
             PlanRowBuiltin::NumberCeil
             | PlanRowBuiltin::NumberFloor
@@ -25742,12 +25678,12 @@ impl MachineInstance {
             PlanRowBuiltin::ListLatest => {
                 let mut values = eval_to_list(require_input(input)?)?;
                 work.consume(1)?;
-                values.pop().unwrap_or(EvalValue::Value(Value::Null))
+                values.pop().unwrap_or(EvalValue::Absent)
             }
             PlanRowBuiltin::ListCount | PlanRowBuiltin::ListLength => EvalValue::Value(
                 Value::integer(eval_to_list(require_input(input)?)?.len() as i64)?,
             ),
-            PlanRowBuiltin::ListIsNotEmpty => EvalValue::Value(Value::Bool(
+            PlanRowBuiltin::ListIsNotEmpty => EvalValue::Value(Value::truth(
                 !eval_to_list(require_input(input)?)?.is_empty(),
             )),
             PlanRowBuiltin::ListTake => {
@@ -26696,11 +26632,7 @@ fn normalize_scalar_list_item(
 }
 
 fn eval_value_is_present(value: &EvalValue) -> bool {
-    match value {
-        EvalValue::Value(Value::Null) => false,
-        EvalValue::Value(Value::Text(value)) if value == "SKIP" => false,
-        _ => true,
-    }
+    !matches!(value, EvalValue::Absent)
 }
 
 fn expression_row(row: Option<RowId>) -> Option<RowId> {
@@ -26726,6 +26658,11 @@ pub(crate) fn normalize_host_output_value(value: Value) -> Result<Value, Error> 
             .map(|(name, value)| Ok((name, normalize_host_output_value(value)?)))
             .collect::<Result<BTreeMap<_, _>, Error>>()
             .map(Value::Record),
+        Value::Tag { tag, fields } => fields
+            .into_iter()
+            .map(|(name, value)| Ok((name, normalize_host_output_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(|fields| Value::Tag { tag, fields }),
         Value::MappedRow { fields, .. } => fields
             .into_iter()
             .map(|(name, value)| Ok((name, normalize_host_output_value(value)?)))
@@ -26738,12 +26675,7 @@ pub(crate) fn normalize_host_output_value(value: Value) -> Result<Value, Error> 
         Value::HostBound { .. } => Err(Error::Evaluation(
             "host outputs cannot expose process-local host bindings".to_owned(),
         )),
-        Value::Null
-        | Value::Bool(_)
-        | Value::Number(_)
-        | Value::Text(_)
-        | Value::Bytes(_)
-        | Value::Error { .. } => Ok(value),
+        Value::Number(_) | Value::Text(_) | Value::Bytes(_) => Ok(value),
     }
 }
 
@@ -26759,6 +26691,11 @@ fn normalize_effect_intent_value(value: Value) -> Result<Value, Error> {
             .map(|(name, value)| Ok((name, normalize_effect_intent_value(value)?)))
             .collect::<Result<BTreeMap<_, _>, Error>>()
             .map(Value::Record),
+        Value::Tag { tag, fields } => fields
+            .into_iter()
+            .map(|(name, value)| Ok((name, normalize_effect_intent_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(|fields| Value::Tag { tag, fields }),
         Value::MappedRow { fields, .. } => fields
             .into_iter()
             .map(|(name, value)| Ok((name, normalize_effect_intent_value(value)?)))
@@ -26769,12 +26706,9 @@ fn normalize_effect_intent_value(value: Value) -> Result<Value, Error> {
                 .to_owned(),
         )),
         value @ Value::HostBound { .. }
-        | value @ Value::Null
-        | value @ Value::Bool(_)
         | value @ Value::Number(_)
         | value @ Value::Text(_)
-        | value @ Value::Bytes(_)
-        | value @ Value::Error { .. } => Ok(value),
+        | value @ Value::Bytes(_) => Ok(value),
     }
 }
 
@@ -26784,9 +26718,11 @@ fn eval_row_id(value: &EvalValue) -> Option<RowId> {
         EvalValue::Value(Value::Row { id, .. }) | EvalValue::Value(Value::MappedRow { id, .. }) => {
             Some(*id)
         }
-        EvalValue::Value(_)
+        EvalValue::Absent
+        | EvalValue::Value(_)
         | EvalValue::List(_)
         | EvalValue::Record(_)
+        | EvalValue::Tag { .. }
         | EvalValue::OrderedList { .. } => None,
     }
 }
@@ -26889,10 +26825,12 @@ fn eval_ordered_items(
 
 fn eval_order_direction(value: &EvalValue) -> Result<EvalOrderDirection, Error> {
     match value {
-        EvalValue::Value(Value::Text(value)) if value == "Ascending" => {
+        EvalValue::Value(Value::Tag { tag, fields }) if tag == "Ascending" && fields.is_empty() => {
             Ok(EvalOrderDirection::Ascending)
         }
-        EvalValue::Value(Value::Text(value)) if value == "Descending" => {
+        EvalValue::Value(Value::Tag { tag, fields })
+            if tag == "Descending" && fields.is_empty() =>
+        {
             Ok(EvalOrderDirection::Descending)
         }
         other => Err(Error::Evaluation(format!(
@@ -26903,9 +26841,10 @@ fn eval_order_direction(value: &EvalValue) -> Result<EvalOrderDirection, Error> 
 
 fn eval_order_key(value: Value) -> Result<Value, Error> {
     match value {
-        value @ (Value::Bool(_) | Value::Number(_) | Value::Text(_)) => Ok(value),
+        value @ (Value::Number(_) | Value::Text(_)) => Ok(value),
+        Value::Tag { tag, fields } if fields.is_empty() => Ok(Value::Tag { tag, fields }),
         other => Err(Error::Evaluation(format!(
-            "list order key must be Bool, Number, Text, or a fieldless tag, found {other:?}"
+            "list order key must be Number, Text, or a fieldless tag, found {other:?}"
         ))),
     }
 }
@@ -26944,14 +26883,8 @@ fn eval_to_text(value: &EvalValue) -> Result<String, Error> {
 
 fn page_position_bytes(value: &Value) -> Result<Option<Bytes>, ()> {
     match value {
-        Value::Text(tag) if tag == "Start" => Ok(None),
-        Value::Record(fields)
-            if fields.len() == 2
-                && matches!(
-                    runtime_string_map_get(fields, "$tag"),
-                    Some(Value::Text(tag)) if tag == "Cursor"
-                ) =>
-        {
+        Value::Tag { tag, fields } if tag == "Start" && fields.is_empty() => Ok(None),
+        Value::Tag { tag, fields } if tag == "Cursor" && fields.len() == 1 => {
             match runtime_string_map_get(fields, "value") {
                 Some(Value::Bytes(value)) => Ok(Some(value.clone())),
                 _ => Err(()),
@@ -27168,22 +27101,24 @@ fn uncaptured_expression_references_local(
 }
 
 fn page_terminal_variant(tag: &str) -> EvalValue {
-    EvalValue::Value(Value::Text(tag.to_owned()))
+    EvalValue::Value(Value::tag(tag))
 }
 
 fn page_result(items: Vec<Value>, next: Option<Vec<u8>>) -> EvalValue {
     let next = match next {
-        Some(value) => Value::Record(BTreeMap::from([
-            ("$tag".to_owned(), Value::Text("Cursor".to_owned())),
-            ("value".to_owned(), Value::Bytes(Bytes::from(value))),
-        ])),
-        None => Value::Text("End".to_owned()),
+        Some(value) => Value::tagged(
+            "Cursor",
+            BTreeMap::from([("value".to_owned(), Value::Bytes(Bytes::from(value)))]),
+        ),
+        None => Value::tag("End"),
     };
-    EvalValue::Value(Value::Record(BTreeMap::from([
-        ("$tag".to_owned(), Value::Text("Page".to_owned())),
-        ("items".to_owned(), Value::List(items)),
-        ("next".to_owned(), next),
-    ])))
+    EvalValue::Value(Value::tagged(
+        "Page",
+        BTreeMap::from([
+            ("items".to_owned(), Value::List(items)),
+            ("next".to_owned(), next),
+        ]),
+    ))
 }
 
 fn evaluated_list_access_selection_matches_key(
@@ -27286,16 +27221,18 @@ fn record_access_metrics(work: &mut Work, metrics: AccessMetrics, result_count: 
 
 fn value_to_text(value: &Value) -> Result<String, Error> {
     match value {
-        Value::Null => Ok(String::new()),
-        Value::Bool(value) => Ok(if *value { "True" } else { "False" }.to_owned()),
         Value::Number(value) => Ok(value.to_string()),
         Value::Text(value) => Ok(value.clone()),
         Value::Bytes(bytes) => String::from_utf8(bytes.to_vec())
             .map_err(|error| Error::Evaluation(format!("invalid UTF-8: {error}"))),
-        Value::Error { code } => Ok(code.clone()),
-        Value::List(_) | Value::Record(_) | Value::MappedRow { .. } | Value::Row { .. } => Err(
-            Error::Evaluation("list or record cannot be converted to text".to_owned()),
-        ),
+        Value::Tag { tag, fields } if fields.is_empty() => Ok(tag.clone()),
+        Value::List(_)
+        | Value::Record(_)
+        | Value::Tag { .. }
+        | Value::MappedRow { .. }
+        | Value::Row { .. } => Err(Error::Evaluation(
+            "list, record, or structured tag cannot be converted to text".to_owned(),
+        )),
         Value::HostBound { .. } => Err(Error::Evaluation(
             "host-bound values cannot be converted to text".to_owned(),
         )),
@@ -27313,12 +27250,9 @@ fn source_event_transform_op(op: &PlanOp) -> bool {
 }
 
 fn value_to_bool(value: &Value) -> Result<bool, Error> {
-    match value {
-        Value::Bool(value) => Ok(*value),
-        Value::Text(value) if value == "True" => Ok(true),
-        Value::Text(value) if value == "False" => Ok(false),
-        other => Err(Error::Evaluation(format!("value {other:?} is not boolean"))),
-    }
+    value
+        .as_truth()
+        .ok_or_else(|| Error::Evaluation(format!("value {value:?} is not True or False")))
 }
 
 fn eval_to_number(value: &EvalValue) -> Result<FiniteReal, Error> {
@@ -27339,10 +27273,10 @@ fn eval_to_integer(value: &EvalValue) -> Result<i64, Error> {
 
 fn eval_to_bool(value: &EvalValue) -> Result<bool, Error> {
     match value {
-        EvalValue::Value(Value::Bool(value)) => Ok(*value),
-        EvalValue::Value(Value::Text(value)) if value == "True" => Ok(true),
-        EvalValue::Value(Value::Text(value)) if value == "False" => Ok(false),
-        other => Err(Error::Evaluation(format!("value {other:?} is not boolean"))),
+        EvalValue::Value(value) => value_to_bool(value),
+        other => Err(Error::Evaluation(format!(
+            "value {other:?} is not True or False"
+        ))),
     }
 }
 
@@ -27359,11 +27293,6 @@ fn finite_number_result(value: f64, context: &str) -> Result<FiniteReal, Error> 
 }
 
 fn eval_number_infix(op: PlanInfixOp, left: &EvalValue, right: &EvalValue) -> Result<Value, Error> {
-    for value in [left, right] {
-        if let EvalValue::Value(Value::Error { code }) = value {
-            return Ok(Value::Error { code: code.clone() });
-        }
-    }
     if matches!(left, EvalValue::Value(Value::Text(value)) if value == "NaN")
         || matches!(right, EvalValue::Value(Value::Text(value)) if value == "NaN")
     {
@@ -27374,7 +27303,7 @@ fn eval_number_infix(op: PlanInfixOp, left: &EvalValue, right: &EvalValue) -> Re
             (Ok(left), Ok(right)) => numeric_compare(left, PlanInfixOp::Equal, right)?,
             _ => eval_data_equal(left, right)?,
         };
-        return Ok(Value::Bool(if op == PlanInfixOp::Equal {
+        return Ok(Value::truth(if op == PlanInfixOp::Equal {
             equal
         } else {
             !equal
@@ -27593,17 +27522,17 @@ fn eval_to_numeric(value: &EvalValue) -> Result<FiniteReal, Error> {
 
 fn numeric_infix(left: FiniteReal, op: PlanInfixOp, right: FiniteReal) -> Result<Value, Error> {
     if matches!(op, PlanInfixOp::Divide | PlanInfixOp::Remainder) && right.get() == 0.0 {
-        return Ok(Value::Error {
-            code: if op == PlanInfixOp::Divide {
+        return Err(Error::Evaluation(
+            if op == PlanInfixOp::Divide {
                 "div_by_zero"
             } else {
                 "mod_by_zero"
             }
             .to_owned(),
-        });
+        ));
     }
     if op.is_comparison() {
-        return Ok(Value::Bool(numeric_compare(left, op, right)?));
+        return Ok(Value::truth(numeric_compare(left, op, right)?));
     }
     let left = left.get();
     let right = right.get();
@@ -27682,10 +27611,11 @@ fn compare_update_values(
 
 fn select_pattern_matches(pattern: &PlanRowSelectPattern, value: &Value) -> bool {
     match pattern {
-        PlanRowSelectPattern::Bool { value: expected } => value == &Value::Bool(*expected),
+        PlanRowSelectPattern::Tag { name } => {
+            matches!(value.visible(), Value::Tag { tag, fields } if tag == name && fields.is_empty())
+        }
         PlanRowSelectPattern::Text { value: expected } => {
-            value == &Value::Text(expected.clone())
-                || tagged_value_label(value).is_some_and(|tag| tag == expected)
+            value.visible() == &Value::Text(expected.clone())
         }
         PlanRowSelectPattern::Number { value: expected } => value == &Value::Number(*expected),
         PlanRowSelectPattern::NaN => value == &Value::Text("NaN".to_owned()),
@@ -27694,21 +27624,14 @@ fn select_pattern_matches(pattern: &PlanRowSelectPattern, value: &Value) -> bool
 }
 
 fn tagged_value_label(value: &Value) -> Option<&str> {
-    let value = value.visible();
-    let Value::Record(fields) = value else {
-        return None;
-    };
-    runtime_string_map_get(fields, "$tag").and_then(|tag| match tag {
-        Value::Text(tag) => Some(tag.as_str()),
+    match value.visible() {
+        Value::Tag { tag, .. } => Some(tag),
         _ => None,
-    })
+    }
 }
 
 fn effect_outcome_tag(value: &Value) -> Option<&str> {
-    match value {
-        Value::Text(tag) => Some(tag),
-        _ => tagged_value_label(value),
-    }
+    tagged_value_label(value)
 }
 
 fn nonnegative_usize(value: i64, context: &str) -> Result<usize, Error> {
@@ -27949,7 +27872,8 @@ pub(crate) fn report_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
             Delta::InsertRow { row } => Delta::InsertRow {
                 row: report_row_snapshot(row),
             },
-            delta @ (Delta::RemoveRow { .. }
+            delta @ (Delta::ClearDistributedImport { .. }
+            | Delta::RemoveRow { .. }
             | Delta::BindSource { .. }
             | Delta::UnbindSource { .. }) => delta,
         })
@@ -28075,6 +27999,7 @@ fn delta_logical_bytes(delta: &Delta) -> u64 {
         Delta::SetDistributedImport { value, .. } => {
             32_u64.saturating_add(value_tree_stats(value).logical_payload_bytes)
         }
+        Delta::ClearDistributedImport { .. } => 32,
         Delta::InsertRow { row } => row_snapshot_logical_bytes(row),
         Delta::RemoveRow { .. } => 24,
         Delta::BindSource { .. } | Delta::UnbindSource { .. } => 24 + 8 + 8,
@@ -28212,6 +28137,14 @@ fn coalesce_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
                 } else {
                     import_positions.insert(import_id, output.len());
                     output.push(Delta::SetDistributedImport { import_id, value });
+                }
+            }
+            Delta::ClearDistributedImport { import_id } => {
+                if let Some(position) = import_positions.get(&import_id).copied() {
+                    output[position] = Delta::ClearDistributedImport { import_id };
+                } else {
+                    import_positions.insert(import_id, output.len());
+                    output.push(Delta::ClearDistributedImport { import_id });
                 }
             }
             other => output.push(other),
@@ -28362,7 +28295,7 @@ mod ownership_tests {
     fn legacy_runtime_intervals_count_recursive_clones_boundaries_and_string_trees() {
         let value = Value::Record(BTreeMap::from([(
             "items".to_owned(),
-            Value::List(vec![Value::Text("alpha".to_owned()), Value::Bool(true)]),
+            Value::List(vec![Value::Text("alpha".to_owned()), Value::truth(true)]),
         )]));
         let mut work = Work::with_limit(None);
 
@@ -28396,10 +28329,10 @@ mod ownership_tests {
             .push_task(ExpressionTask::RestoreBinding { undo: 1 })
             .unwrap();
         stack
-            .push_value(EvalValue::Value(Value::Bool(false)))
+            .push_value(EvalValue::Value(Value::truth(false)))
             .unwrap();
         stack
-            .push_value(EvalValue::Value(Value::Bool(true)))
+            .push_value(EvalValue::Value(Value::truth(true)))
             .unwrap();
         let mut metrics = TurnMetrics::default();
         stack.record_metrics(&mut metrics);
@@ -28441,7 +28374,7 @@ mod ownership_tests {
         });
         work.authority_deltas.push(AuthorityDelta::SetRoot {
             state: StateId(7),
-            value: Value::Record(BTreeMap::from([("value".to_owned(), Value::Bool(true))])),
+            value: Value::Record(BTreeMap::from([("value".to_owned(), Value::truth(true))])),
         });
         let (deltas, authority_deltas) = take_report_deltas(&mut work);
         work.finish_metrics();

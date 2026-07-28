@@ -250,9 +250,8 @@ pub struct DocumentConstant {
 pub enum DocumentConstantValue {
     Text { value: String },
     Number { coefficient: i64, scale: u32 },
-    Bool { value: bool },
     Bytes { value: Vec<u8> },
-    Enum { name: DocumentNameId },
+    Tag { name: DocumentNameId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -286,8 +285,6 @@ pub enum DocumentBuiltin {
     BytesStartsWith,
     BytesToText,
     DirectoryEntries,
-    ErrorNew,
-    ErrorText,
     FileWriteText,
     LightAmbient,
     LightDirectional,

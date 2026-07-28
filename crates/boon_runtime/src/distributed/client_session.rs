@@ -698,7 +698,13 @@ mod tests {
                 consumer_role: ProgramRole::Session,
                 scope: DistributedRouteScopePlan::OriginScoped,
                 payload_field: None,
-                payload_type: DataTypePlan::Null,
+                payload_type: DataTypePlan::Variant {
+                    variants: vec![boon_plan::DataVariantPlan {
+                        tag: "Null".to_owned(),
+                        fields: Vec::new(),
+                        open: false,
+                    }],
+                },
             }],
             call_edges: Vec::new(),
         };

@@ -75,6 +75,19 @@ fn empty_plan() -> MachinePlan {
     }
 }
 
+fn truth_data_type() -> DataTypePlan {
+    DataTypePlan::Variant {
+        variants: ["False", "True"]
+            .into_iter()
+            .map(|tag| DataVariantPlan {
+                tag: tag.to_owned(),
+                fields: Vec::new(),
+                open: false,
+            })
+            .collect(),
+    }
+}
+
 fn encoded_serde_string(value: &impl Serialize, expected: &str) {
     let mut encoded = vec![6];
     encoded.extend_from_slice(&(expected.len() as u64).to_le_bytes());
@@ -431,7 +444,7 @@ fn plan_verifier_rejects_malformed_row_builtin_calls() {
         id: PlanStorageId(0),
         state_id: StateId(0),
         owner: PlanOwner::root(),
-        value_type: PlanValueType::Bool,
+        value_type: PlanValueType::Tag,
         scope_id: None,
         indexed: false,
         indexed_field_id: None,
@@ -1947,7 +1960,7 @@ fn passkey_effect_contracts_have_canonical_closed_outbox_schemas() {
                     vec![
                         ("code", DataTypePlan::Text),
                         ("message", DataTypePlan::Text),
-                        ("retryable", DataTypePlan::Bool),
+                        ("retryable", truth_data_type()),
                     ],
                 ),
                 (
@@ -1956,7 +1969,7 @@ fn passkey_effect_contracts_have_canonical_closed_outbox_schemas() {
                         ("account_id", DataTypePlan::Text),
                         ("credential_id", DataTypePlan::Text),
                         ("label", DataTypePlan::Text),
-                        ("workspace_grant_bound", DataTypePlan::Bool),
+                        ("workspace_grant_bound", truth_data_type()),
                     ],
                 ),
             ],
@@ -1975,7 +1988,7 @@ fn passkey_effect_contracts_have_canonical_closed_outbox_schemas() {
                     vec![
                         ("code", DataTypePlan::Text),
                         ("message", DataTypePlan::Text),
-                        ("retryable", DataTypePlan::Bool),
+                        ("retryable", truth_data_type()),
                     ],
                 ),
                 (
@@ -2064,7 +2077,7 @@ fn persistence_schema_hash_includes_outbox_schema_but_excludes_output_registry()
             open: false,
         },
         key_type.clone(),
-        DataTypePlan::Bool,
+        truth_data_type(),
     )
     .unwrap();
     let with_outbox = PersistencePlan::new_with_migrations_and_effect_outbox(

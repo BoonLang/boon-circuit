@@ -391,7 +391,7 @@ impl HostServiceEffectAdapter {
                 "SecretVerified",
                 BTreeMap::from([(
                     "matches".to_owned(),
-                    Value::Bool(verification.is_verified()),
+                    Value::truth(verification.is_verified()),
                 )]),
             ),
             Err(error) => host_failure(error),
@@ -439,7 +439,7 @@ impl HostServiceEffectAdapter {
                 "HmacVerified",
                 BTreeMap::from([(
                     "matches".to_owned(),
-                    Value::Bool(verification.is_verified()),
+                    Value::truth(verification.is_verified()),
                 )]),
             ),
             Err(error) => host_failure(error),
@@ -2226,8 +2226,8 @@ fn decode_file_read_stream_intent(
     let chunk_bytes = usize::try_from(chunk_bytes).map_err(|_| {
         FileStreamFailure::invalid("file stream chunk_bytes exceeds the host platform range")
     })?;
-    let retain_content = match fields.get("retain_content") {
-        Some(Value::Bool(value)) => *value,
+    let retain_content = match fields.get("retain_content").and_then(Value::as_truth) {
+        Some(value) => value,
         _ => {
             return Err(FileStreamFailure::invalid(
                 "file stream retain_content must be Bool",
@@ -3724,7 +3724,7 @@ mod tests {
     fn strict_intent_decoder_rejects_extra_fields() {
         let value = Value::Record(BTreeMap::from([
             ("byte_count".to_owned(), number(16)),
-            ("unexpected".to_owned(), Value::Bool(true)),
+            ("unexpected".to_owned(), Value::truth(true)),
         ]));
         let Value::Record(result) = exact_record(&value, &["byte_count"]).unwrap_err() else {
             panic!("failure must be a variant record");

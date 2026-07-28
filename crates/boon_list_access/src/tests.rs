@@ -5,6 +5,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 const TAG_TYPE: TagTypeId = TagTypeId::from_u128(0xabc);
+const TRUTH_TAG_TYPE: TagTypeId = TagTypeId::from_u128(0xdef);
 const PLAN_ID: IndexPlanId = IndexPlanId::from_u128(0x123);
 
 fn component(kind: KeyKind, direction: Direction) -> KeyComponent {
@@ -37,6 +38,10 @@ fn tag(ordinal: u32) -> StructuralValue {
     StructuralValue::ClosedTag(ClosedTag::new(TAG_TYPE, ordinal))
 }
 
+fn truth(value: bool) -> StructuralValue {
+    StructuralValue::ClosedTag(ClosedTag::new(TRUTH_TAG_TYPE, u32::from(value)))
+}
+
 fn row(value: u128) -> RowId {
     RowId::from_u128(value)
 }
@@ -62,7 +67,6 @@ fn value_cmp(left: &StructuralValue, right: &StructuralValue) -> Ordering {
     match (left, right) {
         (StructuralValue::Number(left), StructuralValue::Number(right)) => left.cmp(right),
         (StructuralValue::Text(left), StructuralValue::Text(right)) => left.cmp(right),
-        (StructuralValue::Bool(left), StructuralValue::Bool(right)) => left.cmp(right),
         (StructuralValue::ClosedTag(left), StructuralValue::ClosedTag(right)) => left.cmp(right),
         _ => panic!("reference comparator received unlike typed components"),
     }
@@ -162,16 +166,11 @@ fn codec_has_a_stable_typed_byte_layout() {
     let schema = schema(&[
         (KeyKind::Number, Direction::Asc),
         (KeyKind::Text, Direction::Asc),
-        (KeyKind::Bool, Direction::Asc),
+        (KeyKind::ClosedTag(TRUTH_TAG_TYPE), Direction::Asc),
         (KeyKind::ClosedTag(TAG_TYPE), Direction::Asc),
     ]);
     let encoded = schema
-        .encode(&key(vec![
-            number(0),
-            text("a\0"),
-            StructuralValue::Bool(true),
-            tag(7),
-        ]))
+        .encode(&key(vec![number(0), text("a\0"), truth(true), tag(7)]))
         .unwrap();
     let mut expected = vec![
         KEY_CODEC_VERSION,
@@ -190,10 +189,11 @@ fn codec_has_a_stable_typed_byte_layout() {
         u8::MAX,
         0,
         0,
-        0x33,
-        1,
-        0x44,
     ];
+    expected.push(0x44);
+    expected.extend_from_slice(TRUTH_TAG_TYPE.as_bytes());
+    expected.extend_from_slice(&1_u32.to_be_bytes());
+    expected.push(0x44);
     expected.extend_from_slice(TAG_TYPE.as_bytes());
     expected.extend_from_slice(&7_u32.to_be_bytes());
     assert_eq!(encoded.as_bytes(), expected);
@@ -211,7 +211,7 @@ fn mixed_direction_codec_matches_independent_structural_order() {
                     keys.push(key(vec![
                         text(text_value),
                         number(number_value),
-                        StructuralValue::Bool(bool_value),
+                        truth(bool_value),
                         tag(tag_value),
                     ]));
                 }
@@ -229,7 +229,7 @@ fn mixed_direction_codec_matches_independent_structural_order() {
         let schema = schema(&[
             (KeyKind::Text, direction(0)),
             (KeyKind::Number, direction(1)),
-            (KeyKind::Bool, direction(2)),
+            (KeyKind::ClosedTag(TRUTH_TAG_TYPE), direction(2)),
             (KeyKind::ClosedTag(TAG_TYPE), direction(3)),
         ]);
         for left in &keys {
@@ -327,7 +327,7 @@ fn source_order_only_index_resumes_from_a_direct_cursor_without_scanning() {
 #[test]
 fn exact_range_and_descending_text_prefix_are_seekable() {
     let schema = schema(&[
-        (KeyKind::Bool, Direction::Asc),
+        (KeyKind::ClosedTag(TRUTH_TAG_TYPE), Direction::Asc),
         (KeyKind::Text, Direction::Desc),
     ]);
     let mut index = ordered_index(schema.clone());
@@ -337,16 +337,12 @@ fn exact_range_and_descending_text_prefix_are_seekable() {
             .insert(
                 row(position as u128),
                 token(position as u128),
-                key(vec![StructuralValue::Bool(true), text(name)]),
+                key(vec![truth(true), text(name)]),
             )
             .unwrap();
     }
 
-    let (prefix, prefix_metrics) = collect(
-        index
-            .text_prefix(&[StructuralValue::Bool(true)], "al", None)
-            .unwrap(),
-    );
+    let (prefix, prefix_metrics) = collect(index.text_prefix(&[truth(true)], "al", None).unwrap());
     let prefix_names = prefix
         .iter()
         .map(|item| match &item.key().parts()[1] {
@@ -360,7 +356,7 @@ fn exact_range_and_descending_text_prefix_are_seekable() {
         let key = index.cursor_for(row(position as u128)).unwrap();
         assert_eq!(
             index
-                .key_matches_text_prefix(key.key(), &[StructuralValue::Bool(true)], "al",)
+                .key_matches_text_prefix(key.key(), &[truth(true)], "al",)
                 .unwrap(),
             name.starts_with("al")
         );
@@ -368,7 +364,7 @@ fn exact_range_and_descending_text_prefix_are_seekable() {
 
     let mut ordered_keys = names
         .iter()
-        .map(|name| key(vec![StructuralValue::Bool(true), text(name)]))
+        .map(|name| key(vec![truth(true), text(name)]))
         .collect::<Vec<_>>();
     ordered_keys.sort_by(|left, right| directed_key_cmp(&schema, left, right));
     let (middle, _) = collect(
@@ -1253,7 +1249,7 @@ fn generated_key(rng: &mut DeterministicRng) -> StructuralKey {
     key(vec![
         text(texts[(rng.next() as usize) % texts.len()]),
         number((rng.next() % 41) as i64 - 20),
-        StructuralValue::Bool(rng.next() & 1 == 1),
+        truth(rng.next() & 1 == 1),
         tag((rng.next() % 5) as u32),
     ])
 }
@@ -1263,7 +1259,7 @@ fn deterministic_mutation_trace_matches_reference_after_every_turn() {
     let schema = schema(&[
         (KeyKind::Text, Direction::Asc),
         (KeyKind::Number, Direction::Desc),
-        (KeyKind::Bool, Direction::Asc),
+        (KeyKind::ClosedTag(TRUTH_TAG_TYPE), Direction::Asc),
         (KeyKind::ClosedTag(TAG_TYPE), Direction::Desc),
     ]);
     let mut index = ordered_index(schema.clone());

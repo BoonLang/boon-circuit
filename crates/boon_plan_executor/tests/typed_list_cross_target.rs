@@ -20,17 +20,18 @@ use std::collections::BTreeMap;
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn typed_key_codec_has_the_same_golden_bytes_on_native_and_wasm() {
     let tag_type = TagTypeId::from_u128(0x0102_0304_0506_0708_1112_1314_1516_1718);
+    let truth_type = TagTypeId::from_u128(0x2122_2324_2526_2728_3132_3334_3536_3738);
     let schema = KeySchema::new(vec![
         KeyComponent::new(KeyKind::Number, Direction::Asc),
         KeyComponent::new(KeyKind::Text, Direction::Asc),
-        KeyComponent::new(KeyKind::Bool, Direction::Asc),
+        KeyComponent::new(KeyKind::ClosedTag(truth_type), Direction::Asc),
         KeyComponent::new(KeyKind::ClosedTag(tag_type), Direction::Asc),
     ])
     .unwrap();
     let key = StructuralKey::new(vec![
         StructuralValue::number(0.0).unwrap(),
         StructuralValue::text("a\0"),
-        StructuralValue::Bool(true),
+        StructuralValue::ClosedTag(ClosedTag::new(truth_type, 1)),
         StructuralValue::ClosedTag(ClosedTag::new(tag_type, 7)),
     ])
     .unwrap();
@@ -51,10 +52,11 @@ fn typed_key_codec_has_the_same_golden_bytes_on_native_and_wasm() {
         u8::MAX,
         0,
         0,
-        0x33,
-        1,
-        0x44,
     ];
+    expected.push(0x44);
+    expected.extend_from_slice(truth_type.as_bytes());
+    expected.extend_from_slice(&1_u32.to_be_bytes());
+    expected.push(0x44);
     expected.extend_from_slice(tag_type.as_bytes());
     expected.extend_from_slice(&7_u32.to_be_bytes());
     assert_eq!(schema.encode(&key).unwrap().as_bytes(), expected);

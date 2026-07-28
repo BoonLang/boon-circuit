@@ -1763,7 +1763,7 @@ fn source_payload(
 
 fn scenario_value(value: &MigrationScenarioValue) -> Value {
     match value {
-        MigrationScenarioValue::Bool(value) => Value::Bool(*value),
+        MigrationScenarioValue::Truth(value) => Value::truth(*value),
         MigrationScenarioValue::Integer(value) => Value::Number(
             FiniteReal::from_i64_exact(*value)
                 .expect("validated migration scenario integer must be exactly representable"),

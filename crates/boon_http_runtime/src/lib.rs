@@ -449,9 +449,9 @@ fn failure_outcome(failure: Failure) -> Value {
             ("endpoint".to_owned(), Value::Text(failure.endpoint)),
             ("code".to_owned(), Value::Text(failure.code.to_owned())),
             ("diagnostic".to_owned(), Value::Text(failure.diagnostic)),
-            ("retryable".to_owned(), Value::Bool(failure.retryable)),
-            ("timed_out".to_owned(), Value::Bool(failure.timed_out)),
-            ("cancelled".to_owned(), Value::Bool(failure.cancelled)),
+            ("retryable".to_owned(), Value::truth(failure.retryable)),
+            ("timed_out".to_owned(), Value::truth(failure.timed_out)),
+            ("cancelled".to_owned(), Value::truth(failure.cancelled)),
         ]),
     )
 }

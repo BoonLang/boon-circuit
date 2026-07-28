@@ -3495,8 +3495,6 @@ fn format_inspection_value(value: &Value, depth: usize) -> String {
         return "...".to_owned();
     }
     match value {
-        Value::Null => "Null".to_owned(),
-        Value::Bool(value) => value.to_string(),
         Value::Number(value) => value.to_string(),
         Value::Text(value) => {
             let mut bounded = value.chars().take(MAX_TEXT).collect::<String>();
@@ -3530,6 +3528,23 @@ fn format_inspection_value(value: &Value, depth: usize) -> String {
             }
             format!("[{}]", parts.join(", "))
         }
+        Value::Tag { tag, fields } => {
+            let mut parts = fields
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|(name, value)| {
+                    format!("{name}: {}", format_inspection_value(value, depth + 1))
+                })
+                .collect::<Vec<_>>();
+            if fields.len() > MAX_ITEMS {
+                parts.push(format!("... {} more", fields.len() - MAX_ITEMS));
+            }
+            if parts.is_empty() {
+                tag.clone()
+            } else {
+                format!("{tag}[{}]", parts.join(", "))
+            }
+        }
         Value::MappedRow { id, fields } => {
             let mut parts = fields
                 .iter()
@@ -3556,7 +3571,6 @@ fn format_inspection_value(value: &Value, depth: usize) -> String {
             id.generation,
             fields.len()
         ),
-        Value::Error { code } => format!("Error[{code}]"),
         Value::HostBound { visible, .. } => format_inspection_value(visible, depth),
     }
 }
@@ -3726,7 +3740,7 @@ mod tests {
         view.dispatch_root_source(
             source,
             SourcePayload {
-                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                fields: BTreeMap::from([("press".to_owned(), Value::truth(true))]),
                 ..SourcePayload::default()
             },
         )
@@ -4243,7 +4257,7 @@ document: Document/new(
                 route,
                 SourcePayload {
                     address: Some(file.to_owned()),
-                    fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                    fields: BTreeMap::from([("press".to_owned(), Value::truth(true))]),
                     ..SourcePayload::default()
                 },
             )
@@ -4332,7 +4346,7 @@ document: Document/new(
             vcd_route,
             SourcePayload {
                 address: Some("simple.vcd".to_owned()),
-                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                fields: BTreeMap::from([("press".to_owned(), Value::truth(true))]),
                 ..SourcePayload::default()
             },
         )
@@ -4400,7 +4414,7 @@ document: Document/new(
             "store.signal_catalog.signal_elements.select_signal",
             analog_route,
             SourcePayload {
-                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                fields: BTreeMap::from([("press".to_owned(), Value::truth(true))]),
                 ..SourcePayload::default()
             },
         )
@@ -4447,7 +4461,7 @@ document: Document/new(
                 .as_ref()
                 .is_some_and(|text| text.text.contains(&analog_signal_name))
         }));
-        assert_eq!(analog_page.get("has_more"), Some(&Value::Bool(true)));
+        assert_eq!(analog_page.get("has_more"), Some(&Value::truth(true)));
         let first_analog_page_fingerprint = analog_page
             .get("request_fingerprint")
             .cloned()
@@ -4637,7 +4651,7 @@ document: Document/new(
         view.dispatch_root_source(
             "store.elements.simulate_registration_cancel",
             SourcePayload {
-                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                fields: BTreeMap::from([("press".to_owned(), Value::truth(true))]),
                 ..SourcePayload::default()
             },
         )
@@ -4673,7 +4687,7 @@ document: Document/new(
         view.dispatch_root_source(
             "store.elements.register_passkey",
             SourcePayload {
-                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                fields: BTreeMap::from([("press".to_owned(), Value::truth(true))]),
                 ..SourcePayload::default()
             },
         )

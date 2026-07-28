@@ -2204,16 +2204,21 @@ impl<'a> ReactiveBuilder<'a> {
                         }
                         _ => SemanticViewCaptureTargetV1::Read { read: read.id },
                     };
-                    raw.insert((
-                        output.ordinal,
-                        expression,
-                        read.value,
-                        target,
-                        trigger_row_scope(
-                            &triggers.event_causes_for_expression(expression)?,
-                            self.resources,
-                        )?,
-                    ));
+                    let trigger_scope = trigger_row_scope(
+                        &triggers.event_causes_for_expression(expression)?,
+                        self.resources,
+                    )?;
+                    let read_scope = materialization_local_read_scope(read, self.execution)?;
+                    let row_scope = match (trigger_scope, read_scope) {
+                        (Some(trigger), Some(read)) if trigger != read => {
+                            return Err(SemanticReactiveError::new(format!(
+                                "view capture expression {expression} has trigger row scope {trigger} but reads materialization row scope {read}"
+                            )));
+                        }
+                        (Some(scope), _) | (_, Some(scope)) => Some(scope),
+                        (None, None) => None,
+                    };
+                    raw.insert((output.ordinal, expression, read.value, target, row_scope));
                 } else if let Some(field) = fields_by_expression.get(&expression) {
                     raw.insert((
                         output.ordinal,
@@ -3255,6 +3260,30 @@ fn require_trigger(
                 id
             ))
         })
+}
+
+fn materialization_local_read_scope(
+    read: &SemanticReadBindingV1,
+    execution: &SemanticExecutionGraphV1,
+) -> Result<Option<SemanticRowScopeId>, SemanticReactiveError> {
+    let SemanticReadTargetV1::MaterializationLocal { owner, local, .. } = read.target else {
+        return Ok(None);
+    };
+    let materializations = execution
+        .materializations
+        .iter()
+        .filter(|materialization| {
+            materialization.owner == owner && materialization.row_local == local
+        })
+        .collect::<Vec<_>>();
+    let [materialization] = materializations.as_slice() else {
+        return Err(SemanticReactiveError::new(format!(
+            "semantic read {} materialization local {owner}:{local:?} resolves to {} exact materializations",
+            read.id,
+            materializations.len()
+        )));
+    };
+    Ok(materialization.source_scope_id)
 }
 
 fn trigger_row_scope(

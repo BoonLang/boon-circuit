@@ -7532,7 +7532,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             states.push(state);
         }
 
-        let mut lists = Vec::new();
+        let mut lists = Vec::<CheckedList>::new();
         for expression in expressions
             .iter()
             .filter(|expression| matches!(expression.kind, CheckedExpressionKind::List { .. }))
@@ -7602,7 +7602,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     _ => None,
                 })
                 .unwrap_or_else(|| item_type.as_ref().clone());
-            let projection = checked_declaration_resource_projection(
+            let mut projection = checked_declaration_resource_projection(
                 &self.signatures,
                 &declaration_values,
                 expressions,
@@ -7611,6 +7611,21 @@ impl<'a> CheckedProgramBuilder<'a> {
                 expression.id,
             )
             .unwrap_or_default();
+            if projection.is_empty()
+                && self
+                    .declarations
+                    .iter()
+                    .find(|candidate| candidate.id == declaration)
+                    .is_some_and(|declaration| declaration.kind == CheckedDeclarationKind::Function)
+            {
+                projection = vec![format!(
+                    "list_{}",
+                    lists
+                        .iter()
+                        .filter(|list| list.declaration == declaration)
+                        .count()
+                )];
+            }
             let list = CheckedList {
                 id: CheckedListId(lists.len() as u32),
                 declaration,

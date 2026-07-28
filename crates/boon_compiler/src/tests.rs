@@ -8128,7 +8128,22 @@ fn cells_rows_are_typed_visible_range_materializations() {
             .filter(|field| field.role.is_authority())
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>(),
-        ["index", "value"]
+        // `editing_text` has both stable list authority and the canonical
+        // state authority for its internally named `draft` HOLD.
+        [
+            "editing_text",
+            "address",
+            "default_formula",
+            "display_text",
+            "editing",
+            "editing_text",
+            "error",
+            "formula_text",
+            "index",
+            "result",
+            "sources",
+            "value",
+        ]
     );
     let demand_current_fields = compiled
         .plan
@@ -8173,11 +8188,14 @@ fn cells_rows_are_typed_visible_range_materializations() {
     assert!(sources_field.resource_only);
     assert_eq!(
         demand_current_fields,
+        // Formula references read `result` across rows, so it is a real
+        // demand-current value rather than an inline-only intermediate.
         BTreeSet::from([
             "address",
             "default_formula",
             "display_text",
             "error",
+            "result",
             "value",
         ])
     );

@@ -6750,8 +6750,25 @@ fn erased_field_is_runtime_row_storage(
 ) -> bool {
     !field.resource_only
         && !program.scope_index.bindings.iter().any(|binding| {
-            matches!(binding.target, ir::ErasedBindingTarget::Source { .. })
-                && field.producer == Some(binding.producer)
+            (matches!(binding.target, ir::ErasedBindingTarget::Source { .. })
+                && field.producer == Some(binding.producer))
+                || (matches!(
+                    binding.target,
+                    ir::ErasedBindingTarget::Value {
+                        field: None,
+                        row: Some(row),
+                    } if Some(row) == field.row
+                ) && field.producer == Some(binding.producer)
+                    && field.declaration == Some(binding.declaration))
+                || (matches!(
+                    binding.target,
+                    ir::ErasedBindingTarget::State {
+                        field: Some(authority),
+                        row: Some(row),
+                        ..
+                    } if Some(row) == field.row && authority != field.id
+                ) && field.producer == Some(binding.producer)
+                    && field.declaration == Some(binding.declaration))
         })
 }
 
@@ -11173,9 +11190,34 @@ impl<'a> ExecutableRowLowerer<'a> {
         };
         let field_id =
             row_input_field_id_for_list_id(self.program, list_id, &field).ok_or_else(|| {
+                let list = self
+                    .program
+                    .lists
+                    .iter()
+                    .find(|candidate| plan_list_id(candidate.id) == list_id);
+                let fields = list
+                    .map(|list| {
+                        self.program
+                            .scope_index
+                            .fields
+                            .iter()
+                            .filter(|candidate| candidate.row.map(|row| row.list) == Some(list.id))
+                            .map(|candidate| {
+                                (
+                                    candidate.name.as_str(),
+                                    candidate.diagnostic_path.as_str(),
+                                    candidate.role,
+                                    candidate.static_owner,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 PlanError::new(format!(
-                    "typed row from list {} has no compiler-owned field `{field}`",
-                    list_id.0
+                    "typed row expression {:?} from list {} (`{}`) has no compiler-owned field `{field}` among {fields:?}",
+                    self.arena.node(value),
+                    list_id.0,
+                    list.map(|list| list.name.as_str()).unwrap_or("<missing>")
                 ))
             })?;
         let input = ValueRef::List(list_id);
@@ -11236,11 +11278,26 @@ impl<'a> ExecutableRowLowerer<'a> {
                 };
                 self.unique_row_source(*source)
             }
-            PlanRowExpressionNode::BuiltinCall {
-                function,
-                input: Some(source),
-                ..
-            } if *function == PlanRowBuiltin::ListGet => self.unique_row_source(*source),
+            PlanRowExpressionNode::ObjectField { object, field }
+                if field == "value"
+                    && matches!(
+                        self.arena.node(*object)?,
+                        PlanRowExpressionNode::BuiltinCall {
+                            function: PlanRowBuiltin::ListGet,
+                            input: Some(_),
+                            ..
+                        }
+                    ) =>
+            {
+                let PlanRowExpressionNode::BuiltinCall {
+                    input: Some(source),
+                    ..
+                } = self.arena.node(*object)?
+                else {
+                    unreachable!("guard proves List/get input")
+                };
+                self.unique_row_source(*source)
+            }
             PlanRowExpressionNode::Select { arms, .. } => {
                 let mut sources = BTreeSet::new();
                 for arm in arms {

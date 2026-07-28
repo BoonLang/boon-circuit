@@ -514,8 +514,14 @@ fn derive_semantic_view_binding_graph(
                     )?;
                     if leaf_bindings.is_empty() {
                         return Err(SemanticViewBindingError::new(format!(
-                            "view capture {} has no exact retained-view leaf under argument {}",
-                            capture.id, parameter.name
+                            "view capture {} expression {} ({:?}) has no exact retained-view leaf under {} argument {} expression {} ({:?})",
+                            capture.id,
+                            capture.expression,
+                            capture_expression.kind,
+                            function,
+                            parameter.name,
+                            call_argument.value,
+                            argument_expression.kind,
                         )));
                     }
                     for leaf in leaf_bindings {
@@ -837,7 +843,7 @@ impl BindingLeafTraversal<'_> {
                 for field in fields {
                     let child_mode = if field.spread {
                         Some(BindingLeafMode::Element)
-                    } else if field.name == "events" {
+                    } else if matches!(field.name.as_str(), "event" | "events") {
                         Some(BindingLeafMode::Events { attribute: None })
                     } else if field.name == "target" {
                         Some(BindingLeafMode::Data {
@@ -845,7 +851,10 @@ impl BindingLeafTraversal<'_> {
                             kind: SemanticViewBindingKindV1::Target,
                         })
                     } else {
-                        None
+                        Some(BindingLeafMode::Data {
+                            attribute: field.name.clone(),
+                            kind: SemanticViewBindingKindV1::Data,
+                        })
                     };
                     if let Some(child_mode) = child_mode {
                         self.visit(

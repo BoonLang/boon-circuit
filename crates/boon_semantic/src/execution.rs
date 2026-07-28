@@ -1759,6 +1759,15 @@ impl SemanticExecutionGraphV1 {
                         ));
                     }
                 };
+                let resolved_instance = &out_net.call_instances[instance.as_usize()];
+                let expected_flow_type = FlowType {
+                    mode: resolved_instance.result.mode,
+                    ty: crate::contextual_expansion::erase_runtime_type_vars(
+                        &resolved_instance.result.ty,
+                    ),
+                };
+                let expression_definition =
+                    self.require_expression(expression, context("call expression"))?;
                 if call_definition.callable != *callable
                     || *callable_kind != expected_kind
                     || name != &callable_definition.name
@@ -1766,12 +1775,14 @@ impl SemanticExecutionGraphV1 {
                     || *role != call_definition.role
                     || *effect != callable_definition.effect
                     || result != &call_definition.result
+                    || expression_definition.checked_expr_id != call_definition.checked_expression
+                    || expression_definition.effect != *effect
+                    || expression_definition.flow_type != expected_flow_type
                 {
                     return Err(format!(
                         "expression {expression} call contract differs from semantic call {call}"
                     ));
                 }
-                let resolved_instance = &out_net.call_instances[instance.as_usize()];
                 if resolved_instance.provenance.call_id != Some(call_definition.checked_call)
                     || resolved_instance.provenance.callable != callable_definition.checked_callable
                 {

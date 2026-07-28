@@ -670,9 +670,6 @@ fn append_state_authority_fields(
         let Some(reactive_field) = reactive_by_statement.get(&state.statement).copied() else {
             continue;
         };
-        if reactive_field.flow_type == state.flow_type {
-            continue;
-        }
         let public_field = reactive_storage
             .get(&reactive_field.id)
             .copied()
@@ -683,6 +680,15 @@ fn append_state_authority_fields(
                     state.id, reactive_field.id
                 ))
             })?;
+        let authority_name = state
+            .path
+            .rsplit('.')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(public_field.name.as_str());
+        if reactive_field.flow_type == state.flow_type && public_field.name == authority_name {
+            continue;
+        }
         let expected_row = state
             .target_list
             .zip(state.row_scope)
@@ -706,7 +712,7 @@ fn append_state_authority_fields(
             owner: state.owner,
             parent: public_field.parent,
             row: expected_row,
-            name: public_field.name.clone(),
+            name: authority_name.to_owned(),
             diagnostic_path: public_field.diagnostic_path.clone(),
             statement: Some(state.statement),
             producer: Some(state.expression),
@@ -959,11 +965,16 @@ fn list_authority_fields(
     initializer: &crate::SemanticListInitializerV1,
     item_fields: &[String],
 ) -> Vec<(Vec<String>, Type)> {
-    let mut fields = flattened_type_fields(item_type);
-    if matches!(initializer, crate::SemanticListInitializerV1::Range { .. }) {
-        fields.push((vec!["index".to_owned()], Type::Number));
-        fields.push((vec!["value".to_owned()], Type::Number));
-    } else if fields.is_empty() {
+    let range_authority = matches!(initializer, crate::SemanticListInitializerV1::Range { .. });
+    let mut fields = if range_authority {
+        vec![
+            (vec!["index".to_owned()], Type::Number),
+            (vec!["value".to_owned()], Type::Number),
+        ]
+    } else {
+        flattened_type_fields(item_type)
+    };
+    if !range_authority && fields.is_empty() {
         fields.push((vec!["value".to_owned()], item_type.clone()));
     }
     for name in item_fields {
@@ -982,6 +993,14 @@ fn list_authority_fields(
     fields.sort_by(|left, right| left.0.cmp(&right.0));
     fields.dedup_by(|left, right| left.0 == right.0);
     fields
+}
+
+fn list_item_fields(item_type: &Type, item_fields: &[String]) -> Vec<(Vec<String>, Type)> {
+    list_authority_fields(
+        item_type,
+        &crate::SemanticListInitializerV1::Empty,
+        item_fields,
+    )
 }
 
 fn ensure_value_authority_parent(
@@ -1192,9 +1211,7 @@ fn append_materialized_value_fields(
         if materializations.is_empty() {
             continue;
         }
-        for (path, _) in
-            list_authority_fields(&list.item_type, &list.initializer, &list.item_fields)
-        {
+        for (path, _) in list_item_fields(&list.item_type, &list.item_fields) {
             let [name] = path.as_slice() else {
                 continue;
             };
@@ -1448,13 +1465,15 @@ fn append_record_projection_fields(
                 continue;
             }
             let value = require_expression(execution, record_field.value)?;
+            let mut projection = storage_field_item_path(&parent).unwrap_or_default();
+            projection.push(record_field.name.clone());
             fields.push(SemanticStorageFieldV1 {
                 id: SemanticStorageFieldId(fields.len()),
                 role: SemanticStorageFieldRoleV1::Value,
                 origin: SemanticStorageFieldOriginV1::RecordProjection {
                     parent: parent.id,
                     expression: record_field.value,
-                    projection: vec![record_field.name.clone()],
+                    projection,
                 },
                 reactive_field: None,
                 producer_identity: None,
@@ -1559,7 +1578,10 @@ fn local_members_for_row(
         )?;
     }
     for (path, _) in flattened_type_fields(item_type) {
-        if members.contains_key(&path) {
+        if members
+            .keys()
+            .any(|resource_path| path.starts_with(resource_path))
+        {
             continue;
         }
         let candidates = fields
@@ -1586,8 +1608,22 @@ fn local_members_for_row(
             preferred
         };
         let [field] = selected.as_slice() else {
+            let available = fields
+                .iter()
+                .filter(|field| field.row == Some(row))
+                .filter_map(|field| {
+                    storage_field_item_path(field).map(|path| {
+                        (
+                            path.join("."),
+                            field.role,
+                            field.producer,
+                            field.diagnostic_path.as_str(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
             return Err(SemanticScopeStorageError::new(format!(
-                "row {}/{} member `{}` resolves to {} exact storage fields",
+                "row {}/{} member `{}` resolves to {} exact storage fields among {available:?}",
                 row.list,
                 row.scope,
                 path.join("."),
@@ -1630,9 +1666,11 @@ fn storage_field_item_path(field: &SemanticStorageFieldV1) -> Option<Vec<String>
     match &field.origin {
         SemanticStorageFieldOriginV1::ListAuthority { item_path, .. } => Some(item_path.clone()),
         SemanticStorageFieldOriginV1::StateAuthority { .. } => None,
+        SemanticStorageFieldOriginV1::RecordProjection { projection, .. } => {
+            field.row.map(|_| projection.clone())
+        }
         SemanticStorageFieldOriginV1::Reactive { .. }
         | SemanticStorageFieldOriginV1::ValueListAuthority { .. }
-        | SemanticStorageFieldOriginV1::RecordProjection { .. }
         | SemanticStorageFieldOriginV1::DetachedCapture { .. } => {
             field.row.map(|_| vec![field.name.clone()])
         }
@@ -1935,8 +1973,14 @@ fn collect_capture_requests(
             })?;
         if source.row != Some(target_row) {
             if !owner_descends_from(target_owner, *owner, owners)? {
+                if owner_descends_from(*owner, target_owner, owners)? {
+                    return Ok(());
+                }
                 return Err(SemanticScopeStorageError::new(format!(
-                    "capture target owner {target_owner} is unrelated to source local {owner}:{local}"
+                    "capture expression {expression} target owner {target_owner} ancestry {:?} is unrelated to source local {owner}:{local} ancestry {:?} projection {:?}",
+                    owner_ancestry(Some(target_owner), owners)?,
+                    owner_ancestry(Some(*owner), owners)?,
+                    projection,
                 )));
             }
             let key = CaptureRequestKey {

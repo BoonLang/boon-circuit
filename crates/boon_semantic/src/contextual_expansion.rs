@@ -962,7 +962,7 @@ fn concrete_type_in_frame(out_net: &OutNet, ty: &Type, frame: Option<OutCallInst
     erase_runtime_type_vars(&ty)
 }
 
-fn erase_runtime_type_vars(ty: &Type) -> Type {
+pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
     match ty {
         Type::Var(_) => Type::Unknown,
         Type::List(item) => Type::List(Box::new(erase_runtime_type_vars(item))),
@@ -3609,10 +3609,35 @@ struct ExpansionKey {
     evaluation_owner: Option<StaticOwnerId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SemanticValueFrameKey {
+    Block {
+        expression: CheckedExprId,
+        frame: Option<OutCallInstanceId>,
+        parent: Option<usize>,
+        owner: Option<StaticOwnerId>,
+    },
+    SelectArm {
+        arm: CheckedExprId,
+        frame: Option<OutCallInstanceId>,
+        parent: Option<usize>,
+        owner: Option<StaticOwnerId>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SemanticValueBinding {
     Local(SemanticLocalBindingId),
-    Expression(SemanticExprId),
+    Projection {
+        input: ScopedCheckedExpr,
+        fields: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SemanticValueFrame {
+    bindings: BTreeMap<DeclId, SemanticValueBinding>,
+    local_ids: BTreeMap<DeclId, SemanticLocalBindingId>,
 }
 
 fn runtime_value_provenance() -> SemanticValueProvenance {
@@ -3943,7 +3968,8 @@ pub(crate) struct SemanticExpressionBuilder<'a> {
     owner_stack: Vec<Option<StaticOwnerId>>,
     frame_stack: Vec<Option<OutCallInstanceId>>,
     current_statement: Option<SemanticStatementId>,
-    value_frames: Vec<BTreeMap<DeclId, SemanticValueBinding>>,
+    value_frames: Vec<SemanticValueFrame>,
+    value_frame_by_key: BTreeMap<SemanticValueFrameKey, usize>,
     next_local_binding: usize,
     defer_nested_expansion: bool,
 }
@@ -4001,6 +4027,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
             frame_stack: Vec::new(),
             current_statement: None,
             value_frames: Vec::new(),
+            value_frame_by_key: BTreeMap::new(),
             next_local_binding: 0,
             defer_nested_expansion: false,
         }
@@ -4017,6 +4044,94 @@ impl<'a> SemanticExpressionBuilder<'a> {
 
     fn set_current_statement(&mut self, statement: Option<SemanticStatementId>) {
         self.current_statement = statement;
+    }
+
+    fn parent_value_bindings(
+        &self,
+        parent: Option<usize>,
+    ) -> BTreeMap<DeclId, SemanticValueBinding> {
+        parent
+            .and_then(|frame| self.value_frames.get(frame))
+            .map(|frame| frame.bindings.clone())
+            .unwrap_or_default()
+    }
+
+    fn intern_block_value_frame(
+        &mut self,
+        scoped: ScopedCheckedExpr,
+        owner: Option<StaticOwnerId>,
+        declarations: &[DeclId],
+    ) -> (usize, BTreeMap<DeclId, SemanticLocalBindingId>) {
+        let key = SemanticValueFrameKey::Block {
+            expression: scoped.expression,
+            frame: scoped.frame,
+            parent: scoped.value_frame,
+            owner,
+        };
+        if let Some(frame) = self.value_frame_by_key.get(&key).copied() {
+            return (frame, self.value_frames[frame].local_ids.clone());
+        }
+
+        let mut bindings = self.parent_value_bindings(scoped.value_frame);
+        let local_ids = declarations
+            .iter()
+            .copied()
+            .map(|declaration| {
+                let id = SemanticLocalBindingId(self.next_local_binding);
+                self.next_local_binding += 1;
+                bindings.insert(declaration, SemanticValueBinding::Local(id));
+                (declaration, id)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let frame = self.value_frames.len();
+        self.value_frames.push(SemanticValueFrame {
+            bindings,
+            local_ids: local_ids.clone(),
+        });
+        self.value_frame_by_key.insert(key, frame);
+        (frame, local_ids)
+    }
+
+    fn intern_select_value_frame(
+        &mut self,
+        scoped: ScopedCheckedExpr,
+        owner: Option<StaticOwnerId>,
+        arm: CheckedExprId,
+        input: CheckedExprId,
+        bindings: &[(DeclId, Vec<String>)],
+    ) -> usize {
+        let key = SemanticValueFrameKey::SelectArm {
+            arm,
+            frame: scoped.frame,
+            parent: scoped.value_frame,
+            owner,
+        };
+        if let Some(frame) = self.value_frame_by_key.get(&key).copied() {
+            return frame;
+        }
+
+        let mut frame_bindings = self.parent_value_bindings(scoped.value_frame);
+        frame_bindings.extend(bindings.iter().cloned().map(|(declaration, fields)| {
+            (
+                declaration,
+                SemanticValueBinding::Projection {
+                    input: ScopedCheckedExpr {
+                        expression: input,
+                        frame: scoped.frame,
+                        evaluation_port: None,
+                        value_frame: scoped.value_frame,
+                    },
+                    fields,
+                },
+            )
+        }));
+        let frame = self.value_frames.len();
+        self.value_frames.push(SemanticValueFrame {
+            bindings: frame_bindings,
+            local_ids: BTreeMap::new(),
+        });
+        self.value_frame_by_key.insert(key, frame);
+        frame
     }
 
     fn direct_resource_provenance(
@@ -4199,8 +4314,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
             }
             let expression_len = self.expressions.len();
             let origin_len = self.checked_expression_origins.len();
-            let value_frame_len = self.value_frames.len();
-            let next_local_binding = self.next_local_binding;
             self.defer_nested_expansion = true;
             let result = self.expand_once(current.expression, current.inherited_owner);
             self.defer_nested_expansion = false;
@@ -4212,8 +4325,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 }) => {
                     self.expressions.truncate(expression_len);
                     self.checked_expression_origins.truncate(origin_len);
-                    self.value_frames.truncate(value_frame_len);
-                    self.next_local_binding = next_local_binding;
                     let dependency_key = self.expansion_key(expression, inherited_owner);
                     if dependency_key == current_key || current.ancestry.contains(&dependency_key) {
                         let cycle_start = current
@@ -4251,8 +4362,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 Err(error) => {
                     self.expressions.truncate(expression_len);
                     self.checked_expression_origins.truncate(origin_len);
-                    self.value_frames.truncate(value_frame_len);
-                    self.next_local_binding = next_local_binding;
                     return Err(error);
                 }
             }
@@ -4436,8 +4545,8 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 if let Some(binding) = scoped
                     .value_frame
                     .and_then(|frame| self.value_frames.get(frame))
-                    .and_then(|bindings| bindings.get(&target))
-                    .copied()
+                    .and_then(|frame| frame.bindings.get(&target))
+                    .cloned()
                 {
                     return match binding {
                         SemanticValueBinding::Local(binding) => Ok(self.push(
@@ -4449,8 +4558,13 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                 projection,
                             },
                         )),
-                        SemanticValueBinding::Expression(input) => {
-                            self.project(&expression, owner, input, projection)
+                        SemanticValueBinding::Projection {
+                            input,
+                            fields: mut binding_fields,
+                        } => {
+                            let input = self.expand(input)?;
+                            binding_fields.extend(projection);
+                            self.project(&expression, owner, input, binding_fields)
                         }
                     };
                 }
@@ -4720,19 +4834,23 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 branches: self.expand_many(scoped.frame, scoped.value_frame, branches)?,
             },
             CheckedExpressionKind::When { input, arms } => {
-                let input = self.expand_in_frame(input, scoped.frame, scoped.value_frame)?;
+                let checked_input = input;
+                let input =
+                    self.expand_in_frame(checked_input, scoped.frame, scoped.value_frame)?;
                 SemanticExpressionKind::When {
                     select_kind: SemanticSelectKind::When,
                     input,
-                    arms: self.expand_select_arms(scoped, owner, input, &arms)?,
+                    arms: self.expand_select_arms(scoped, owner, checked_input, &arms)?,
                 }
             }
             CheckedExpressionKind::While { input, arms } => {
-                let input = self.expand_in_frame(input, scoped.frame, scoped.value_frame)?;
+                let checked_input = input;
+                let input =
+                    self.expand_in_frame(checked_input, scoped.frame, scoped.value_frame)?;
                 SemanticExpressionKind::When {
                     select_kind: SemanticSelectKind::While,
                     input,
-                    arms: self.expand_select_arms(scoped, owner, input, &arms)?,
+                    arms: self.expand_select_arms(scoped, owner, checked_input, &arms)?,
                 }
             }
             CheckedExpressionKind::Then { input, output } => SemanticExpressionKind::Then {
@@ -4755,27 +4873,12 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     .transpose()?,
             },
             CheckedExpressionKind::Block { bindings, result } => {
-                let frame = self.value_frames.len();
-                let mut values = scoped
-                    .value_frame
-                    .and_then(|frame| self.value_frames.get(frame))
-                    .cloned()
-                    .unwrap_or_default();
-                let binding_ids = bindings
+                let declarations = bindings
                     .iter()
-                    .map(|binding| {
-                        let id = SemanticLocalBindingId(self.next_local_binding);
-                        self.next_local_binding += 1;
-                        (binding.declaration, id)
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                for binding in &bindings {
-                    values.insert(
-                        binding.declaration,
-                        SemanticValueBinding::Local(binding_ids[&binding.declaration]),
-                    );
-                }
-                self.value_frames.push(values);
+                    .map(|binding| binding.declaration)
+                    .collect::<Vec<_>>();
+                let (frame, binding_ids) =
+                    self.intern_block_value_frame(scoped, owner, &declarations);
                 let result = result.ok_or(ExpansionError::MissingExpression(scoped.expression))?;
                 let bindings = bindings
                     .into_iter()
@@ -5187,7 +5290,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         &mut self,
         scoped: ScopedCheckedExpr,
         owner: Option<StaticOwnerId>,
-        input: SemanticExprId,
+        input: CheckedExprId,
         arm_ids: &[CheckedExprId],
     ) -> Result<Vec<SemanticSelectArm>, ExpansionError> {
         let mut arms = Vec::new();
@@ -5206,24 +5309,19 @@ impl<'a> SemanticExpressionBuilder<'a> {
             let value_frame = if bindings.is_empty() {
                 scoped.value_frame
             } else {
-                let frame = self.value_frames.len();
-                let mut values = scoped
-                    .value_frame
-                    .and_then(|frame| self.value_frames.get(frame))
-                    .cloned()
-                    .unwrap_or_default();
-                for binding in bindings {
-                    let projection = self
-                        .lookup
-                        .pattern_binding(self.program, *binding)
-                        .ok_or(ExpansionError::MissingDeclaration(*binding))?
-                        .projection
-                        .clone();
-                    let value = self.project(&expression, owner, input, projection)?;
-                    values.insert(*binding, SemanticValueBinding::Expression(value));
-                }
-                self.value_frames.push(values);
-                Some(frame)
+                let frame_bindings = bindings
+                    .iter()
+                    .map(|binding| {
+                        let projection = self
+                            .lookup
+                            .pattern_binding(self.program, *binding)
+                            .ok_or(ExpansionError::MissingDeclaration(*binding))?
+                            .projection
+                            .clone();
+                        Ok((*binding, projection))
+                    })
+                    .collect::<Result<Vec<_>, ExpansionError>>()?;
+                Some(self.intern_select_value_frame(scoped, owner, *child, input, &frame_bindings))
             };
             arms.push(SemanticSelectArm {
                 pattern: pattern.clone(),

@@ -2290,6 +2290,11 @@ fn direct_erased_storage_statements(
         .statements
         .iter()
         .filter(|statement| {
+            if statement.declaration.is_none()
+                && matches!(statement.kind, ExecutableStatementKind::List { .. })
+            {
+                return false;
+            }
             let Some(parent) = parents.get(&statement.id) else {
                 return true;
             };
@@ -2486,8 +2491,9 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                         }
                     }
                     if field.row != local.row
-                        || member.path.len() != 1
-                        || member.path[0] != field.name
+                        || member.path.last() != Some(&field.name)
+                        || relative_path(&field.diagnostic_path)
+                            .is_none_or(|path| path != member.path)
                     {
                         return Err(format!(
                             "owner {} local {} member `{}` is inconsistent with FieldId {}",

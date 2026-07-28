@@ -7943,6 +7943,138 @@ fn validate_external_value_identity(
     Ok(())
 }
 
+fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
+    match ty {
+        boon_typecheck::Type::Var(_) => true,
+        boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
+        boon_typecheck::Type::Function { args, result } => {
+            args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
+        }
+        boon_typecheck::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
+        boon_typecheck::Type::VariantSet(variants) => {
+            variants.iter().any(|variant| match variant {
+                boon_typecheck::Variant::Tag(_) => false,
+                boon_typecheck::Variant::Tagged { fields, .. } => {
+                    fields.fields.values().any(runtime_type_contains_var)
+                }
+            })
+        }
+        boon_typecheck::Type::Union(members) => members.iter().any(runtime_type_contains_var),
+        boon_typecheck::Type::Text
+        | boon_typecheck::Type::Number
+        | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Absent
+        | boon_typecheck::Type::RenderContract
+        | boon_typecheck::Type::UnresolvedShape { .. }
+        | boon_typecheck::Type::Unknown => false,
+    }
+}
+
+fn runtime_type_matches_scheme(
+    actual: &boon_typecheck::Type,
+    scheme: &boon_typecheck::Type,
+) -> bool {
+    fn matches(
+        actual: &boon_typecheck::Type,
+        scheme: &boon_typecheck::Type,
+        bindings: &mut BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
+    ) -> bool {
+        match (actual, scheme) {
+            (actual, boon_typecheck::Type::Var(variable)) => {
+                if runtime_type_contains_var(actual) {
+                    return false;
+                }
+                match bindings.get(variable) {
+                    Some(bound) => bound == actual,
+                    None => {
+                        bindings.insert(*variable, actual.clone());
+                        true
+                    }
+                }
+            }
+            (boon_typecheck::Type::List(actual), boon_typecheck::Type::List(scheme)) => {
+                matches(actual, scheme, bindings)
+            }
+            (
+                boon_typecheck::Type::Function {
+                    args: actual_args,
+                    result: actual_result,
+                },
+                boon_typecheck::Type::Function {
+                    args: scheme_args,
+                    result: scheme_result,
+                },
+            ) => {
+                actual_args.len() == scheme_args.len()
+                    && actual_args
+                        .iter()
+                        .zip(scheme_args)
+                        .all(|(actual, scheme)| matches(actual, scheme, bindings))
+                    && actual_result.mode == scheme_result.mode
+                    && matches(&actual_result.ty, &scheme_result.ty, bindings)
+            }
+            (boon_typecheck::Type::Object(actual), boon_typecheck::Type::Object(scheme)) => {
+                actual.open == scheme.open
+                    && actual.field_order == scheme.field_order
+                    && actual.fields.len() == scheme.fields.len()
+                    && scheme.fields.iter().all(|(name, scheme)| {
+                        actual
+                            .fields
+                            .get(name)
+                            .is_some_and(|actual| matches(actual, scheme, bindings))
+                    })
+            }
+            (
+                boon_typecheck::Type::VariantSet(actual),
+                boon_typecheck::Type::VariantSet(scheme),
+            ) => {
+                actual.len() == scheme.len()
+                    && actual
+                        .iter()
+                        .zip(scheme)
+                        .all(|(actual, scheme)| match (actual, scheme) {
+                            (
+                                boon_typecheck::Variant::Tag(actual),
+                                boon_typecheck::Variant::Tag(scheme),
+                            ) => actual == scheme,
+                            (
+                                boon_typecheck::Variant::Tagged {
+                                    tag: actual_tag,
+                                    fields: actual,
+                                },
+                                boon_typecheck::Variant::Tagged {
+                                    tag: scheme_tag,
+                                    fields: scheme,
+                                },
+                            ) => {
+                                actual_tag == scheme_tag
+                                    && matches(
+                                        &boon_typecheck::Type::Object(actual.clone()),
+                                        &boon_typecheck::Type::Object(scheme.clone()),
+                                        bindings,
+                                    )
+                            }
+                            _ => false,
+                        })
+            }
+            (boon_typecheck::Type::Union(actual), boon_typecheck::Type::Union(scheme)) => {
+                actual.len() == scheme.len()
+                    && actual
+                        .iter()
+                        .zip(scheme)
+                        .all(|(actual, scheme)| matches(actual, scheme, bindings))
+            }
+            _ => actual == scheme,
+        }
+    }
+
+    matches(actual, scheme, &mut BTreeMap::new())
+}
+
+fn runtime_flow_matches_scheme(actual: &FlowType, scheme: &FlowType) -> bool {
+    actual.mode == scheme.mode && runtime_type_matches_scheme(&actual.ty, &scheme.ty)
+}
+
 fn validate_call_expression(
     graph: &SemanticExecutionGraphV1,
     ids: &SemanticToExecutableMap,
@@ -7991,7 +8123,7 @@ fn validate_call_expression(
         || result != &call_definition.result
         || expression.checked_expr_id != call_definition.checked_expression
         || expression.effect != *effect
-        || expression.flow_type != *result
+        || !runtime_flow_matches_scheme(&expression.flow_type, result)
     {
         return Err(format!(
             "semantic expression {} call contract differs from semantic call {call}: callable={callable:?}/{:?}, kind={callable_kind:?}/{expected_kind:?}, name={name:?}/{:?}, function={function:?}/{:?}, role={role:?}/{:?}, effect={effect:?}/{:?}, result={result:?}/{:?}, checked={:?}/{:?}, expression_effect={:?}, expression_flow={:?}",
@@ -10224,6 +10356,42 @@ fn exact_map<T: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_generic_scheme_requires_one_consistent_concrete_substitution() {
+        let variable = boon_typecheck::TypeVar(0);
+        let scheme = boon_typecheck::Type::Function {
+            args: vec![
+                boon_typecheck::Type::Var(variable),
+                boon_typecheck::Type::Var(variable),
+            ],
+            result: Box::new(FlowType {
+                mode: boon_typecheck::FlowMode::Continuous,
+                ty: boon_typecheck::Type::Var(variable),
+            }),
+        };
+        let consistent = boon_typecheck::Type::Function {
+            args: vec![boon_typecheck::Type::Text, boon_typecheck::Type::Text],
+            result: Box::new(FlowType {
+                mode: boon_typecheck::FlowMode::Continuous,
+                ty: boon_typecheck::Type::Text,
+            }),
+        };
+        let inconsistent = boon_typecheck::Type::Function {
+            args: vec![boon_typecheck::Type::Text, boon_typecheck::Type::Number],
+            result: Box::new(FlowType {
+                mode: boon_typecheck::FlowMode::Continuous,
+                ty: boon_typecheck::Type::Text,
+            }),
+        };
+
+        assert!(runtime_type_matches_scheme(&consistent, &scheme));
+        assert!(!runtime_type_matches_scheme(&inconsistent, &scheme));
+        assert!(!runtime_type_matches_scheme(
+            &boon_typecheck::Type::Var(boon_typecheck::TypeVar(1)),
+            &boon_typecheck::Type::Var(variable),
+        ));
+    }
 
     #[test]
     fn non_dense_semantic_resource_identity_has_no_executable_mapping() {

@@ -146,7 +146,7 @@ FUNCTION signal_value_is_special(value) {
 }
 
 FUNCTION signal_special_symbol(value) {
-    signal_value_trimmed(value: value) |> Text/to_uppercase() |> Text/substring(start: 0, length: 1)
+    signal_value_trimmed(value: value) |> Text/to_uppercase() |> Text/slice(from: 1, count: 1)
 }
 
 FUNCTION signal_special_value(value) {
@@ -213,12 +213,18 @@ FUNCTION signal_inferred_width(value) {
     signal_value_radix(value: value) |> WHEN {
         16 => signal_hex_width(value: value)
         2 => signal_binary_width(value: value)
-        __ => signal_value_number(value: value) |> Number/bit_width()
+        __ => signal_value_number(value: value) |> WHEN {
+            Parsed[value] => value |> Number/bit_width()
+            InvalidNumber[reason, position] => signal_trimmed_length(value: value)
+        }
     }
 }
 
 FUNCTION signal_bit_width(value, bit_width) {
-    bit_width |> Text/to_number(leading: True, fallback: signal_inferred_width(value: value))
+    bit_width |> Text/to_number() |> WHEN {
+        Parsed[value] => value
+        InvalidNumber[reason, position] => signal_inferred_width(value: value)
+    }
 }
 
 FUNCTION signal_octal_width(width) {
@@ -241,8 +247,8 @@ FUNCTION signal_octal_digits(width) {
 
 FUNCTION signal_numeric_value_label(value, bit_width, format) {
     signal_value_number(value: value) |> WHEN {
-        NaN => signal_value_trimmed(value: value)
-        number => signal_numeric_number_label(number: number, width: signal_bit_width(value: value, bit_width: bit_width), format: format)
+        Parsed[value] => signal_numeric_number_label(number: value, width: signal_bit_width(value: value, bit_width: bit_width), format: format)
+        InvalidNumber[reason, position] => signal_value_trimmed(value: value)
     }
 }
 

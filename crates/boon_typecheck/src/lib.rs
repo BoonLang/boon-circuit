@@ -1,5 +1,5 @@
 use boon_contract::SourceBundleDigestV1;
-use boon_data::MAX_NUMBER_TEXT_DIGITS;
+use boon_data::{ExactNumber, MAX_NUMBER_TEXT_DIGITS};
 pub use boon_document_model::ProgramRole;
 use boon_parser::{
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
@@ -586,7 +586,6 @@ pub enum CheckedMatchPattern {
     Text {
         value: String,
     },
-    NaN,
     Tag {
         name: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -607,7 +606,6 @@ impl From<&AstMatchPattern> for CheckedMatchPattern {
             AstMatchPattern::Text { value } => Self::Text {
                 value: value.clone(),
             },
-            AstMatchPattern::NaN => Self::NaN,
             AstMatchPattern::Tag { name, fields } => Self::Tag {
                 name: name.clone(),
                 fields: fields.clone(),
@@ -1645,6 +1643,7 @@ struct CheckedProgramBuilder<'a> {
     authoritative_expr_types: BTreeSet<usize>,
     checked_flow_inference_epoch: u64,
     checked_flow_inference_cache: BTreeMap<usize, (u64, FlowType)>,
+    validate_checked_projections: bool,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     diagnostics: Vec<TypeDiagnostic>,
 }
@@ -1952,6 +1951,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             authoritative_expr_types: BTreeSet::new(),
             checked_flow_inference_epoch: 0,
             checked_flow_inference_cache: BTreeMap::new(),
+            validate_checked_projections: false,
             source_payload_shape_table: source_payload_shape_table.to_vec(),
             diagnostics: Vec::new(),
         };
@@ -2017,6 +2017,10 @@ impl<'a> CheckedProgramBuilder<'a> {
         checked_program_phase!(
             "install_flush_control_contract",
             builder.install_flush_control_contract()
+        );
+        checked_program_phase!(
+            "validate_checked_projections",
+            builder.validate_checked_type_projections()
         );
         checked_program_phase!("validate_pass_calls", builder.validate_pass_calls());
         checked_program_phase!(
@@ -5451,6 +5455,21 @@ impl<'a> CheckedProgramBuilder<'a> {
         changed
     }
 
+    fn validate_checked_type_projections(&mut self) {
+        self.validate_checked_projections = true;
+        self.begin_checked_flow_inference_epoch();
+        let expression_ids = self
+            .program
+            .expressions
+            .iter()
+            .map(|expression| expression.id)
+            .collect::<Vec<_>>();
+        for expression in expression_ids {
+            self.infer_checked_expr_flow(expression, &mut BTreeSet::new());
+        }
+        self.validate_checked_projections = false;
+    }
+
     fn infer_checked_expr_flow(
         &mut self,
         expr_id: usize,
@@ -6210,13 +6229,15 @@ impl<'a> CheckedProgramBuilder<'a> {
                 | Type::Bytes(_)
                 | Type::Absent
                 | Type::List(_)) => {
-                    self.contextual_type_diagnostic(
-                        expr_id,
-                        format!(
-                            "cannot project field `{field}` from {}",
-                            boon_facing_type_label(&other)
-                        ),
-                    );
+                    if self.validate_checked_projections {
+                        self.contextual_type_diagnostic(
+                            expr_id,
+                            format!(
+                                "cannot project field `{field}` from {}",
+                                boon_facing_type_label(&other)
+                            ),
+                        );
+                    }
                     Type::Unknown
                 }
                 Type::VariantSet(variants) => variants
@@ -9586,7 +9607,7 @@ fn order_key_call_is_error_capable(function: &str) -> bool {
     matches!(
         function,
         "Text/to_number"
-            | "Text/substring"
+            | "Text/slice"
             | "List/get"
             | "List/latest"
             | "Bytes/get"
@@ -11154,7 +11175,7 @@ fn unify_checked_type_pattern(
     substitutions: &mut BTreeMap<TypeVar, Type>,
 ) {
     match (pattern, actual) {
-        (Type::Var(var), Type::Unknown | Type::UnresolvedShape { .. }) => {
+        (Type::Var(var), Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent) => {
             let _ = var;
         }
         (Type::Var(var), actual) => match substitutions.get(var) {
@@ -14113,7 +14134,9 @@ impl<'a> Checker<'a> {
                     self.ensure_expr(arg.value);
                 }
                 self.check_bytes_builtin_arguments(expr.id, function, args, None);
+                self.check_text_to_number_arguments(expr.id, function, args, false);
                 self.check_number_to_text_arguments(expr.id, function, args, false);
+                self.check_one_based_arguments(expr.id, function, args);
                 self.check_builtin_call_compatibility(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
                     self.check_style_args(args);
@@ -14178,7 +14201,9 @@ impl<'a> Checker<'a> {
                     self.ensure_expr(arg.value);
                 }
                 self.check_bytes_builtin_arguments(expr.id, op, args, Some(input_expr_id));
+                self.check_text_to_number_arguments(expr.id, op, args, true);
                 self.check_number_to_text_arguments(expr.id, op, args, true);
+                self.check_one_based_arguments(expr.id, op, args);
                 self.check_builtin_call_compatibility(expr.id, op, Some(input_expr_id), args);
                 if self.render_contracts.is_render_constructor(op) {
                     self.check_style_args(args);
@@ -14649,6 +14674,74 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn check_text_to_number_arguments(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        args: &[AstCallArg],
+        piped: bool,
+    ) {
+        if function != "Text/to_number" {
+            return;
+        }
+        let mut names = BTreeSet::new();
+        for arg in args {
+            match arg.named_name() {
+                Some(name) if matches!(name, "input" | "text" | "radix") => {
+                    if !names.insert(name) {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            arg.value,
+                            format!("`Text/to_number` argument `{name}` is duplicated"),
+                        ));
+                    }
+                    if piped && matches!(name, "input" | "text") {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            arg.value,
+                            "piped `Text/to_number` cannot also declare an input".to_owned(),
+                        ));
+                    }
+                }
+                Some(name) => self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!(
+                        "`Text/to_number` does not accept argument `{name}`; strict parsing has no fallback or prefix-scanning mode"
+                    ),
+                )),
+                None => self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    "`Text/to_number` requires named arguments".to_owned(),
+                )),
+            }
+        }
+        if !piped && !names.contains("input") && !names.contains("text") {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                "`Text/to_number` requires one complete Text input".to_owned(),
+            ));
+        }
+        let Some(radix_expr) = named_arg_expr(args, "radix") else {
+            return;
+        };
+        if let Some(radix) = self.static_integer_literal(radix_expr) {
+            if !(2..=36).contains(&radix) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    radix_expr,
+                    "`Text/to_number` radix must be a whole Number between 2 and 36".to_owned(),
+                ));
+            }
+        } else if self
+            .program
+            .expressions
+            .get(radix_expr)
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::Number(_)))
+        {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                radix_expr,
+                "`Text/to_number` radix must be a whole Number".to_owned(),
+            ));
+        }
+    }
+
     fn check_bytes_builtin_allowed_args(
         &mut self,
         expr_id: usize,
@@ -14684,6 +14777,51 @@ impl<'a> Checker<'a> {
                 expr_id,
                 "`Bytes/zeros` creates BYTES and does not accept an input BYTES value".to_owned(),
             ));
+        }
+    }
+
+    fn check_one_based_arguments(&mut self, _expr_id: usize, function: &str, args: &[AstCallArg]) {
+        let (position_names, count_names): (&[&str], &[&str]) = match function {
+            "List/get" | "Bytes/get" | "Bytes/set" => (&["position"], &[]),
+            "Text/slice" | "Bytes/slice" => (&["from"], &["count"]),
+            "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed" => (&["from"], &["byte_count"]),
+            "Bytes/take" | "Bytes/drop" | "Bytes/zeros" => (&[], &["count"]),
+            _ => return,
+        };
+        for (name, requires_positive) in position_names
+            .iter()
+            .map(|name| (*name, true))
+            .chain(count_names.iter().map(|name| (*name, false)))
+        {
+            let Some(value_expr) = named_arg_expr(args, name) else {
+                continue;
+            };
+            let Some(value) = static_exact_number_expr(self.program, value_expr) else {
+                continue;
+            };
+            if !value.is_whole() {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    value_expr,
+                    format!(
+                        "`{function}` argument `{name}` must be a whole Number; positions and counts are never rounded"
+                    ),
+                ));
+            } else if requires_positive && !value.is_positive() {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    value_expr,
+                    format!(
+                        "`{function}` argument `{name}` is a one-based position and must be at least 1"
+                    ),
+                ));
+            } else if !requires_positive && value.is_negative() {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    value_expr,
+                    format!("`{function}` argument `{name}` is a count and cannot be negative"),
+                ));
+            }
         }
     }
 
@@ -14756,28 +14894,20 @@ impl<'a> Checker<'a> {
         }
 
         match function {
-            "Bytes/get" => self.require_one_of(expr_id, function, args, &["index"], "`index`"),
+            "Bytes/get" => {
+                self.require_one_of(expr_id, function, args, &["position"], "`position`")
+            }
             "Bytes/set" => {
-                self.require_one_of(expr_id, function, args, &["index"], "`index`");
+                self.require_one_of(expr_id, function, args, &["position"], "`position`");
                 self.require_one_of(expr_id, function, args, &["value"], "`value`");
             }
             "Bytes/slice" => {
-                self.require_one_of(expr_id, function, args, &["offset", "start"], "`offset`");
-                self.require_one_of(
-                    expr_id,
-                    function,
-                    args,
-                    &["byte_count", "length", "count"],
-                    "`byte_count`",
-                );
+                self.require_one_of(expr_id, function, args, &["from"], "`from`");
+                self.require_one_of(expr_id, function, args, &["count"], "`count`");
             }
-            "Bytes/take" | "Bytes/drop" | "Bytes/zeros" => self.require_one_of(
-                expr_id,
-                function,
-                args,
-                &["byte_count", "length", "count"],
-                "`byte_count`",
-            ),
+            "Bytes/take" | "Bytes/drop" | "Bytes/zeros" => {
+                self.require_one_of(expr_id, function, args, &["count"], "`count`")
+            }
             "Bytes/find" => self.require_one_of(expr_id, function, args, &["needle"], "`needle`"),
             "Bytes/starts_with" => {
                 self.require_one_of(expr_id, function, args, &["prefix"], "`prefix`");
@@ -14786,12 +14916,12 @@ impl<'a> Checker<'a> {
                 self.require_one_of(expr_id, function, args, &["suffix"], "`suffix`");
             }
             "Bytes/read_unsigned" | "Bytes/read_signed" => {
-                self.require_one_of(expr_id, function, args, &["offset"], "`offset`");
+                self.require_one_of(expr_id, function, args, &["from"], "`from`");
                 self.require_one_of(expr_id, function, args, &["byte_count"], "`byte_count`");
                 self.require_one_of(expr_id, function, args, &["endian"], "`endian: Little|Big`");
             }
             "Bytes/write_unsigned" | "Bytes/write_signed" => {
-                self.require_one_of(expr_id, function, args, &["offset"], "`offset`");
+                self.require_one_of(expr_id, function, args, &["from"], "`from`");
                 self.require_one_of(expr_id, function, args, &["byte_count"], "`byte_count`");
                 self.require_one_of(expr_id, function, args, &["endian"], "`endian: Little|Big`");
                 self.require_one_of(expr_id, function, args, &["value"], "`value`");
@@ -14883,22 +15013,16 @@ impl<'a> Checker<'a> {
             };
             if !matches!(
                 (function, name),
-                ("Bytes/get", "index")
-                    | ("Bytes/set", "index")
-                    | (
-                        "Bytes/slice",
-                        "offset" | "start" | "byte_count" | "length" | "count"
-                    )
-                    | (
-                        "Bytes/take" | "Bytes/drop" | "Bytes/zeros",
-                        "byte_count" | "length" | "count"
-                    )
+                ("Bytes/get", "position")
+                    | ("Bytes/set", "position")
+                    | ("Bytes/slice", "from" | "count")
+                    | ("Bytes/take" | "Bytes/drop" | "Bytes/zeros", "count")
                     | (
                         "Bytes/read_unsigned"
                             | "Bytes/read_signed"
                             | "Bytes/write_unsigned"
                             | "Bytes/write_signed",
-                        "offset" | "byte_count" | "value"
+                        "from" | "byte_count" | "value"
                     )
             ) {
                 continue;
@@ -14950,53 +15074,53 @@ impl<'a> Checker<'a> {
         let len = len as i128;
 
         match function {
-            "Bytes/get" | "Bytes/set" => {
-                let Some((index_expr, index)) = self.static_integer_arg(args, &["index"]) else {
+            "Bytes/get" => {}
+            "Bytes/set" => {
+                let Some((position_expr, position)) = self.static_integer_arg(args, &["position"])
+                else {
                     return;
                 };
-                if index < 0 || index >= len {
+                if position < 1 || position > len {
                     self.diagnostics.push(self.diagnostic_for_expr(
-                        index_expr,
+                        position_expr,
                         format!(
-                            "`{function}` index {index} is out of bounds for fixed BYTES[{len}]"
+                            "`{function}` position {position} is out of bounds for fixed BYTES[{len}]"
                         ),
                     ));
                 }
             }
             "Bytes/slice" => {
-                let Some((_offset_expr, offset)) =
-                    self.static_integer_arg(args, &["offset", "start"])
-                else {
+                let Some((_from_expr, from)) = self.static_integer_arg(args, &["from"]) else {
                     return;
                 };
-                let Some((count_expr, count)) =
-                    self.static_integer_arg(args, &["byte_count", "length", "count"])
-                else {
+                let Some((count_expr, count)) = self.static_integer_arg(args, &["count"]) else {
                     return;
                 };
-                self.check_bytes_static_range(count_expr, function, len, offset, count);
+                self.check_bytes_static_range(count_expr, function, len, from, count);
             }
             "Bytes/take" | "Bytes/drop" => {
-                let Some((count_expr, count)) =
-                    self.static_integer_arg(args, &["byte_count", "length", "count"])
-                else {
+                let Some((count_expr, count)) = self.static_integer_arg(args, &["count"]) else {
                     return;
                 };
-                self.check_bytes_static_range(count_expr, function, len, 0, count);
+                if count < 0 {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        count_expr,
+                        format!("`{function}` count {count} cannot be negative"),
+                    ));
+                }
             }
             "Bytes/read_unsigned"
             | "Bytes/read_signed"
             | "Bytes/write_unsigned"
             | "Bytes/write_signed" => {
-                let Some((_offset_expr, offset)) = self.static_integer_arg(args, &["offset"])
-                else {
+                let Some((_from_expr, from)) = self.static_integer_arg(args, &["from"]) else {
                     return;
                 };
                 let Some((count_expr, count)) = self.static_integer_arg(args, &["byte_count"])
                 else {
                     return;
                 };
-                self.check_bytes_static_range(count_expr, function, len, offset, count);
+                self.check_bytes_static_range(count_expr, function, len, from, count);
             }
             _ => {}
         }
@@ -15007,18 +15131,20 @@ impl<'a> Checker<'a> {
         expr_id: usize,
         function: &str,
         len: i128,
-        offset: i128,
+        from: i128,
         count: i128,
     ) {
-        let end = offset.checked_add(count);
-        if offset < 0 || count < 0 || end.is_none_or(|end| end > len) {
+        let start = from.checked_sub(1);
+        let end = start.and_then(|start| start.checked_add(count));
+        if from < 1 || from > len.saturating_add(1) || count < 0 || end.is_none_or(|end| end > len)
+        {
             let range_end = end
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "overflow".to_owned());
             self.diagnostics.push(self.diagnostic_for_expr(
                 expr_id,
                 format!(
-                    "`{function}` byte range {offset}..{range_end} is out of bounds for fixed BYTES[{len}]"
+                    "`{function}` byte slice from position {from} through exclusive boundary {range_end} is out of bounds for fixed BYTES[{len}]"
                 ),
             ));
         }
@@ -15508,7 +15634,7 @@ impl<'a> Checker<'a> {
         args: &[AstCallArg],
     ) -> Option<Type> {
         match function {
-            "Bytes/get" => Some(Type::Bytes(BytesType::Fixed(1))),
+            "Bytes/get" => Some(found_or_not_found_type(Type::Bytes(BytesType::Fixed(1)))),
             "Bytes/set" | "Bytes/write_unsigned" | "Bytes/write_signed" => Some(
                 self.bytes_input_type(piped_input, args)
                     .unwrap_or(Type::Bytes(BytesType::Dynamic)),
@@ -15582,8 +15708,15 @@ impl<'a> Checker<'a> {
         match function {
             "List/filter" | "List/retain" | "List/remove" | "List/sort_by" | "List/then_by"
             | "List/take" => Some(list),
+            "List/get" => Some(found_or_not_found_type(
+                list_item_type_from_list_type(&list)
+                    .filter(|item| !matches!(item, Type::Absent))
+                    .unwrap_or_else(open_object_type),
+            )),
             "List/page" => Some(page_result_type(
-                list_item_type_from_list_type(&list).unwrap_or_else(open_object_type),
+                list_item_type_from_list_type(&list)
+                    .filter(|item| !matches!(item, Type::Absent))
+                    .unwrap_or_else(open_object_type),
             )),
             _ => None,
         }
@@ -15639,7 +15772,7 @@ impl<'a> Checker<'a> {
     }
 
     fn static_bytes_count(&self, args: &[AstCallArg]) -> Option<usize> {
-        ["byte_count", "length", "count"].iter().find_map(|name| {
+        ["count", "byte_count"].iter().find_map(|name| {
             named_arg_expr(args, name).and_then(|expr_id| self.static_usize_literal(expr_id))
         })
     }
@@ -18480,6 +18613,38 @@ fn static_integer_expr_checked(
     static_integer_expr_checked_cached(program, expr_id, &mut cache)
 }
 
+fn static_exact_number_expr(program: &ParsedProgram, expr_id: usize) -> Option<ExactNumber> {
+    fn evaluate(
+        program: &ParsedProgram,
+        expr_id: usize,
+        active: &mut BTreeSet<usize>,
+    ) -> Option<ExactNumber> {
+        if !active.insert(expr_id) {
+            return None;
+        }
+        let value = match &program.expressions.get(expr_id)?.kind {
+            AstExprKind::Number(value) => ExactNumber::parse_strict(value, None).ok(),
+            AstExprKind::Infix { left, op, right } => {
+                let left = evaluate(program, *left, active)?;
+                let right = evaluate(program, *right, active)?;
+                match op.as_str() {
+                    "+" => left.checked_add(&right).ok(),
+                    "-" => left.checked_sub(&right).ok(),
+                    "*" => left.checked_mul(&right).ok(),
+                    "/" => left.checked_div(&right).ok(),
+                    "%" => left.checked_rem(&right).ok(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        active.remove(&expr_id);
+        value
+    }
+
+    evaluate(program, expr_id, &mut BTreeSet::new())
+}
+
 fn static_integer_expr_checked_cached(
     program: &ParsedProgram,
     expr_id: usize,
@@ -18667,6 +18832,38 @@ fn found_or_not_found_type(item: Type) -> Type {
     ])
 }
 
+fn found_position_type() -> Type {
+    Type::VariantSet(vec![
+        Variant::Tagged {
+            tag: "Found".to_owned(),
+            fields: ObjectShape::from_ordered_fields(
+                [("position".to_owned(), Type::Number)],
+                false,
+            ),
+        },
+        Variant::Tag("NotFound".to_owned()),
+    ])
+}
+
+fn parsed_number_type() -> Type {
+    Type::VariantSet(vec![
+        Variant::Tagged {
+            tag: "Parsed".to_owned(),
+            fields: ObjectShape::from_ordered_fields([("value".to_owned(), Type::Number)], false),
+        },
+        Variant::Tagged {
+            tag: "InvalidNumber".to_owned(),
+            fields: ObjectShape::from_ordered_fields(
+                [
+                    ("reason".to_owned(), Type::Text),
+                    ("position".to_owned(), Type::Number),
+                ],
+                false,
+            ),
+        },
+    ])
+}
+
 impl Default for BuiltinSignatureRegistry {
     fn default() -> Self {
         let mut entries = BTreeMap::new();
@@ -18721,12 +18918,12 @@ impl Default for BuiltinSignatureRegistry {
             None,
         );
         register(
-            "Text/substring",
+            "Text/slice",
             Type::Text,
             vec![
                 required_parameter("input", Type::Text),
-                required_parameter("start", Type::Number),
-                required_parameter("length", Type::Number),
+                required_parameter("from", Type::Number),
+                required_parameter("count", Type::Number),
             ],
             None,
         );
@@ -18896,7 +19093,7 @@ impl Default for BuiltinSignatureRegistry {
         }
         register(
             "Text/find",
-            Type::Number,
+            found_position_type(),
             vec![
                 required_parameter("input", Type::Text),
                 required_parameter("needle", Type::Text),
@@ -18911,12 +19108,10 @@ impl Default for BuiltinSignatureRegistry {
         );
         register(
             "Text/to_number",
-            Type::Number,
+            parsed_number_type(),
             vec![
                 required_parameter("input", Type::Text),
                 optional_parameter("radix", Type::Number),
-                optional_parameter("leading", true_false_type()),
-                optional_parameter("fallback", Type::Number),
             ],
             None,
         );
@@ -18928,7 +19123,7 @@ impl Default for BuiltinSignatureRegistry {
         );
         register(
             "Bytes/find",
-            Type::Number,
+            found_position_type(),
             vec![
                 required_parameter("input", Type::Bytes(BytesType::Dynamic)),
                 required_parameter("needle", Type::Bytes(BytesType::Dynamic)),
@@ -18941,7 +19136,7 @@ impl Default for BuiltinSignatureRegistry {
                 Type::Number,
                 vec![
                     required_parameter("input", Type::Bytes(BytesType::Dynamic)),
-                    required_parameter("offset", Type::Number),
+                    required_parameter("from", Type::Number),
                     required_parameter("byte_count", Type::Number),
                     required_parameter("endian", Type::Unknown),
                 ],
@@ -18951,10 +19146,10 @@ impl Default for BuiltinSignatureRegistry {
 
         register(
             "Bytes/get",
-            Type::Bytes(BytesType::Dynamic),
+            found_or_not_found_type(Type::Bytes(BytesType::Fixed(1))),
             vec![
                 required_parameter("input", Type::Bytes(BytesType::Dynamic)),
-                required_parameter("index", Type::Number),
+                required_parameter("position", Type::Number),
             ],
             None,
         );
@@ -18963,7 +19158,7 @@ impl Default for BuiltinSignatureRegistry {
             Type::Bytes(BytesType::Dynamic),
             vec![
                 required_parameter("input", Type::Bytes(BytesType::Dynamic)),
-                required_parameter("index", Type::Number),
+                required_parameter("position", Type::Number),
                 required_parameter("value", Type::Bytes(BytesType::Fixed(1))),
             ],
             None,
@@ -18973,8 +19168,8 @@ impl Default for BuiltinSignatureRegistry {
             Type::Bytes(BytesType::Dynamic),
             vec![
                 required_parameter("input", Type::Bytes(BytesType::Dynamic)),
-                required_parameter("offset", Type::Number),
-                required_parameter("byte_count", Type::Number),
+                required_parameter("from", Type::Number),
+                required_parameter("count", Type::Number),
             ],
             None,
         );
@@ -18984,7 +19179,7 @@ impl Default for BuiltinSignatureRegistry {
                 Type::Bytes(BytesType::Dynamic),
                 vec![
                     required_parameter("input", Type::Bytes(BytesType::Dynamic)),
-                    required_parameter("byte_count", Type::Number),
+                    required_parameter("count", Type::Number),
                 ],
                 None,
             );
@@ -19001,7 +19196,7 @@ impl Default for BuiltinSignatureRegistry {
         register(
             "Bytes/zeros",
             Type::Bytes(BytesType::Dynamic),
-            vec![required_parameter("byte_count", Type::Number)],
+            vec![required_parameter("count", Type::Number)],
             None,
         );
         register(
@@ -19027,7 +19222,7 @@ impl Default for BuiltinSignatureRegistry {
                 Type::Bytes(BytesType::Dynamic),
                 vec![
                     required_parameter("input", Type::Bytes(BytesType::Dynamic)),
-                    required_parameter("offset", Type::Number),
+                    required_parameter("from", Type::Number),
                     required_parameter("byte_count", Type::Number),
                     required_parameter("endian", Type::Unknown),
                     required_parameter("value", Type::Number),
@@ -19267,10 +19462,10 @@ impl Default for BuiltinSignatureRegistry {
         );
         register(
             "List/get",
-            contextual_item_type(),
+            found_or_not_found_type(contextual_item_type()),
             vec![
                 required_parameter("list", Type::List(Box::new(contextual_item_type()))),
-                required_parameter("index", Type::Number),
+                required_parameter("position", Type::Number),
             ],
             None,
         );
@@ -20575,6 +20770,7 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
         (actual, _) if is_open_object_type(actual) => true,
         (Type::Union(actual), _) if actual.is_empty() => false,
         (_, Type::Union(expected)) if expected.is_empty() => false,
+        (Type::Absent, Type::Absent) => true,
         (Type::Union(actual), Type::Union(expected)) => actual.iter().all(|actual| {
             expected
                 .iter()
@@ -21729,9 +21925,7 @@ fn reachable_static_when_arms(
                 });
                 break;
             }
-            AstMatchPattern::Number { .. }
-            | AstMatchPattern::Text { .. }
-            | AstMatchPattern::NaN => {}
+            AstMatchPattern::Number { .. } | AstMatchPattern::Text { .. } => {}
             AstMatchPattern::Tag { .. } => unreachable!(),
             AstMatchPattern::Invalid { .. } => {
                 unreachable!("invalid match patterns are rejected by boon_parser")
@@ -21885,6 +22079,16 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
             })
         }
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
+            if function == "Text/to_number" =>
+        {
+            parsed_number_type()
+        }
+        AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
+            if matches!(function.as_str(), "Text/find" | "Bytes/find") =>
+        {
+            found_position_type()
+        }
+        AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if matches!(
                 function.as_str(),
                 "Number/project_width"
@@ -21900,9 +22104,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Number/truncate"
                     | "List/count"
                     | "List/sum"
-                    | "Text/find"
                     | "Text/length"
-                    | "Text/to_number"
                     | "Bytes/length"
             ) =>
         {
@@ -21917,7 +22119,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Text/to_uppercase"
                     | "Text/concat"
                     | "Text/time_range_label"
-                    | "Text/substring"
+                    | "Text/slice"
                     | "Number/to_text"
                     | "Number/to_codepoint_text"
                     | "Number/to_ascii_text"
@@ -22594,8 +22796,8 @@ fn text_argument_expected_type(
         // helper parameters as TEXT before their numeric use is observed.
         // Unknown blocks the old all-Text fallback without over-constraining
         // otherwise valid formula helpers.
-        ("Text/substring", Some("start" | "length")) => Some(Type::Unknown),
-        ("Text/substring", Some("input" | "text")) => Some(Type::Text),
+        ("Text/slice", Some("from" | "count")) => Some(Type::Number),
+        ("Text/slice", Some("input" | "text")) => Some(Type::Text),
         ("Text/find", Some("needle" | "input" | "text")) => Some(Type::Text),
         ("Text/starts_with", Some("prefix" | "input" | "text")) => Some(Type::Text),
         ("Text/ends_with", Some("suffix" | "input" | "text")) => Some(Type::Text),
@@ -22605,10 +22807,9 @@ fn text_argument_expected_type(
         ("Text/time_range_label", Some("end" | "unit" | "input" | "text") | None) => {
             Some(Type::Unknown)
         }
-        ("Text/to_number", Some("radix" | "fallback")) => Some(Type::Number),
-        ("Text/to_number", Some("leading")) => Some(true_false_type()),
+        ("Text/to_number", Some("radix")) => Some(Type::Number),
         ("Text/to_number", Some("input" | "text")) => Some(Type::Text),
-        ("Text/to_number", None) if piped => Some(Type::Number),
+        ("Text/to_number", None) if piped => Some(Type::Unknown),
         ("Text/to_number", None) => Some(Type::Text),
         ("Text/to_bytes", Some("input" | "text")) => Some(Type::Text),
         ("Text/to_bytes", Some("encoding")) => Some(Type::Unknown),
@@ -22763,7 +22964,7 @@ fn bytes_argument_expected_type(function: &str, arg_name: Option<&str>) -> Optio
             | "Bytes/write_unsigned"
             | "Bytes/write_signed"
             | "Bytes/zeros",
-            Some("index" | "offset" | "start" | "length" | "count" | "byte_count" | "value"),
+            Some("position" | "from" | "count" | "byte_count" | "value"),
         ) => Some(Type::Number),
         (
             "Bytes/read_unsigned"
@@ -22812,27 +23013,22 @@ fn bytes_builtin_arg_allowed(function: &str, name: &str, piped: bool) -> bool {
     match function {
         "Text/to_bytes" => matches!(name, "input" | "text" | "encoding"),
         "Bytes/length" | "Bytes/is_empty" | "Bytes/to_hex" | "Bytes/to_base64" => name == "input",
-        "Bytes/get" => matches!(name, "input" | "index"),
-        "Bytes/set" => matches!(name, "input" | "index" | "value"),
-        "Bytes/slice" => matches!(
-            name,
-            "input" | "offset" | "start" | "byte_count" | "length" | "count"
-        ),
-        "Bytes/take" | "Bytes/drop" => {
-            matches!(name, "input" | "byte_count" | "length" | "count")
-        }
+        "Bytes/get" => matches!(name, "input" | "position"),
+        "Bytes/set" => matches!(name, "input" | "position" | "value"),
+        "Bytes/slice" => matches!(name, "input" | "from" | "count"),
+        "Bytes/take" | "Bytes/drop" => matches!(name, "input" | "count"),
         "Bytes/concat" | "Bytes/equal" => matches!(name, "input" | "with" | "left" | "right"),
         "Bytes/find" => matches!(name, "input" | "needle"),
         "Bytes/starts_with" => matches!(name, "input" | "prefix"),
         "Bytes/ends_with" => matches!(name, "input" | "suffix"),
-        "Bytes/zeros" => matches!(name, "byte_count" | "length" | "count"),
+        "Bytes/zeros" => name == "count",
         "Bytes/to_text" => matches!(name, "input" | "encoding"),
         "Bytes/from_hex" | "Bytes/from_base64" => matches!(name, "input" | "text"),
         "Bytes/read_unsigned" | "Bytes/read_signed" => {
-            matches!(name, "input" | "offset" | "byte_count" | "endian")
+            matches!(name, "input" | "from" | "byte_count" | "endian")
         }
         "Bytes/write_unsigned" | "Bytes/write_signed" => {
-            matches!(name, "input" | "offset" | "byte_count" | "endian" | "value")
+            matches!(name, "input" | "from" | "byte_count" | "endian" | "value")
         }
         _ => true,
     }
@@ -23790,8 +23986,7 @@ fn pattern_variable_names(pattern: &AstMatchPattern) -> Vec<String> {
         AstMatchPattern::Tag { fields, .. } => fields.clone(),
         AstMatchPattern::Wildcard
         | AstMatchPattern::Number { .. }
-        | AstMatchPattern::Text { .. }
-        | AstMatchPattern::NaN => Vec::new(),
+        | AstMatchPattern::Text { .. } => Vec::new(),
         AstMatchPattern::Invalid { .. } => {
             unreachable!("invalid match patterns are rejected by boon_parser")
         }
@@ -23840,9 +24035,7 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
         (Type::VariantSet(left), Type::VariantSet(right)) => {
             let mut variants = left.clone();
             for variant in right {
-                if !variants.contains(variant) {
-                    variants.push(variant.clone());
-                }
+                merge_structural_variant(&mut variants, variant.clone());
             }
             variants.sort_by_key(variant_sort_key);
             Type::VariantSet(variants)
@@ -23896,9 +24089,7 @@ pub fn canonical_union_type(candidates: Vec<Type>) -> Type {
                 Type::Absent => {}
                 Type::VariantSet(candidate_variants) => {
                     for variant in candidate_variants {
-                        if !variants.contains(&variant) {
-                            variants.push(variant);
-                        }
+                        merge_structural_variant(&mut variants, variant);
                     }
                 }
                 candidate if !members.contains(&candidate) => members.push(candidate),
@@ -23920,6 +24111,44 @@ pub fn canonical_union_type(candidates: Vec<Type>) -> Type {
         [member] => member.clone(),
         _ => Type::Union(members),
     }
+}
+
+fn merge_structural_variant(variants: &mut Vec<Variant>, incoming: Variant) {
+    let Variant::Tagged {
+        tag: incoming_tag,
+        fields: incoming_fields,
+    } = &incoming
+    else {
+        if !variants.contains(&incoming) {
+            variants.push(incoming);
+        }
+        return;
+    };
+    let Some(index) = variants
+        .iter()
+        .position(|variant| matches!(variant, Variant::Tagged { tag, .. } if tag == incoming_tag))
+    else {
+        variants.push(incoming);
+        return;
+    };
+    let Variant::Tagged {
+        fields: existing_fields,
+        ..
+    } = &variants[index]
+    else {
+        unreachable!("only a tagged variant can match the tagged search");
+    };
+    let merged = widen_structural_type(
+        &Type::Object(existing_fields.clone()),
+        &Type::Object(incoming_fields.clone()),
+    );
+    let Type::Object(fields) = merged else {
+        unreachable!("widening two tagged payload records must produce a record");
+    };
+    variants[index] = Variant::Tagged {
+        tag: incoming_tag.clone(),
+        fields,
+    };
 }
 
 fn widen_hold_type(current: &Type, update: &Type) -> Type {

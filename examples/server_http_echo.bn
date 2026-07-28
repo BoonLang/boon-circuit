@@ -4,7 +4,11 @@ store: [
     first_path_segment:
         TEXT { none } |> HOLD first_path_segment {
             request.method |> THEN {
-                List/get(list: request.path_segments, index: 0)
+                List/get(list: request.path_segments, position: 1)
+                |> WHEN {
+                    Found[value] => value
+                    NotFound => TEXT { none }
+                }
             }
         }
 

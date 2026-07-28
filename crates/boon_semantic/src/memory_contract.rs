@@ -2228,7 +2228,7 @@ pub fn semantic_migration_call_is_supported_v1(function: &str) -> bool {
             | "Text/trim"
             | "Text/to_uppercase"
             | "Text/concat"
-            | "Text/substring"
+            | "Text/slice"
             | "Text/is_empty"
             | "Text/is_not_empty"
             | "Text/starts_with"

@@ -585,7 +585,7 @@ fn source_payload_text_to_number_lowers_as_a_typed_conversion() {
 store: [
     input: SOURCE
     value:
-        0 |> HOLD value {
+        Parsed[value: 0] |> HOLD value {
             input.amount |> THEN {
                 input.amount |> Text/to_number()
             }
@@ -636,11 +636,12 @@ store: [
     else {
         unreachable!();
     };
-    let PlanRowExpressionNode::TextToNumber { input } =
+    let PlanRowExpressionNode::TextToNumber { input, radix } =
         row_node(&compiled.plan.row_expressions, *value)
     else {
         unreachable!();
     };
+    assert!(radix.is_none());
     assert!(matches!(
         row_node(&compiled.plan.row_expressions, *input),
         PlanRowExpressionNode::Field {
@@ -661,7 +662,7 @@ store: [
             .iter()
             .find(|slot| slot.state_id == output)
             .map(|slot| &slot.value_type),
-        Some(&boon_plan::PlanValueType::Number)
+        Some(&boon_plan::PlanValueType::Tag)
     );
     let verification = verify_plan(&compiled.plan).unwrap();
     assert!(
@@ -6810,7 +6811,7 @@ store: [
             }
         }
     second_row:
-        request.method |> THEN { List/get(list: request.query, index: 1) }
+        request.method |> THEN { List/get(list: request.query, position: 2) }
 ]
 "#,
         TargetProfile::SoftwareDefault,
@@ -7072,9 +7073,12 @@ document: Document/new(
 fn cells_scoped_source_routes_publish_complete_structural_owners() {
     let path = example_path("examples/cells.bn");
     let units = compiler_source_units_for_path(&path).unwrap();
-    assert_eq!(units[0].path, "examples/cells.bn");
+    let entrypoint = units
+        .iter()
+        .find(|unit| unit.path == "examples/cells.bn")
+        .expect("Cells source bundle entrypoint");
     let compiled = compile_runtime_source_units_to_machine_plan_with_persistence_identity(
-        &units[0].path,
+        &entrypoint.path,
         &units,
         TargetProfile::SoftwareDefault,
         ApplicationIdentity::new("dev.boon.cells-route-indexes", "test", "local"),
@@ -7230,7 +7234,12 @@ store: [
         [key: TEXT { a }, value: TEXT { A }]
         [key: TEXT { b }, value: TEXT { B }]
     }
-    indexed_row: List/get(list: items, index: 1)
+    indexed_row:
+        List/get(list: items, position: 2)
+        |> WHEN {
+            Found[value] => value
+            NotFound => FLUSH { MissingIndexedRow }
+        }
     indexed_value: indexed_row.value
     latest_row: List/latest(list: items)
     latest_value: latest_row.value
@@ -7313,8 +7322,14 @@ store: [
     right: LIST { [value: TEXT { right }] }
     selected_row:
         choose_left |> WHILE {
-            True => List/get(list: left, index: 0)
-            False => List/get(list: right, index: 0)
+            True => List/get(list: left, position: 1) |> WHEN {
+                Found[value] => value
+                NotFound => FLUSH { MissingLeftRow }
+            }
+            False => List/get(list: right, position: 1) |> WHEN {
+                Found[value] => value
+                NotFound => FLUSH { MissingRightRow }
+            }
         }
     selected_value: selected_row.value
 ]

@@ -1,6 +1,6 @@
 use boon_data::{
-    Bytes, ExactRoundingRule, NumberTextFormat, format_number_ascii_text, format_number_text,
-    number_bit_width,
+    Bytes, ExactNumberParseReason, ExactRoundingRule, NumberTextFormat, format_number_ascii_text,
+    format_number_text, number_bit_width,
 };
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
@@ -1995,12 +1995,18 @@ impl<'a> Evaluator<'a> {
             }
             DocumentBuiltin::ListIsNotEmpty => Ok(EvalValue::Truth(logical_len != 0)),
             DocumentBuiltin::ListGet => {
-                let Some(index) =
-                    named_number(&arguments, "index").and_then(|value| value.to_u64_exact().ok())
-                else {
-                    return Ok(EvalValue::Absent);
-                };
-                self.runtime_list_row(list, logical_len, index)
+                let position =
+                    required_document_position(&arguments, "position", "List/get position")?;
+                let position = u64::try_from(position).map_err(|_| {
+                    DocumentError::Evaluation(
+                        "List/get position exceeds the runtime list address space".to_owned(),
+                    )
+                })?;
+                if position > logical_len {
+                    return Ok(EvalValue::Tag("NotFound".to_owned(), BTreeMap::new()));
+                }
+                let value = self.runtime_list_row(list, logical_len, position - 1)?;
+                Ok(found_document_value(value))
             }
             DocumentBuiltin::ListLatest => {
                 if logical_len == 0 {
@@ -3797,7 +3803,6 @@ impl EvalValue {
     fn number(&self) -> Option<ExactNumber> {
         match self {
             Self::Number(value) => Some(value.clone()),
-            Self::Text(value) => value.parse().ok(),
             _ => None,
         }
     }
@@ -4061,27 +4066,48 @@ fn eval_builtin(
         }
         DocumentBuiltin::BoolNot | DocumentBuiltin::BoolToggle => EvalValue::Truth(!first.truthy()),
         DocumentBuiltin::BytesFind => {
-            let needle = values.next().unwrap_or(EvalValue::Absent).text();
-            EvalValue::Number(ExactNumber::from_usize(
-                first.text().find(&needle).unwrap_or(usize::MAX),
-            ))
+            let needle = values.next().unwrap_or(EvalValue::Absent);
+            match (&first, &needle) {
+                (EvalValue::Bytes(input), EvalValue::Bytes(needle)) => {
+                    find_document_bytes(input, needle)
+                }
+                _ => find_document_text(&first.text(), &needle.text()),
+            }
         }
-        DocumentBuiltin::BytesSlice | DocumentBuiltin::TextSubstring => {
+        DocumentBuiltin::BytesSlice => {
+            let from = required_document_position(&arguments, "from", "Bytes/slice from")?;
+            let count = required_document_count(&arguments, "count", "Bytes/slice count")?;
+            let bytes = match first {
+                EvalValue::Bytes(bytes) => bytes,
+                value => value.text().into_bytes().into(),
+            };
+            let start = from - 1;
+            let end = start.checked_add(count).ok_or_else(|| {
+                DocumentError::Evaluation("Bytes/slice range overflows platform bounds".to_owned())
+            })?;
+            if from > bytes.len().saturating_add(1) || end > bytes.len() {
+                return Err(DocumentError::Evaluation(format!(
+                    "Bytes/slice from position {from} with count {count} is out of bounds for {} bytes",
+                    bytes.len()
+                )));
+            }
+            EvalValue::Bytes(bytes.slice(start..end))
+        }
+        DocumentBuiltin::TextSlice => {
+            let from = required_document_position(&arguments, "from", "Text/slice from")?;
+            let count = required_document_count(&arguments, "count", "Text/slice count")?;
             let text = first.text();
-            let start = named_number(&arguments, "from")
-                .or_else(|| named_number(&arguments, "start"))
-                .and_then(|value| value.to_usize_exact().ok())
-                .unwrap_or(0);
-            let end = named_number(&arguments, "to")
-                .or_else(|| named_number(&arguments, "end"))
-                .and_then(|value| value.to_usize_exact().ok())
-                .unwrap_or(text.len());
-            EvalValue::Text(
-                text.chars()
-                    .skip(start)
-                    .take(end.saturating_sub(start))
-                    .collect(),
-            )
+            let length = text.chars().count();
+            let start = from - 1;
+            let end = start.checked_add(count).ok_or_else(|| {
+                DocumentError::Evaluation("Text/slice range overflows platform bounds".to_owned())
+            })?;
+            if from > length.saturating_add(1) || end > length {
+                return Err(DocumentError::Evaluation(format!(
+                    "Text/slice from position {from} with count {count} is out of bounds for Text length {length}"
+                )));
+            }
+            EvalValue::Text(text.chars().skip(start).take(count).collect())
         }
         DocumentBuiltin::BytesStartsWith | DocumentBuiltin::TextStartsWith => EvalValue::Truth(
             first
@@ -4129,12 +4155,12 @@ fn eval_builtin(
             })
         }
         DocumentBuiltin::ListGet => {
-            let index = named_number(&arguments, "index")
-                .and_then(|value| value.to_usize_exact().ok())
-                .unwrap_or(0);
+            let position = required_document_position(&arguments, "position", "List/get position")?;
             match first {
-                EvalValue::List(mut values) if index < values.len() => values.remove(index),
-                _ => EvalValue::Absent,
+                EvalValue::List(mut values) if position <= values.len() => {
+                    found_document_value(values.remove(position - 1))
+                }
+                _ => EvalValue::Tag("NotFound".to_owned(), BTreeMap::new()),
             }
         }
         DocumentBuiltin::ListIsNotEmpty => EvalValue::Truth(match first {
@@ -4266,6 +4292,10 @@ fn eval_builtin(
                 .contains(&values.next().unwrap_or(EvalValue::Absent).text()),
         ),
         DocumentBuiltin::TextEmpty => EvalValue::Text(String::new()),
+        DocumentBuiltin::TextFind => {
+            let needle = values.next().unwrap_or(EvalValue::Absent).text();
+            find_document_text(&first.text(), &needle)
+        }
         DocumentBuiltin::TextIsEmpty => EvalValue::Truth(first.text().is_empty()),
         DocumentBuiltin::TextJoin => {
             let separator = named_value(&arguments, "separator")
@@ -4307,11 +4337,29 @@ fn eval_builtin(
         }
         DocumentBuiltin::TextToBytes => EvalValue::Bytes(first.text().into_bytes().into()),
         DocumentBuiltin::TextToLowercase => EvalValue::Text(first.text().to_lowercase()),
-        DocumentBuiltin::TextToNumber => first
-            .text()
-            .parse()
-            .map(EvalValue::Number)
-            .unwrap_or(EvalValue::Absent),
+        DocumentBuiltin::TextToNumber => {
+            let radix = named_number(&arguments, "radix").map(|value| {
+                value
+                    .to_u64_exact()
+                    .ok()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| (2..=36).contains(value))
+            });
+            match radix {
+                Some(None) => invalid_document_number("invalid_radix", 1),
+                radix => match ExactNumber::parse_strict(&first.text(), radix.flatten()) {
+                    Ok(value) => parsed_document_number(value),
+                    Err(error) if error.reason() == ExactNumberParseReason::ResourceLimit => {
+                        return Err(DocumentError::Evaluation(format!(
+                            "Text/to_number exhausted the exact Number resource budget: {error}"
+                        )));
+                    }
+                    Err(error) => {
+                        invalid_document_number(error.reason().as_str(), error.position())
+                    }
+                },
+            }
+        }
         DocumentBuiltin::TextToUppercase => EvalValue::Text(first.text().to_uppercase()),
         DocumentBuiltin::TextTrim => EvalValue::Text(first.text().trim().to_owned()),
         DocumentBuiltin::LightAmbient
@@ -4336,6 +4384,109 @@ fn named_value<'a>(arguments: &'a [(String, EvalValue)], name: &str) -> Option<&
 
 fn named_number(arguments: &[(String, EvalValue)], name: &str) -> Option<ExactNumber> {
     named_value(arguments, name).and_then(EvalValue::number)
+}
+
+fn required_document_position(
+    arguments: &[(String, EvalValue)],
+    name: &str,
+    context: &str,
+) -> Result<usize, DocumentError> {
+    let value = named_number(arguments, name).ok_or_else(|| {
+        DocumentError::Evaluation(format!(
+            "{context} requires a Number argument named `{name}`"
+        ))
+    })?;
+    let position = value.to_usize_exact().map_err(|error| {
+        DocumentError::Evaluation(format!("{context} must be a whole Number: {error}"))
+    })?;
+    if position == 0 {
+        return Err(DocumentError::Evaluation(format!(
+            "{context} is one-based and must be at least 1"
+        )));
+    }
+    Ok(position)
+}
+
+fn required_document_count(
+    arguments: &[(String, EvalValue)],
+    name: &str,
+    context: &str,
+) -> Result<usize, DocumentError> {
+    named_number(arguments, name)
+        .ok_or_else(|| {
+            DocumentError::Evaluation(format!(
+                "{context} requires a Number argument named `{name}`"
+            ))
+        })?
+        .to_usize_exact()
+        .map_err(|error| {
+            DocumentError::Evaluation(format!(
+                "{context} must be a non-negative whole Number: {error}"
+            ))
+        })
+}
+
+fn parsed_document_number(value: ExactNumber) -> EvalValue {
+    EvalValue::Tag(
+        "Parsed".to_owned(),
+        BTreeMap::from([("value".to_owned(), EvalValue::Number(value))]),
+    )
+}
+
+fn invalid_document_number(reason: &str, position: usize) -> EvalValue {
+    EvalValue::Tag(
+        "InvalidNumber".to_owned(),
+        BTreeMap::from([
+            ("reason".to_owned(), EvalValue::Text(reason.to_owned())),
+            (
+                "position".to_owned(),
+                EvalValue::Number(ExactNumber::from_usize(position)),
+            ),
+        ]),
+    )
+}
+
+fn found_document_value(value: EvalValue) -> EvalValue {
+    EvalValue::Tag(
+        "Found".to_owned(),
+        BTreeMap::from([("value".to_owned(), value)]),
+    )
+}
+
+fn found_document_position(position: usize) -> EvalValue {
+    EvalValue::Tag(
+        "Found".to_owned(),
+        BTreeMap::from([(
+            "position".to_owned(),
+            EvalValue::Number(ExactNumber::from_usize(position)),
+        )]),
+    )
+}
+
+fn find_document_bytes(input: &[u8], needle: &[u8]) -> EvalValue {
+    let position = if needle.is_empty() {
+        Some(0)
+    } else {
+        input
+            .windows(needle.len())
+            .position(|window| window == needle)
+    };
+    position
+        .map(|position| found_document_position(position + 1))
+        .unwrap_or_else(|| EvalValue::Tag("NotFound".to_owned(), BTreeMap::new()))
+}
+
+fn find_document_text(input: &str, needle: &str) -> EvalValue {
+    let position = if needle.is_empty() {
+        Some(1)
+    } else {
+        input
+            .find(needle)
+            .map(|byte| input[..byte].chars().count() + 1)
+    };
+    position
+        .map(found_document_position)
+        .unwrap_or_else(|| EvalValue::Tag("NotFound".to_owned(), BTreeMap::new()))
 }
 
 fn constructor_kind(constructor: DocumentConstructor, direction: Option<&str>) -> DocumentNodeKind {
@@ -6378,11 +6529,11 @@ mod tests {
 
         let first = EvalValue::Record(BTreeMap::from([(
             "address".to_owned(),
-            EvalValue::Text("A0".to_owned()),
+            EvalValue::Text("A1".to_owned()),
         )]));
         let second = EvalValue::Record(BTreeMap::from([(
             "address".to_owned(),
-            EvalValue::Text("B0".to_owned()),
+            EvalValue::Text("B1".to_owned()),
         )]));
         let error = resolve_semantic_metadata([
             ("first", DocumentArgumentRole::EventBindings, &first),

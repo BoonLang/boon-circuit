@@ -1,4 +1,4 @@
--- These target argument spellings parse today; one-based semantics are planned.
+-- Position 1 names the first public LIST, TEXT, or BYTES value.
 items: LIST { 10, 20 }
 first: List/get(list: items, position: 1)
 first_byte: Bytes/get(input: BYTES[2] { 16uAA, 16uBB }, position: 1)

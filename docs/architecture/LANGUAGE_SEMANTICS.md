@@ -424,11 +424,9 @@ dynamic comparison patterns fail in the parser with targeted diagnostics.
 Pattern bindings and field projections are then carried structurally through
 the checked and executable artifacts; typechecking does not recover them by
 scanning source tokens. Fixed-width BITS literal patterns remain unavailable
-until the BITS value phase lands. The parser still recognizes the legacy `NaN`
-arm only as migration debt for the old `Text/to_number()` failure profile; no
-`Number` value can contain NaN. Its flag-day removal accompanies the
-`Parsed[...] | InvalidNumber[...]` conversion and it must not be used by new
-code.
+until the BITS value phase lands. `NaN` is neither a Number nor a match pattern.
+Strict `Text/to_number()` returns
+`Parsed[value] | InvalidNumber[reason, position]`.
 
 On an absent event input, event-style `WHEN` returns `SKIP`. Value-style `WHEN`
 does not have absence unless the value being matched is itself an event/optional

@@ -2,7 +2,7 @@ use super::{
     ActivationBatch, DurableOutboxState, OutboxItemId, RestoreImage, StoredList, StoredRow,
     StoredScalar, StoredValue, validate_outbox_item_schema,
 };
-use boon_data::{ExactNumber, NumberTextFormat, format_number_text};
+use boon_data::{ExactNumber, ExactNumberParseReason, NumberTextFormat, format_number_text};
 use boon_plan::{
     ApplicationIdentity, DataTypePlan, MachinePlan, MemoryId, MemoryLeafId,
     MigrationArgumentValuePlan, MigrationEdgeId, MigrationEdgePlan, MigrationExpressionPlan,
@@ -972,9 +972,6 @@ fn stored_value_matches_pattern(
         boon_plan::PlanRowSelectPattern::Text { value: expected } => {
             matches!(value, StoredValue::Text(value) if value == expected)
         }
-        boon_plan::PlanRowSelectPattern::NaN => {
-            matches!(value, StoredValue::Text(value) if value == "NaN")
-        }
     }
 }
 
@@ -1076,11 +1073,41 @@ fn evaluate_call(
             .map_err(|error| MigrationError::Evaluation(error.to_string()))?;
             Ok(StoredValue::Text(text))
         }
-        "Text/to_number" => match input.or_else(|| named_value("input")) {
-            Some(StoredValue::Text(value)) => value
-                .parse::<ExactNumber>()
-                .map(StoredValue::Number)
-                .map_err(|_| MigrationError::Evaluation("text is not a number".to_owned())),
+        "Text/to_number" => match input
+            .or_else(|| named_value("input"))
+            .or_else(|| named_value("text"))
+        {
+            Some(StoredValue::Text(value)) => {
+                let radix = named_value("radix").map(|value| match value {
+                    StoredValue::Number(value) => value
+                        .to_u64_exact()
+                        .ok()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| (2..=36).contains(value)),
+                    _ => None,
+                });
+                match radix {
+                    Some(None) => Ok(stored_invalid_number("invalid_radix", 1)),
+                    radix => match ExactNumber::parse_strict(&value, radix.flatten()) {
+                        Ok(value) => Ok(StoredValue::Tag {
+                            tag: "Parsed".to_owned(),
+                            fields: BTreeMap::from([(
+                                "value".to_owned(),
+                                StoredValue::Number(value),
+                            )]),
+                        }),
+                        Err(error) if error.reason() == ExactNumberParseReason::ResourceLimit => {
+                            Err(MigrationError::Evaluation(format!(
+                                "Text/to_number exhausted the exact Number resource budget: {error}"
+                            )))
+                        }
+                        Err(error) => Ok(stored_invalid_number(
+                            error.reason().as_str(),
+                            error.position(),
+                        )),
+                    },
+                }
+            }
             _ => Err(MigrationError::Evaluation(
                 "Text/to_number requires one text value".to_owned(),
             )),
@@ -1153,6 +1180,19 @@ fn evaluate_call(
         other => Err(MigrationError::Evaluation(format!(
             "unsupported target-neutral migration call `{other}`"
         ))),
+    }
+}
+
+fn stored_invalid_number(reason: &str, position: usize) -> StoredValue {
+    StoredValue::Tag {
+        tag: "InvalidNumber".to_owned(),
+        fields: BTreeMap::from([
+            ("reason".to_owned(), StoredValue::Text(reason.to_owned())),
+            (
+                "position".to_owned(),
+                StoredValue::Number(ExactNumber::from_usize(position)),
+            ),
+        ]),
     }
 }
 

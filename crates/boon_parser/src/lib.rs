@@ -311,10 +311,10 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
     },
     LanguageFeatureSpec {
         id: "one_based_positions",
-        stage: LanguageFeatureStage::Planned,
+        stage: LanguageFeatureStage::Current,
         parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["position:", "from:", "count:"],
-        summary: "one-based LIST, TEXT, BYTES, and BITS position semantics are planned",
+        summary: "LIST, TEXT, and BYTES positions are one-based; BITS joins the same contract when its value phase lands",
     },
     LanguageFeatureSpec {
         id: "reactive_temporal_operators",
@@ -604,7 +604,6 @@ pub enum AstMatchPattern {
     Text {
         value: String,
     },
-    NaN,
     Tag {
         name: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2580,7 +2579,9 @@ fn ast_match_pattern(tokens: &[String], item: &ParserItem, source: &str) -> AstM
         };
     }
     if tokens == ["NaN"] {
-        return AstMatchPattern::NaN;
+        return AstMatchPattern::Invalid {
+            message: "`NaN` is not a Number or a valid match pattern; handle typed parse and find results instead".to_owned(),
+        };
     }
     if let Some(value) = ast_number_literal(tokens) {
         return AstMatchPattern::Number { value };
@@ -4707,7 +4708,7 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "Text/trim"
             | "Text/to_lowercase"
             | "Text/to_uppercase"
-            | "Text/substring"
+            | "Text/slice"
             | "Text/length"
             | "Text/find"
             | "Text/contains"
@@ -4915,6 +4916,7 @@ selected:
             ("LIST { value }", "LIST patterns are unsupported"),
             ("NUMBER", "runtime type patterns are unsupported"),
             ("SKIP", "private flow-control states cannot be matched"),
+            ("NaN", "is not a Number or a valid match pattern"),
             (
                 "Found[value: renamed]",
                 "do not support renaming, nesting, or comparison",

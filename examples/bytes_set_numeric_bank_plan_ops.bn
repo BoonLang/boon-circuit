@@ -7,25 +7,25 @@ store: [
     patched:
         BYTES[4] {} |> HOLD patched {
             LATEST {
-                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: BYTES[1] { 16uFE }) }
+                store.patch |> THEN { left_payload |> Bytes/set(position: 2, value: BYTES[1] { 16uFE }) }
             }
         }
     read_u16_be:
         0 |> HOLD read_u16_be {
             LATEST {
-                store.inspect |> THEN { store.patched |> Bytes/read_unsigned(offset: 0, byte_count: 2, endian: Big) }
+                store.inspect |> THEN { store.patched |> Bytes/read_unsigned(from: 1, byte_count: 2, endian: Big) }
             }
         }
     read_u16_le:
         0 |> HOLD read_u16_le {
             LATEST {
-                store.inspect |> THEN { Bytes/read_unsigned(input: store.patched, offset: 0, byte_count: 2, endian: Little) }
+                store.inspect |> THEN { Bytes/read_unsigned(input: store.patched, from: 1, byte_count: 2, endian: Little) }
             }
         }
     read_i8:
         0 |> HOLD read_i8 {
             LATEST {
-                store.inspect |> THEN { store.patched |> Bytes/read_signed(offset: 1, byte_count: 1, endian: Little) }
+                store.inspect |> THEN { store.patched |> Bytes/read_signed(from: 2, byte_count: 1, endian: Little) }
             }
         }
 ]

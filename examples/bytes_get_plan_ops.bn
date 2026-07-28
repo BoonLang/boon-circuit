@@ -6,7 +6,14 @@ store: [
     selected_byte:
         BYTES[1] { 16u00 } |> HOLD selected_byte {
             LATEST {
-                store.measure |> THEN { payload |> Bytes/get(index: 2) }
+                store.measure |> THEN {
+                    payload
+                    |> Bytes/get(position: 3)
+                    |> WHEN {
+                        Found[value] => value
+                        NotFound => FLUSH { MissingBytePosition }
+                    }
+                }
             }
         }
 ]

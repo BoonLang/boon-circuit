@@ -22,7 +22,14 @@ FUNCTION row_widget(row) {
             }
         payload_second:
             BYTES[1] { 16u00 } |> HOLD payload_second {
-                inspect |> THEN { payload |> Bytes/get(index: 1) }
+                inspect |> THEN {
+                    payload
+                    |> Bytes/get(position: 2)
+                    |> WHEN {
+                        Found[value] => value
+                        NotFound => FLUSH { MissingBytePosition }
+                    }
+                }
             }
     ]
 }

@@ -9,9 +9,9 @@ store: [
     patched:
         BYTES[4] {} |> HOLD patched {
             LATEST {
-                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: BYTES[1] { 16uFE }) }
-                store.write_unsigned |> THEN { store.patched |> Bytes/write_unsigned(offset: 2, byte_count: 2, endian: Big, value: 4660) }
-                store.write_signed |> THEN { store.patched |> Bytes/write_signed(offset: 0, byte_count: 2, endian: Little, value: -2) }
+                store.patch |> THEN { left_payload |> Bytes/set(position: 2, value: BYTES[1] { 16uFE }) }
+                store.write_unsigned |> THEN { store.patched |> Bytes/write_unsigned(from: 3, byte_count: 2, endian: Big, value: 4660) }
+                store.write_signed |> THEN { store.patched |> Bytes/write_signed(from: 1, byte_count: 2, endian: Little, value: -2) }
             }
         }
     hex:
@@ -23,13 +23,13 @@ store: [
     read_u16_be:
         0 |> HOLD read_u16_be {
             LATEST {
-                store.inspect |> THEN { store.patched |> Bytes/read_unsigned(offset: 2, byte_count: 2, endian: Big) }
+                store.inspect |> THEN { store.patched |> Bytes/read_unsigned(from: 3, byte_count: 2, endian: Big) }
             }
         }
     read_i16_le:
         0 |> HOLD read_i16_le {
             LATEST {
-                store.inspect |> THEN { store.patched |> Bytes/read_signed(offset: 0, byte_count: 2, endian: Little) }
+                store.inspect |> THEN { store.patched |> Bytes/read_signed(from: 1, byte_count: 2, endian: Little) }
             }
         }
 ]

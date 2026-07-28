@@ -6,25 +6,32 @@ store: [
     folded_byte:
         BYTES[1] { 16u00 } |> HOLD folded_byte {
             LATEST {
-                store.inspect |> THEN { payload |> Bytes/get(index: 0 + 1) }
+                store.inspect |> THEN {
+                    payload
+                    |> Bytes/get(position: 1 + 1)
+                    |> WHEN {
+                        Found[value] => value
+                        NotFound => FLUSH { MissingBytePosition }
+                    }
+                }
             }
         }
     folded_slice:
         BYTES[2] {} |> HOLD folded_slice {
             LATEST {
-                store.inspect |> THEN { payload |> Bytes/slice(offset: 1 + 1, byte_count: 1 + 1) }
+                store.inspect |> THEN { payload |> Bytes/slice(from: 1 + 1 + 1, count: 1 + 1) }
             }
         }
     folded_read:
         0 |> HOLD folded_read {
             LATEST {
-                store.inspect |> THEN { payload |> Bytes/read_unsigned(offset: 2 - 2, byte_count: 2 * 2, endian: Big) }
+                store.inspect |> THEN { payload |> Bytes/read_unsigned(from: 1 + 2 - 2, byte_count: 2 * 2, endian: Big) }
             }
         }
     folded_write:
         BYTES[4] {} |> HOLD folded_write {
             LATEST {
-                store.inspect |> THEN { payload |> Bytes/write_unsigned(offset: 2 + 0, byte_count: 1 + 1, endian: Big, value: 258) }
+                store.inspect |> THEN { payload |> Bytes/write_unsigned(from: 1 + 2, byte_count: 1 + 1, endian: Big, value: 258) }
             }
         }
 ]

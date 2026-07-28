@@ -262,7 +262,7 @@ fn plan_row_builtin_inventory_uses_stable_string_serde() {
         "List/page",
         "Url/encode",
         "Text/trim",
-        "Text/substring",
+        "Text/slice",
         "Text/to_bytes",
         "Bytes/to_text",
     ] {

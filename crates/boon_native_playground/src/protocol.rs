@@ -2857,7 +2857,7 @@ mod tests {
                             list: "cells".to_owned(),
                             key_field: "address".to_owned(),
                             field: "value".to_owned(),
-                            keys: vec!["A0".to_owned(), "B0".to_owned()],
+                            keys: vec!["A1".to_owned(), "B1".to_owned()],
                         },
                         ScenarioExpectation::SemanticDeltaContains(
                             "store.count changed".to_owned(),

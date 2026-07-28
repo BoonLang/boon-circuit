@@ -2,7 +2,7 @@
 
 store: [
     selected_address:
-        TEXT { A0 } |> HOLD selected_address {
+        TEXT { A1 } |> HOLD selected_address {
             LATEST {
                 cells
                     |> List/map(item, new: item.sources.editor.select.address)

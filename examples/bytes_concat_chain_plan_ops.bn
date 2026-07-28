@@ -22,7 +22,14 @@ store: [
     joined_byte:
         BYTES[1] { 16u00 } |> HOLD joined_byte {
             LATEST {
-                store.inspect |> THEN { store.joined |> Bytes/get(index: 3) }
+                store.inspect |> THEN {
+                    store.joined
+                    |> Bytes/get(position: 4)
+                    |> WHEN {
+                        Found[value] => value
+                        NotFound => FLUSH { MissingBytePosition }
+                    }
+                }
             }
         }
     joined_again:

@@ -16,7 +16,14 @@ store: [
     received_byte:
         BYTES[1] { 16u00 } |> HOLD received_byte {
             LATEST {
-                store.inspect |> THEN { store.received |> Bytes/get(index: 1) }
+                store.inspect |> THEN {
+                    store.received
+                    |> Bytes/get(position: 2)
+                    |> WHEN {
+                        Found[value] => value
+                        NotFound => FLUSH { MissingBytePosition }
+                    }
+                }
             }
         }
 ]

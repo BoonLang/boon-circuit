@@ -5,9 +5,10 @@
 pub use bytes::Bytes;
 mod number;
 pub use number::{
-    ExactNumber, ExactNumberError, ExactNumberSemanticProfileV1, ExactNumberSign,
-    ExactRoundingRule, MAX_NUMBER_ARITHMETIC_BIT_WORK, MAX_NUMBER_COMPONENT_BITS,
-    MAX_NUMBER_FORMATTED_DIGITS, MAX_NUMBER_PARSED_DIGITS,
+    ExactNumber, ExactNumberError, ExactNumberParseError, ExactNumberParseReason,
+    ExactNumberSemanticProfileV1, ExactNumberSign, ExactRoundingRule,
+    MAX_NUMBER_ARITHMETIC_BIT_WORK, MAX_NUMBER_COMPONENT_BITS, MAX_NUMBER_FORMATTED_DIGITS,
+    MAX_NUMBER_PARSED_DIGITS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

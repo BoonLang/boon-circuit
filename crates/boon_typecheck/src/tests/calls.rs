@@ -827,7 +827,7 @@ sum: Number/add(left: 1, right: 2)
 numbers: List/range(from: 0, to: 3)
 count: numbers |> List/count()
 encoded: TEXT { 00ff } |> Bytes/from_hex()
-first: encoded |> Bytes/get(index: 0)
+first: encoded |> Bytes/get(position: 1)
 "#,
     )
     .unwrap();
@@ -845,10 +845,49 @@ first: encoded |> Bytes/get(index: 0)
         ("List/range", &["from", "to"][..]),
         ("List/count", &["list"][..]),
         ("Bytes/from_hex", &["input"][..]),
-        ("Bytes/get", &["input", "index"][..]),
+        ("Bytes/get", &["input", "position"][..]),
     ] {
         assert_callable_parameters(&program, name, parameters);
     }
+    assert_no_unbound_calls(&parsed, &program);
+}
+
+#[test]
+fn one_based_list_get_preserves_a_mapped_record_item_shape() {
+    let parsed = boon_parser::parse_source(
+        "checked-one-based-list-get.bn",
+        r#"
+FUNCTION copy_column(column) {
+    [label: column.label]
+}
+
+columns:
+    LIST {
+        [label: TEXT { A }]
+        [label: TEXT { B }]
+    }
+    |> List/map(item, new: copy_column(column: item))
+
+first:
+    List/get(list: columns, position: 1)
+    |> WHEN {
+        Found[value] => value
+        NotFound => FLUSH { MissingColumn }
+    }
+
+label: first.label
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output
+        .program
+        .expect("one-based List/get keeps its exact mapped row type");
     assert_no_unbound_calls(&parsed, &program);
 }
 
@@ -2581,16 +2620,13 @@ fn explicit_tagged_result_branches_preserve_the_success_value_type() {
         "checked-explicit-tagged-result.bn",
         r#"
 FUNCTION parse_number(text) {
-    text |> Text/to_number() |> WHILE {
-        NaN => InvalidNumber[reason: TEXT { invalid_number }]
-        number => Parsed[value: number]
-    }
+    text |> Text/to_number()
 }
 
 result:
     parse_number(text: TEXT { 41 }) |> WHEN {
         Parsed[value] => value + 1
-        InvalidNumber[reason] => 0
+        InvalidNumber[reason, position] => 0
     }
 "#,
     )

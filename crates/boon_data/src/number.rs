@@ -76,6 +76,76 @@ pub enum ExactRoundingRule {
     AwayFromZero,
 }
 
+/// Stable reason carried by `InvalidNumber[reason, position]`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactNumberParseReason {
+    Empty,
+    Whitespace,
+    LeadingPlus,
+    InvalidDigit,
+    InvalidSyntax,
+    InvalidExponent,
+    ZeroDenominator,
+    InvalidRadix,
+    ResourceLimit,
+}
+
+impl ExactNumberParseReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Whitespace => "whitespace",
+            Self::LeadingPlus => "leading_plus",
+            Self::InvalidDigit => "invalid_digit",
+            Self::InvalidSyntax => "invalid_syntax",
+            Self::InvalidExponent => "invalid_exponent",
+            Self::ZeroDenominator => "zero_denominator",
+            Self::InvalidRadix => "invalid_radix",
+            Self::ResourceLimit => "resource_limit",
+        }
+    }
+}
+
+/// One-based, deterministic failure for strict source or runtime Number text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactNumberParseError {
+    reason: ExactNumberParseReason,
+    position: usize,
+    message: String,
+}
+
+impl ExactNumberParseError {
+    fn new(reason: ExactNumberParseReason, position: usize, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            position: position.max(1),
+            message: message.into(),
+        }
+    }
+
+    pub const fn reason(&self) -> ExactNumberParseReason {
+        self.reason
+    }
+
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+}
+
+impl fmt::Display for ExactNumberParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} at position {}: {}",
+            self.reason.as_str(),
+            self.position,
+            self.message
+        )
+    }
+}
+
+impl Error for ExactNumberParseError {}
+
 /// Deterministic Number construction, domain, or resource failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExactNumberError {
@@ -97,6 +167,12 @@ impl fmt::Display for ExactNumberError {
 }
 
 impl Error for ExactNumberError {}
+
+impl From<ExactNumberParseError> for ExactNumberError {
+    fn from(error: ExactNumberParseError) -> Self {
+        Self::new(error.to_string())
+    }
+}
 
 /// Boon's one canonical arbitrary-precision exact rational Number.
 ///
@@ -141,6 +217,42 @@ impl ExactNumber {
         Self {
             numerator: BigInt::from(value),
             denominator: BigUint::one(),
+        }
+    }
+
+    /// Parses the complete input as one exact Number.
+    ///
+    /// `radix = None` accepts exact decimal, exponent, and canonical fraction
+    /// notation. An explicit radix accepts one whole Number and the matching
+    /// `0b`, `0o`, or `0x` prefix when present.
+    pub fn parse_strict(text: &str, radix: Option<u32>) -> Result<Self, ExactNumberParseError> {
+        Self::parse_strict_with_profile(text, radix, ExactNumberSemanticProfileV1::default())
+    }
+
+    pub fn parse_strict_with_profile(
+        text: &str,
+        radix: Option<u32>,
+        profile: ExactNumberSemanticProfileV1,
+    ) -> Result<Self, ExactNumberParseError> {
+        match radix {
+            Some(radix) => parse_radix_number(text, radix, profile),
+            None => {
+                validate_default_number_syntax(text, profile)?;
+                Self::parse_with_profile(text, profile).map_err(|error| {
+                    let message = error.to_string();
+                    let reason = if message.contains("denominator must be positive") {
+                        ExactNumberParseReason::ZeroDenominator
+                    } else if message.contains("budget")
+                        || message.contains("out of range")
+                        || message.contains("exceeds")
+                    {
+                        ExactNumberParseReason::ResourceLimit
+                    } else {
+                        ExactNumberParseReason::InvalidSyntax
+                    };
+                    ExactNumberParseError::new(reason, 1, message)
+                })
+            }
         }
     }
 
@@ -760,6 +872,322 @@ impl ExactNumber {
     }
 }
 
+fn parse_failure(
+    reason: ExactNumberParseReason,
+    position: usize,
+    message: impl Into<String>,
+) -> ExactNumberParseError {
+    ExactNumberParseError::new(reason, position, message)
+}
+
+fn validate_digit_budget(
+    digit_count: usize,
+    position: usize,
+    profile: ExactNumberSemanticProfileV1,
+) -> Result<(), ExactNumberParseError> {
+    if digit_count == 0 {
+        return Err(parse_failure(
+            ExactNumberParseReason::Empty,
+            position,
+            "Number text contains no digits",
+        ));
+    }
+    if digit_count > profile.max_parsed_digits {
+        return Err(parse_failure(
+            ExactNumberParseReason::ResourceLimit,
+            position,
+            format!(
+                "parsed digit budget exceeded: {digit_count} > {}",
+                profile.max_parsed_digits
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decimal_digits(
+    text: &str,
+    start_position: usize,
+) -> Result<usize, ExactNumberParseError> {
+    let mut count = 0;
+    for (offset, character) in text.chars().enumerate() {
+        if !character.is_ascii_digit() {
+            return Err(parse_failure(
+                ExactNumberParseReason::InvalidDigit,
+                start_position + offset,
+                format!("`{character}` is not a decimal digit"),
+            ));
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn validate_default_number_syntax(
+    text: &str,
+    profile: ExactNumberSemanticProfileV1,
+) -> Result<(), ExactNumberParseError> {
+    if text.is_empty() {
+        return Err(parse_failure(
+            ExactNumberParseReason::Empty,
+            1,
+            "Number text is empty",
+        ));
+    }
+    if let Some((offset, _)) = text
+        .chars()
+        .enumerate()
+        .find(|(_, character)| character.is_whitespace())
+    {
+        return Err(parse_failure(
+            ExactNumberParseReason::Whitespace,
+            offset + 1,
+            "strict Number text cannot contain whitespace",
+        ));
+    }
+    if text.starts_with('+') {
+        return Err(parse_failure(
+            ExactNumberParseReason::LeadingPlus,
+            1,
+            "strict Number text does not accept a leading plus sign",
+        ));
+    }
+
+    let slash_positions = text
+        .char_indices()
+        .filter_map(|(index, character)| (character == '/').then_some(index))
+        .collect::<Vec<_>>();
+    if slash_positions.len() > 1 {
+        let position = text[..slash_positions[1]].chars().count() + 1;
+        return Err(parse_failure(
+            ExactNumberParseReason::InvalidSyntax,
+            position,
+            "fraction notation contains more than one slash",
+        ));
+    }
+    if let Some(slash) = slash_positions.first().copied() {
+        let numerator = &text[..slash];
+        let denominator = &text[slash + 1..];
+        let numerator_digits = numerator.strip_prefix('-').unwrap_or(numerator);
+        if numerator_digits.is_empty() {
+            return Err(parse_failure(
+                ExactNumberParseReason::Empty,
+                1,
+                "fraction numerator is empty",
+            ));
+        }
+        let numerator_count = validate_decimal_digits(
+            numerator_digits,
+            usize::from(numerator.starts_with('-')) + 1,
+        )?;
+        if denominator.is_empty() {
+            return Err(parse_failure(
+                ExactNumberParseReason::Empty,
+                text.chars().count() + 1,
+                "fraction denominator is empty",
+            ));
+        }
+        let denominator_position = text[..=slash].chars().count() + 1;
+        let denominator_count = validate_decimal_digits(denominator, denominator_position)?;
+        validate_digit_budget(
+            numerator_count.saturating_add(denominator_count),
+            denominator_position,
+            profile,
+        )?;
+        if denominator.bytes().all(|byte| byte == b'0') {
+            return Err(parse_failure(
+                ExactNumberParseReason::ZeroDenominator,
+                denominator_position,
+                "fraction denominator must be positive",
+            ));
+        }
+        return Ok(());
+    }
+
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    if unsigned.is_empty() {
+        return Err(parse_failure(
+            ExactNumberParseReason::Empty,
+            2,
+            "Number text contains no digits",
+        ));
+    }
+    let sign_offset = usize::from(text.starts_with('-'));
+    let mut seen_decimal = false;
+    let mut seen_exponent = false;
+    let mut mantissa_digits = 0usize;
+    let mut exponent_digits = 0usize;
+    let mut exponent_sign_allowed = false;
+    for (offset, character) in unsigned.chars().enumerate() {
+        let position = sign_offset + offset + 1;
+        if character.is_ascii_digit() {
+            if seen_exponent {
+                exponent_digits += 1;
+            } else {
+                mantissa_digits += 1;
+            }
+            exponent_sign_allowed = false;
+            continue;
+        }
+        match character {
+            '.' if !seen_decimal && !seen_exponent => {
+                seen_decimal = true;
+            }
+            '.' => {
+                return Err(parse_failure(
+                    ExactNumberParseReason::InvalidSyntax,
+                    position,
+                    "Number text repeats or misplaces the decimal point",
+                ));
+            }
+            'e' | 'E' if !seen_exponent && mantissa_digits > 0 => {
+                seen_exponent = true;
+                exponent_sign_allowed = true;
+            }
+            'e' | 'E' => {
+                return Err(parse_failure(
+                    ExactNumberParseReason::InvalidExponent,
+                    position,
+                    "Number text repeats or misplaces the exponent marker",
+                ));
+            }
+            '+' | '-' if exponent_sign_allowed => {
+                exponent_sign_allowed = false;
+            }
+            '+' | '-' => {
+                return Err(parse_failure(
+                    ExactNumberParseReason::InvalidExponent,
+                    position,
+                    "sign is valid only at the start of an exponent",
+                ));
+            }
+            _ => {
+                return Err(parse_failure(
+                    ExactNumberParseReason::InvalidDigit,
+                    position,
+                    format!("`{character}` is not valid Number syntax"),
+                ));
+            }
+        }
+    }
+    if mantissa_digits == 0 {
+        return Err(parse_failure(
+            ExactNumberParseReason::Empty,
+            sign_offset + 1,
+            "Number mantissa contains no digits",
+        ));
+    }
+    if seen_exponent && exponent_digits == 0 {
+        return Err(parse_failure(
+            ExactNumberParseReason::InvalidExponent,
+            text.chars().count() + 1,
+            "Number exponent contains no digits",
+        ));
+    }
+    validate_digit_budget(
+        mantissa_digits.saturating_add(exponent_digits),
+        text.chars().count(),
+        profile,
+    )
+}
+
+fn parse_radix_number(
+    text: &str,
+    radix: u32,
+    profile: ExactNumberSemanticProfileV1,
+) -> Result<ExactNumber, ExactNumberParseError> {
+    if !(2..=36).contains(&radix) {
+        return Err(parse_failure(
+            ExactNumberParseReason::InvalidRadix,
+            1,
+            format!("radix {radix} is outside 2..=36"),
+        ));
+    }
+    if text.is_empty() {
+        return Err(parse_failure(
+            ExactNumberParseReason::Empty,
+            1,
+            "Number text is empty",
+        ));
+    }
+    if let Some((offset, _)) = text
+        .chars()
+        .enumerate()
+        .find(|(_, character)| character.is_whitespace())
+    {
+        return Err(parse_failure(
+            ExactNumberParseReason::Whitespace,
+            offset + 1,
+            "strict Number text cannot contain whitespace",
+        ));
+    }
+    if text.starts_with('+') {
+        return Err(parse_failure(
+            ExactNumberParseReason::LeadingPlus,
+            1,
+            "strict Number text does not accept a leading plus sign",
+        ));
+    }
+    let negative = text.starts_with('-');
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let declared_prefix_radix = if unsigned.starts_with("0b") || unsigned.starts_with("0B") {
+        Some(2)
+    } else if unsigned.starts_with("0o") || unsigned.starts_with("0O") {
+        Some(8)
+    } else if unsigned.starts_with("0x") || unsigned.starts_with("0X") {
+        Some(16)
+    } else {
+        None
+    };
+    if let Some(declared) = declared_prefix_radix
+        && declared != radix
+    {
+        return Err(parse_failure(
+            ExactNumberParseReason::InvalidRadix,
+            usize::from(negative) + 2,
+            format!("base-{declared} prefix does not match requested radix {radix}"),
+        ));
+    }
+    let prefix = usize::from(declared_prefix_radix.is_some()) * 2;
+    let digits = &unsigned[prefix..];
+    if digits.is_empty() {
+        return Err(parse_failure(
+            ExactNumberParseReason::Empty,
+            text.chars().count() + 1,
+            "radix Number contains no digits",
+        ));
+    }
+    for (offset, character) in digits.chars().enumerate() {
+        if character.to_digit(radix).is_none() {
+            return Err(parse_failure(
+                ExactNumberParseReason::InvalidDigit,
+                usize::from(negative) + prefix + offset + 1,
+                format!("`{character}` is not a base-{radix} digit"),
+            ));
+        }
+    }
+    validate_digit_budget(digits.chars().count(), text.chars().count(), profile)?;
+    let magnitude = BigUint::parse_bytes(digits.as_bytes(), radix).ok_or_else(|| {
+        parse_failure(
+            ExactNumberParseReason::InvalidDigit,
+            usize::from(negative) + prefix + 1,
+            format!("Number is not valid base-{radix} text"),
+        )
+    })?;
+    let numerator = BigInt::from_biguint(
+        if magnitude.is_zero() {
+            Sign::NoSign
+        } else if negative {
+            Sign::Minus
+        } else {
+            Sign::Plus
+        },
+        magnitude,
+    );
+    ExactNumber::from_ratio_with_profile(numerator, BigUint::one(), profile)
+        .map_err(|error| parse_failure(ExactNumberParseReason::ResourceLimit, 1, error.to_string()))
+}
+
 fn split_once_unique(
     text: &str,
     separator: char,
@@ -939,7 +1367,7 @@ impl FromStr for ExactNumber {
     type Err = ExactNumberError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse_with_profile(value, ExactNumberSemanticProfileV1::default())
+        Self::parse_strict(value, None).map_err(Into::into)
     }
 }
 
@@ -1059,6 +1487,48 @@ mod tests {
         assert_eq!(number("-0.0"), ExactNumber::zero());
         assert_eq!(number("1.25e2"), ExactNumber::from_i64(125));
         assert_eq!(number("2/4"), number("0.5"));
+    }
+
+    #[test]
+    fn strict_parsing_reports_stable_one_based_failures_and_radix_values() {
+        let failure = |text: &str| ExactNumber::parse_strict(text, None).unwrap_err();
+        assert_eq!(failure("").reason(), ExactNumberParseReason::Empty);
+        assert_eq!(failure("").position(), 1);
+        assert_eq!(failure(" 1").reason(), ExactNumberParseReason::Whitespace);
+        assert_eq!(failure(" 1").position(), 1);
+        assert_eq!(
+            failure("12x").reason(),
+            ExactNumberParseReason::InvalidDigit
+        );
+        assert_eq!(failure("12x").position(), 3);
+        assert_eq!(
+            failure("1e").reason(),
+            ExactNumberParseReason::InvalidExponent
+        );
+        assert_eq!(failure("1e").position(), 3);
+        assert_eq!(
+            failure("1/0").reason(),
+            ExactNumberParseReason::ZeroDenominator
+        );
+        assert_eq!(failure("1/0").position(), 3);
+
+        assert_eq!(
+            ExactNumber::parse_strict("0xff", Some(16)).unwrap(),
+            ExactNumber::from_i64(255)
+        );
+        assert_eq!(
+            ExactNumber::parse_strict("-101", Some(2)).unwrap(),
+            ExactNumber::from_i64(-5)
+        );
+        let invalid = ExactNumber::parse_strict("102", Some(2)).unwrap_err();
+        assert_eq!(invalid.reason(), ExactNumberParseReason::InvalidDigit);
+        assert_eq!(invalid.position(), 3);
+        let mismatched_prefix = ExactNumber::parse_strict("0b10", Some(16)).unwrap_err();
+        assert_eq!(
+            mismatched_prefix.reason(),
+            ExactNumberParseReason::InvalidRadix
+        );
+        assert_eq!(mismatched_prefix.position(), 2);
     }
 
     #[test]

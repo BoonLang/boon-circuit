@@ -2269,8 +2269,18 @@ store: [
     selected_waveform_canvas_width:
         selected_waveform_metadata_canvas_width |> HOLD selected_waveform_canvas_width {
             LATEST {
-                elements.waveform_click.pointer_width |> THEN { elements.waveform_click.pointer_width |> Text/to_number() }
-                elements.waveform_hover.pointer_width |> THEN { elements.waveform_hover.pointer_width |> Text/to_number() }
+                elements.waveform_click.pointer_width |> THEN {
+                    elements.waveform_click.pointer_width |> Text/to_number() |> WHEN {
+                        Parsed[value] => value
+                        InvalidNumber[reason, position] => selected_waveform_metadata_canvas_width
+                    }
+                }
+                elements.waveform_hover.pointer_width |> THEN {
+                    elements.waveform_hover.pointer_width |> Text/to_number() |> WHEN {
+                        Parsed[value] => value
+                        InvalidNumber[reason, position] => selected_waveform_metadata_canvas_width
+                    }
+                }
                 elements.select_counter_file |> THEN { selected_waveform_metadata_canvas_width }
                 elements.select_uart_compare_file |> THEN { selected_waveform_metadata_canvas_width }
                 elements.select_ghw_file |> THEN { selected_waveform_metadata_canvas_width }

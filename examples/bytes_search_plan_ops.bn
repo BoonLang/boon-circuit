@@ -34,20 +34,20 @@ store: [
                 store.build |> THEN { left_payload |> Bytes/concat(with: right_payload) }
             }
         }
-    found_index:
-        0 |> HOLD found_index {
+    found_result:
+        NotFound |> HOLD found_result {
             LATEST {
                 store.measure |> THEN { Bytes/find(input: store.joined, needle: found_needle) }
             }
         }
-    missing_index:
-        0 |> HOLD missing_index {
+    missing_result:
+        NotFound |> HOLD missing_result {
             LATEST {
                 store.measure |> THEN { store.joined |> Bytes/find(needle: missing_needle) }
             }
         }
-    empty_index:
-        9 |> HOLD empty_index {
+    empty_result:
+        NotFound |> HOLD empty_result {
             LATEST {
                 store.measure |> THEN { store.joined |> Bytes/find(needle: empty_needle) }
             }

@@ -20,7 +20,7 @@ FUNCTION row_widget(row) {
         patched:
             row.payload |> HOLD patched {
                 LATEST {
-                    receive |> THEN { payload |> Bytes/set(index: 0, value: BYTES[1] { 16uAA }) }
+                    receive |> THEN { payload |> Bytes/set(position: 1, value: BYTES[1] { 16uAA }) }
                 }
             }
         payload_len:
@@ -32,13 +32,27 @@ FUNCTION row_widget(row) {
         payload_second:
             BYTES[1] { 16u00 } |> HOLD payload_second {
                 LATEST {
-                    receive |> THEN { payload |> Bytes/get(index: 1) }
+                    receive |> THEN {
+                        payload
+                        |> Bytes/get(position: 2)
+                        |> WHEN {
+                            Found[value] => value
+                            NotFound => FLUSH { MissingBytePosition }
+                        }
+                    }
                 }
             }
         patched_first:
             BYTES[1] { 16u00 } |> HOLD patched_first {
                 LATEST {
-                    receive |> THEN { patched |> Bytes/get(index: 0) }
+                    receive |> THEN {
+                        patched
+                        |> Bytes/get(position: 1)
+                        |> WHEN {
+                            Found[value] => value
+                            NotFound => FLUSH { MissingBytePosition }
+                        }
+                    }
                 }
             }
     ]

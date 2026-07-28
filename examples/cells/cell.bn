@@ -50,6 +50,9 @@ FUNCTION new_cell(cell_index) {
                 }
             }
 
+        result:
+            compute_result(formula_text: formula_text)
+
         display_text:
             editing |> WHEN {
                 True => editing_text
@@ -57,9 +60,9 @@ FUNCTION new_cell(cell_index) {
             }
 
         value:
-            compute_value(address: address, formula_text: formula_text)
+            formula_result_value(result: result)
 
         error:
-            Error/text(value: compute_value(address: address, formula_text: formula_text))
+            formula_result_error(result: result)
     ]
 }

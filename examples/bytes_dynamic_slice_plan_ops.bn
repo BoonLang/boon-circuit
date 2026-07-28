@@ -9,7 +9,7 @@ store: [
     dynamic_sliced:
         BYTES {} |> HOLD dynamic_sliced {
             LATEST {
-                store.split |> THEN { payload |> Bytes/slice(offset: 1, byte_count: store.slice_count) }
+                store.split |> THEN { payload |> Bytes/slice(from: 2, count: store.slice_count) }
             }
         }
     dynamic_len:
@@ -21,7 +21,14 @@ store: [
     dynamic_byte:
         BYTES[1] { 16u00 } |> HOLD dynamic_byte {
             LATEST {
-                store.inspect |> THEN { store.dynamic_sliced |> Bytes/get(index: 2) }
+                store.inspect |> THEN {
+                    store.dynamic_sliced
+                    |> Bytes/get(position: 3)
+                    |> WHEN {
+                        Found[value] => value
+                        NotFound => FLUSH { MissingBytePosition }
+                    }
+                }
             }
         }
 ]

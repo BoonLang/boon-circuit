@@ -41,7 +41,7 @@ CellDependency:
 
 `from_address -> to_address` means `to_address` reads `from_address`.
 
-`address` is ordinary spreadsheet data such as `A0`, not hidden runtime
+`address` is ordinary spreadsheet data such as `A1`, not hidden runtime
 identity. It can be displayed and compared as data. Runtime keys, slots, and
 source generations remain below the Boon language boundary.
 
@@ -95,11 +95,14 @@ FUNCTION new_cell(cell) {
                 }
             }
 
+        result:
+            compute_result(formula_text: formula_text)
+
         value:
-            compute_value(address: address, formula_text: formula_text)
+            formula_result_value(result: result)
 
         error:
-            Error/text(compute_value(address: address, formula_text: formula_text))
+            formula_result_error(result: result)
     ]
 }
 ```
@@ -120,9 +123,9 @@ expressions come from generic lookup helpers such as
 `default_formula_for_address(address: address)`, for example:
 
 ```text
-[row: 0, column: A, address: TEXT { A0 }, default_formula: TEXT { 5 }]
-[row: 0, column: B, address: TEXT { B0 }, default_formula: TEXT { =add(A0,A1) }]
-[row: 0, column: C, address: TEXT { C0 }, default_formula: TEXT { =sum(A0:A2) }]
+[row: 0, column: A, address: TEXT { A1 }, default_formula: TEXT { 5 }]
+[row: 0, column: B, address: TEXT { B1 }, default_formula: TEXT { =add(A1,A2) }]
+[row: 0, column: C, address: TEXT { C1 }, default_formula: TEXT { =sum(A1:A3) }]
 ```
 
 Those coordinates are ordinary data. They are not the hidden list key.
@@ -138,7 +141,7 @@ source model: 26 columns x 100 rows
 visible projection: 26 columns x 100 rows
 visible selectable cells: 2600
 visible text editors: formula bar plus any explicit active-cell editor
-required visible samples beyond A0-D0: Z0, A99, and Z99
+required visible samples beyond A1-D1: Z1, A100, and Z100
 ```
 
 The runtime state summary may expose bounded source-declared projections such as
@@ -163,25 +166,24 @@ Minimum supported formula contract:
 
 ```text
 literals: numbers and text
-references: A0 style cell addresses with 7GUIs rows 0 through 99
+references: A1 style cell addresses with 7GUIs rows 1 through 100
 operators: + - * / for numeric values
 functions: add(left,right), sum(vertical_range)
 errors: parse_error, cycle_error, missing_ref, type_error, div_by_zero
 ```
 
-Current implementation note: numeric literals, A0 references, single binary
-`+`, `-`, `*`, and `/` expressions, `add(left,right)`, vertical `sum(A0:A2)`,
+Current implementation note: numeric literals, A1 references, single binary
+`+`, `-`, `*`, and `/` expressions, `add(left,right)`, vertical `sum(A1:A3)`,
 dependency-edge replacement, `parse_error`, `cycle_error`, and `div_by_zero` are
 covered by runtime tests.
 
 The user-facing formula state remains `TEXT`: `formula_text`, edit drafts,
-semantic deltas, and visible editor values must not become `BYTES`. The current
-source helper converts only the trimmed formula expression through
-`Text/to_bytes(encoding: Ascii)` before grammar scanning. Operator, comma,
-colon, and function-prefix searches use `Bytes/find` / `Bytes/starts_with`, and
-the resulting byte offsets are reused for `Text/substring` only because the
-strict ASCII boundary rejects non-ASCII formula syntax first. Ordinary literal
-cell text still stays TEXT and must not be encoded merely to exercise BYTES.
+semantic deltas, and visible editor values must not become `BYTES`. Formula
+grammar scanning uses `Text/find`, `Text/starts_with`, and one-based
+`Text/slice` positions directly. Strict numeric conversion produces
+`Parsed[value] | InvalidNumber[reason, position]`, and formula evaluation keeps
+success and failure as ordinary tagged data until the cell derives its visible
+`value` and `error` text.
 
 `CellExpression/parse(text)` returns a small formula AST or a deterministic error.
 `CellExpression/dependencies(ast)` returns a set of domain cell addresses. `CellExpression/eval`
@@ -191,10 +193,10 @@ keys.
 
 ## Propagation
 
-When `formula_text[A0]` changes:
+When `formula_text[A1]` changes:
 
-1. recompute `parsed_formula[A0]`.
-2. recompute dependency edges for `A0`.
+1. recompute `parsed_formula[A1]`.
+2. recompute dependency edges for `A1`.
 3. mark reverse dependents dirty.
 4. topologically recompute affected `value[*]`.
 5. emit `FieldSet` deltas for changed displayed values/errors.
@@ -217,7 +219,7 @@ scanning the whole grid.
 If a dependency cycle appears:
 
 ```text
-A0 -> B0 -> C0 -> A0
+A1 -> B1 -> C1 -> A1
 ```
 
 the engine should:
@@ -229,10 +231,10 @@ the engine should:
 ## Renderer Delta Example
 
 ```text
-FieldSet(/cells:A0, formula_text, "=B0+1")
-FieldSet(/cells:A0, value, 42)
-FieldSet(/cells:C4, value, 100)
-FieldSet(/cells:C4, error, null)
+FieldSet(/cells:A1, formula_text, "=B1+1")
+FieldSet(/cells:A1, value, 42)
+FieldSet(/cells:C5, value, 100)
+FieldSet(/cells:C5, error, null)
 ```
 
 The grid renderer updates only affected cells. It does not diff the whole grid.

@@ -7,13 +7,13 @@ store: [
     sliced:
         BYTES[3] {} |> HOLD sliced {
             LATEST {
-                store.split |> THEN { payload |> Bytes/slice(offset: 1, byte_count: 3) }
+                store.split |> THEN { payload |> Bytes/slice(from: 2, count: 3) }
             }
         }
     taken:
         BYTES[4] {} |> HOLD taken {
             LATEST {
-                store.split |> THEN { Bytes/take(input: payload, byte_count: 4) }
+                store.split |> THEN { Bytes/take(input: payload, count: 4) }
             }
         }
     dropped:
@@ -31,7 +31,14 @@ store: [
     taken_byte:
         BYTES[1] { 16u00 } |> HOLD taken_byte {
             LATEST {
-                store.inspect |> THEN { store.taken |> Bytes/get(index: 3) }
+                store.inspect |> THEN {
+                    store.taken
+                    |> Bytes/get(position: 4)
+                    |> WHEN {
+                        Found[value] => value
+                        NotFound => FLUSH { MissingBytePosition }
+                    }
+                }
             }
         }
     dropped_joined:

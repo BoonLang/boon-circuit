@@ -27,7 +27,11 @@ FUNCTION row_widget(row) {
         payload_len:
             payload |> Bytes/length()
         payload_second:
-            payload |> Bytes/get(index: 1)
+            payload |> Bytes/get(position: 2)
+            |> WHEN {
+                Found[value] => value
+                NotFound => FLUSH { MissingBytePosition }
+            }
     ]
 }
 

@@ -29,7 +29,7 @@ store: [
         }
     zeros:
         BYTES[4] { 16uFF, 16uFF, 16uFF, 16uFF } |> HOLD zeros {
-            store.decode |> THEN { Bytes/zeros(byte_count: 4) }
+            store.decode |> THEN { Bytes/zeros(count: 4) }
         }
     decoded_hex:
         BYTES[4] {} |> HOLD decoded_hex {
@@ -45,7 +45,14 @@ store: [
         }
     decoded_hex_byte:
         BYTES[1] { 16u00 } |> HOLD decoded_hex_byte {
-            store.inspect |> THEN { store.decoded_hex |> Bytes/get(index: 2) }
+            store.inspect |> THEN {
+                store.decoded_hex
+                |> Bytes/get(position: 3)
+                |> WHEN {
+                    Found[value] => value
+                    NotFound => FLUSH { MissingBytePosition }
+                }
+            }
         }
     decoded_base64_hex:
         TEXT { old } |> HOLD decoded_base64_hex {

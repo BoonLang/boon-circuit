@@ -1499,9 +1499,6 @@ impl<'a> DocumentCompiler<'a> {
             return Ok(DocumentPattern::Constant { constant });
         }
         match pattern {
-            CheckedMatchPattern::NaN => Ok(DocumentPattern::Tag {
-                tag: self.intern_name("NaN"),
-            }),
             CheckedMatchPattern::Tag { name, .. } => Ok(DocumentPattern::Tag {
                 tag: self.intern_name(name),
             }),
@@ -2464,13 +2461,14 @@ fn document_builtin(function: &str) -> Option<DocumentBuiltin> {
         "Text/concat" => DocumentBuiltin::TextConcat,
         "Text/contains" => DocumentBuiltin::TextContains,
         "Text/empty" => DocumentBuiltin::TextEmpty,
+        "Text/find" => DocumentBuiltin::TextFind,
         "Text/is_empty" => DocumentBuiltin::TextIsEmpty,
         "Text/join" => DocumentBuiltin::TextJoin,
         "Text/join_lines" => DocumentBuiltin::TextJoinLines,
         "Text/length" => DocumentBuiltin::TextLength,
         "Text/space" => DocumentBuiltin::TextSpace,
         "Text/starts_with" => DocumentBuiltin::TextStartsWith,
-        "Text/substring" => DocumentBuiltin::TextSubstring,
+        "Text/slice" => DocumentBuiltin::TextSlice,
         "Text/time_range_label" => DocumentBuiltin::TextTimeRangeLabel,
         "Text/to_bytes" => DocumentBuiltin::TextToBytes,
         "Text/to_lowercase" => DocumentBuiltin::TextToLowercase,

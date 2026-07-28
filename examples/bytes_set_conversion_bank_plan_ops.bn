@@ -6,7 +6,7 @@ store: [
     inspect: SOURCE
     patched:
         BYTES[3] {} |> HOLD patched {
-            store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: BYTES[1] { 16u5A }) }
+            store.patch |> THEN { left_payload |> Bytes/set(position: 2, value: BYTES[1] { 16u5A }) }
         }
     text:
         TEXT { old } |> HOLD text {

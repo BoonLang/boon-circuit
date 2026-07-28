@@ -1814,13 +1814,15 @@ fn distributed_call_expression_is_safe(
             PlanRowExpressionNode::TextTrim { input }
             | PlanRowExpressionNode::TextIsEmpty { input }
             | PlanRowExpressionNode::TextLength { input }
-            | PlanRowExpressionNode::TextToNumber { input }
             | PlanRowExpressionNode::BytesToHex { input }
             | PlanRowExpressionNode::BytesToBase64 { input }
             | PlanRowExpressionNode::BytesFromHex { input }
             | PlanRowExpressionNode::BytesFromBase64 { input }
             | PlanRowExpressionNode::BytesIsEmpty { input }
             | PlanRowExpressionNode::BytesLength { input } => child_is_valid(input),
+            PlanRowExpressionNode::TextToNumber { input, radix } => {
+                child_is_valid(input) && radix.as_ref().is_none_or(child_is_valid)
+            }
             PlanRowExpressionNode::TextStartsWith { input, prefix }
             | PlanRowExpressionNode::BytesStartsWith { input, prefix } => {
                 child_is_valid(input) && child_is_valid(prefix)
@@ -1833,66 +1835,62 @@ fn distributed_call_expression_is_safe(
             | PlanRowExpressionNode::NumberInfix { left, right, .. } => {
                 child_is_valid(left) && child_is_valid(right)
             }
-            PlanRowExpressionNode::TextSubstring {
-                input,
-                start,
-                length,
-            } => child_is_valid(input) && child_is_valid(start) && child_is_valid(length),
+            PlanRowExpressionNode::TextSlice { input, from, count } => {
+                child_is_valid(input) && child_is_valid(from) && child_is_valid(count)
+            }
             PlanRowExpressionNode::TextToBytes { input, encoding }
             | PlanRowExpressionNode::BytesToText { input, encoding } => {
                 child_is_valid(input) && encoding.as_ref().is_none_or(child_is_valid)
             }
-            PlanRowExpressionNode::BytesGet { input, index } => {
-                child_is_valid(input) && child_is_valid(index)
+            PlanRowExpressionNode::BytesGet { input, position } => {
+                child_is_valid(input) && child_is_valid(position)
             }
-            PlanRowExpressionNode::BytesSlice {
-                input,
-                offset,
-                byte_count,
-            } => child_is_valid(input) && child_is_valid(offset) && child_is_valid(byte_count),
-            PlanRowExpressionNode::BytesTake { input, byte_count }
-            | PlanRowExpressionNode::BytesDrop { input, byte_count } => {
-                child_is_valid(input) && child_is_valid(byte_count)
+            PlanRowExpressionNode::BytesSlice { input, from, count } => {
+                child_is_valid(input) && child_is_valid(from) && child_is_valid(count)
             }
-            PlanRowExpressionNode::BytesZeros { byte_count } => child_is_valid(byte_count),
+            PlanRowExpressionNode::BytesTake { input, count }
+            | PlanRowExpressionNode::BytesDrop { input, count } => {
+                child_is_valid(input) && child_is_valid(count)
+            }
+            PlanRowExpressionNode::BytesZeros { count } => child_is_valid(count),
             PlanRowExpressionNode::BytesReadUnsigned {
                 input,
-                offset,
+                from,
                 byte_count,
                 endian,
             }
             | PlanRowExpressionNode::BytesReadSigned {
                 input,
-                offset,
+                from,
                 byte_count,
                 endian,
             } => {
                 child_is_valid(input)
-                    && child_is_valid(offset)
+                    && child_is_valid(from)
                     && child_is_valid(byte_count)
                     && child_is_valid(endian)
             }
             PlanRowExpressionNode::BytesSet {
                 input,
-                index,
+                position,
                 value,
-            } => child_is_valid(input) && child_is_valid(index) && child_is_valid(value),
+            } => child_is_valid(input) && child_is_valid(position) && child_is_valid(value),
             PlanRowExpressionNode::BytesWriteUnsigned {
                 input,
-                offset,
+                from,
                 byte_count,
                 endian,
                 value,
             }
             | PlanRowExpressionNode::BytesWriteSigned {
                 input,
-                offset,
+                from,
                 byte_count,
                 endian,
                 value,
             } => {
                 child_is_valid(input)
-                    && child_is_valid(offset)
+                    && child_is_valid(from)
                     && child_is_valid(byte_count)
                     && child_is_valid(endian)
                     && child_is_valid(value)
@@ -4465,7 +4463,7 @@ pub fn migration_call_is_supported(function: &str) -> bool {
             | "Text/trim"
             | "Text/to_uppercase"
             | "Text/concat"
-            | "Text/substring"
+            | "Text/slice"
             | "Text/is_empty"
             | "Text/is_not_empty"
             | "Text/starts_with"
@@ -6828,7 +6826,7 @@ static BUILTIN_PARAMS_LIST: &[PlanRowBuiltinParameter] =
     &[PlanRowBuiltinParameter::required_receiver("list")];
 static BUILTIN_PARAMS_LIST_GET: &[PlanRowBuiltinParameter] = &[
     PlanRowBuiltinParameter::required_receiver("list"),
-    PlanRowBuiltinParameter::required("index"),
+    PlanRowBuiltinParameter::required("position"),
 ];
 static BUILTIN_PARAMS_LIST_TAKE: &[PlanRowBuiltinParameter] = &[
     PlanRowBuiltinParameter::required_receiver("list"),
@@ -6932,6 +6930,7 @@ pub enum PlanRowBuiltin {
     TextToLowercase,
     TextToUppercase,
     TextContains,
+    TextFind,
     TextIsNotEmpty,
     TextAllCharsIn,
     TextJoin,
@@ -6968,6 +6967,7 @@ impl PlanRowBuiltin {
         Self::TextToLowercase,
         Self::TextToUppercase,
         Self::TextContains,
+        Self::TextFind,
         Self::TextIsNotEmpty,
         Self::TextAllCharsIn,
         Self::TextJoin,
@@ -7011,6 +7011,7 @@ impl PlanRowBuiltin {
             Self::TextToLowercase => "Text/to_lowercase",
             Self::TextToUppercase => "Text/to_uppercase",
             Self::TextContains => "Text/contains",
+            Self::TextFind => "Text/find",
             Self::TextIsNotEmpty => "Text/is_not_empty",
             Self::TextAllCharsIn => "Text/all_chars_in",
             Self::TextJoin => "Text/join",
@@ -7066,10 +7067,12 @@ impl PlanRowBuiltin {
             | Self::BoolOr
             | Self::BoolToggle
             | Self::TextContains
+            | Self::TextFind
             | Self::TextIsNotEmpty
             | Self::TextAllCharsIn
-            | Self::ListIsNotEmpty => Some(PlanValueType::Tag),
-            Self::ListGet | Self::ListLatest | Self::ListTake => None,
+            | Self::ListIsNotEmpty
+            | Self::ListGet => Some(PlanValueType::Tag),
+            Self::ListLatest | Self::ListTake => None,
         }
     }
 
@@ -7089,7 +7092,7 @@ impl PlanRowBuiltin {
             Self::TextToLowercase | Self::TextToUppercase | Self::TextIsNotEmpty => {
                 BUILTIN_PARAMS_TEXT_INPUT
             }
-            Self::TextContains => BUILTIN_PARAMS_TEXT_CONTAINS,
+            Self::TextContains | Self::TextFind => BUILTIN_PARAMS_TEXT_CONTAINS,
             Self::TextAllCharsIn => BUILTIN_PARAMS_TEXT_ALL_CHARS_IN,
             Self::TextJoin => BUILTIN_PARAMS_TEXT_JOIN,
             Self::TextJoinLines => BUILTIN_PARAMS_TEXTS,
@@ -7191,11 +7194,13 @@ pub enum PlanRowExpressionNode {
     },
     TextToNumber {
         input: PlanRowExpressionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radix: Option<PlanRowExpressionId>,
     },
-    TextSubstring {
+    TextSlice {
         input: PlanRowExpressionId,
-        start: PlanRowExpressionId,
-        length: PlanRowExpressionId,
+        from: PlanRowExpressionId,
+        count: PlanRowExpressionId,
     },
     TextToBytes {
         input: PlanRowExpressionId,
@@ -7227,51 +7232,51 @@ pub enum PlanRowExpressionNode {
     },
     BytesGet {
         input: PlanRowExpressionId,
-        index: PlanRowExpressionId,
+        position: PlanRowExpressionId,
     },
     BytesSlice {
         input: PlanRowExpressionId,
-        offset: PlanRowExpressionId,
-        byte_count: PlanRowExpressionId,
+        from: PlanRowExpressionId,
+        count: PlanRowExpressionId,
     },
     BytesTake {
         input: PlanRowExpressionId,
-        byte_count: PlanRowExpressionId,
+        count: PlanRowExpressionId,
     },
     BytesDrop {
         input: PlanRowExpressionId,
-        byte_count: PlanRowExpressionId,
+        count: PlanRowExpressionId,
     },
     BytesZeros {
-        byte_count: PlanRowExpressionId,
+        count: PlanRowExpressionId,
     },
     BytesReadUnsigned {
         input: PlanRowExpressionId,
-        offset: PlanRowExpressionId,
+        from: PlanRowExpressionId,
         byte_count: PlanRowExpressionId,
         endian: PlanRowExpressionId,
     },
     BytesReadSigned {
         input: PlanRowExpressionId,
-        offset: PlanRowExpressionId,
+        from: PlanRowExpressionId,
         byte_count: PlanRowExpressionId,
         endian: PlanRowExpressionId,
     },
     BytesSet {
         input: PlanRowExpressionId,
-        index: PlanRowExpressionId,
+        position: PlanRowExpressionId,
         value: PlanRowExpressionId,
     },
     BytesWriteUnsigned {
         input: PlanRowExpressionId,
-        offset: PlanRowExpressionId,
+        from: PlanRowExpressionId,
         byte_count: PlanRowExpressionId,
         endian: PlanRowExpressionId,
         value: PlanRowExpressionId,
     },
     BytesWriteSigned {
         input: PlanRowExpressionId,
-        offset: PlanRowExpressionId,
+        from: PlanRowExpressionId,
         byte_count: PlanRowExpressionId,
         endian: PlanRowExpressionId,
         value: PlanRowExpressionId,
@@ -7420,7 +7425,6 @@ impl PlanRowExpressionNode {
             | Self::TextTrim { input }
             | Self::TextIsEmpty { input }
             | Self::TextLength { input }
-            | Self::TextToNumber { input }
             | Self::BytesToHex { input }
             | Self::BytesToBase64 { input }
             | Self::BytesFromHex { input }
@@ -7430,6 +7434,12 @@ impl PlanRowExpressionNode {
             | Self::ListSum { input }
             | Self::ObjectField { object: input, .. }
             | Self::ListRowField { row: input, .. } => visitor(*input),
+            Self::TextToNumber { input, radix } => {
+                visitor(*input);
+                if let Some(radix) = radix {
+                    visitor(*radix);
+                }
+            }
             Self::TextStartsWith { input, prefix }
             | Self::BytesStartsWith { input, prefix }
             | Self::BytesConcat {
@@ -7455,32 +7465,32 @@ impl PlanRowExpressionNode {
             }
             | Self::BytesGet {
                 input,
-                index: suffix,
+                position: suffix,
             }
             | Self::BytesTake {
                 input,
-                byte_count: suffix,
+                count: suffix,
             }
             | Self::BytesDrop {
                 input,
-                byte_count: suffix,
+                count: suffix,
             } => {
                 visitor(*input);
                 visitor(*suffix);
             }
-            Self::TextSubstring {
+            Self::TextSlice {
                 input,
-                start,
-                length,
+                from: start,
+                count: length,
             }
             | Self::BytesSlice {
                 input,
-                offset: start,
-                byte_count: length,
+                from: start,
+                count: length,
             }
             | Self::BytesSet {
                 input,
-                index: start,
+                position: start,
                 value: length,
             } => {
                 visitor(*input);
@@ -7493,16 +7503,16 @@ impl PlanRowExpressionNode {
                     visitor(*encoding);
                 }
             }
-            Self::BytesZeros { byte_count } => visitor(*byte_count),
+            Self::BytesZeros { count } => visitor(*count),
             Self::BytesReadUnsigned {
                 input,
-                offset,
+                from: offset,
                 byte_count,
                 endian,
             }
             | Self::BytesReadSigned {
                 input,
-                offset,
+                from: offset,
                 byte_count,
                 endian,
             } => {
@@ -7513,14 +7523,14 @@ impl PlanRowExpressionNode {
             }
             Self::BytesWriteUnsigned {
                 input,
-                offset,
+                from: offset,
                 byte_count,
                 endian,
                 value,
             }
             | Self::BytesWriteSigned {
                 input,
-                offset,
+                from: offset,
                 byte_count,
                 endian,
                 value,
@@ -7617,7 +7627,6 @@ impl PlanRowExpressionNode {
             | Self::TextTrim { input }
             | Self::TextIsEmpty { input }
             | Self::TextLength { input }
-            | Self::TextToNumber { input }
             | Self::BytesToHex { input }
             | Self::BytesToBase64 { input }
             | Self::BytesFromHex { input }
@@ -7627,6 +7636,12 @@ impl PlanRowExpressionNode {
             | Self::ListSum { input }
             | Self::ObjectField { object: input, .. }
             | Self::ListRowField { row: input, .. } => visitor(input),
+            Self::TextToNumber { input, radix } => {
+                visitor(input);
+                if let Some(radix) = radix {
+                    visitor(radix);
+                }
+            }
             Self::TextStartsWith { input, prefix }
             | Self::BytesStartsWith { input, prefix }
             | Self::BytesConcat {
@@ -7652,32 +7667,32 @@ impl PlanRowExpressionNode {
             }
             | Self::BytesGet {
                 input,
-                index: suffix,
+                position: suffix,
             }
             | Self::BytesTake {
                 input,
-                byte_count: suffix,
+                count: suffix,
             }
             | Self::BytesDrop {
                 input,
-                byte_count: suffix,
+                count: suffix,
             } => {
                 visitor(input);
                 visitor(suffix);
             }
-            Self::TextSubstring {
+            Self::TextSlice {
                 input,
-                start,
-                length,
+                from: start,
+                count: length,
             }
             | Self::BytesSlice {
                 input,
-                offset: start,
-                byte_count: length,
+                from: start,
+                count: length,
             }
             | Self::BytesSet {
                 input,
-                index: start,
+                position: start,
                 value: length,
             } => {
                 visitor(input);
@@ -7690,16 +7705,16 @@ impl PlanRowExpressionNode {
                     visitor(encoding);
                 }
             }
-            Self::BytesZeros { byte_count } => visitor(byte_count),
+            Self::BytesZeros { count } => visitor(count),
             Self::BytesReadUnsigned {
                 input,
-                offset,
+                from: offset,
                 byte_count,
                 endian,
             }
             | Self::BytesReadSigned {
                 input,
-                offset,
+                from: offset,
                 byte_count,
                 endian,
             } => {
@@ -7710,14 +7725,14 @@ impl PlanRowExpressionNode {
             }
             Self::BytesWriteUnsigned {
                 input,
-                offset,
+                from: offset,
                 byte_count,
                 endian,
                 value,
             }
             | Self::BytesWriteSigned {
                 input,
-                offset,
+                from: offset,
                 byte_count,
                 endian,
                 value,
@@ -8635,7 +8650,6 @@ pub enum PlanRowSelectPattern {
     Tag { name: String },
     Text { value: String },
     Number { value: ExactNumber },
-    NaN,
     Wildcard,
 }
 

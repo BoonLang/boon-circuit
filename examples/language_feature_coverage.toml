@@ -49,9 +49,9 @@ fixture = "examples/language_surface/future/map_literals.bn"
 
 [[feature]]
 id = "one_based_positions"
-stage = "planned"
+stage = "current"
 parser_expectation = "accept"
-fixture = "examples/language_surface/future/one_based_positions.bn"
+fixture = "examples/language_surface/current/one_based_positions.bn"
 
 [[feature]]
 id = "reactive_temporal_operators"

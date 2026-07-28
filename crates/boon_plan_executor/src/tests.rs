@@ -1967,7 +1967,12 @@ store: [
         [key: TEXT { a }, value: TEXT { A }]
         [key: TEXT { b }, value: TEXT { B }]
     }
-    indexed_row: List/get(list: items, index: 1)
+    indexed_row:
+        List/get(list: items, position: 2)
+        |> WHEN {
+            Found[value] => value
+            NotFound => FLUSH { MissingIndexedRow }
+        }
     indexed_value: indexed_row.value
     latest_row: List/latest(list: items)
     latest_value: latest_row.value
@@ -3924,6 +3929,10 @@ store: [
         2 |> HOLD requested_size {
             size_input.value |> THEN {
                 size_input.value |> Text/to_number()
+                |> WHEN {
+                    Parsed[value] => value
+                    InvalidNumber[reason, position] => 0
+                }
             }
         }
     items: LIST {
@@ -7206,7 +7215,7 @@ fn source_payload_text_to_number_executes_the_typed_conversion() {
 store: [
     input: SOURCE
     value:
-        0 |> HOLD value {
+        Parsed[value: 0] |> HOLD value {
             input.amount |> THEN {
                 input.amount |> Text/to_number()
             }
@@ -7235,7 +7244,7 @@ store: [
 
     assert_eq!(
         session.root_value_current("store.value").unwrap(),
-        number(42)
+        Value::tagged("Parsed", BTreeMap::from([("value".to_owned(), number(42))]),)
     );
 }
 

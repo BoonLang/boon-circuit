@@ -6,13 +6,20 @@ store: [
     patched:
         BYTES[4] {} |> HOLD patched {
             LATEST {
-                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: BYTES[1] { 16uAA }) }
+                store.patch |> THEN { left_payload |> Bytes/set(position: 3, value: BYTES[1] { 16uAA }) }
             }
         }
     patched_byte:
         BYTES[1] { 16u00 } |> HOLD patched_byte {
             LATEST {
-                store.patch |> THEN { store.patched |> Bytes/get(index: 2) }
+                store.patch |> THEN {
+                    store.patched
+                    |> Bytes/get(position: 3)
+                    |> WHEN {
+                        Found[value] => value
+                        NotFound => FLUSH { MissingBytePosition }
+                    }
+                }
             }
         }
     patched_len:

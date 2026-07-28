@@ -14,7 +14,8 @@ typed byte operation refs.
 
 Boon has no standalone byte type. A byte literal is constructor syntax and is
 valid only as a direct item of `BYTES { ... }`. Single-byte values use
-`BYTES[1]`; `Bytes/get()` returns `BYTES[1]`, and `Bytes/set(value:)` requires
+`BYTES[1]`; `Bytes/get(position:)` returns
+`Found[value: BYTES[1]] | NotFound`, and `Bytes/set(value:)` requires
 `BYTES[1]`.
 
 ## Constructors
@@ -56,8 +57,14 @@ larger than `255`. It also rejects a byte literal used as an ordinary scalar,
 including a raw literal passed to `Bytes/set(value:)`.
 
 ```boon
-one: bytes |> Bytes/get(index: 0)
-patched: bytes |> Bytes/set(index: 0, value: BYTES[1] { 16uFF })
+one:
+    bytes
+    |> Bytes/get(position: 1)
+    |> WHEN {
+        Found[value] => value
+        NotFound => FLUSH { MissingByte }
+    }
+patched: bytes |> Bytes/set(position: 1, value: BYTES[1] { 16uFF })
 ```
 
 ## TEXT Boundaries
@@ -78,9 +85,9 @@ TEXT { FF } |> Bytes/from_hex()
 When a `TEXT` value appears inside a `BYTES` constructor, the typechecker should
 emit a direct error suggesting `Text/to_bytes`.
 
-`Ascii` is a strict boundary for byte-indexed grammars. Encoding rejects any
+`Ascii` is a strict boundary for byte-positioned grammars. Encoding rejects any
 non-ASCII `TEXT`, and decoding rejects any byte above `0x7F`; this keeps byte
-offsets equal to Boon text positions for examples such as Cells formula
+positions equal to Boon text positions for examples such as Cells formula
 operator scanning.
 
 When conversion input is a static `TEXT` literal, the typechecker may refine the
@@ -104,23 +111,20 @@ compiler.
 Multi-byte numeric operations must specify endian explicitly:
 
 ```boon
-bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Little)
-bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Big, value: 1)
+bytes |> Bytes/read_unsigned(from: 1, byte_count: 4, endian: Little)
+bytes |> Bytes/write_unsigned(from: 1, byte_count: 4, endian: Big, value: 1)
 ```
 
 `byte_count` is limited to `1`, `2`, `4`, or `8` in v1. The typechecker
 registers these builtin signatures and checks static `byte_count` values plus
 `endian: Little|Big`.
 
-BYTES scalar arguments may use a narrow static integer expression subset:
-integer literals and checked `+`, `-`, and `*` over integer literals. This
-subset is folded by the typechecker and emitted in the resolved constant table
-so semantic IR and MachinePlan lowering still receive typed constants, not AST
-or string expressions. Unsupported literal-only static formulas such as
-division and modulo are compiler errors. Calls, identifiers, field reads,
-comparisons, and other dynamic values are not folded constants; they remain
-dynamic Boon values and must be handled by runtime/lowering rather than being
-rejected merely because they are not static.
+BYTES scalar arguments may use exact static Number expressions. The
+typechecker evaluates rational `+`, `-`, `*`, `/`, and whole-number remainder
+without binary floating point. Positions must resolve to whole Numbers at
+least one; counts must be non-negative whole Numbers. Calls, identifiers,
+field reads, comparisons, and other dynamic values remain dynamic Boon values
+and receive the same validation in the runtime.
 
 ## Bounds And Conversion Failures
 
@@ -128,8 +132,11 @@ Use the existing Boon recoverable-error convention rather than Rust panics:
 
 - malformed literals are parser diagnostics;
 - incompatible constructor items are typechecker diagnostics;
-- fixed-size BYTES operations with statically known out-of-bounds indexes or
-  ranges are typechecker diagnostics;
+- zero, negative, or non-whole positions are typechecker diagnostics when
+  static and terminal API-domain errors when dynamic;
+- a positive `Bytes/get` position beyond the length returns `NotFound`;
+- fixed-size mutating or slicing operations with statically known
+  out-of-bounds positions or ranges are typechecker diagnostics;
 - out-of-bounds runtime reads/writes produce deterministic Boon errors;
 - decoding failures produce deterministic Boon errors with the requested
   encoding named;

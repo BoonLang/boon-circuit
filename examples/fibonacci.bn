@@ -1,7 +1,6 @@
 -- A small immutable table keeps this example focused on LIST, List/get,
 -- List/map, function calls, and text interpolation.
 fibonacci: LIST {
-    [position: 0, value: 0]
     [position: 1, value: 1]
     [position: 2, value: 1]
     [position: 3, value: 2]
@@ -48,7 +47,13 @@ document: Document/new(
 
 FUNCTION fibonacci_result(sequence) {
     BLOCK {
-        selected: sequence |> List/get(index: 10)
+        selected:
+            sequence
+            |> List/get(position: 10)
+            |> WHEN {
+                Found[value] => value
+                NotFound => FLUSH { MissingFibonacciPosition }
+            }
         TEXT { Position 10 is {selected.value} }
     }
 }

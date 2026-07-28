@@ -5,8 +5,8 @@ use crate::cursor::{
 };
 use crate::effect_stream::TransientEffectSemanticValidator;
 use boon_data::{
-    Bytes, ExactRoundingRule, NumberTextFormat, format_number_ascii_text, format_number_text,
-    number_bit_width,
+    Bytes, ExactNumberParseReason, ExactRoundingRule, NumberTextFormat, format_number_ascii_text,
+    format_number_text, number_bit_width,
 };
 use boon_list_access::{
     AccessError, AccessMetrics, AccessStream, ClosedTag as AccessClosedTag,
@@ -7692,7 +7692,6 @@ fn schedule_apply_operands<'event, 'plan>(
         PlanRowExpressionNode::TextTrim { input }
         | PlanRowExpressionNode::TextIsEmpty { input }
         | PlanRowExpressionNode::TextLength { input }
-        | PlanRowExpressionNode::TextToNumber { input }
         | PlanRowExpressionNode::BytesToHex { input }
         | PlanRowExpressionNode::BytesToBase64 { input }
         | PlanRowExpressionNode::BytesFromHex { input }
@@ -7701,6 +7700,12 @@ fn schedule_apply_operands<'event, 'plan>(
         | PlanRowExpressionNode::BytesLength { input }
         | PlanRowExpressionNode::ListSum { input }
         | PlanRowExpressionNode::ObjectField { object: input, .. } => push(*input)?,
+        PlanRowExpressionNode::TextToNumber { input, radix } => {
+            if let Some(radix) = radix {
+                push(*radix)?;
+            }
+            push(*input)?;
+        }
         PlanRowExpressionNode::TextStartsWith { input, prefix }
         | PlanRowExpressionNode::BytesStartsWith { input, prefix }
         | PlanRowExpressionNode::BytesConcat {
@@ -7726,32 +7731,32 @@ fn schedule_apply_operands<'event, 'plan>(
         }
         | PlanRowExpressionNode::BytesGet {
             input,
-            index: suffix,
+            position: suffix,
         }
         | PlanRowExpressionNode::BytesTake {
             input,
-            byte_count: suffix,
+            count: suffix,
         }
         | PlanRowExpressionNode::BytesDrop {
             input,
-            byte_count: suffix,
+            count: suffix,
         } => {
             push(*suffix)?;
             push(*input)?;
         }
-        PlanRowExpressionNode::TextSubstring {
+        PlanRowExpressionNode::TextSlice {
             input,
-            start,
-            length,
+            from: start,
+            count: length,
         }
         | PlanRowExpressionNode::BytesSlice {
             input,
-            offset: start,
-            byte_count: length,
+            from: start,
+            count: length,
         }
         | PlanRowExpressionNode::BytesSet {
             input,
-            index: start,
+            position: start,
             value: length,
         } => {
             push(*length)?;
@@ -7766,16 +7771,16 @@ fn schedule_apply_operands<'event, 'plan>(
                 push(*encoding)?;
             }
         }
-        PlanRowExpressionNode::BytesZeros { byte_count } => push(*byte_count)?,
+        PlanRowExpressionNode::BytesZeros { count } => push(*count)?,
         PlanRowExpressionNode::BytesReadUnsigned {
             input,
-            offset,
+            from: offset,
             byte_count,
             endian,
         }
         | PlanRowExpressionNode::BytesReadSigned {
             input,
-            offset,
+            from: offset,
             byte_count,
             endian,
         } => {
@@ -7786,14 +7791,14 @@ fn schedule_apply_operands<'event, 'plan>(
         }
         PlanRowExpressionNode::BytesWriteUnsigned {
             input,
-            offset,
+            from: offset,
             byte_count,
             endian,
             value,
         }
         | PlanRowExpressionNode::BytesWriteSigned {
             input,
-            offset,
+            from: offset,
             byte_count,
             endian,
             value,
@@ -25816,24 +25821,47 @@ impl MachineInstance {
             PlanRowExpressionNode::TextLength { .. } => EvalValue::Value(Value::integer(
                 eval_to_text(&next()?)?.chars().count() as i64,
             )?),
-            PlanRowExpressionNode::TextToNumber { .. } => {
+            PlanRowExpressionNode::TextToNumber { radix, .. } => {
                 let input = next()?;
                 let text = eval_to_text(&input)?;
-                EvalValue::Value(match text.trim().parse::<ExactNumber>() {
-                    Ok(value) => Value::Number(value),
-                    Err(_) => Value::Text("NaN".to_owned()),
-                })
+                let radix = radix
+                    .is_some()
+                    .then(|| next())
+                    .transpose()?
+                    .map(|value| eval_number_radix(&value))
+                    .transpose()?;
+                match radix {
+                    Some(None) => EvalValue::Value(invalid_number_value("invalid_radix", 1)),
+                    radix => match ExactNumber::parse_strict(&text, radix.flatten()) {
+                        Ok(value) => EvalValue::Value(parsed_number_value(value)),
+                        Err(error) if error.reason() == ExactNumberParseReason::ResourceLimit => {
+                            return Err(Error::Evaluation(format!(
+                                "Text/to_number exhausted the exact Number resource budget: {error}"
+                            )));
+                        }
+                        Err(error) => EvalValue::Value(invalid_number_value(
+                            error.reason().as_str(),
+                            error.position(),
+                        )),
+                    },
+                }
             }
-            PlanRowExpressionNode::TextSubstring { .. } => {
+            PlanRowExpressionNode::TextSlice { .. } => {
                 let input = next()?;
-                let start = nonnegative_usize(eval_to_integer(&next()?)?, "text substring start")?;
-                let length =
-                    nonnegative_usize(eval_to_integer(&next()?)?, "text substring length")?;
-                let value = eval_to_text(&input)?
-                    .chars()
-                    .skip(start)
-                    .take(length)
-                    .collect::<String>();
+                let from = one_based_position(&next()?, "Text/slice from")?;
+                let count = exact_count(&next()?, "Text/slice count")?;
+                let input = eval_to_text(&input)?;
+                let length = input.chars().count();
+                let start = from - 1;
+                let end = start.checked_add(count).ok_or_else(|| {
+                    Error::Evaluation("Text/slice range overflows platform bounds".to_owned())
+                })?;
+                if from > length.saturating_add(1) || end > length {
+                    return Err(Error::Evaluation(format!(
+                        "Text/slice from position {from} with count {count} is out of bounds for Text length {length}"
+                    )));
+                }
+                let value = input.chars().skip(start).take(count).collect::<String>();
                 EvalValue::Value(Value::Text(value))
             }
             PlanRowExpressionNode::TextToBytes { encoding, .. } => {
@@ -25875,53 +25903,61 @@ impl MachineInstance {
             }
             PlanRowExpressionNode::BytesGet { .. } => {
                 let bytes = eval_to_bytes(&next()?)?;
-                let index = nonnegative_usize(eval_to_integer(&next()?)?, "byte index")?;
-                let value = bytes.get(index).copied().ok_or_else(|| {
-                    Error::Evaluation(format!("byte index {index} is out of range"))
-                })?;
-                EvalValue::Value(Value::Bytes(Bytes::copy_from_slice(&[value])))
+                let position = one_based_position(&next()?, "Bytes/get position")?;
+                EvalValue::Value(match bytes.get(position - 1).copied() {
+                    Some(value) => found_value(Value::Bytes(Bytes::copy_from_slice(&[value]))),
+                    None => Value::tag("NotFound"),
+                })
             }
             PlanRowExpressionNode::BytesSlice { .. } => {
                 let bytes = eval_to_bytes(&next()?)?;
-                let offset = nonnegative_usize(eval_to_integer(&next()?)?, "byte offset")?;
-                let count = nonnegative_usize(eval_to_integer(&next()?)?, "byte count")?;
-                EvalValue::Value(Value::Bytes(checked_slice(&bytes, offset, count)?))
+                let from = one_based_position(&next()?, "Bytes/slice from")?;
+                let count = exact_count(&next()?, "Bytes/slice count")?;
+                EvalValue::Value(Value::Bytes(checked_slice(&bytes, from - 1, count)?))
             }
             PlanRowExpressionNode::BytesTake { .. } => {
                 let bytes = eval_to_bytes(&next()?)?;
-                let count = nonnegative_usize(eval_to_integer(&next()?)?, "byte count")?;
+                let count = exact_count(&next()?, "Bytes/take count")?;
                 EvalValue::Value(Value::Bytes(bytes.slice(..count.min(bytes.len()))))
             }
             PlanRowExpressionNode::BytesDrop { .. } => {
                 let bytes = eval_to_bytes(&next()?)?;
-                let count = nonnegative_usize(eval_to_integer(&next()?)?, "byte count")?;
+                let count = exact_count(&next()?, "Bytes/drop count")?;
                 EvalValue::Value(Value::Bytes(bytes.slice(count.min(bytes.len())..)))
             }
             PlanRowExpressionNode::BytesZeros { .. } => {
-                let count = nonnegative_usize(eval_to_integer(&next()?)?, "byte count")?;
+                let count = exact_count(&next()?, "Bytes/zeros count")?;
                 EvalValue::Value(Value::Bytes(vec![0; count].into()))
             }
             PlanRowExpressionNode::BytesReadUnsigned { .. } => {
                 let bytes = eval_to_bytes(&next()?)?;
-                let offset = nonnegative_usize(eval_to_integer(&next()?)?, "byte offset")?;
-                let count = nonnegative_usize(eval_to_integer(&next()?)?, "byte count")?;
+                let from = one_based_position(&next()?, "Bytes/read_unsigned from")?;
+                let count = exact_count(&next()?, "Bytes/read_unsigned byte_count")?;
                 let endian = eval_to_text(&next()?)?;
                 EvalValue::Value(Value::integer(read_integer(
-                    &bytes, offset, count, &endian, false,
+                    &bytes,
+                    from - 1,
+                    count,
+                    &endian,
+                    false,
                 )?)?)
             }
             PlanRowExpressionNode::BytesReadSigned { .. } => {
                 let bytes = eval_to_bytes(&next()?)?;
-                let offset = nonnegative_usize(eval_to_integer(&next()?)?, "byte offset")?;
-                let count = nonnegative_usize(eval_to_integer(&next()?)?, "byte count")?;
+                let from = one_based_position(&next()?, "Bytes/read_signed from")?;
+                let count = exact_count(&next()?, "Bytes/read_signed byte_count")?;
                 let endian = eval_to_text(&next()?)?;
                 EvalValue::Value(Value::integer(read_integer(
-                    &bytes, offset, count, &endian, true,
+                    &bytes,
+                    from - 1,
+                    count,
+                    &endian,
+                    true,
                 )?)?)
             }
             PlanRowExpressionNode::BytesSet { .. } => {
                 let mut bytes = eval_to_bytes(&next()?)?.to_vec();
-                let index = nonnegative_usize(eval_to_integer(&next()?)?, "byte index")?;
+                let position = one_based_position(&next()?, "Bytes/set position")?;
                 let value = eval_to_bytes(&next()?)?;
                 let [value] = value.as_ref() else {
                     return Err(Error::Evaluation(format!(
@@ -25929,8 +25965,12 @@ impl MachineInstance {
                         value.len()
                     )));
                 };
-                let target = bytes.get_mut(index).ok_or_else(|| {
-                    Error::Evaluation(format!("byte index {index} is out of range"))
+                let byte_len = bytes.len();
+                let target = bytes.get_mut(position - 1).ok_or_else(|| {
+                    Error::Evaluation(format!(
+                        "Bytes/set position {position} is out of range for {} bytes",
+                        byte_len
+                    ))
                 })?;
                 *target = *value;
                 EvalValue::Value(Value::Bytes(bytes.into()))
@@ -25938,19 +25978,19 @@ impl MachineInstance {
             PlanRowExpressionNode::BytesWriteUnsigned { .. }
             | PlanRowExpressionNode::BytesWriteSigned { .. } => {
                 let mut bytes = eval_to_bytes(&next()?)?.to_vec();
-                let offset = nonnegative_usize(eval_to_integer(&next()?)?, "byte offset")?;
-                let count = nonnegative_usize(eval_to_integer(&next()?)?, "byte count")?;
+                let from = one_based_position(&next()?, "Bytes/write from")?;
+                let count = exact_count(&next()?, "Bytes/write byte_count")?;
                 let endian = eval_to_text(&next()?)?;
                 let value = eval_to_integer(&next()?)?;
-                write_integer(&mut bytes, offset, count, &endian, value)?;
+                write_integer(&mut bytes, from - 1, count, &endian, value)?;
                 EvalValue::Value(Value::Bytes(bytes.into()))
             }
             PlanRowExpressionNode::BytesFind { .. } => {
                 let input = eval_to_bytes(&next()?)?;
                 let needle = eval_to_bytes(&next()?)?;
                 EvalValue::Value(match find_bytes(&input, &needle) {
-                    Some(index) => Value::integer(index as i64)?,
-                    None => Value::Text("NaN".to_owned()),
+                    Some(index) => found_position_value(index + 1),
+                    None => Value::tag("NotFound"),
                 })
             }
             PlanRowExpressionNode::BytesStartsWith { .. } => {
@@ -26302,6 +26342,16 @@ impl MachineInstance {
                     eval_to_text(&input)?.contains(&eval_to_text(&needle)?),
                 ))
             }
+            PlanRowBuiltin::TextFind => {
+                let input = eval_to_text(&require_input(input)?)?;
+                let needle =
+                    eval_to_text(&take_required_builtin_arg(&mut args, "needle", function)?)?;
+                EvalValue::Value(
+                    find_text_position(&input, &needle)
+                        .map(found_position_value)
+                        .unwrap_or_else(|| Value::tag("NotFound")),
+                )
+            }
             PlanRowBuiltin::TextIsNotEmpty => EvalValue::Value(Value::truth(
                 !eval_to_text(&require_input(input)?)?.is_empty(),
             )),
@@ -26496,16 +26546,18 @@ impl MachineInstance {
             }
             PlanRowBuiltin::ListGet => {
                 let input = require_input(input)?;
-                let index = usize::try_from(eval_to_integer(&take_required_builtin_arg(
-                    &mut args, "index", function,
-                )?)?)
-                .map_err(|_| {
-                    Error::Evaluation("List/get index must be a non-negative integer".to_owned())
-                })?;
+                let position = one_based_position(
+                    &take_required_builtin_arg(&mut args, "position", function)?,
+                    "List/get position",
+                )?;
                 work.consume(1)?;
-                eval_to_list(input)?.into_iter().nth(index).ok_or_else(|| {
-                    Error::Evaluation(format!("List/get index {index} is out of bounds"))
-                })?
+                match eval_to_list(input)?.into_iter().nth(position - 1) {
+                    Some(value) => EvalValue::Tag {
+                        tag: "Found".to_owned(),
+                        fields: BTreeMap::from([("value".to_owned(), value)]),
+                    },
+                    None => EvalValue::Value(Value::tag("NotFound")),
+                }
             }
             PlanRowBuiltin::ListLatest => {
                 let mut values = eval_to_list(require_input(input)?)?;
@@ -28162,11 +28214,81 @@ fn value_to_bool(value: &Value) -> Result<bool, Error> {
 fn eval_to_number(value: &EvalValue) -> Result<ExactNumber, Error> {
     match value {
         EvalValue::Value(Value::Number(value)) => Ok(value.clone()),
-        EvalValue::Value(Value::Text(value)) => value
-            .parse::<ExactNumber>()
-            .map_err(|_| Error::Evaluation(format!("text `{value}` is not a number"))),
         other => Err(Error::Evaluation(format!("value {other:?} is not numeric"))),
     }
+}
+
+fn eval_number_radix(value: &EvalValue) -> Result<Option<u32>, Error> {
+    let value = eval_to_number(value)?;
+    Ok(value
+        .to_u64_exact()
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| (2..=36).contains(value)))
+}
+
+fn parsed_number_value(value: ExactNumber) -> Value {
+    Value::tagged(
+        "Parsed",
+        BTreeMap::from([("value".to_owned(), Value::Number(value))]),
+    )
+}
+
+fn invalid_number_value(reason: &str, position: usize) -> Value {
+    Value::tagged(
+        "InvalidNumber",
+        BTreeMap::from([
+            ("reason".to_owned(), Value::Text(reason.to_owned())),
+            (
+                "position".to_owned(),
+                Value::Number(ExactNumber::from_usize(position)),
+            ),
+        ]),
+    )
+}
+
+fn found_position_value(position: usize) -> Value {
+    Value::tagged(
+        "Found",
+        BTreeMap::from([(
+            "position".to_owned(),
+            Value::Number(ExactNumber::from_usize(position)),
+        )]),
+    )
+}
+
+fn found_value(value: Value) -> Value {
+    Value::tagged("Found", BTreeMap::from([("value".to_owned(), value)]))
+}
+
+fn find_text_position(input: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(1);
+    }
+    input
+        .find(needle)
+        .map(|byte| input[..byte].chars().count() + 1)
+}
+
+fn one_based_position(value: &EvalValue, context: &str) -> Result<usize, Error> {
+    let value = eval_to_number(value)?;
+    let position = value
+        .to_usize_exact()
+        .map_err(|error| Error::Evaluation(format!("{context} must be a whole Number: {error}")))?;
+    if position == 0 {
+        return Err(Error::Evaluation(format!(
+            "{context} is one-based and must be at least 1"
+        )));
+    }
+    Ok(position)
+}
+
+fn exact_count(value: &EvalValue, context: &str) -> Result<usize, Error> {
+    eval_to_number(value)?.to_usize_exact().map_err(|error| {
+        Error::Evaluation(format!(
+            "{context} must be a non-negative whole Number: {error}"
+        ))
+    })
 }
 
 fn eval_to_integer(value: &EvalValue) -> Result<i64, Error> {
@@ -28207,11 +28329,6 @@ fn clamp_exact_number(
 }
 
 fn eval_number_infix(op: PlanInfixOp, left: &EvalValue, right: &EvalValue) -> Result<Value, Error> {
-    if matches!(left, EvalValue::Value(Value::Text(value)) if value == "NaN")
-        || matches!(right, EvalValue::Value(Value::Text(value)) if value == "NaN")
-    {
-        return Ok(Value::Text("NaN".to_owned()));
-    }
     if matches!(op, PlanInfixOp::Equal | PlanInfixOp::NotEqual) {
         let equal = match (eval_to_numeric(left), eval_to_numeric(right)) {
             (Ok(left), Ok(right)) => numeric_compare(left, PlanInfixOp::Equal, right)?,
@@ -28532,7 +28649,6 @@ fn select_pattern_matches(pattern: &PlanRowSelectPattern, value: &Value) -> bool
         PlanRowSelectPattern::Number { value: expected } => {
             value == &Value::Number(expected.clone())
         }
-        PlanRowSelectPattern::NaN => value == &Value::Text("NaN".to_owned()),
         PlanRowSelectPattern::Wildcard => true,
     }
 }

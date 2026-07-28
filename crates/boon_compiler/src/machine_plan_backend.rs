@@ -70,7 +70,6 @@ fn visit_row_node_children_mut(
         | PlanRowExpressionNode::TextTrim { input }
         | PlanRowExpressionNode::TextIsEmpty { input }
         | PlanRowExpressionNode::TextLength { input }
-        | PlanRowExpressionNode::TextToNumber { input }
         | PlanRowExpressionNode::BytesToHex { input }
         | PlanRowExpressionNode::BytesToBase64 { input }
         | PlanRowExpressionNode::BytesFromHex { input }
@@ -80,6 +79,12 @@ fn visit_row_node_children_mut(
         | PlanRowExpressionNode::ListSum { input }
         | PlanRowExpressionNode::ObjectField { object: input, .. }
         | PlanRowExpressionNode::ListRowField { row: input, .. } => visitor(input),
+        PlanRowExpressionNode::TextToNumber { input, radix } => {
+            visitor(input);
+            if let Some(radix) = radix {
+                visitor(radix);
+            }
+        }
         PlanRowExpressionNode::TextStartsWith { input, prefix }
         | PlanRowExpressionNode::BytesStartsWith { input, prefix }
         | PlanRowExpressionNode::BytesConcat {
@@ -105,32 +110,32 @@ fn visit_row_node_children_mut(
         }
         | PlanRowExpressionNode::BytesGet {
             input,
-            index: suffix,
+            position: suffix,
         }
         | PlanRowExpressionNode::BytesTake {
             input,
-            byte_count: suffix,
+            count: suffix,
         }
         | PlanRowExpressionNode::BytesDrop {
             input,
-            byte_count: suffix,
+            count: suffix,
         } => {
             visitor(input);
             visitor(suffix);
         }
-        PlanRowExpressionNode::TextSubstring {
+        PlanRowExpressionNode::TextSlice {
             input,
-            start,
-            length,
+            from: start,
+            count: length,
         }
         | PlanRowExpressionNode::BytesSlice {
             input,
-            offset: start,
-            byte_count: length,
+            from: start,
+            count: length,
         }
         | PlanRowExpressionNode::BytesSet {
             input,
-            index: start,
+            position: start,
             value: length,
         } => {
             visitor(input);
@@ -144,16 +149,16 @@ fn visit_row_node_children_mut(
                 visitor(encoding);
             }
         }
-        PlanRowExpressionNode::BytesZeros { byte_count } => visitor(byte_count),
+        PlanRowExpressionNode::BytesZeros { count } => visitor(count),
         PlanRowExpressionNode::BytesReadUnsigned {
             input,
-            offset,
+            from: offset,
             byte_count,
             endian,
         }
         | PlanRowExpressionNode::BytesReadSigned {
             input,
-            offset,
+            from: offset,
             byte_count,
             endian,
         } => {
@@ -164,14 +169,14 @@ fn visit_row_node_children_mut(
         }
         PlanRowExpressionNode::BytesWriteUnsigned {
             input,
-            offset,
+            from: offset,
             byte_count,
             endian,
             value,
         }
         | PlanRowExpressionNode::BytesWriteSigned {
             input,
-            offset,
+            from: offset,
             byte_count,
             endian,
             value,
@@ -6489,7 +6494,7 @@ fn inferred_builtin_call_value_type(function: &str) -> Option<PlanValueType> {
         | "Text/to_lowercase"
         | "Text/to_uppercase"
         | "Text/concat"
-        | "Text/substring"
+        | "Text/slice"
         | "Text/time_range_label"
         | "Number/to_text"
         | "Number/to_codepoint_text"
@@ -6517,14 +6522,11 @@ fn inferred_builtin_call_value_type(function: &str) -> Option<PlanValueType> {
         | "List/count"
         | "List/length"
         | "List/sum"
-        | "Text/find"
         | "Text/length"
-        | "Text/to_number"
         | "Bytes/length"
-        | "Bytes/find"
         | "Bytes/read_unsigned"
         | "Bytes/read_signed" => Some(PlanValueType::Number),
-        "Bytes/get" => Some(PlanValueType::Bytes { fixed_len: Some(1) }),
+        "Text/find" | "Text/to_number" | "Bytes/find" | "Bytes/get" => Some(PlanValueType::Tag),
         "Bool/not" | "Bool/and" | "Bool/or" | "Bool/toggle" | "Text/is_empty"
         | "Text/is_not_empty" | "Text/starts_with" | "Text/contains" | "Text/all_chars_in"
         | "Bytes/is_empty" | "Bytes/equal" | "Bytes/starts_with" | "Bytes/ends_with" => {
@@ -11552,7 +11554,6 @@ fn executable_select_pattern(
         CheckedMatchPattern::Text { value } => PlanRowSelectPattern::Text {
             value: value.clone(),
         },
-        CheckedMatchPattern::NaN => PlanRowSelectPattern::NaN,
         CheckedMatchPattern::Tag { name, .. } => PlanRowSelectPattern::Tag { name: name.clone() },
     })
 }
@@ -11603,197 +11604,190 @@ fn plan_builtin_expression(
     }
     let fallback_input = input;
     let named = |names: &[&str]| row_call_arg_value(&args, names);
-    let expression =
-        match function {
-            "Text/trim" => input
-                .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::TextTrim { input }),
-            "Text/is_empty" => input
-                .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::TextIsEmpty { input }),
-            "Text/starts_with" => input
-                .or_else(|| named(&["input", "text"]))
-                .zip(named(&["prefix"]))
-                .map(|(input, prefix)| PlanRowExpressionNode::TextStartsWith { input, prefix }),
-            "Text/length" => input
-                .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::TextLength { input }),
-            "Text/to_number" => input
-                .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::TextToNumber { input }),
-            "Text/concat" => input
-                .or_else(|| named(&["input", "text", "left"]))
-                .zip(named(&["with", "right"]))
-                .map(|(left, right)| {
-                    let mut parts = vec![left];
-                    if let Some(separator) = named(&["separator"]) {
-                        parts.push(separator);
-                    }
-                    parts.push(right);
-                    PlanRowExpressionNode::TextConcat { parts }
-                }),
-            "Text/substring" => input
-                .or_else(|| named(&["input", "text"]))
-                .zip(named(&["start"]))
-                .zip(named(&["length"]))
-                .map(
-                    |((input, start), length)| PlanRowExpressionNode::TextSubstring {
-                        input,
-                        start,
-                        length,
-                    },
-                ),
-            "Text/to_bytes" => input.or_else(|| named(&["input", "text"])).map(|input| {
-                PlanRowExpressionNode::TextToBytes {
-                    input,
-                    encoding: named(&["encoding"]),
+    let expression = match function {
+        "Text/trim" => input
+            .or_else(|| named(&["input", "text"]))
+            .map(|input| PlanRowExpressionNode::TextTrim { input }),
+        "Text/is_empty" => input
+            .or_else(|| named(&["input", "text"]))
+            .map(|input| PlanRowExpressionNode::TextIsEmpty { input }),
+        "Text/starts_with" => input
+            .or_else(|| named(&["input", "text"]))
+            .zip(named(&["prefix"]))
+            .map(|(input, prefix)| PlanRowExpressionNode::TextStartsWith { input, prefix }),
+        "Text/length" => input
+            .or_else(|| named(&["input", "text"]))
+            .map(|input| PlanRowExpressionNode::TextLength { input }),
+        "Text/to_number" => input.or_else(|| named(&["input", "text"])).map(|input| {
+            PlanRowExpressionNode::TextToNumber {
+                input,
+                radix: named(&["radix"]),
+            }
+        }),
+        "Text/concat" => input
+            .or_else(|| named(&["input", "text", "left"]))
+            .zip(named(&["with", "right"]))
+            .map(|(left, right)| {
+                let mut parts = vec![left];
+                if let Some(separator) = named(&["separator"]) {
+                    parts.push(separator);
                 }
+                parts.push(right);
+                PlanRowExpressionNode::TextConcat { parts }
             }),
-            "Bytes/to_text" => input.or_else(|| named(&["input", "bytes"])).map(|input| {
-                PlanRowExpressionNode::BytesToText {
-                    input,
-                    encoding: named(&["encoding"]),
-                }
-            }),
-            "Bytes/to_hex" => input
-                .or_else(|| named(&["input", "bytes"]))
-                .map(|input| PlanRowExpressionNode::BytesToHex { input }),
-            "Bytes/to_base64" => input
-                .or_else(|| named(&["input", "bytes"]))
-                .map(|input| PlanRowExpressionNode::BytesToBase64 { input }),
-            "Bytes/from_hex" => input
-                .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::BytesFromHex { input }),
-            "Bytes/from_base64" => input
-                .or_else(|| named(&["input", "text"]))
-                .map(|input| PlanRowExpressionNode::BytesFromBase64 { input }),
-            "Bytes/is_empty" => input
-                .or_else(|| named(&["input"]))
-                .map(|input| PlanRowExpressionNode::BytesIsEmpty { input }),
-            "Bytes/length" => input
-                .or_else(|| named(&["input"]))
-                .map(|input| PlanRowExpressionNode::BytesLength { input }),
-            "Bytes/get" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["index"]))
-                .map(|(input, index)| PlanRowExpressionNode::BytesGet { input, index }),
-            "Bytes/read_unsigned" | "Bytes/read_signed" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["offset"]))
-                .zip(named(&["byte_count"]))
-                .zip(named(&["endian"]))
-                .map(|(((input, offset), byte_count), endian)| {
-                    if function == "Bytes/read_signed" {
-                        PlanRowExpressionNode::BytesReadSigned {
-                            input,
-                            offset,
-                            byte_count,
-                            endian,
-                        }
-                    } else {
-                        PlanRowExpressionNode::BytesReadUnsigned {
-                            input,
-                            offset,
-                            byte_count,
-                            endian,
-                        }
-                    }
-                }),
-            "Bytes/slice" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["offset", "start"]))
-                .zip(named(&["byte_count", "length", "count"]))
-                .map(
-                    |((input, offset), byte_count)| PlanRowExpressionNode::BytesSlice {
+        "Text/slice" => input
+            .or_else(|| named(&["input", "text"]))
+            .zip(named(&["from"]))
+            .zip(named(&["count"]))
+            .map(|((input, from), count)| PlanRowExpressionNode::TextSlice { input, from, count }),
+        "Text/to_bytes" => input.or_else(|| named(&["input", "text"])).map(|input| {
+            PlanRowExpressionNode::TextToBytes {
+                input,
+                encoding: named(&["encoding"]),
+            }
+        }),
+        "Bytes/to_text" => input.or_else(|| named(&["input", "bytes"])).map(|input| {
+            PlanRowExpressionNode::BytesToText {
+                input,
+                encoding: named(&["encoding"]),
+            }
+        }),
+        "Bytes/to_hex" => input
+            .or_else(|| named(&["input", "bytes"]))
+            .map(|input| PlanRowExpressionNode::BytesToHex { input }),
+        "Bytes/to_base64" => input
+            .or_else(|| named(&["input", "bytes"]))
+            .map(|input| PlanRowExpressionNode::BytesToBase64 { input }),
+        "Bytes/from_hex" => input
+            .or_else(|| named(&["input", "text"]))
+            .map(|input| PlanRowExpressionNode::BytesFromHex { input }),
+        "Bytes/from_base64" => input
+            .or_else(|| named(&["input", "text"]))
+            .map(|input| PlanRowExpressionNode::BytesFromBase64 { input }),
+        "Bytes/is_empty" => input
+            .or_else(|| named(&["input"]))
+            .map(|input| PlanRowExpressionNode::BytesIsEmpty { input }),
+        "Bytes/length" => input
+            .or_else(|| named(&["input"]))
+            .map(|input| PlanRowExpressionNode::BytesLength { input }),
+        "Bytes/get" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["position"]))
+            .map(|(input, position)| PlanRowExpressionNode::BytesGet { input, position }),
+        "Bytes/read_unsigned" | "Bytes/read_signed" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["from"]))
+            .zip(named(&["byte_count"]))
+            .zip(named(&["endian"]))
+            .map(|(((input, from), byte_count), endian)| {
+                if function == "Bytes/read_signed" {
+                    PlanRowExpressionNode::BytesReadSigned {
                         input,
-                        offset,
+                        from,
                         byte_count,
-                    },
-                ),
-            "Bytes/take" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["byte_count", "length", "count"]))
-                .map(|(input, byte_count)| PlanRowExpressionNode::BytesTake { input, byte_count }),
-            "Bytes/drop" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["byte_count", "length", "count"]))
-                .map(|(input, byte_count)| PlanRowExpressionNode::BytesDrop { input, byte_count }),
-            "Bytes/zeros" => named(&["byte_count", "length", "count"])
-                .map(|byte_count| PlanRowExpressionNode::BytesZeros { byte_count }),
-            "Bytes/set" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["index"]))
-                .zip(named(&["value"]))
-                .map(|((input, index), value)| PlanRowExpressionNode::BytesSet {
-                    input,
-                    index,
-                    value,
-                }),
-            "Bytes/write_unsigned" | "Bytes/write_signed" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["offset"]))
-                .zip(named(&["byte_count"]))
-                .zip(named(&["endian"]))
-                .zip(named(&["value"]))
-                .map(|((((input, offset), byte_count), endian), value)| {
-                    if function == "Bytes/write_signed" {
-                        PlanRowExpressionNode::BytesWriteSigned {
-                            input,
-                            offset,
-                            byte_count,
-                            endian,
-                            value,
-                        }
-                    } else {
-                        PlanRowExpressionNode::BytesWriteUnsigned {
-                            input,
-                            offset,
-                            byte_count,
-                            endian,
-                            value,
-                        }
+                        endian,
                     }
-                }),
-            "Bytes/find" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["needle"]))
-                .map(|(input, needle)| PlanRowExpressionNode::BytesFind { input, needle }),
-            "Bytes/starts_with" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["prefix"]))
-                .map(|(input, prefix)| PlanRowExpressionNode::BytesStartsWith { input, prefix }),
-            "Bytes/ends_with" => input
-                .or_else(|| named(&["input"]))
-                .zip(named(&["suffix"]))
-                .map(|(input, suffix)| PlanRowExpressionNode::BytesEndsWith { input, suffix }),
-            "Bytes/concat" => input
-                .or_else(|| named(&["left", "input"]))
-                .zip(named(&["right", "with"]))
-                .map(|(left, right)| PlanRowExpressionNode::BytesConcat { left, right }),
-            "Bytes/equal" => input
-                .or_else(|| named(&["left", "input"]))
-                .zip(named(&["right", "with"]))
-                .map(|(left, right)| PlanRowExpressionNode::BytesEqual { left, right }),
-            "List/range" => named(&["from"])
-                .zip(named(&["to"]))
-                .map(|(from, to)| PlanRowExpressionNode::ListRange { from, to }),
-            "List/sum" => input
-                .or_else(|| named(&["input", "list"]))
-                .map(|input| PlanRowExpressionNode::ListSum { input }),
-            "List/get" | "List/latest" | "List/count" | "List/length" | "List/is_not_empty"
-            | "List/take" => input.or_else(|| named(&["input", "list"])).map(|input| {
-                PlanRowExpressionNode::BuiltinCall {
-                    function: runtime_builtin.expect("typed list terminal builtin"),
-                    input: Some(input),
-                    args: args
-                        .iter()
-                        .filter(|argument| !matches!(argument.name.as_str(), "input" | "list"))
-                        .cloned()
-                        .collect(),
+                } else {
+                    PlanRowExpressionNode::BytesReadUnsigned {
+                        input,
+                        from,
+                        byte_count,
+                        endian,
+                    }
                 }
             }),
-            "Text/all_chars_in" => input.or_else(|| named(&["input"])).map(|input| {
-                PlanRowExpressionNode::BuiltinCall {
+        "Bytes/slice" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["from"]))
+            .zip(named(&["count"]))
+            .map(|((input, from), count)| PlanRowExpressionNode::BytesSlice { input, from, count }),
+        "Bytes/take" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["count"]))
+            .map(|(input, count)| PlanRowExpressionNode::BytesTake { input, count }),
+        "Bytes/drop" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["count"]))
+            .map(|(input, count)| PlanRowExpressionNode::BytesDrop { input, count }),
+        "Bytes/zeros" => named(&["count"]).map(|count| PlanRowExpressionNode::BytesZeros { count }),
+        "Bytes/set" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["position"]))
+            .zip(named(&["value"]))
+            .map(
+                |((input, position), value)| PlanRowExpressionNode::BytesSet {
+                    input,
+                    position,
+                    value,
+                },
+            ),
+        "Bytes/write_unsigned" | "Bytes/write_signed" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["from"]))
+            .zip(named(&["byte_count"]))
+            .zip(named(&["endian"]))
+            .zip(named(&["value"]))
+            .map(|((((input, from), byte_count), endian), value)| {
+                if function == "Bytes/write_signed" {
+                    PlanRowExpressionNode::BytesWriteSigned {
+                        input,
+                        from,
+                        byte_count,
+                        endian,
+                        value,
+                    }
+                } else {
+                    PlanRowExpressionNode::BytesWriteUnsigned {
+                        input,
+                        from,
+                        byte_count,
+                        endian,
+                        value,
+                    }
+                }
+            }),
+        "Bytes/find" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["needle"]))
+            .map(|(input, needle)| PlanRowExpressionNode::BytesFind { input, needle }),
+        "Bytes/starts_with" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["prefix"]))
+            .map(|(input, prefix)| PlanRowExpressionNode::BytesStartsWith { input, prefix }),
+        "Bytes/ends_with" => input
+            .or_else(|| named(&["input"]))
+            .zip(named(&["suffix"]))
+            .map(|(input, suffix)| PlanRowExpressionNode::BytesEndsWith { input, suffix }),
+        "Bytes/concat" => input
+            .or_else(|| named(&["left", "input"]))
+            .zip(named(&["right", "with"]))
+            .map(|(left, right)| PlanRowExpressionNode::BytesConcat { left, right }),
+        "Bytes/equal" => input
+            .or_else(|| named(&["left", "input"]))
+            .zip(named(&["right", "with"]))
+            .map(|(left, right)| PlanRowExpressionNode::BytesEqual { left, right }),
+        "List/range" => named(&["from"])
+            .zip(named(&["to"]))
+            .map(|(from, to)| PlanRowExpressionNode::ListRange { from, to }),
+        "List/sum" => input
+            .or_else(|| named(&["input", "list"]))
+            .map(|input| PlanRowExpressionNode::ListSum { input }),
+        "List/get" | "List/latest" | "List/count" | "List/length" | "List/is_not_empty"
+        | "List/take" => input.or_else(|| named(&["input", "list"])).map(|input| {
+            PlanRowExpressionNode::BuiltinCall {
+                function: runtime_builtin.expect("typed list terminal builtin"),
+                input: Some(input),
+                args: args
+                    .iter()
+                    .filter(|argument| !matches!(argument.name.as_str(), "input" | "list"))
+                    .cloned()
+                    .collect(),
+            }
+        }),
+        "Text/all_chars_in" => {
+            input
+                .or_else(|| named(&["input"]))
+                .map(|input| PlanRowExpressionNode::BuiltinCall {
                     function: runtime_builtin.expect("typed text predicate builtin"),
                     input: Some(input),
                     args: args
@@ -11801,10 +11795,10 @@ fn plan_builtin_expression(
                         .filter(|argument| argument.name != "input")
                         .cloned()
                         .collect(),
-                }
-            }),
-            _ => None,
-        };
+                })
+        }
+        _ => None,
+    };
     if let Some(expression) = expression {
         return arena.intern(expression);
     }
@@ -11850,7 +11844,7 @@ fn row_expression_value_type(
                 PlanConstantValue::Data { .. } => Some(PlanValueType::Data),
             }),
         PlanRowExpressionNode::TextTrim { .. }
-        | PlanRowExpressionNode::TextSubstring { .. }
+        | PlanRowExpressionNode::TextSlice { .. }
         | PlanRowExpressionNode::TextConcat { .. }
         | PlanRowExpressionNode::BytesToText { .. }
         | PlanRowExpressionNode::BytesToHex { .. }
@@ -11872,20 +11866,20 @@ fn row_expression_value_type(
             Some(PlanValueType::Tag)
         }
         PlanRowExpressionNode::BytesLength { .. }
-        | PlanRowExpressionNode::BytesFind { .. }
         | PlanRowExpressionNode::BytesReadUnsigned { .. }
         | PlanRowExpressionNode::BytesReadSigned { .. }
         | PlanRowExpressionNode::TextLength { .. }
-        | PlanRowExpressionNode::TextToNumber { .. }
         | PlanRowExpressionNode::NumberInfix { .. }
         | PlanRowExpressionNode::ListSum { .. } => Some(PlanValueType::Number),
-        PlanRowExpressionNode::BytesGet { .. } => Some(PlanValueType::Bytes { fixed_len: Some(1) }),
         PlanRowExpressionNode::BytesIsEmpty { .. }
         | PlanRowExpressionNode::BytesStartsWith { .. }
         | PlanRowExpressionNode::BytesEndsWith { .. }
         | PlanRowExpressionNode::BytesEqual { .. }
+        | PlanRowExpressionNode::BytesGet { .. }
+        | PlanRowExpressionNode::BytesFind { .. }
         | PlanRowExpressionNode::TextIsEmpty { .. }
-        | PlanRowExpressionNode::TextStartsWith { .. } => Some(PlanValueType::Tag),
+        | PlanRowExpressionNode::TextStartsWith { .. }
+        | PlanRowExpressionNode::TextToNumber { .. } => Some(PlanValueType::Tag),
         PlanRowExpressionNode::BuiltinCall { function, .. } => function.fixed_result_type(),
         PlanRowExpressionNode::Select { arms, .. } => {
             let mut arm_types = Vec::new();

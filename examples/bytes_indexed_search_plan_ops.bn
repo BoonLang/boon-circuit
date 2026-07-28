@@ -72,25 +72,25 @@ FUNCTION row_widget(row) {
         payload_mid:
             BYTES[2] {} |> HOLD payload_mid {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/slice(offset: 1, byte_count: 2) }
+                    inspect |> THEN { payload |> Bytes/slice(from: 2, count: 2) }
                 }
             }
         payload_take:
             BYTES[2] {} |> HOLD payload_take {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/take(byte_count: 2) }
+                    inspect |> THEN { payload |> Bytes/take(count: 2) }
                 }
             }
         payload_drop:
             BYTES[3] {} |> HOLD payload_drop {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/drop(byte_count: 2) }
+                    inspect |> THEN { payload |> Bytes/drop(count: 2) }
                 }
             }
         zero_fill:
             BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD zero_fill {
                 LATEST {
-                    inspect |> THEN { Bytes/zeros(byte_count: 3) }
+                    inspect |> THEN { Bytes/zeros(count: 3) }
                 }
             }
         payload_joined:
@@ -102,25 +102,25 @@ FUNCTION row_widget(row) {
         read_u16_be:
             0 |> HOLD read_u16_be {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/read_unsigned(offset: 1, byte_count: 2, endian: Big) }
+                    inspect |> THEN { payload |> Bytes/read_unsigned(from: 2, byte_count: 2, endian: Big) }
                 }
             }
         read_i8_last:
             0 |> HOLD read_i8_last {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/read_signed(offset: 4, byte_count: 1, endian: Little) }
+                    inspect |> THEN { payload |> Bytes/read_signed(from: 5, byte_count: 1, endian: Little) }
                 }
             }
         write_u16_le:
             BYTES[5] {} |> HOLD write_u16_le {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/write_unsigned(offset: 2, byte_count: 2, endian: Little, value: 4660) }
+                    inspect |> THEN { payload |> Bytes/write_unsigned(from: 3, byte_count: 2, endian: Little, value: 4660) }
                 }
             }
         write_i8_first:
             BYTES[5] {} |> HOLD write_i8_first {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/write_signed(offset: 0, byte_count: 1, endian: Little, value: -1) }
+                    inspect |> THEN { payload |> Bytes/write_signed(from: 1, byte_count: 1, endian: Little, value: -1) }
                 }
             }
         payload_empty:
@@ -147,14 +147,14 @@ FUNCTION row_widget(row) {
                     inspect |> THEN { Bytes/ends_with(input: payload, suffix: wrong_suffix) }
                 }
             }
-        found_index:
-            0 |> HOLD found_index {
+        found_result:
+            NotFound |> HOLD found_result {
                 LATEST {
                     inspect |> THEN { payload |> Bytes/find(needle: needle) }
                 }
             }
-        missing_index:
-            9 |> HOLD missing_index {
+        missing_result:
+            NotFound |> HOLD missing_result {
                 LATEST {
                     inspect |> THEN { Bytes/find(input: payload, needle: missing) }
                 }

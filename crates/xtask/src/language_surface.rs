@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const MANIFEST_RELATIVE_PATH: &str = "examples/language_feature_coverage.toml";
@@ -86,10 +86,12 @@ pub fn run(workspace: &Path) -> Result<(), String> {
     let registry = load_parser_registry(workspace)?;
     validate_contract(workspace, &manifest, &registry)?;
     verify_fixture_parsing(workspace, &manifest)?;
+    let pattern_corpus_count = verify_match_pattern_corpus(workspace)?;
     println!(
-        "verified {} parser-owned language feature(s) from {}",
+        "verified {} parser-owned language feature(s) from {} and {} Boon match-pattern source(s)",
         manifest.features.len(),
-        MANIFEST_RELATIVE_PATH
+        MANIFEST_RELATIVE_PATH,
+        pattern_corpus_count,
     );
     Ok(())
 }
@@ -386,6 +388,85 @@ fn verify_fixture_parsing(workspace: &Path, manifest: &Manifest) -> Result<(), S
         .map_err(|error| format!("failed to wait for parser fixture probe: {error}"))?;
     if !output.status.success() {
         return Err(command_failure("parser fixture probe", &output));
+    }
+    Ok(())
+}
+
+fn verify_match_pattern_corpus(workspace: &Path) -> Result<usize, String> {
+    let mut paths = Vec::new();
+    collect_boon_source_paths(workspace, workspace, &mut paths)?;
+    paths.sort();
+    if paths.is_empty() {
+        return Err("workspace contains no Boon source files".to_owned());
+    }
+
+    let mut child = parser_probe_command(workspace)
+        .arg("verify-pattern-corpus")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start parser match-pattern corpus probe: {error}"))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or("parser match-pattern corpus probe has no stdin")?;
+        for path in &paths {
+            let relative = path
+                .strip_prefix(workspace)
+                .map_err(|_| format!("{} escaped the workspace", path.display()))?;
+            let relative = relative
+                .to_str()
+                .ok_or_else(|| format!("{} is not valid UTF-8", relative.display()))?;
+            if relative.chars().any(|ch| matches!(ch, '\n' | '\r' | '\t')) {
+                return Err(format!(
+                    "Boon source path `{relative}` contains protocol control characters"
+                ));
+            }
+            writeln!(stdin, "{relative}")
+                .map_err(|error| format!("failed to send corpus paths to parser probe: {error}"))?;
+        }
+    }
+    let output = child.wait_with_output().map_err(|error| {
+        format!("failed to wait for parser match-pattern corpus probe: {error}")
+    })?;
+    if !output.status.success() {
+        return Err(command_failure(
+            "parser match-pattern corpus probe",
+            &output,
+        ));
+    }
+    Ok(paths.len())
+}
+
+fn collect_boon_source_paths(
+    workspace: &Path,
+    directory: &Path,
+    output: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|error| format!("failed to read {}: {error}", directory.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to enumerate {}: {error}", directory.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if file_type.is_dir() {
+            if directory == workspace
+                && matches!(entry.file_name().to_str(), Some(".git" | "target"))
+            {
+                continue;
+            }
+            collect_boon_source_paths(workspace, &path, output)?;
+        } else if file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("bn")
+        {
+            output.push(path);
+        }
     }
     Ok(())
 }

@@ -1502,13 +1502,9 @@ impl<'a> DocumentCompiler<'a> {
             CheckedMatchPattern::NaN => Ok(DocumentPattern::Tag {
                 tag: self.intern_name("NaN"),
             }),
-            CheckedMatchPattern::Tag { name } => Ok(DocumentPattern::Tag {
+            CheckedMatchPattern::Tag { name, .. } => Ok(DocumentPattern::Tag {
                 tag: self.intern_name(name),
             }),
-            CheckedMatchPattern::Unknown { tokens } => Err(PlanError::new(format!(
-                "conditional arm has an unknown checked pattern `{}`",
-                tokens.join(" ")
-            ))),
             CheckedMatchPattern::Wildcard
             | CheckedMatchPattern::Binding { .. }
             | CheckedMatchPattern::Number { .. }

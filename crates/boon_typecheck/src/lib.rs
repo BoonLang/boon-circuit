@@ -580,12 +580,21 @@ pub struct CheckedSpan {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckedMatchPattern {
     Wildcard,
-    Number { value: String },
-    Text { value: String },
+    Number {
+        value: String,
+    },
+    Text {
+        value: String,
+    },
     NaN,
-    Tag { name: String },
-    Binding { name: String },
-    Unknown { tokens: Vec<String> },
+    Tag {
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fields: Vec<String>,
+    },
+    Binding {
+        name: String,
+    },
 }
 
 impl From<&AstMatchPattern> for CheckedMatchPattern {
@@ -599,11 +608,14 @@ impl From<&AstMatchPattern> for CheckedMatchPattern {
                 value: value.clone(),
             },
             AstMatchPattern::NaN => Self::NaN,
-            AstMatchPattern::Tag { name } => Self::Tag { name: name.clone() },
-            AstMatchPattern::Binding { name } => Self::Binding { name: name.clone() },
-            AstMatchPattern::Unknown { tokens } => Self::Unknown {
-                tokens: tokens.clone(),
+            AstMatchPattern::Tag { name, fields } => Self::Tag {
+                name: name.clone(),
+                fields: fields.clone(),
             },
+            AstMatchPattern::Binding { name } => Self::Binding { name: name.clone() },
+            AstMatchPattern::Invalid { .. } => {
+                unreachable!("invalid match patterns are rejected by boon_parser")
+            }
         }
     }
 }
@@ -2177,12 +2189,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                             AstExprKind::MatchArm { pattern, .. } => Some(pattern),
                             _ => None,
                         })?;
-                let projection = if pattern_variant(pattern)
-                    .is_some_and(|variant| matches!(variant, Variant::Tag(_)))
-                {
-                    vec![name.clone()]
-                } else {
-                    Vec::new()
+                let projection = match pattern {
+                    AstMatchPattern::Tag { fields, .. } if fields.contains(name) => {
+                        vec![name.clone()]
+                    }
+                    _ => Vec::new(),
                 };
                 Some(CheckedPatternBinding {
                     declaration: *declaration,
@@ -6930,9 +6941,7 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn predeclare_pattern_arm(&mut self, expr_id: usize, selector: usize, parent: LexicalScopeId) {
         let Some(AstExpr {
-            kind: AstExprKind::MatchArm {
-                pattern, output, ..
-            },
+            kind: AstExprKind::MatchArm { pattern, output },
             ..
         }) = self.program.expressions.get(expr_id).cloned()
         else {
@@ -8282,12 +8291,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                 op: op.clone(),
                 right: id(*right),
             },
-            AstExprKind::MatchArm {
-                pattern,
-                semantic_pattern,
-                output,
-            } => CheckedExpressionKind::MatchArm {
-                pattern: semantic_pattern.into(),
+            AstExprKind::MatchArm { pattern, output } => CheckedExpressionKind::MatchArm {
+                pattern: pattern.into(),
                 bindings: pattern_variable_names(pattern)
                     .into_iter()
                     .filter_map(|name| self.pattern_declarations.get(&(expr.id, name)).copied())
@@ -13387,7 +13392,7 @@ impl<'a> Checker<'a> {
                             .expr
                             .and_then(|expr_id| self.program.expressions.get(expr_id))
                             .and_then(|expr| match &expr.kind {
-                                AstExprKind::MatchArm { pattern, .. } => Some(pattern.as_slice()),
+                                AstExprKind::MatchArm { pattern, .. } => Some(pattern),
                                 _ => None,
                             })?;
                         let narrowed = narrowed_pattern_binding(selector_ty, pattern)?;
@@ -13405,7 +13410,7 @@ impl<'a> Checker<'a> {
                     .expr
                     .and_then(|expr_id| self.program.expressions.get(expr_id))
                     .and_then(|expr| match &expr.kind {
-                        AstExprKind::MatchArm { pattern, .. } => Some(pattern.as_slice()),
+                        AstExprKind::MatchArm { pattern, .. } => Some(pattern),
                         _ => None,
                     })?;
                 let bindings = pattern_payload_bindings(selector_ty, pattern);
@@ -16960,25 +16965,40 @@ impl<'a> Checker<'a> {
         arm_expr_id: usize,
         selector_type: &Type,
         tag: &str,
-        pattern: &[String],
+        pattern: &AstMatchPattern,
     ) {
-        let fields = match selector_type {
-            Type::VariantSet(variants) => variants.iter().find_map(|variant| match variant {
-                Variant::Tagged {
-                    tag: candidate,
-                    fields,
-                } if candidate == tag => Some(fields),
-                _ => None,
+        let names = pattern_variable_names(pattern);
+        if names.is_empty() {
+            return;
+        }
+        let matching_variant = match selector_type {
+            Type::VariantSet(variants) => variants.iter().find(|variant| {
+                matches!(
+                    variant,
+                    Variant::Tag(candidate) | Variant::Tagged { tag: candidate, .. }
+                        if candidate == tag
+                )
             }),
             _ => None,
         };
-        let Some(fields) = fields else {
+        let Some(matching_variant) = matching_variant else {
+            return;
+        };
+        let Variant::Tagged { fields, .. } = matching_variant else {
+            for name in names {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    arm_expr_id,
+                    format!(
+                        "tagged pattern `{tag}[{name}]` binds unknown payload field `{name}`; no payload fields"
+                    ),
+                ));
+            }
             return;
         };
         if fields.open {
             return;
         }
-        for name in pattern_variable_names(pattern) {
+        for name in names {
             if fields.fields.contains_key(&name) {
                 continue;
             }
@@ -18336,21 +18356,11 @@ fn pattern_selector_expr_id(expr_id: usize, expressions: &[AstExpr]) -> Option<u
     }
 }
 
-fn pattern_variant(pattern: &[String]) -> Option<Variant> {
-    let first = pattern
-        .iter()
-        .find(|part| !matches!(part.as_str(), "__" | "=>" | "{" | "}"))?;
-    if !starts_uppercase_identifier(first) {
-        return None;
+fn pattern_variant(pattern: &AstMatchPattern) -> Option<Variant> {
+    match pattern {
+        AstMatchPattern::Tag { name, .. } => Some(Variant::Tag(name.clone())),
+        _ => None,
     }
-    Some(Variant::Tag(first.clone()))
-}
-
-fn starts_uppercase_identifier(value: &str) -> bool {
-    value
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
 fn pattern_selector_path(expr: Option<&AstExpr>) -> Option<String> {
@@ -20805,7 +20815,7 @@ fn checked_inline_list_authority_root(
     None
 }
 
-fn when_arms(expr_id: usize, expressions: &[AstExpr]) -> Vec<(Vec<String>, usize)> {
+fn when_arms(expr_id: usize, expressions: &[AstExpr]) -> Vec<(AstMatchPattern, usize)> {
     let Some(expression) = expressions.get(expr_id) else {
         return Vec::new();
     };
@@ -20819,14 +20829,13 @@ fn when_arms(expr_id: usize, expressions: &[AstExpr]) -> Vec<(Vec<String>, usize
             AstExprKind::MatchArm {
                 pattern,
                 output: Some(output),
-                ..
             } => Some((pattern.clone(), *output)),
             _ => None,
         })
         .collect()
 }
 
-fn narrowed_pattern_binding(selector: &Type, pattern: &[String]) -> Option<Type> {
+fn narrowed_pattern_binding(selector: &Type, pattern: &AstMatchPattern) -> Option<Type> {
     let Variant::Tag(pattern_tag) = pattern_variant(pattern)? else {
         return None;
     };
@@ -20842,7 +20851,7 @@ fn narrowed_pattern_binding(selector: &Type, pattern: &[String]) -> Option<Type>
     })
 }
 
-fn pattern_payload_bindings(selector: &Type, pattern: &[String]) -> BTreeMap<String, Type> {
+fn pattern_payload_bindings(selector: &Type, pattern: &AstMatchPattern) -> BTreeMap<String, Type> {
     let variables = pattern_variable_names(pattern);
     let Some(Variant::Tag(pattern_tag)) = pattern_variant(pattern) else {
         return match variables.as_slice() {
@@ -21628,7 +21637,7 @@ fn static_when_type_from_bindings(
 
 #[derive(Clone, Debug)]
 struct ReachableStaticWhenArm {
-    pattern: Vec<String>,
+    pattern: AstMatchPattern,
     output: usize,
     selector_type: Option<Type>,
     catch_all: bool,
@@ -21653,7 +21662,6 @@ fn reachable_static_when_arms(
             .filter_map(|arm| {
                 let AstExprKind::MatchArm {
                     pattern,
-                    semantic_pattern,
                     output: Some(output),
                 } = &expressions.get(*arm)?.kind
                 else {
@@ -21664,7 +21672,7 @@ fn reachable_static_when_arms(
                     output: *output,
                     selector_type: None,
                     catch_all: matches!(
-                        semantic_pattern,
+                        pattern,
                         AstMatchPattern::Wildcard | AstMatchPattern::Binding { .. }
                     ),
                 })
@@ -21682,7 +21690,6 @@ fn reachable_static_when_arms(
             kind:
                 AstExprKind::MatchArm {
                     pattern,
-                    semantic_pattern,
                     output: Some(output),
                 },
             ..
@@ -21690,8 +21697,8 @@ fn reachable_static_when_arms(
         else {
             continue;
         };
-        let tag = match semantic_pattern {
-            AstMatchPattern::Tag { name } => Some(name.as_str()),
+        let tag = match pattern {
+            AstMatchPattern::Tag { name, .. } => Some(name.as_str()),
             _ => None,
         };
         if let Some(tag) = tag {
@@ -21712,7 +21719,7 @@ fn reachable_static_when_arms(
             }
             continue;
         }
-        match semantic_pattern {
+        match pattern {
             AstMatchPattern::Wildcard | AstMatchPattern::Binding { .. } => {
                 reachable.push(ReachableStaticWhenArm {
                     pattern: pattern.clone(),
@@ -21725,13 +21732,10 @@ fn reachable_static_when_arms(
             AstMatchPattern::Number { .. }
             | AstMatchPattern::Text { .. }
             | AstMatchPattern::NaN => {}
-            AstMatchPattern::Unknown { .. } => reachable.push(ReachableStaticWhenArm {
-                pattern: pattern.clone(),
-                output: *output,
-                selector_type: Some(Type::VariantSet(remaining.clone())),
-                catch_all: false,
-            }),
             AstMatchPattern::Tag { .. } => unreachable!(),
+            AstMatchPattern::Invalid { .. } => {
+                unreachable!("invalid match patterns are rejected by boon_parser")
+            }
         }
     }
     reachable
@@ -23780,29 +23784,18 @@ fn is_value_placeholder_type(ty: &Type) -> bool {
     }
 }
 
-fn pattern_variable_names(pattern: &[String]) -> Vec<String> {
-    pattern
-        .iter()
-        .filter(|part| {
-            is_binding_name(part)
-                && !matches!(part.as_str(), "__" | "TEXT" | "True" | "False")
-                && part
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_lowercase())
-        })
-        .cloned()
-        .collect()
-}
-
-fn is_binding_name(value: &str) -> bool {
-    value
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+fn pattern_variable_names(pattern: &AstMatchPattern) -> Vec<String> {
+    match pattern {
+        AstMatchPattern::Binding { name } => vec![name.clone()],
+        AstMatchPattern::Tag { fields, .. } => fields.clone(),
+        AstMatchPattern::Wildcard
+        | AstMatchPattern::Number { .. }
+        | AstMatchPattern::Text { .. }
+        | AstMatchPattern::NaN => Vec::new(),
+        AstMatchPattern::Invalid { .. } => {
+            unreachable!("invalid match patterns are rejected by boon_parser")
+        }
+    }
 }
 
 fn statements_define_explicit_record(statements: &[AstStatement], expressions: &[AstExpr]) -> bool {
@@ -25567,10 +25560,13 @@ fn collect_find_result_field_requirements(
             continue;
         }
         for (pattern, output) in when_arms(expression.id, &program.expressions) {
-            if !pattern.iter().any(|part| part == "Found") {
+            let AstMatchPattern::Tag { name, fields } = pattern else {
+                continue;
+            };
+            if name != "Found" {
                 continue;
             }
-            for binding in pattern_variable_names(&pattern) {
+            for binding in fields {
                 collect_contextual_binding_field_requirements(
                     output,
                     &binding,
@@ -27093,14 +27089,11 @@ fn parts_without_payload(parts: &[String]) -> &[String] {
     }
 }
 
-fn source_payload_fields_from_pattern(pattern: &[String]) -> Vec<String> {
-    let mut fields = Vec::new();
-    for window in pattern.windows(2) {
-        if window[1].as_str() == ":" && !matches!(window[0].as_str(), "__" | "SKIP") {
-            fields.push(window[0].clone());
-        }
+fn source_payload_fields_from_pattern(pattern: &AstMatchPattern) -> Vec<String> {
+    match pattern {
+        AstMatchPattern::Tag { fields, .. } => fields.clone(),
+        _ => Vec::new(),
     }
-    fields
 }
 
 fn path_is_event_payload_parts(parts: &[String]) -> bool {

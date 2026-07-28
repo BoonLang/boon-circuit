@@ -268,6 +268,13 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
         summary: "fixed-width BITS[N] literals are planned and rejected today",
     },
     LanguageFeatureSpec {
+        id: "closed_truth_tags",
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
+        spellings: &["True", "False"],
+        summary: "True and False are ordinary members of a closed Tag set",
+    },
+    LanguageFeatureSpec {
         id: "distributed_role_paths",
         stage: LanguageFeatureStage::Current,
         parse_expectation: LanguageFeatureParseExpectation::Accept,
@@ -301,13 +308,6 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
         parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["integer literal", "decimal literal"],
         summary: "current number literals lower through the legacy finite binary64 value",
-    },
-    LanguageFeatureSpec {
-        id: "legacy_bool_values",
-        stage: LanguageFeatureStage::Current,
-        parse_expectation: LanguageFeatureParseExpectation::Accept,
-        spellings: &["True", "False"],
-        summary: "True and False currently parse as dedicated legacy Bool values",
     },
     LanguageFeatureSpec {
         id: "map_literals",
@@ -605,12 +605,24 @@ pub enum AstTextSegment {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AstMatchPattern {
     Wildcard,
-    Number { value: String },
-    Text { value: String },
+    Number {
+        value: String,
+    },
+    Text {
+        value: String,
+    },
     NaN,
-    Tag { name: String },
-    Binding { name: String },
-    Unknown { tokens: Vec<String> },
+    Tag {
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fields: Vec<String>,
+    },
+    Binding {
+        name: String,
+    },
+    Invalid {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -681,8 +693,7 @@ pub enum AstExprKind {
         right: usize,
     },
     MatchArm {
-        pattern: Vec<String>,
-        semantic_pattern: AstMatchPattern,
+        pattern: AstMatchPattern,
         output: Option<usize>,
     },
     Block {
@@ -1395,13 +1406,15 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let mut statements = ast_statement_tree(&items, &mut expressions, source);
     link_multiline_expression_structure(&mut statements, &mut expressions);
     validate_pipeline_inputs(path, source, &expressions)?;
-    Ok(AstProgram {
+    let ast = AstProgram {
         tokens,
         lines,
         items,
         statements,
         expressions,
-    })
+    };
+    validate_match_patterns(path, &ast)?;
+    Ok(ast)
 }
 
 fn link_multiline_expression_structure(
@@ -2417,8 +2430,7 @@ fn ast_expr_kind(
     if let Some(arrow) = find_top_level_token(tokens, "=>") {
         let pattern = &tokens[..arrow];
         return AstExprKind::MatchArm {
-            pattern: pattern.to_vec(),
-            semantic_pattern: ast_match_pattern(pattern, item, source),
+            pattern: ast_match_pattern(pattern, item, source),
             output: (!tokens[arrow + 1..].is_empty())
                 .then(|| parse_ast_expr(&tokens[arrow + 1..], item, expressions, source)),
         };
@@ -2565,11 +2577,13 @@ fn ast_match_pattern(tokens: &[String], item: &ParserItem, source: &str) -> AstM
     if tokens == ["True"] {
         return AstMatchPattern::Tag {
             name: "True".to_owned(),
+            fields: Vec::new(),
         };
     }
     if tokens == ["False"] {
         return AstMatchPattern::Tag {
             name: "False".to_owned(),
+            fields: Vec::new(),
         };
     }
     if tokens == ["NaN"] {
@@ -2584,22 +2598,142 @@ fn ast_match_pattern(tokens: &[String], item: &ParserItem, source: &str) -> AstM
     if let Some(value) = text_literal_value(tokens, item, source) {
         return AstMatchPattern::Text { value };
     }
+    if tokens.len() == 1 && matches!(tokens[0].as_str(), "FLUSH" | "FLUSHED" | "SKIP" | "SOURCE") {
+        return AstMatchPattern::Invalid {
+            message: "private flow-control states cannot be matched as public values".to_owned(),
+        };
+    }
+    if tokens.len() == 1
+        && matches!(
+            tokens[0].as_str(),
+            "BITS" | "BYTES" | "LIST" | "MAP" | "NUMBER" | "SET" | "TEXT"
+        )
+    {
+        return AstMatchPattern::Invalid {
+            message: invalid_match_pattern_message(tokens),
+        };
+    }
     if let Some(name) = tokens.first().filter(|_| tokens.len() == 1) {
         if value_starts_uppercase_identifier(name) {
-            return AstMatchPattern::Tag { name: name.clone() };
+            return AstMatchPattern::Tag {
+                name: name.clone(),
+                fields: Vec::new(),
+            };
         }
         if is_name(name) {
             return AstMatchPattern::Binding { name: name.clone() };
         }
     }
-    if let Some(name) = tokens
-        .first()
-        .filter(|name| value_starts_uppercase_identifier(name))
+    if let Some(name) = tokens.first().filter(|name| {
+        value_starts_uppercase_identifier(name)
+            && !matches!(
+                name.as_str(),
+                "BITS" | "BYTES" | "LIST" | "MAP" | "NUMBER" | "SET" | "TEXT"
+            )
+    }) && tokens.get(1).map(String::as_str) == Some("[")
+        && matching_close(tokens, 1) == tokens.len().checked_sub(1)
     {
-        return AstMatchPattern::Tag { name: name.clone() };
+        return match ast_tag_pattern_fields(&tokens[2..tokens.len() - 1]) {
+            Ok(fields) => AstMatchPattern::Tag {
+                name: name.clone(),
+                fields,
+            },
+            Err(message) => AstMatchPattern::Invalid { message },
+        };
     }
-    AstMatchPattern::Unknown {
-        tokens: tokens.to_vec(),
+    AstMatchPattern::Invalid {
+        message: invalid_match_pattern_message(tokens),
+    }
+}
+
+fn ast_tag_pattern_fields(tokens: &[String]) -> Result<Vec<String>, String> {
+    if tokens.is_empty() {
+        return Err(
+            "tag payload patterns require at least one lowercase payload field binding".to_owned(),
+        );
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "[" | "]" | "{" | "}" | ":" | "=>"))
+    {
+        return Err(
+            "tag payload patterns do not support renaming, nesting, or comparison; use `Tag[field, ...]`"
+                .to_owned(),
+        );
+    }
+    if tokens.len() % 2 == 0 {
+        return Err(
+            "tag payload patterns must use `Tag[field, ...]` with comma-separated lowercase payload field bindings"
+                .to_owned(),
+        );
+    }
+    let mut fields = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if index % 2 == 1 {
+            if token != "," {
+                return Err(
+                    "tag payload patterns do not support renaming, nesting, or comparison; use `Tag[field, ...]`"
+                        .to_owned(),
+                );
+            }
+            continue;
+        }
+        if !is_name(token)
+            || !token
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_lowercase())
+        {
+            return Err(format!(
+                "tag payload binding `{token}` must be a lowercase field name"
+            ));
+        }
+        if fields.contains(token) {
+            return Err(format!(
+                "tag payload field `{token}` cannot be bound more than once"
+            ));
+        }
+        fields.push(token.clone());
+    }
+    Ok(fields)
+}
+
+fn invalid_match_pattern_message(tokens: &[String]) -> String {
+    let rendered = tokens.join(" ");
+    match tokens.first().map(String::as_str) {
+        None => "match arms require a pattern before `=>`".to_owned(),
+        Some("[") => {
+            "object patterns are unsupported; match an ordinary Tag and bind explicit payload fields"
+                .to_owned()
+        }
+        Some("LIST") => {
+            "LIST patterns are unsupported; use explicit list operations before matching".to_owned()
+        }
+        Some("MAP") => {
+            "MAP patterns are unsupported; use explicit map operations before matching".to_owned()
+        }
+        Some("SET") => {
+            "SET patterns are unsupported; use explicit set operations before matching".to_owned()
+        }
+        Some("BITS") => {
+            "BITS patterns are unavailable until fixed-width BITS literals are implemented"
+                .to_owned()
+        }
+        Some("BYTES" | "NUMBER" | "TEXT") => {
+            "runtime type patterns are unsupported; match an exact literal or an ordinary Tag"
+                .to_owned()
+        }
+        Some("{") => {
+            "dynamic comparison patterns are unsupported; compare explicitly inside the arm"
+                .to_owned()
+        }
+        Some(name) if value_starts_uppercase_identifier(name) => {
+            "tag payload patterns must use `Tag[field, ...]` with lowercase payload field bindings"
+                .to_owned()
+        }
+        _ => format!(
+            "unsupported match pattern `{rendered}`; use `__`, a lowercase whole-value binding, an exact literal, a bare Tag, or `Tag[field, ...]`"
+        ),
     }
 }
 
@@ -3780,6 +3914,25 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
     Ok(())
 }
 
+fn validate_match_patterns(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
+    for expression in &ast.expressions {
+        let AstExprKind::MatchArm {
+            pattern: AstMatchPattern::Invalid { message },
+            ..
+        } = &expression.kind
+        else {
+            continue;
+        };
+        let column = ast
+            .tokens
+            .iter()
+            .find(|token| token.line == expression.line && token.start >= expression.start)
+            .map_or(1, |token| token.column);
+        return Err(error(path, expression.line, column, message));
+    }
+    Ok(())
+}
+
 fn validate_function_parameter_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
     for item in ast.items.iter().filter(|item| item.function.is_some()) {
         let Some(open) = item.symbols.iter().position(|symbol| symbol == "(") else {
@@ -4689,7 +4842,7 @@ selected:
             .iter()
             .filter_map(|expression| match &expression.kind {
                 AstExprKind::MatchArm {
-                    semantic_pattern: AstMatchPattern::Tag { name },
+                    pattern: AstMatchPattern::Tag { name, .. },
                     ..
                 } => Some(name.as_str()),
                 _ => None,
@@ -4701,6 +4854,101 @@ selected:
         assert!(!artifact.contains("\"kind\":\"bool\""));
         assert!(!artifact.contains("\"kind\":\"enum\""));
         assert!(!artifact.contains("\"kind\":\"record\""));
+    }
+
+    #[test]
+    fn match_patterns_preserve_only_the_supported_typed_surface() {
+        let parsed = parse_source(
+            "typed-match-patterns.bn",
+            r#"
+selected:
+    candidate |> WHEN {
+        __ => 0
+        whole => whole
+        42 => 1
+        TEXT { exact } => 2
+        Ready => 3
+        Found[value] => value
+        InvalidNumber[reason, position] => position
+    }
+"#,
+        )
+        .unwrap();
+
+        let patterns = parsed
+            .expressions
+            .iter()
+            .filter_map(|expression| match &expression.kind {
+                AstExprKind::MatchArm { pattern, .. } => Some(pattern),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            patterns,
+            [
+                &AstMatchPattern::Wildcard,
+                &AstMatchPattern::Binding {
+                    name: "whole".to_owned(),
+                },
+                &AstMatchPattern::Number {
+                    value: "42".to_owned(),
+                },
+                &AstMatchPattern::Text {
+                    value: "exact".to_owned(),
+                },
+                &AstMatchPattern::Tag {
+                    name: "Ready".to_owned(),
+                    fields: Vec::new(),
+                },
+                &AstMatchPattern::Tag {
+                    name: "Found".to_owned(),
+                    fields: vec!["value".to_owned()],
+                },
+                &AstMatchPattern::Tag {
+                    name: "InvalidNumber".to_owned(),
+                    fields: vec!["reason".to_owned(), "position".to_owned()],
+                },
+            ]
+        );
+        let artifact = serde_json::to_string(&parsed).unwrap();
+        assert!(!artifact.contains("\"pattern\":["));
+        assert!(!artifact.contains("\"kind\":\"unknown\""));
+    }
+
+    #[test]
+    fn unsupported_compound_match_patterns_fail_closed_with_targeted_errors() {
+        let cases = [
+            ("[field: value]", "object patterns are unsupported"),
+            ("LIST { value }", "LIST patterns are unsupported"),
+            ("NUMBER", "runtime type patterns are unsupported"),
+            ("SKIP", "private flow-control states cannot be matched"),
+            (
+                "Found[value: renamed]",
+                "do not support renaming, nesting, or comparison",
+            ),
+            (
+                "Outer[Inner[value]]",
+                "do not support renaming, nesting, or comparison",
+            ),
+            ("Found[value, value]", "cannot be bound more than once"),
+            ("Found[Value]", "must be a lowercase field name"),
+            ("{expected}", "dynamic comparison patterns are unsupported"),
+        ];
+
+        for (pattern, expected) in cases {
+            let error = parse_source(
+                "invalid-match-pattern.bn",
+                format!(
+                    "selected:\n    candidate |> WHEN {{\n        {pattern} => 1\n        __ => 0\n    }}\n"
+                ),
+            )
+            .unwrap_err();
+            assert!(
+                error.message.contains(expected),
+                "pattern `{pattern}` produced `{}`",
+                error.message
+            );
+        }
     }
 
     #[test]
@@ -4843,10 +5091,9 @@ while_value:
             .iter()
             .find_map(|arm| match &parsed.expressions[*arm].kind {
                 AstExprKind::MatchArm {
-                    pattern,
+                    pattern: AstMatchPattern::Tag { name, .. },
                     output: Some(output),
-                    ..
-                } if pattern == &["Ready"] => Some(*output),
+                } if name == "Ready" => Some(*output),
                 _ => None,
             });
         let ready_output = ready_output.expect("Ready output");
@@ -4862,10 +5109,9 @@ while_value:
             .iter()
             .find_map(|arm| match &parsed.expressions[*arm].kind {
                 AstExprKind::MatchArm {
-                    pattern,
+                    pattern: AstMatchPattern::Binding { name },
                     output: Some(output),
-                    ..
-                } if pattern == &["fallback"] => Some(*output),
+                } if name == "fallback" => Some(*output),
                 _ => None,
             })
             .expect("fallback output");
@@ -5513,10 +5759,9 @@ store: [
             .expect("map continuation exists");
         let ready_output = parsed.expressions.iter().find_map(|expr| match &expr.kind {
             AstExprKind::MatchArm {
-                pattern,
+                pattern: AstMatchPattern::Tag { name, .. },
                 output: Some(output),
-                ..
-            } if pattern.iter().any(|part| part == "Ready") => Some(*output),
+            } if name == "Ready" => Some(*output),
             _ => None,
         });
         assert_eq!(ready_output, Some(map.id));

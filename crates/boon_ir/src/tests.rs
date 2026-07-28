@@ -144,14 +144,12 @@ selected:
                 return None;
             };
             arms.iter().find_map(|arm| {
-                if matches!(
-                    &arm.pattern,
-                    boon_typecheck::CheckedMatchPattern::Tag { name } if name == "Found"
-                ) {
-                    arm.bindings.first().map(|binding| (arm.output, binding))
-                } else {
-                    None
-                }
+                let boon_typecheck::CheckedMatchPattern::Tag { name, fields } = &arm.pattern else {
+                    return None;
+                };
+                (name == "Found" && fields == &["value"])
+                    .then(|| arm.bindings.first().map(|binding| (arm.output, binding)))
+                    .flatten()
             })
         })
         .expect("typed Found arm");

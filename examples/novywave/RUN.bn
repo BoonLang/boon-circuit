@@ -4455,25 +4455,25 @@ FUNCTION new_signal(signal) {
                 LATEST {
                     signal_elements.select_signal |> THEN { True }
                     row_elements.remove_signal |> THEN { False }
-                    elements.select_clk |> THEN { signal.key == TEXT { clk } |> WHEN { True => True False => selected_once } }
-                    elements.select_reset |> THEN { signal.key == TEXT { reset_n } |> WHEN { True => True False => selected_once } }
-                    elements.select_data |> THEN { signal.key == TEXT { data_bus } |> WHEN { True => True False => selected_once } }
-                    elements.select_temperature |> THEN { signal.key == TEXT { temperature } |> WHEN { True => True False => selected_once } }
-                    elements.selected_remove_clk |> THEN { signal.key == TEXT { clk } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_reset |> THEN { signal.key == TEXT { reset_n } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_data |> THEN { signal.key == TEXT { data_bus } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_data_valid |> THEN { signal.key == TEXT { data_valid } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_data_ready |> THEN { signal.key == TEXT { data_ready } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_state |> THEN { signal.key == TEXT { state } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_error_count |> THEN { signal.key == TEXT { error_count } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_temperature |> THEN { signal.key == TEXT { temperature } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_tx_data |> THEN { signal.key == TEXT { tx_data } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_rx_data |> THEN { signal.key == TEXT { rx_data } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_baud_tick |> THEN { signal.key == TEXT { baud_tick } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_uart_busy |> THEN { signal.key == TEXT { uart_busy } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_ghw_counter |> THEN { signal.key == TEXT { ghw_counter } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_ghw_enable |> THEN { signal.key == TEXT { ghw_enable } |> WHEN { True => False False => selected_once } }
-                    elements.selected_remove_ghw_state |> THEN { signal.key == TEXT { ghw_state } |> WHEN { True => False False => selected_once } }
+                    elements.select_clk |> THEN { signal.key == TEXT { clk } |> WHEN { True => True, False => selected_once } }
+                    elements.select_reset |> THEN { signal.key == TEXT { reset_n } |> WHEN { True => True, False => selected_once } }
+                    elements.select_data |> THEN { signal.key == TEXT { data_bus } |> WHEN { True => True, False => selected_once } }
+                    elements.select_temperature |> THEN { signal.key == TEXT { temperature } |> WHEN { True => True, False => selected_once } }
+                    elements.selected_remove_clk |> THEN { signal.key == TEXT { clk } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_reset |> THEN { signal.key == TEXT { reset_n } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_data |> THEN { signal.key == TEXT { data_bus } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_data_valid |> THEN { signal.key == TEXT { data_valid } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_data_ready |> THEN { signal.key == TEXT { data_ready } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_state |> THEN { signal.key == TEXT { state } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_error_count |> THEN { signal.key == TEXT { error_count } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_temperature |> THEN { signal.key == TEXT { temperature } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_tx_data |> THEN { signal.key == TEXT { tx_data } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_rx_data |> THEN { signal.key == TEXT { rx_data } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_baud_tick |> THEN { signal.key == TEXT { baud_tick } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_uart_busy |> THEN { signal.key == TEXT { uart_busy } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_ghw_counter |> THEN { signal.key == TEXT { ghw_counter } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_ghw_enable |> THEN { signal.key == TEXT { ghw_enable } |> WHEN { True => False, False => selected_once } }
+                    elements.selected_remove_ghw_state |> THEN { signal.key == TEXT { ghw_state } |> WHEN { True => False, False => selected_once } }
                     selected_signal_defaults
                         |> List/filter(item, if: item.item_kind == VariableRow)
                         |> List/map(item, new:

@@ -393,6 +393,24 @@ selected_filter |> WHEN {
 }
 ```
 
+The parser owns one typed pattern representation. It accepts:
+
+- `__`;
+- one lowercase whole-value binding;
+- exact Number or Text literals;
+- one bare Tag;
+- `Tag[field, ...]`, where every listed lowercase name binds that exact
+  inferred payload field without recursively matching it.
+
+Raw object, LIST, MAP, SET, runtime-type, nested payload, renamed payload, and
+dynamic comparison patterns fail in the parser with targeted diagnostics.
+Pattern bindings and field projections are then carried structurally through
+the checked and executable artifacts; typechecking does not recover them by
+scanning source tokens. Fixed-width BITS literal patterns remain unavailable
+until the BITS value phase lands. The legacy `NaN` arm remains temporarily
+accepted only while the binary64 `Text/to_number()` profile still exists; the
+exact Number cut replaces it with `Parsed[...] | InvalidNumber[...]`.
+
 On an absent event input, event-style `WHEN` returns `SKIP`. Value-style `WHEN`
 does not have absence unless the value being matched is itself an event/optional
 value.

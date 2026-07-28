@@ -12,6 +12,12 @@ parser_expectation = "reject"
 fixture = "examples/language_surface/future/bits_fixed_width_literals.bn"
 
 [[feature]]
+id = "closed_truth_tags"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/closed_truth_tags.bn"
+
+[[feature]]
 id = "distributed_role_paths"
 stage = "current"
 parser_expectation = "accept"
@@ -40,12 +46,6 @@ id = "legacy_binary64_numbers"
 stage = "current"
 parser_expectation = "accept"
 fixture = "examples/language_surface/current/legacy_binary64_numbers.bn"
-
-[[feature]]
-id = "legacy_bool_values"
-stage = "current"
-parser_expectation = "accept"
-fixture = "examples/language_surface/current/legacy_bool_values.bn"
 
 [[feature]]
 id = "map_literals"

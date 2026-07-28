@@ -2979,6 +2979,53 @@ document: Document/new(
 }
 
 #[test]
+fn tagged_payload_pattern_lowers_one_exact_document_projection() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "tagged-payload-document-pattern.bn",
+        r#"
+store: [
+    selected: Found[value: TEXT { ready }]
+]
+
+document: Document/new(
+    root: store.selected |> WHEN {
+        Found[value] => Element/text(element: [], style: [], text: value)
+        __ => Element/text(element: [], style: [], text: TEXT { missing })
+    }
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let document = compiled.plan.document.as_ref().expect("document plan");
+    let found = document
+        .expressions
+        .iter()
+        .find_map(|expression| {
+            let DocumentExprOp::Select { arms, .. } = &expression.op else {
+                return None;
+            };
+            arms.iter().find(|arm| {
+                matches!(
+                    arm.pattern,
+                    boon_plan::DocumentPattern::Tag { tag }
+                        if document.names.get(tag.0).map(String::as_str) == Some("Found")
+                )
+            })
+        })
+        .expect("Found select arm");
+    assert_eq!(found.bindings.len(), 1);
+    assert_eq!(
+        found.bindings[0]
+            .projection
+            .iter()
+            .map(|name| document.names[name.0].as_str())
+            .collect::<Vec<_>>(),
+        ["value"]
+    );
+}
+
+#[test]
 fn effect_invocation_identity_tracks_the_direct_result_state() {
     let original = compile_fixture_source_text_to_machine_plan(
         "typed-passkey-effects.bn",

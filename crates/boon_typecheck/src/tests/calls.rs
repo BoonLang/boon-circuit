@@ -2576,18 +2576,22 @@ selected:
 }
 
 #[test]
-fn propagating_error_branches_preserve_the_success_value_type() {
+fn explicit_tagged_result_branches_preserve_the_success_value_type() {
     let parsed = boon_parser::parse_source(
-        "checked-propagating-error-result.bn",
+        "checked-explicit-tagged-result.bn",
         r#"
 FUNCTION parse_number(text) {
     text |> Text/to_number() |> WHILE {
-        NaN => Error/new(code: TEXT { invalid_number })
-        number => number
+        NaN => InvalidNumber[reason: TEXT { invalid_number }]
+        number => Parsed[value: number]
     }
 }
 
-result: parse_number(text: TEXT { 41 }) + 1
+result:
+    parse_number(text: TEXT { 41 }) |> WHEN {
+        Parsed[value] => value + 1
+        InvalidNumber[reason] => 0
+    }
 "#,
     )
     .unwrap();
@@ -2597,13 +2601,15 @@ result: parse_number(text: TEXT { 41 }) + 1
         "diagnostics: {:#?}",
         output.report.diagnostics
     );
-    let program = output.program.expect("error-capable function is checked");
-    let signature = program
-        .callables
+    let result = output
+        .report
+        .named_value_type_table
+        .entries
         .iter()
-        .find(|signature| signature.name == "parse_number")
-        .expect("parse_number signature");
-    assert_eq!(signature.result.ty, Type::Number);
+        .find(|entry| entry.path == "result")
+        .expect("result value");
+    assert_eq!(result.flow_type.ty, Type::Number);
+    assert!(output.program.is_some());
 }
 
 #[test]
@@ -2628,6 +2634,94 @@ selected:
             "tagged pattern `Found[row]` binds unknown payload field `row`; payload fields: value",
         )
     }));
+}
+
+#[test]
+fn bare_tags_reject_payload_field_bindings() {
+    let parsed = boon_parser::parse_source(
+        "checked-bare-tag-payload.bn",
+        r#"
+selected:
+    Ready |> WHEN {
+        Ready[value] => value
+        __ => 0
+    }
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.report.has_errors());
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains(
+            "tagged pattern `Ready[value]` binds unknown payload field `value`; no payload fields",
+        )
+    }));
+}
+
+#[test]
+fn multi_field_tag_patterns_preserve_ordered_payload_projections() {
+    let parsed = boon_parser::parse_source(
+        "checked-multi-field-tag-pattern.bn",
+        r#"
+failure: InvalidNumber[reason: TEXT { invalid digit }, position: 3]
+
+selected:
+    failure |> WHEN {
+        InvalidNumber[reason, position] => reason
+        __ => TEXT { ok }
+    }
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("multi-field pattern is checked");
+    let (fields, bindings) = program
+        .expressions
+        .iter()
+        .find_map(|expression| {
+            let CheckedExpressionKind::MatchArm {
+                pattern: CheckedMatchPattern::Tag { name, fields },
+                bindings,
+                ..
+            } = &expression.kind
+            else {
+                return None;
+            };
+            (name == "InvalidNumber").then_some((fields, bindings))
+        })
+        .expect("checked InvalidNumber arm");
+    assert_eq!(fields, &["reason", "position"]);
+    let binding_names = bindings
+        .iter()
+        .map(|binding| {
+            program
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == *binding)
+                .expect("pattern declaration")
+                .name
+                .as_str()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(binding_names, ["reason", "position"]);
+    for binding in bindings {
+        let declaration = program
+            .declarations
+            .iter()
+            .find(|declaration| declaration.id == *binding)
+            .expect("pattern declaration");
+        let projection = program
+            .pattern_bindings
+            .iter()
+            .find(|candidate| candidate.declaration == *binding)
+            .expect("checked pattern projection");
+        assert_eq!(projection.projection, [declaration.name.clone()]);
+    }
 }
 
 #[test]
@@ -4167,7 +4261,13 @@ result:
 
     let reachable = reachable_static_when_arms(when.id, &parsed.expressions, Some(&trace_edge));
     assert_eq!(reachable.len(), 1, "singleton variants select one arm");
-    assert_eq!(reachable[0].pattern, ["TraceEdge"]);
+    assert_eq!(
+        reachable[0].pattern,
+        AstMatchPattern::Tag {
+            name: "TraceEdge".to_owned(),
+            fields: Vec::new(),
+        }
+    );
 
     let bindings = BTreeMap::from([("choice".to_owned(), trace_edge)]);
     assert_eq!(
@@ -4184,7 +4284,12 @@ result:
     assert_eq!(
         reachable
             .iter()
-            .map(|arm| arm.pattern.join(" "))
+            .map(|arm| match &arm.pattern {
+                AstMatchPattern::Tag { name, .. } | AstMatchPattern::Binding { name } => {
+                    name.clone()
+                }
+                pattern => panic!("unexpected reachable pattern: {pattern:?}"),
+            })
             .collect::<Vec<_>>(),
         vec!["TraceEdge".to_owned(), "fallback".to_owned()],
         "the fallback consumes only variants left by earlier arms and ends ordered matching"

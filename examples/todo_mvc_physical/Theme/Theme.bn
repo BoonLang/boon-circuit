@@ -78,15 +78,23 @@ FUNCTION shared_material(of) {
         Classic => []
 
         __ => BLOCK {
-            divider: LIST { PASSED.theme_options.name, PASSED.theme_options.mode } |> WHEN {
-                LIST { Professional, Light } => TEXT { #e5e8ee }
-                LIST { Professional, Dark } => TEXT { #323840 }
-                LIST { Glassmorphism, Light } => TEXT { #5f71882e }
-                LIST { Glassmorphism, Dark } => TEXT { #b4c3eb29 }
-                LIST { Neobrutalism, Light } => TEXT { #000000 }
-                LIST { Neobrutalism, Dark } => TEXT { #f4f4f4 }
-                LIST { Neumorphism, Light } => TEXT { #a8b2c23d }
-                LIST { Neumorphism, Dark } => TEXT { #ffffff14 }
+            divider: PASSED.theme_options.name |> WHEN {
+                Professional => PASSED.theme_options.mode |> WHEN {
+                    Light => TEXT { #e5e8ee }
+                    Dark => TEXT { #323840 }
+                }
+                Glassmorphism => PASSED.theme_options.mode |> WHEN {
+                    Light => TEXT { #5f71882e }
+                    Dark => TEXT { #b4c3eb29 }
+                }
+                Neobrutalism => PASSED.theme_options.mode |> WHEN {
+                    Light => TEXT { #000000 }
+                    Dark => TEXT { #f4f4f4 }
+                }
+                Neumorphism => PASSED.theme_options.mode |> WHEN {
+                    Light => TEXT { #a8b2c23d }
+                    Dark => TEXT { #ffffff14 }
+                }
                 __ => TEXT { #e5e8ee }
             }
 

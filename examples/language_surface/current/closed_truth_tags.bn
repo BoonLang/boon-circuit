@@ -1,0 +1,8 @@
+enabled: True
+disabled: False
+
+selected:
+    enabled |> WHEN {
+        True => disabled
+        False => enabled
+    }

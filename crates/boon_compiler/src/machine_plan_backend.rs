@@ -11557,13 +11557,7 @@ fn executable_select_pattern(
             value: value.clone(),
         },
         CheckedMatchPattern::NaN => PlanRowSelectPattern::NaN,
-        CheckedMatchPattern::Tag { name } => PlanRowSelectPattern::Tag { name: name.clone() },
-        CheckedMatchPattern::Unknown { tokens } => {
-            return Err(PlanError::new(format!(
-                "unknown checked match pattern `{}`",
-                tokens.join(" ")
-            )));
-        }
+        CheckedMatchPattern::Tag { name, .. } => PlanRowSelectPattern::Tag { name: name.clone() },
     })
 }
 

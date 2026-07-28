@@ -1,4 +1,4 @@
-use boon_parser::{LANGUAGE_FEATURE_REGISTRY, parse_source};
+use boon_parser::{LANGUAGE_FEATURE_REGISTRY, parse_ast, parse_source};
 use std::fs;
 use std::io::{self, BufRead};
 
@@ -16,9 +16,13 @@ fn run() -> Result<(), String> {
     match args.as_slice() {
         [command] if command == "registry" => emit_registry(),
         [command] if command == "verify-fixtures" => verify_fixtures(),
-        _ => Err("usage: language_surface_probe <registry|verify-fixtures>; \
-             verify-fixtures reads tab-separated feature-id, expectation, and path rows from stdin"
-            .to_owned()),
+        [command] if command == "verify-pattern-corpus" => verify_pattern_corpus(),
+        _ => Err(
+            "usage: language_surface_probe <registry|verify-fixtures|verify-pattern-corpus>; \
+             verify-fixtures reads tab-separated feature-id, expectation, and path rows from stdin; \
+             verify-pattern-corpus reads one workspace-relative Boon source path per line"
+                .to_owned(),
+        ),
     }
 }
 
@@ -92,6 +96,28 @@ fn verify_fixtures() -> Result<(), String> {
         return Err("no language-surface fixtures were provided".to_owned());
     }
     println!("verified {verified} language-surface parser fixture(s)");
+    Ok(())
+}
+
+fn verify_pattern_corpus() -> Result<(), String> {
+    let stdin = io::stdin();
+    let mut verified = 0usize;
+    for (index, line) in stdin.lock().lines().enumerate() {
+        let path = line.map_err(|error| format!("stdin row {}: {error}", index + 1))?;
+        if path.is_empty() {
+            continue;
+        }
+        reject_protocol_text(&path)?;
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read Boon source `{path}`: {error}"))?;
+        parse_ast(&path, &source)
+            .map_err(|error| format!("match-pattern corpus rejected `{path}`: {error}"))?;
+        verified += 1;
+    }
+    if verified == 0 {
+        return Err("no Boon source paths were provided".to_owned());
+    }
+    println!("verified {verified} Boon source match-pattern surfaces");
     Ok(())
 }
 

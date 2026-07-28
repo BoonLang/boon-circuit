@@ -163,27 +163,37 @@ needle = "pub bootstrap_source_digest:"
 id = "semantic-program"
 owner_phase = "goal-phase-1-verified-spine"
 owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
-status = "absent"
+status = "present"
 
 [[artifacts.probes]]
-kind = "path-absent"
+kind = "path-exists"
 path = "crates/boon_semantic"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_semantic/src/lib.rs"
+needle = "pub struct SemanticProgram"
 
 [[artifacts]]
 id = "contract-verified-program"
 owner_phase = "goal-phase-1-verified-spine"
 owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
-status = "absent"
+status = "present"
 
 [[artifacts.probes]]
-kind = "path-absent"
+kind = "path-exists"
 path = "crates/boon_verify"
+
+[[artifacts.probes]]
+kind = "text-contains"
+path = "crates/boon_verify/src/lib.rs"
+needle = "pub struct ContractVerifiedProgram"
 
 [[artifacts]]
 id = "erased-program"
 owner_phase = "goal-phase-1-verified-spine"
 owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
-status = "legacy-present"
+status = "present"
 
 [[artifacts.probes]]
 kind = "text-contains"
@@ -287,7 +297,7 @@ path = "target/reports/portfolio-v1/complete.json"
 
 [[version_axes]]
 id = "semantic-value-profile"
-absent = true
+current_version = "ExactNumberSemanticProfileV1"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
 target = "ExactNumberSemanticProfileV1 plus final Tags/BITS/MAP/SET/FLUSH algebra"
@@ -295,7 +305,7 @@ replacement = "Replace unversioned FiniteReal/binary64 and privileged Bool/Null/
 
 [[version_axes]]
 id = "semantic-program-artifact"
-absent = true
+current_version = "boon.semantic-program.v1"
 owner_phase = "goal-phase-1-verified-spine"
 owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
 target = "SemanticProgramV1"
@@ -311,7 +321,7 @@ replacement = "Version the opaque verification-derived executable artifact; the 
 
 [[version_axes]]
 id = "verification-policy"
-absent = true
+current_version = "VerificationPolicyV1"
 owner_phase = "goal-phase-4-formal"
 owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
 target = "VerificationPolicyV1"
@@ -319,7 +329,7 @@ replacement = "Freeze accepted assurance, resource, kernel, and solver policy be
 
 [[version_axes]]
 id = "verification-manifest"
-absent = true
+current_version = "boon.verification-manifest.v1"
 owner_phase = "goal-phase-4-formal"
 owner_plan = "docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md"
 target = "VerificationManifestV1"

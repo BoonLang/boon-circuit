@@ -16,7 +16,7 @@ const DEFAULT_REPORT: &str = "target/reports/phase0-v1/evidence.json";
 const VERSIONS_MANIFEST: &str = "docs/architecture/phase0/versions.toml";
 const DELETION_MANIFEST: &str = "docs/architecture/phase0/deletion_ledger.toml";
 const DELETION_MANIFEST_SHA256: &str =
-    "1c5f8bed6f09de01dd2ffcbd61c4635efe8fc9218c1d870476375e4c202c7f1a";
+    "c8a5997c5678e8dfbe17010d42408225920ee03b0aea9337b25df3ddcabab89d";
 const CONTAINER_MANIFEST: &str = "docs/architecture/phase0/container_inventory.toml";
 #[cfg(test)]
 const CONTAINER_OCCURRENCE_LEDGER: &str = "docs/architecture/phase0/container_occurrences.tsv";
@@ -848,6 +848,12 @@ struct OccurrenceScan {
     allowed_paths: Vec<String>,
 }
 
+struct ScanObservation {
+    occurrences: usize,
+    matched_paths: Vec<String>,
+    path_occurrences: HashMap<String, usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContainerInventoryManifest {
@@ -1093,9 +1099,9 @@ fn validate_versions(
             "caller-controlled-embedded-program-digests",
             ArtifactStatus::Absent,
         ),
-        ("semantic-program", ArtifactStatus::Absent),
-        ("contract-verified-program", ArtifactStatus::Absent),
-        ("erased-program", ArtifactStatus::LegacyPresent),
+        ("semantic-program", ArtifactStatus::Present),
+        ("contract-verified-program", ArtifactStatus::Present),
+        ("erased-program", ArtifactStatus::Present),
         ("machine-plan", ArtifactStatus::Present),
         ("program-artifact-v3", ArtifactStatus::Present),
         ("native-playground-protocol-v13", ArtifactStatus::Present),
@@ -1771,42 +1777,11 @@ fn execute_scan(
             ));
         }
     }
-    let mut occurrences = 0;
-    let mut matched_paths = Vec::new();
-    let mut observed_path_occurrences = HashMap::new();
-    for relative in workspace_files {
-        if scan.excluded_paths.contains(relative) {
-            continue;
-        }
-        if !scan
-            .roots
-            .iter()
-            .any(|root| path_matches_root(relative, root))
-            || !scan
-                .extensions
-                .iter()
-                .any(|extension| path_has_extension(relative, extension))
-        {
-            continue;
-        }
-        if !cache.contains_key(relative) {
-            let text = read_bounded_text(&workspace.join(relative), MAX_TEXT_PROBE_BYTES)
-                .map_err(|error| format!("{relative}: {error}"))?;
-            cache.insert(relative.clone(), text);
-        }
-        let count = count_scan_occurrences(
-            cache
-                .get(relative)
-                .expect("scan cache contains the just-inserted path"),
-            scan,
-        )
-        .map_err(|error| format!("{relative}: {error}"))?;
-        if count > 0 {
-            occurrences += count;
-            matched_paths.push(relative.clone());
-            observed_path_occurrences.insert(relative.clone(), count);
-        }
-    }
+    let ScanObservation {
+        occurrences,
+        matched_paths,
+        path_occurrences: observed_path_occurrences,
+    } = observe_scan(workspace, workspace_files, cache, scan)?;
     if !scan.expected_path_occurrences.is_empty()
         && observed_path_occurrences != scan.expected_path_occurrences
     {
@@ -1851,6 +1826,55 @@ fn execute_scan(
         ));
     }
     Ok(occurrences)
+}
+
+fn observe_scan(
+    workspace: &Path,
+    workspace_files: &[String],
+    cache: &mut HashMap<String, String>,
+    scan: &OccurrenceScan,
+) -> Result<ScanObservation, String> {
+    let mut occurrences = 0;
+    let mut matched_paths = Vec::new();
+    let mut path_occurrences = HashMap::new();
+    for relative in workspace_files {
+        if scan.excluded_paths.contains(relative) {
+            continue;
+        }
+        if !scan
+            .roots
+            .iter()
+            .any(|root| path_matches_root(relative, root))
+            || !scan
+                .extensions
+                .iter()
+                .any(|extension| path_has_extension(relative, extension))
+        {
+            continue;
+        }
+        if !cache.contains_key(relative) {
+            let text = read_bounded_text(&workspace.join(relative), MAX_TEXT_PROBE_BYTES)
+                .map_err(|error| format!("{relative}: {error}"))?;
+            cache.insert(relative.clone(), text);
+        }
+        let count = count_scan_occurrences(
+            cache
+                .get(relative)
+                .expect("scan cache contains the just-inserted path"),
+            scan,
+        )
+        .map_err(|error| format!("{relative}: {error}"))?;
+        if count > 0 {
+            occurrences += count;
+            matched_paths.push(relative.clone());
+            path_occurrences.insert(relative.clone(), count);
+        }
+    }
+    Ok(ScanObservation {
+        occurrences,
+        matched_paths,
+        path_occurrences,
+    })
 }
 
 fn require_exact_source_bundle_scan_root(
@@ -2397,6 +2421,95 @@ fn generate_container_occurrence_ledger(workspace: &Path) -> Result<usize, Strin
     fs::write(&temp_path, output).map_err(|error| error.to_string())?;
     fs::rename(&temp_path, &output_path).map_err(|error| error.to_string())?;
     Ok(occurrences.len())
+}
+
+#[cfg(test)]
+fn regenerate_deletion_scan_expectations(workspace: &Path) -> Result<usize, String> {
+    let manifest_path = workspace.join(DELETION_MANIFEST);
+    let text = read_bounded_text(&manifest_path, MAX_MANIFEST_BYTES)?;
+    let manifest = toml::from_str::<DeletionManifest>(&text)
+        .map_err(|error| format!("{DELETION_MANIFEST}: {error}"))?;
+    let mut document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("{DELETION_MANIFEST}: {error}"))?;
+    let entry_tables = document
+        .get_mut("entries")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .ok_or_else(|| format!("{DELETION_MANIFEST}: entries is not an array of tables"))?;
+    if entry_tables.len() != manifest.entries.len() {
+        return Err(format!(
+            "{DELETION_MANIFEST}: parsed {} entry tables but deserialized {} entries",
+            entry_tables.len(),
+            manifest.entries.len()
+        ));
+    }
+
+    let workspace_files = workspace_files(workspace)?;
+    let mut cache = HashMap::<String, String>::new();
+    let mut updated_scans = 0;
+    for (entry_table, entry) in entry_tables.iter_mut().zip(&manifest.entries) {
+        if entry.scans.is_empty() {
+            if entry_table.get("scans").is_some() {
+                return Err(format!(
+                    "{DELETION_MANIFEST}: entry {} unexpectedly declares scan tables",
+                    entry.id
+                ));
+            }
+            continue;
+        }
+        let scan_tables = entry_table
+            .get_mut("scans")
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+            .ok_or_else(|| {
+                format!(
+                    "{DELETION_MANIFEST}: entry {} scans is not an array of tables",
+                    entry.id
+                )
+            })?;
+        if scan_tables.len() != entry.scans.len() {
+            return Err(format!(
+                "{DELETION_MANIFEST}: entry {} has {} scan tables but {} deserialized scans",
+                entry.id,
+                scan_tables.len(),
+                entry.scans.len()
+            ));
+        }
+        for (scan_table, scan) in scan_tables.iter_mut().zip(&entry.scans) {
+            let observation = observe_scan(workspace, &workspace_files, &mut cache, scan)
+                .map_err(|error| format!("{} {:?}: {error}", entry.id, scan.needle))?;
+            let occurrences = i64::try_from(observation.occurrences)
+                .map_err(|_| "deletion occurrence count exceeds i64".to_owned())?;
+            let files = i64::try_from(observation.matched_paths.len())
+                .map_err(|_| "deletion file count exceeds i64".to_owned())?;
+            scan_table.insert("expected_occurrences", toml_edit::value(occurrences));
+            scan_table.insert("expected_files", toml_edit::value(files));
+
+            let exact_paths = scan.allowed_paths.is_empty()
+                && (observation.matched_paths.len() > 1
+                    || (observation.matched_paths.len() == 1
+                        && !scan.expected_path_occurrences.is_empty()));
+            if exact_paths {
+                let mut paths = observation.path_occurrences.into_iter().collect::<Vec<_>>();
+                paths.sort_by(|left, right| left.0.cmp(&right.0));
+                let mut exact = toml_edit::Table::new();
+                for (path, count) in paths {
+                    let count = i64::try_from(count)
+                        .map_err(|_| "deletion path count exceeds i64".to_owned())?;
+                    exact.insert(&path, toml_edit::value(count));
+                }
+                scan_table.insert("expected_path_occurrences", toml_edit::Item::Table(exact));
+            } else {
+                scan_table.remove("expected_path_occurrences");
+            }
+            updated_scans += 1;
+        }
+    }
+
+    let temp_path =
+        manifest_path.with_extension(format!("toml.phase0-generator-{}", std::process::id()));
+    fs::write(&temp_path, document.to_string()).map_err(|error| error.to_string())?;
+    fs::rename(&temp_path, &manifest_path).map_err(|error| error.to_string())?;
+    Ok(updated_scans)
 }
 
 fn source_line_starts(text: &str) -> Vec<usize> {
@@ -4816,6 +4929,17 @@ mod tests {
             .unwrap();
         let rows = generate_container_occurrence_ledger(&workspace).unwrap();
         assert!(rows > 0);
+    }
+
+    #[test]
+    #[ignore = "updates exact deletion occurrence and per-path expectations"]
+    fn regenerate_deletion_scan_expectations_from_current_worktree() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let scans = regenerate_deletion_scan_expectations(&workspace).unwrap();
+        assert!(scans > 0);
     }
 
     #[test]

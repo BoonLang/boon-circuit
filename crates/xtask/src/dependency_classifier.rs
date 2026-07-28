@@ -1652,8 +1652,8 @@ fields = [
                         fields: vec!["profile".to_owned()],
                     },
                     RustVariantSchema {
-                        name: "Bool".to_owned(),
-                        fields: vec!["value".to_owned()],
+                        name: "Tag".to_owned(),
+                        fields: vec!["name".to_owned()],
                     },
                     RustVariantSchema {
                         name: "ExactInteger".to_owned(),

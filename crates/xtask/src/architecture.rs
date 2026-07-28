@@ -2894,8 +2894,11 @@ macro_rules! diagnostic_text {
         let error = verify_semantic_mapping_contract(&missing_totality).unwrap_err();
         assert!(error.contains("states"), "{error}");
 
-        let missing_bijection =
-            mapping.replacen("collect::<BTreeSet<_>>()", "collect::<Vec<_>>()", 1);
+        let missing_bijection = mapping.replacen(
+            "let unique_expressions = expressions.iter().copied().collect::<BTreeSet<_>>();",
+            "let unique_expressions = expressions.iter().copied().collect::<Vec<_>>();",
+            1,
+        );
         let error = verify_semantic_mapping_contract(&missing_bijection).unwrap_err();
         assert!(error.contains("bijection"), "{error}");
 

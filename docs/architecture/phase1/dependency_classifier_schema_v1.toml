@@ -226,6 +226,14 @@ hash_targets = ["implementation_dependency", "proof_context"]
 erasure = "normalize_then_erase"
 
 [[dispositions]]
+id = "a-fca-priv-sp-id-n"
+traversal = "semantic_atom"
+roles = ["formula_binder", "coverage_or_routing", "assurance_or_activation"]
+visibility = "private"
+hash_targets = ["semantic_program", "implementation_dependency"]
+erasure = "normalize_then_erase"
+
+[[dispositions]]
 id = "a-fca-priv-sp-id-pc-n"
 traversal = "semantic_atom"
 roles = ["formula_binder", "coverage_or_routing", "assurance_or_activation"]
@@ -600,6 +608,14 @@ roles = ["formula_binder", "coverage_or_routing", "assurance_or_activation"]
 visibility = "private"
 hash_targets = ["proof_context", "obligation", "evidence_cache"]
 erasure = "erase_after_verification"
+
+[[dispositions]]
+id = "r-fca-priv-sp-id-n"
+traversal = "recurse"
+roles = ["formula_binder", "coverage_or_routing", "assurance_or_activation"]
+visibility = "private"
+hash_targets = ["semantic_program", "implementation_dependency"]
+erasure = "normalize_then_erase"
 
 [[dispositions]]
 id = "r-fca-priv-sp-id-pc-n"
@@ -1900,11 +1916,26 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Bool"
+name = "Absent"
+disposition = "a-fc-priv-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Flush"
 disposition = "r-fc-priv-id-pc-n"
 reviewed = true
 fields = [
-  { name = "0", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "payload", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "FlushBoundary"
+disposition = "r-fc-priv-id-pc-n"
+reviewed = true
+fields = [
+  { name = "input", disposition = "r-fc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -2018,14 +2049,6 @@ fields = [
 
 [[records.variants]]
 name = "Object"
-disposition = "r-fc-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "0", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Record"
 disposition = "r-fc-priv-id-pc-n"
 reviewed = true
 fields = [
@@ -2520,14 +2543,6 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Bool"
-disposition = "r-fc-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "value", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
 name = "Bytes"
 disposition = "r-fc-priv-id-pc-n"
 reviewed = true
@@ -2537,11 +2552,11 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Enum"
+name = "Tag"
 disposition = "r-fc-priv-id-pc-n"
 reviewed = true
 fields = [
-  { name = "value", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "name", disposition = "a-fc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -6550,11 +6565,26 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Bool"
-disposition = "r-fc-priv-sp-id-n"
+name = "Absent"
+disposition = "a-fc-priv-sp-id-pc-n"
 reviewed = true
 fields = [
-  { name = "0", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Flush"
+disposition = "r-fc-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "payload", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "FlushBoundary"
+disposition = "r-fc-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "input", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -6676,14 +6706,6 @@ fields = [
 
 [[records.variants]]
 name = "Object"
-disposition = "r-fc-priv-sp-id-n"
-reviewed = true
-fields = [
-  { name = "0", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Record"
 disposition = "r-fc-priv-sp-id-n"
 reviewed = true
 fields = [
@@ -9339,14 +9361,6 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Bool"
-disposition = "r-f-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "value", disposition = "r-f-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
 name = "Bytes"
 disposition = "r-f-priv-sp-id-pc-n"
 reviewed = true
@@ -9356,11 +9370,11 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Enum"
-disposition = "r-f-priv-sp-id-pc-n"
+name = "Tag"
+disposition = "r-fc-priv-sp-id-pc-n"
 reviewed = true
 fields = [
-  { name = "value", disposition = "r-f-priv-sp-id-pc-n", reviewed = true },
+  { name = "name", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -10031,6 +10045,14 @@ disposition = "r-frc-priv-sp-id-pc-n"
 reviewed = true
 fields = [
   { name = "field", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "StateAuthority"
+disposition = "r-frc-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "state", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -11051,6 +11073,7 @@ fields = [
   { name = "scope_id", disposition = "r-fc-priv-sp-id-n", reviewed = true },
   { name = "declaration", disposition = "r-f-priv-sp-id-n", reviewed = true },
   { name = "flow_type", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "flush_type", disposition = "r-fc-priv-sp-id-n", reviewed = true },
   { name = "effect", disposition = "r-f-priv-sp-id-n", reviewed = true },
   { name = "kind", disposition = "r-fc-priv-sp-id-n", reviewed = true },
   { name = "span", disposition = "r-fd-diag-sp-id-n", reviewed = true },
@@ -11132,11 +11155,18 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Bool"
+name = "Absent"
+disposition = "a-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Flush"
 disposition = "r-fc-priv-sp-id-n"
 reviewed = true
 fields = [
-  { name = "value", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "payload", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -11254,14 +11284,6 @@ fields = [
 
 [[records.variants]]
 name = "Object"
-disposition = "r-fc-priv-sp-id-n"
-reviewed = true
-fields = [
-  { name = "fields", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Record"
 disposition = "r-fc-priv-sp-id-n"
 reviewed = true
 fields = [
@@ -11401,14 +11423,6 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Bool"
-disposition = "r-f-priv-sp-id-n"
-reviewed = true
-fields = [
-  { name = "value", disposition = "r-f-priv-sp-id-n", reviewed = true },
-]
-
-[[records.variants]]
 name = "Number"
 disposition = "r-f-priv-sp-id-n"
 reviewed = true
@@ -11425,18 +11439,12 @@ fields = [
 ]
 
 [[records.variants]]
-name = "NaN"
-disposition = "r-f-priv-sp-id-n"
-reviewed = true
-fields = [
-]
-
-[[records.variants]]
 name = "Tag"
 disposition = "r-f-priv-sp-id-n"
 reviewed = true
 fields = [
   { name = "name", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "fields", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -11445,14 +11453,6 @@ disposition = "r-f-priv-sp-id-n"
 reviewed = true
 fields = [
   { name = "name", disposition = "r-f-priv-sp-id-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Unknown"
-disposition = "n-x-priv-id-x"
-reviewed = true
-fields = [
-  { name = "tokens", disposition = "r-f-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]
@@ -11533,11 +11533,11 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Bool"
-disposition = "r-f-priv-sp-id-n"
+name = "Tag"
+disposition = "r-fca-priv-sp-id-n"
 reviewed = true
 fields = [
-  { name = "value", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "name", disposition = "a-fca-priv-sp-id-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -12560,8 +12560,8 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Skip"
-disposition = "r-f-priv-sp-id-n"
+name = "Absent"
+disposition = "a-fc-priv-sp-id-n"
 reviewed = true
 fields = [
 ]
@@ -12627,6 +12627,14 @@ name = "Unknown"
 disposition = "n-x-priv-id-x"
 reviewed = true
 fields = [
+]
+
+[[records.variants]]
+name = "Union"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "0", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]

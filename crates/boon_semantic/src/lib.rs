@@ -37,8 +37,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x62, 0xf4, 0x4e, 0x8b, 0xf7, 0xb0, 0x5e, 0x80, 0x1c, 0x84, 0xcd, 0x1a, 0x80, 0x1e, 0xee, 0xd3,
-    0x5c, 0xbd, 0xbd, 0x9b, 0x32, 0xd1, 0x9f, 0xf5, 0x3b, 0xfd, 0x05, 0xf4, 0xa0, 0x50, 0x4c, 0x5a,
+    0xa4, 0x68, 0x59, 0x04, 0x57, 0x50, 0x38, 0xc7, 0x3b, 0x6e, 0x46, 0xb1, 0x6a, 0xa5, 0x08, 0x88,
+    0x19, 0x0b, 0x94, 0x74, 0x3e, 0xb8, 0x9e, 0xe5, 0x09, 0xe9, 0xb9, 0xf4, 0x07, 0x61, 0x4e, 0x32,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -3205,14 +3205,6 @@ fn concrete_checked_expression_type(
                     &expression.flow_type.ty,
                     &expression_substitutions,
                 );
-                if out_contract_type_is_resolved(&expression_actual) {
-                    // Checked read types are expression-local.  In particular,
-                    // a read inside a tagged WHEN arm already carries the
-                    // structurally narrowed payload type, while its declaration
-                    // still owns the complete variant set.  Re-projecting the
-                    // declaration here would discard that arm-local proof.
-                    return Ok(expression_actual);
-                }
                 let output_actual = scoped
                     .evaluation_port
                     .map(|port_id| {
@@ -3283,6 +3275,40 @@ fn concrete_checked_expression_type(
                     })
                     .transpose()?
                     .flatten();
+                if let Some(output_actual) = output_actual {
+                    let projected_output = project_out_contract_type(output_actual, projection)
+                        .map_err(|error| {
+                            SemanticError::new(format!(
+                                "READ expression {} evaluation-port projection: {error}",
+                                scoped.expression.0
+                            ))
+                        })?;
+                    if out_contract_type_is_resolved(&expression_actual)
+                        && unify_out_contract_type(
+                            &projected_output,
+                            &expression_actual,
+                            &mut BTreeMap::new(),
+                        )
+                        .is_ok()
+                    {
+                        // The checked expression may carry a stricter
+                        // arm-local refinement than the port's concrete item
+                        // contract.
+                        return Ok(expression_actual);
+                    }
+                    // Builtin type variables are reused across call frames.
+                    // The exact evaluation port owns this read; a flat nested
+                    // substitution snapshot must not reinterpret its item.
+                    return Ok(projected_output);
+                }
+                if out_contract_type_is_resolved(&expression_actual) {
+                    // Checked read types are expression-local.  In particular,
+                    // a read inside a tagged WHEN arm already carries the
+                    // structurally narrowed payload type, while its declaration
+                    // still owns the complete variant set.  Re-projecting the
+                    // declaration here would discard that arm-local proof.
+                    return Ok(expression_actual);
+                }
                 let frame_actual = scoped
                     .frame
                     .map(|frame| {
@@ -3316,7 +3342,7 @@ fn concrete_checked_expression_type(
                         }
                     })
                     .transpose()?;
-                let base = match output_actual.or(frame_actual) {
+                let base = match frame_actual {
                     Some(actual) => actual,
                     None => program
                         .declarations
@@ -5676,6 +5702,64 @@ store: [
                         && authority.role == SemanticValueListRoleV1::InlineValue
                 }),
             "the fallback literal must retain a distinct inline-value authority"
+        );
+    }
+
+    #[test]
+    fn out_contract_keeps_captured_parameter_distinct_from_map_item() {
+        let parsed = boon_parser::parse_source(
+            "semantic-captured-map-parameter.bn",
+            r#"
+store: [
+    rows:
+        LIST {
+            [
+                bit_width: TEXT { 8 }
+                formatter: Hexadecimal
+                segments: LIST {
+                    [value: TEXT { a }]
+                }
+            ]
+        }
+        |> List/map(item, new: render(signal: item))
+]
+
+FUNCTION render(signal) {
+    signal.segments
+    |> List/map(item, new:
+        decorate(segment: item, signal: signal)
+    )
+}
+
+FUNCTION decorate(segment, signal) {
+    [
+        value: segment.value
+        label: signal.bit_width
+        format: signal.formatter
+    ]
+}
+"#,
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "captured map parameter fixture must typecheck: {:#?}",
+            checked.report.diagnostics
+        );
+        let semantic = elaborate(
+            checked
+                .program
+                .expect("captured map parameter fixture has a checked program"),
+            &[],
+        )
+        .expect("captured parameter keeps its frame type beneath the map item port");
+        assert!(
+            semantic
+                .resolved_out_graph()
+                .ports
+                .iter()
+                .all(|port| out_contract_type_is_resolved(&port.contract.resolved_type))
         );
     }
 

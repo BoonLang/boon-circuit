@@ -197,7 +197,7 @@ units = [
   "examples/cells/store.bn",
   "examples/cells/view.bn",
 ]
-source_bundle_digest_v1 = "dc172ca8bf4fcd11b93d23fc26360a6e5d4057500013e6f733f04d32df70e224"
+source_bundle_digest_v1 = "079c4ba86093e022830fbcfad6d02e5be528240caad11db7b4833fc7add65409"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
 
@@ -272,7 +272,7 @@ units = [
   "examples/novywave/View/NovyView.bn",
   "examples/novywave/hold.bn",
 ]
-source_bundle_digest_v1 = "94710542ea8dc264597531e21ba79a489aba2401bf8ea14511febcb3b7e3a2bc"
+source_bundle_digest_v1 = "44c3afb53fd95ba487e6f1a89d8ee8154e3e156931f74fe03dbc050597ff834e"
 owner_phase = "goal-phase-6-web-persistence"
 owner_plan = "docs/plans/NOVYWAVE_BOON_REWRITE_PLAN.md"
 

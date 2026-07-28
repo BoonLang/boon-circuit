@@ -2237,7 +2237,7 @@ FUNCTION place(id, name, x, y) {
             .unwrap()
             .value,
         InitialValue::Data {
-            value: boon_data::Value::Record(fields),
+            value: boon_data::Value::Object(fields),
         } if fields.len() == 2
     ));
 }

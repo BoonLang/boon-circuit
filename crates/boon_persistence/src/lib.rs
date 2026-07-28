@@ -1549,9 +1549,11 @@ fn validate_stored_value_type(
     path: &str,
 ) -> Result<(), StoreError> {
     let valid = match (value, data_type) {
-        (StoredValue::Null, DataTypePlan::Null)
-        | (StoredValue::Bool(_), DataTypePlan::Bool)
-        | (StoredValue::Number(_), DataTypePlan::Number)
+        (StoredValue::Tag { tag, fields }, DataTypePlan::Null) => {
+            tag == "Null" && fields.is_empty()
+        }
+        (value, DataTypePlan::Bool) => value.as_truth().is_some(),
+        (StoredValue::Number(_), DataTypePlan::Number)
         | (StoredValue::Text(_), DataTypePlan::Text) => true,
         (StoredValue::Bytes(value), DataTypePlan::Bytes { fixed_len }) => {
             fixed_len.is_none_or(|expected| u64::try_from(value.len()).ok() == Some(expected))
@@ -1562,11 +1564,11 @@ fn validate_stored_value_type(
             }
             true
         }
-        (StoredValue::Record(values), DataTypePlan::Record { fields, open }) => {
+        (StoredValue::Object(values), DataTypePlan::Record { fields, open }) => {
             validate_stored_fields(values, fields, *open, path)?;
             true
         }
-        (StoredValue::Variant { tag, fields }, DataTypePlan::Variant { variants }) => {
+        (StoredValue::Tag { tag, fields }, DataTypePlan::Variant { variants }) => {
             let variant = variants
                 .iter()
                 .find(|variant| &variant.tag == tag)
@@ -1579,7 +1581,7 @@ fn validate_stored_value_type(
             true
         }
         (
-            StoredValue::Error { fields, .. },
+            StoredValue::Tag { fields, .. },
             DataTypePlan::Error {
                 fields: expected,
                 open,
@@ -2586,42 +2588,33 @@ fn hash_stored_row(hasher: &mut Sha256, row: &StoredRow) {
 
 fn hash_stored_value(hasher: &mut Sha256, value: &StoredValue) {
     match value {
-        StoredValue::Null => hasher.update([0]),
-        StoredValue::Bool(value) => {
-            hasher.update([1, u8::from(*value)]);
-        }
         StoredValue::Number(value) => {
-            hasher.update([10]);
+            hasher.update([20]);
             hasher.update(value.get().to_bits().to_be_bytes());
         }
         StoredValue::Text(value) => {
-            hasher.update([3]);
+            hasher.update([21]);
             hash_text(hasher, value);
         }
         StoredValue::Bytes(value) => {
-            hasher.update([4]);
+            hasher.update([22]);
             hasher.update((value.len() as u64).to_be_bytes());
             hasher.update(value);
         }
         StoredValue::List(values) => {
-            hasher.update([5]);
+            hasher.update([23]);
             hasher.update((values.len() as u64).to_be_bytes());
             for value in values {
                 hash_stored_value(hasher, value);
             }
         }
-        StoredValue::Record(fields) => {
-            hasher.update([6]);
+        StoredValue::Object(fields) => {
+            hasher.update([24]);
             hash_value_fields(hasher, fields);
         }
-        StoredValue::Variant { tag, fields } => {
-            hasher.update([7]);
+        StoredValue::Tag { tag, fields } => {
+            hasher.update([25]);
             hash_text(hasher, tag);
-            hash_value_fields(hasher, fields);
-        }
-        StoredValue::Error { code, fields } => {
-            hasher.update([8]);
-            hash_text(hasher, code);
             hash_value_fields(hasher, fields);
         }
     }
@@ -3072,7 +3065,7 @@ mod tests {
                 memory_id: memory("must_not_commit"),
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Bool(true),
+                    value: StoredValue::truth(true),
                 },
             }],
         );
@@ -3321,7 +3314,7 @@ mod tests {
             invocation(),
             effect(),
             number(key),
-            StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(key * 10))])),
+            StoredValue::Object(BTreeMap::from([("amount".to_owned(), number(key * 10))])),
             DurableOwner::default(),
             None,
             turn_sequence,
@@ -3330,7 +3323,7 @@ mod tests {
 
     #[test]
     fn indexed_effect_rows_keep_distinct_local_completion_obligations() {
-        let intent = StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(10))]));
+        let intent = StoredValue::Object(BTreeMap::from([("amount".to_owned(), number(10))]));
         let key = canonical_intent_key(&intent);
         let row = |row_key| DurableRowId {
             list_memory_id: memory("todos"),
@@ -3685,7 +3678,7 @@ mod tests {
                 memory_id: memory("must_not_commit"),
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Bool(true),
+                    value: StoredValue::truth(true),
                 },
             }],
             outbox_changes: vec![DurableOutboxChange::BeginDispatch {
@@ -3737,7 +3730,7 @@ mod tests {
                 memory_id: outcome_memory,
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Bool(true),
+                    value: StoredValue::truth(true),
                 },
             }],
             outbox_changes: completions,
@@ -3753,7 +3746,7 @@ mod tests {
         assert!(image.outbox.is_empty());
         assert_eq!(
             image.scalars[&outcome_memory].value,
-            StoredValue::Bool(true)
+            StoredValue::truth(true)
         );
         let snapshot = match driver.execute(PersistenceCommand::Inspect(InspectRequest {
             application: application(),

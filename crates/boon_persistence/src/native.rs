@@ -2615,7 +2615,7 @@ mod tests {
             boon_plan::EffectInvocationId::from_result_owner(effect, "store.result").unwrap(),
             effect,
             StoredValue::Text("request-1".to_owned()),
-            StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(12))])),
+            StoredValue::Object(BTreeMap::from([("amount".to_owned(), number(12))])),
             crate::DurableOwner::default(),
             None,
             turn_sequence,
@@ -3303,7 +3303,7 @@ mod tests {
                 memory_id: pending_memory,
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Bool(true),
+                    value: StoredValue::truth(true),
                 },
             }],
             vec![super::super::DurableOutboxChange::Enqueue { item: item.clone() }],
@@ -3319,7 +3319,7 @@ mod tests {
         assert_eq!(restored.outbox[&item_id].state, DurableOutboxState::Pending);
         assert_eq!(
             restored.scalars[&pending_memory].value,
-            StoredValue::Bool(true)
+            StoredValue::truth(true)
         );
         let dispatch = checkpoint(
             app.clone(),
@@ -3366,7 +3366,7 @@ mod tests {
                 memory_id: completed_memory,
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Bool(true),
+                    value: StoredValue::truth(true),
                 },
             }],
             vec![super::super::DurableOutboxChange::Complete {
@@ -3389,7 +3389,7 @@ mod tests {
         );
         assert_eq!(
             acknowledged.scalars[&completed_memory].value,
-            StoredValue::Bool(true)
+            StoredValue::truth(true)
         );
         assert!(matches!(
             driver.execute(PersistenceCommand::Commit(outcome)),

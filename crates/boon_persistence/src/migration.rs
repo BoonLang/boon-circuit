@@ -629,7 +629,7 @@ fn scalar_inputs(
         let value = if input.leaves.len() == 1 {
             leaves.into_values().next().expect("one input leaf exists")
         } else {
-            StoredValue::Record(leaves)
+            StoredValue::Object(leaves)
         };
         values.insert(input.input_id, value);
     }
@@ -657,9 +657,9 @@ fn write_scalar_destination(
             .entry(transfer.destination.memory_id)
             .or_insert_with(|| StoredScalar {
                 touched: true,
-                value: StoredValue::Record(BTreeMap::new()),
+                value: StoredValue::Object(BTreeMap::new()),
             });
-        let StoredValue::Record(fields) = &mut scalar.value else {
+        let StoredValue::Object(fields) = &mut scalar.value else {
             return Err(MigrationError::InvalidTransfer(
                 "multiple destination leaves require record authority".to_owned(),
             ));
@@ -735,7 +735,7 @@ fn apply_indexed_transfer(
             let value = if input.leaves.len() == 1 {
                 fields.into_values().next().expect("one row input exists")
             } else {
-                StoredValue::Record(fields)
+                StoredValue::Object(fields)
             };
             inputs.insert(input.input_id, value);
         }
@@ -835,12 +835,9 @@ fn evaluate_expression(
             Ok(StoredValue::Text(text))
         }
         MigrationExpressionPlan::Number { value } => Ok(StoredValue::Number(*value)),
-        MigrationExpressionPlan::Bool { value } => Ok(StoredValue::Bool(*value)),
-        MigrationExpressionPlan::Variant { tag } => Ok(StoredValue::Variant {
-            tag: tag.clone(),
-            fields: BTreeMap::new(),
-        }),
-        MigrationExpressionPlan::Tagged { tag, fields } => Ok(StoredValue::Variant {
+        MigrationExpressionPlan::Bool { value } => Ok(StoredValue::truth(*value)),
+        MigrationExpressionPlan::Variant { tag } => Ok(StoredValue::tag(tag)),
+        MigrationExpressionPlan::Tagged { tag, fields } => Ok(StoredValue::Tag {
             tag: tag.clone(),
             fields: evaluate_fields(fields, inputs, parameters)?,
         }),
@@ -887,7 +884,7 @@ fn evaluate_expression(
             evaluate_expression(left, inputs, parameters)?,
             evaluate_expression(right, inputs, parameters)?,
         ),
-        MigrationExpressionPlan::Record { fields } => Ok(StoredValue::Record(evaluate_fields(
+        MigrationExpressionPlan::Record { fields } => Ok(StoredValue::Object(evaluate_fields(
             fields, inputs, parameters,
         )?)),
         MigrationExpressionPlan::List { items } => Ok(StoredValue::List(
@@ -934,8 +931,6 @@ fn evaluate_expression(
 
 fn migration_value_text(value: &StoredValue) -> Result<String, MigrationError> {
     match value {
-        StoredValue::Null => Ok(String::new()),
-        StoredValue::Bool(value) => Ok(if *value { "True" } else { "False" }.to_owned()),
         StoredValue::Number(value) => Ok(value.to_string()),
         StoredValue::Text(value) => Ok(value.clone()),
         StoredValue::Bytes(value) => String::from_utf8(value.to_vec()).map_err(|error| {
@@ -943,13 +938,12 @@ fn migration_value_text(value: &StoredValue) -> Result<String, MigrationError> {
                 "text interpolation contains invalid UTF-8: {error}"
             ))
         }),
-        StoredValue::Variant { tag, fields } => fields
+        StoredValue::Tag { tag, fields } => fields
             .get("text")
             .map(migration_value_text)
             .transpose()
             .map(|value| value.unwrap_or_else(|| tag.clone())),
-        StoredValue::Error { code, .. } => Ok(code.clone()),
-        StoredValue::Record(fields) => fields
+        StoredValue::Object(fields) => fields
             .get("text")
             .map(migration_value_text)
             .transpose()?
@@ -971,14 +965,14 @@ fn stored_value_matches_pattern(
     match pattern {
         boon_plan::PlanRowSelectPattern::Wildcard => true,
         boon_plan::PlanRowSelectPattern::Bool { value: expected } => {
-            value == &StoredValue::Bool(*expected)
+            value.as_truth() == Some(*expected)
         }
         boon_plan::PlanRowSelectPattern::Number { value: expected } => {
             value == &StoredValue::Number(*expected)
         }
         boon_plan::PlanRowSelectPattern::Text { value: expected } => {
             matches!(value, StoredValue::Text(value) if value == expected)
-                || matches!(value, StoredValue::Variant { tag, .. } | StoredValue::Error { code: tag, .. } if tag == expected)
+                || matches!(value, StoredValue::Tag { tag, .. } if tag == expected)
         }
         boon_plan::PlanRowSelectPattern::NaN => {
             matches!(value, StoredValue::Text(value) if value == "NaN")
@@ -1029,10 +1023,14 @@ fn evaluate_call(
         })
     };
     match function {
-        "Bool/not" => match input.or_else(|| named_value("value")) {
-            Some(StoredValue::Bool(value)) => Ok(StoredValue::Bool(!value)),
+        "Bool/not" => match input
+            .or_else(|| named_value("value"))
+            .as_ref()
+            .and_then(StoredValue::as_truth)
+        {
+            Some(value) => Ok(StoredValue::truth(!value)),
             _ => Err(MigrationError::Evaluation(
-                "Bool/not requires one boolean".to_owned(),
+                "Bool/not requires one True or False Tag".to_owned(),
             )),
         },
         "Number/to_text" => {
@@ -1054,12 +1052,11 @@ fn evaluate_call(
                     .transpose()
             };
             let prefix = match named_value("prefix") {
-                Some(StoredValue::Bool(value)) => value,
-                Some(_) => {
-                    return Err(MigrationError::Evaluation(
-                        "Number/to_text prefix must be Bool".to_owned(),
-                    ));
-                }
+                Some(value) => value.as_truth().ok_or_else(|| {
+                    MigrationError::Evaluation(
+                        "Number/to_text prefix must be True or False".to_owned(),
+                    )
+                })?,
                 None => false,
             };
             let radix = integer_arg("radix")?.unwrap_or(10);
@@ -1103,7 +1100,7 @@ fn evaluate_call(
             Ok(StoredValue::Text(parts.concat()))
         }
         "Text/is_empty" => match input.or_else(|| named_value("input")) {
-            Some(StoredValue::Text(value)) => Ok(StoredValue::Bool(value.is_empty())),
+            Some(StoredValue::Text(value)) => Ok(StoredValue::truth(value.is_empty())),
             _ => Err(MigrationError::Evaluation(
                 "Text/is_empty requires one text value".to_owned(),
             )),
@@ -1182,14 +1179,20 @@ fn evaluate_infix(
         ("/", StoredValue::Number(left), StoredValue::Number(right)) => {
             stored_number_result(left.get() / right.get())
         }
-        ("==", left, right) => Ok(StoredValue::Bool(left == right)),
-        ("!=", left, right) => Ok(StoredValue::Bool(left != right)),
-        ("&&", StoredValue::Bool(left), StoredValue::Bool(right)) => {
-            Ok(StoredValue::Bool(left && right))
-        }
-        ("||", StoredValue::Bool(left), StoredValue::Bool(right)) => {
-            Ok(StoredValue::Bool(left || right))
-        }
+        ("==", left, right) => Ok(StoredValue::truth(left == right)),
+        ("!=", left, right) => Ok(StoredValue::truth(left != right)),
+        ("&&", left, right) => match (left.as_truth(), right.as_truth()) {
+            (Some(left), Some(right)) => Ok(StoredValue::truth(left && right)),
+            _ => Err(MigrationError::Evaluation(
+                "migration && requires True or False Tags".to_owned(),
+            )),
+        },
+        ("||", left, right) => match (left.as_truth(), right.as_truth()) {
+            (Some(left), Some(right)) => Ok(StoredValue::truth(left || right)),
+            _ => Err(MigrationError::Evaluation(
+                "migration || requires True or False Tags".to_owned(),
+            )),
+        },
         ("+", StoredValue::Text(left), StoredValue::Text(right)) => {
             Ok(StoredValue::Text(left + &right))
         }
@@ -1201,9 +1204,7 @@ fn evaluate_infix(
 
 fn project_stored_field(value: &StoredValue, field: &str) -> Result<StoredValue, MigrationError> {
     let fields = match value {
-        StoredValue::Record(fields)
-        | StoredValue::Variant { fields, .. }
-        | StoredValue::Error { fields, .. } => fields,
+        StoredValue::Object(fields) | StoredValue::Tag { fields, .. } => fields,
         _ => {
             return Err(MigrationError::Evaluation(format!(
                 "cannot project field `{field}` from a non-record value"
@@ -1218,23 +1219,22 @@ fn project_stored_field(value: &StoredValue, field: &str) -> Result<StoredValue,
 
 fn stored_tag(value: &StoredValue) -> &str {
     match value {
-        StoredValue::Bool(true) => "True",
-        StoredValue::Bool(false) => "False",
-        StoredValue::Variant { tag, .. } | StoredValue::Error { code: tag, .. } => tag,
-        StoredValue::Null => "Null",
+        StoredValue::Tag { tag, .. } => tag,
         StoredValue::Number(_) => "Number",
         StoredValue::Text(value) => value,
         StoredValue::Bytes(_) => "Bytes",
         StoredValue::List(_) => "List",
-        StoredValue::Record(_) => "Record",
+        StoredValue::Object(_) => "Object",
     }
 }
 
 fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<(), MigrationError> {
     let valid = match (value, data_type) {
         (_, DataTypePlan::Unknown) => true,
-        (StoredValue::Null, DataTypePlan::Null) => true,
-        (StoredValue::Bool(_), DataTypePlan::Bool) => true,
+        (StoredValue::Tag { tag, fields }, DataTypePlan::Null) => {
+            tag == "Null" && fields.is_empty()
+        }
+        (value, DataTypePlan::Bool) => value.as_truth().is_some(),
         (StoredValue::Number(_), DataTypePlan::Number) => true,
         (StoredValue::Text(_), DataTypePlan::Text) => true,
         (StoredValue::Bytes(value), DataTypePlan::Bytes { fixed_len }) => {
@@ -1243,7 +1243,7 @@ fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<()
         (StoredValue::Text(tag), DataTypePlan::Variant { variants }) => {
             variants.iter().any(|variant| variant.tag == *tag)
         }
-        (StoredValue::Variant { tag, fields }, DataTypePlan::Variant { variants }) => variants
+        (StoredValue::Tag { tag, fields }, DataTypePlan::Variant { variants }) => variants
             .iter()
             .find(|variant| variant.tag == *tag)
             .is_some_and(|variant| {
@@ -1254,7 +1254,7 @@ fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<()
                             .is_some_and(|value| ensure_value_type(value, &field.data_type).is_ok())
                     })
             }),
-        (StoredValue::Record(values), DataTypePlan::Record { fields, open }) => {
+        (StoredValue::Object(values), DataTypePlan::Record { fields, open }) => {
             (*open || values.len() == fields.len())
                 && fields.iter().all(|field| {
                     values
@@ -1265,7 +1265,7 @@ fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<()
         (StoredValue::List(values), DataTypePlan::List { item }) => values
             .iter()
             .all(|value| ensure_value_type(value, item).is_ok()),
-        (StoredValue::Error { fields: values, .. }, DataTypePlan::Error { fields, open }) => {
+        (StoredValue::Tag { fields: values, .. }, DataTypePlan::Error { fields, open }) => {
             (*open || values.len() == fields.len())
                 && fields.iter().all(|field| {
                     values
@@ -1647,7 +1647,7 @@ mod tests {
             invocation_id,
             effect_id,
             number(9),
-            StoredValue::Record(BTreeMap::new()),
+            StoredValue::Object(BTreeMap::new()),
             DurableOwner {
                 ancestors: vec![row],
             },

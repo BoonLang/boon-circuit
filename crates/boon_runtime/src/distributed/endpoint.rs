@@ -677,11 +677,12 @@ impl EndpointRuntime {
                     sequence,
                 )?;
                 let mut payload = SourcePayload::default();
-                let value = Value::from_data(&value);
-                match &import.payload_field {
-                    Some(field) => set_source_payload_value(&mut payload, field, value)?,
-                    None if value == Value::Null => {}
-                    None => return Err(DistributedRuntimeError::InvalidTransportFrame),
+                match (&import.payload_field, value) {
+                    (Some(field), Some(value)) => {
+                        set_source_payload_value(&mut payload, field, Value::from_data(&value))?
+                    }
+                    (None, None) => {}
+                    _ => return Err(DistributedRuntimeError::InvalidTransportFrame),
                 }
                 let event = self
                     .machine

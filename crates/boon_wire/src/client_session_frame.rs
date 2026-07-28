@@ -4,7 +4,7 @@ use minicbor::data::Type;
 use minicbor::{Decoder, Encoder};
 use std::fmt;
 
-pub const CLIENT_SESSION_PROTOCOL_VERSION: u16 = 4;
+pub const CLIENT_SESSION_PROTOCOL_VERSION: u16 = 5;
 
 const DATA_KIND: u8 = 0;
 const ACK_KIND: u8 = 1;
@@ -47,6 +47,10 @@ impl ClientSessionDataOperation {
         matches!(self, Self::CurrentCallResult)
     }
 
+    pub const fn requires_payload(self) -> bool {
+        !matches!(self, Self::CurrentCallDetach)
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::Current => "Current",
@@ -81,7 +85,7 @@ pub enum ClientSessionFrame {
         call_instance_id: Option<[u8; 32]>,
         semantic_revision: u64,
         result_revision: Option<u64>,
-        payload: Value,
+        payload: Option<Value>,
     },
     Ack {
         session_id: SessionId,
@@ -170,6 +174,15 @@ pub enum ClientSessionFrameError {
     InvalidResultRevisionEncoding {
         operation: ClientSessionDataOperation,
     },
+    MissingPayload {
+        operation: ClientSessionDataOperation,
+    },
+    UnexpectedPayload {
+        operation: ClientSessionDataOperation,
+    },
+    InvalidPayloadEncoding {
+        operation: ClientSessionDataOperation,
+    },
     InvalidFieldWidth {
         field: ClientSessionFrameField,
         actual: usize,
@@ -255,6 +268,27 @@ impl fmt::Display for ClientSessionFrameError {
                     operation.label()
                 )
             }
+            Self::MissingPayload { operation } => {
+                write!(
+                    formatter,
+                    "client/session {} operation requires a payload",
+                    operation.label()
+                )
+            }
+            Self::UnexpectedPayload { operation } => {
+                write!(
+                    formatter,
+                    "client/session {} operation must not carry a payload",
+                    operation.label()
+                )
+            }
+            Self::InvalidPayloadEncoding { operation } => {
+                write!(
+                    formatter,
+                    "client/session {} payload must be null or a definite byte string",
+                    operation.label()
+                )
+            }
             Self::InvalidFieldWidth { field, actual } => {
                 write!(
                     formatter,
@@ -302,8 +336,14 @@ pub fn encode_client_session_frame(
         } => {
             validate_call_instance_id(*operation, call_instance_id.is_some())?;
             validate_result_revision(*operation, result_revision.is_some())?;
-            let payload = encode_with_limits(payload, limits.value)
-                .map_err(|_| ClientSessionFrameError::InvalidPayload)?;
+            validate_payload(*operation, payload.is_some())?;
+            let payload = payload
+                .as_ref()
+                .map(|payload| {
+                    encode_with_limits(payload, limits.value)
+                        .map_err(|_| ClientSessionFrameError::InvalidPayload)
+                })
+                .transpose()?;
             encode_header(&mut encoder, DATA_FIELDS, DATA_KIND)?;
             encoder
                 .bytes(graph_hash)
@@ -323,9 +363,14 @@ pub fn encode_client_session_frame(
                 .u64(*semantic_revision)
                 .map_err(|_| ClientSessionFrameError::CborEncode)?;
             encode_result_revision(&mut encoder, *result_revision)?;
-            encoder
-                .bytes(&payload)
-                .map_err(|_| ClientSessionFrameError::CborEncode)?;
+            match payload {
+                Some(payload) => encoder
+                    .bytes(&payload)
+                    .map_err(|_| ClientSessionFrameError::CborEncode)?,
+                None => encoder
+                    .null()
+                    .map_err(|_| ClientSessionFrameError::CborEncode)?,
+            };
         }
         ClientSessionFrame::Ack {
             session_id,
@@ -406,9 +451,7 @@ pub fn decode_client_session_frame(
             let call_instance_id = decode_call_instance_id(&mut decoder, operation)?;
             let semantic_revision = decode_u64(&mut decoder)?;
             let result_revision = decode_result_revision(&mut decoder, operation)?;
-            let payload_bytes = decode_definite_bytes(&mut decoder)?;
-            let payload = decode_with_limits(payload_bytes, limits.value)
-                .map_err(|_| ClientSessionFrameError::InvalidPayload)?;
+            let payload = decode_payload(&mut decoder, operation, limits)?;
             ClientSessionFrame::Data {
                 graph_hash,
                 graph_revision,
@@ -602,6 +645,46 @@ fn validate_result_revision(
     }
 }
 
+fn decode_payload(
+    decoder: &mut Decoder<'_>,
+    operation: ClientSessionDataOperation,
+    limits: ClientSessionFrameLimits,
+) -> Result<Option<Value>, ClientSessionFrameError> {
+    let payload = match decoder
+        .datatype()
+        .map_err(|_| ClientSessionFrameError::CborDecode)?
+    {
+        Type::Null => {
+            decoder
+                .null()
+                .map_err(|_| ClientSessionFrameError::CborDecode)?;
+            None
+        }
+        Type::Bytes => Some(
+            decode_with_limits(decode_definite_bytes(decoder)?, limits.value)
+                .map_err(|_| ClientSessionFrameError::InvalidPayload)?,
+        ),
+        Type::BytesIndef => return Err(ClientSessionFrameError::IndefiniteFrame),
+        _ => return Err(ClientSessionFrameError::InvalidPayloadEncoding { operation }),
+    };
+    validate_payload(operation, payload.is_some())?;
+    Ok(payload)
+}
+
+fn validate_payload(
+    operation: ClientSessionDataOperation,
+    is_some: bool,
+) -> Result<(), ClientSessionFrameError> {
+    if operation == ClientSessionDataOperation::Event {
+        return Ok(());
+    }
+    match (operation.requires_payload(), is_some) {
+        (true, false) => Err(ClientSessionFrameError::MissingPayload { operation }),
+        (false, true) => Err(ClientSessionFrameError::UnexpectedPayload { operation }),
+        _ => Ok(()),
+    }
+}
+
 fn decode_session_id(decoder: &mut Decoder<'_>) -> Result<SessionId, ClientSessionFrameError> {
     decode_fixed_bytes(decoder, ClientSessionFrameField::SessionId).map(SessionId::from_bytes)
 }
@@ -675,13 +758,15 @@ mod tests {
             call_instance_id: call_instance_id(operation),
             semantic_revision: 17,
             result_revision: result_revision(operation),
-            payload: Value::Record(BTreeMap::from([
-                (
-                    "bytes".to_owned(),
-                    Value::Bytes(Bytes::from_static(b"chunk")),
-                ),
-                ("text".to_owned(), Value::Text("accepted".to_owned())),
-            ])),
+            payload: operation.requires_payload().then(|| {
+                Value::Object(BTreeMap::from([
+                    (
+                        "bytes".to_owned(),
+                        Value::Bytes(Bytes::from_static(b"chunk")),
+                    ),
+                    ("text".to_owned(), Value::Text("accepted".to_owned())),
+                ]))
+            }),
         }
     }
 
@@ -711,7 +796,7 @@ mod tests {
         call_instance_id: RawCallInstance,
         result_revision: RawResultRevision,
     ) -> Vec<u8> {
-        let payload = encode(&Value::Null).unwrap();
+        let payload = encode(&Value::tag("Null")).unwrap();
         let mut bytes = Vec::new();
         let mut encoder = Encoder::new(&mut bytes);
         encoder
@@ -751,7 +836,11 @@ mod tests {
                 encoder.i64(value).unwrap();
             }
         }
-        encoder.bytes(&payload).unwrap();
+        if operation == ClientSessionDataOperation::CurrentCallDetach as u8 {
+            encoder.null().unwrap();
+        } else {
+            encoder.bytes(&payload).unwrap();
+        }
         bytes
     }
 
@@ -806,9 +895,9 @@ mod tests {
             call_instance_id: None,
             semantic_revision: 17,
             result_revision: None,
-            payload: Value::Null,
+            payload: Some(Value::tag("Null")),
         };
-        let mut data_golden = vec![0x8f, 0x04, DATA_KIND, 0x58, 0x20];
+        let mut data_golden = vec![0x8f, 0x05, DATA_KIND, 0x58, 0x20];
         data_golden.extend_from_slice(&[1; 32]);
         data_golden.push(0x07);
         data_golden.extend_from_slice(&[0x58, 0x20]);
@@ -820,7 +909,9 @@ mod tests {
         data_golden.extend_from_slice(&[4; 32]);
         data_golden.extend_from_slice(&[ClientSessionDataOperation::Current as u8, 0xf6]);
         data_golden.extend_from_slice(&[0x11, 0xf6]);
-        data_golden.extend_from_slice(&[0x45, b'B', b'W', b'V', 0x01, 0x00]);
+        data_golden.extend_from_slice(&[
+            0x4b, b'B', b'W', b'V', 0x02, 0x05, 0x04, b'N', b'u', b'l', b'l', 0x00,
+        ]);
         assert_eq!(
             encode_client_session_frame(&data, limits).unwrap(),
             data_golden
@@ -831,7 +922,7 @@ mod tests {
             generation: 19,
             ack_through: 23,
         };
-        let mut ack_golden = vec![0x85, 0x04, ACK_KIND, 0x58, 0x20];
+        let mut ack_golden = vec![0x85, 0x05, ACK_KIND, 0x58, 0x20];
         ack_golden.extend_from_slice(&[5; SESSION_ID_BYTES]);
         ack_golden.extend_from_slice(&[0x13, 0x17]);
         assert_eq!(
@@ -844,7 +935,7 @@ mod tests {
             generation: 29,
             expected_next: 31,
         };
-        let mut resync_golden = vec![0x85, 0x04, RESYNC_KIND, 0x58, 0x20];
+        let mut resync_golden = vec![0x85, 0x05, RESYNC_KIND, 0x58, 0x20];
         resync_golden.extend_from_slice(&[6; SESSION_ID_BYTES]);
         resync_golden.extend_from_slice(&[0x18, 0x1d, 0x18, 0x1f]);
         assert_eq!(
@@ -854,9 +945,9 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_v3_without_compatibility_decoding() {
+    fn decoder_rejects_v4_without_compatibility_decoding() {
         let limits = ClientSessionFrameLimits::default();
-        let mut old_v3 = encode_client_session_frame(
+        let mut old_v4 = encode_client_session_frame(
             &ClientSessionFrame::Ack {
                 session_id: SessionId::from_bytes([7; SESSION_ID_BYTES]),
                 generation: 1,
@@ -865,11 +956,11 @@ mod tests {
             limits,
         )
         .unwrap();
-        old_v3[1] = 3;
+        old_v4[1] = 4;
 
         assert!(matches!(
-            decode_client_session_frame(&old_v3, limits),
-            Err(ClientSessionFrameError::UnsupportedProtocolVersion(3))
+            decode_client_session_frame(&old_v4, limits),
+            Err(ClientSessionFrameError::UnsupportedProtocolVersion(4))
         ));
     }
 
@@ -1109,11 +1200,11 @@ mod tests {
             Err(ClientSessionFrameError::FrameTooLarge { .. })
         ));
         assert!(matches!(
-            decode_client_session_frame(&[0x9f, 0x04, ACK_KIND, 0xff], limits),
+            decode_client_session_frame(&[0x9f, 0x05, ACK_KIND, 0xff], limits),
             Err(ClientSessionFrameError::IndefiniteFrame)
         ));
 
-        let mut indefinite_id = vec![0x85, 0x04, ACK_KIND, 0x5f, 0x58, 0x20];
+        let mut indefinite_id = vec![0x85, 0x05, ACK_KIND, 0x5f, 0x58, 0x20];
         indefinite_id.extend_from_slice(&[7; SESSION_ID_BYTES]);
         indefinite_id.extend_from_slice(&[0xff, 0x01, 0x00]);
         assert!(matches!(
@@ -1135,7 +1226,7 @@ mod tests {
             Err(ClientSessionFrameError::NonCanonicalFrame)
         ));
 
-        let mut noncanonical_version = vec![0x85, 0x18, 0x04];
+        let mut noncanonical_version = vec![0x85, 0x18, 0x05];
         noncanonical_version.extend_from_slice(&encoded[2..]);
         assert!(matches!(
             decode_client_session_frame(&noncanonical_version, limits),
@@ -1147,18 +1238,18 @@ mod tests {
     fn decoder_rejects_unknown_kind_wrong_count_and_field_widths() {
         let limits = ClientSessionFrameLimits::default();
         assert!(matches!(
-            decode_client_session_frame(&[0x82, 0x04, 0x03], limits),
+            decode_client_session_frame(&[0x82, 0x05, 0x03], limits),
             Err(ClientSessionFrameError::UnknownMessageKind(3))
         ));
         assert!(matches!(
-            decode_client_session_frame(&[0x84, 0x04, ACK_KIND, 0, 0], limits),
+            decode_client_session_frame(&[0x84, 0x05, ACK_KIND, 0, 0], limits),
             Err(ClientSessionFrameError::WrongFieldCount {
                 actual: 4,
                 expected: ACK_FIELDS
             })
         ));
         assert!(matches!(
-            decode_client_session_frame(&[0x8e, 0x04, DATA_KIND], limits),
+            decode_client_session_frame(&[0x8e, 0x05, DATA_KIND], limits),
             Err(ClientSessionFrameError::WrongFieldCount {
                 actual: 14,
                 expected: DATA_FIELDS
@@ -1199,7 +1290,7 @@ mod tests {
             .and_then(|encoder| encoder.null())
             .and_then(|encoder| encoder.u64(1))
             .and_then(|encoder| encoder.null())
-            .and_then(|encoder| encoder.bytes(&encode(&Value::Null).unwrap()))
+            .and_then(|encoder| encoder.bytes(&encode(&Value::tag("Null")).unwrap()))
             .unwrap();
         assert!(matches!(
             decode_client_session_frame(&narrow_graph, limits),

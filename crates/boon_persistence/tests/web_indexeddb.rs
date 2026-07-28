@@ -246,7 +246,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
             }],
         },
         materialization_origin: None,
-        fields: BTreeMap::from([(inserted_field, StoredValue::Bool(true))]),
+        fields: BTreeMap::from([(inserted_field, StoredValue::truth(true))]),
         touched_fields: BTreeSet::from([inserted_field]),
     };
     let second_effect_row = DurableRowId {

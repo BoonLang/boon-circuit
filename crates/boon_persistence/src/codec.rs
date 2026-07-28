@@ -14,11 +14,18 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESTORE_IMAGE_FORMAT: u32 = 8;
-const APPLICATION_TRANSFER_FORMAT: u32 = 6;
-const CHECKPOINT_BATCH_FORMAT: u32 = 8;
-const OUTBOX_RECORD_FORMAT: u32 = 3;
+const RESTORE_IMAGE_FORMAT: u32 = 9;
+const APPLICATION_TRANSFER_FORMAT: u32 = 7;
+const CHECKPOINT_BATCH_FORMAT: u32 = 9;
+const OUTBOX_RECORD_FORMAT: u32 = 4;
 const BLOB_RECORD_FORMAT: u32 = 1;
+const STORED_NUMBER: u8 = 20;
+const STORED_TEXT: u8 = 21;
+const STORED_BYTES: u8 = 22;
+const STORED_LIST: u8 = 23;
+const STORED_OBJECT: u8 = 24;
+const STORED_TAG: u8 = 25;
+const STORED_BLOB_REFERENCE: u8 = 26;
 pub const INLINE_BYTES_THRESHOLD: usize = 16 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 80 * 1024 * 1024;
 type CborEncoder<'a> = Encoder<&'a mut Vec<u8>>;
@@ -1457,59 +1464,46 @@ fn encode_component_value(
             }
             encoder
                 .array(3)
-                .and_then(|encoder| encoder.u8(9))
+                .and_then(|encoder| encoder.u8(STORED_BLOB_REFERENCE))
                 .and_then(|encoder| encoder.bytes(&digest.0))
                 .and_then(|encoder| encoder.u64(value.len() as u64))
-                .map_err(encode_error)?;
-        }
-        StoredValue::Null => {
-            encoder
-                .array(1)
-                .and_then(|encoder| encoder.u8(0))
-                .map_err(encode_error)?;
-        }
-        StoredValue::Bool(value) => {
-            encoder
-                .array(2)
-                .and_then(|encoder| encoder.u8(1))
-                .and_then(|encoder| encoder.bool(*value))
                 .map_err(encode_error)?;
         }
         StoredValue::Number(value) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(10))
+                .and_then(|encoder| encoder.u8(STORED_NUMBER))
                 .and_then(|encoder| encoder.f64(value.get()))
                 .map_err(encode_error)?;
         }
         StoredValue::Text(value) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(3))
+                .and_then(|encoder| encoder.u8(STORED_TEXT))
                 .and_then(|encoder| encoder.str(value))
                 .map_err(encode_error)?;
         }
         StoredValue::Bytes(value) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(4))
+                .and_then(|encoder| encoder.u8(STORED_BYTES))
                 .and_then(|encoder| encoder.bytes(value))
                 .map_err(encode_error)?;
         }
         StoredValue::List(values) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(5))
+                .and_then(|encoder| encoder.u8(STORED_LIST))
                 .and_then(|encoder| encoder.array(values.len() as u64))
                 .map_err(encode_error)?;
             for value in values {
                 encode_component_value(encoder, value, depth + 1, blobs, references)?;
             }
         }
-        StoredValue::Record(fields) => {
+        StoredValue::Object(fields) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(6))
+                .and_then(|encoder| encoder.u8(STORED_OBJECT))
                 .and_then(|encoder| encoder.map(fields.len() as u64))
                 .map_err(encode_error)?;
             for (name, value) in fields {
@@ -1517,23 +1511,11 @@ fn encode_component_value(
                 encode_component_value(encoder, value, depth + 1, blobs, references)?;
             }
         }
-        StoredValue::Variant { tag, fields } => {
+        StoredValue::Tag { tag, fields } => {
             encoder
                 .array(3)
-                .and_then(|encoder| encoder.u8(7))
+                .and_then(|encoder| encoder.u8(STORED_TAG))
                 .and_then(|encoder| encoder.str(tag))
-                .and_then(|encoder| encoder.map(fields.len() as u64))
-                .map_err(encode_error)?;
-            for (name, value) in fields {
-                encoder.str(name).map_err(encode_error)?;
-                encode_component_value(encoder, value, depth + 1, blobs, references)?;
-            }
-        }
-        StoredValue::Error { code, fields } => {
-            encoder
-                .array(3)
-                .and_then(|encoder| encoder.u8(8))
-                .and_then(|encoder| encoder.str(code))
                 .and_then(|encoder| encoder.map(fields.len() as u64))
                 .map_err(encode_error)?;
             for (name, value) in fields {
@@ -1558,25 +1540,19 @@ fn decode_component_value(
     let len = definite_len(decoder.array().map_err(decode_error)?, "stored value")?;
     let tag = decoder.u8().map_err(decode_error)?;
     match (tag, len) {
-        (0, 1) => Ok(StoredValue::Null),
-        (1, 2) => Ok(StoredValue::Bool(decoder.bool().map_err(decode_error)?)),
-        (2, 2) => Ok(StoredValue::Number(
-            boon_data::FiniteReal::from_i64_exact(decoder.i64().map_err(decode_error)?)
-                .map_err(|error| CodecError::new(error.to_string()))?,
-        )),
-        (10, 2) => Ok(StoredValue::Number(
+        (STORED_NUMBER, 2) => Ok(StoredValue::Number(
             boon_data::FiniteReal::new(decoder.f64().map_err(decode_error)?)
                 .map_err(|error| CodecError::new(error.to_string()))?,
         )),
-        (3, 2) => Ok(StoredValue::Text(decode_text(decoder, limits)?)),
-        (4, 2) => {
+        (STORED_TEXT, 2) => Ok(StoredValue::Text(decode_text(decoder, limits)?)),
+        (STORED_BYTES, 2) => {
             let bytes = decoder.bytes().map_err(decode_error)?;
             if bytes.len() > limits.max_blob_bytes {
                 return Err(CodecError::new("stored byte value exceeds decode limit"));
             }
             Ok(StoredValue::Bytes(bytes.to_vec().into()))
         }
-        (5, 2) => {
+        (STORED_LIST, 2) => {
             let count = collection_len(decoder, limits, "stored value list", true)?;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
@@ -1590,22 +1566,18 @@ fn decode_component_value(
             }
             Ok(StoredValue::List(values))
         }
-        (6, 2) => Ok(StoredValue::Record(decode_component_fields(
+        (STORED_OBJECT, 2) => Ok(StoredValue::Object(decode_component_fields(
             decoder,
             limits,
             depth + 1,
             blobs,
             references,
         )?)),
-        (7, 3) => Ok(StoredValue::Variant {
+        (STORED_TAG, 3) => Ok(StoredValue::Tag {
             tag: decode_text(decoder, limits)?,
             fields: decode_component_fields(decoder, limits, depth + 1, blobs, references)?,
         }),
-        (8, 3) => Ok(StoredValue::Error {
-            code: decode_text(decoder, limits)?,
-            fields: decode_component_fields(decoder, limits, depth + 1, blobs, references)?,
-        }),
-        (9, 3) => {
+        (STORED_BLOB_REFERENCE, 3) => {
             let digest = BlobDigest(decode_digest(decoder)?);
             let length = decoder.u64().map_err(decode_error)?;
             let count = references.entry(digest).or_default();
@@ -1661,70 +1633,49 @@ fn encode_value(
         ));
     }
     match value {
-        StoredValue::Null => {
-            encoder
-                .array(1)
-                .and_then(|encoder| encoder.u8(0))
-                .map_err(encode_error)?;
-        }
-        StoredValue::Bool(value) => {
-            encoder
-                .array(2)
-                .and_then(|encoder| encoder.u8(1))
-                .and_then(|encoder| encoder.bool(*value))
-                .map_err(encode_error)?;
-        }
         StoredValue::Number(value) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(10))
+                .and_then(|encoder| encoder.u8(STORED_NUMBER))
                 .and_then(|encoder| encoder.f64(value.get()))
                 .map_err(encode_error)?;
         }
         StoredValue::Text(value) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(3))
+                .and_then(|encoder| encoder.u8(STORED_TEXT))
                 .and_then(|encoder| encoder.str(value))
                 .map_err(encode_error)?;
         }
         StoredValue::Bytes(value) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(4))
+                .and_then(|encoder| encoder.u8(STORED_BYTES))
                 .and_then(|encoder| encoder.bytes(value))
                 .map_err(encode_error)?;
         }
         StoredValue::List(values) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(5))
+                .and_then(|encoder| encoder.u8(STORED_LIST))
                 .and_then(|encoder| encoder.array(values.len() as u64))
                 .map_err(encode_error)?;
             for value in values {
                 encode_value(encoder, value, depth + 1)?;
             }
         }
-        StoredValue::Record(fields) => {
+        StoredValue::Object(fields) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(6))
+                .and_then(|encoder| encoder.u8(STORED_OBJECT))
                 .map_err(encode_error)?;
             encode_value_fields(encoder, fields, depth + 1)?;
         }
-        StoredValue::Variant { tag, fields } => {
+        StoredValue::Tag { tag, fields } => {
             encoder
                 .array(3)
-                .and_then(|encoder| encoder.u8(7))
+                .and_then(|encoder| encoder.u8(STORED_TAG))
                 .and_then(|encoder| encoder.str(tag))
-                .map_err(encode_error)?;
-            encode_value_fields(encoder, fields, depth + 1)?;
-        }
-        StoredValue::Error { code, fields } => {
-            encoder
-                .array(3)
-                .and_then(|encoder| encoder.u8(8))
-                .and_then(|encoder| encoder.str(code))
                 .map_err(encode_error)?;
             encode_value_fields(encoder, fields, depth + 1)?;
         }
@@ -1743,25 +1694,19 @@ fn decode_value(
     let len = definite_len(decoder.array().map_err(decode_error)?, "stored value")?;
     let tag = decoder.u8().map_err(decode_error)?;
     match (tag, len) {
-        (0, 1) => Ok(StoredValue::Null),
-        (1, 2) => Ok(StoredValue::Bool(decoder.bool().map_err(decode_error)?)),
-        (2, 2) => Ok(StoredValue::Number(
-            boon_data::FiniteReal::from_i64_exact(decoder.i64().map_err(decode_error)?)
-                .map_err(|error| CodecError::new(error.to_string()))?,
-        )),
-        (10, 2) => Ok(StoredValue::Number(
+        (STORED_NUMBER, 2) => Ok(StoredValue::Number(
             boon_data::FiniteReal::new(decoder.f64().map_err(decode_error)?)
                 .map_err(|error| CodecError::new(error.to_string()))?,
         )),
-        (3, 2) => Ok(StoredValue::Text(decode_text(decoder, limits)?)),
-        (4, 2) => {
+        (STORED_TEXT, 2) => Ok(StoredValue::Text(decode_text(decoder, limits)?)),
+        (STORED_BYTES, 2) => {
             let bytes = decoder.bytes().map_err(decode_error)?;
             if bytes.len() > limits.max_blob_bytes {
                 return Err(CodecError::new("stored byte value exceeds decode limit"));
             }
             Ok(StoredValue::Bytes(bytes.to_vec().into()))
         }
-        (5, 2) => {
+        (STORED_LIST, 2) => {
             let count = collection_len(decoder, limits, "stored value list", true)?;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
@@ -1769,17 +1714,13 @@ fn decode_value(
             }
             Ok(StoredValue::List(values))
         }
-        (6, 2) => Ok(StoredValue::Record(decode_value_fields(
+        (STORED_OBJECT, 2) => Ok(StoredValue::Object(decode_value_fields(
             decoder,
             limits,
             depth + 1,
         )?)),
-        (7, 3) => Ok(StoredValue::Variant {
+        (STORED_TAG, 3) => Ok(StoredValue::Tag {
             tag: decode_text(decoder, limits)?,
-            fields: decode_value_fields(decoder, limits, depth + 1)?,
-        }),
-        (8, 3) => Ok(StoredValue::Error {
-            code: decode_text(decoder, limits)?,
             fields: decode_value_fields(decoder, limits, depth + 1)?,
         }),
         _ => Err(CodecError::new(format!(
@@ -1965,7 +1906,7 @@ mod tests {
             memory("value"),
             StoredScalar {
                 touched: true,
-                value: StoredValue::Record(BTreeMap::from([
+                value: StoredValue::Object(BTreeMap::from([
                     ("a".to_owned(), number(3)),
                     ("b".to_owned(), StoredValue::Text("text".to_owned())),
                     (
@@ -2181,7 +2122,7 @@ mod tests {
         let payload = vec![7; INLINE_BYTES_THRESHOLD + 1];
         let scalar = StoredScalar {
             touched: true,
-            value: StoredValue::Record(BTreeMap::from([
+            value: StoredValue::Object(BTreeMap::from([
                 (
                     "first".to_owned(),
                     StoredValue::Bytes(payload.clone().into()),

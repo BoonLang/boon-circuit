@@ -379,19 +379,13 @@ impl<'de> Deserialize<'de> for FiniteReal {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Value {
-    Null,
-    Bool(bool),
     Number(FiniteReal),
     Text(String),
     Bytes(Bytes),
     List(Vec<Value>),
-    Record(BTreeMap<String, Value>),
-    Variant {
+    Object(BTreeMap<String, Value>),
+    Tag {
         tag: String,
-        fields: BTreeMap<String, Value>,
-    },
-    Error {
-        code: String,
         fields: BTreeMap<String, Value>,
     },
 }
@@ -401,6 +395,25 @@ impl Value {
     /// representation.
     pub fn integer(value: i64) -> Result<Self, FiniteRealError> {
         FiniteReal::from_i64_exact(value).map(Self::Number)
+    }
+
+    pub fn tag(tag: impl Into<String>) -> Self {
+        Self::Tag {
+            tag: tag.into(),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    pub fn truth(value: bool) -> Self {
+        Self::tag(if value { "True" } else { "False" })
+    }
+
+    pub fn as_truth(&self) -> Option<bool> {
+        match self {
+            Self::Tag { tag, fields } if fields.is_empty() && tag == "True" => Some(true),
+            Self::Tag { tag, fields } if fields.is_empty() && tag == "False" => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -534,42 +547,45 @@ mod tests {
 
     #[test]
     fn structural_value_contains_only_recursive_language_data() {
-        let value = Value::Record(BTreeMap::from([
+        let value = Value::Object(BTreeMap::from([
             ("bytes".to_owned(), Value::Bytes(vec![1, 2, 3].into())),
             (
                 "list".to_owned(),
                 Value::List(vec![
-                    Value::Null,
-                    Value::Bool(true),
+                    Value::tag("Null"),
+                    Value::truth(true),
                     Value::Text("ready".to_owned()),
                 ]),
             ),
             (
                 "result".to_owned(),
-                Value::Variant {
+                Value::Tag {
                     tag: "Ready".to_owned(),
                     fields: BTreeMap::from([("count".to_owned(), Value::integer(3).unwrap())]),
                 },
             ),
             (
                 "failure".to_owned(),
-                Value::Error {
-                    code: "not_ready".to_owned(),
+                Value::Tag {
+                    tag: "NotReady".to_owned(),
                     fields: BTreeMap::new(),
                 },
             ),
         ]));
 
-        let Value::Record(fields) = value else {
-            panic!("expected record");
+        let Value::Object(fields) = value else {
+            panic!("expected object");
         };
         assert_eq!(fields.len(), 4);
         assert_eq!(
             fields["result"],
-            Value::Variant {
+            Value::Tag {
                 tag: "Ready".to_owned(),
                 fields: BTreeMap::from([("count".to_owned(), Value::integer(3).unwrap())]),
             }
         );
+        assert_eq!(Value::truth(true).as_truth(), Some(true));
+        assert_eq!(Value::truth(false).as_truth(), Some(false));
+        assert_eq!(Value::tag("Null").as_truth(), None);
     }
 }

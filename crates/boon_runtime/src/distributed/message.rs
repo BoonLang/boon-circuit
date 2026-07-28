@@ -54,7 +54,7 @@ pub enum DistributedMessagePayload {
     Event {
         export_id: ExportId,
         sequence: u64,
-        value: Value,
+        value: Option<Value>,
     },
     CurrentCallRequest {
         call_site_id: RemoteCallSiteId,
@@ -131,10 +131,12 @@ impl DistributedMessage {
         let metadata = 128usize;
         let payload = match &self.payload {
             DistributedMessagePayload::Current { value, .. }
-            | DistributedMessagePayload::Event { value, .. }
             | DistributedMessagePayload::CurrentCallResult { value, .. }
             | DistributedMessagePayload::InvocationResult { value, .. } => {
                 estimated_value_bytes(value)
+            }
+            DistributedMessagePayload::Event { value, .. } => {
+                value.as_ref().map_or(Some(0), estimated_value_bytes)
             }
             DistributedMessagePayload::CurrentCallRequest { arguments, .. }
             | DistributedMessagePayload::InvocationRequest { arguments, .. } => {
@@ -207,14 +209,14 @@ impl DistributedMessage {
 
 fn estimated_value_bytes(value: &Value) -> Option<usize> {
     match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) => Some(16),
+        Value::Number(_) => Some(16),
         Value::Text(value) => 16usize.checked_add(value.len()),
         Value::Bytes(value) => 16usize.checked_add(value.len()),
         Value::List(values) => values.iter().try_fold(16usize, |total, value| {
             total.checked_add(estimated_value_bytes(value)?)
         }),
-        Value::Record(fields) => estimated_fields_bytes(fields, 16),
-        Value::Variant { tag, fields } | Value::Error { code: tag, fields } => {
+        Value::Object(fields) => estimated_fields_bytes(fields, 16),
+        Value::Tag { tag, fields } => {
             estimated_fields_bytes(fields, 32usize.checked_add(tag.len())?)
         }
     }
@@ -358,7 +360,7 @@ mod tests {
             payload: DistributedMessagePayload::Event {
                 export_id: ExportId([9; 32]),
                 sequence,
-                value: Value::Null,
+                value: None,
             },
         }
     }
@@ -407,7 +409,7 @@ mod tests {
             payload: DistributedMessagePayload::Event {
                 export_id: ExportId([4; 32]),
                 sequence: 1,
-                value: Value::Text("ordinary data".to_owned()),
+                value: Some(Value::Text("ordinary data".to_owned())),
             },
         };
         let mut queue = TypedMessageQueue::new(DistributedQueueLimits::default()).unwrap();
@@ -416,7 +418,7 @@ mod tests {
         else {
             panic!("queued message changed payload kind");
         };
-        let _: &boon_data::Value = value;
+        let _: &boon_data::Value = value.as_ref().unwrap();
 
         let mut encoded = Vec::new();
         ciborium::into_writer(&message, &mut encoded).unwrap();
@@ -456,11 +458,11 @@ mod tests {
             payload: DistributedMessagePayload::Event {
                 export_id: ExportId([5; 32]),
                 sequence: 1,
-                value: Value::Error {
-                    code: "read_failed".to_owned(),
+                value: Some(Value::Tag {
+                    tag: "ReadFailed".to_owned(),
                     fields: BTreeMap::from([(
                         "detail".to_owned(),
-                        Value::Variant {
+                        Value::Tag {
                             tag: "Chunk".to_owned(),
                             fields: BTreeMap::from([(
                                 "bytes".to_owned(),
@@ -468,7 +470,7 @@ mod tests {
                             )]),
                         },
                     )]),
-                },
+                }),
             },
         };
         let estimated_bytes = message.estimated_bytes().unwrap();

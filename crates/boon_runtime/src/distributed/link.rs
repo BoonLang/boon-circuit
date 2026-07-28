@@ -36,7 +36,7 @@ pub(super) struct DataFrameRequest {
     pub(super) call_instance_id: Option<[u8; 32]>,
     pub(super) semantic_revision: u64,
     pub(super) result_revision: Option<u64>,
-    pub(super) payload: boon_data::Value,
+    pub(super) payload: Option<boon_data::Value>,
 }
 
 impl ClientSessionLink {

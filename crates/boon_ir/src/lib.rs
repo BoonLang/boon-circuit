@@ -740,15 +740,12 @@ pub enum InitialValue {
     Number {
         value: String,
     },
-    Bool {
-        value: bool,
-    },
     Bytes {
         bytes: Vec<u8>,
         fixed_len: Option<usize>,
     },
-    Enum {
-        value: String,
+    Tag {
+        name: String,
     },
     Data {
         value: boon_data::Value,
@@ -4819,13 +4816,12 @@ fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
         InitialValue::RowInitialField { path } => {
             reject_hidden_identity_identifier("row initial field", path)
         }
-        InitialValue::Enum { value } => reject_hidden_identity_identifier("enum value", value),
+        InitialValue::Tag { name } => reject_hidden_identity_identifier("Tag name", name),
         InitialValue::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown initializer", summary)
         }
         InitialValue::Text { .. }
         | InitialValue::Number { .. }
-        | InitialValue::Bool { .. }
         | InitialValue::Bytes { .. }
         | InitialValue::Data { .. } => Ok(()),
     }

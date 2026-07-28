@@ -4278,7 +4278,7 @@ scene: Scene/Element/program(
             request: &HostEffectRequest,
         ) -> Result<StoredValue, HostEffectError> {
             self.dispatch_count += 1;
-            let StoredValue::Record(intent) = &request.intent else {
+            let StoredValue::Object(intent) = &request.intent else {
                 return Err(HostEffectError::rejected("effect intent is not a record"));
             };
             let outcome = successful_registration_stored(intent)?;
@@ -4312,7 +4312,7 @@ scene: Scene/Element/program(
             &mut self,
             request: &HostEffectRequest,
         ) -> Result<StoredValue, HostEffectError> {
-            let StoredValue::Record(intent) = &request.intent else {
+            let StoredValue::Object(intent) = &request.intent else {
                 return Err(HostEffectError::rejected("effect intent is not a record"));
             };
             let result = successful_registration_stored(intent)?;
@@ -4355,7 +4355,7 @@ scene: Scene/Element/program(
         let Some(StoredValue::Text(account_id)) = intent.get("account_id") else {
             return Err(HostEffectError::rejected("effect account_id is not Text"));
         };
-        Ok(StoredValue::Variant {
+        Ok(StoredValue::Tag {
             tag: "RegistrationSucceeded".to_owned(),
             fields: BTreeMap::from([
                 (
@@ -4370,7 +4370,7 @@ scene: Scene/Element/program(
                     "label".to_owned(),
                     StoredValue::Text("Test credential".to_owned()),
                 ),
-                ("workspace_grant_bound".to_owned(), StoredValue::Bool(true)),
+                ("workspace_grant_bound".to_owned(), StoredValue::truth(true)),
             ]),
         })
     }

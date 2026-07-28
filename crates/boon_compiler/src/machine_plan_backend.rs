@@ -1485,12 +1485,12 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
                 value: variant.tag.clone(),
             })
         }
-        DataTypePlan::Null
-        | DataTypePlan::Record { .. }
-        | DataTypePlan::List { .. }
-        | DataTypePlan::Error { .. } => Some(PlanConstantValue::Data {
-            value: boon_data::Value::Null,
+        DataTypePlan::Null => Some(PlanConstantValue::Data {
+            value: boon_data::Value::tag("Null"),
         }),
+        DataTypePlan::Record { .. } | DataTypePlan::List { .. } | DataTypePlan::Error { .. } => {
+            None
+        }
         DataTypePlan::Bytes { fixed_len: Some(_) } | DataTypePlan::Unknown => None,
     }
 }
@@ -1809,7 +1809,7 @@ fn plan_row_expression_static_data(
             match &constant.value {
                 PlanConstantValue::Text { value } => Some(boon_data::Value::Text(value.clone())),
                 PlanConstantValue::Number { value } => Some(boon_data::Value::Number(*value)),
-                PlanConstantValue::Bool { value } => Some(boon_data::Value::Bool(*value)),
+                PlanConstantValue::Bool { value } => Some(boon_data::Value::truth(*value)),
                 PlanConstantValue::Bytes {
                     inline_bytes: Some(bytes),
                     ..
@@ -1817,10 +1817,7 @@ fn plan_row_expression_static_data(
                 PlanConstantValue::Bytes {
                     inline_bytes: None, ..
                 } => None,
-                PlanConstantValue::Enum { value } => Some(boon_data::Value::Variant {
-                    tag: value.clone(),
-                    fields: BTreeMap::new(),
-                }),
+                PlanConstantValue::Enum { value } => Some(boon_data::Value::tag(value)),
                 PlanConstantValue::Data { value } => Some(value.clone()),
             }
         }
@@ -1841,7 +1838,7 @@ fn plan_row_expression_static_data(
                     Ok(Some((field.name.clone(), value)))
                 })
                 .collect::<Result<Option<BTreeMap<_, _>>, PlanError>>()?
-                .map(boon_data::Value::Record)
+                .map(boon_data::Value::Object)
         }
         PlanRowExpressionNode::TaggedObject { tag, fields }
             if fields.iter().all(|field| !field.spread) =>
@@ -1857,7 +1854,7 @@ fn plan_row_expression_static_data(
                     Ok(Some((field.name.clone(), value)))
                 })
                 .collect::<Result<Option<BTreeMap<_, _>>, PlanError>>()?
-                .map(|fields| boon_data::Value::Variant {
+                .map(|fields| boon_data::Value::Tag {
                     tag: tag.clone(),
                     fields,
                 })
@@ -2350,13 +2347,12 @@ fn data_type_plan_from_initial_value(value: &InitialValue) -> Option<DataTypePla
     Some(match value {
         InitialValue::Text { .. } => DataTypePlan::Text,
         InitialValue::Number { .. } => DataTypePlan::Number,
-        InitialValue::Bool { .. } => DataTypePlan::Bool,
         InitialValue::Bytes { fixed_len, .. } => DataTypePlan::Bytes {
             fixed_len: fixed_len.map(|len| len as u64),
         },
-        InitialValue::Enum { value } => DataTypePlan::Variant {
+        InitialValue::Tag { name } => DataTypePlan::Variant {
             variants: vec![DataVariantPlan {
-                tag: value.clone(),
+                tag: name.clone(),
                 fields: Vec::new(),
                 open: false,
             }],
@@ -5983,7 +5979,6 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
         InitialValue::Number { value } => Some(PlanConstantValue::Number {
             value: value.parse().ok()?,
         }),
-        InitialValue::Bool { value } => Some(PlanConstantValue::Bool { value: *value }),
         InitialValue::Bytes { bytes, .. } => {
             let mut hasher = Sha256::new();
             hasher.update(bytes);
@@ -5993,8 +5988,8 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
                 inline_bytes: (bytes.len() <= INLINE_BYTE_CONSTANT_LIMIT).then(|| bytes.clone()),
             })
         }
-        InitialValue::Enum { value } => Some(PlanConstantValue::Enum {
-            value: value.clone(),
+        InitialValue::Tag { name } => Some(PlanConstantValue::Enum {
+            value: name.clone(),
         }),
         InitialValue::Data { value } => Some(PlanConstantValue::Data {
             value: value.clone(),
@@ -6318,8 +6313,6 @@ fn plan_value_type_is_concrete(value_type: PlanValueType) -> bool {
 
 fn data_type_plan_from_data(value: &boon_data::Value) -> DataTypePlan {
     match value {
-        boon_data::Value::Null => DataTypePlan::Null,
-        boon_data::Value::Bool(_) => DataTypePlan::Bool,
         boon_data::Value::Number(_) => DataTypePlan::Number,
         boon_data::Value::Text(_) => DataTypePlan::Text,
         boon_data::Value::Bytes(_) => DataTypePlan::Bytes { fixed_len: None },
@@ -6332,7 +6325,7 @@ fn data_type_plan_from_data(value: &boon_data::Value) -> DataTypePlan {
                 item: Box::new(item),
             }
         }
-        boon_data::Value::Record(fields) => DataTypePlan::Record {
+        boon_data::Value::Object(fields) => DataTypePlan::Record {
             fields: fields
                 .iter()
                 .map(|(name, value)| DataTypeFieldPlan {
@@ -6342,7 +6335,7 @@ fn data_type_plan_from_data(value: &boon_data::Value) -> DataTypePlan {
                 .collect(),
             open: false,
         },
-        boon_data::Value::Variant { tag, fields } => DataTypePlan::Variant {
+        boon_data::Value::Tag { tag, fields } => DataTypePlan::Variant {
             variants: vec![DataVariantPlan {
                 tag: tag.clone(),
                 fields: fields
@@ -6354,16 +6347,6 @@ fn data_type_plan_from_data(value: &boon_data::Value) -> DataTypePlan {
                     .collect(),
                 open: false,
             }],
-        },
-        boon_data::Value::Error { fields, .. } => DataTypePlan::Error {
-            fields: fields
-                .iter()
-                .map(|(name, value)| DataTypeFieldPlan {
-                    name: name.clone(),
-                    data_type: data_type_plan_from_data(value),
-                })
-                .collect(),
-            open: false,
         },
     }
 }
@@ -6711,9 +6694,8 @@ fn plan_initial_list_rows(
                             }
                             InitialValue::Text { .. }
                             | InitialValue::Number { .. }
-                            | InitialValue::Bool { .. }
                             | InitialValue::Bytes { .. }
-                            | InitialValue::Enum { .. }
+                            | InitialValue::Tag { .. }
                             | InitialValue::Data { .. } => {
                                 unreachable!("constant initial values were matched above")
                             }
@@ -9673,9 +9655,24 @@ fn source_event_transform_fresh_value(
                 value: String::new(),
             })
         }
-        Some(PlanValueType::Data) => PlanConstantValue::Data {
-            value: boon_data::Value::Null,
-        },
+        Some(PlanValueType::Data) => {
+            let fresh = arms.iter().find_map(|(_, value)| {
+                let PlanRowExpressionNode::Constant { constant_id } = arena.node(*value).ok()?
+                else {
+                    return None;
+                };
+                constants
+                    .iter()
+                    .find(|constant| constant.id == *constant_id)
+                    .and_then(|constant| match &constant.value {
+                        PlanConstantValue::Data { .. } => Some(constant.value.clone()),
+                        _ => None,
+                    })
+            });
+            fresh.ok_or_else(|| {
+                PlanError::new("data source-event transform has no canonical fresh value")
+            })?
+        }
         Some(PlanValueType::Unknown) | None => {
             let mut all_bool_constants = true;
             for (_, value) in arms {

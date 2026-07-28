@@ -3,14 +3,14 @@
 //! This format is for process and network boundaries. In-process Boon graphs
 //! should continue to pass `Value` directly without serialization.
 //!
-//! # Version 1 format
+//! # Version 2 format
 //!
 //! Every message starts with `BWV` followed by the one-byte format version.
 //! Values use a one-byte tag. Lengths and collection counts use minimal unsigned
 //! LEB128; numbers use eight little-endian IEEE-754 bytes. Text is UTF-8. Lists
-//! preserve item order, while record, variant-field, and error-field keys must be
-//! strictly increasing in Rust `String` order. Variant tags and error codes use
-//! the same length-prefixed text representation as record keys.
+//! preserve item order, while object and Tag payload keys must be strictly
+//! increasing in Rust `String` order. Tag names use the same length-prefixed
+//! text representation as object keys.
 
 #![forbid(unsafe_code)]
 
@@ -38,7 +38,7 @@ pub use session_control::{
 };
 
 const MAGIC: [u8; 3] = *b"BWV";
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
 pub const HEADER: [u8; 4] = [MAGIC[0], MAGIC[1], MAGIC[2], FORMAT_VERSION];
 
 /// The protocol-owned same-origin WebSocket path for Client/Session traffic.
@@ -46,21 +46,17 @@ pub const HEADER: [u8; 4] = [MAGIC[0], MAGIC[1], MAGIC[2], FORMAT_VERSION];
 /// silently drift between the two transport endpoints.
 pub const DISTRIBUTED_SESSION_TRANSPORT_PATH: &str = "/_boon/distributed-session";
 
-const TAG_NULL: u8 = 0;
-const TAG_FALSE: u8 = 1;
-const TAG_TRUE: u8 = 2;
-const TAG_NUMBER: u8 = 3;
-const TAG_TEXT: u8 = 4;
-const TAG_BYTES: u8 = 5;
-const TAG_LIST: u8 = 6;
-const TAG_RECORD: u8 = 7;
-const TAG_VARIANT: u8 = 8;
-const TAG_ERROR: u8 = 9;
+const VALUE_NUMBER: u8 = 0;
+const VALUE_TEXT: u8 = 1;
+const VALUE_BYTES: u8 = 2;
+const VALUE_LIST: u8 = 3;
+const VALUE_OBJECT: u8 = 4;
+const VALUE_TAG: u8 = 5;
 
 /// Resource limits applied to both encoding and decoding.
 ///
-/// `max_depth` and `max_nodes` count only recursive `Value` nodes. Record keys,
-/// variant tags, and error codes are bounded as text but are not separate nodes.
+/// `max_depth` and `max_nodes` count only recursive `Value` nodes. Object keys
+/// and Tag names are bounded as text but are not separate nodes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     pub max_total_bytes: usize,
@@ -228,19 +224,16 @@ impl Encoder {
         check_limit(LimitKind::Nodes, self.nodes, self.limits.max_nodes)?;
 
         match value {
-            Value::Null => self.byte(TAG_NULL),
-            Value::Bool(false) => self.byte(TAG_FALSE),
-            Value::Bool(true) => self.byte(TAG_TRUE),
             Value::Number(number) => {
-                self.byte(TAG_NUMBER)?;
+                self.byte(VALUE_NUMBER)?;
                 self.write(&number.get().to_bits().to_le_bytes())
             }
             Value::Text(text) => {
-                self.byte(TAG_TEXT)?;
+                self.byte(VALUE_TEXT)?;
                 self.text(text)
             }
             Value::Bytes(bytes) => {
-                self.byte(TAG_BYTES)?;
+                self.byte(VALUE_BYTES)?;
                 check_limit(
                     LimitKind::ByteStringBytes,
                     bytes.len(),
@@ -250,25 +243,20 @@ impl Encoder {
                 self.write(bytes)
             }
             Value::List(values) => {
-                self.byte(TAG_LIST)?;
+                self.byte(VALUE_LIST)?;
                 self.collection_len(values.len())?;
                 for value in values {
                     self.value(value, depth + 1)?;
                 }
                 Ok(())
             }
-            Value::Record(fields) => {
-                self.byte(TAG_RECORD)?;
+            Value::Object(fields) => {
+                self.byte(VALUE_OBJECT)?;
                 self.fields(fields, depth)
             }
-            Value::Variant { tag, fields } => {
-                self.byte(TAG_VARIANT)?;
+            Value::Tag { tag, fields } => {
+                self.byte(VALUE_TAG)?;
                 self.text(tag)?;
-                self.fields(fields, depth)
-            }
-            Value::Error { code, fields } => {
-                self.byte(TAG_ERROR)?;
-                self.text(code)?;
                 self.fields(fields, depth)
             }
         }
@@ -356,13 +344,10 @@ impl Decoder<'_> {
         check_limit(LimitKind::Nodes, self.nodes, self.limits.max_nodes)?;
 
         match self.byte()? {
-            TAG_NULL => Ok(Value::Null),
-            TAG_FALSE => Ok(Value::Bool(false)),
-            TAG_TRUE => Ok(Value::Bool(true)),
-            TAG_NUMBER => self.number().map(Value::Number),
-            TAG_TEXT => self.text().map(Value::Text),
-            TAG_BYTES => self.byte_string().map(|bytes| Value::Bytes(bytes.into())),
-            TAG_LIST => {
+            VALUE_NUMBER => self.number().map(Value::Number),
+            VALUE_TEXT => self.text().map(Value::Text),
+            VALUE_BYTES => self.byte_string().map(|bytes| Value::Bytes(bytes.into())),
+            VALUE_LIST => {
                 let count = self.collection_len(1)?;
                 let mut values = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -370,16 +355,11 @@ impl Decoder<'_> {
                 }
                 Ok(Value::List(values))
             }
-            TAG_RECORD => self.fields(depth).map(Value::Record),
-            TAG_VARIANT => {
+            VALUE_OBJECT => self.fields(depth).map(Value::Object),
+            VALUE_TAG => {
                 let tag = self.text()?;
                 let fields = self.fields(depth)?;
-                Ok(Value::Variant { tag, fields })
-            }
-            TAG_ERROR => {
-                let code = self.text()?;
-                let fields = self.fields(depth)?;
-                Ok(Value::Error { code, fields })
+                Ok(Value::Tag { tag, fields })
             }
             tag => Err(WireError::UnknownTag(tag)),
         }
@@ -501,28 +481,28 @@ mod tests {
     use super::*;
 
     fn all_shapes() -> Value {
-        Value::Record(BTreeMap::from([
+        Value::Object(BTreeMap::from([
             ("bytes".into(), Value::Bytes(vec![0, 127, 128, 255].into())),
             (
                 "error".into(),
-                Value::Error {
-                    code: "Unavailable".into(),
-                    fields: BTreeMap::from([("retry".into(), Value::Bool(false))]),
+                Value::Tag {
+                    tag: "Unavailable".into(),
+                    fields: BTreeMap::from([("retry".into(), Value::truth(false))]),
                 },
             ),
             (
                 "list".into(),
                 Value::List(vec![
-                    Value::Null,
+                    Value::tag("Null"),
                     Value::Number(FiniteReal::new(-12.5).unwrap()),
                     Value::Text("Boon \u{2603}".into()),
                 ]),
             ),
             (
                 "variant".into(),
-                Value::Variant {
+                Value::Tag {
                     tag: "Ready".into(),
-                    fields: BTreeMap::from([("enabled".into(), Value::Bool(true))]),
+                    fields: BTreeMap::from([("enabled".into(), Value::truth(true))]),
                 },
             ),
         ]))
@@ -537,10 +517,10 @@ mod tests {
 
     #[test]
     fn encoding_is_deterministic_and_matches_golden_bytes() {
-        let first = Value::Record(BTreeMap::from([
+        let first = Value::Object(BTreeMap::from([
             (
                 "z".into(),
-                Value::Variant {
+                Value::Tag {
                     tag: "Ok".into(),
                     fields: BTreeMap::from([(
                         "n".into(),
@@ -548,13 +528,13 @@ mod tests {
                     )]),
                 },
             ),
-            ("a".into(), Value::Bool(true)),
+            ("a".into(), Value::truth(true)),
         ]));
         let mut reordered = BTreeMap::new();
-        reordered.insert("a".into(), Value::Bool(true));
+        reordered.insert("a".into(), Value::truth(true));
         reordered.insert(
             "z".into(),
-            Value::Variant {
+            Value::Tag {
                 tag: "Ok".into(),
                 fields: BTreeMap::from([(
                     "n".into(),
@@ -562,11 +542,11 @@ mod tests {
                 )]),
             },
         );
-        let second = Value::Record(reordered);
+        let second = Value::Object(reordered);
 
         let golden = vec![
-            b'B', b'W', b'V', 1, 7, 2, 1, b'a', 2, 1, b'z', 8, 2, b'O', b'k', 1, 1, b'n', 3, 0, 0,
-            0, 0, 0, 0, 0xf8, 0x3f,
+            b'B', b'W', b'V', 2, 4, 2, 1, b'a', 5, 4, b'T', b'r', b'u', b'e', 0, 1, b'z', 5, 2,
+            b'O', b'k', 1, 1, b'n', 0, 0, 0, 0, 0, 0, 0, 0xf8, 0x3f,
         ];
         assert_eq!(encode(&first).unwrap(), golden);
         assert_eq!(encode(&second).unwrap(), golden);
@@ -575,43 +555,45 @@ mod tests {
 
     #[test]
     fn rejects_malformed_headers_tags_and_trailing_bytes() {
-        assert_eq!(decode(b"bad\x01\x00"), Err(WireError::InvalidMagic));
+        assert_eq!(decode(b"bad\x02\x00"), Err(WireError::InvalidMagic));
         assert_eq!(
-            decode(b"BWV\x02\x00"),
-            Err(WireError::UnsupportedVersion(2))
+            decode(b"BWV\x01\x00"),
+            Err(WireError::UnsupportedVersion(1))
         );
-        assert_eq!(decode(b"BWV\x01\xff"), Err(WireError::UnknownTag(0xff)));
-        assert_eq!(decode(b"BWV\x01\x00\x00"), Err(WireError::TrailingBytes(1)));
+        assert_eq!(decode(b"BWV\x02\xff"), Err(WireError::UnknownTag(0xff)));
+        let mut trailing = encode(&Value::integer(0).unwrap()).unwrap();
+        trailing.push(0);
+        assert_eq!(decode(&trailing), Err(WireError::TrailingBytes(1)));
     }
 
     #[test]
     fn rejects_invalid_text_varints_and_numbers() {
-        assert_eq!(decode(b"BWV\x01\x04\x01\xff"), Err(WireError::InvalidUtf8));
+        assert_eq!(decode(b"BWV\x02\x01\x01\xff"), Err(WireError::InvalidUtf8));
         assert_eq!(
-            decode(b"BWV\x01\x04\x80\x00"),
+            decode(b"BWV\x02\x01\x80\x00"),
             Err(WireError::NonCanonicalVarint)
         );
 
-        let mut overflowing = b"BWV\x01\x04".to_vec();
+        let mut overflowing = b"BWV\x02\x01".to_vec();
         overflowing.extend_from_slice(&[0xff; 9]);
         overflowing.push(0x02);
         assert_eq!(decode(&overflowing), Err(WireError::VarintOverflow));
 
-        let mut infinity = b"BWV\x01\x03".to_vec();
+        let mut infinity = b"BWV\x02\x00".to_vec();
         infinity.extend_from_slice(&f64::INFINITY.to_bits().to_le_bytes());
         assert_eq!(decode(&infinity), Err(WireError::NonFiniteNumber));
 
-        let mut negative_zero = b"BWV\x01\x03".to_vec();
+        let mut negative_zero = b"BWV\x02\x00".to_vec();
         negative_zero.extend_from_slice(&(-0.0f64).to_bits().to_le_bytes());
         assert_eq!(decode(&negative_zero), Err(WireError::NonCanonicalNumber));
     }
 
     #[test]
     fn rejects_noncanonical_map_key_order_and_duplicates() {
-        let out_of_order = b"BWV\x01\x07\x02\x01b\x00\x01a\x00";
+        let out_of_order = b"BWV\x02\x04\x02\x01b\x05\x00\x00\x01a\x05\x00\x00";
         assert_eq!(decode(out_of_order), Err(WireError::NonCanonicalMapOrder));
 
-        let duplicate = b"BWV\x01\x07\x02\x01a\x00\x01a\x00";
+        let duplicate = b"BWV\x02\x04\x02\x01a\x05\x00\x00\x01a\x05\x00\x00";
         assert_eq!(decode(duplicate), Err(WireError::NonCanonicalMapOrder));
     }
 
@@ -620,7 +602,7 @@ mod tests {
         let value = Value::List(vec![
             Value::Text("abcd".into()),
             Value::Bytes(vec![1, 2, 3, 4].into()),
-            Value::List(vec![Value::Null]),
+            Value::List(vec![Value::tag("Null")]),
         ]);
         let encoded = encode(&value).unwrap();
 
@@ -685,7 +667,7 @@ mod tests {
             ..Limits::default()
         };
         assert!(matches!(
-            encode_with_limits(&Value::List(vec![Value::Null]), limits),
+            encode_with_limits(&Value::List(vec![Value::tag("Null")]), limits),
             Err(WireError::LimitExceeded {
                 kind: LimitKind::Nodes,
                 ..

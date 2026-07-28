@@ -193,16 +193,13 @@ pub enum SemanticInitialValueV1 {
     Number {
         value: String,
     },
-    Bool {
-        value: bool,
-    },
     Bytes {
         bytes: Vec<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fixed_len: Option<usize>,
     },
-    Enum {
-        value: String,
+    Tag {
+        name: String,
     },
     Data {
         value: boon_data::Value,
@@ -1125,9 +1122,9 @@ fn semantic_initial_record(
             for field in fields {
                 if field.spread {
                     let value = semantic_static_data(execution, field.value)?;
-                    let boon_data::Value::Record(fields) = value else {
+                    let boon_data::Value::Object(fields) = value else {
                         return Err(format!(
-                            "spread field `{}` is not a static record",
+                            "spread field `{}` is not a static object",
                             field.name
                         ));
                     };
@@ -1156,8 +1153,8 @@ fn semantic_initial_record(
         }
         _ => {
             let value = semantic_static_data(execution, expression_id)?;
-            let boon_data::Value::Record(fields) = value else {
-                return Err(format!("expression {expression_id} is not a static record"));
+            let boon_data::Value::Object(fields) = value else {
+                return Err(format!("expression {expression_id} is not a static object"));
             };
             fields
                 .into_iter()
@@ -1192,7 +1189,6 @@ fn semantic_initial_value(
 
 fn semantic_initial_value_from_data(value: boon_data::Value) -> SemanticInitialValueV1 {
     match value {
-        boon_data::Value::Bool(value) => SemanticInitialValueV1::Bool { value },
         boon_data::Value::Number(value) => SemanticInitialValueV1::Number {
             value: value.to_string(),
         },
@@ -1201,8 +1197,8 @@ fn semantic_initial_value_from_data(value: boon_data::Value) -> SemanticInitialV
             fixed_len: Some(bytes.len()),
             bytes: bytes.to_vec(),
         },
-        boon_data::Value::Variant { tag, fields } if fields.is_empty() => {
-            SemanticInitialValueV1::Enum { value: tag }
+        boon_data::Value::Tag { tag, fields } if fields.is_empty() => {
+            SemanticInitialValueV1::Tag { name: tag }
         }
         value => SemanticInitialValueV1::Data { value },
     }
@@ -1349,14 +1345,14 @@ fn semantic_static_data(
             }
             StaticTask::FinishRecord(parts) => {
                 let field_values = take_static_values(&mut values, parts.len())?;
-                values.push(boon_data::Value::Record(finish_static_record(
+                values.push(boon_data::Value::Object(finish_static_record(
                     parts,
                     field_values,
                 )?));
             }
             StaticTask::FinishTagged { tag, fields } => {
                 let field_values = take_static_values(&mut values, fields.len())?;
-                values.push(boon_data::Value::Variant {
+                values.push(boon_data::Value::Tag {
                     tag,
                     fields: finish_static_record(fields, field_values)?,
                 });
@@ -1459,7 +1455,7 @@ fn semantic_static_data(
                         )));
                     }
                     SemanticExpressionKind::Tag(tag) => {
-                        values.push(boon_data::Value::Variant {
+                        values.push(boon_data::Value::Tag {
                             tag: tag.clone(),
                             fields: BTreeMap::new(),
                         });
@@ -1640,9 +1636,9 @@ fn finish_static_record(
     let mut result = BTreeMap::new();
     for (part, value) in parts.into_iter().zip(values) {
         if part.spread {
-            let boon_data::Value::Record(fields) = value else {
+            let boon_data::Value::Object(fields) = value else {
                 return Err(format!(
-                    "spread field `{}` is not a static record",
+                    "spread field `{}` is not a static object",
                     part.name
                 ));
             };
@@ -1660,14 +1656,14 @@ fn static_projection(
 ) -> Result<boon_data::Value, String> {
     for field in projection {
         value = match value {
-            boon_data::Value::Record(mut fields)
-            | boon_data::Value::Variant { mut fields, .. }
-            | boon_data::Value::Error { mut fields, .. } => fields
-                .remove(field)
-                .ok_or_else(|| format!("static value has no field `{field}`"))?,
+            boon_data::Value::Object(mut fields) | boon_data::Value::Tag { mut fields, .. } => {
+                fields
+                    .remove(field)
+                    .ok_or_else(|| format!("static value has no field `{field}`"))?
+            }
             _ => {
                 return Err(format!(
-                    "cannot project `{field}` from non-record static value"
+                    "cannot project `{field}` from non-object static value"
                 ));
             }
         };

@@ -7350,14 +7350,11 @@ fn map_initial_value(value: &SemanticInitialValueV1) -> InitialValue {
         SemanticInitialValueV1::Number { value } => InitialValue::Number {
             value: value.clone(),
         },
-        SemanticInitialValueV1::Bool { value } => InitialValue::Bool { value: *value },
         SemanticInitialValueV1::Bytes { bytes, fixed_len } => InitialValue::Bytes {
             bytes: bytes.clone(),
             fixed_len: *fixed_len,
         },
-        SemanticInitialValueV1::Enum { value } => InitialValue::Enum {
-            value: value.clone(),
-        },
+        SemanticInitialValueV1::Tag { name } => InitialValue::Tag { name: name.clone() },
         SemanticInitialValueV1::Data { value } => InitialValue::Data {
             value: value.clone(),
         },

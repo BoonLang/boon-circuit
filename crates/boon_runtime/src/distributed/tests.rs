@@ -1291,7 +1291,7 @@ fn persistent_server_context_switches_preserve_contiguous_authority_turns() {
                 payload: DistributedMessagePayload::Event {
                     export_id: event_export,
                     sequence: 1,
-                    value: DataValue::Null,
+                    value: None,
                 },
             },
         )

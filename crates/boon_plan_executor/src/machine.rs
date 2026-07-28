@@ -5038,41 +5038,28 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
 
 fn runtime_value_from_data(value: &boon_data::Value) -> Value {
     match value {
-        boon_data::Value::Null => Value::Null,
-        boon_data::Value::Bool(value) => Value::Bool(*value),
         boon_data::Value::Number(value) => Value::Number(*value),
         boon_data::Value::Text(value) => Value::Text(value.clone()),
         boon_data::Value::Bytes(value) => Value::Bytes(value.clone()),
         boon_data::Value::List(values) => {
             Value::List(values.iter().map(runtime_value_from_data).collect())
         }
-        boon_data::Value::Record(fields) => Value::Record(
+        boon_data::Value::Object(fields) => Value::Record(
             fields
                 .iter()
                 .map(|(name, value)| (name.clone(), runtime_value_from_data(value)))
                 .collect(),
         ),
-        boon_data::Value::Variant { tag, fields } => {
-            if fields.is_empty() {
+        boon_data::Value::Tag { tag, fields } => {
+            if fields.is_empty() && tag == "True" {
+                Value::Bool(true)
+            } else if fields.is_empty() && tag == "False" {
+                Value::Bool(false)
+            } else if fields.is_empty() {
                 Value::Text(tag.clone())
             } else {
                 Value::Record(
                     std::iter::once(("$tag".to_owned(), Value::Text(tag.clone())))
-                        .chain(
-                            fields.iter().map(|(name, value)| {
-                                (name.clone(), runtime_value_from_data(value))
-                            }),
-                        )
-                        .collect(),
-                )
-            }
-        }
-        boon_data::Value::Error { code, fields } => {
-            if fields.is_empty() {
-                Value::Error { code: code.clone() }
-            } else {
-                Value::Record(
-                    std::iter::once(("error".to_owned(), Value::Text(code.clone())))
                         .chain(
                             fields.iter().map(|(name, value)| {
                                 (name.clone(), runtime_value_from_data(value))
@@ -5087,8 +5074,12 @@ fn runtime_value_from_data(value: &boon_data::Value) -> Value {
 
 fn runtime_value_to_data(value: &Value) -> Result<boon_data::Value, Error> {
     Ok(match value {
-        Value::Null => boon_data::Value::Null,
-        Value::Bool(value) => boon_data::Value::Bool(*value),
+        Value::Null => {
+            return Err(Error::Evaluation(
+                "private runtime absence cannot cross an ordinary data boundary".to_owned(),
+            ));
+        }
+        Value::Bool(value) => boon_data::Value::truth(*value),
         Value::Number(value) => boon_data::Value::Number(*value),
         Value::Text(value) => boon_data::Value::Text(value.clone()),
         Value::Bytes(value) => boon_data::Value::Bytes(value.clone()),
@@ -5098,16 +5089,31 @@ fn runtime_value_to_data(value: &Value) -> Result<boon_data::Value, Error> {
                 .map(runtime_value_to_data)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Value::Record(fields) => boon_data::Value::Record(
-            fields
+        Value::Record(fields) => {
+            let tag = runtime_string_map_get(fields, "$tag");
+            let values = fields
                 .iter()
+                .filter(|(name, _)| name.as_str() != "$tag")
                 .map(|(name, value)| Ok((name.clone(), runtime_value_to_data(value)?)))
-                .collect::<Result<BTreeMap<_, _>, Error>>()?,
-        ),
-        Value::Error { code } => boon_data::Value::Error {
-            code: code.clone(),
-            fields: BTreeMap::new(),
-        },
+                .collect::<Result<BTreeMap<_, _>, Error>>()?;
+            match tag {
+                Some(Value::Text(tag)) => boon_data::Value::Tag {
+                    tag: tag.clone(),
+                    fields: values,
+                },
+                Some(_) => {
+                    return Err(Error::Evaluation(
+                        "tagged runtime object has a non-text `$tag` field".to_owned(),
+                    ));
+                }
+                None => boon_data::Value::Object(values),
+            }
+        }
+        Value::Error { .. } => {
+            return Err(Error::Evaluation(
+                "private runtime faults cannot cross an ordinary data boundary".to_owned(),
+            ));
+        }
         Value::MappedRow { .. } | Value::Row { .. } => {
             return Err(Error::Evaluation(
                 "ordinary data boundaries cannot contain runtime row handles".to_owned(),
@@ -5249,8 +5255,10 @@ fn durable_owner_for_rows(
 
 pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValue, Error> {
     match value {
-        Value::Null => Ok(boon_persistence::StoredValue::Null),
-        Value::Bool(value) => Ok(boon_persistence::StoredValue::Bool(*value)),
+        Value::Null => Err(Error::Evaluation(
+            "private runtime absence cannot be persisted".to_owned(),
+        )),
+        Value::Bool(value) => Ok(boon_persistence::StoredValue::truth(*value)),
         Value::Number(value) => Ok(boon_persistence::StoredValue::Number(*value)),
         Value::Text(value) => Ok(boon_persistence::StoredValue::Text(value.clone())),
         Value::Bytes(value) => Ok(boon_persistence::StoredValue::Bytes(value.clone())),
@@ -5266,20 +5274,19 @@ pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValu
                 .map(|(name, value)| Ok((name.clone(), stored_value(value)?)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()?;
             match runtime_string_map_get(fields, "$tag") {
-                Some(Value::Text(tag)) => Ok(boon_persistence::StoredValue::Variant {
+                Some(Value::Text(tag)) => Ok(boon_persistence::StoredValue::Tag {
                     tag: tag.clone(),
                     fields: std::mem::take(&mut stored),
                 }),
                 Some(_) => Err(Error::Evaluation(
                     "tagged runtime record has a non-text `$tag` field".to_owned(),
                 )),
-                None => Ok(boon_persistence::StoredValue::Record(stored)),
+                None => Ok(boon_persistence::StoredValue::Object(stored)),
             }
         }
-        Value::Error { code } => Ok(boon_persistence::StoredValue::Error {
-            code: code.clone(),
-            fields: BTreeMap::new(),
-        }),
+        Value::Error { .. } => Err(Error::Evaluation(
+            "private runtime faults cannot be persisted".to_owned(),
+        )),
         Value::MappedRow { .. } | Value::Row { .. } => Err(Error::Evaluation(
             "row handles and derived mapped rows are not durable authority".to_owned(),
         )),
@@ -5295,7 +5302,7 @@ fn durable_owner_value(owner: &boon_persistence::DurableOwner) -> boon_persisten
             .ancestors
             .iter()
             .map(|row| {
-                boon_persistence::StoredValue::Record(BTreeMap::from([
+                boon_persistence::StoredValue::Object(BTreeMap::from([
                     (
                         "generation".to_owned(),
                         boon_persistence::StoredValue::Text(row.row_generation.to_string()),
@@ -5334,7 +5341,7 @@ fn stored_value_for_data_type(
                 "structured variant `{tag}` requires named fields"
             )));
         }
-        return Ok(boon_persistence::StoredValue::Variant {
+        return Ok(boon_persistence::StoredValue::Tag {
             tag: tag.clone(),
             fields: BTreeMap::new(),
         });
@@ -5479,8 +5486,6 @@ fn validate_record_for_data_type(
 
 pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Value, Error> {
     match value {
-        boon_persistence::StoredValue::Null => Ok(Value::Null),
-        boon_persistence::StoredValue::Bool(value) => Ok(Value::Bool(value)),
         boon_persistence::StoredValue::Number(value) => Ok(Value::Number(value)),
         boon_persistence::StoredValue::Text(value) => Ok(Value::Text(value)),
         boon_persistence::StoredValue::Bytes(value) => Ok(Value::Bytes(value)),
@@ -5489,15 +5494,19 @@ pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Valu
             .map(runtime_value)
             .collect::<Result<Vec<_>, _>>()
             .map(Value::List),
-        boon_persistence::StoredValue::Record(fields) => fields
+        boon_persistence::StoredValue::Object(fields) => fields
             .into_iter()
             .map(|(name, value)| Ok((name, runtime_value(value)?)))
             .collect::<Result<BTreeMap<_, _>, Error>>()
             .map(Value::Record),
-        boon_persistence::StoredValue::Variant { tag, fields } if fields.is_empty() => {
-            Ok(Value::Text(tag))
+        boon_persistence::StoredValue::Tag { tag, fields } if fields.is_empty() => {
+            Ok(match tag.as_str() {
+                "True" => Value::Bool(true),
+                "False" => Value::Bool(false),
+                _ => Value::Text(tag),
+            })
         }
-        boon_persistence::StoredValue::Variant { tag, mut fields } => {
+        boon_persistence::StoredValue::Tag { tag, mut fields } => {
             if fields
                 .insert("$tag".to_owned(), boon_persistence::StoredValue::Text(tag))
                 .is_some()
@@ -5506,16 +5515,7 @@ pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Valu
                     "stored variant contains reserved `$tag` field".to_owned(),
                 ));
             }
-            runtime_value(boon_persistence::StoredValue::Record(fields))
-        }
-        boon_persistence::StoredValue::Error { code, fields } => {
-            if fields.is_empty() {
-                Ok(Value::Error { code })
-            } else {
-                Err(Error::Evaluation(
-                    "runtime cannot restore structured error authority".to_owned(),
-                ))
-            }
+            runtime_value(boon_persistence::StoredValue::Object(fields))
         }
     }
 }
@@ -15861,7 +15861,7 @@ impl MachineInstance {
                 effect.invocation_id
             )));
         }
-        let intent = boon_persistence::StoredValue::Record(
+        let intent = boon_persistence::StoredValue::Object(
             effect
                 .intent_fields
                 .iter()
@@ -15892,7 +15892,7 @@ impl MachineInstance {
         let durable_owner = self.durable_owner(&owner_route)?;
         let idempotency_key = match effect.idempotency_key {
             boon_plan::EffectIdempotencyKeyPlan::InvocationTurnIntentSha256 => {
-                boon_persistence::canonical_intent_key(&boon_persistence::StoredValue::Record(
+                boon_persistence::canonical_intent_key(&boon_persistence::StoredValue::Object(
                     BTreeMap::from([
                         (
                             "authority_turn_sequence".to_owned(),

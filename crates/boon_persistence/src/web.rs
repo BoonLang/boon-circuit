@@ -2051,21 +2051,18 @@ fn stored_value_bytes(value: &super::StoredValue, depth: usize) -> usize {
         return usize::MAX;
     }
     match value {
-        super::StoredValue::Null | super::StoredValue::Bool(_) | super::StoredValue::Number(_) => {
-            16
-        }
+        super::StoredValue::Number(_) => 16,
         super::StoredValue::Text(value) => 24usize.saturating_add(value.len()),
         super::StoredValue::Bytes(value) => 24usize.saturating_add(value.len()),
         super::StoredValue::List(values) => values.iter().fold(24, |bytes, value| {
             bytes.saturating_add(stored_value_bytes(value, depth + 1))
         }),
-        super::StoredValue::Record(fields) => fields.iter().fold(24, |bytes, (name, value)| {
+        super::StoredValue::Object(fields) => fields.iter().fold(24, |bytes, (name, value)| {
             bytes
                 .saturating_add(name.len())
                 .saturating_add(stored_value_bytes(value, depth + 1))
         }),
-        super::StoredValue::Variant { tag, fields }
-        | super::StoredValue::Error { code: tag, fields } => {
+        super::StoredValue::Tag { tag, fields } => {
             fields
                 .iter()
                 .fold(32usize.saturating_add(tag.len()), |bytes, (name, value)| {
@@ -5383,12 +5380,12 @@ mod tests {
     fn browser_scalar_and_row_records_match_the_native_component_codec() {
         let scalar = StoredScalar {
             touched: true,
-            value: StoredValue::Record(BTreeMap::from([
+            value: StoredValue::Object(BTreeMap::from([
                 ("a".to_owned(), number(-7)),
                 (
                     "b".to_owned(),
                     StoredValue::List(vec![
-                        StoredValue::Bool(true),
+                        StoredValue::truth(true),
                         StoredValue::Text("Boon".to_owned()),
                     ]),
                 ),

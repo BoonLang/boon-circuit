@@ -104,14 +104,15 @@ pub(super) fn runtime_error(error: impl fmt::Display) -> DistributedRuntimeError
 pub(super) fn exported_event_data(
     export: &DistributedEventExportPlan,
     source: &SourcePayload,
-) -> Result<boon_data::Value, DistributedRuntimeError> {
+) -> Result<Option<boon_data::Value>, DistributedRuntimeError> {
     let Some(field) = export.payload_field.as_ref() else {
-        return Ok(boon_data::Value::Null);
+        return Ok(None);
     };
     export_runtime_value(
         source_payload_value(source, field)
             .ok_or_else(|| runtime_error("distributed event export is missing its payload"))?,
     )
+    .map(Some)
 }
 
 pub(super) fn export_runtime_value(

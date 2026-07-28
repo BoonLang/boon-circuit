@@ -208,7 +208,7 @@ fn encode_message(
                     None,
                     *revision,
                     None,
-                    value.clone(),
+                    Some(value.clone()),
                 )
             }
             DistributedMessagePayload::Event {
@@ -246,7 +246,7 @@ fn encode_message(
                     Some(call_instance_id.0),
                     *demand_revision,
                     None,
-                    values,
+                    Some(values),
                 )
             }
             DistributedMessagePayload::CurrentCallResult {
@@ -268,7 +268,7 @@ fn encode_message(
                     Some(call_instance_id.0),
                     *demand_revision,
                     Some(*result_revision),
-                    value.clone(),
+                    Some(value.clone()),
                 )
             }
             DistributedMessagePayload::CurrentCallDetach {
@@ -288,7 +288,7 @@ fn encode_message(
                     Some(call_instance_id.0),
                     *demand_revision,
                     None,
-                    DataValue::Null,
+                    None,
                 )
             }
             DistributedMessagePayload::InvocationRequest {
@@ -312,7 +312,7 @@ fn encode_message(
                     Some(call_instance_id.0),
                     *sequence,
                     None,
-                    values,
+                    Some(values),
                 )
             }
             DistributedMessagePayload::InvocationResult {
@@ -333,7 +333,7 @@ fn encode_message(
                     Some(call_instance_id.0),
                     *sequence,
                     None,
-                    value.clone(),
+                    Some(value.clone()),
                 )
             }
         };
@@ -401,7 +401,7 @@ struct ClassifiedDataRequest {
     call_instance_id: Option<[u8; 32]>,
     semantic_revision: u64,
     result_revision: Option<u64>,
-    payload: DataValue,
+    payload: Option<DataValue>,
 }
 
 fn classify_data(
@@ -425,6 +425,9 @@ fn classify_data(
                 && edge.consumer_role == consumer
         })
     {
+        if payload.is_some() != edge.payload_field.is_some() {
+            return Err(DistributedRuntimeError::InvalidTransportFrame);
+        }
         return Ok(DistributedMessage {
             producer,
             consumer,
@@ -442,6 +445,7 @@ fn classify_data(
                 && edge.consumer_role == consumer
         })
     {
+        let payload = payload.ok_or(DistributedRuntimeError::InvalidTransportFrame)?;
         return Ok(DistributedMessage {
             producer,
             consumer,
@@ -467,7 +471,7 @@ fn classify_data(
             && edge.callee_role == consumer
     }) {
         if operation == ClientSessionDataOperation::CurrentCallDetach {
-            if edge.mode != DistributedCallMode::Current || payload != DataValue::Null {
+            if edge.mode != DistributedCallMode::Current || payload.is_some() {
                 return Err(DistributedRuntimeError::InvalidTransportFrame);
             }
             return Ok(DistributedMessage {
@@ -480,6 +484,7 @@ fn classify_data(
                 },
             });
         }
+        let payload = payload.ok_or(DistributedRuntimeError::InvalidTransportFrame)?;
         let DataValue::List(values) = &payload else {
             return Err(DistributedRuntimeError::InvalidTransportFrame);
         };
@@ -528,6 +533,7 @@ fn classify_data(
             && edge.callee_role == producer
             && edge.caller_role == consumer
     }) {
+        let payload = payload.ok_or(DistributedRuntimeError::InvalidTransportFrame)?;
         let payload = match (operation, edge.mode) {
             (ClientSessionDataOperation::CurrentCallResult, DistributedCallMode::Current) => {
                 DistributedMessagePayload::CurrentCallResult {
@@ -702,7 +708,7 @@ mod tests {
             payload: DistributedMessagePayload::Event {
                 export_id,
                 sequence: 7,
-                value: DataValue::Null,
+                value: None,
             },
         };
         let link = ClientSessionLink::new([1; 32], [2; 32], 1, SessionId::from_bytes([9; 32]), 1);

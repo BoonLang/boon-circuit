@@ -47,7 +47,7 @@ impl DevelopmentPasskeySimulator {
                 request.effect_id
             )));
         }
-        let StoredValue::Record(intent) = &request.intent else {
+        let StoredValue::Object(intent) = &request.intent else {
             return Err(HostEffectError::rejected(format!(
                 "{expected} intent is not a record"
             )));
@@ -133,7 +133,7 @@ fn registration_result(
                     ),
                     (
                         "workspace_grant_bound",
-                        StoredValue::Bool(first_registration),
+                        StoredValue::truth(first_registration),
                     ),
                 ],
             )
@@ -198,7 +198,7 @@ fn stable_public_id(kind: &str, authority: &str, ordinal: i64) -> String {
 }
 
 fn variant<const N: usize>(tag: &str, fields: [(&str, StoredValue); N]) -> StoredValue {
-    StoredValue::Variant {
+    StoredValue::Tag {
         tag: tag.to_owned(),
         fields: fields
             .into_iter()
@@ -213,7 +213,7 @@ fn failure_variant(tag: &str, code: &str, message: &str) -> StoredValue {
         [
             ("code", StoredValue::Text(code.to_owned())),
             ("message", StoredValue::Text(message.to_owned())),
-            ("retryable", StoredValue::Bool(true)),
+            ("retryable", StoredValue::truth(true)),
         ],
     )
 }
@@ -251,7 +251,7 @@ fn variant_tag_field<'a>(
     name: &str,
 ) -> Result<&'a str, HostEffectError> {
     match intent.get(name) {
-        Some(StoredValue::Variant { tag, fields }) if fields.is_empty() => Ok(tag),
+        Some(StoredValue::Tag { tag, fields }) if fields.is_empty() => Ok(tag),
         _ => Err(HostEffectError::rejected(format!(
             "passkey intent field `{name}` is not a fieldless variant"
         ))),

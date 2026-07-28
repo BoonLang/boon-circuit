@@ -1192,6 +1192,45 @@ fn append_materialized_value_fields(
             });
         }
     }
+    let materialized_rows = execution
+        .materializations
+        .iter()
+        .filter_map(|materialization| {
+            materialization
+                .target_list_id
+                .zip(materialization.target_scope_id)
+                .map(|(list, scope)| SemanticRowBinding { list, scope })
+        })
+        .collect::<BTreeSet<_>>();
+    let explicit_value_paths = fields
+        .iter()
+        .filter(|field| field.role == SemanticStorageFieldRoleV1::Value)
+        .filter_map(|field| {
+            field
+                .row
+                .zip(storage_field_item_path(field))
+                .map(|(row, path)| (row, path))
+        })
+        .collect::<BTreeSet<_>>();
+    let promoted = fields
+        .iter()
+        .filter(|field| field.role == SemanticStorageFieldRoleV1::ListAuthority)
+        .filter_map(|field| {
+            let row = field.row?;
+            let path = storage_field_item_path(field)?;
+            (materialized_rows.contains(&row) && !explicit_value_paths.contains(&(row, path)))
+                .then_some(field.id)
+        })
+        .collect::<BTreeSet<_>>();
+    for field in fields {
+        if promoted.contains(&field.id) {
+            // A contextual materializer must write every target row member.
+            // Fields with an explicit computed projection retain that Value
+            // field; unchanged row members use their authority field as both
+            // the writable value and the stable row authority.
+            field.role = SemanticStorageFieldRoleV1::ValueAuthority;
+        }
+    }
     Ok(())
 }
 

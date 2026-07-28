@@ -703,28 +703,68 @@ fn synthesize_inline_checked_list_target(
     let binding = CheckedResourceBinding::ListAuthority {
         list: checked_list.id,
     };
-    let candidates = execution
-        .expressions
+    let binding_statements = execution
+        .statements
         .iter()
-        .filter(|expression| {
-            expression.checked_expr_id == checked_list.producer
-                && matches!(expression.kind, SemanticExpressionKind::List { .. })
-        })
-        .filter_map(|expression| {
-            let origin = execution
-                .checked_expression_origins
-                .get(expression.id.as_usize())
-                .filter(|origin| origin.expression == expression.id)?;
-            let statement_id = origin.owning_statement?;
-            execution
-                .statements
-                .get(statement_id.as_usize())
-                .filter(|statement| {
-                    statement.id == statement_id && statement.checked_resources.contains(&binding)
-                })
-                .map(|_| (expression.id, statement_id))
-        })
+        .filter(|statement| statement.checked_resources.contains(&binding))
+        .map(|statement| statement.id)
         .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    for candidate in execution.expressions.iter().filter(|expression| {
+        expression.checked_expr_id == checked_list.producer
+            && matches!(expression.kind, SemanticExpressionKind::List { .. })
+    }) {
+        let origin = execution
+            .checked_expression_origins
+            .get(candidate.id.as_usize())
+            .filter(|origin| origin.expression == candidate.id)
+            .ok_or_else(|| {
+                format!(
+                    "checked inline list {} expression {} has no exact origin",
+                    checked_list.id.0, candidate.id
+                )
+            })?;
+        let mut owners = BTreeSet::new();
+        if let Some(statement) = origin.owning_statement
+            && execution
+                .statements
+                .get(statement.as_usize())
+                .filter(|candidate| candidate.id == statement)
+                .is_some_and(|statement| statement.checked_resources.contains(&binding))
+        {
+            owners.insert(statement);
+        }
+        for statement in &binding_statements {
+            let statement = execution
+                .statements
+                .get(statement.as_usize())
+                .filter(|candidate| candidate.id == *statement)
+                .ok_or_else(|| {
+                    format!(
+                        "checked inline list {} references missing binding statement {statement}",
+                        checked_list.id.0
+                    )
+                })?;
+            if let Some(root) = statement.value
+                && expression_reaches(execution, root, candidate.id)?
+            {
+                owners.insert(statement.id);
+            }
+        }
+        match owners.len() {
+            0 => {}
+            1 => candidates.push((
+                candidate.id,
+                owners.iter().next().copied().expect("one exact list owner"),
+            )),
+            count => {
+                return Err(format!(
+                    "checked inline list {} expression {} resolves to {count} semantic authority statements",
+                    checked_list.id.0, candidate.id
+                ));
+            }
+        }
+    }
     let concrete_candidates = candidates
         .iter()
         .copied()
@@ -746,10 +786,11 @@ fn synthesize_inline_checked_list_target(
                 })
         })
         .collect::<Vec<_>>();
-    let (candidate, existing_statement) = match concrete_candidates.as_slice() {
-        [(expression, statement)] => (*expression, Some(*statement)),
+    let (candidate, existing_statement, authority_statement) = match concrete_candidates.as_slice()
+    {
+        [(expression, statement)] => (*expression, Some(*statement), *statement),
         [] => match candidates.as_slice() {
-            [(expression, _)] => (*expression, None),
+            [(expression, statement)] => (*expression, None, *statement),
             [] => return Ok(None),
             _ => {
                 return Err(format!(
@@ -794,36 +835,37 @@ fn synthesize_inline_checked_list_target(
     let (producer, statement) = if let Some(statement) = existing_statement {
         (candidate, statement)
     } else {
-        let parent = origin.owning_statement;
+        let authority = execution
+            .statements
+            .get(authority_statement.as_usize())
+            .filter(|statement| statement.id == authority_statement)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "checked inline list {} references missing authority statement {authority_statement}",
+                    checked_list.id.0
+                )
+            })?;
+        let parent = Some(authority_statement);
         let statement = SemanticStatementId(execution.statements.len());
         let producer = SemanticExprId(execution.expressions.len());
         let mut concrete = definition.clone();
         concrete.id = producer;
         concrete.value_id = SemanticValueId(producer.as_usize());
+        concrete.flow_type.ty = Type::List(Box::new(checked_list.item_type.clone()));
         execution.expressions.push(concrete);
         let mut concrete_origin = origin.clone();
         concrete_origin.expression = producer;
         concrete_origin.owning_statement = Some(statement);
         execution.checked_expression_origins.push(concrete_origin);
-        let scope = execution
-            .scopes
-            .iter()
-            .find(|scope| scope.checked_scope == origin.checked_scope)
-            .map(|scope| scope.id)
-            .ok_or_else(|| {
-                format!(
-                    "checked inline list {} expression {candidate} references missing semantic scope {}",
-                    checked_list.id.0, origin.checked_scope.0
-                )
-            })?;
         execution.statements.push(SemanticStatement {
             id: statement,
             origin: SemanticStatementOrigin::Checked {
                 statement: checked_list.statement,
             },
-            scope,
+            scope: authority.scope,
             parent,
-            call_instance: origin.call_instance,
+            call_instance: authority.call_instance,
             span: checked_list.span,
             checked_resources: vec![binding],
             declaration: None,
@@ -854,13 +896,17 @@ fn synthesize_inline_checked_list_target(
         }
         (producer, statement)
     };
-    let Type::List(item_type) = &definition.flow_type.ty else {
+    let Type::List(_) = &definition.flow_type.ty else {
         return Err(format!(
             "checked inline list {} semantic authority is not list-typed",
             checked_list.id.0
         ));
     };
-    let mut item_fields = ordered_object_fields(item_type);
+    // The literal's local type can intentionally be open (most notably for an
+    // empty fallback arm).  The checked list owns the contextual item type
+    // inferred from the complete declaration, so that is the exact authority
+    // type that must survive into semantic storage.
+    let mut item_fields = ordered_object_fields(&checked_list.item_type);
     for field in expression_record_field_names(execution, producer)? {
         if !item_fields.contains(&field) {
             item_fields.push(field);
@@ -873,7 +919,7 @@ fn synthesize_inline_checked_list_target(
         path: path.to_owned(),
         local_name,
         capacity: checked_list.capacity,
-        item_type: (**item_type).clone(),
+        item_type: checked_list.item_type.clone(),
         item_fields,
         span: checked_list.span.into(),
         alias: None,

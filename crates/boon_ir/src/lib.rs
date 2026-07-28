@@ -2322,10 +2322,12 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
             verify_erased_row(program, row, &format!("FieldId {}", field.id))?;
         }
         if field.role == ErasedFieldRole::ListAuthority
-            && (field.row.is_none() || field.declaration.is_some() || field.producer.is_some())
+            && ((field.row.is_none() && field.parent.is_none())
+                || field.declaration.is_some()
+                || field.producer.is_some())
         {
             return Err(format!(
-                "list authority FieldId {} must be hidden row storage without a declaration or producer",
+                "list authority FieldId {} must be hidden authority storage with a row or parent and without a declaration or producer",
                 field.id
             ));
         }

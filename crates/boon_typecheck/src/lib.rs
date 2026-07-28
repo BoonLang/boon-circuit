@@ -7357,7 +7357,23 @@ impl<'a> CheckedProgramBuilder<'a> {
                 });
                 continue;
             };
-            let Some(statement) = declaration_statements.get(&declaration).copied() else {
+            let declaration_authority =
+                declaration_values.get(&declaration).and_then(|(root, _)| {
+                    checked_inline_list_authority_root(expressions, &self.calls, *root)
+                }) == Some(expression.id);
+            let Some(statement) = declaration_authority
+                .then(|| declaration_statements.get(&declaration).copied())
+                .flatten()
+                .or_else(|| {
+                    containing_expression_statement(
+                        &self.program.ast.statements,
+                        expression.id.0 as usize,
+                        &self.program.expressions,
+                    )
+                    .map(|statement| CheckedStatementId(statement.id as u32))
+                })
+                .or_else(|| declaration_statements.get(&declaration).copied())
+            else {
                 self.diagnostics.push(TypeDiagnostic {
                     severity: DiagnosticSeverity::Error,
                     line: expression.span.line,
@@ -20105,6 +20121,84 @@ fn hold_update_exprs_for_expr(
         }
     }
     Vec::new()
+}
+
+fn checked_inline_list_authority_root(
+    expressions: &[CheckedExpression],
+    calls: &[CheckedCall],
+    root: CheckedExprId,
+) -> Option<CheckedExprId> {
+    let mut current = root;
+    let mut visited = BTreeSet::new();
+    while visited.insert(current) {
+        let expression = expressions.get(current.0 as usize)?;
+        current = match &expression.kind {
+            CheckedExpressionKind::List { .. } => return Some(current),
+            CheckedExpressionKind::Call { call } => {
+                let call = calls.iter().find(|candidate| candidate.id == *call)?;
+                if call.function == "List/range" {
+                    return Some(current);
+                }
+                let inputs = call
+                    .entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        CheckedCallEntry::Input { value, .. }
+                            if expressions.get(value.0 as usize).is_some_and(|expression| {
+                                matches!(expression.flow_type.ty, Type::List(_))
+                            }) =>
+                        {
+                            Some(*value)
+                        }
+                        CheckedCallEntry::Input { .. }
+                        | CheckedCallEntry::FreshOut { .. }
+                        | CheckedCallEntry::ForwardOut { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                let [input] = inputs.as_slice() else {
+                    return None;
+                };
+                *input
+            }
+            CheckedExpressionKind::Draining { input } => *input,
+            CheckedExpressionKind::Block {
+                result: Some(result),
+                ..
+            } => *result,
+            CheckedExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | CheckedExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => *output,
+            CheckedExpressionKind::Read { .. }
+            | CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Drain { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::TextTemplate { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::TaggedObject { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Hold { .. }
+            | CheckedExpressionKind::Latest { .. }
+            | CheckedExpressionKind::When { .. }
+            | CheckedExpressionKind::While { .. }
+            | CheckedExpressionKind::Then { output: None, .. }
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::MatchArm { output: None, .. }
+            | CheckedExpressionKind::Block { result: None, .. }
+            | CheckedExpressionKind::Object { .. }
+            | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => return None,
+        };
+    }
+    None
 }
 
 fn when_arms(expr_id: usize, expressions: &[AstExpr]) -> Vec<(Vec<String>, usize)> {

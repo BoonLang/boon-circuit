@@ -1,5 +1,5 @@
 use boon_contract::SourceBundleDigestV1;
-use boon_data::{ExactNumber, MAX_NUMBER_TEXT_DIGITS};
+use boon_data::{ExactNumber, ExactRoundingRule, MAX_NUMBER_TEXT_DIGITS};
 pub use boon_document_model::ProgramRole;
 use boon_parser::{
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
@@ -14151,6 +14151,7 @@ impl<'a> Checker<'a> {
                 self.check_bytes_builtin_arguments(expr.id, function, args, None);
                 self.check_text_to_number_arguments(expr.id, function, args, false);
                 self.check_number_to_text_arguments(expr.id, function, args, false);
+                self.check_number_round_arguments(function, args);
                 self.check_one_based_arguments(expr.id, function, args);
                 self.check_builtin_call_compatibility(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
@@ -14218,6 +14219,7 @@ impl<'a> Checker<'a> {
                 self.check_bytes_builtin_arguments(expr.id, op, args, Some(input_expr_id));
                 self.check_text_to_number_arguments(expr.id, op, args, true);
                 self.check_number_to_text_arguments(expr.id, op, args, true);
+                self.check_number_round_arguments(op, args);
                 self.check_one_based_arguments(expr.id, op, args);
                 self.check_builtin_call_compatibility(expr.id, op, Some(input_expr_id), args);
                 if self.render_contracts.is_render_constructor(op) {
@@ -14837,6 +14839,24 @@ impl<'a> Checker<'a> {
                     format!("`{function}` argument `{name}` is a count and cannot be negative"),
                 ));
             }
+        }
+    }
+
+    fn check_number_round_arguments(&mut self, function: &str, args: &[AstCallArg]) {
+        if function != "Number/round" {
+            return;
+        }
+        let Some(quantum_expr) = named_arg_expr(args, "to") else {
+            return;
+        };
+        let Some(quantum) = static_exact_number_expr(self.program, quantum_expr) else {
+            return;
+        };
+        if !quantum.is_positive() {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                quantum_expr,
+                "`Number/round` argument `to` must be a strictly positive exact Number".to_owned(),
+            ));
         }
     }
 
@@ -19028,7 +19048,6 @@ impl Default for BuiltinSignatureRegistry {
             "Number/bit_width",
             "Number/ceil",
             "Number/floor",
-            "Number/round",
             "Number/truncate",
         ] {
             register(
@@ -19038,6 +19057,16 @@ impl Default for BuiltinSignatureRegistry {
                 None,
             );
         }
+        register(
+            "Number/round",
+            Type::Number,
+            vec![
+                required_parameter("value", Type::Number),
+                required_parameter("to", Type::Number),
+                required_parameter("using", rounding_rule_type()),
+            ],
+            None,
+        );
         register(
             "Number/interpolate",
             Type::Number,
@@ -22838,6 +22867,8 @@ fn number_argument_expected_type(
     _piped: bool,
 ) -> Option<Type> {
     match (function, arg_name) {
+        ("Number/round", Some("value" | "to") | None) => Some(Type::Number),
+        ("Number/round", Some("using")) => Some(rounding_rule_type()),
         ("Number/to_text", Some("prefix")) => Some(true_false_type()),
         ("Number/to_text", Some("value")) => Some(Type::Number),
         ("Number/to_text", Some("radix" | "min_width" | "signed_width" | "group_size")) => {
@@ -27469,6 +27500,10 @@ fn tag_union_type(tags: &[&str]) -> Type {
             .map(|tag| Variant::Tag((*tag).to_owned()))
             .collect(),
     )
+}
+
+fn rounding_rule_type() -> Type {
+    tag_union_type(&ExactRoundingRule::ALL.map(ExactRoundingRule::as_tag))
 }
 
 fn stripe_kind_type(direction: Option<&Type>) -> Type {

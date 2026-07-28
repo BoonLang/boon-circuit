@@ -50,9 +50,15 @@ Whole-number operations are explicit:
 
 - `Number/floor()` returns the greatest whole Number no greater than its input.
 - `Number/ceil()` returns the least whole Number no less than its input.
-- `Number/round()` rounds to the nearest whole Number, with exact halves away
-  from zero.
+- `Number/round(to:, using:)` rounds to an exact, strictly positive quantum
+  using one of `NearestEven`, `NearestAwayFromZero`, `TowardZero`,
+  `TowardPositive`, `TowardNegative`, or `AwayFromZero`.
 - `Number/truncate()` rounds toward zero.
+
+A statically known zero or negative `to:` quantum is a compile error. A
+dynamically invalid quantum is a deterministic terminal API-domain error; it
+is never made positive or replaced with a default. The former no-argument
+`Number/round()` spelling does not exist.
 
 List positions, byte offsets, byte counts, and other bounded indices accept
 only an already-whole, non-negative, in-range Number. They do not round

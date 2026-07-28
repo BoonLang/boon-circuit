@@ -231,7 +231,8 @@ store: [
         }
 
     real_cursor_time_tick:
-        selected_timeline_cursor_value |> Number/round()
+        selected_timeline_cursor_value
+        |> Number/round(to: 1, using: NearestAwayFromZero)
 
     real_cursor_request_fingerprint:
         real_signal_page_request_fingerprint

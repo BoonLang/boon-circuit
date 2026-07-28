@@ -26413,20 +26413,25 @@ impl MachineInstance {
             }
             PlanRowBuiltin::NumberCeil
             | PlanRowBuiltin::NumberFloor
-            | PlanRowBuiltin::NumberRound
             | PlanRowBuiltin::NumberTruncate => {
                 let value = eval_to_number(&require_input(input)?)?;
                 let rounded = match function {
                     PlanRowBuiltin::NumberCeil => value.ceil(),
                     PlanRowBuiltin::NumberFloor => value.floor(),
-                    PlanRowBuiltin::NumberRound => exact_number_result(
-                        value.round_to(&ExactNumber::one(), ExactRoundingRule::NearestAwayFromZero),
-                        function.function_name(),
-                    )?,
                     PlanRowBuiltin::NumberTruncate => value.truncate(),
                     _ => unreachable!(),
                 };
                 EvalValue::Value(Value::Number(rounded))
+            }
+            PlanRowBuiltin::NumberRound => {
+                let value = eval_to_number(&require_input(input)?)?;
+                let quantum = take_required_builtin_number(&mut args, "to", function)?;
+                let rule_value = take_required_builtin_arg(&mut args, "using", function)?;
+                let rule = eval_to_rounding_rule(&rule_value)?;
+                EvalValue::Value(Value::Number(exact_number_result(
+                    value.round_to(&quantum, rule),
+                    function.function_name(),
+                )?))
             }
             PlanRowBuiltin::NumberBitWidth => {
                 let value = eval_to_number(&require_input(input)?)?;
@@ -28216,6 +28221,21 @@ fn eval_to_number(value: &EvalValue) -> Result<ExactNumber, Error> {
         EvalValue::Value(Value::Number(value)) => Ok(value.clone()),
         other => Err(Error::Evaluation(format!("value {other:?} is not numeric"))),
     }
+}
+
+fn eval_to_rounding_rule(value: &EvalValue) -> Result<ExactRoundingRule, Error> {
+    let EvalValue::Value(Value::Tag { tag, fields }) = value else {
+        return Err(Error::Evaluation(
+            "Number/round `using` must be a rounding-rule tag".to_owned(),
+        ));
+    };
+    if !fields.is_empty() {
+        return Err(Error::Evaluation(
+            "Number/round `using` must be a fieldless rounding-rule tag".to_owned(),
+        ));
+    }
+    ExactRoundingRule::from_tag(tag)
+        .ok_or_else(|| Error::Evaluation(format!("Number/round has unknown rounding rule `{tag}`")))
 }
 
 fn eval_number_radix(value: &EvalValue) -> Result<Option<u32>, Error> {

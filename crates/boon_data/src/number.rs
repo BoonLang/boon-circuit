@@ -76,6 +76,40 @@ pub enum ExactRoundingRule {
     AwayFromZero,
 }
 
+impl ExactRoundingRule {
+    pub const ALL: [Self; 6] = [
+        Self::NearestEven,
+        Self::NearestAwayFromZero,
+        Self::TowardZero,
+        Self::TowardPositive,
+        Self::TowardNegative,
+        Self::AwayFromZero,
+    ];
+
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            Self::NearestEven => "NearestEven",
+            Self::NearestAwayFromZero => "NearestAwayFromZero",
+            Self::TowardZero => "TowardZero",
+            Self::TowardPositive => "TowardPositive",
+            Self::TowardNegative => "TowardNegative",
+            Self::AwayFromZero => "AwayFromZero",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "NearestEven" => Self::NearestEven,
+            "NearestAwayFromZero" => Self::NearestAwayFromZero,
+            "TowardZero" => Self::TowardZero,
+            "TowardPositive" => Self::TowardPositive,
+            "TowardNegative" => Self::TowardNegative,
+            "AwayFromZero" => Self::AwayFromZero,
+            _ => return None,
+        })
+    }
+}
+
 /// Stable reason carried by `InvalidNumber[reason, position]`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExactNumberParseReason {
@@ -1605,29 +1639,53 @@ mod tests {
     #[test]
     fn exact_rounding_covers_ties_and_direction() {
         let quantum = number("1");
+        for (value, rule, expected) in [
+            ("5/2", ExactRoundingRule::NearestEven, "2"),
+            ("7/2", ExactRoundingRule::NearestEven, "4"),
+            ("-5/2", ExactRoundingRule::NearestEven, "-2"),
+            ("-7/2", ExactRoundingRule::NearestEven, "-4"),
+            ("5/2", ExactRoundingRule::NearestAwayFromZero, "3"),
+            ("-5/2", ExactRoundingRule::NearestAwayFromZero, "-3"),
+            ("7/3", ExactRoundingRule::TowardZero, "2"),
+            ("-7/3", ExactRoundingRule::TowardZero, "-2"),
+            ("7/3", ExactRoundingRule::TowardPositive, "3"),
+            ("-7/3", ExactRoundingRule::TowardPositive, "-2"),
+            ("7/3", ExactRoundingRule::TowardNegative, "2"),
+            ("-7/3", ExactRoundingRule::TowardNegative, "-3"),
+            ("7/3", ExactRoundingRule::AwayFromZero, "3"),
+            ("-7/3", ExactRoundingRule::AwayFromZero, "-3"),
+        ] {
+            assert_eq!(
+                number(value).round_to(&quantum, rule).unwrap(),
+                number(expected),
+                "{value} using {}",
+                rule.as_tag()
+            );
+        }
         assert_eq!(
-            number("5/2")
-                .round_to(&quantum, ExactRoundingRule::NearestEven)
+            number("10/3")
+                .round_to(&number("0.01"), ExactRoundingRule::NearestEven)
                 .unwrap(),
-            number("2")
-        );
-        assert_eq!(
-            number("5/2")
-                .round_to(&quantum, ExactRoundingRule::NearestAwayFromZero)
-                .unwrap(),
-            number("3")
-        );
-        assert_eq!(
-            number("-5/2")
-                .round_to(&quantum, ExactRoundingRule::NearestAwayFromZero)
-                .unwrap(),
-            number("-3")
+            number("3.33")
         );
         assert!(
             number("1")
                 .round_to(&ExactNumber::zero(), ExactRoundingRule::TowardZero)
                 .is_err()
         );
+        assert!(
+            number("1")
+                .round_to(&number("-1"), ExactRoundingRule::TowardZero)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_rounding_rules_use_the_public_boon_tags() {
+        for rule in ExactRoundingRule::ALL {
+            assert_eq!(ExactRoundingRule::from_tag(rule.as_tag()), Some(rule));
+        }
+        assert_eq!(ExactRoundingRule::from_tag("Nearest"), None);
     }
 
     #[test]

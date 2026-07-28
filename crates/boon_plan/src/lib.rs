@@ -6791,6 +6791,11 @@ static BUILTIN_PARAMS_NUMBER_TO_ASCII_TEXT: &[PlanRowBuiltinParameter] = &[
     PlanRowBuiltinParameter::required_receiver("value"),
     PlanRowBuiltinParameter::optional("width"),
 ];
+static BUILTIN_PARAMS_NUMBER_ROUND: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("value"),
+    PlanRowBuiltinParameter::required("to"),
+    PlanRowBuiltinParameter::required("using"),
+];
 static BUILTIN_PARAMS_NUMBER_INTERPOLATE: &[PlanRowBuiltinParameter] = &[
     PlanRowBuiltinParameter::required("start"),
     PlanRowBuiltinParameter::required("end"),
@@ -7082,8 +7087,8 @@ impl PlanRowBuiltin {
             | Self::NumberBitWidth
             | Self::NumberCeil
             | Self::NumberFloor
-            | Self::NumberRound
             | Self::NumberTruncate => BUILTIN_PARAMS_VALUE,
+            Self::NumberRound => BUILTIN_PARAMS_NUMBER_ROUND,
             Self::BoolAnd | Self::BoolOr | Self::NumberMin | Self::NumberMax => {
                 BUILTIN_PARAMS_BOOL_BINARY
             }

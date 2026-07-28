@@ -7106,7 +7106,7 @@ store: [
     half: 1 / 2
     floor: 1.9 |> Number/floor()
     ceil: -1.9 |> Number/ceil()
-    round: -1.5 |> Number/round()
+    round: -1.5 |> Number/round(to: 1, using: NearestAwayFromZero)
     truncate: -1.9 |> Number/truncate()
     latitude:
         59.91 |> HOLD latitude {
@@ -7164,6 +7164,89 @@ outputs: [
         panic!("decimal arithmetic must produce a real number");
     };
     assert_eq!(updated, "60.01".parse::<ExactNumber>().unwrap());
+}
+
+#[test]
+fn exact_number_round_executes_every_public_rule_and_nonunit_quantum() {
+    let compiled = compile_server_source(
+        "exact-rounding.bn",
+        r#"
+store: [
+    nearest_even: 5 / 2 |> Number/round(to: 1, using: NearestEven)
+    nearest_away: -5 / 2 |> Number/round(to: 1, using: NearestAwayFromZero)
+    toward_zero: -7 / 3 |> Number/round(to: 1, using: TowardZero)
+    toward_positive: -7 / 3 |> Number/round(to: 1, using: TowardPositive)
+    toward_negative: 7 / 3 |> Number/round(to: 1, using: TowardNegative)
+    away: 7 / 3 |> Number/round(to: 1, using: AwayFromZero)
+    cents: 10 / 3 |> Number/round(to: 0.01, using: NearestEven)
+]
+
+outputs: [
+    nearest_even: store.nearest_even
+    nearest_away: store.nearest_away
+    toward_zero: store.toward_zero
+    toward_positive: store.toward_positive
+    toward_negative: store.toward_negative
+    away: store.away
+    cents: store.cents
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    for (name, expected) in [
+        ("nearest_even", "2"),
+        ("nearest_away", "-3"),
+        ("toward_zero", "-2"),
+        ("toward_positive", "-2"),
+        ("toward_negative", "2"),
+        ("away", "3"),
+        ("cents", "3.33"),
+    ] {
+        assert_eq!(
+            session.output_value_current(name).unwrap(),
+            Value::Number(expected.parse().unwrap()),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn dynamically_nonpositive_rounding_quantum_is_terminal() {
+    let compiled = compile_server_source(
+        "dynamic-invalid-rounding-quantum.bn",
+        r#"
+store: [
+    tick: SOURCE
+    quantum:
+        0 |> HOLD quantum {
+            store.tick |> THEN { 1 }
+        }
+    rounded:
+        5 / 2
+        |> Number/round(to: store.quantum, using: NearestEven)
+]
+
+outputs: [
+    rounded: store.rounded
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let error = match MachineInstance::new(compiled.plan, SessionOptions::default()) {
+        Ok(mut session) => session
+            .output_value_current("rounded")
+            .expect_err("a dynamic zero rounding quantum must fail terminally"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("rounding quantum must be strictly positive"),
+        "{error}"
+    );
 }
 
 #[test]

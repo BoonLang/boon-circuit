@@ -738,7 +738,12 @@ impl DocumentPlan {
                     ));
                 }
             }
-            if let DocumentExprOp::Builtin { arguments, .. } = &expression.op {
+            if let DocumentExprOp::Builtin {
+                builtin,
+                input,
+                arguments,
+            } = &expression.op
+            {
                 let mut names = BTreeSet::new();
                 for argument in arguments {
                     if argument.name.0 >= self.names.len() {
@@ -751,6 +756,37 @@ impl DocumentPlan {
                         return Err(format!(
                             "document expression {} contains duplicate builtin argument name {}",
                             expression.id.0, argument.name.0
+                        ));
+                    }
+                }
+                if *builtin == DocumentBuiltin::NumberRound {
+                    let argument_names = arguments
+                        .iter()
+                        .map(|argument| self.names[argument.name.0].as_str())
+                        .collect::<BTreeSet<_>>();
+                    let has_named_value = argument_names.contains("value");
+                    if input.is_some() == has_named_value {
+                        return Err(format!(
+                            "document Number/round expression {} must have exactly one `value` receiver",
+                            expression.id.0
+                        ));
+                    }
+                    for required in ["to", "using"] {
+                        if !argument_names.contains(required) {
+                            return Err(format!(
+                                "document Number/round expression {} is missing required argument `{required}`",
+                                expression.id.0
+                            ));
+                        }
+                    }
+                    if let Some(unknown) = argument_names
+                        .iter()
+                        .copied()
+                        .find(|name| !matches!(*name, "value" | "to" | "using"))
+                    {
+                        return Err(format!(
+                            "document Number/round expression {} has unknown argument `{unknown}`",
+                            expression.id.0
                         ));
                     }
                 }

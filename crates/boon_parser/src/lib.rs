@@ -1397,6 +1397,7 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let mut expressions = Vec::new();
     let mut statements = ast_statement_tree(&items, &mut expressions, source);
     link_multiline_expression_structure(&mut statements, &mut expressions);
+    normalize_unlinked_unary_negation(&mut expressions);
     validate_pipeline_inputs(path, source, &expressions)?;
     let ast = AstProgram {
         tokens,
@@ -1453,7 +1454,39 @@ fn statement_pipeline_continuation_target(
     statement: &AstStatement,
     expressions: &[AstExpr],
 ) -> Option<usize> {
+    if matches!(
+        statement.kind,
+        AstStatementKind::Function { .. }
+            | AstStatementKind::Field { .. }
+            | AstStatementKind::Source { field: Some(_), .. }
+            | AstStatementKind::Hold { field: Some(_), .. }
+            | AstStatementKind::List { field: Some(_), .. }
+    ) {
+        return None;
+    }
     pipeline_placeholder_target(statement.expr?, expressions)
+}
+
+fn normalize_unlinked_unary_negation(expressions: &mut [AstExpr]) {
+    let zero_expressions = expressions
+        .iter()
+        .filter_map(|expression| {
+            let AstExprKind::Infix { left, op, .. } = &expression.kind else {
+                return None;
+            };
+            (expression.linked_input.is_none()
+                && op == "-"
+                && expressions
+                    .get(*left)
+                    .is_some_and(|left| matches!(left.kind, AstExprKind::Delimiter)))
+            .then_some(*left)
+        })
+        .collect::<BTreeSet<_>>();
+    for expression in zero_expressions {
+        if let Some(expression) = expressions.get_mut(expression) {
+            expression.kind = AstExprKind::Number("0".to_owned());
+        }
+    }
 }
 
 fn statement_is_pipeline_continuation(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
@@ -5253,6 +5286,69 @@ value:
 
         assert_eq!(abs.linked_input, Some(input.id));
         assert_eq!(floor.linked_input, Some(abs.id));
+    }
+
+    #[test]
+    fn named_leading_minus_is_unary_not_a_sibling_continuation() {
+        let parsed = parse_ast(
+            "named-negative.bn",
+            r#"
+first: 10
+second: -5 / 2 |> Number/round(to: 1, using: NearestEven)
+third: 1 |> Number/round(to: -0.1, using: TowardZero)
+"#,
+        )
+        .unwrap();
+
+        let second = parsed
+            .statements
+            .iter()
+            .find(|statement| {
+                matches!(&statement.kind, AstStatementKind::Field { name } if name == "second")
+            })
+            .and_then(|statement| statement.expr)
+            .expect("second field expression");
+        let AstExprKind::Pipe { input, .. } = &parsed.expressions[second].kind else {
+            panic!("second field must retain its rounding call");
+        };
+        let AstExprKind::Infix { left, op, right: _ } = &parsed.expressions[*input].kind else {
+            panic!("second field must retain unary negation");
+        };
+        assert_eq!(op, "-");
+        assert_eq!(parsed.expressions[*input].linked_input, None);
+        assert!(matches!(
+            &parsed.expressions[*left].kind,
+            AstExprKind::Number(value) if value == "0"
+        ));
+
+        let third = parsed
+            .statements
+            .iter()
+            .find(|statement| {
+                matches!(&statement.kind, AstStatementKind::Field { name } if name == "third")
+            })
+            .and_then(|statement| statement.expr)
+            .expect("third field expression");
+        let AstExprKind::Pipe { args, .. } = &parsed.expressions[third].kind else {
+            panic!("third field must retain its rounding call");
+        };
+        let quantum = args
+            .iter()
+            .find(|argument| argument.name == "to")
+            .map(|argument| argument.value)
+            .expect("rounding quantum");
+        assert_eq!(parsed.expressions[quantum].linked_input, None);
+        match &parsed.expressions[quantum].kind {
+            AstExprKind::Number(value) => assert_eq!(value, "-0.1"),
+            AstExprKind::Infix { left, op, right: _ } => {
+                assert_eq!(op, "-");
+                assert!(matches!(
+                    &parsed.expressions[*left].kind,
+                    AstExprKind::Number(value) if value == "0"
+                ));
+            }
+            _ => panic!("negative call argument must retain unary negation"),
+        }
     }
 
     #[test]

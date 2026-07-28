@@ -853,6 +853,78 @@ first: encoded |> Bytes/get(position: 1)
 }
 
 #[test]
+fn checked_number_round_requires_an_exact_quantum_and_public_rule() {
+    let parsed = boon_parser::parse_source(
+        "checked-number-round.bn",
+        r#"
+nearest_even: 5 / 2 |> Number/round(to: 1, using: NearestEven)
+nearest_away: -5 / 2 |> Number/round(to: 1, using: NearestAwayFromZero)
+toward_zero: -7 / 3 |> Number/round(to: 1, using: TowardZero)
+toward_positive: -7 / 3 |> Number/round(to: 1, using: TowardPositive)
+toward_negative: 7 / 3 |> Number/round(to: 1, using: TowardNegative)
+away: 7 / 3 |> Number/round(to: 1, using: AwayFromZero)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output
+        .program
+        .expect("valid exact rounding calls produce a checked program");
+    assert_callable_parameters(&program, "Number/round", &["value", "to", "using"]);
+    assert_no_unbound_calls(&parsed, &program);
+}
+
+#[test]
+fn checked_number_round_rejects_legacy_domain_and_rule_forms() {
+    let parsed = boon_parser::parse_source(
+        "invalid-number-round.bn",
+        r#"
+legacy: 1.5 |> Number/round()
+zero: 1.5 |> Number/round(to: 0, using: NearestEven)
+negative: 1.5 |> Number/round(to: -0.1, using: TowardZero)
+unknown: 1.5 |> Number/round(to: 1, using: Nearest)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.report.has_errors());
+    let messages = output
+        .report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("missing call entry `to`")),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("must be a strictly positive exact Number"))
+            .count(),
+        2,
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message.contains("`Number/round` argument `using` has incompatible type")
+        }),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
 fn one_based_list_get_preserves_a_mapped_record_item_shape() {
     let parsed = boon_parser::parse_source(
         "checked-one-based-list-get.bn",

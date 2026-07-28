@@ -4254,9 +4254,24 @@ fn eval_builtin(
                 .unwrap_or(EvalValue::Absent)
         }
         DocumentBuiltin::NumberRound => {
-            let value = first.number().unwrap_or_else(ExactNumber::zero);
+            let value = first.number().ok_or_else(|| {
+                DocumentError::Evaluation(
+                    "Number/round requires one Number input named `value`".to_owned(),
+                )
+            })?;
+            let quantum = named_number(&arguments, "to").ok_or_else(|| {
+                DocumentError::Evaluation(
+                    "Number/round requires a Number argument named `to`".to_owned(),
+                )
+            })?;
+            let rule =
+                document_rounding_rule(named_value(&arguments, "using").ok_or_else(|| {
+                    DocumentError::Evaluation(
+                        "Number/round requires a rounding-rule tag named `using`".to_owned(),
+                    )
+                })?)?;
             EvalValue::Number(document_number_result(
-                value.round_to(&ExactNumber::one(), ExactRoundingRule::NearestAwayFromZero),
+                value.round_to(&quantum, rule),
                 "Number/round",
             )?)
         }
@@ -4384,6 +4399,22 @@ fn named_value<'a>(arguments: &'a [(String, EvalValue)], name: &str) -> Option<&
 
 fn named_number(arguments: &[(String, EvalValue)], name: &str) -> Option<ExactNumber> {
     named_value(arguments, name).and_then(EvalValue::number)
+}
+
+fn document_rounding_rule(value: &EvalValue) -> Result<ExactRoundingRule, DocumentError> {
+    let EvalValue::Tag(tag, fields) = value else {
+        return Err(DocumentError::Evaluation(
+            "Number/round `using` must be a rounding-rule tag".to_owned(),
+        ));
+    };
+    if !fields.is_empty() {
+        return Err(DocumentError::Evaluation(
+            "Number/round `using` must be a fieldless rounding-rule tag".to_owned(),
+        ));
+    }
+    ExactRoundingRule::from_tag(tag).ok_or_else(|| {
+        DocumentError::Evaluation(format!("Number/round has unknown rounding rule `{tag}`"))
+    })
 }
 
 fn required_document_position(
@@ -6629,6 +6660,78 @@ mod tests {
         assert_eq!(ascii(0, 7), EvalValue::Text("-".to_owned()));
         assert_eq!(ascii(0, 8), EvalValue::Text("?".to_owned()));
         assert_eq!(ascii(1, 8), EvalValue::Text("?".to_owned()));
+    }
+
+    #[test]
+    fn number_round_uses_exact_quantum_and_public_rule_tags() {
+        let round = |value: &str, quantum: &str, rule: &str| {
+            eval_builtin(
+                DocumentBuiltin::NumberRound,
+                Some(EvalValue::Number(value.parse().unwrap())),
+                vec![
+                    ("to".to_owned(), EvalValue::Number(quantum.parse().unwrap())),
+                    (
+                        "using".to_owned(),
+                        EvalValue::Tag(rule.to_owned(), BTreeMap::new()),
+                    ),
+                ],
+            )
+            .unwrap()
+        };
+        for (value, quantum, rule, expected) in [
+            ("5/2", "1", "NearestEven", "2"),
+            ("-5/2", "1", "NearestAwayFromZero", "-3"),
+            ("-7/3", "1", "TowardZero", "-2"),
+            ("-7/3", "1", "TowardPositive", "-2"),
+            ("7/3", "1", "TowardNegative", "2"),
+            ("7/3", "1", "AwayFromZero", "3"),
+            ("10/3", "0.01", "NearestEven", "3.33"),
+        ] {
+            assert_eq!(
+                round(value, quantum, rule),
+                EvalValue::Number(expected.parse().unwrap()),
+                "{value} to {quantum} using {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn number_round_rejects_dynamic_domain_and_rule_errors() {
+        let error = eval_builtin(
+            DocumentBuiltin::NumberRound,
+            Some(eval_number(1)),
+            vec![
+                ("to".to_owned(), eval_number(0)),
+                (
+                    "using".to_owned(),
+                    EvalValue::Tag("NearestEven".to_owned(), BTreeMap::new()),
+                ),
+            ],
+        )
+        .expect_err("zero quantum must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("rounding quantum must be strictly positive")
+        );
+
+        let error = eval_builtin(
+            DocumentBuiltin::NumberRound,
+            Some(eval_number(1)),
+            vec![
+                ("to".to_owned(), eval_number(1)),
+                (
+                    "using".to_owned(),
+                    EvalValue::Tag("Nearest".to_owned(), BTreeMap::new()),
+                ),
+            ],
+        )
+        .expect_err("unknown rounding rule must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown rounding rule `Nearest`")
+        );
     }
 
     #[test]

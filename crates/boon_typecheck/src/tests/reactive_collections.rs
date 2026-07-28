@@ -146,6 +146,10 @@ store: [
             item.controls.select |> THEN { item.name }
         )
         |> List/latest()
+    selected_controls:
+        rows
+        |> List/map(item, new: item.controls)
+        |> List/latest()
 ]
 
 FUNCTION selected_row(row) {
@@ -206,6 +210,26 @@ FUNCTION selected_row(row) {
             .source_origins
             .iter()
             .all(|origin| origin.payload_projection.is_empty())
+    );
+    let container = checked
+        .expressions
+        .iter()
+        .find(|expression| {
+            matches!(
+                &expression.kind,
+                CheckedExpressionKind::Read { projection, .. }
+                    if projection == &["controls".to_owned()]
+            )
+        })
+        .expect("mapped source container projection");
+    let container_requirement = checked
+        .resource_projection_requirements
+        .iter()
+        .find(|requirement| requirement.expression == container.id)
+        .expect("mapped source container retains ordinary projection metadata");
+    assert!(
+        container_requirement.source_origins.is_empty(),
+        "a record containing source handles is not itself a source payload projection"
     );
 }
 

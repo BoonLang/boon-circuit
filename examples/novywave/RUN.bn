@@ -4388,18 +4388,21 @@ FUNCTION real_cursor_value_text(signal_id) {
 }
 
 FUNCTION real_waveform_segment(transition, signal_id) {
-    [
-        file: store.active_file
-        signal_id: signal_id
-        start_time_value: transition.time
-        end_time_value: transition.end_time
-        state: real_waveform_value_state(value: transition.value)
-        label: real_waveform_value_text(value: transition.value)
-        click_time:
-            transition.time
-            |> Number/to_text(radix: 10)
-            |> Text/concat(with: real_waveform_time_unit(), separator: " ")
-    ]
+    BLOCK {
+        segment_signal_id: signal_id
+        [
+            file: store.active_file
+            signal_id: segment_signal_id
+            start_time_value: transition.time
+            end_time_value: transition.end_time
+            state: real_waveform_value_state(value: transition.value)
+            label: real_waveform_value_text(value: transition.value)
+            click_time:
+                transition.time
+                |> Number/to_text(radix: 10)
+                |> Text/concat(with: real_waveform_time_unit(), separator: " ")
+        ]
+    }
 }
 
 FUNCTION real_waveform_time_unit() {

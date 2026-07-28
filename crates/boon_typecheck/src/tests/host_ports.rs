@@ -525,7 +525,8 @@ host_ports: [
 "#,
     )
     .unwrap();
-    let report = check(&parsed);
+    let checked_output = check_program(&parsed);
+    let report = &checked_output.report;
 
     assert!(!report.has_errors(), "{:?}", report.diagnostics);
     let output = report
@@ -539,6 +540,37 @@ host_ports: [
     assert_eq!(shape.field_order, ["status", "body"]);
     assert!(!shape.fields.contains_key("response_status"));
     assert!(!shape.fields.contains_key("response_body"));
+
+    let program = checked_output
+        .program
+        .as_ref()
+        .expect("unused host source still produces a checked program");
+    let request_binding = &report
+        .host_port_table
+        .http
+        .as_ref()
+        .expect("HTTP host port")
+        .request;
+    let request = program
+        .sources
+        .iter()
+        .find(|source| source.id == request_binding.source)
+        .expect("checked request source");
+    let payload = report
+        .source_payload_shape_table
+        .iter()
+        .find(|payload| payload.checked_sources.contains(&request.id))
+        .expect("request payload contract");
+    assert_eq!(request.payload_type, payload.payload_type);
+    assert_eq!(
+        program
+            .expressions
+            .iter()
+            .find(|expression| expression.id == request.expression)
+            .map(|expression| &expression.flow_type.ty),
+        Some(&payload.payload_type),
+        "an unused SOURCE expression must retain its exact host payload contract"
+    );
 }
 
 #[test]

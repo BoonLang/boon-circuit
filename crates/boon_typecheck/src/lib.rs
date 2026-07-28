@@ -1749,6 +1749,18 @@ struct InferredStructuralValue {
     structural_record: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ForwardedParameterPathSegment {
+    Field(String),
+    ListItem,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ForwardedParameterResolution {
+    Expression(CheckedExprId),
+    Output(DeclId),
+}
+
 fn checked_contextual_operation(
     kind: ContextualBuiltinKind,
     parameters: &[CheckedParameter],
@@ -3366,6 +3378,13 @@ impl<'a> CheckedProgramBuilder<'a> {
             .map(|entry| (entry.expr_id, entry.flow_type.clone()))
             .collect();
 
+        for (expression, flow_type) in checked_source_expression_flow_types(
+            &self.program.ast.statements,
+            &self.program.expressions,
+            &self.source_payload_shape_table,
+        ) {
+            self.inferred_expr_types.insert(expression, flow_type);
+        }
         for declaration in self
             .declarations
             .iter()
@@ -3552,6 +3571,33 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
 
         let propagation_started = Instant::now();
+        let mut existing_vars = BTreeSet::new();
+        for signature in &self.signatures {
+            for parameter in &signature.parameters {
+                collect_type_vars(&parameter.flow_type.ty, &mut existing_vars);
+            }
+            collect_type_vars(&signature.result.ty, &mut existing_vars);
+        }
+        for formal in &self.context_formals {
+            collect_type_vars(&formal.scheme.flow_type.ty, &mut existing_vars);
+        }
+        for call in &self.calls {
+            collect_type_vars(&call.result.ty, &mut existing_vars);
+            for substitution in &call.type_substitutions {
+                existing_vars.insert(substitution.variable);
+                collect_type_vars(&substitution.value, &mut existing_vars);
+            }
+        }
+        for flow_type in self.inferred_expr_types.values() {
+            collect_type_vars(&flow_type.ty, &mut existing_vars);
+        }
+        let mut next_var = existing_vars
+            .iter()
+            .map(|variable| variable.0)
+            .max()
+            .unwrap_or(CONTEXTUAL_RESULT_VAR.0)
+            .saturating_add(1);
+        let mut call_scheme_vars = BTreeMap::<(CheckedCallId, TypeVar), TypeVar>::new();
         for _ in 0..self.signatures.len().saturating_add(1) {
             let signatures = self.signatures.clone();
             let calls = self.calls.clone();
@@ -3566,6 +3612,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .iter()
                     .map(|parameter| (parameter.decl_id, parameter))
                     .collect::<BTreeMap<_, _>>();
+                let owner_parameter_ids = owner_parameters.keys().copied().collect::<BTreeSet<_>>();
                 let mut parameter_updates = BTreeMap::<DeclId, FlowType>::new();
                 let mut direct_result = None;
 
@@ -3587,14 +3634,15 @@ impl<'a> CheckedProgramBuilder<'a> {
                         .entries
                         .iter()
                         .filter_map(|entry| {
-                            let (formal, owner_parameter, projection, output_forward) = match entry
-                            {
+                            let (formal, owner_parameter, path, output_forward) = match entry {
                                 CheckedCallEntry::Input { formal, value, .. } => {
-                                    let (target, projection) =
-                                        self.direct_read_declaration_with_projection(*value)?;
-                                    owner_parameters
-                                        .contains_key(&target)
-                                        .then_some((*formal, target, projection, false))?
+                                    let (target, path) = self.forwarded_owner_parameter_with_path(
+                                        owner.decl_id,
+                                        &owner_parameter_ids,
+                                        *value,
+                                        &mut BTreeSet::new(),
+                                    )?;
+                                    (*formal, target, path, false)
                                 }
                                 CheckedCallEntry::ForwardOut { formal, target, .. }
                                     if owner_parameters.contains_key(target) =>
@@ -3608,57 +3656,57 @@ impl<'a> CheckedProgramBuilder<'a> {
                                 .parameters
                                 .iter()
                                 .find(|parameter| parameter.decl_id == formal)?;
-                            Some((
-                                owner_parameter,
-                                projection,
-                                callee_parameter,
-                                output_forward,
-                            ))
+                            let callee_flow_type = FlowType {
+                                mode: callee_parameter.flow_type.mode,
+                                ty: instantiate_checked_type_scheme_for_call(
+                                    &callee_parameter.flow_type.ty,
+                                    call.id,
+                                    &mut call_scheme_vars,
+                                    &mut next_var,
+                                ),
+                            };
+                            Some((owner_parameter, path, callee_flow_type, output_forward))
                         })
                         .collect::<Vec<_>>();
                     let direct_wrapper = owner.result_expression == Some(call.expression);
 
                     let mut substitutions = BTreeMap::<TypeVar, Type>::new();
-                    for (owner_parameter, projection, callee_parameter, output_forward) in
-                        &forwarded
-                    {
+                    for (owner_parameter, path, callee_flow_type, output_forward) in &forwarded {
                         if direct_wrapper || *output_forward {
                             continue;
                         }
                         let Some(owner_type) = owner_parameters
                             .get(owner_parameter)
                             .map(|parameter| &parameter.flow_type.ty)
-                            .and_then(|ty| known_type_for_nested_path(ty, projection))
+                            .and_then(|ty| known_type_for_forwarded_parameter_path(ty, path))
                         else {
                             continue;
                         };
                         unify_checked_type_pattern(
-                            &callee_parameter.flow_type.ty,
+                            &callee_flow_type.ty,
                             &owner_type,
                             &mut substitutions,
                         );
                     }
 
-                    for (owner_parameter, projection, callee_parameter, output_forward) in forwarded
-                    {
-                        if direct_wrapper && projection.is_empty() {
-                            parameter_updates
-                                .insert(owner_parameter, callee_parameter.flow_type.clone());
+                    for (owner_parameter, path, callee_flow_type, output_forward) in forwarded {
+                        if direct_wrapper && path.is_empty() {
+                            parameter_updates.insert(owner_parameter, callee_flow_type);
                             continue;
                         }
                         let required =
-                            substitute_checked_type(&callee_parameter.flow_type.ty, &substitutions);
+                            substitute_checked_type(&callee_flow_type.ty, &substitutions);
                         if output_forward {
                             parameter_updates.insert(
                                 owner_parameter,
                                 FlowType {
-                                    mode: callee_parameter.flow_type.mode,
+                                    mode: callee_flow_type.mode,
                                     ty: required,
                                 },
                             );
                             continue;
                         }
-                        let required = forwarded_parameter_requirement(&projection, required);
+                        let required = forwarded_parameter_requirement_for_path(&path, required);
                         let base = parameter_updates
                             .get(&owner_parameter)
                             .or_else(|| {
@@ -3670,8 +3718,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                         parameter_updates.insert(
                             owner_parameter,
                             FlowType {
-                                mode: if projection.is_empty() {
-                                    merge_flow_modes(base.mode, callee_parameter.flow_type.mode)
+                                mode: if path.is_empty() {
+                                    merge_flow_modes(base.mode, callee_flow_type.mode)
                                 } else {
                                     base.mode
                                 },
@@ -3681,7 +3729,15 @@ impl<'a> CheckedProgramBuilder<'a> {
                     }
 
                     if direct_wrapper {
-                        direct_result = Some(callee.result.clone());
+                        direct_result = Some(FlowType {
+                            mode: callee.result.mode,
+                            ty: instantiate_checked_type_scheme_for_call(
+                                &callee.result.ty,
+                                call.id,
+                                &mut call_scheme_vars,
+                                &mut next_var,
+                            ),
+                        });
                     }
                 }
                 if parameter_updates.is_empty() && direct_result.is_none() {
@@ -4449,6 +4505,109 @@ impl<'a> CheckedProgramBuilder<'a> {
             .copied()
             .unwrap_or(LexicalScopeId(0));
         self.resolve_checked_read_path(expr_id, scope_id, &parts)
+    }
+
+    fn forwarded_owner_parameter_with_path(
+        &self,
+        owner: DeclId,
+        owner_parameters: &BTreeSet<DeclId>,
+        expression: CheckedExprId,
+        visited: &mut BTreeSet<ForwardedParameterResolution>,
+    ) -> Option<(DeclId, Vec<ForwardedParameterPathSegment>)> {
+        let expression_key = ForwardedParameterResolution::Expression(expression);
+        if !visited.insert(expression_key) {
+            return None;
+        }
+
+        let routed = if let Some(call) = self.call_for_expression(expression) {
+            let signature = self.signature_by_declaration(call.callable)?;
+            let list_formal = match signature.contextual_operation {
+                Some(
+                    CheckedContextualOperation::Filter { list, .. }
+                    | CheckedContextualOperation::Retain { list, .. }
+                    | CheckedContextualOperation::Remove { list, .. }
+                    | CheckedContextualOperation::SortBy { list, .. }
+                    | CheckedContextualOperation::ThenBy { list, .. },
+                ) => Some((list, false)),
+                _ if matches!(call.function.as_str(), "List/take" | "List/page") => signature
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.name == "list")
+                    .map(|parameter| (parameter.decl_id, false)),
+                _ if call.function == "List/latest" => signature
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.name == "list")
+                    .map(|parameter| (parameter.decl_id, true)),
+                _ => None,
+            };
+            list_formal.and_then(|(list_formal, item_result)| {
+                let list = checked_call_formal_input(call, list_formal)?;
+                let (parameter, mut path) = self.forwarded_owner_parameter_with_path(
+                    owner,
+                    owner_parameters,
+                    list,
+                    visited,
+                )?;
+                if item_result {
+                    path.push(ForwardedParameterPathSegment::ListItem);
+                }
+                Some((parameter, path))
+            })
+        } else {
+            self.direct_read_declaration_with_projection(expression)
+                .and_then(|(target, projection)| {
+                    let projection = projection
+                        .into_iter()
+                        .map(ForwardedParameterPathSegment::Field)
+                        .collect::<Vec<_>>();
+                    if owner_parameters.contains(&target) {
+                        return Some((target, projection));
+                    }
+                    let output_key = ForwardedParameterResolution::Output(target);
+                    if !visited.insert(output_key) {
+                        return None;
+                    }
+                    let routed = self.calls.iter().find_map(|call| {
+                        if call.owner_callable != Some(owner) {
+                            return None;
+                        }
+                        let output_formal = call.entries.iter().find_map(|entry| match entry {
+                            CheckedCallEntry::FreshOut { formal, output, .. }
+                                if *output == target =>
+                            {
+                                Some(*formal)
+                            }
+                            CheckedCallEntry::ForwardOut {
+                                formal,
+                                target: output,
+                                ..
+                            } if *output == target => Some(*formal),
+                            _ => None,
+                        })?;
+                        let signature = self.signature_by_declaration(call.callable)?;
+                        let (list_formal, row_formal, _) =
+                            checked_contextual_operation_formals(signature.contextual_operation?)?;
+                        if output_formal != row_formal {
+                            return None;
+                        }
+                        let list = checked_call_formal_input(call, list_formal)?;
+                        let (parameter, mut path) = self.forwarded_owner_parameter_with_path(
+                            owner,
+                            owner_parameters,
+                            list,
+                            visited,
+                        )?;
+                        path.push(ForwardedParameterPathSegment::ListItem);
+                        path.extend(projection.clone());
+                        Some((parameter, path))
+                    });
+                    visited.remove(&output_key);
+                    routed
+                })
+        };
+        visited.remove(&expression_key);
+        routed
     }
 
     fn sync_signature_declaration_types(&mut self) {
@@ -9842,8 +10001,8 @@ fn validate_structural_lowering_metadata(
                     })?;
                 if expression.declaration != Some(declaration.id) {
                     return Err(format!(
-                        "named-value type `{}` expression origin differs from declaration {}",
-                        entry.path, declaration.id.0
+                        "named-value type `{}` expression {} origin {:?} differs from declaration {}",
+                        entry.path, value.0, expression.declaration, declaration.id.0
                     ));
                 }
             }
@@ -23957,6 +24116,38 @@ fn forwarded_parameter_requirement(projection: &[String], required: Type) -> Typ
     })
 }
 
+fn forwarded_parameter_requirement_for_path(
+    path: &[ForwardedParameterPathSegment],
+    required: Type,
+) -> Type {
+    path.iter()
+        .rev()
+        .fold(required, |child, segment| match segment {
+            ForwardedParameterPathSegment::Field(field) => Type::Object(
+                ObjectShape::from_ordered_fields([(field.clone(), child)], true),
+            ),
+            ForwardedParameterPathSegment::ListItem => Type::List(Box::new(child)),
+        })
+}
+
+fn known_type_for_forwarded_parameter_path(
+    base: &Type,
+    path: &[ForwardedParameterPathSegment],
+) -> Option<Type> {
+    let Some((segment, rest)) = path.split_first() else {
+        return Some(base.clone());
+    };
+    match (segment, base) {
+        (ForwardedParameterPathSegment::Field(field), Type::Object(shape)) => {
+            known_type_for_forwarded_parameter_path(shape.fields.get(field)?, rest)
+        }
+        (ForwardedParameterPathSegment::ListItem, Type::List(item)) => {
+            known_type_for_forwarded_parameter_path(item, rest)
+        }
+        _ => None,
+    }
+}
+
 fn merge_forwarded_parameter_type(caller: &Type, required: &Type) -> Type {
     match (caller, required) {
         (Type::Var(_), Type::Var(_)) => caller.clone(),
@@ -24291,16 +24482,6 @@ fn type_for_nested_path(base: &Type, parts: &[String]) -> Option<Type> {
         Type::UnresolvedShape { .. } | Type::Unknown | Type::Var(_) => Some(base.clone()),
         _ => None,
     }
-}
-
-fn known_type_for_nested_path(base: &Type, parts: &[String]) -> Option<Type> {
-    let Some((field, rest)) = parts.split_first() else {
-        return Some(base.clone());
-    };
-    let Type::Object(shape) = base else {
-        return None;
-    };
-    known_type_for_nested_path(shape.fields.get(field)?, rest)
 }
 
 fn type_from_longest_binding_prefix(
@@ -24859,10 +25040,6 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                     for candidate in fields.iter().filter(|candidate| candidate.name == *field) {
                         resolved.extend(self.expression_sources(candidate.value, rest, visiting));
                     }
-                } else {
-                    for field in fields {
-                        resolved.extend(self.expression_sources(field.value, &[], visiting));
-                    }
                 }
             }
             CheckedExpressionKind::Call { call } => {
@@ -25205,8 +25382,8 @@ fn validate_checked_host_port_source_payload_types(
         ));
         if source.payload_type != contract {
             return Err(format!(
-                "checked host source {} `{path}` payload differs from its exact host contract",
-                source.id.0
+                "checked host source {} `{path}` payload differs from its exact host contract\nexpected: {contract:?}\nfound: {:?}",
+                source.id.0, source.payload_type,
             ));
         }
     }
@@ -26726,6 +26903,68 @@ fn statement_hint_type(
         .unwrap_or_else(|| {
             Type::Object(object_shape_for_statement(statement, &program.expressions))
         })
+}
+
+fn checked_source_expression_flow_types(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    source_payload_shape_table: &[SourcePayloadSyntaxShapeEntry],
+) -> Vec<(usize, FlowType)> {
+    fn collect(
+        statements: &[AstStatement],
+        expressions: &[AstExpr],
+        source_payload_shape_table: &[SourcePayloadSyntaxShapeEntry],
+        result: &mut BTreeMap<usize, FlowType>,
+    ) {
+        for statement in statements {
+            if matches!(statement.kind, AstStatementKind::Source { .. })
+                && let Some(payload_type) =
+                    source_payload_type_for_statement(statement, source_payload_shape_table)
+            {
+                let mut owned_expressions = BTreeSet::new();
+                if let Some(expression) = statement.expr {
+                    collect_expression_tree_ids(expression, expressions, &mut owned_expressions);
+                }
+                let mut child_expressions = BTreeSet::new();
+                for child in &statement.children {
+                    collect_statement_expression_tree_ids(
+                        child,
+                        expressions,
+                        &mut child_expressions,
+                    );
+                }
+                for expression in owned_expressions.difference(&child_expressions).copied() {
+                    if expressions
+                        .get(expression)
+                        .is_some_and(|expression| matches!(expression.kind, AstExprKind::Source))
+                    {
+                        result.insert(
+                            expression,
+                            FlowType {
+                                mode: FlowMode::PresentOrAbsent,
+                                ty: payload_type.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            collect(
+                &statement.children,
+                expressions,
+                source_payload_shape_table,
+                result,
+            );
+        }
+    }
+
+    let mut result = BTreeMap::new();
+    collect(
+        statements,
+        expressions,
+        source_payload_shape_table,
+        &mut result,
+    );
+    result.into_iter().collect()
 }
 
 fn source_payload_type_for_statement(

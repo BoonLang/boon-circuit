@@ -25,92 +25,143 @@ FUNCTION data_policy_label() {
 }
 
 FUNCTION artifact_ref(file, format, digest, generation, byte_length, status) {
-    [
-        ref_type: TEXT { ArtifactRef }
-        module: TEXT { wellen.v1 }
-        provider: provider_version()
-        schema_version: schema_version()
-        artifact_kind: TEXT { waveform_file }
-        file: file
-        format: format
-        digest: digest
-        generation: generation
-        byte_length: byte_length
-        status: status
-    ]
+    BLOCK {
+        artifact_file: file
+        artifact_format: format
+        artifact_digest: digest
+        artifact_generation: generation
+        artifact_byte_length: byte_length
+        artifact_status: status
+        [
+            ref_type: TEXT { ArtifactRef }
+            module: TEXT { wellen.v1 }
+            provider: provider_version()
+            schema_version: schema_version()
+            artifact_kind: TEXT { waveform_file }
+            file: artifact_file
+            format: artifact_format
+            digest: artifact_digest
+            generation: artifact_generation
+            byte_length: artifact_byte_length
+            status: artifact_status
+        ]
+    }
 }
 
 FUNCTION blob_ref(digest, byte_length, media_type, storage, encoding, generation, status) {
-    [
-        ref_type: TEXT { BlobRef }
-        module: TEXT { wellen.v1 }
-        digest: digest
-        byte_length: byte_length
-        media_type: media_type
-        storage: storage
-        encoding: encoding
-        generation: generation
-        status: status
-    ]
+    BLOCK {
+        blob_digest: digest
+        blob_byte_length: byte_length
+        blob_media_type: media_type
+        blob_storage: storage
+        blob_encoding: encoding
+        blob_generation: generation
+        blob_status: status
+        [
+            ref_type: TEXT { BlobRef }
+            module: TEXT { wellen.v1 }
+            digest: blob_digest
+            byte_length: blob_byte_length
+            media_type: blob_media_type
+            storage: blob_storage
+            encoding: blob_encoding
+            generation: blob_generation
+            status: blob_status
+        ]
+    }
 }
 
 FUNCTION page_ref(page_kind_value, artifact_digest, schema_version_number, schema_hash, request_fingerprint, response_fingerprint, input_digest, page_digest, generation, row_count, sample_count, transition_count, byte_length, status) {
-    [
-        ref_type: TEXT { PageRef }
-        page_kind: page_kind_value
-        artifact_digest: artifact_digest
-        schema_version: schema_version_number
-        schema_hash: schema_hash
-        request_fingerprint: request_fingerprint
-        response_fingerprint: response_fingerprint
-        input_digest: input_digest
-        page_digest: page_digest
-        generation: generation
-        row_count: row_count
-        sample_count: sample_count
-        transition_count: transition_count
-        byte_length: byte_length
-        status: status
-    ]
+    BLOCK {
+        page_artifact_digest: artifact_digest
+        page_schema_hash: schema_hash
+        page_request_fingerprint: request_fingerprint
+        page_response_fingerprint: response_fingerprint
+        page_input_digest: input_digest
+        page_digest_value: page_digest
+        page_generation: generation
+        page_row_count: row_count
+        page_sample_count: sample_count
+        page_transition_count: transition_count
+        page_byte_length: byte_length
+        page_status_value: status
+        [
+            ref_type: TEXT { PageRef }
+            page_kind: page_kind_value
+            artifact_digest: page_artifact_digest
+            schema_version: schema_version_number
+            schema_hash: page_schema_hash
+            request_fingerprint: page_request_fingerprint
+            response_fingerprint: page_response_fingerprint
+            input_digest: page_input_digest
+            page_digest: page_digest_value
+            generation: page_generation
+            row_count: page_row_count
+            sample_count: page_sample_count
+            transition_count: page_transition_count
+            byte_length: page_byte_length
+            status: page_status_value
+        ]
+    }
 }
 
 FUNCTION open_result(artifact_ref, blob_ref, status, diagnostic) {
-    [
-        result_type: TEXT { OpenResult }
-        module: TEXT { wellen.v1 }
-        artifact_ref: artifact_ref
-        blob_ref: blob_ref
-        status: status
-        diagnostic: diagnostic
-        diagnostic_count: 1
-    ]
+    BLOCK {
+        open_artifact_ref: artifact_ref
+        open_blob_ref: blob_ref
+        open_status: status
+        open_diagnostic: diagnostic
+        [
+            result_type: TEXT { OpenResult }
+            module: TEXT { wellen.v1 }
+            artifact_ref: open_artifact_ref
+            blob_ref: open_blob_ref
+            status: open_status
+            diagnostic: open_diagnostic
+            diagnostic_count: 1
+        ]
+    }
 }
 
 FUNCTION page(page_kind_value, page_ref, descriptor, status) {
-    [
-        page_type: page_kind_value
-        page_ref: page_ref
-        descriptor: descriptor
-        status: status
-    ]
+    BLOCK {
+        page_reference: page_ref
+        page_descriptor: descriptor
+        page_status_value: status
+        [
+            page_type: page_kind_value
+            page_ref: page_reference
+            descriptor: page_descriptor
+            status: page_status_value
+        ]
+    }
 }
 
 FUNCTION cursor_values(page_ref, cursor_label, rows, status) {
-    [
-        page_type: TEXT { cursor_values }
-        page_ref: page_ref
-        cursor: cursor_label
-        rows: rows
-        status: status
-    ]
+    BLOCK {
+        cursor_page_ref: page_ref
+        cursor_rows: rows
+        cursor_status: status
+        [
+            page_type: TEXT { cursor_values }
+            page_ref: cursor_page_ref
+            cursor: cursor_label
+            rows: cursor_rows
+            status: cursor_status
+        ]
+    }
 }
 
 FUNCTION diagnostic(diagnostic_kind, file, message) {
-    [
-        diagnostic_type: TEXT { BridgeDiagnostic }
-        kind: diagnostic_kind
-        file: file
-        library: TEXT { wellen.v1 }
-        message: message
-    ]
+    BLOCK {
+        diagnostic_file: file
+        diagnostic_message: message
+        [
+            diagnostic_type: TEXT { BridgeDiagnostic }
+            kind: diagnostic_kind
+            file: diagnostic_file
+            library: TEXT { wellen.v1 }
+            message: diagnostic_message
+        ]
+    }
 }

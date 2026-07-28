@@ -3172,9 +3172,12 @@ selected:
     assert_number_row(found_payload_type(&call.result.ty).expect("Found payload"));
     assert_number_row(fresh_output_type(&program, call));
     let signature = checked_callable(&program, "find_row");
-    assert_eq!(
-        found_payload_type(&signature.result.ty),
-        Some(&Type::Var(CONTEXTUAL_ITEM_VAR))
+    assert!(
+        matches!(
+            found_payload_type(&signature.result.ty),
+            Some(Type::Var(_))
+        ),
+        "find_row must remain generic"
     );
 }
 
@@ -3215,13 +3218,18 @@ selected:
         .expect("outer wrapper call");
     assert_number_row(found_payload_type(&call.result.ty).expect("Found payload"));
     assert_number_row(fresh_output_type(&program, call));
-    for wrapper in ["find_row", "find_row_twice"] {
-        assert_eq!(
-            found_payload_type(&checked_callable(&program, wrapper).result.ty),
-            Some(&Type::Var(CONTEXTUAL_ITEM_VAR)),
-            "{wrapper} must remain generic"
-        );
-    }
+    let wrapper_vars = ["find_row", "find_row_twice"].map(|wrapper| {
+        let Some(Type::Var(variable)) =
+            found_payload_type(&checked_callable(&program, wrapper).result.ty)
+        else {
+            panic!("{wrapper} must remain generic");
+        };
+        *variable
+    });
+    assert_ne!(
+        wrapper_vars[0], wrapper_vars[1],
+        "independent wrapper schemes must not alias one generic variable"
+    );
 }
 
 #[test]

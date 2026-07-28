@@ -2617,6 +2617,17 @@ fn resolve_out_contracts(
             .iter()
             .map(|substitution| (substitution.variable, substitution.value.clone()))
             .collect::<BTreeMap<_, _>>();
+        let parent_substitutions = instance
+            .parent
+            .and_then(|parent| graph.call_instances.get(parent.as_usize()))
+            .map(|parent| {
+                parent
+                    .type_substitutions
+                    .iter()
+                    .map(|substitution| (substitution.variable, substitution.value.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
         let ordered_inputs = instance
             .inputs
             .iter()
@@ -2652,23 +2663,65 @@ fn resolve_out_contracts(
                 })?;
             let actual = match &input.value {
                 out_net::OutInputValue::Checked(scoped) => {
+                    let mut input_substitutions = parent_substitutions.clone();
+                    if let Some(evaluation_call) = scoped
+                        .evaluation_port
+                        .and_then(|port| graph.ports.get(port.as_usize()))
+                        .map(|port| port.call)
+                    {
+                        if evaluation_call == call_id {
+                            input_substitutions = substitutions.clone();
+                        } else if let Some(evaluation_instance) =
+                            graph.call_instances.get(evaluation_call.as_usize())
+                        {
+                            merge_out_contract_substitutions(
+                                &mut input_substitutions,
+                                evaluation_instance
+                                    .type_substitutions
+                                    .iter()
+                                    .map(|substitution| {
+                                        (substitution.variable, substitution.value.clone())
+                                    }),
+                            );
+                        }
+                    }
                     concrete_checked_expression_type(
                         program,
                         graph,
                         *scoped,
-                        &substitutions,
+                        &input_substitutions,
                         &mut BTreeSet::new(),
                     )
                     .map_err(|error| {
                         SemanticError::new(format!(
-                            "OUT call instance {call_id} `{}` input `{}` with substitutions {substitutions:?}: {error}",
-                            callable.name, input_parameter.name
+                            "OUT call instance {call_id} `{}` input `{}` with {} local and {} parent substitution(s): {error}",
+                            callable.name,
+                            input_parameter.name,
+                            substitutions.len(),
+                            parent_substitutions.len(),
                         ))
                     })?
                 }
-                out_net::OutInputValue::ProducerParameter { flow_type, .. } => flow_type.ty.clone(),
+                out_net::OutInputValue::ProducerParameter { flow_type, .. } => {
+                    apply_out_contract_substitutions(&flow_type.ty, &parent_substitutions)
+                }
             };
-            unify_out_contract_type(&input_parameter.flow_type.ty, &actual, &mut substitutions)?;
+            unify_out_contract_type(&input_parameter.flow_type.ty, &actual, &mut substitutions)
+                .map_err(|error| {
+                    let provenance_line = program
+                        .expressions
+                        .iter()
+                        .find(|expression| expression.id == instance.provenance.expression)
+                        .map_or(0, |expression| expression.span.line);
+                    SemanticError::new(format!(
+                        "OUT call instance {call_id} `{}` at checked expression {} line {provenance_line} input `{}` pattern {:?} with {} substitution(s): {error}",
+                        callable.name,
+                        instance.provenance.expression.0,
+                        input_parameter.name,
+                        input_parameter.flow_type.ty,
+                        substitutions.len(),
+                    ))
+                })?;
         }
         let substitutions = substitutions
             .into_iter()
@@ -2764,6 +2817,310 @@ fn concrete_checked_expression_type(
                 ))
             })?;
         match &expression.kind {
+            boon_typecheck::CheckedExpressionKind::Call { call } => {
+                let instance_id = graph
+                    .call_instance_for_checked_call(*call, scoped.frame)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "CALL expression {} references missing OUT call instance for checked call {} in frame {:?}",
+                            scoped.expression.0, call.0, scoped.frame
+                        ))
+                    })?;
+                let instance = graph
+                    .call_instances
+                    .get(instance_id.as_usize())
+                    .filter(|instance| instance.id == instance_id)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "CALL expression {} references missing OUT call instance {instance_id}",
+                            scoped.expression.0
+                        ))
+                    })?;
+                let callable = program
+                    .callables
+                    .iter()
+                    .find(|callable| callable.decl_id == instance.provenance.callable)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "CALL expression {} references missing callable {}",
+                            scoped.expression.0, instance.provenance.callable.0
+                        ))
+                    })?;
+                let mut substitutions = active_substitutions.clone();
+                merge_out_contract_substitutions(
+                    &mut substitutions,
+                    instance
+                        .type_substitutions
+                        .iter()
+                        .map(|substitution| (substitution.variable, substitution.value.clone())),
+                );
+                let ordered_inputs = instance
+                    .inputs
+                    .iter()
+                    .filter(|input| {
+                        !matches!(
+                            input.value,
+                            out_net::OutInputValue::Checked(ScopedCheckedExpr {
+                                evaluation_port: Some(_),
+                                ..
+                            })
+                        )
+                    })
+                    .chain(instance.inputs.iter().filter(|input| {
+                        matches!(
+                            input.value,
+                            out_net::OutInputValue::Checked(ScopedCheckedExpr {
+                                evaluation_port: Some(_),
+                                ..
+                            })
+                        )
+                    }))
+                    .collect::<Vec<_>>();
+                let mut deferred_inputs = Vec::new();
+                for input in ordered_inputs {
+                    let parameter = callable
+                        .parameters
+                        .iter()
+                        .find(|parameter| parameter.decl_id == input.formal)
+                        .ok_or_else(|| {
+                            SemanticError::new(format!(
+                                "CALL expression {} references missing input formal {} on `{}`",
+                                scoped.expression.0, input.formal.0, callable.name
+                            ))
+                        })?;
+                    let actual = match &input.value {
+                        out_net::OutInputValue::Checked(input) => {
+                            let mut input_substitutions = active_substitutions.clone();
+                            if let Some(evaluation_call) = input
+                                .evaluation_port
+                                .and_then(|port| graph.ports.get(port.as_usize()))
+                                .map(|port| port.call)
+                            {
+                                if evaluation_call == instance_id {
+                                    input_substitutions = substitutions.clone();
+                                } else if let Some(evaluation_instance) =
+                                    graph.call_instances.get(evaluation_call.as_usize())
+                                {
+                                    merge_out_contract_substitutions(
+                                        &mut input_substitutions,
+                                        evaluation_instance.type_substitutions.iter().map(
+                                            |substitution| {
+                                                (substitution.variable, substitution.value.clone())
+                                            },
+                                        ),
+                                    );
+                                }
+                            }
+                            concrete_checked_expression_type(
+                                program,
+                                graph,
+                                *input,
+                                &input_substitutions,
+                                visiting,
+                            )?
+                        }
+                        out_net::OutInputValue::ProducerParameter { flow_type, .. } => {
+                            apply_out_contract_substitutions(&flow_type.ty, active_substitutions)
+                        }
+                    };
+                    if out_contract_type_contains_empty_list_placeholder(&actual) {
+                        deferred_inputs.push((
+                            parameter.name.clone(),
+                            parameter.flow_type.ty.clone(),
+                            actual,
+                        ));
+                        continue;
+                    }
+                    unify_out_contract_type(&parameter.flow_type.ty, &actual, &mut substitutions)
+                        .map_err(|error| {
+                        SemanticError::new(format!(
+                            "CALL expression {} `{}` input `{}`: {error}",
+                            scoped.expression.0, callable.name, parameter.name
+                        ))
+                    })?;
+                }
+                for (parameter_name, parameter_type, actual) in deferred_inputs {
+                    let expected =
+                        apply_out_contract_substitutions(&parameter_type, &substitutions);
+                    let contextual_actual =
+                        contextualize_empty_list_placeholders(&actual, &expected).unwrap_or(actual);
+                    unify_out_contract_type(
+                        &parameter_type,
+                        &contextual_actual,
+                        &mut substitutions,
+                    )
+                    .map_err(|error| {
+                        SemanticError::new(format!(
+                            "CALL expression {} `{}` input `{parameter_name}`: {error}",
+                            scoped.expression.0, callable.name
+                        ))
+                    })?;
+                }
+                let result = apply_out_contract_substitutions(&callable.result.ty, &substitutions);
+                if out_contract_type_is_resolved(&result) {
+                    return Ok(result);
+                }
+                if callable.kind == boon_typecheck::CheckedCallableKind::User
+                    && let Some(result_expression) = callable.result_expression
+                {
+                    return concrete_checked_expression_type(
+                        program,
+                        graph,
+                        ScopedCheckedExpr {
+                            expression: result_expression,
+                            frame: Some(instance_id),
+                            evaluation_port: None,
+                            value_frame: scoped.value_frame,
+                        },
+                        &substitutions,
+                        visiting,
+                    );
+                }
+                Ok(result)
+            }
+            boon_typecheck::CheckedExpressionKind::Block {
+                result: Some(result),
+                ..
+            }
+            | boon_typecheck::CheckedExpressionKind::MatchArm {
+                output: Some(result),
+                ..
+            }
+            | boon_typecheck::CheckedExpressionKind::Then {
+                output: Some(result),
+                ..
+            } => concrete_checked_expression_type(
+                program,
+                graph,
+                ScopedCheckedExpr {
+                    expression: *result,
+                    frame: scoped.frame,
+                    evaluation_port: scoped.evaluation_port,
+                    value_frame: scoped.value_frame,
+                },
+                active_substitutions,
+                visiting,
+            ),
+            boon_typecheck::CheckedExpressionKind::Object { fields } => {
+                let mut concrete_fields = BTreeMap::new();
+                let mut field_order = Vec::new();
+                let mut open = false;
+                for field in fields {
+                    let field_type = concrete_checked_expression_type(
+                        program,
+                        graph,
+                        ScopedCheckedExpr {
+                            expression: field.value,
+                            frame: scoped.frame,
+                            evaluation_port: scoped.evaluation_port,
+                            value_frame: scoped.value_frame,
+                        },
+                        active_substitutions,
+                        visiting,
+                    )?;
+                    if field.spread {
+                        let boon_typecheck::Type::Object(shape) = field_type else {
+                            return Err(SemanticError::new(format!(
+                                "OBJECT expression {} spread field `{}` has non-object concrete type {field_type:?}",
+                                scoped.expression.0, field.name
+                            )));
+                        };
+                        open |= shape.open;
+                        for name in &shape.field_order {
+                            let Some(ty) = shape.fields.get(name).cloned() else {
+                                continue;
+                            };
+                            if !concrete_fields.contains_key(name) {
+                                field_order.push(name.clone());
+                            }
+                            concrete_fields.insert(name.clone(), ty);
+                        }
+                    } else {
+                        if !concrete_fields.contains_key(&field.name) {
+                            field_order.push(field.name.clone());
+                        }
+                        concrete_fields.insert(field.name.clone(), field_type);
+                    }
+                }
+                Ok(boon_typecheck::Type::Object(boon_typecheck::ObjectShape {
+                    fields: concrete_fields,
+                    field_order,
+                    open,
+                }))
+            }
+            boon_typecheck::CheckedExpressionKind::TaggedObject { tag, fields } => {
+                let mut concrete_fields = BTreeMap::new();
+                let mut field_order = Vec::new();
+                let mut open = false;
+                for field in fields {
+                    let field_type = concrete_checked_expression_type(
+                        program,
+                        graph,
+                        ScopedCheckedExpr {
+                            expression: field.value,
+                            frame: scoped.frame,
+                            evaluation_port: scoped.evaluation_port,
+                            value_frame: scoped.value_frame,
+                        },
+                        active_substitutions,
+                        visiting,
+                    )?;
+                    if field.spread {
+                        let boon_typecheck::Type::Object(shape) = field_type else {
+                            return Err(SemanticError::new(format!(
+                                "tagged OBJECT expression {} spread field `{}` has non-object concrete type {field_type:?}",
+                                scoped.expression.0, field.name
+                            )));
+                        };
+                        open |= shape.open;
+                        for name in &shape.field_order {
+                            let Some(ty) = shape.fields.get(name).cloned() else {
+                                continue;
+                            };
+                            if !concrete_fields.contains_key(name) {
+                                field_order.push(name.clone());
+                            }
+                            concrete_fields.insert(name.clone(), ty);
+                        }
+                    } else {
+                        if !concrete_fields.contains_key(&field.name) {
+                            field_order.push(field.name.clone());
+                        }
+                        concrete_fields.insert(field.name.clone(), field_type);
+                    }
+                }
+                Ok(boon_typecheck::Type::VariantSet(vec![
+                    boon_typecheck::Variant::Tagged {
+                        tag: tag.clone(),
+                        fields: boon_typecheck::ObjectShape {
+                            fields: concrete_fields,
+                            field_order,
+                            open,
+                        },
+                    },
+                ]))
+            }
+            boon_typecheck::CheckedExpressionKind::When { arms, .. }
+            | boon_typecheck::CheckedExpressionKind::While { arms, .. } => {
+                concrete_checked_branch_expression_type(
+                    program,
+                    graph,
+                    scoped,
+                    arms,
+                    active_substitutions,
+                    visiting,
+                )
+            }
+            boon_typecheck::CheckedExpressionKind::Latest { branches } => {
+                concrete_checked_branch_expression_type(
+                    program,
+                    graph,
+                    scoped,
+                    branches,
+                    active_substitutions,
+                    visiting,
+                )
+            }
             boon_typecheck::CheckedExpressionKind::Passed { projection, .. } => {
                 let frame = scoped.frame.ok_or_else(|| {
                     SemanticError::new(format!(
@@ -2811,10 +3168,13 @@ fn concrete_checked_expression_type(
                 )? {
                     return Ok(payload_type);
                 }
-                let mut expression_substitutions = scoped
-                    .frame
-                    .map(|frame| {
-                        graph
+                let mut expression_substitutions = active_substitutions.clone();
+                merge_out_contract_substitutions(
+                    &mut expression_substitutions,
+                    scoped
+                        .frame
+                        .map(|frame| {
+                            graph
                             .call_instances
                             .get(frame.as_usize())
                             .filter(|instance| instance.id == frame)
@@ -2825,16 +3185,12 @@ fn concrete_checked_expression_type(
                                     scoped.expression.0
                                 ))
                             })
-                    })
-                    .transpose()?
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|substitution| (substitution.variable, substitution.value.clone()))
-                    .collect::<BTreeMap<_, _>>();
-                expression_substitutions.extend(
-                    active_substitutions
+                        })
+                        .transpose()?
+                        .unwrap_or_default()
                         .iter()
-                        .map(|(variable, value)| (*variable, value.clone())),
+                        .map(|substitution| (substitution.variable, substitution.value.clone()))
+                        .collect::<BTreeMap<_, _>>(),
                 );
                 let expression_substitutions = expression_substitutions
                     .into_iter()
@@ -2877,6 +3233,9 @@ fn concrete_checked_expression_type(
                         if output != *target {
                             return Ok(None);
                         }
+                        if out_contract_type_is_resolved(&port.contract.resolved_type) {
+                            return Ok(Some(port.contract.resolved_type.clone()));
+                        }
                         let instance = graph
                             .call_instances
                             .get(port.call.as_usize())
@@ -2907,9 +3266,19 @@ fn concrete_checked_expression_type(
                                     port.formal.0
                                 ))
                             })?;
+                        let mut output_substitutions = active_substitutions.clone();
+                        merge_out_contract_substitutions(
+                            &mut output_substitutions,
+                            instance
+                                .type_substitutions
+                                .iter()
+                                .map(|substitution| {
+                                    (substitution.variable, substitution.value.clone())
+                                }),
+                        );
                         Ok(Some(apply_out_contract_substitutions(
                             &parameter.flow_type.ty,
-                            active_substitutions,
+                            &output_substitutions,
                         )))
                     })
                     .transpose()?
@@ -3001,38 +3370,70 @@ fn concrete_checked_expression_type(
                         )
                     })
                     .unwrap_or_else(|| "none".to_owned());
+                let frame_detail = scoped
+                    .frame
+                    .and_then(|frame| graph.call_instances.get(frame.as_usize()))
+                    .map(|instance| {
+                        let callable = program
+                            .callables
+                            .iter()
+                            .find(|callable| callable.decl_id == instance.provenance.callable)
+                            .map(|callable| callable.name.as_str())
+                            .unwrap_or("<missing callable>");
+                        let input = instance
+                            .inputs
+                            .iter()
+                            .find(|input| input.formal == *target)
+                            .map(|input| match &input.value {
+                                out_net::OutInputValue::Checked(actual) => format!(
+                                    "checked {} frame {:?} evaluation {:?}",
+                                    actual.expression.0, actual.frame, actual.evaluation_port
+                                ),
+                                out_net::OutInputValue::ProducerParameter { parameter, .. } => {
+                                    format!("producer parameter {parameter:?}")
+                                }
+                            })
+                            .unwrap_or_else(|| "missing target input".to_owned());
+                        format!(
+                            "{} `{callable}` parent {:?} checked expression {} with {} substitution(s), target input {input}",
+                            instance.id,
+                            instance.parent,
+                            instance.provenance.expression.0,
+                            instance.type_substitutions.len(),
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_owned());
                 project_out_contract_type(base, projection).map_err(|error| {
                     SemanticError::new(format!(
-                        "READ expression {} target {} {target_detail} in frame {:?} under evaluation port {evaluation_detail}: {error}",
-                        scoped.expression.0, target.0, scoped.frame,
+                        "READ expression {} target {} {target_detail} in frame {frame_detail} under evaluation port {evaluation_detail}: {error}",
+                        scoped.expression.0, target.0,
                     ))
                 })
             }
             _ => {
-                let mut substitutions = scoped
-                    .frame
-                    .map(|frame| {
-                        graph
-                            .call_instances
-                            .get(frame.as_usize())
-                            .filter(|instance| instance.id == frame)
-                            .map(|instance| instance.type_substitutions.as_slice())
-                            .ok_or_else(|| {
-                                SemanticError::new(format!(
-                                    "expression {} references missing OUT call frame {frame}",
-                                    scoped.expression.0
-                                ))
-                            })
-                    })
-                    .transpose()?
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|substitution| (substitution.variable, substitution.value.clone()))
-                    .collect::<BTreeMap<_, _>>();
-                substitutions.extend(
-                    active_substitutions
+                let mut substitutions = active_substitutions.clone();
+                merge_out_contract_substitutions(
+                    &mut substitutions,
+                    scoped
+                        .frame
+                        .map(|frame| {
+                            graph
+                                .call_instances
+                                .get(frame.as_usize())
+                                .filter(|instance| instance.id == frame)
+                                .map(|instance| instance.type_substitutions.as_slice())
+                                .ok_or_else(|| {
+                                    SemanticError::new(format!(
+                                        "expression {} references missing OUT call frame {frame}",
+                                        scoped.expression.0
+                                    ))
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or_default()
                         .iter()
-                        .map(|(variable, value)| (*variable, value.clone())),
+                        .map(|substitution| (substitution.variable, substitution.value.clone()))
+                        .collect::<BTreeMap<_, _>>(),
                 );
                 let substitutions = substitutions
                     .into_iter()
@@ -3052,6 +3453,102 @@ fn concrete_checked_expression_type(
     })();
     visiting.remove(&key);
     resolved
+}
+
+fn concrete_checked_branch_expression_type(
+    program: &CheckedProgram,
+    graph: &ResolvedOutGraph,
+    scoped: ScopedCheckedExpr,
+    branches: &[boon_typecheck::CheckedExprId],
+    active_substitutions: &BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
+    visiting: &mut BTreeSet<(boon_typecheck::CheckedExprId, Option<OutCallInstanceId>)>,
+) -> Result<boon_typecheck::Type, SemanticError> {
+    let expression = program
+        .expressions
+        .iter()
+        .find(|expression| expression.id == scoped.expression)
+        .ok_or_else(|| {
+            SemanticError::new(format!(
+                "branch type resolution references missing checked expression {}",
+                scoped.expression.0
+            ))
+        })?;
+    let mut substitutions = active_substitutions.clone();
+    merge_out_contract_substitutions(
+        &mut substitutions,
+        scoped
+            .frame
+            .map(|frame| {
+                graph
+                    .call_instances
+                    .get(frame.as_usize())
+                    .filter(|instance| instance.id == frame)
+                    .map(|instance| instance.type_substitutions.as_slice())
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "branch expression {} references missing OUT call frame {frame}",
+                            scoped.expression.0
+                        ))
+                    })
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .iter()
+            .map(|substitution| (substitution.variable, substitution.value.clone()))
+            .collect::<BTreeMap<_, _>>(),
+    );
+
+    let mut concrete_branches = Vec::new();
+    for branch in branches {
+        let branch_expression = program
+            .expressions
+            .iter()
+            .find(|expression| expression.id == *branch)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "branch expression {} references missing branch {}",
+                    scoped.expression.0, branch.0
+                ))
+            })?;
+        let concrete = concrete_checked_expression_type(
+            program,
+            graph,
+            ScopedCheckedExpr {
+                expression: *branch,
+                frame: scoped.frame,
+                evaluation_port: scoped.evaluation_port,
+                value_frame: scoped.value_frame,
+            },
+            &substitutions,
+            visiting,
+        )?;
+        unify_out_contract_type(
+            &branch_expression.flow_type.ty,
+            &concrete,
+            &mut substitutions,
+        )
+        .map_err(|error| {
+            SemanticError::new(format!(
+                "branch expression {} cannot resolve branch {}: {error}",
+                scoped.expression.0, branch.0
+            ))
+        })?;
+        concrete_branches.push(concrete);
+    }
+
+    let result = apply_out_contract_substitutions(&expression.flow_type.ty, &substitutions);
+    if out_contract_type_is_resolved(&result) {
+        return Ok(result);
+    }
+    if let Some(first) = concrete_branches.first()
+        && concrete_branches
+            .iter()
+            .skip(1)
+            .all(|candidate| candidate == first)
+    {
+        return Ok(first.clone());
+    }
+    Ok(result)
 }
 
 fn exact_checked_resource_projection_type(
@@ -3119,9 +3616,31 @@ fn exact_checked_resource_projection_type(
     }
     let exact_type = exact_type.expect("nonempty checked source origins");
     if out_contract_type_is_resolved(&required_type) && required_type != exact_type {
+        let expression_detail = program
+            .expressions
+            .iter()
+            .find(|candidate| candidate.id == expression)
+            .map(|candidate| format!(" line {} kind {:?}", candidate.span.line, candidate.kind))
+            .unwrap_or_default();
+        let origins = requirement
+            .source_origins
+            .iter()
+            .filter_map(|origin| {
+                program
+                    .sources
+                    .get(origin.source.0 as usize)
+                    .filter(|source| source.id == origin.source)
+                    .map(|source| {
+                        format!(
+                            "source {} path {:?} line {} projection {:?}",
+                            source.id.0, source.path, source.span.line, origin.payload_projection
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
         return Err(SemanticError::new(format!(
-            "checked expression {} resource requirement type {required_type:?} differs from exact source payload type {exact_type:?}",
-            expression.0
+            "checked expression {}{expression_detail} resource requirement type {required_type:?} (raw {:?}) differs from exact source payload type {exact_type:?}; origins: {origins:?}",
+            expression.0, requirement.required_type,
         )));
     }
     Ok(Some(exact_type))
@@ -3161,6 +3680,110 @@ fn project_out_contract_type(
         })?;
     }
     Ok(ty)
+}
+
+fn out_contract_type_contains_empty_list_placeholder(ty: &boon_typecheck::Type) -> bool {
+    match ty {
+        boon_typecheck::Type::UnresolvedShape { reason } => reason == "empty list item",
+        boon_typecheck::Type::List(item) => out_contract_type_contains_empty_list_placeholder(item),
+        boon_typecheck::Type::Function { args, result } => {
+            args.iter()
+                .any(out_contract_type_contains_empty_list_placeholder)
+                || out_contract_type_contains_empty_list_placeholder(&result.ty)
+        }
+        boon_typecheck::Type::Object(shape) => shape
+            .fields
+            .values()
+            .any(out_contract_type_contains_empty_list_placeholder),
+        boon_typecheck::Type::VariantSet(variants) => {
+            variants.iter().any(|variant| match variant {
+                boon_typecheck::Variant::Tag(_) => false,
+                boon_typecheck::Variant::Tagged { fields, .. } => fields
+                    .fields
+                    .values()
+                    .any(out_contract_type_contains_empty_list_placeholder),
+            })
+        }
+        boon_typecheck::Type::Union(members) => members
+            .iter()
+            .any(out_contract_type_contains_empty_list_placeholder),
+        boon_typecheck::Type::Var(_)
+        | boon_typecheck::Type::Unknown
+        | boon_typecheck::Type::Text
+        | boon_typecheck::Type::Number
+        | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Absent
+        | boon_typecheck::Type::RenderContract => false,
+    }
+}
+
+fn contextualize_empty_list_placeholders(
+    actual: &boon_typecheck::Type,
+    expected: &boon_typecheck::Type,
+) -> Option<boon_typecheck::Type> {
+    match (actual, expected) {
+        (boon_typecheck::Type::UnresolvedShape { reason }, expected)
+            if reason == "empty list item" && out_contract_type_is_resolved(expected) =>
+        {
+            Some(expected.clone())
+        }
+        (boon_typecheck::Type::List(actual), boon_typecheck::Type::List(expected)) => {
+            Some(boon_typecheck::Type::List(Box::new(
+                contextualize_empty_list_placeholders(actual, expected)?,
+            )))
+        }
+        (boon_typecheck::Type::Object(actual), boon_typecheck::Type::Object(expected)) => {
+            let mut contextual = actual.clone();
+            for (name, actual_field) in &actual.fields {
+                if !out_contract_type_contains_empty_list_placeholder(actual_field) {
+                    continue;
+                }
+                let expected_field = expected.fields.get(name)?;
+                contextual.fields.insert(
+                    name.clone(),
+                    contextualize_empty_list_placeholders(actual_field, expected_field)?,
+                );
+            }
+            Some(boon_typecheck::Type::Object(contextual))
+        }
+        (
+            boon_typecheck::Type::Function {
+                args: actual_args,
+                result: actual_result,
+            },
+            boon_typecheck::Type::Function {
+                args: expected_args,
+                result: expected_result,
+            },
+        ) if actual_args.len() == expected_args.len() => Some(boon_typecheck::Type::Function {
+            args: actual_args
+                .iter()
+                .zip(expected_args)
+                .map(|(actual, expected)| contextualize_empty_list_placeholders(actual, expected))
+                .collect::<Option<Vec<_>>>()?,
+            result: Box::new(boon_typecheck::FlowType {
+                mode: actual_result.mode,
+                ty: contextualize_empty_list_placeholders(&actual_result.ty, &expected_result.ty)?,
+            }),
+        }),
+        (boon_typecheck::Type::Union(actual), boon_typecheck::Type::Union(expected))
+            if actual.len() == expected.len() =>
+        {
+            Some(boon_typecheck::Type::Union(
+                actual
+                    .iter()
+                    .zip(expected)
+                    .map(|(actual, expected)| {
+                        contextualize_empty_list_placeholders(actual, expected)
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ))
+        }
+        (actual, _) if !out_contract_type_contains_empty_list_placeholder(actual) => {
+            Some(actual.clone())
+        }
+        _ => None,
+    }
 }
 
 fn unify_out_contract_type(
@@ -3295,6 +3918,22 @@ fn unify_out_contract_type(
         }
     }
     Ok(())
+}
+
+fn merge_out_contract_substitutions(
+    substitutions: &mut BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
+    additions: impl IntoIterator<Item = (boon_typecheck::TypeVar, boon_typecheck::Type)>,
+) {
+    for (variable, value) in additions {
+        match substitutions.get(&variable) {
+            Some(existing)
+                if out_contract_type_is_resolved(existing)
+                    && !out_contract_type_is_resolved(&value) => {}
+            _ => {
+                substitutions.insert(variable, value);
+            }
+        }
+    }
 }
 
 fn validate_contextual_bindings(program: &CheckedProgram) -> Result<(), SemanticError> {
@@ -5037,6 +5676,109 @@ store: [
                         && authority.role == SemanticValueListRoleV1::InlineValue
                 }),
             "the fallback literal must retain a distinct inline-value authority"
+        );
+    }
+
+    #[test]
+    fn nested_generic_map_result_resolves_from_its_concrete_call_frames() {
+        let parsed = boon_parser::parse_source(
+            "semantic-nested-generic-map-result.bn",
+            r#"
+store: [
+    rows:
+        LIST {
+            [
+                kind: VariableRow
+                id: TEXT { signal-1 }
+                segments: LIST {
+                    [
+                        file: TEXT { waveform.vcd }
+                        signal_id: TEXT { signal-1 }
+                        label: TEXT { high }
+                    ]
+                }
+            ]
+        }
+        |> List/map(item, new: lane_row(row: item))
+]
+
+FUNCTION segment_row(segment, row) {
+    [
+        file: segment.file
+        signal_id: segment.signal_id
+        lane_id: row.id
+        label: segment.label
+    ]
+}
+
+FUNCTION segment_rows(row) {
+    row.segments
+    |> List/retain(item, if: segment_is_visible(segment: item))
+    |> List/map(item, new:
+        segment_row(
+            segment: normalized_segment(segment: item)
+            row: row
+        )
+    )
+}
+
+FUNCTION segment_is_visible(segment) {
+    segment.label == TEXT { high }
+}
+
+FUNCTION normalized_segment(segment) {
+    [
+        file: segment.file
+        signal_id: segment.signal_id
+        label: segment.label
+    ]
+}
+
+FUNCTION variable_lane(row) {
+    [
+        kind: row.kind
+        id: row.id
+        segments: segment_rows(row: row)
+    ]
+}
+
+FUNCTION group_lane(row) {
+    [
+        kind: row.kind
+        id: row.id
+        segments: segment_rows(row: row)
+    ]
+}
+
+FUNCTION lane_row(row) {
+    row.kind |> WHEN {
+        VariableRow => variable_lane(row: row)
+        __ => group_lane(row: row)
+    }
+}
+"#,
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "nested generic map fixture must typecheck: {:#?}",
+            checked.report.diagnostics
+        );
+        let semantic = elaborate(
+            checked
+                .program
+                .expect("nested generic map fixture has a checked program"),
+            &[],
+        )
+        .expect("nested generic map results resolve through concrete call frames");
+        assert!(
+            semantic
+                .resolved_out_graph()
+                .ports
+                .iter()
+                .all(|port| out_contract_type_is_resolved(&port.contract.resolved_type)),
+            "every nested generic map OUT port must have a concrete contract"
         );
     }
 

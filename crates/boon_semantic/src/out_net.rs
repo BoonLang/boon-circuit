@@ -1123,6 +1123,47 @@ where
             }
         }
 
+        // A call written inside a repeated-output body evaluates its
+        // parent-scoped arguments in that enclosing output, even when none of
+        // its own formals is output-scoped. Preserve the concrete enclosing
+        // port so later type resolution can recover the per-output generic
+        // substitutions instead of falling back to the caller frame.
+        let inherited_evaluation_ports = pending_calls
+            .iter()
+            .filter_map(|pending| {
+                let call = &self.call_instances[pending.instance.as_usize()];
+                let parent_output = call.parent_output?;
+                let parent_frame = call.parent;
+                let evaluation_port = self
+                    .ports
+                    .iter()
+                    .find(|port| {
+                        matches!(
+                            port.binding,
+                            OutPortBinding::Fresh { output, .. } if output == parent_output
+                        ) && self.call_instances[port.call.as_usize()].parent == parent_frame
+                    })
+                    .map(|port| port.id)?;
+                Some((pending.instance, evaluation_port))
+            })
+            .collect::<Vec<_>>();
+        for (instance, evaluation_port) in inherited_evaluation_ports {
+            let call = &mut self.call_instances[instance.as_usize()];
+            for input in &mut call.inputs {
+                if let OutInputValue::Checked(value) = &mut input.value
+                    && value.evaluation_port.is_none()
+                {
+                    value.evaluation_port = Some(evaluation_port);
+                }
+            }
+            if let Some(passed) = &mut call.passed
+                && passed.evaluation_call == instance
+                && passed.value.evaluation_port.is_none()
+            {
+                passed.value.evaluation_port = Some(evaluation_port);
+            }
+        }
+
         for pending in pending_calls {
             if pending.kind != Some(CheckedCallableKind::User) {
                 continue;

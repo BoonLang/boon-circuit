@@ -1715,6 +1715,34 @@ fn recursive_type_fingerprint_is_canonical() {
 }
 
 #[test]
+fn structural_union_schema_is_flattened_sorted_and_deduplicated() {
+    let union = DataTypePlan::Union {
+        members: vec![
+            DataTypePlan::Text,
+            DataTypePlan::Union {
+                members: vec![DataTypePlan::Number, DataTypePlan::Text],
+            },
+        ],
+    }
+    .canonicalized();
+
+    assert_eq!(
+        union,
+        DataTypePlan::Union {
+            members: vec![DataTypePlan::Number, DataTypePlan::Text],
+        }
+    );
+    assert!(union.is_canonical());
+    assert_eq!(
+        DataTypePlan::Union {
+            members: vec![DataTypePlan::Text, DataTypePlan::Text],
+        }
+        .canonicalized(),
+        DataTypePlan::Text,
+    );
+}
+
+#[test]
 fn canonical_schema_hash_excludes_runtime_numeric_links() {
     let application = ApplicationPlan::new(ApplicationIdentity::new(
         "dev.example.notes",

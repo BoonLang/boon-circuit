@@ -80,6 +80,9 @@ pub enum SemanticDataType {
     Unknown {
         reason: String,
     },
+    Union {
+        members: Vec<SemanticDataType>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

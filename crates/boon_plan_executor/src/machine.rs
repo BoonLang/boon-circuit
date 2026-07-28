@@ -3803,6 +3803,12 @@ struct EffectActivation {
     source_event: Option<SourceEvent>,
 }
 
+#[derive(Clone, Default)]
+struct ConsumerDependencySnapshot {
+    dynamic: BTreeSet<DynamicDependency>,
+    distributed_calls: Option<DistributedConsumerCallDemands>,
+}
+
 type ListAccessSubscriptions = Vec<(EvaluatedListAccessSelection, BTreeSet<Consumer>)>;
 type OrderedIndexCursorSnapshot = BTreeMap<RowId, Vec<AccessCursorKey>>;
 
@@ -5363,6 +5369,18 @@ fn validate_value_for_data_type(
     if let Value::HostBound { visible, .. } = value {
         return validate_value_for_data_type(visible, data_type, path);
     }
+    if let DataTypePlan::Union { members } = data_type {
+        if members
+            .iter()
+            .any(|member| validate_value_for_data_type(value, member, path).is_ok())
+        {
+            return Ok(());
+        }
+        return Err(Error::Evaluation(format!(
+            "{path} has runtime kind {} but does not match any member of {data_type:?}",
+            runtime_value_kind(value)
+        )));
+    }
 
     match (value, data_type) {
         (Value::Number(_), DataTypePlan::Number) | (Value::Text(_), DataTypePlan::Text) => Ok(()),
@@ -5572,6 +5590,11 @@ struct Work {
     suppress_row_deltas: HashSet<RowId>,
     recomputed_targets: HashSet<ValueTarget>,
     pending_list_mutations: Vec<PendingListMutation>,
+    /// Activation-local HOLD candidates that failed with FLUSH. The committed
+    /// state remains unchanged; reads in the same causal activation observe
+    /// the private carrier so the owning expression can reach its lexical
+    /// boundary.
+    flushed_state_candidates: BTreeMap<(StateId, Option<RowId>), Value>,
     authority_undo: Vec<AuthorityUndo>,
     undo_root_states: HashSet<StateId>,
     undo_row_fields: HashSet<(RowId, FieldId)>,
@@ -5622,6 +5645,7 @@ impl Work {
         self.suppress_row_deltas.clear();
         self.recomputed_targets.clear();
         self.pending_list_mutations.clear();
+        self.flushed_state_candidates.clear();
         self.distributed_invocations.clear();
         self.authority_undo.clear();
         self.undo_root_states.clear();
@@ -5673,6 +5697,7 @@ impl Work {
         self.completed_transient_effects.clear();
         self.updated_transient_effects.clear();
         self.pending_list_mutations.clear();
+        self.flushed_state_candidates.clear();
         self.distributed_context_undo = None;
         self.effect_activation_undo.clear();
         self.detached_producer_leases.clear();
@@ -5985,6 +6010,11 @@ enum EvalValue {
         items: Vec<OrderedEvalItem>,
         directions: Vec<EvalOrderDirection>,
     },
+}
+
+enum ControlOutcome<T> {
+    Normal(T),
+    Flushed(Value),
 }
 
 fn validate_flush_payload_value(value: &Value) -> Result<(), Error> {
@@ -7888,10 +7918,9 @@ struct DistributedCurrentCallResult {
     value: Value,
 }
 
-type DistributedCurrentCallDemands = BTreeMap<
-    Consumer,
-    BTreeMap<(RemoteCallSiteId, DistributedCallInstanceId), DistributedCurrentCallArguments>,
->;
+type DistributedConsumerCallDemands =
+    BTreeMap<(RemoteCallSiteId, DistributedCallInstanceId), DistributedCurrentCallArguments>;
+type DistributedCurrentCallDemands = BTreeMap<Consumer, DistributedConsumerCallDemands>;
 
 #[derive(Clone, Debug)]
 enum PendingListMutation {
@@ -13093,7 +13122,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         consumer: Consumer,
         work: &mut Work,
-    ) -> Result<Value, Error> {
+    ) -> Result<ControlOutcome<Value>, Error> {
         let value = self.eval_row_expression(
             expression,
             row.or_else(|| event.and_then(|event| event.target)),
@@ -13103,7 +13132,12 @@ impl MachineInstance {
             &mut PlanLocalBindings::new(),
             work,
         )?;
-        self.materialize_typed_effect_value(value, data_type, event, consumer, work)
+        match value {
+            EvalValue::Flushed(payload) => Ok(ControlOutcome::Flushed(payload)),
+            value => self
+                .materialize_typed_effect_value(value, data_type, event, consumer, work)
+                .map(ControlOutcome::Normal),
+        }
     }
 
     fn materialize_typed_effect_value(
@@ -15044,6 +15078,7 @@ impl MachineInstance {
         work.transient_effects.clear();
         work.distributed_invocations.clear();
         work.pending_list_mutations.clear();
+        work.flushed_state_candidates.clear();
         work.emit = false;
         self.rebuild_runtime_state_after_rollback(work)?;
         self.ensure_published_current(None, work)?;
@@ -15528,14 +15563,34 @@ impl MachineInstance {
         if effect.is_some() {
             return self.stage_effect_invocation(op, row, trigger, work);
         }
-        let Some(value) = self.evaluate_update(op, row, trigger.source_event, work)? else {
-            return Ok(());
-        };
         let Some(ValueRef::State(state)) = op.output else {
             return Err(Error::InvalidPlan(format!(
                 "update op {} has no state output",
                 op.id.0
             )));
+        };
+        let candidate_row = if op.indexed {
+            Some(row.ok_or_else(|| {
+                Error::InvalidEvent(format!("indexed update op {} has no row target", op.id.0))
+            })?)
+        } else {
+            None
+        };
+        let value = match self.evaluate_update(op, row, trigger.source_event, work)? {
+            ControlOutcome::Normal(value) => {
+                work.flushed_state_candidates
+                    .remove(&(state, candidate_row));
+                value
+            }
+            ControlOutcome::Flushed(payload) => {
+                return self.propagate_flushed_state_candidate(
+                    state,
+                    candidate_row,
+                    payload,
+                    trigger,
+                    work,
+                );
+            }
         };
         if op.indexed {
             let row = row.ok_or_else(|| {
@@ -15614,8 +15669,22 @@ impl MachineInstance {
             })?;
         let mut pending = Vec::with_capacity(rows.len());
         for row in rows {
-            if let Some(value) = self.evaluate_update(op, Some(*row), Some(event), work)? {
-                pending.push((*row, value));
+            match self.evaluate_update(op, Some(*row), Some(event), work)? {
+                ControlOutcome::Normal(value) => {
+                    work.flushed_state_candidates.remove(&(state, Some(*row)));
+                    pending.push((*row, value));
+                }
+                ControlOutcome::Flushed(payload) => {
+                    let source_trigger = self.source_trigger_frame(event)?;
+                    let trigger = self.trigger_for_state_target(state, &source_trigger, *row)?;
+                    self.propagate_flushed_state_candidate(
+                        state,
+                        Some(*row),
+                        payload,
+                        &trigger,
+                        work,
+                    )?;
+                }
             }
         }
         for (row, value) in pending {
@@ -15649,6 +15718,78 @@ impl MachineInstance {
             }
         }
         Ok(())
+    }
+
+    fn propagate_flushed_state_candidate(
+        &mut self,
+        state: StateId,
+        row: Option<RowId>,
+        payload: Value,
+        trigger: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        validate_flush_payload_value(&payload)?;
+        let key = (state, row);
+        if let Some(previous) = work.flushed_state_candidates.get(&key)
+            && previous != &payload
+        {
+            return Err(Error::Evaluation(format!(
+                "state {} received conflicting FLUSH payloads in one activation",
+                state.0
+            )));
+        }
+        work.flushed_state_candidates.insert(key, payload);
+        if let Some(row) = row {
+            let field = *self
+                .metadata
+                .indexed_state_field
+                .get(&state)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!("indexed state {} has no FieldId", state.0))
+                })?;
+            self.invalidate_row_field(row, field, work);
+        } else {
+            self.invalidate_root_state_dependents(state, work);
+        }
+        self.route_state_transition(state, trigger, row, work)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn discard_flushed_effect_candidate(
+        &mut self,
+        op: &PlanOp,
+        row: Option<RowId>,
+        payload: Value,
+        trigger: &TriggerFrame<'_>,
+        consumer: Consumer,
+        effect_consumer: EffectConsumer,
+        dependencies: ConsumerDependencySnapshot,
+        reconciliation_was_pending: bool,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        self.restore_consumer_dependencies(consumer, dependencies);
+        if reconciliation_was_pending {
+            work.pending_effect_reconciliations.insert(effect_consumer);
+        } else {
+            work.pending_effect_reconciliations.remove(&effect_consumer);
+        }
+        let Some(ValueRef::State(state)) = op.output else {
+            return Err(Error::InvalidPlan(format!(
+                "effect update op {} has no state output",
+                op.id.0
+            )));
+        };
+        let candidate_row = if op.indexed {
+            Some(row.ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "indexed effect update op {} has no row target",
+                    op.id.0
+                ))
+            })?)
+        } else {
+            None
+        };
+        self.propagate_flushed_state_candidate(state, candidate_row, payload, trigger, work)
     }
 
     fn record_effect_activation_undo(&self, consumer: EffectConsumer, work: &mut Work) {
@@ -15755,14 +15896,22 @@ impl MachineInstance {
                 continue;
             }
             for field in &effect.intent_fields {
-                self.eval_typed_effect_expression(
-                    field.expression,
-                    &field.data_type,
-                    effect_consumer.row,
-                    source_event.as_ref(),
-                    consumer,
-                    work,
-                )?;
+                if matches!(
+                    self.eval_typed_effect_expression(
+                        field.expression,
+                        &field.data_type,
+                        effect_consumer.row,
+                        source_event.as_ref(),
+                        consumer,
+                        work,
+                    )?,
+                    ControlOutcome::Flushed(_)
+                ) {
+                    return Err(Error::Evaluation(
+                        "FLUSH reached effect dependency reconstruction without an activation"
+                            .to_owned(),
+                    ));
+                }
             }
         }
         work.pending_effect_reconciliations.clear();
@@ -15844,6 +15993,74 @@ impl MachineInstance {
                     .then_some(*candidate)
             })
             .collect::<Vec<_>>();
+        let consumer = Consumer::Effect(effect_consumer);
+        let dependencies = self.snapshot_consumer_dependencies(consumer);
+        let reconciliation_was_pending =
+            work.pending_effect_reconciliations.remove(&effect_consumer);
+        self.clear_consumer_dependencies(consumer);
+        let gate = self.eval_row_expression(
+            effect.gate,
+            row.or_else(|| trigger.source_event.and_then(|event| event.target)),
+            trigger.source_event,
+            None,
+            Some(consumer),
+            &mut PlanLocalBindings::new(),
+            work,
+        )?;
+        // Bringing a gate dependency current while this activation is being
+        // evaluated is part of capturing the activation, not a subsequent
+        // semantic change that should reconcile it again.
+        work.pending_effect_reconciliations.remove(&effect_consumer);
+        let gate_open = match gate {
+            EvalValue::Flushed(payload) => {
+                return self.discard_flushed_effect_candidate(
+                    op,
+                    row,
+                    payload,
+                    trigger,
+                    consumer,
+                    effect_consumer,
+                    dependencies,
+                    reconciliation_was_pending,
+                    work,
+                );
+            }
+            gate => value_to_bool(&self.materialize_eval(gate)?)?,
+        };
+        let mut intent_values = BTreeMap::new();
+        if gate_open {
+            for field in &effect.intent_fields {
+                match self.eval_typed_effect_expression(
+                    field.expression,
+                    &field.data_type,
+                    row,
+                    trigger.source_event,
+                    consumer,
+                    work,
+                )? {
+                    ControlOutcome::Normal(value) => {
+                        intent_values.insert(field.name.clone(), value);
+                    }
+                    ControlOutcome::Flushed(payload) => {
+                        return self.discard_flushed_effect_candidate(
+                            op,
+                            row,
+                            payload,
+                            trigger,
+                            consumer,
+                            effect_consumer,
+                            dependencies,
+                            reconciliation_was_pending,
+                            work,
+                        );
+                    }
+                }
+            }
+        }
+        // The same rule applies to dependencies first materialized while
+        // capturing the intent. A later invalidation can enqueue reconciliation
+        // again because the consumer remains registered.
+        work.pending_effect_reconciliations.remove(&effect_consumer);
         for candidate in superseded {
             self.record_effect_activation_undo(candidate, work);
             self.effect_activations.remove(&candidate);
@@ -15859,23 +16076,7 @@ impl MachineInstance {
                 source_event: trigger.source_event.cloned(),
             },
         );
-        self.clear_consumer_dependencies(Consumer::Effect(effect_consumer));
-        work.pending_effect_reconciliations.remove(&effect_consumer);
-        let consumer = Consumer::Effect(effect_consumer);
-        let gate = self.eval_row_expression(
-            effect.gate,
-            row.or_else(|| trigger.source_event.and_then(|event| event.target)),
-            trigger.source_event,
-            None,
-            Some(consumer),
-            &mut PlanLocalBindings::new(),
-            work,
-        )?;
-        // Bringing a gate dependency current while this activation is being
-        // evaluated is part of capturing the activation, not a subsequent
-        // semantic change that should reconcile it again.
-        work.pending_effect_reconciliations.remove(&effect_consumer);
-        if !value_to_bool(&self.materialize_eval(gate)?)? {
+        if !gate_open {
             self.cancel_pending_transient_effect_owner(
                 effect.invocation_id,
                 owner,
@@ -15884,25 +16085,6 @@ impl MachineInstance {
             );
             return Ok(());
         }
-        let intent_values = effect
-            .intent_fields
-            .iter()
-            .map(|field| {
-                let value = self.eval_typed_effect_expression(
-                    field.expression,
-                    &field.data_type,
-                    row,
-                    trigger.source_event,
-                    consumer,
-                    work,
-                )?;
-                Ok((field.name.clone(), value))
-            })
-            .collect::<Result<BTreeMap<_, _>, Error>>()?;
-        // The same rule applies to dependencies first materialized while
-        // capturing the intent. A later invalidation can enqueue reconciliation
-        // again because the consumer remains registered.
-        work.pending_effect_reconciliations.remove(&effect_consumer);
         let transient_intent = Value::Record(intent_values.clone());
         validate_value_for_data_type(&transient_intent, &schema.intent_type, "effect intent")?;
         let sequence = self
@@ -17430,6 +17612,11 @@ impl MachineInstance {
                 value,
             });
         }
+        self.invalidate_root_state_dependents(state, work);
+        true
+    }
+
+    fn invalidate_root_state_dependents(&mut self, state: StateId, work: &mut Work) {
         let dynamic_dependents = self
             .dynamic_dependencies
             .by_root_state
@@ -17473,7 +17660,6 @@ impl MachineInstance {
             }
         }
         self.propagate_dirty(dirty, work);
-        true
     }
 
     fn set_row_field(
@@ -18939,6 +19125,36 @@ impl MachineInstance {
     fn clear_consumer_dependencies(&mut self, consumer: Consumer) {
         self.dynamic_dependencies.clear(consumer);
         self.distributed_current_call_demands.remove(&consumer);
+    }
+
+    fn snapshot_consumer_dependencies(&self, consumer: Consumer) -> ConsumerDependencySnapshot {
+        ConsumerDependencySnapshot {
+            dynamic: self
+                .dynamic_dependencies
+                .by_consumer
+                .get(&consumer)
+                .cloned()
+                .unwrap_or_default(),
+            distributed_calls: self
+                .distributed_current_call_demands
+                .get(&consumer)
+                .cloned(),
+        }
+    }
+
+    fn restore_consumer_dependencies(
+        &mut self,
+        consumer: Consumer,
+        snapshot: ConsumerDependencySnapshot,
+    ) {
+        self.clear_consumer_dependencies(consumer);
+        for dependency in snapshot.dynamic {
+            self.dynamic_dependencies.insert(consumer, dependency);
+        }
+        if let Some(calls) = snapshot.distributed_calls {
+            self.distributed_current_call_demands
+                .insert(consumer, calls);
+        }
     }
 
     fn register_distributed_current_call_demand(
@@ -21320,6 +21536,14 @@ impl MachineInstance {
                                         state.0, owner.0, row.list.0
                                     )));
                                 }
+                                if let Some(payload) = work
+                                    .flushed_state_candidates
+                                    .get(&(state, Some(row)))
+                                    .cloned()
+                                {
+                                    stack.push_value(EvalValue::Flushed(payload))?;
+                                    return Ok(());
+                                }
                                 let field =
                                     *self.metadata.indexed_state_field.get(&state).ok_or_else(
                                         || {
@@ -21332,6 +21556,12 @@ impl MachineInstance {
                                 self.register_row_dependency(context.consumer, row, field);
                                 stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
                             } else {
+                                if let Some(payload) =
+                                    work.flushed_state_candidates.get(&(state, None)).cloned()
+                                {
+                                    stack.push_value(EvalValue::Flushed(payload))?;
+                                    return Ok(());
+                                }
                                 self.register_root_state_dependency(context.consumer, state);
                                 let value = self
                                     .root_states
@@ -26344,7 +26574,7 @@ impl MachineInstance {
         row: Option<RowId>,
         event: Option<&SourceEvent>,
         work: &mut Work,
-    ) -> Result<Option<Value>, Error> {
+    ) -> Result<ControlOutcome<Value>, Error> {
         let PlanOpKind::StateUpdate {
             value: Some(expression),
             effect: None,
@@ -26365,7 +26595,10 @@ impl MachineInstance {
             &mut PlanLocalBindings::new(),
             work,
         )?;
-        self.materialize_eval(value).map(Some)
+        match value {
+            EvalValue::Flushed(payload) => Ok(ControlOutcome::Flushed(payload)),
+            value => self.materialize_eval(value).map(ControlOutcome::Normal),
+        }
     }
 
     fn stage_mutation_batch(
@@ -26375,13 +26608,37 @@ impl MachineInstance {
         trigger: &TriggerFrame<'_>,
         work: &mut Work,
     ) -> Result<(), Error> {
-        let pending = operations
-            .iter()
-            .map(|op| self.evaluate_mutation(op, event, trigger, work))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for op in operations {
+            match self.evaluate_mutation(op, event, trigger, work)? {
+                ControlOutcome::Normal(Some(mutation)) => pending.push(mutation),
+                ControlOutcome::Normal(None) => {}
+                ControlOutcome::Flushed(payload) => {
+                    let PlanOpKind::ListMutation { mutation } = &op.kind else {
+                        unreachable!("evaluate_mutation accepted a non-mutation op");
+                    };
+                    let mutation_trigger = match mutation {
+                        PlanListMutation::Append(append) => &append.trigger,
+                        PlanListMutation::Remove(remove) => &remove.trigger,
+                    };
+                    let propagated = match mutation_trigger {
+                        ValueRef::State(state) => {
+                            work.flushed_state_candidates
+                                .get(&(*state, trigger.active.target))
+                                .or_else(|| work.flushed_state_candidates.get(&(*state, None)))
+                                == Some(&payload)
+                        }
+                        _ => false,
+                    };
+                    if !propagated {
+                        return Err(Error::Evaluation(format!(
+                            "list mutation op {} produced FLUSH without an owning state activation",
+                            op.id.0
+                        )));
+                    }
+                }
+            }
+        }
         #[cfg(feature = "phase0-instrumentation")]
         let pushed = pending.len();
         #[cfg(feature = "phase0-instrumentation")]
@@ -26478,7 +26735,7 @@ impl MachineInstance {
         event: Option<&SourceEvent>,
         trigger: &TriggerFrame<'_>,
         work: &mut Work,
-    ) -> Result<Option<PendingListMutation>, Error> {
+    ) -> Result<ControlOutcome<Option<PendingListMutation>>, Error> {
         work.consume(1)?;
         let PlanOpKind::ListMutation { mutation } = &op.kind else {
             return Err(Error::InvalidPlan(format!(
@@ -26495,7 +26752,7 @@ impl MachineInstance {
         match mutation {
             PlanListMutation::Append(append) => {
                 if !Self::trigger_accepts(&append.trigger, &trigger.active) {
-                    return Ok(None);
+                    return Ok(ControlOutcome::Normal(None));
                 }
                 let row = event.and_then(|event| event.target);
                 let gate = self.eval_row_expression(
@@ -26507,8 +26764,14 @@ impl MachineInstance {
                     &mut PlanLocalBindings::new(),
                     work,
                 )?;
+                let gate = match gate {
+                    EvalValue::Flushed(payload) => {
+                        return Ok(ControlOutcome::Flushed(payload));
+                    }
+                    gate => gate,
+                };
                 if !eval_value_is_present(&gate) {
-                    return Ok(None);
+                    return Ok(ControlOutcome::Normal(None));
                 }
                 let item = self.eval_row_expression(
                     append.item,
@@ -26519,8 +26782,14 @@ impl MachineInstance {
                     &mut PlanLocalBindings::new(),
                     work,
                 )?;
+                let item = match item {
+                    EvalValue::Flushed(payload) => {
+                        return Ok(ControlOutcome::Flushed(payload));
+                    }
+                    item => item,
+                };
                 if !eval_value_is_present(&item) {
-                    return Ok(None);
+                    return Ok(ControlOutcome::Normal(None));
                 }
                 let fields = self.materialize_append_item(list, append, item, event, work)?;
                 let owner = instantiate_plan_owner(
@@ -26528,18 +26797,18 @@ impl MachineInstance {
                     &trigger.active,
                     &mut self.owner_instances,
                 )?;
-                Ok(Some(PendingListMutation::Append {
+                Ok(ControlOutcome::Normal(Some(PendingListMutation::Append {
                     site: append.site,
                     ordinal: append.ordinal,
                     sequence: trigger.active.sequence,
                     owner,
                     list,
                     fields,
-                }))
+                })))
             }
             PlanListMutation::Remove(remove) => {
                 if !Self::trigger_accepts(&remove.trigger, &trigger.active) {
-                    return Ok(None);
+                    return Ok(ControlOutcome::Normal(None));
                 }
                 let owner = instantiate_plan_owner(
                     &remove.owner,
@@ -26577,6 +26846,12 @@ impl MachineInstance {
                         &mut PlanLocalBindings::new(),
                         work,
                     )?;
+                    let gate = match gate {
+                        EvalValue::Flushed(payload) => {
+                            return Ok(ControlOutcome::Flushed(payload));
+                        }
+                        gate => gate,
+                    };
                     if !eval_value_is_present(&gate) {
                         continue;
                     }
@@ -26593,6 +26868,12 @@ impl MachineInstance {
                         &mut PlanLocalBindings::new(),
                         work,
                     )?;
+                    let predicate = match predicate {
+                        EvalValue::Flushed(payload) => {
+                            return Ok(ControlOutcome::Flushed(payload));
+                        }
+                        predicate => predicate,
+                    };
                     if !eval_value_is_present(&predicate) {
                         continue;
                     }
@@ -26600,15 +26881,15 @@ impl MachineInstance {
                         removed.push(row);
                     }
                 }
-                Ok(
-                    (!removed.is_empty()).then_some(PendingListMutation::Remove {
+                Ok(ControlOutcome::Normal((!removed.is_empty()).then_some(
+                    PendingListMutation::Remove {
                         site: remove.site,
                         ordinal: remove.ordinal,
                         sequence: trigger.active.sequence,
                         owner,
                         rows: removed,
-                    }),
-                )
+                    },
+                )))
             }
         }
     }
@@ -28794,7 +29075,31 @@ fn effect_replay_is_transient(replay: &boon_plan::EffectReplay) -> bool {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
-    use boon_plan::{ProgramRole, TargetProfile};
+    use boon_plan::{DataTypePlan, DataVariantPlan, ProgramRole, TargetProfile};
+
+    #[test]
+    fn public_union_schema_accepts_exactly_one_matching_runtime_member() {
+        let data_type = DataTypePlan::Union {
+            members: vec![
+                DataTypePlan::Number,
+                DataTypePlan::Variant {
+                    variants: vec![DataVariantPlan {
+                        tag: "Invalid".to_owned(),
+                        fields: Vec::new(),
+                        open: false,
+                    }],
+                },
+            ],
+        }
+        .canonicalized();
+
+        validate_value_for_data_type(&Value::integer(7).unwrap(), &data_type, "result").unwrap();
+        validate_value_for_data_type(&Value::tag("Invalid"), &data_type, "result").unwrap();
+        assert!(
+            validate_value_for_data_type(&Value::Text("wrong".to_owned()), &data_type, "result")
+                .is_err()
+        );
+    }
 
     #[test]
     fn owner_instance_interner_is_exact_stable_and_round_trips_routes() {

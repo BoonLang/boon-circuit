@@ -34,6 +34,12 @@ pub enum Type {
     },
     Var(TypeVar),
     Unknown,
+    /// An ordinary public sum of structurally distinct value types. Closed
+    /// Tag alternatives remain normalized as `VariantSet`; this form is for
+    /// sums such as a normal scalar/record result plus an exposed FLUSH
+    /// payload. Appended to preserve every existing serialized type
+    /// discriminant.
+    Union(Vec<Type>),
 }
 
 impl EqUnifyValue for Type {}
@@ -823,6 +829,10 @@ pub struct CheckedExpression {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<DeclId>,
     pub flow_type: FlowType,
+    /// Checker-private `Flush<E>` control carried by this expression before
+    /// a lexical boundary exposes `E` as ordinary public data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush_type: Option<Type>,
     pub effect: CheckedEffectSummary,
     pub kind: CheckedExpressionKind,
     pub span: CheckedSpan,
@@ -4725,7 +4735,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         let Some(flush_type) = self.expression_flush_types.get(&expression) else {
             return flow_type;
         };
-        flow_type.ty = widen_structural_type(&flow_type.ty, flush_type);
+        flow_type.ty = union_structural_type(&flow_type.ty, flush_type);
         if flow_type.mode == FlowMode::Absent {
             flow_type.mode = FlowMode::Continuous;
         }
@@ -6136,6 +6146,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                     })
                     .reduce(|existing, extra| widen_structural_type(&existing, &extra))
                     .unwrap_or(Type::Unknown),
+                Type::Union(members) => members
+                    .iter()
+                    .filter_map(|member| type_for_nested_path(member, std::slice::from_ref(field)))
+                    .reduce(|existing, extra| union_structural_type(&existing, &extra))
+                    .unwrap_or(Type::Unknown),
                 Type::Function { .. } | Type::RenderContract => Type::Unknown,
             };
         }
@@ -7005,6 +7020,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                         .get(&expr.id)
                         .cloned()
                         .unwrap_or_else(unknown_flow_type),
+                    flush_type: self.expression_flush_types.get(&expr.id).cloned(),
                     effect: call_effects.get(&expr.id).copied().map_or_else(
                         || checked_expression_effect(expr),
                         |call_effect| {
@@ -9953,6 +9969,7 @@ fn validate_source_payload_shape_table(
             | Type::Bytes(_)
             | Type::List(_)
             | Type::VariantSet(_)
+            | Type::Union(_)
             | Type::Absent
             | Type::RenderContract
             | Type::Function { .. }
@@ -10521,6 +10538,7 @@ fn context_scheme_conflict_reason(ty: &Type) -> Option<&str> {
                 .values()
                 .find_map(context_scheme_conflict_reason),
         }),
+        Type::Union(members) => members.iter().find_map(context_scheme_conflict_reason),
         _ => None,
     }
 }
@@ -10586,6 +10604,12 @@ fn alpha_normalize_context_type(
                         },
                     },
                 })
+                .collect(),
+        ),
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|member| alpha_normalize_context_type(member, variables, next_var))
                 .collect(),
         ),
         Type::Text
@@ -10665,6 +10689,12 @@ fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {
                 })
                 .collect(),
         ),
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|member| pass_scheme_type_with_fallback(member, fallback))
+                .collect(),
+        ),
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -10728,6 +10758,12 @@ fn freshen_checked_scheme_type(ty: &Type, next_var: &mut u32) -> Type {
                         },
                     },
                 })
+                .collect(),
+        ),
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|member| freshen_checked_scheme_type(member, next_var))
                 .collect(),
         ),
         Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::RenderContract => {
@@ -10806,6 +10842,14 @@ fn instantiate_checked_type_scheme_for_call(
                 })
                 .collect(),
         ),
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|member| {
+                    instantiate_checked_type_scheme_for_call(member, call, call_vars, next_var)
+                })
+                .collect(),
+        ),
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -10836,6 +10880,7 @@ fn checked_type_contains_var(ty: &Type) -> bool {
             Variant::Tag(_) => false,
             Variant::Tagged { fields, .. } => fields.fields.values().any(checked_type_contains_var),
         }),
+        Type::Union(members) => members.iter().any(checked_type_contains_var),
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -10860,6 +10905,9 @@ fn type_is_recursively_closed(ty: &Type) -> bool {
                 !fields.open && fields.fields.values().all(type_is_recursively_closed)
             }
         }),
+        Type::Union(members) => {
+            !members.is_empty() && members.iter().all(type_is_recursively_closed)
+        }
         Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_) => false,
     }
 }
@@ -10942,6 +10990,12 @@ fn substitute_checked_type_inner(
                 })
                 .collect(),
         ),
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|member| substitute_checked_type_inner(member, substitutions, active))
+                .collect(),
+        ),
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -11000,6 +11054,32 @@ fn unify_checked_type_pattern(
                         unify_checked_type_pattern(pattern, actual, substitutions);
                     }
                 }
+            }
+        }
+        (Type::Union(pattern), Type::Union(actual)) => {
+            for actual in actual {
+                if let Some(pattern) = pattern
+                    .iter()
+                    .find(|pattern| type_is_assignable_to(actual, pattern))
+                {
+                    unify_checked_type_pattern(pattern, actual, substitutions);
+                }
+            }
+        }
+        (Type::Union(pattern), actual) => {
+            if let Some(pattern) = pattern
+                .iter()
+                .find(|pattern| type_is_assignable_to(actual, pattern))
+            {
+                unify_checked_type_pattern(pattern, actual, substitutions);
+            }
+        }
+        (pattern, Type::Union(actual)) => {
+            for actual in actual
+                .iter()
+                .filter(|actual| type_is_assignable_to(actual, pattern))
+            {
+                unify_checked_type_pattern(pattern, actual, substitutions);
             }
         }
         _ => {}
@@ -11459,7 +11539,7 @@ fn merge_optional_flush_type(target: &mut Option<Type>, extra: Option<Type>) {
         return;
     };
     *target = Some(match target.take() {
-        Some(current) => widen_structural_type(&current, &extra),
+        Some(current) => union_structural_type(&current, &extra),
         None => extra,
     });
 }
@@ -11503,6 +11583,9 @@ fn flush_payload_field_type_is_closed(ty: &Type) -> bool {
                     .fields
                     .values()
                     .all(flush_payload_field_type_is_closed)
+        }
+        Type::Union(members) => {
+            !members.is_empty() && members.iter().all(flush_payload_field_type_is_closed)
         }
         Type::Unknown
         | Type::Var(_)
@@ -12110,6 +12193,9 @@ fn external_data_type_is_closed(ty: &Type) -> bool {
                 !fields.open && fields.fields.values().all(external_data_type_is_closed)
             }
         }),
+        Type::Union(members) => {
+            !members.is_empty() && members.iter().all(external_data_type_is_closed)
+        }
         Type::Absent
         | Type::RenderContract
         | Type::Function { .. }
@@ -17455,6 +17541,9 @@ fn host_output_type_is_closed(ty: &Type) -> bool {
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(host_output_type_is_closed),
         Type::List(item) => host_output_type_is_closed(item),
+        Type::Union(members) => {
+            !members.is_empty() && members.iter().all(host_output_type_is_closed)
+        }
         Type::Absent
         | Type::RenderContract
         | Type::Function { .. }
@@ -19794,6 +19883,14 @@ fn boon_facing_type_display_tree_with_depth(
                 }
             }
         }
+        Type::Union(members) => TypeDisplayNode::Union {
+            variants: members
+                .iter()
+                .map(|member| {
+                    boon_facing_type_display_tree_with_depth(member, depth + 1, max_depth)
+                })
+                .collect(),
+        },
         Type::VariantSet(variants) => {
             let variants = sorted_variants(variants);
             if variants.is_empty() {
@@ -19890,6 +19987,11 @@ fn boon_facing_type_label_with_depth(
             }
             object_shape_label(shape, depth, compact, max_depth)
         }
+        Type::Union(members) => members
+            .iter()
+            .map(|member| boon_facing_type_label_with_depth(member, depth + 1, compact, max_depth))
+            .collect::<Vec<_>>()
+            .join(" | "),
         Type::VariantSet(variants) => {
             let variants = sorted_variants(variants);
             if variants.is_empty() {
@@ -20267,6 +20369,15 @@ fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
         (Type::Absent, _) | (_, Type::Absent) => false,
         (left, _) if is_open_object_type(left) => false,
         (_, right) if is_open_object_type(right) => false,
+        (Type::Union(left), Type::Union(right)) => left.iter().all(|left| {
+            right
+                .iter()
+                .all(|right| concrete_type_conflict(left, right))
+        }),
+        (Type::Union(left), right) => left.iter().all(|left| concrete_type_conflict(left, right)),
+        (left, Type::Union(right)) => right
+            .iter()
+            .all(|right| concrete_type_conflict(left, right)),
         (Type::Text, Type::Text)
         | (Type::Number, Type::Number)
         | (Type::RenderContract, Type::RenderContract) => false,
@@ -20310,6 +20421,19 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
         (Type::UnresolvedShape { .. }, _) | (_, Type::UnresolvedShape { .. }) => true,
         (_, expected) if is_open_object_type(expected) => true,
         (actual, _) if is_open_object_type(actual) => true,
+        (Type::Union(actual), _) if actual.is_empty() => false,
+        (_, Type::Union(expected)) if expected.is_empty() => false,
+        (Type::Union(actual), Type::Union(expected)) => actual.iter().all(|actual| {
+            expected
+                .iter()
+                .any(|expected| type_is_assignable_to(actual, expected))
+        }),
+        (Type::Union(actual), expected) => actual
+            .iter()
+            .all(|actual| type_is_assignable_to(actual, expected)),
+        (actual, Type::Union(expected)) => expected
+            .iter()
+            .any(|expected| type_is_assignable_to(actual, expected)),
         (Type::Text, Type::Text) | (Type::Number, Type::Number) => true,
         (Type::Bytes(actual), Type::Bytes(expected)) => bytes_type_assignable(actual, expected),
         (actual, expected) if type_accepts_true_false(expected) => type_accepts_true_false(actual),
@@ -20359,6 +20483,19 @@ fn exact_closed_type_is_assignable(actual: &Type, expected: &Type) -> bool {
     match (actual, expected) {
         (Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }, _) => true,
         (actual, _) if is_open_object_type(actual) => true,
+        (Type::Union(actual), _) if actual.is_empty() => false,
+        (_, Type::Union(expected)) if expected.is_empty() => false,
+        (Type::Union(actual), Type::Union(expected)) => actual.iter().all(|actual| {
+            expected
+                .iter()
+                .any(|expected| exact_closed_type_is_assignable(actual, expected))
+        }),
+        (Type::Union(actual), expected) => actual
+            .iter()
+            .all(|actual| exact_closed_type_is_assignable(actual, expected)),
+        (actual, Type::Union(expected)) => expected
+            .iter()
+            .any(|expected| exact_closed_type_is_assignable(actual, expected)),
         (Type::List(actual), Type::List(expected)) => {
             exact_closed_type_is_assignable(actual, expected)
         }
@@ -23607,6 +23744,49 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
     }
 }
 
+fn union_structural_type(left: &Type, right: &Type) -> Type {
+    canonical_union_type(vec![left.clone(), right.clone()])
+}
+
+pub fn canonical_union_type(candidates: Vec<Type>) -> Type {
+    let mut members = Vec::new();
+    let mut variants = Vec::new();
+    let mut push = |candidate: Type| {
+        let candidates = match candidate {
+            Type::Union(candidates) => candidates,
+            candidate => vec![candidate],
+        };
+        for candidate in candidates {
+            match candidate {
+                Type::Absent => {}
+                Type::VariantSet(candidate_variants) => {
+                    for variant in candidate_variants {
+                        if !variants.contains(&variant) {
+                            variants.push(variant);
+                        }
+                    }
+                }
+                candidate if !members.contains(&candidate) => members.push(candidate),
+                _ => {}
+            }
+        }
+    };
+    for candidate in candidates {
+        push(candidate);
+    }
+    if !variants.is_empty() {
+        variants.sort_by_key(variant_sort_key);
+        members.push(Type::VariantSet(variants));
+    }
+    members.sort_by_key(|member| format!("{member:?}"));
+    members.dedup();
+    match members.as_slice() {
+        [] => Type::Absent,
+        [member] => member.clone(),
+        _ => Type::Union(members),
+    }
+}
+
 fn widen_hold_type(current: &Type, update: &Type) -> Type {
     if is_specific_type(current) && !is_specific_type(update) {
         current.clone()
@@ -23694,6 +23874,10 @@ fn type_for_nested_path(base: &Type, parts: &[String]) -> Option<Type> {
             }
             None
         }
+        Type::Union(members) => members
+            .iter()
+            .filter_map(|member| type_for_nested_path(member, parts))
+            .reduce(|existing, extra| union_structural_type(&existing, &extra)),
         Type::UnresolvedShape { .. } | Type::Unknown | Type::Var(_) => Some(base.clone()),
         _ => None,
     }
@@ -26976,6 +27160,7 @@ fn type_contains_renderable(ty: &Type) -> bool {
             Variant::Tag(_) => false,
             Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_renderable),
         }),
+        Type::Union(members) => members.iter().any(type_contains_renderable),
         Type::Function { result, .. } => type_contains_renderable(&result.ty),
         Type::Text
         | Type::Number
@@ -26996,6 +27181,7 @@ fn type_contains_no_element(ty: &Type) -> bool {
             Variant::Tag(_) => false,
             Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_no_element),
         }),
+        Type::Union(members) => members.iter().any(type_contains_no_element),
         Type::Function { result, .. } => type_contains_no_element(&result.ty),
         Type::Text
         | Type::Number
@@ -27017,6 +27203,7 @@ fn type_contains_absence(ty: &Type) -> bool {
             Variant::Tag(_) => false,
             Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_absence),
         }),
+        Type::Union(members) => members.iter().any(type_contains_absence),
         Type::Function { result, .. } => type_contains_absence(&result.ty),
         Type::Text
         | Type::Number
@@ -27091,6 +27278,11 @@ fn collect_type_vars(ty: &Type, vars: &mut BTreeSet<TypeVar>) {
                         collect_type_vars(field, vars);
                     }
                 }
+            }
+        }
+        Type::Union(members) => {
+            for member in members {
+                collect_type_vars(member, vars);
             }
         }
         Type::Text

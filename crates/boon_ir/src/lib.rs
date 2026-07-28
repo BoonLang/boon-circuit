@@ -3366,6 +3366,9 @@ fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
             !shape.open && shape.fields.values().all(distributed_type_is_closed)
         }
         boon_typecheck::Type::List(item) => distributed_type_is_closed(item),
+        boon_typecheck::Type::Union(members) => {
+            !members.is_empty() && members.iter().all(distributed_type_is_closed)
+        }
         boon_typecheck::Type::VariantSet(variants) => {
             variants.iter().all(|variant| match variant {
                 boon_typecheck::Variant::Tag(_) => true,
@@ -4224,6 +4227,7 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
     match ty {
         boon_typecheck::Type::Var(_) => true,
         boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
+        boon_typecheck::Type::Union(members) => members.iter().any(runtime_type_contains_var),
         boon_typecheck::Type::Function { args, result } => {
             args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
         }

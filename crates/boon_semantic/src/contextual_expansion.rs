@@ -1004,6 +1004,7 @@ fn erase_runtime_type_vars(ty: &Type) -> Type {
                 })
                 .collect(),
         ),
+        Type::Union(members) => Type::Union(members.iter().map(erase_runtime_type_vars).collect()),
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -1016,10 +1017,23 @@ fn erase_runtime_type_vars(ty: &Type) -> Type {
 
 fn project_concrete_type(mut ty: Type, fields: &[String]) -> Option<Type> {
     for field in fields {
-        let Type::Object(shape) = ty else {
-            return None;
+        ty = match ty {
+            Type::Object(shape) => shape.fields.get(field)?.clone(),
+            Type::Union(members) => {
+                let projected = members
+                    .iter()
+                    .filter_map(|member| match member {
+                        Type::Object(shape) => shape.fields.get(field).cloned(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                match projected.as_slice() {
+                    [] => return None,
+                    _ => boon_typecheck::canonical_union_type(projected),
+                }
+            }
+            _ => return None,
         };
-        ty = shape.fields.get(field)?.clone();
     }
     Some(ty)
 }
@@ -5090,14 +5104,23 @@ impl<'a> SemanticExpressionBuilder<'a> {
             .expression(self.program, checked_expression)
             .cloned()
             .ok_or(ExpansionError::MissingExpression(checked_expression))?;
+        let Some(flush_type) = origin.flush_type.clone() else {
+            return Ok(input);
+        };
+        let flow_type = flow_type.unwrap_or_else(|| {
+            let mut flow_type = origin.flow_type.clone();
+            flow_type.ty = boon_typecheck::canonical_union_type(vec![flow_type.ty, flush_type]);
+            if flow_type.mode == boon_typecheck::FlowMode::Absent {
+                flow_type.mode = boon_typecheck::FlowMode::Continuous;
+            }
+            flow_type
+        });
         let boundary = self.push(
             &origin,
             owner,
             SemanticExpressionKind::FlushBoundary { input },
         );
-        if let Some(flow_type) = flow_type {
-            self.expressions[boundary.as_usize()].flow_type = flow_type;
-        }
+        self.expressions[boundary.as_usize()].flow_type = flow_type;
         Ok(boundary)
     }
 

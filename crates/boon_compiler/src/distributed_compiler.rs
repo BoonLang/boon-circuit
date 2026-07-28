@@ -3293,6 +3293,15 @@ fn type_to_data_plan(ty: &Type) -> Option<DataTypePlan> {
         Type::List(item) => Some(DataTypePlan::List {
             item: Box::new(type_to_data_plan(item)?),
         }),
+        Type::Union(members) => Some(
+            DataTypePlan::Union {
+                members: members
+                    .iter()
+                    .map(type_to_data_plan)
+                    .collect::<Option<Vec<_>>>()?,
+            }
+            .canonicalized(),
+        ),
         Type::VariantSet(variants) => Some(DataTypePlan::Variant {
             variants: variants
                 .iter()

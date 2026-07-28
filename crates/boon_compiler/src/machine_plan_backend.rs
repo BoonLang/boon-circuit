@@ -1454,7 +1454,9 @@ fn plan_value_type_from_semantic_data_type(data_type: &DataTypePlan) -> PlanValu
             fixed_len: *fixed_len,
         },
         DataTypePlan::Variant { .. } => PlanValueType::Tag,
-        DataTypePlan::Record { .. } | DataTypePlan::List { .. } => PlanValueType::Data,
+        DataTypePlan::Record { .. } | DataTypePlan::List { .. } | DataTypePlan::Union { .. } => {
+            PlanValueType::Data
+        }
         DataTypePlan::Unknown => PlanValueType::Unknown,
     }
 }
@@ -1483,6 +1485,7 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
                 name: variant.tag.clone(),
             })
         }
+        DataTypePlan::Union { members } => members.first().and_then(deterministic_fresh_constant),
         DataTypePlan::Record { .. } | DataTypePlan::List { .. } => None,
         DataTypePlan::Bytes { fixed_len: Some(_) } | DataTypePlan::Unknown => None,
     }
@@ -1937,6 +1940,10 @@ fn semantic_data_type_plan(value: &ir::SemanticDataType) -> DataTypePlan {
         ir::SemanticDataType::List { item } => DataTypePlan::List {
             item: Box::new(semantic_data_type_plan(item)),
         },
+        ir::SemanticDataType::Union { members } => DataTypePlan::Union {
+            members: members.iter().map(semantic_data_type_plan).collect(),
+        }
+        .canonicalized(),
         ir::SemanticDataType::Unknown { .. } => DataTypePlan::Unknown,
     }
 }
@@ -2454,6 +2461,12 @@ fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataT
             },
             Type::List(item) => DataTypePlan::List {
                 item: Box::new(data_type_plan_from_typecheck_type(item)?),
+            },
+            Type::Union(members) => DataTypePlan::Union {
+                members: members
+                    .iter()
+                    .map(data_type_plan_from_typecheck_type)
+                    .collect::<Option<Vec<_>>>()?,
             },
             Type::Absent
             | Type::RenderContract
@@ -8192,6 +8205,7 @@ fn plan_typed_list_index_key(
                 DataTypePlan::Bytes { .. }
                 | DataTypePlan::Record { .. }
                 | DataTypePlan::List { .. }
+                | DataTypePlan::Union { .. }
                 | DataTypePlan::Unknown => return Ok(None),
             }
         }

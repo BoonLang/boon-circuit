@@ -3567,6 +3567,9 @@ fn out_contract_type_is_resolved(ty: &boon_typecheck::Type) -> bool {
         | boon_typecheck::Type::Unknown
         | boon_typecheck::Type::UnresolvedShape { .. } => false,
         boon_typecheck::Type::List(item) => out_contract_type_is_resolved(item),
+        boon_typecheck::Type::Union(members) => {
+            !members.is_empty() && members.iter().all(out_contract_type_is_resolved)
+        }
         boon_typecheck::Type::Function { args, result } => {
             args.iter().all(out_contract_type_is_resolved)
                 && out_contract_type_is_resolved(&result.ty)
@@ -3866,6 +3869,7 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
     match ty {
         boon_typecheck::Type::Var(_) => true,
         boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
+        boon_typecheck::Type::Union(members) => members.iter().any(runtime_type_contains_var),
         boon_typecheck::Type::Function { args, result } => {
             args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
         }

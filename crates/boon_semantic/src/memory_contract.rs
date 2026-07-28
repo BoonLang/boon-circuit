@@ -685,6 +685,9 @@ fn type_is_closed_memory_data(data_type: &Type) -> bool {
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(type_is_closed_memory_data),
         Type::List(item) => type_is_closed_memory_data(item),
+        Type::Union(members) => {
+            !members.is_empty() && members.iter().all(type_is_closed_memory_data)
+        }
         Type::Absent
         | Type::Function { .. }
         | Type::RenderContract

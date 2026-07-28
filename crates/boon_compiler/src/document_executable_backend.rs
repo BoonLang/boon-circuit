@@ -2620,6 +2620,18 @@ fn value_class_for_type(ty: &Type) -> DocumentValueClass {
             DocumentValueClass::ChildList
         }
         Type::List(_) | Type::Object(_) => DocumentValueClass::DynamicStructure,
+        Type::Union(members) => {
+            if members.iter().all(|member| {
+                matches!(
+                    value_class_for_type(member),
+                    DocumentValueClass::Static | DocumentValueClass::DynamicScalar
+                )
+            }) {
+                DocumentValueClass::DynamicScalar
+            } else {
+                DocumentValueClass::DynamicStructure
+            }
+        }
         Type::Text
         | Type::Number
         | Type::Bytes(_)

@@ -1771,6 +1771,7 @@ fn resolved_visual_type(ty: &Type) -> bool {
             false
         }
         Type::List(item) => resolved_visual_type(item),
+        Type::Union(members) => !members.is_empty() && members.iter().all(resolved_visual_type),
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -1872,6 +1873,7 @@ fn type_is_closed_host_data(data_type: &Type) -> bool {
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(type_is_closed_host_data),
         Type::List(item) => type_is_closed_host_data(item),
+        Type::Union(members) => !members.is_empty() && members.iter().all(type_is_closed_host_data),
         Type::Absent
         | Type::Function { .. }
         | Type::RenderContract

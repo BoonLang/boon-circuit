@@ -7285,6 +7285,428 @@ fn flush_is_private_until_the_named_root_boundary() {
 }
 
 #[test]
+fn flushing_state_update_preserves_prior_state_and_later_activation_recovers() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let payload = row_constant(&mut row_expressions, PlanConstantId(1));
+    let flush = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::Flush { payload },
+    );
+    let valid = row_constant(&mut row_expressions, PlanConstantId(2));
+    let state = row_field(&mut row_expressions, ValueRef::State(StateId(0)));
+    let exposed = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::FlushBoundary { input: state },
+    );
+    let flush_update = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::StateUpdate {
+            trigger: ValueRef::Source(SourceId(0)),
+            value: Some(flush),
+            effect: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(0))],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let valid_update = PlanOp {
+        id: PlanOpId(1),
+        kind: PlanOpKind::StateUpdate {
+            trigger: ValueRef::Source(SourceId(1)),
+            value: Some(valid),
+            effect: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(1))],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let exposed_result = derived(2, 0, vec![ValueRef::State(StateId(0))], Some(exposed));
+    let mut session = MachineInstance::new(
+        plan(
+            RootOutputDemand::All,
+            row_expressions,
+            vec![
+                constant(0, number_constant(1)),
+                constant(1, tag_constant("InvalidUpdate")),
+                constant(2, number_constant(2)),
+            ],
+            vec![route(0, None), route(1, None)],
+            vec![number_slot(0, 0)],
+            Vec::new(),
+            vec![flush_update, valid_update, exposed_result],
+            vec![(StateId(0), "store.value")],
+            Vec::new(),
+            vec![(FieldId(0), "result")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        number(1)
+    );
+    assert_eq!(session.root_value_current("result").unwrap(), number(1));
+
+    let flushed = session.apply(event(&session, 1, 0, None)).unwrap();
+    assert!(flushed.authority_deltas.is_empty());
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        number(1)
+    );
+    assert_eq!(
+        session.root_value_current("result").unwrap(),
+        Value::tag("InvalidUpdate")
+    );
+
+    let recovered = session.apply(event(&session, 2, 1, None)).unwrap();
+    assert!(recovered.authority_deltas.iter().any(|delta| {
+        matches!(
+            delta,
+            AuthorityDelta::SetRoot { state, value }
+                if *state == StateId(0) && *value == number(2)
+        )
+    }));
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        number(2)
+    );
+    assert_eq!(session.root_value_current("result").unwrap(), number(2));
+}
+
+#[test]
+fn collection_flush_uses_first_semantic_position_and_bypasses_downstream_work() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let one = row_constant(&mut row_expressions, PlanConstantId(0));
+    let two = row_constant(&mut row_expressions, PlanConstantId(1));
+    let three = row_constant(&mut row_expressions, PlanConstantId(2));
+    let source = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::ListLiteral {
+            items: vec![one, two, three],
+        },
+    );
+    let item = contextual_local(&mut row_expressions, 1, &[]);
+    let fails = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::NumberInfix {
+            op: PlanInfixOp::GreaterOrEqual,
+            left: item,
+            right: two,
+        },
+    );
+    let payload = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::TaggedObject {
+            tag: "InvalidItem".to_owned(),
+            fields: vec![PlanRowObjectField {
+                name: "position".to_owned(),
+                value: item,
+                spread: false,
+            }],
+        },
+    );
+    let flush = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::Flush { payload },
+    );
+    let body = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::Select {
+            input: fails,
+            arms: vec![
+                PlanRowSelectArm {
+                    pattern: PlanRowSelectPattern::Tag {
+                        name: "True".to_owned(),
+                    },
+                    value: flush,
+                },
+                PlanRowSelectArm {
+                    pattern: PlanRowSelectPattern::Wildcard,
+                    value: item,
+                },
+            ],
+        },
+    );
+    let mapped = contextual_collection(
+        &mut row_expressions,
+        1,
+        PlanContextualOperationKind::Map,
+        source,
+        body,
+    );
+    let downstream_count = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::BuiltinCall {
+            function: PlanRowBuiltin::ListCount,
+            input: Some(mapped),
+            args: Vec::new(),
+        },
+    );
+    let exposed = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::FlushBoundary {
+            input: downstream_count,
+        },
+    );
+    let mut session = MachineInstance::new(
+        plan(
+            RootOutputDemand::All,
+            row_expressions,
+            vec![
+                constant(0, number_constant(1)),
+                constant(1, number_constant(2)),
+                constant(2, number_constant(3)),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![derived(0, 0, Vec::new(), Some(exposed))],
+            Vec::new(),
+            Vec::new(),
+            vec![(FieldId(0), "result")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.root_value_current("result").unwrap(),
+        Value::tagged(
+            "InvalidItem",
+            BTreeMap::from([("position".to_owned(), number(2))]),
+        )
+    );
+}
+
+#[test]
+fn flushed_state_chain_suppresses_dispatch_without_cancelling_prior_effect() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let payload = row_constant(&mut row_expressions, PlanConstantId(2));
+    let flush = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::Flush { payload },
+    );
+    let gate = row_field(&mut row_expressions, ValueRef::State(StateId(0)));
+    let flush_update = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::StateUpdate {
+            trigger: ValueRef::Source(SourceId(0)),
+            value: Some(flush),
+            effect: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(0))],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let valid = row_constant(&mut row_expressions, PlanConstantId(3));
+    let valid_update = PlanOp {
+        id: PlanOpId(1),
+        kind: PlanOpKind::StateUpdate {
+            trigger: ValueRef::Source(SourceId(1)),
+            value: Some(valid),
+            effect: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(1))],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let contract = builtin_effect_contract("Clock/wall")
+        .unwrap()
+        .expect("Clock/wall effect contract");
+    let effect_update = PlanOp {
+        id: PlanOpId(2),
+        kind: PlanOpKind::StateUpdate {
+            trigger: ValueRef::State(StateId(0)),
+            value: None,
+            effect: Some(EffectInvocationPlan {
+                invocation_id: EffectInvocationId([7; 32]),
+                effect_id: contract.effect_id,
+                owner: PlanOwner::root(),
+                gate,
+                intent_fields: Vec::new(),
+                idempotency_key: EffectIdempotencyKeyPlan::InvocationTurnIntentSha256,
+                result: EffectResultRoute::Target {
+                    target: ValueRef::State(StateId(1)),
+                    policy: EffectResultPolicy::ReturnValue,
+                },
+                barrier: contract.barrier,
+            }),
+        },
+        inputs: vec![ValueRef::State(StateId(0))],
+        output: Some(ValueRef::State(StateId(1))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let tag_slot = |state: usize, constant: usize| ScalarStorageSlot {
+        id: PlanStorageId(state),
+        state_id: StateId(state),
+        owner: PlanOwner::root(),
+        value_type: PlanValueType::Tag,
+        scope_id: None,
+        indexed: false,
+        indexed_field_id: None,
+        initializer: ScalarInitializerPlan::Constant {
+            constant_id: PlanConstantId(constant),
+        },
+    };
+    let mut machine = plan(
+        RootOutputDemand::All,
+        row_expressions,
+        vec![
+            constant(0, tag_constant("False")),
+            constant(1, tag_constant("RandomNotRequested")),
+            constant(2, tag_constant("ClockUnavailable")),
+            constant(3, tag_constant("True")),
+        ],
+        vec![route(0, None), route(1, None)],
+        vec![tag_slot(0, 0), tag_slot(1, 1)],
+        Vec::new(),
+        vec![flush_update, valid_update, effect_update],
+        vec![
+            (StateId(0), "store.clock_result"),
+            (StateId(1), "store.random_result"),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    machine.effects.push(contract);
+    machine.capability_summary = derive_capability_summary(&machine);
+
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let dispatched = session.apply(event(&session, 1, 1, None)).unwrap();
+    assert_eq!(dispatched.transient_effects.len(), 1);
+    assert_eq!(session.pending_transient_effect_count(), 1);
+
+    let flushed = session.apply(event(&session, 2, 0, None)).unwrap();
+
+    assert!(flushed.transient_effects.is_empty());
+    assert!(flushed.cancelled_transient_effects.is_empty());
+    assert!(flushed.outbox_changes.is_empty());
+    assert_eq!(session.pending_transient_effect_count(), 1);
+    assert_eq!(
+        session.root_value_current("store.clock_result").unwrap(),
+        Value::tag("True")
+    );
+    assert_eq!(
+        session.root_value_current("store.random_result").unwrap(),
+        Value::tag("RandomNotRequested")
+    );
+    assert!(flushed.authority_deltas.is_empty());
+}
+
+#[test]
+fn flushed_state_chain_discards_staged_list_mutation() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let payload = row_constant(&mut row_expressions, PlanConstantId(1));
+    let flush = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::Flush { payload },
+    );
+    let flush_update = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::StateUpdate {
+            trigger: ValueRef::Source(SourceId(0)),
+            value: Some(flush),
+            effect: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(0))],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let gate = row_field(&mut row_expressions, ValueRef::State(StateId(0)));
+    let item = row_constant(&mut row_expressions, PlanConstantId(2));
+    let append = PlanOp {
+        id: PlanOpId(1),
+        kind: PlanOpKind::ListMutation {
+            mutation: PlanListMutation::Append(PlanListAppend {
+                site: 0,
+                ordinal: 0,
+                owner: PlanOwner::root(),
+                trigger: ValueRef::State(StateId(0)),
+                gate,
+                item,
+                fields: vec![PlanListAppendField {
+                    name: "value".to_owned(),
+                    field_id: FieldId(10),
+                }],
+                row_field_copies: Vec::new(),
+            }),
+        },
+        inputs: vec![ValueRef::State(StateId(0))],
+        output: Some(ValueRef::List(ListId(0))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    };
+    let state = ScalarStorageSlot {
+        id: PlanStorageId(0),
+        state_id: StateId(0),
+        owner: PlanOwner::root(),
+        value_type: PlanValueType::Tag,
+        scope_id: None,
+        indexed: false,
+        indexed_field_id: None,
+        initializer: ScalarInitializerPlan::Constant {
+            constant_id: PlanConstantId(0),
+        },
+    };
+    let list = ListStorageSlot {
+        id: PlanStorageId(1),
+        list_id: ListId(0),
+        scope_id: None,
+        row_fields: vec![PlanListRowField {
+            field_id: FieldId(10),
+            name: "value".to_owned(),
+            role: PlanListRowFieldRole::Authority,
+        }],
+        capacity: None,
+        hidden_key_type: "Key".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Empty,
+        range: None,
+        initial_rows: Vec::new(),
+    };
+    let mut session = MachineInstance::new(
+        plan(
+            RootOutputDemand::All,
+            row_expressions,
+            vec![
+                constant(0, tag_constant("Ready")),
+                constant(1, tag_constant("InvalidMutation")),
+                constant(
+                    2,
+                    PlanConstantValue::Text {
+                        value: "must-not-append".to_owned(),
+                    },
+                ),
+            ],
+            vec![route(0, None)],
+            vec![state],
+            vec![list],
+            vec![flush_update, append],
+            vec![(StateId(0), "store.status")],
+            vec![(ListId(0), "store.items")],
+            vec![(FieldId(10), "store.items.value")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    let turn = session.apply(event(&session, 1, 0, None)).unwrap();
+    assert!(session.list_rows(ListId(0)).is_empty());
+    assert!(turn.authority_deltas.is_empty());
+    assert_eq!(
+        session.root_value_current("store.status").unwrap(),
+        Value::tag("Ready")
+    );
+}
+
+#[test]
 fn removed_error_builtins_are_rejected() {
     assert!(
         compile_server_source(

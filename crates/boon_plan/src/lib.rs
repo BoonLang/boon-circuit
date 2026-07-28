@@ -298,7 +298,7 @@ pub struct MemoryOwnerPath {
     pub named_owner_path: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DataTypePlan {
     Number,
@@ -318,6 +318,10 @@ pub enum DataTypePlan {
         item: Box<DataTypePlan>,
     },
     Unknown,
+    /// Appended to preserve every existing binary MachinePlan discriminant.
+    Union {
+        members: Vec<DataTypePlan>,
+    },
 }
 
 impl DataTypePlan {
@@ -339,6 +343,21 @@ impl DataTypePlan {
             Self::List { item } => Self::List {
                 item: Box::new(item.canonicalized()),
             },
+            Self::Union { members } => {
+                let mut members = members
+                    .iter()
+                    .flat_map(|member| match member.canonicalized() {
+                        Self::Union { members } => members,
+                        member => vec![member],
+                    })
+                    .collect::<Vec<_>>();
+                members.sort();
+                members.dedup();
+                match members.as_slice() {
+                    [member] => member.clone(),
+                    _ => Self::Union { members },
+                }
+            }
             Self::Number | Self::Text | Self::Bytes { .. } | Self::Unknown => self.clone(),
         }
     }
@@ -348,13 +367,13 @@ impl DataTypePlan {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct DataTypeFieldPlan {
     pub name: String,
     pub data_type: DataTypePlan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct DataVariantPlan {
     pub tag: String,
     pub fields: Vec<DataTypeFieldPlan>,
@@ -1340,6 +1359,9 @@ fn distributed_data_type_is_supported(data_type: &DataTypePlan) -> bool {
         }),
         DataTypePlan::Record { fields, open } => !open && fields_supported(fields),
         DataTypePlan::List { item } => distributed_data_type_is_supported(item),
+        DataTypePlan::Union { members } => {
+            !members.is_empty() && members.iter().all(distributed_data_type_is_supported)
+        }
         DataTypePlan::Unknown => false,
         DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => true,
     }
@@ -3300,6 +3322,7 @@ fn data_type_contains_unknown(data_type: &DataTypePlan) -> bool {
             .iter()
             .any(|field| data_type_contains_unknown(&field.data_type)),
         DataTypePlan::List { item } => data_type_contains_unknown(item),
+        DataTypePlan::Union { members } => members.iter().any(data_type_contains_unknown),
         DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => false,
     }
 }
@@ -9585,6 +9608,11 @@ fn distributed_import_data_type(plan: &MachinePlan, import_id: ImportId) -> Opti
 }
 
 fn plan_value_type_matches_data_type(actual: PlanValueType, expected: &DataTypePlan) -> bool {
+    if let DataTypePlan::Union { members } = expected {
+        return members
+            .iter()
+            .any(|member| plan_value_type_matches_data_type(actual, member));
+    }
     match actual {
         PlanValueType::Text => matches!(expected, DataTypePlan::Text),
         PlanValueType::Number => matches!(expected, DataTypePlan::Number),
@@ -9598,6 +9626,11 @@ fn plan_value_type_matches_data_type(actual: PlanValueType, expected: &DataTypeP
 }
 
 fn constant_value_matches_data_type(actual: &PlanConstantValue, expected: &DataTypePlan) -> bool {
+    if let DataTypePlan::Union { members } = expected {
+        return members
+            .iter()
+            .any(|member| constant_value_matches_data_type(actual, member));
+    }
     match actual {
         PlanConstantValue::Text { .. } => matches!(expected, DataTypePlan::Text),
         PlanConstantValue::Number { .. } => matches!(expected, DataTypePlan::Number),
@@ -9611,6 +9644,11 @@ fn constant_value_matches_data_type(actual: &PlanConstantValue, expected: &DataT
 }
 
 fn data_type_accepts_fieldless_tag(data_type: &DataTypePlan, name: &str) -> bool {
+    if let DataTypePlan::Union { members } = data_type {
+        return members
+            .iter()
+            .any(|member| data_type_accepts_fieldless_tag(member, name));
+    }
     matches!(
         data_type,
         DataTypePlan::Variant { variants }
@@ -11591,6 +11629,9 @@ fn data_type_is_closed(data_type: &DataTypePlan) -> bool {
                     .all(|field| data_type_is_closed(&field.data_type))
         }),
         DataTypePlan::List { item } => data_type_is_closed(item),
+        DataTypePlan::Union { members } => {
+            !members.is_empty() && members.iter().all(data_type_is_closed)
+        }
         DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => true,
     }
 }

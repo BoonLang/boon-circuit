@@ -100,6 +100,9 @@ fn semantic_data_type(value: &boon_typecheck::Type) -> crate::SemanticDataType {
         boon_typecheck::Type::List(item) => crate::SemanticDataType::List {
             item: Box::new(semantic_data_type(item)),
         },
+        boon_typecheck::Type::Union(members) => crate::SemanticDataType::Union {
+            members: members.iter().map(semantic_data_type).collect(),
+        },
         boon_typecheck::Type::Function { .. } => crate::SemanticDataType::Unknown {
             reason: "function values are not semantic memory data".to_owned(),
         },
@@ -2949,8 +2952,15 @@ fn map_reactive_binding(
                 || state.expression != binding.producer
             {
                 return Err(format!(
-                    "semantic binding {} state target {} has stale provenance",
-                    binding.id, state.id
+                    "semantic binding {} state target {} has stale provenance: statement={}/{}, declaration={:?}/{:?}, expression={}/{}",
+                    binding.id,
+                    state.id,
+                    state.statement,
+                    binding.statement,
+                    state.declaration,
+                    binding.declaration,
+                    state.expression,
+                    binding.producer,
                 ));
             }
             let field = unique_mapped_field_for_statement(

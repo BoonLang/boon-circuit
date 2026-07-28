@@ -1030,6 +1030,7 @@ fn render_tree_formal(ty: &Type) -> bool {
     match ty {
         Type::RenderContract => true,
         Type::List(item) => render_tree_formal(item),
+        Type::Union(members) => !members.is_empty() && members.iter().all(render_tree_formal),
         Type::Text
         | Type::Number
         | Type::Bytes(_)

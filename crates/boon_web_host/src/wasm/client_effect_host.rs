@@ -401,7 +401,6 @@ fn failure(code: &str, diagnostic: &str) -> Value {
     )
 }
 
-fn tagged(tag: &str, mut fields: BTreeMap<String, Value>) -> Value {
-    fields.insert("$tag".to_owned(), Value::Text(tag.to_owned()));
-    Value::Record(fields)
+fn tagged(tag: &str, fields: BTreeMap<String, Value>) -> Value {
+    Value::tagged(tag, fields)
 }

@@ -3794,9 +3794,8 @@ mod tests {
             .root_value_current("store.real_waveform_open_result")
             .unwrap();
         assert!(
-            matches!(&waveform_open, Value::Record(fields)
-                if fields.get("$tag")
-                    == Some(&Value::Text("WaveformOpened".to_owned()))
+            matches!(&waveform_open, Value::Tag { tag, fields }
+                if tag == "WaveformOpened"
                     && fields.get("format")
                         == Some(&Value::Text(expected_format.to_owned()))),
             "{expected_format} selection did not reach the real Wellen artifact: \
@@ -3820,15 +3819,20 @@ mod tests {
         let signal_request_fingerprint = view
             .root_value_current("store.real_signal_page_request_fingerprint")
             .unwrap();
-        let Value::Record(signal_page) = signal_page else {
+        let Value::Tag {
+            tag,
+            fields: signal_page,
+        } = signal_page
+        else {
             panic!(
-                "real signal page is not a tagged record: {signal_page:?}; active signal \
+                "real signal page is not a tag: {signal_page:?}; active signal \
                  {active_signal:?}; requested IDs {requested_signal_ids:?}; selected asset \
                  {selected_asset:?}; file stream {file_stream:?}; open {waveform_open:?}; \
                  hierarchy {hierarchy_page:?}; request {signal_request:?}; current fingerprint \
                  {signal_request_fingerprint:?}"
             );
         };
+        assert_eq!(tag, "SignalPage");
         let Some(Value::List(signals)) = signal_page.get("signals") else {
             panic!(
                 "real signal page has no bounded signal rows for active signal {active_signal:?} \
@@ -3878,12 +3882,15 @@ mod tests {
         let cursor_values = view
             .root_value_current("store.real_cursor_values_result")
             .unwrap();
-        let Value::Record(cursor_values) = cursor_values else {
-            panic!("real cursor response is not a tagged record: {cursor_values:?}");
+        let Value::Tag {
+            tag,
+            fields: cursor_values,
+        } = cursor_values
+        else {
+            panic!("real cursor response is not a tag: {cursor_values:?}");
         };
         assert_eq!(
-            cursor_values.get("$tag"),
-            Some(&Value::Text("CursorValues".to_owned())),
+            tag, "CursorValues",
             "{expected_format} cursor request failed: {cursor_values:?}"
         );
         let current_cursor_fingerprint = view
@@ -3906,9 +3913,14 @@ mod tests {
         let hierarchy = view
             .root_value_current("store.real_hierarchy_page_result")
             .unwrap();
-        let Value::Record(hierarchy) = hierarchy else {
-            panic!("real hierarchy page is not a tagged record: {hierarchy:?}");
+        let Value::Tag {
+            tag,
+            fields: hierarchy,
+        } = hierarchy
+        else {
+            panic!("real hierarchy page is not a tag: {hierarchy:?}");
         };
+        assert_eq!(tag, "HierarchyPage");
         let Some(Value::List(hierarchy_rows)) = hierarchy.get("rows") else {
             panic!("real hierarchy page has no rows: {hierarchy:?}");
         };
@@ -4153,8 +4165,8 @@ document: Document/new(
             .root_value_current("store.real_waveform_asset")
             .unwrap();
         assert!(
-            matches!(&selected_asset, Value::Record(fields)
-            if fields.get("$tag") == Some(&Value::Text("PackageAsset".to_owned()))
+            matches!(&selected_asset, Value::Tag { tag, fields }
+            if tag == "PackageAsset"
                 && fields.get("url")
                     == Some(&Value::Text(
                         "asset://novywave/simple_test.ghw".to_owned()
@@ -4172,9 +4184,12 @@ document: Document/new(
                 let Value::Record(intent) = &invocation.intent else {
                     return None;
                 };
-                let Some(Value::Record(file)) = intent.get("file") else {
+                let Some(Value::Tag { tag, fields: file }) = intent.get("file") else {
                     return None;
                 };
+                if tag != "PackageAsset" {
+                    return None;
+                }
                 let Some(Value::Text(url)) = file.get("url") else {
                     return None;
                 };
@@ -4205,8 +4220,7 @@ document: Document/new(
             let value = view.root_value_current(path).unwrap();
             assert!(
                 matches!(&value,
-                    Value::Record(fields)
-                        if fields.get("$tag") == Some(&Value::Text(expected_tag.to_owned()))),
+                    Value::Tag { tag, .. } if tag == expected_tag),
                 "{path} did not reach {expected_tag}: {value:?}"
             );
         }
@@ -4291,9 +4305,7 @@ document: Document/new(
                     let value = view.root_value_current(path).unwrap();
                     assert!(
                         matches!(&value,
-                            Value::Record(fields)
-                                if fields.get("$tag")
-                                    == Some(&Value::Text(expected_tag.to_owned()))),
+                            Value::Tag { tag, .. } if tag == expected_tag),
                         "{path} did not reach {expected_tag}: {value:?}"
                     );
                 }
@@ -4427,9 +4439,14 @@ document: Document/new(
         let analog_page = view
             .root_value_current("store.real_signal_page_result")
             .unwrap();
-        let Value::Record(analog_page) = &analog_page else {
-            panic!("real analog signal page is not a record: {analog_page:?}");
+        let Value::Tag {
+            tag,
+            fields: analog_page,
+        } = &analog_page
+        else {
+            panic!("real analog signal page is not a tag: {analog_page:?}");
         };
+        assert_eq!(tag, "SignalPage");
         let has_real_value = analog_page
             .get("signals")
             .and_then(|signals| match signals {
@@ -4451,9 +4468,7 @@ document: Document/new(
                 matches!(transition,
                     Value::Record(transition)
                         if matches!(transition.get("value"),
-                            Some(Value::Record(value))
-                                if value.get("$tag")
-                                    == Some(&Value::Text("RealValue".to_owned()))))
+                            Some(Value::Tag { tag, .. }) if tag == "RealValue"))
             });
         assert!(has_real_value, "real VCD analog page contains no RealValue");
         assert!(view.retained_frame().nodes.values().any(|node| {

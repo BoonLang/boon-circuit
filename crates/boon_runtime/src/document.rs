@@ -5757,10 +5757,10 @@ mod tests {
 
     #[test]
     fn machine_tagged_values_keep_their_tag_and_payload_in_documents() {
-        let value = Value::Record(BTreeMap::from([
-            ("$tag".to_owned(), Value::Text("Found".to_owned())),
-            ("value".to_owned(), Value::Text("current".to_owned())),
-        ]));
+        let value = Value::tagged(
+            "Found",
+            BTreeMap::from([("value".to_owned(), Value::Text("current".to_owned()))]),
+        );
         let expected = EvalValue::Tag(
             "Found".to_owned(),
             BTreeMap::from([("value".to_owned(), EvalValue::Text("current".to_owned()))]),

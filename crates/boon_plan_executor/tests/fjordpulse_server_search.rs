@@ -483,15 +483,17 @@ fn fjordpulse_scale_access_matrix_is_bounded_across_58_500_rows() {
     let (first_page, first_metrics) = session
         .root_value_current_with_metrics("store.page")
         .expect("first station page must execute");
-    let Value::Record(first_page) = first_page else {
+    let Value::Tag {
+        tag,
+        fields: first_page,
+    } = first_page
+    else {
         panic!("station page must be structural")
     };
-    assert_eq!(first_page["$tag"], Value::Text("Page".to_owned()));
+    assert_eq!(tag, "Page");
     assert!(matches!(&first_page["items"], Value::List(items) if items.len() == 20));
     let next = first_page["next"].clone();
-    assert!(
-        matches!(&next, Value::Record(fields) if fields.get("$tag") == Some(&Value::Text("Cursor".to_owned())))
-    );
+    assert!(matches!(&next, Value::Tag { tag, .. } if tag == "Cursor"));
     assert_eq!(first_metrics.access_index_seek_count, 1);
     assert_eq!(first_metrics.access_candidate_count, 21);
     assert_eq!(first_metrics.access_full_scan_count, 0);

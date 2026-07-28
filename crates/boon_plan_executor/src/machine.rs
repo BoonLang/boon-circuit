@@ -27612,7 +27612,7 @@ fn compare_update_values(
 fn select_pattern_matches(pattern: &PlanRowSelectPattern, value: &Value) -> bool {
     match pattern {
         PlanRowSelectPattern::Tag { name } => {
-            matches!(value.visible(), Value::Tag { tag, fields } if tag == name && fields.is_empty())
+            matches!(value.visible(), Value::Tag { tag, .. } if tag == name)
         }
         PlanRowSelectPattern::Text { value: expected } => {
             value.visible() == &Value::Text(expected.clone())
@@ -28169,7 +28169,7 @@ pub(crate) fn project_value<'a>(value: &'a Value, field_path: &[String]) -> Opti
     let mut value = value;
     for field in field_path {
         value = match value {
-            Value::Record(fields) | Value::MappedRow { fields, .. } => {
+            Value::Record(fields) | Value::Tag { fields, .. } | Value::MappedRow { fields, .. } => {
                 runtime_string_map_get(fields, field)?
             }
             _ => return None,

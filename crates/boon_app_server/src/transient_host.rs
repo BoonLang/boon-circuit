@@ -1063,10 +1063,10 @@ outputs: [
             panic!("random effect must return one single-result event");
         };
         assert_eq!(completed, call_id);
-        let Value::Record(fields) = &outcome else {
+        let Value::Tag { tag, .. } = &outcome else {
             panic!("random outcome must be tagged");
         };
-        assert_eq!(fields["$tag"], Value::Text("RandomBytesReady".to_owned()));
+        assert_eq!(tag, "RandomBytesReady");
         program.complete_transient_effect(call_id, outcome).unwrap();
         assert_eq!(program.pending_transient_effect_count(), 0);
     }
@@ -1125,10 +1125,7 @@ outputs: [
             };
             assert_eq!(completed, call_id);
             let tag = match &outcome {
-                Value::Record(fields) => match &fields["$tag"] {
-                    Value::Text(tag) => tag.clone(),
-                    _ => panic!("file event tag must be Text"),
-                },
+                Value::Tag { tag, .. } => tag.clone(),
                 _ => panic!("file event must be tagged"),
             };
             let turn = program

@@ -1679,11 +1679,8 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
     session.apply(event(&session, 1, 0, None)).unwrap();
 
     let rows = &session.snapshot().unwrap().lists[&ListId(0)];
-    assert_eq!(rows[0].fields[&FieldId(11)], Value::Text("Binary".into()));
-    assert_eq!(
-        rows[1].fields[&FieldId(11)],
-        Value::Text("Hexadecimal".into())
-    );
+    assert_eq!(rows[0].fields[&FieldId(11)], Value::tag("Binary"));
+    assert_eq!(rows[1].fields[&FieldId(11)], Value::tag("Hexadecimal"));
 }
 
 #[test]
@@ -3019,7 +3016,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         &items[0],
         Value::Record(fields) if fields.get("rank") == Some(&number(2))
     ));
-    assert!(matches!(next, Value::Record(_)));
+    assert!(matches!(&next, Value::Tag { tag, .. } if tag == "Cursor"));
     assert_eq!(page_metrics.access_index_seek_count, 1);
     assert_eq!(page_metrics.access_full_scan_count, 0);
     assert_eq!(page_metrics.access_candidate_count, 2);
@@ -3112,7 +3109,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
             if fields.get("label") == Some(&Value::Text("Alpha".to_owned()))
                 && fields.get("score") == Some(&number(3))
     ));
-    assert!(matches!(next, Value::Record(_)));
+    assert!(matches!(&next, Value::Tag { tag, .. } if tag == "Cursor"));
     assert_eq!(page_metrics.access_index_seek_count, 1);
     assert_eq!(page_metrics.access_candidate_count, 2);
     assert_eq!(page_metrics.access_full_scan_count, 0);
@@ -3275,7 +3272,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     let (page, first_metrics) = first.root_value_current_with_metrics("store.page").unwrap();
     let (first_items, cursor) = page_parts(page);
     assert_eq!(page_names(&first_items), ["Gamma"]);
-    assert!(matches!(cursor, Value::Record(_)));
+    assert!(matches!(&cursor, Value::Tag { tag, .. } if tag == "Cursor"));
     assert_eq!(first_metrics.access_index_seek_count, 1);
     assert_eq!(first_metrics.access_candidate_count, 2);
     assert_eq!(first_metrics.access_full_scan_count, 0);
@@ -3287,7 +3284,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .unwrap();
     let (second_items, end) = page_parts(page);
     assert_eq!(page_names(&second_items), ["Alpha"]);
-    assert_eq!(end, Value::Text("End".to_owned()));
+    assert_eq!(end, Value::tag("End"));
     assert_eq!(second_metrics.access_cursor_seek_count, 1);
     assert_eq!(second_metrics.access_candidate_count, 1);
     assert_eq!(second_metrics.access_full_scan_count, 0);
@@ -3318,7 +3315,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     let (page, first_metrics) = first.root_value_current_with_metrics("store.page").unwrap();
     let (first_items, cursor) = page_parts(page);
     assert_eq!(first_items, vec![number(3), number(1)]);
-    assert!(matches!(cursor, Value::Record(_)));
+    assert!(matches!(&cursor, Value::Tag { tag, .. } if tag == "Cursor"));
     assert_eq!(first_metrics.access_index_seek_count, 0);
     assert_eq!(first_metrics.access_candidate_count, 0);
     assert_eq!(first_metrics.access_full_scan_count, 0);
@@ -3332,7 +3329,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .unwrap();
     let (second_items, end) = page_parts(page);
     assert_eq!(second_items, vec![number(2)]);
-    assert_eq!(end, Value::Text("End".to_owned()));
+    assert_eq!(end, Value::tag("End"));
     assert_eq!(second_metrics.access_index_seek_count, 0);
     assert_eq!(second_metrics.access_candidate_count, 0);
     assert_eq!(second_metrics.access_full_scan_count, 0);
@@ -3371,7 +3368,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     let (page, first_metrics) = first.root_value_current_with_metrics("store.page").unwrap();
     let (first_items, cursor) = page_parts(page);
     assert_eq!(page_names(&first_items), ["Alpha"]);
-    assert!(matches!(cursor, Value::Record(_)));
+    assert!(matches!(&cursor, Value::Tag { tag, .. } if tag == "Cursor"));
     assert_eq!(first_metrics.access_index_seek_count, 1);
     assert_eq!(first_metrics.access_candidate_count, 2);
     assert_eq!(first_metrics.access_full_scan_count, 0);
@@ -3382,7 +3379,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     let mut second = MachineInstance::new(second_plan, options).unwrap();
     let (second_items, end) = page_parts(second.root_value_current("store.page").unwrap());
     assert_eq!(page_names(&second_items), ["Gamma"]);
-    assert_eq!(end, Value::Text("End".to_owned()));
+    assert_eq!(end, Value::tag("End"));
 }
 
 #[test]
@@ -3444,7 +3441,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .unwrap();
     assert_eq!(
         changed.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 }
 
@@ -3733,7 +3730,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     let (resized_items, resized_next) =
         page_parts(resized.root_value_current("store.page").unwrap());
     assert_eq!(page_names(&resized_items), ["Charlie"]);
-    assert!(matches!(resized_next, Value::Record(_)));
+    assert!(matches!(&resized_next, Value::Tag { tag, .. } if tag == "Cursor"));
 
     let mut wrong_scope = MachineInstanceBuilder::new(
         cursor_plan.clone(),
@@ -3749,7 +3746,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     .unwrap();
     assert_eq!(
         wrong_scope.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 
     let mut wrong_principal = MachineInstanceBuilder::new(
@@ -3769,7 +3766,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     .unwrap();
     assert_eq!(
         wrong_principal.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 
     let mut second = MachineInstanceBuilder::new(cursor_plan.clone(), options.clone())
@@ -3821,16 +3818,17 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .unwrap();
     assert_eq!(
         second.root_value_current("store.page").unwrap(),
-        Value::Text("PageExpired".to_owned())
+        Value::tag("PageExpired")
     );
     second.rollback_unsettled_turn().unwrap();
     let (rolled_back_items, _) = page_parts(second.root_value_current("store.page").unwrap());
     assert_eq!(page_names(&rolled_back_items), ["Charlie", "Delta"]);
 
     let mut tampered = first_next;
-    let Value::Record(fields) = &mut tampered else {
-        panic!("page cursor must be a record");
+    let Value::Tag { tag, fields } = &mut tampered else {
+        panic!("page cursor must be a tag");
     };
+    assert_eq!(tag, "Cursor");
     let Value::Bytes(bytes) = fields.get_mut("value").expect("cursor bytes") else {
         panic!("cursor value must be BYTES");
     };
@@ -3847,7 +3845,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .unwrap();
     assert_eq!(
         tampered_session.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 }
 
@@ -3947,7 +3945,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
             .unwrap();
         assert_eq!(
             session.root_value_current("store.page").unwrap(),
-            Value::Text("InvalidPageSize".to_owned()),
+            Value::tag("InvalidPageSize"),
             "dynamic size {invalid}"
         );
     }
@@ -3986,7 +3984,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     )
     .unwrap();
     let (value, metrics) = root_field_current_with_metrics(&mut limited, "store.page");
-    assert_eq!(value, Value::Text("PageWorkLimitExceeded".to_owned()));
+    assert_eq!(value, Value::tag("PageWorkLimitExceeded"));
     assert_eq!(metrics.access_work_limit_failure_count, 1);
     assert_eq!(metrics.access_full_scan_count, 0);
 }
@@ -4038,14 +4036,14 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         .unwrap();
     let (second_items, second_next) = page_parts(second.root_value_current("store.page").unwrap());
     assert_eq!(page_names(&second_items), ["Charlie"]);
-    assert_eq!(second_next, Value::Text("End".to_owned()));
+    assert_eq!(second_next, Value::tag("End"));
 
     let changed_take_plan = plan_with_page_position(compile(4).plan, first_next);
     verify_plan(&changed_take_plan).unwrap();
     let mut changed_take = MachineInstance::new(changed_take_plan, options).unwrap();
     assert_eq!(
         changed_take.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 }
 
@@ -4093,7 +4091,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
     let mut second = MachineInstance::new(changed, options).unwrap();
     assert_eq!(
         second.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 }
 
@@ -4230,7 +4228,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         .unwrap();
     assert_eq!(
         changed_capture.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 
     let descending_plan = plan_with_page_position(compile("Descending").plan, cursor);
@@ -4238,7 +4236,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
     let mut descending = MachineInstance::new(descending_plan, options).unwrap();
     assert_eq!(
         descending.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 
     let mut noncanonical = cursor_plan;
@@ -4311,7 +4309,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     assert_eq!(turn.metrics.ordered_index_full_rebuild_count, 0);
     assert_eq!(
         continued.root_value_current("store.page").unwrap(),
-        Value::Text("InvalidPageCursor".to_owned())
+        Value::tag("InvalidPageCursor")
     );
 }
 
@@ -4370,7 +4368,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     let (restored_items, restored_next) =
         page_parts(restored.root_value_current("store.page").unwrap());
     assert_eq!(page_names(&restored_items), ["Charlie"]);
-    assert_eq!(restored_next, Value::Text("End".to_owned()));
+    assert_eq!(restored_next, Value::tag("End"));
 }
 
 fn root_field_current_with_metrics(
@@ -4381,14 +4379,14 @@ fn root_field_current_with_metrics(
 }
 
 fn page_parts(value: Value) -> (Vec<Value>, Value) {
-    let Value::Record(mut page) = value else {
-        panic!("page result must be a record");
+    let Value::Tag { tag, mut fields } = value else {
+        panic!("page result must be a tag");
     };
-    assert_eq!(page.remove("$tag"), Some(Value::Text("Page".to_owned())));
-    let Some(Value::List(items)) = page.remove("items") else {
+    assert_eq!(tag, "Page");
+    let Some(Value::List(items)) = fields.remove("items") else {
         panic!("Page.items must be a typed LIST");
     };
-    let next = page.remove("next").expect("Page.next");
+    let next = fields.remove("next").expect("Page.next");
     (items, next)
 }
 
@@ -5656,7 +5654,7 @@ fn default_stack_deep_typed_list_pages_do_not_nest_evaluator_transactions() {
         panic!("deep typed page must contain one materialized record");
     };
     assert_eq!(item["rank"], number((DEPTH - 1) as i64));
-    assert!(matches!(next, Value::Record(_)));
+    assert!(matches!(&next, Value::Tag { tag, .. } if tag == "Cursor"));
 }
 
 fn projected_chunk_slot(list: usize, label_field: usize, items_field: usize) -> ListStorageSlot {
@@ -7576,13 +7574,7 @@ fn file_stream_payload() -> SourcePayload {
     SourcePayload {
         fields: BTreeMap::from([(
             "file".to_owned(),
-            Value::host_bound(
-                Value::Record(BTreeMap::from([(
-                    "$tag".to_owned(),
-                    Value::Text("FileSelected".to_owned()),
-                )])),
-                binding,
-            ),
+            Value::host_bound(Value::tag("FileSelected"), binding),
         )]),
         ..SourcePayload::default()
     }
@@ -7602,41 +7594,32 @@ fn host_value_issuers_isolate_bindings_and_fully_redact_debug_output() {
 }
 
 #[test]
-fn host_bound_projection_preserves_authority_without_exposing_the_facade() {
+fn host_bound_projection_preserves_authority_without_exposing_a_fake_tag_field() {
     let binding = HostValueIssuer::new([1; 32]).mint([2; 32], 1).unwrap();
-    let value = Value::host_bound(
-        Value::Record(BTreeMap::from([(
-            "$tag".to_owned(),
-            Value::Text("FileSelected".to_owned()),
-        )])),
-        binding,
-    );
+    let value = Value::host_bound(Value::tag("FileSelected"), binding);
     let enclosing = Value::Record(BTreeMap::from([("file".to_owned(), value.clone())]));
-    let tag = vec!["$tag".to_owned()];
+    let fake_tag_field = vec!["tag".to_owned()];
     let file = vec!["file".to_owned()];
-    let nested_tag = vec!["file".to_owned(), "$tag".to_owned()];
+    let nested_fake_tag_field = vec!["file".to_owned(), "tag".to_owned()];
 
     assert!(value.host_binding().is_some());
     assert!(value.contains_host_binding());
     assert_eq!(crate::machine::project_value(&value, &[]), Some(&value));
-    assert_eq!(crate::machine::project_value(&value, &tag), None);
+    assert_eq!(crate::machine::project_value(&value, &fake_tag_field), None);
     assert_eq!(
         crate::machine::project_value(&enclosing, &file),
         Some(&value)
     );
-    assert_eq!(crate::machine::project_value(&enclosing, &nested_tag), None);
+    assert_eq!(
+        crate::machine::project_value(&enclosing, &nested_fake_tag_field),
+        None
+    );
 }
 
 #[test]
 fn inspection_reports_hide_nested_bindings_while_boundaries_fail_closed() {
     let binding = HostValueIssuer::new([4; 32]).mint([5; 32], 9).unwrap();
-    let bound = Value::host_bound(
-        Value::Record(BTreeMap::from([(
-            "$tag".to_owned(),
-            Value::Text("FileSelected".to_owned()),
-        )])),
-        binding,
-    );
+    let bound = Value::host_bound(Value::tag("FileSelected"), binding);
     let value = Value::Record(BTreeMap::from([(
         "nested".to_owned(),
         Value::List(vec![bound.clone()]),
@@ -7791,21 +7774,21 @@ fn file_stream_outcome(
     tag: &str,
     fields: impl IntoIterator<Item = (&'static str, Value)>,
 ) -> Value {
-    let mut record = BTreeMap::from([("$tag".to_owned(), Value::Text(tag.to_owned()))]);
-    record.extend(
+    Value::tagged(
+        tag,
         fields
             .into_iter()
-            .map(|(name, value)| (name.to_owned(), value)),
-    );
-    Value::Record(record)
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    )
 }
 
 fn retained_content_outcome(tag: &str, content: Option<Value>) -> Value {
-    let mut fields = BTreeMap::from([("$tag".to_owned(), Value::Text(tag.to_owned()))]);
+    let mut fields = BTreeMap::new();
     if let Some(content) = content {
         fields.insert("content".to_owned(), content);
     }
-    Value::Record(fields)
+    Value::tagged(tag, fields)
 }
 
 fn content_ref_value() -> Value {
@@ -7823,7 +7806,7 @@ fn outbound_http_payload() -> SourcePayload {
     SourcePayload {
         fields: BTreeMap::from([
             ("endpoint".to_owned(), Value::Text("catalog".to_owned())),
-            ("method".to_owned(), Value::Text("Get".to_owned())),
+            ("method".to_owned(), Value::tag("Get")),
             (
                 "path_segments".to_owned(),
                 Value::List(vec![
@@ -7857,26 +7840,28 @@ fn outbound_http_payload() -> SourcePayload {
 }
 
 fn outbound_http_success(status: i64) -> Value {
-    Value::Record(BTreeMap::from([
-        ("$tag".to_owned(), Value::Text("HttpSucceeded".to_owned())),
-        ("endpoint".to_owned(), Value::Text("catalog".to_owned())),
-        ("status".to_owned(), number(status)),
-        (
-            "headers".to_owned(),
-            Value::List(vec![Value::Record(BTreeMap::from([
-                ("name".to_owned(), Value::Text("content-type".to_owned())),
-                (
-                    "value".to_owned(),
-                    Value::Bytes(b"application/json".to_vec().into()),
-                ),
-            ]))]),
-        ),
-        (
-            "body".to_owned(),
-            Value::Bytes(br#"{"ok":true}"#.to_vec().into()),
-        ),
-        ("redirects_followed".to_owned(), number(0)),
-    ]))
+    Value::tagged(
+        "HttpSucceeded",
+        BTreeMap::from([
+            ("endpoint".to_owned(), Value::Text("catalog".to_owned())),
+            ("status".to_owned(), number(status)),
+            (
+                "headers".to_owned(),
+                Value::List(vec![Value::Record(BTreeMap::from([
+                    ("name".to_owned(), Value::Text("content-type".to_owned())),
+                    (
+                        "value".to_owned(),
+                        Value::Bytes(b"application/json".to_vec().into()),
+                    ),
+                ]))]),
+            ),
+            (
+                "body".to_owned(),
+                Value::Bytes(br#"{"ok":true}"#.to_vec().into()),
+            ),
+            ("redirects_followed".to_owned(), number(0)),
+        ]),
+    )
 }
 
 #[test]
@@ -7957,14 +7942,16 @@ store: [
                 ),
             ]))
         };
-        Value::Record(BTreeMap::from([
-            ("$tag".to_owned(), Value::Text("HttpSucceeded".to_owned())),
-            ("endpoint".to_owned(), Value::Text("catalog".to_owned())),
-            ("status".to_owned(), number(200)),
-            ("headers".to_owned(), Value::List(vec![header(), header()])),
-            ("body".to_owned(), Value::Bytes(Vec::new().into())),
-            ("redirects_followed".to_owned(), number(0)),
-        ]))
+        Value::tagged(
+            "HttpSucceeded",
+            BTreeMap::from([
+                ("endpoint".to_owned(), Value::Text("catalog".to_owned())),
+                ("status".to_owned(), number(200)),
+                ("headers".to_owned(), Value::List(vec![header(), header()])),
+                ("body".to_owned(), Value::Bytes(Vec::new().into())),
+                ("redirects_followed".to_owned(), number(0)),
+            ]),
+        )
     };
     session
         .complete_transient_effect(request_call.call_id, response(b"v1"))
@@ -8385,11 +8372,13 @@ fn effect_completion_triggers_the_next_effect_even_when_the_value_repeats() {
         .find(|effect| effect.host_operation == "Random/bytes")
         .unwrap()
         .effect_id;
-    let wall_result = Value::Record(BTreeMap::from([
-        ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
-        ("unix_seconds".to_owned(), number(1_700_000_000)),
-        ("nanoseconds".to_owned(), number(123)),
-    ]));
+    let wall_result = Value::tagged(
+        "WallClockRead",
+        BTreeMap::from([
+            ("unix_seconds".to_owned(), number(1_700_000_000)),
+            ("nanoseconds".to_owned(), number(123)),
+        ]),
+    );
     let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
 
     for sequence in 1..=2 {
@@ -8415,16 +8404,13 @@ fn effect_completion_triggers_the_next_effect_even_when_the_value_repeats() {
         session
             .complete_transient_effect(
                 random.call_id,
-                Value::Record(BTreeMap::from([
-                    (
-                        "$tag".to_owned(),
-                        Value::Text("RandomBytesReady".to_owned()),
-                    ),
-                    (
+                Value::tagged(
+                    "RandomBytesReady",
+                    BTreeMap::from([(
                         "bytes".to_owned(),
                         Value::Bytes(vec![sequence as u8; 16].into()),
-                    ),
-                ])),
+                    )]),
+                ),
             )
             .unwrap();
     }
@@ -8443,17 +8429,16 @@ fn effect_completion_triggers_the_next_effect_even_when_the_value_repeats() {
     let failure = session
         .complete_transient_effect(
             clock.call_id,
-            Value::Record(BTreeMap::from([
-                (
-                    "$tag".to_owned(),
-                    Value::Text("HostServiceFailed".to_owned()),
-                ),
-                ("code".to_owned(), Value::Text("clock_failed".to_owned())),
-                (
-                    "diagnostic".to_owned(),
-                    Value::Text("clock unavailable".to_owned()),
-                ),
-            ])),
+            Value::tagged(
+                "HostServiceFailed",
+                BTreeMap::from([
+                    ("code".to_owned(), Value::Text("clock_failed".to_owned())),
+                    (
+                        "diagnostic".to_owned(),
+                        Value::Text("clock unavailable".to_owned()),
+                    ),
+                ]),
+            ),
         )
         .unwrap();
     assert!(failure.transient_effects.is_empty());
@@ -8550,11 +8535,13 @@ store: [
     session
         .complete_transient_effect(
             clock.call_id,
-            Value::Record(BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
-                ("unix_seconds".to_owned(), number(1_700_000_000)),
-                ("nanoseconds".to_owned(), number(123)),
-            ])),
+            Value::tagged(
+                "WallClockRead",
+                BTreeMap::from([
+                    ("unix_seconds".to_owned(), number(1_700_000_000)),
+                    ("nanoseconds".to_owned(), number(123)),
+                ]),
+            ),
         )
         .unwrap();
     assert_eq!(
@@ -8642,11 +8629,13 @@ FUNCTION selectable_row(seed_row) {
     session
         .complete_transient_effect(
             clock.call_id,
-            Value::Record(BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
-                ("unix_seconds".to_owned(), number(1_700_000_000)),
-                ("nanoseconds".to_owned(), number(123)),
-            ])),
+            Value::tagged(
+                "WallClockRead",
+                BTreeMap::from([
+                    ("unix_seconds".to_owned(), number(1_700_000_000)),
+                    ("nanoseconds".to_owned(), number(123)),
+                ]),
+            ),
         )
         .unwrap();
 
@@ -8734,11 +8723,13 @@ store: [
     let completed = session
         .complete_transient_effect(
             clock.call_id,
-            Value::Record(BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
-                ("unix_seconds".to_owned(), number(1_700_000_000)),
-                ("nanoseconds".to_owned(), number(123)),
-            ])),
+            Value::tagged(
+                "WallClockRead",
+                BTreeMap::from([
+                    ("unix_seconds".to_owned(), number(1_700_000_000)),
+                    ("nanoseconds".to_owned(), number(123)),
+                ]),
+            ),
         )
         .unwrap();
 
@@ -9049,11 +9040,13 @@ store: [
     let first = session
         .complete_transient_effect(
             clock.call_id,
-            Value::Record(BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
-                ("unix_seconds".to_owned(), number(1_700_000_000)),
-                ("nanoseconds".to_owned(), number(123)),
-            ])),
+            Value::tagged(
+                "WallClockRead",
+                BTreeMap::from([
+                    ("unix_seconds".to_owned(), number(1_700_000_000)),
+                    ("nanoseconds".to_owned(), number(123)),
+                ]),
+            ),
         )
         .unwrap();
     let [first_random] = first.transient_effects.as_slice() else {
@@ -9067,13 +9060,10 @@ store: [
     session
         .complete_transient_effect(
             first_random_call,
-            Value::Record(BTreeMap::from([
-                (
-                    "$tag".to_owned(),
-                    Value::Text("RandomBytesReady".to_owned()),
-                ),
-                ("bytes".to_owned(), Value::Bytes(vec![1; 4].into())),
-            ])),
+            Value::tagged(
+                "RandomBytesReady",
+                BTreeMap::from([("bytes".to_owned(), Value::Bytes(vec![1; 4].into()))]),
+            ),
         )
         .unwrap();
 
@@ -9230,8 +9220,7 @@ fn stream_effect_delivery_is_ordered_bounded_terminal_and_replaced_by_owner() {
     );
     assert!(matches!(
         session.root_value_current("store.stream_result").unwrap(),
-        Value::Record(fields)
-            if fields.get("$tag") == Some(&Value::Text("Opened".to_owned()))
+        Value::Tag { tag, .. } if tag == "Opened"
     ));
 
     let chunk = session
@@ -9819,9 +9808,10 @@ store: [
         let Value::Record(intent) = intent else {
             panic!("effect intent is not a record: {intent:?}");
         };
-        let Some(Value::Record(file)) = intent.get("file") else {
-            panic!("effect intent has no file record: {intent:?}");
+        let Some(Value::Tag { tag, fields: file }) = intent.get("file") else {
+            panic!("effect intent has no file tag: {intent:?}");
         };
+        assert_eq!(tag, "PackageAsset");
         let Some(Value::Text(url)) = file.get("url") else {
             panic!("effect file has no URL: {file:?}");
         };
@@ -9959,9 +9949,10 @@ store: [
         let Value::Record(intent) = intent else {
             panic!("effect intent is not a record: {intent:?}");
         };
-        let Some(Value::Record(file)) = intent.get("file") else {
-            panic!("effect intent has no file record: {intent:?}");
+        let Some(Value::Tag { tag, fields: file }) = intent.get("file") else {
+            panic!("effect intent has no file tag: {intent:?}");
         };
+        assert_eq!(tag, "PackageAsset");
         let Some(Value::Text(url)) = file.get("url") else {
             panic!("effect file has no URL: {file:?}");
         };
@@ -10138,13 +10129,10 @@ store: [
     session
         .complete_transient_effect(
             first.call_id,
-            Value::Record(BTreeMap::from([
-                (
-                    "$tag".to_owned(),
-                    Value::Text("RandomBytesReady".to_owned()),
-                ),
-                ("bytes".to_owned(), Value::Bytes(vec![7].into())),
-            ])),
+            Value::tagged(
+                "RandomBytesReady",
+                BTreeMap::from([("bytes".to_owned(), Value::Bytes(vec![7].into()))]),
+            ),
         )
         .unwrap();
 
@@ -10409,8 +10397,7 @@ fn mapped_source_row_does_not_become_the_root_effect_result_owner() {
         .unwrap();
     assert!(matches!(
         session.root_value_current("store.stream_result").unwrap(),
-        Value::Record(fields)
-            if fields.get("$tag") == Some(&Value::Text("Opened".to_owned()))
+        Value::Tag { tag, .. } if tag == "Opened"
     ));
 }
 
@@ -10844,7 +10831,7 @@ fn correlated_effect_completion_rejects_wrong_variant_and_shape_atomically() {
         .unwrap();
     assert_eq!(
         session.snapshot().unwrap().states[&state_id(&machine, "store.last_result")],
-        Value::Text("RegistrationCancelled".to_owned())
+        Value::tag("RegistrationCancelled")
     );
 }
 
@@ -10967,7 +10954,7 @@ fn reconciliation_completion_routes_result_after_session_restart() {
     let snapshot = restored.snapshot().unwrap();
     assert_eq!(
         snapshot.states[&state_id(&machine, "store.last_result")],
-        Value::Text("RegistrationSucceeded".to_owned())
+        Value::tag("RegistrationSucceeded")
     );
     assert_eq!(
         snapshot.states[&state_id(&machine, "store.result_account_id")],

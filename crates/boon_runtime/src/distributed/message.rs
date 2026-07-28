@@ -41,7 +41,7 @@ pub struct DistributedMessage {
 /// let _ = DistributedMessagePayload::Event {
 ///     export_id: ExportId([0; 32]),
 ///     sequence: 1,
-///     value: Value::Null,
+///     value: Value::tag("RuntimeOnly"),
 /// };
 /// ```
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]

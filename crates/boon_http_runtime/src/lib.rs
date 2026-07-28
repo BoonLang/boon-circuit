@@ -323,7 +323,7 @@ fn decode_intent(value: &Value) -> Result<DecodedIntent, Failure> {
             "endpoint capability name is invalid",
         )
     })?;
-    let method = match text_field(fields, "method")? {
+    let method = match bare_tag_field(fields, "method")? {
         "Get" => HttpMethod::Get,
         "Head" => HttpMethod::Head,
         "Post" => HttpMethod::Post,
@@ -598,9 +598,8 @@ fn limit_code(kind: LimitKind) -> &'static str {
     }
 }
 
-fn tagged(tag: &str, mut fields: BTreeMap<String, Value>) -> Value {
-    fields.insert("$tag".to_owned(), Value::Text(tag.to_owned()));
-    Value::Record(fields)
+fn tagged(tag: &str, fields: BTreeMap<String, Value>) -> Value {
+    Value::tagged(tag, fields)
 }
 
 fn number(value: i64) -> Value {
@@ -664,6 +663,17 @@ fn text_field<'a>(fields: &'a BTreeMap<String, Value>, name: &str) -> Result<&'a
             "unresolved",
             "invalid_intent",
             "outbound HTTP text field has the wrong type",
+        )),
+    }
+}
+
+fn bare_tag_field<'a>(fields: &'a BTreeMap<String, Value>, name: &str) -> Result<&'a str, Failure> {
+    match fields.get(name) {
+        Some(Value::Tag { tag, fields }) if fields.is_empty() => Ok(tag),
+        _ => Err(Failure::invalid(
+            "unresolved",
+            "invalid_intent",
+            "outbound HTTP tag field has the wrong type",
         )),
     }
 }

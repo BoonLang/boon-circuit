@@ -2000,18 +2000,20 @@ fn session_owns_and_completes_its_transient_effects() {
     session
         .complete_transient_effect(
             invocation.call_id,
-            Value::Record(std::collections::BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
-                ("unix_seconds".to_owned(), Value::integer(123).unwrap()),
-                ("nanoseconds".to_owned(), Value::integer(0).unwrap()),
-            ])),
+            Value::tagged(
+                "WallClockRead",
+                std::collections::BTreeMap::from([
+                    ("unix_seconds".to_owned(), Value::integer(123).unwrap()),
+                    ("nanoseconds".to_owned(), Value::integer(0).unwrap()),
+                ]),
+            ),
         )
         .unwrap();
     assert_eq!(session.pending_transient_effect_count(), 0);
     assert!(matches!(
         session.root_value_current("store.clock_result").unwrap(),
-        Value::Record(fields)
-            if fields.get("$tag") == Some(&Value::Text("WallClockRead".to_owned()))
+        Value::Tag { tag, fields }
+            if tag == "WallClockRead"
                 && fields.get("unix_seconds") == Some(&Value::integer(123).unwrap())
     ));
 }
@@ -2076,11 +2078,13 @@ fn server_effect_completion_returns_to_its_origin_session() {
         .bind(&mut runtime.server_machine)
         .complete_transient_effect(
             invocation.call_id,
-            Value::Record(std::collections::BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
-                ("unix_seconds".to_owned(), Value::integer(456).unwrap()),
-                ("nanoseconds".to_owned(), Value::integer(0).unwrap()),
-            ])),
+            Value::tagged(
+                "WallClockRead",
+                std::collections::BTreeMap::from([
+                    ("unix_seconds".to_owned(), Value::integer(456).unwrap()),
+                    ("nanoseconds".to_owned(), Value::integer(0).unwrap()),
+                ]),
+            ),
         )
         .unwrap();
     runtime.deliver_server(update);
@@ -2170,11 +2174,13 @@ fn origin_effect_completion_routes_each_nested_invocation_once() {
         .bind(&mut runtime.server_machine)
         .complete_transient_effect(
             effect.call_id,
-            Value::Record(BTreeMap::from([
-                ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
-                ("unix_seconds".to_owned(), Value::integer(789).unwrap()),
-                ("nanoseconds".to_owned(), Value::integer(0).unwrap()),
-            ])),
+            Value::tagged(
+                "WallClockRead",
+                BTreeMap::from([
+                    ("unix_seconds".to_owned(), Value::integer(789).unwrap()),
+                    ("nanoseconds".to_owned(), Value::integer(0).unwrap()),
+                ]),
+            ),
         )
         .unwrap();
     let nested = update

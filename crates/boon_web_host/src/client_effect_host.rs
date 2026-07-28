@@ -535,13 +535,10 @@ scene: Scene/Element/text(
         runtime
             .complete_transient_effect(
                 invocation.call_id,
-                Value::Record(BTreeMap::from([
-                    (
-                        "$tag".to_owned(),
-                        Value::Text("RandomBytesReady".to_owned()),
-                    ),
-                    ("bytes".to_owned(), Value::Bytes(vec![42].into())),
-                ])),
+                Value::tagged(
+                    "RandomBytesReady",
+                    BTreeMap::from([("bytes".to_owned(), Value::Bytes(vec![42].into()))]),
+                ),
             )
             .unwrap();
         assert_eq!(

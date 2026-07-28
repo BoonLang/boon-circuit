@@ -48,7 +48,7 @@ fn request_payload(endpoint: &str) -> SourcePayload {
     SourcePayload {
         fields: BTreeMap::from([
             ("endpoint".to_owned(), Value::Text(endpoint.to_owned())),
-            ("method".to_owned(), Value::Text("Get".to_owned())),
+            ("method".to_owned(), Value::tag("Get")),
             (
                 "path_segments".to_owned(),
                 Value::List(vec![
@@ -163,10 +163,14 @@ async fn compiled_boon_effect_uses_real_loopback_and_typed_correlated_completion
     );
 
     let completion = adapter.next_completion().await.unwrap();
-    let Value::Record(outcome) = &completion.outcome else {
-        panic!("HTTP completion must be a typed variant record");
+    let Value::Tag {
+        tag,
+        fields: outcome,
+    } = &completion.outcome
+    else {
+        panic!("HTTP completion must be a typed tag");
     };
-    assert_eq!(outcome["$tag"], Value::Text("HttpSucceeded".to_owned()));
+    assert_eq!(tag, "HttpSucceeded");
     assert_eq!(outcome["status"], number(207));
     assert!(
         matches!(&outcome["body"], Value::Bytes(bytes) if bytes.as_ref() == br#"{"items":[1]}"#)
@@ -214,10 +218,14 @@ async fn transport_failure_is_typed_bounded_and_does_not_echo_request_secrets() 
     apply_submission(&mut program, submission).unwrap();
 
     let completion = adapter.next_completion().await.unwrap();
-    let Value::Record(outcome) = &completion.outcome else {
-        panic!("HTTP failure must be a typed variant record");
+    let Value::Tag {
+        tag,
+        fields: outcome,
+    } = &completion.outcome
+    else {
+        panic!("HTTP failure must be a typed tag");
     };
-    assert_eq!(outcome["$tag"], Value::Text("HttpFailed".to_owned()));
+    assert_eq!(tag, "HttpFailed");
     assert_eq!(
         outcome["endpoint"],
         Value::Text("not-configured".to_owned())

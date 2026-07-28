@@ -501,11 +501,11 @@ fn execute_action(
 }
 
 fn page_next(value: Value) -> Result<Value, String> {
-    let Value::Record(mut fields) = value else {
-        return Err("cursor-page target is not a Page record".to_owned());
+    let Value::Tag { tag, mut fields } = value else {
+        return Err("cursor-page target is not a Page tag".to_owned());
     };
-    if fields.remove("$tag") != Some(Value::Text("Page".to_owned())) {
-        return Err("cursor-page target does not carry the Page tag".to_owned());
+    if tag != "Page" {
+        return Err(format!("cursor-page target carries the `{tag}` tag"));
     }
     fields
         .remove("next")

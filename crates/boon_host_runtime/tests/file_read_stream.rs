@@ -127,8 +127,8 @@ fn adapter(registry: FileCapabilityRegistry) -> FileEffectAdapter {
 }
 
 fn fields(event: &FileEffectEvent) -> &BTreeMap<String, Value> {
-    let Value::Record(fields) = &event.outcome else {
-        panic!("stream outcome must be a tagged record");
+    let Value::Tag { fields, .. } = &event.outcome else {
+        panic!("stream outcome must be a tag");
     };
     fields
 }
@@ -138,13 +138,14 @@ fn variant<'a>(
     name: &str,
     expected_tag: &str,
 ) -> &'a BTreeMap<String, Value> {
-    let Value::Record(variant) = &fields[name] else {
-        panic!("{name} must be a tagged record");
+    let Value::Tag {
+        tag,
+        fields: variant,
+    } = &fields[name]
+    else {
+        panic!("{name} must be a tag");
     };
-    assert_eq!(
-        variant.get("$tag"),
-        Some(&Value::Text(expected_tag.to_owned()))
-    );
+    assert_eq!(tag, expected_tag);
     variant
 }
 
@@ -324,10 +325,7 @@ async fn forged_and_foreign_file_selections_fail_closed() {
     assert_eq!(text(fields(&foreign_failure), "code"), "unknown_capability");
     apply_event(&mut program, &mut adapter, foreign_failure).unwrap();
 
-    let forged = Value::Record(BTreeMap::from([(
-        "$tag".to_owned(),
-        Value::Text("FileSelected".to_owned()),
-    )]));
+    let forged = Value::tag("FileSelected");
     let forged_invocation = invocation(&mut program, forged);
     assert!(adapter.submit(forged_invocation).unwrap().queued_terminal);
     let forged_failure = adapter.next_event().await.unwrap();
@@ -379,7 +377,7 @@ async fn nonretained_stream_finishes_without_advertising_unresolvable_content() 
         let terminal = event.is_terminal();
         if event.result_tag() == Some("Finished") {
             let retained = variant(fields(&event), "retained", "NotRetained");
-            assert_eq!(retained.len(), 1);
+            assert!(retained.is_empty());
         }
         apply_event(&mut program, &mut adapter, event).unwrap();
         if terminal {
@@ -441,11 +439,11 @@ fn file_capability_is_hidden_from_ordinary_boon_data() {
     let capability = registry.register_file(selected_file.path()).unwrap();
     let selected = capability.file_selected_value();
     assert!(selected.host_binding().is_some());
-    let Value::Record(visible) = selected.visible() else {
-        panic!("visible selection must remain a structural tag");
+    let Value::Tag { tag, fields } = selected.visible() else {
+        panic!("visible selection must remain a tag");
     };
-    assert_eq!(visible.len(), 1);
-    assert_eq!(visible["$tag"], Value::Text("FileSelected".to_owned()));
+    assert_eq!(tag, "FileSelected");
+    assert!(fields.is_empty());
     assert!(selected.to_data().is_err());
     assert_eq!(
         format!("{:?}", selected.host_binding().unwrap()),

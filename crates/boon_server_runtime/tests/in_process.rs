@@ -157,13 +157,10 @@ fn settle(runtime: &mut InProcessDistributedRuntime, now: &mut Duration) -> Sett
 }
 
 fn random_ready(byte: u8) -> Value {
-    Value::Record(BTreeMap::from([
-        (
-            "$tag".to_owned(),
-            Value::Text("RandomBytesReady".to_owned()),
-        ),
-        ("bytes".to_owned(), Value::Bytes(vec![byte].into())),
-    ]))
+    Value::tagged(
+        "RandomBytesReady",
+        BTreeMap::from([("bytes".to_owned(), Value::Bytes(vec![byte].into()))]),
+    )
 }
 
 #[test]

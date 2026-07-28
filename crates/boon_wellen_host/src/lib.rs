@@ -1328,9 +1328,7 @@ fn number_from_u64(value: u64) -> Result<Value, WaveformFailure> {
 }
 
 fn tagged(tag: &str, fields: BTreeMap<String, Value>) -> Value {
-    let mut tagged = BTreeMap::from([("$tag".to_owned(), Value::Text(tag.to_owned()))]);
-    tagged.extend(fields);
-    Value::Record(tagged)
+    Value::tagged(tag, fields)
 }
 
 fn content_failure(error: ContentStoreError) -> WaveformFailure {

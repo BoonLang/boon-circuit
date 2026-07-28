@@ -121,8 +121,8 @@ fn tag(event: &FileEffectEvent) -> &str {
 }
 
 fn fields(event: &FileEffectEvent) -> &BTreeMap<String, Value> {
-    let Value::Record(fields) = &event.outcome else {
-        panic!("effect outcome must be a tagged record");
+    let Value::Tag { fields, .. } = &event.outcome else {
+        panic!("effect outcome must be a tag");
     };
     fields
 }
@@ -301,10 +301,7 @@ async fn bounded_file_operations_reject_oversize_and_relabelled_wrong_direction_
     assert_eq!(text(fields(&too_large), "code"), "file_too_large");
 
     let wrong_source = Value::host_bound(
-        Value::Record(BTreeMap::from([(
-            "$tag".to_owned(),
-            Value::Text("FileSelected".to_owned()),
-        )])),
+        Value::tag("FileSelected"),
         destination
             .file_target_value()
             .host_binding()
@@ -329,10 +326,7 @@ async fn bounded_file_operations_reject_oversize_and_relabelled_wrong_direction_
     );
 
     let wrong_target = Value::host_bound(
-        Value::Record(BTreeMap::from([(
-            "$tag".to_owned(),
-            Value::Text("FileTarget".to_owned()),
-        )])),
+        Value::tag("FileTarget"),
         source.file_selected_value().host_binding().unwrap().clone(),
     );
     let write = dispatch(

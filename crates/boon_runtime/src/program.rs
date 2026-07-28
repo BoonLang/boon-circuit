@@ -4851,23 +4851,22 @@ document: Document/new(
             dispatched.runtime_turn.sequence
         );
 
-        let outcome = crate::Value::Record(BTreeMap::from([
-            (
-                "$tag".to_owned(),
-                crate::Value::Text("HttpSucceeded".to_owned()),
-            ),
-            (
-                "endpoint".to_owned(),
-                crate::Value::Text("catalog".to_owned()),
-            ),
-            ("status".to_owned(), crate::Value::integer(207).unwrap()),
-            ("headers".to_owned(), crate::Value::List(Vec::new())),
-            ("body".to_owned(), crate::Value::Bytes(Vec::new().into())),
-            (
-                "redirects_followed".to_owned(),
-                crate::Value::integer(0).unwrap(),
-            ),
-        ]));
+        let outcome = crate::Value::tagged(
+            "HttpSucceeded",
+            BTreeMap::from([
+                (
+                    "endpoint".to_owned(),
+                    crate::Value::Text("catalog".to_owned()),
+                ),
+                ("status".to_owned(), crate::Value::integer(207).unwrap()),
+                ("headers".to_owned(), crate::Value::List(Vec::new())),
+                ("body".to_owned(), crate::Value::Bytes(Vec::new().into())),
+                (
+                    "redirects_followed".to_owned(),
+                    crate::Value::integer(0).unwrap(),
+                ),
+            ]),
+        );
         let completed = session
             .complete_transient_effect_durably(call_id, outcome)
             .unwrap();

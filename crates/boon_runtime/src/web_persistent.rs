@@ -1153,10 +1153,10 @@ mod tests {
     }
 
     fn station_page_parts(value: Value) -> (Vec<Value>, Value) {
-        let Value::Record(mut fields) = value else {
-            panic!("station page must be a tagged record")
+        let Value::Tag { tag, mut fields } = value else {
+            panic!("station page must be a tag")
         };
-        assert_eq!(fields.remove("$tag"), Some(Value::Text("Page".to_owned())));
+        assert_eq!(tag, "Page");
         let Value::List(items) = fields.remove("items").expect("station page items") else {
             panic!("station page items must stay a list")
         };
@@ -1551,8 +1551,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         assert_eq!(first_metrics.access_full_scan_count, 0);
         assert!(matches!(
             &cursor,
-            Value::Record(fields)
-                if fields.get("$tag") == Some(&Value::Text("Cursor".to_owned()))
+            Value::Tag { tag, .. } if tag == "Cursor"
         ));
 
         let event = runtime

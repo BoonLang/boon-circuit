@@ -4376,29 +4376,28 @@ scene: Scene/Element/program(
     }
 
     fn pending_registration_value() -> Value {
-        Value::Text("RegistrationNotRequested".to_owned())
+        Value::tag("RegistrationNotRequested")
     }
 
     fn successful_registration_value() -> Value {
-        Value::Record(BTreeMap::from([
-            (
-                "$tag".to_owned(),
-                Value::Text("RegistrationSucceeded".to_owned()),
-            ),
-            (
-                "account_id".to_owned(),
-                Value::Text("account-test".to_owned()),
-            ),
-            (
-                "credential_id".to_owned(),
-                Value::Text("credential-test".to_owned()),
-            ),
-            (
-                "label".to_owned(),
-                Value::Text("Test credential".to_owned()),
-            ),
-            ("workspace_grant_bound".to_owned(), Value::truth(true)),
-        ]))
+        Value::tagged(
+            "RegistrationSucceeded",
+            BTreeMap::from([
+                (
+                    "account_id".to_owned(),
+                    Value::Text("account-test".to_owned()),
+                ),
+                (
+                    "credential_id".to_owned(),
+                    Value::Text("credential-test".to_owned()),
+                ),
+                (
+                    "label".to_owned(),
+                    Value::Text("Test credential".to_owned()),
+                ),
+                ("workspace_grant_bound".to_owned(), Value::truth(true)),
+            ]),
+        )
     }
 
     #[test]

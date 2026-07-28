@@ -4930,8 +4930,7 @@ host_ports: [
                 .machine
                 .output_value_current("stream_result")
                 .unwrap(),
-            Value::Record(fields)
-                if fields.get("$tag") == Some(&Value::Text("Finished".to_owned()))
+            Value::Tag { tag, .. } if tag == "Finished"
         ));
         let state = state.lock().unwrap();
         assert_eq!(state.submitted, [call_id]);
@@ -4950,13 +4949,13 @@ host_ports: [
     }
 
     fn tagged_value(tag: &str, fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
-        let mut record = BTreeMap::from([("$tag".to_owned(), Value::Text(tag.to_owned()))]);
-        record.extend(
+        Value::tagged(
+            tag,
             fields
                 .into_iter()
-                .map(|(name, value)| (name.to_owned(), value)),
-        );
-        Value::Record(record)
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+        )
     }
 }
 
@@ -5187,16 +5186,13 @@ FUNCTION double(value) {
         ) -> Result<(), TransientEffectHostError> {
             for call in calls {
                 self.state.lock().unwrap().submitted.push(call.call_id);
-                let outcome = Value::Record(BTreeMap::from([
-                    (
-                        "$tag".to_owned(),
-                        Value::Text("RandomBytesReady".to_owned()),
-                    ),
-                    (
+                let outcome = Value::tagged(
+                    "RandomBytesReady",
+                    BTreeMap::from([(
                         "bytes".to_owned(),
                         Value::Bytes(vec![self.next_byte].into()),
-                    ),
-                ]));
+                    )]),
+                );
                 self.next_byte = self.next_byte.saturating_add(12);
                 self.events.push_back(TransientEffectHostEvent::Result {
                     call_id: call.call_id,
@@ -5695,13 +5691,10 @@ FUNCTION double(value) {
             panic!("randomize should emit exactly one transient effect");
         };
         let call_id = invocation.call_id;
-        let outcome = Value::Record(BTreeMap::from([
-            (
-                "$tag".to_owned(),
-                Value::Text("RandomBytesReady".to_owned()),
-            ),
-            ("bytes".to_owned(), Value::Bytes(vec![7].into())),
-        ]));
+        let outcome = Value::tagged(
+            "RandomBytesReady",
+            BTreeMap::from([("bytes".to_owned(), Value::Bytes(vec![7].into()))]),
+        );
 
         let blocked = program
             .complete_server_transient_effect(call_id, outcome.clone(), ServerTurnClass::Http)
@@ -5765,13 +5758,10 @@ FUNCTION double(value) {
             panic!("randomize should emit exactly one transient effect");
         };
         let call_id = invocation.call_id;
-        let outcome = Value::Record(BTreeMap::from([
-            (
-                "$tag".to_owned(),
-                Value::Text("RandomBytesReady".to_owned()),
-            ),
-            ("bytes".to_owned(), Value::Bytes(vec![9].into())),
-        ]));
+        let outcome = Value::tagged(
+            "RandomBytesReady",
+            BTreeMap::from([("bytes".to_owned(), Value::Bytes(vec![9].into()))]),
+        );
         let before_completion = startup.lifecycle.status();
         assert_eq!(
             before_completion.accepted_turns,
@@ -5879,13 +5869,10 @@ FUNCTION double(value) {
                 ServerTurnClass::Http,
             )
             .unwrap();
-        let outcome = Value::Record(BTreeMap::from([
-            (
-                "$tag".to_owned(),
-                Value::Text("RandomBytesReady".to_owned()),
-            ),
-            ("bytes".to_owned(), Value::Bytes(vec![11].into())),
-        ]));
+        let outcome = Value::tagged(
+            "RandomBytesReady",
+            BTreeMap::from([("bytes".to_owned(), Value::Bytes(vec![11].into()))]),
+        );
         let blocked = program
             .complete_server_transient_effect(call_id, outcome.clone(), ServerTurnClass::Http)
             .unwrap_err();

@@ -81,12 +81,10 @@ fn tagged<'a>(
     value: &'a Value,
     expected: &str,
 ) -> Result<&'a std::collections::BTreeMap<String, Value>, String> {
-    let Value::Record(fields) = value else {
-        return Err(format!(
-            "expected tagged record `{expected}`, received {value:?}"
-        ));
+    let Value::Tag { tag, fields } = value else {
+        return Err(format!("expected tag `{expected}`, received {value:?}"));
     };
-    if fields.get("$tag") != Some(&Value::Text(expected.to_owned())) {
+    if tag != expected {
         return Err(format!("expected tag `{expected}`, received {value:?}"));
     }
     Ok(fields)
@@ -167,15 +165,15 @@ pub fn tags_presence_and_fault_current_analogue_executes() -> Result<(), String>
     let ordinary_fault = machine
         .root_value_current("ordinary_fault")
         .map_err(|error| error.to_string())?;
-    if ordinary_fault != Value::Text("InvalidNumber".to_owned()) {
+    if ordinary_fault != Value::tag("InvalidNumber") {
         return Err(format!("ordinary fault Tag changed: {ordinary_fault:?}"));
     }
     let current_absence = machine
         .root_value_current("current_absence")
         .map_err(|error| error.to_string())?;
-    if current_absence != Value::Text("Null".to_owned()) {
+    if current_absence != Value::tag("Null") {
         return Err(format!(
-            "current visible Null Tag facade changed: {current_absence:?}"
+            "current visible Null Tag changed: {current_absence:?}"
         ));
     }
     Ok(())

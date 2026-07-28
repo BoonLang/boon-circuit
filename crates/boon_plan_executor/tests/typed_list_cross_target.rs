@@ -134,10 +134,10 @@ fn sixty_thousand_row_kernel_seek_and_mutation_match_native_and_wasm() {
 }
 
 fn page_parts(value: Value) -> (Vec<Value>, Value) {
-    let Value::Record(mut fields) = value else {
-        panic!("page must be a closed tagged record")
+    let Value::Tag { tag, mut fields } = value else {
+        panic!("page must be a closed tag")
     };
-    assert_eq!(fields.remove("$tag"), Some(Value::Text("Page".to_owned())));
+    assert_eq!(tag, "Page");
     let Value::List(items) = fields.remove("items").expect("page items") else {
         panic!("page items must stay typed as a list")
     };
@@ -270,8 +270,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
     assert_eq!(item_names(&first_items), ["Alpha", "Beta"]);
     assert!(matches!(
         &next,
-        Value::Record(fields)
-            if fields.get("$tag") == Some(&Value::Text("Cursor".to_owned()))
+        Value::Tag { tag, fields }
+            if tag == "Cursor"
                 && matches!(fields.get("value"), Some(Value::Bytes(bytes)) if !bytes.is_empty())
     ));
     assert_eq!(first_metrics.access_index_seek_count, 1);
@@ -295,7 +295,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .unwrap();
     let (second_items, end) = page_parts(second);
     assert_eq!(item_names(&second_items), ["Charlie", "Delta"]);
-    assert_eq!(end, Value::Text("End".to_owned()));
+    assert_eq!(end, Value::tag("End"));
     assert_eq!(
         turn.metrics
             .access_cursor_seek_count

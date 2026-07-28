@@ -179,13 +179,17 @@ async fn materialize(
         let event = adapter.next_event().await.unwrap();
         let terminal = event.is_terminal();
         let content = (event.result_tag() == Some("Finished")).then(|| {
-            let Value::Record(fields) = &event.outcome else {
-                panic!("finished event must be a record");
+            let Value::Tag { fields, .. } = &event.outcome else {
+                panic!("finished event must be a tag");
             };
-            let Value::Record(retained) = &fields["retained"] else {
-                panic!("finished retention must be a tagged record");
+            let Value::Tag {
+                tag,
+                fields: retained,
+            } = &fields["retained"]
+            else {
+                panic!("finished retention must be a tag");
             };
-            assert_eq!(retained["$tag"], Value::Text("Retained".to_owned()));
+            assert_eq!(tag, "Retained");
             let content = ContentRef::from_value(&retained["content"]).unwrap();
             assert_eq!(
                 fields["digest"],
@@ -205,13 +209,10 @@ fn number(value: i64) -> Value {
 }
 
 fn fields<'a>(value: &'a Value, expected_tag: &str) -> &'a BTreeMap<String, Value> {
-    let Value::Record(fields) = value else {
-        panic!("effect outcome must be a tagged record");
+    let Value::Tag { tag, fields } = value else {
+        panic!("effect outcome must be a tag");
     };
-    assert_eq!(
-        fields.get("$tag"),
-        Some(&Value::Text(expected_tag.to_owned()))
-    );
+    assert_eq!(tag, expected_tag);
     fields
 }
 
@@ -436,10 +437,10 @@ async fn real_content_drives_bounded_typed_pages_and_survives_parser_cache_evict
     };
     let first_transition_time = transition["time"].clone();
     assert!(integer(&transition["end_time"]) >= integer(&transition["time"]));
-    let Value::Record(value) = &transition["value"] else {
-        panic!("transition value must be a closed variant");
+    let Value::Tag { tag, .. } = &transition["value"] else {
+        panic!("transition value must be a tag");
     };
-    assert!(matches!(value.get("$tag"), Some(Value::Text(tag)) if tag.ends_with("Value")));
+    assert!(tag.ends_with("Value"));
     assert_eq!(signal_page["has_more"], Value::truth(true));
     assert_eq!(integer(&signal_page["next_offset"]), 1);
 

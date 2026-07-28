@@ -67,8 +67,7 @@ impl ByteStreamValidator {
             self.expected_result_sequence,
             result_sequence,
         )?;
-        let fields = record_fields(outcome, "byte stream result")?;
-        let tag = text_field(fields, "$tag", "byte stream result")?;
+        let (tag, fields) = tag_fields(outcome, "byte stream result")?;
         match tag {
             "Opened" => {
                 if terminal || self.opened_size.is_some() || result_sequence != 0 {
@@ -195,8 +194,7 @@ impl ContentProgressValidator {
             self.expected_result_sequence,
             result_sequence,
         )?;
-        let fields = record_fields(outcome, self.operation)?;
-        let tag = text_field(fields, "$tag", self.operation)?;
+        let (tag, fields) = tag_fields(outcome, self.operation)?;
         match tag {
             "Started" => {
                 if terminal || self.started_total.is_some() || result_sequence != 0 {
@@ -379,6 +377,18 @@ fn record_fields<'a>(
     Ok(fields)
 }
 
+fn tag_fields<'a>(
+    value: &'a Value,
+    context: &str,
+) -> Result<(&'a str, &'a BTreeMap<String, Value>), EffectStreamValidationError> {
+    let Value::Tag { tag, fields } = value else {
+        return Err(EffectStreamValidationError::new(format_args!(
+            "{context} must be a tag"
+        )));
+    };
+    Ok((tag, fields))
+}
+
 fn record_field<'a>(
     fields: &'a BTreeMap<String, Value>,
     name: &str,
@@ -390,19 +400,6 @@ fn record_field<'a>(
         )));
     };
     record_fields(value, &format!("{context} field `{name}`"))
-}
-
-fn text_field<'a>(
-    fields: &'a BTreeMap<String, Value>,
-    name: &str,
-    context: &str,
-) -> Result<&'a str, EffectStreamValidationError> {
-    let Some(Value::Text(value)) = fields.get(name) else {
-        return Err(EffectStreamValidationError::new(format_args!(
-            "{context} field `{name}` must be Text"
-        )));
-    };
-    Ok(value)
 }
 
 fn number_field(
@@ -475,13 +472,13 @@ mod tests {
     }
 
     fn tagged<const N: usize>(tag: &str, fields: [(&str, Value); N]) -> Value {
-        let mut record = BTreeMap::from([("$tag".to_owned(), Value::Text(tag.to_owned()))]);
-        record.extend(
+        Value::tagged(
+            tag,
             fields
                 .into_iter()
-                .map(|(name, value)| (name.to_owned(), value)),
-        );
-        Value::Record(record)
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+        )
     }
 
     fn number(value: i64) -> Value {

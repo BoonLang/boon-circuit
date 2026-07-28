@@ -865,11 +865,8 @@ impl FileEffectEvent {
     }
 
     pub fn result_tag(&self) -> Option<&str> {
-        let Value::Record(fields) = &self.outcome else {
-            return None;
-        };
-        match fields.get("$tag") {
-            Some(Value::Text(tag)) => Some(tag.as_str()),
+        match &self.outcome {
+            Value::Tag { tag, .. } => Some(tag),
             _ => None,
         }
     }
@@ -2243,31 +2240,29 @@ fn decode_file_read_stream_intent(
 
 fn decode_file_source(file: &Value) -> Result<DecodedFileSource, FileStreamFailure> {
     let visible = file.visible();
-    let file_fields = match visible {
-        Value::Record(fields) => fields,
+    let (tag, file_fields) = match visible {
+        Value::Tag { tag, fields } => (tag.as_str(), fields),
         _ => {
-            return Err(FileStreamFailure::invalid(
-                "file input must be a tagged object",
-            ));
+            return Err(FileStreamFailure::invalid("file input must be a tag"));
         }
     };
-    match file_fields.get("$tag") {
-        Some(Value::Text(tag)) if tag == "FileSelected" => {
-            file_record(visible, &["$tag"], "selected file")?;
+    match tag {
+        "FileSelected" => {
+            file_fields_exact(file_fields, &[], "selected file")?;
             let binding = file
                 .host_binding()
                 .cloned()
                 .ok_or_else(|| FileStreamFailure::invalid("selected file has no host binding"))?;
             Ok(DecodedFileSource::Capability(FileCapability { binding }))
         }
-        Some(Value::Text(tag)) if tag == "PackageAsset" => {
+        "PackageAsset" => {
             if file.host_binding().is_some() {
                 return Err(FileStreamFailure::invalid(
                     "package assets must not carry a host binding",
                 ));
             }
-            let fields = file_record(visible, &["$tag", "url"], "package asset")?;
-            let url = file_text(fields, "url")?.to_owned();
+            file_fields_exact(file_fields, &["url"], "package asset")?;
+            let url = file_text(file_fields, "url")?.to_owned();
             if url.is_empty() || url.len() > MAX_PACKAGE_ASSET_URL_BYTES {
                 return Err(FileStreamFailure::invalid(
                     "package asset URL is empty or exceeds the bounded contract",
@@ -2282,11 +2277,13 @@ fn decode_file_source(file: &Value) -> Result<DecodedFileSource, FileStreamFailu
 }
 
 fn decode_file_target(value: &Value) -> Result<FileCapability, FileStreamFailure> {
-    let fields = file_record(value.visible(), &["$tag"], "file target")?;
-    match fields.get("$tag") {
-        Some(Value::Text(tag)) if tag == "FileTarget" => {}
-        _ => return Err(FileStreamFailure::invalid("file target must be FileTarget")),
+    let Value::Tag { tag, fields } = value.visible() else {
+        return Err(FileStreamFailure::invalid("file target must be FileTarget"));
+    };
+    if tag != "FileTarget" {
+        return Err(FileStreamFailure::invalid("file target must be FileTarget"));
     }
+    file_fields_exact(fields, &[], "file target")?;
     let binding = value
         .host_binding()
         .cloned()
@@ -2304,6 +2301,15 @@ fn file_record<'a>(
             "{context} must be a record"
         )));
     };
+    file_fields_exact(fields, expected, context)?;
+    Ok(fields)
+}
+
+fn file_fields_exact(
+    fields: &BTreeMap<String, Value>,
+    expected: &[&str],
+    context: &str,
+) -> Result<(), FileStreamFailure> {
     let actual = fields.keys().map(String::as_str).collect::<BTreeSet<_>>();
     let expected = expected.iter().copied().collect::<BTreeSet<_>>();
     if actual != expected {
@@ -2311,7 +2317,7 @@ fn file_record<'a>(
             "{context} fields differ from the typed contract"
         )));
     }
-    Ok(fields)
+    Ok(())
 }
 
 fn file_text<'a>(
@@ -3627,9 +3633,8 @@ fn positive_i64(fields: &BTreeMap<String, Value>, name: &str) -> Result<i64, Val
         })
 }
 
-fn tagged(tag: &str, mut fields: BTreeMap<String, Value>) -> Value {
-    fields.insert("$tag".to_owned(), Value::Text(tag.to_owned()));
-    Value::Record(fields)
+fn tagged(tag: &str, fields: BTreeMap<String, Value>) -> Value {
+    Value::tagged(tag, fields)
 }
 
 fn number(value: i64) -> Value {
@@ -3726,10 +3731,10 @@ mod tests {
             ("byte_count".to_owned(), number(16)),
             ("unexpected".to_owned(), Value::truth(true)),
         ]));
-        let Value::Record(result) = exact_record(&value, &["byte_count"]).unwrap_err() else {
-            panic!("failure must be a variant record");
+        let Value::Tag { tag, fields } = exact_record(&value, &["byte_count"]).unwrap_err() else {
+            panic!("failure must be a tag");
         };
-        assert_eq!(result["$tag"], Value::Text("HostServiceFailed".to_owned()));
-        assert_eq!(result["code"], Value::Text("invalid_intent".to_owned()));
+        assert_eq!(tag, "HostServiceFailed");
+        assert_eq!(fields["code"], Value::Text("invalid_intent".to_owned()));
     }
 }

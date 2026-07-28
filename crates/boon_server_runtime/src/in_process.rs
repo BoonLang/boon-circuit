@@ -1122,11 +1122,7 @@ fn stream_result_is_terminal(delivery: &EffectDeliveryCardinality, outcome: &Val
 
 fn effect_outcome_tag(value: &Value) -> Option<&str> {
     match value.visible() {
-        Value::Text(tag) => Some(tag),
-        Value::Record(fields) => fields.get("$tag").and_then(|tag| match tag {
-            Value::Text(tag) => Some(tag.as_str()),
-            _ => None,
-        }),
+        Value::Tag { tag, .. } => Some(tag),
         _ => None,
     }
 }

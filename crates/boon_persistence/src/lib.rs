@@ -2576,7 +2576,13 @@ fn hash_stored_value(hasher: &mut Sha256, value: &StoredValue) {
     match value {
         StoredValue::Number(value) => {
             hasher.update([20]);
-            hasher.update(value.get().to_bits().to_be_bytes());
+            hasher.update([value.sign() as u8]);
+            let numerator = value.numerator_magnitude_bytes();
+            let denominator = value.denominator_bytes();
+            hasher.update((numerator.len() as u64).to_be_bytes());
+            hasher.update(numerator);
+            hasher.update((denominator.len() as u64).to_be_bytes());
+            hasher.update(denominator);
         }
         StoredValue::Text(value) => {
             hasher.update([21]);

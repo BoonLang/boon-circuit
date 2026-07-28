@@ -6,7 +6,7 @@ use boon_http_client::{
     ClientConfig, EndpointCapability, EndpointName, HttpClient, LocalHttpTestPermit, Timeouts,
 };
 use boon_http_runtime::{OutboundHttpEffectAdapter, apply_completion, apply_submission};
-use boon_plan::{ApplicationIdentity, FiniteReal};
+use boon_plan::{ApplicationIdentity, ExactNumber};
 use boon_runtime::{
     ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession, RuntimeSourceUnit,
     SourcePayload, Value, compile_program_artifact,
@@ -41,7 +41,7 @@ impl Drop for RunningServer {
 }
 
 fn number(value: i64) -> Value {
-    Value::Number(FiniteReal::from_i64_exact(value).unwrap())
+    Value::Number(ExactNumber::from_i64(value))
 }
 
 fn request_payload(endpoint: &str) -> SourcePayload {

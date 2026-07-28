@@ -1,77 +1,14 @@
+use boon_data::ExactNumber;
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 
-pub const KEY_CODEC_VERSION: u8 = 2;
+pub const KEY_CODEC_VERSION: u8 = 3;
 pub const MAX_KEY_COMPONENTS: usize = 8;
 
 const NUMBER_MARKER: u8 = 0x11;
 const TEXT_MARKER: u8 = 0x22;
 const CLOSED_TAG_MARKER: u8 = 0x44;
-const SIGN_BIT: u64 = 1 << 63;
-
-/// A finite IEEE-754 binary64 value with canonical zero representation.
-#[derive(Clone, Copy)]
-pub struct FiniteNumber(u64);
-
-impl FiniteNumber {
-    pub fn new(value: f64) -> Result<Self, KeyError> {
-        if !value.is_finite() {
-            return Err(KeyError::NonFiniteNumber);
-        }
-        let bits = if value == 0.0 { 0 } else { value.to_bits() };
-        Ok(Self(bits))
-    }
-
-    pub fn get(self) -> f64 {
-        f64::from_bits(self.0)
-    }
-
-    pub fn to_bits(self) -> u64 {
-        self.0
-    }
-}
-
-impl TryFrom<f64> for FiniteNumber {
-    type Error = KeyError;
-
-    fn try_from(value: f64) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl fmt::Debug for FiniteNumber {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.get().fmt(formatter)
-    }
-}
-
-impl PartialEq for FiniteNumber {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for FiniteNumber {}
-
-impl PartialOrd for FiniteNumber {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FiniteNumber {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.get().total_cmp(&other.get())
-    }
-}
-
-impl Hash for FiniteNumber {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
 
 /// Compiler-assigned identity of a closed fieldless tag type.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -114,14 +51,14 @@ impl ClosedTag {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StructuralValue {
-    Number(FiniteNumber),
+    Number(ExactNumber),
     Text(String),
     ClosedTag(ClosedTag),
 }
 
 impl StructuralValue {
-    pub fn number(value: f64) -> Result<Self, KeyError> {
-        FiniteNumber::new(value).map(Self::Number)
+    pub fn number(value: ExactNumber) -> Self {
+        Self::Number(value)
     }
 
     pub fn text(value: impl Into<String>) -> Self {
@@ -140,7 +77,7 @@ impl StructuralValue {
     /// not claim allocator, enum, `String`, or `Vec` bookkeeping bytes.
     pub fn payload_bytes(&self) -> u64 {
         match self {
-            Self::Number(_) => 8,
+            Self::Number(value) => usize_to_u64(value.canonical_storage_bytes()),
             Self::Text(value) => usize_to_u64(value.len()),
             Self::ClosedTag(_) => 20,
         }
@@ -366,13 +303,7 @@ fn encode_component(
     match value {
         StructuralValue::Number(value) => {
             output.push(NUMBER_MARKER);
-            let bits = value.to_bits();
-            let ordered = if bits & SIGN_BIT == 0 {
-                bits ^ SIGN_BIT
-            } else {
-                !bits
-            };
-            output.extend_from_slice(&ordered.to_be_bytes());
+            output.extend_from_slice(&value.canonical_order_bytes());
         }
         StructuralValue::Text(value) => {
             output.push(TEXT_MARKER);
@@ -417,7 +348,6 @@ pub(crate) fn lexicographic_successor(mut prefix: Vec<u8>) -> Option<Vec<u8>> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeyError {
-    NonFiniteNumber,
     InvalidSchemaArity {
         actual: usize,
         maximum: usize,
@@ -448,7 +378,6 @@ pub enum KeyError {
 impl fmt::Display for KeyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NonFiniteNumber => formatter.write_str("number key must be finite"),
             Self::InvalidSchemaArity { actual, maximum } => write!(
                 formatter,
                 "key schema has {actual} components; expected 0..={maximum}"

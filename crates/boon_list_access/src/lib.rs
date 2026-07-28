@@ -37,8 +37,8 @@ pub use index::{
     OrderedIndexIntegrityResult, OrderedIndexIntegrityTask, RowId, SourceOrderToken,
 };
 pub use key::{
-    ClosedTag, Direction, EncodedKey, FiniteNumber, KEY_CODEC_VERSION, KeyComponent, KeyError,
-    KeyKind, KeySchema, MAX_KEY_COMPONENTS, StructuralKey, StructuralValue, TagTypeId,
+    ClosedTag, Direction, EncodedKey, KEY_CODEC_VERSION, KeyComponent, KeyError, KeyKind,
+    KeySchema, MAX_KEY_COMPONENTS, StructuralKey, StructuralValue, TagTypeId,
 };
 pub use work::{AccessMetrics, LimitKind, WorkLimitExceeded, WorkLimits, WorkTracker};
 

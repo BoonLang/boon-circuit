@@ -2,7 +2,7 @@ use boon_host_runtime::{
     ContentRef, ContentStore, ContentStoreLimits, FileCapabilityRegistry, FileEffectAdapter,
     apply_event as apply_file_event,
 };
-use boon_plan::{ApplicationIdentity, FiniteReal, ProgramRole};
+use boon_plan::{ApplicationIdentity, ExactNumber, ProgramRole};
 use boon_runtime::{
     ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession, RuntimeSourceUnit,
     SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
@@ -205,7 +205,7 @@ async fn materialize(
 }
 
 fn number(value: i64) -> Value {
-    Value::Number(FiniteReal::from_i64_exact(value).unwrap())
+    Value::Number(ExactNumber::from_i64(value))
 }
 
 fn fields<'a>(value: &'a Value, expected_tag: &str) -> &'a BTreeMap<String, Value> {

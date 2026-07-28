@@ -14,7 +14,7 @@ use boon_persistence::{
     stage_migration,
 };
 use boon_plan::{
-    ApplicationIdentity, FiniteReal, MachinePlan, MemoryId, MigrationPredecessorBinding,
+    ApplicationIdentity, ExactNumber, MachinePlan, MemoryId, MigrationPredecessorBinding,
     TargetProfile,
 };
 use boon_plan_executor::{RowId, SessionOptions, SourcePayload, Value};
@@ -1764,10 +1764,7 @@ fn source_payload(
 fn scenario_value(value: &MigrationScenarioValue) -> Value {
     match value {
         MigrationScenarioValue::Truth(value) => Value::truth(*value),
-        MigrationScenarioValue::Integer(value) => Value::Number(
-            FiniteReal::from_i64_exact(*value)
-                .expect("validated migration scenario integer must be exactly representable"),
-        ),
+        MigrationScenarioValue::Integer(value) => Value::Number(ExactNumber::from_i64(*value)),
         MigrationScenarioValue::Text(value) => Value::Text(value.clone()),
     }
 }

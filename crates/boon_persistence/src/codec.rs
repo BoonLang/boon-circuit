@@ -14,10 +14,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESTORE_IMAGE_FORMAT: u32 = 9;
-const APPLICATION_TRANSFER_FORMAT: u32 = 7;
-const CHECKPOINT_BATCH_FORMAT: u32 = 9;
-const OUTBOX_RECORD_FORMAT: u32 = 4;
+const RESTORE_IMAGE_FORMAT: u32 = 10;
+const APPLICATION_TRANSFER_FORMAT: u32 = 8;
+const CHECKPOINT_BATCH_FORMAT: u32 = 10;
+const OUTBOX_RECORD_FORMAT: u32 = 5;
 const BLOB_RECORD_FORMAT: u32 = 1;
 const STORED_NUMBER: u8 = 20;
 const STORED_TEXT: u8 = 21;
@@ -1470,11 +1470,7 @@ fn encode_component_value(
                 .map_err(encode_error)?;
         }
         StoredValue::Number(value) => {
-            encoder
-                .array(2)
-                .and_then(|encoder| encoder.u8(STORED_NUMBER))
-                .and_then(|encoder| encoder.f64(value.get()))
-                .map_err(encode_error)?;
+            encode_exact_number(encoder, value)?;
         }
         StoredValue::Text(value) => {
             encoder
@@ -1540,10 +1536,7 @@ fn decode_component_value(
     let len = definite_len(decoder.array().map_err(decode_error)?, "stored value")?;
     let tag = decoder.u8().map_err(decode_error)?;
     match (tag, len) {
-        (STORED_NUMBER, 2) => Ok(StoredValue::Number(
-            boon_data::FiniteReal::new(decoder.f64().map_err(decode_error)?)
-                .map_err(|error| CodecError::new(error.to_string()))?,
-        )),
+        (STORED_NUMBER, 4) => decode_exact_number(decoder).map(StoredValue::Number),
         (STORED_TEXT, 2) => Ok(StoredValue::Text(decode_text(decoder, limits)?)),
         (STORED_BYTES, 2) => {
             let bytes = decoder.bytes().map_err(decode_error)?;
@@ -1634,11 +1627,7 @@ fn encode_value(
     }
     match value {
         StoredValue::Number(value) => {
-            encoder
-                .array(2)
-                .and_then(|encoder| encoder.u8(STORED_NUMBER))
-                .and_then(|encoder| encoder.f64(value.get()))
-                .map_err(encode_error)?;
+            encode_exact_number(encoder, value)?;
         }
         StoredValue::Text(value) => {
             encoder
@@ -1694,10 +1683,7 @@ fn decode_value(
     let len = definite_len(decoder.array().map_err(decode_error)?, "stored value")?;
     let tag = decoder.u8().map_err(decode_error)?;
     match (tag, len) {
-        (STORED_NUMBER, 2) => Ok(StoredValue::Number(
-            boon_data::FiniteReal::new(decoder.f64().map_err(decode_error)?)
-                .map_err(|error| CodecError::new(error.to_string()))?,
-        )),
+        (STORED_NUMBER, 4) => decode_exact_number(decoder).map(StoredValue::Number),
         (STORED_TEXT, 2) => Ok(StoredValue::Text(decode_text(decoder, limits)?)),
         (STORED_BYTES, 2) => {
             let bytes = decoder.bytes().map_err(decode_error)?;
@@ -1830,6 +1816,31 @@ fn definite_len(length: Option<u64>, label: &str) -> Result<usize, CodecError> {
     usize::try_from(length).map_err(|_| CodecError::new(format!("{label} length overflows usize")))
 }
 
+fn encode_exact_number(
+    encoder: &mut CborEncoder<'_>,
+    value: &boon_data::ExactNumber,
+) -> Result<(), CodecError> {
+    let numerator = value.numerator_magnitude_bytes();
+    let denominator = value.denominator_bytes();
+    encoder
+        .array(4)
+        .and_then(|encoder| encoder.u8(STORED_NUMBER))
+        .and_then(|encoder| encoder.u8(value.sign() as u8))
+        .and_then(|encoder| encoder.bytes(&numerator))
+        .and_then(|encoder| encoder.bytes(&denominator))
+        .map_err(encode_error)?;
+    Ok(())
+}
+
+fn decode_exact_number(decoder: &mut Decoder<'_>) -> Result<boon_data::ExactNumber, CodecError> {
+    let sign = boon_data::ExactNumberSign::try_from(decoder.u8().map_err(decode_error)?)
+        .map_err(|error| CodecError::new(error.to_string()))?;
+    let numerator = decoder.bytes().map_err(decode_error)?;
+    let denominator = decoder.bytes().map_err(decode_error)?;
+    boon_data::ExactNumber::from_canonical_bytes(sign, numerator, denominator)
+        .map_err(|error| CodecError::new(error.to_string()))
+}
+
 fn encode_error<E: fmt::Debug>(error: E) -> CodecError {
     CodecError::new(format!("CBOR encode failed: {error:?}"))
 }
@@ -1841,7 +1852,6 @@ fn decode_error<E: fmt::Display>(error: E) -> CodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_data::FiniteReal;
     use boon_plan::{MemoryKind, MemoryOwnerPath};
 
     fn number(value: i64) -> StoredValue {
@@ -1874,23 +1884,26 @@ mod tests {
     }
 
     #[test]
-    fn old_integer_number_decodes_and_reencodes_as_canonical_float_number() {
+    fn binary64_and_integer_number_encodings_are_rejected() {
         let mut old_bytes = Vec::new();
         Encoder::new(&mut old_bytes)
             .array(2)
-            .and_then(|encoder| encoder.u8(2))
-            .and_then(|encoder| encoder.i64(42))
+            .and_then(|encoder| encoder.u8(STORED_NUMBER))
+            .and_then(|encoder| encoder.f64(42.0))
             .unwrap();
-        let decoded =
-            decode_value(&mut Decoder::new(&old_bytes), DecodeLimits::default(), 0).unwrap();
-        assert_eq!(decoded, number(42));
+        assert!(decode_value(&mut Decoder::new(&old_bytes), DecodeLimits::default(), 0).is_err());
 
         let mut canonical = Vec::new();
-        encode_value(&mut Encoder::new(&mut canonical), &decoded, 0).unwrap();
+        encode_value(&mut Encoder::new(&mut canonical), &number(42), 0).unwrap();
         let mut decoder = Decoder::new(&canonical);
-        assert_eq!(decoder.array().unwrap(), Some(2));
-        assert_eq!(decoder.u8().unwrap(), 10);
-        assert_eq!(decoder.f64().unwrap(), 42.0);
+        assert_eq!(decoder.array().unwrap(), Some(4));
+        assert_eq!(decoder.u8().unwrap(), STORED_NUMBER);
+        assert_eq!(
+            decoder.u8().unwrap(),
+            boon_data::ExactNumberSign::Positive as u8
+        );
+        assert_eq!(decoder.bytes().unwrap(), [42]);
+        assert_eq!(decoder.bytes().unwrap(), [1]);
     }
 
     #[test]
@@ -1911,7 +1924,7 @@ mod tests {
                     ("b".to_owned(), StoredValue::Text("text".to_owned())),
                     (
                         "c".to_owned(),
-                        StoredValue::Number(FiniteReal::new(59.91).unwrap()),
+                        StoredValue::Number("59.91".parse().unwrap()),
                     ),
                 ])),
             },

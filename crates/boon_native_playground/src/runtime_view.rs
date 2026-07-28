@@ -11,7 +11,7 @@ use boon_persistence::{
     PersistenceWorkerConfig, PersistenceWorkerStatus, RedbDriver,
 };
 use boon_plan::{
-    ApplicationIdentity, ApplicationPlan, EffectReplay, FiniteReal, MachinePlan, MemoryKind,
+    ApplicationIdentity, ApplicationPlan, EffectReplay, ExactNumber, MachinePlan, MemoryKind,
     ProgramRole, SourceRouteToken,
 };
 pub(crate) use boon_runtime::ProgramCompletionObservation;
@@ -3595,23 +3595,29 @@ fn pointer_source_payload(pointer: &boon_host::PointerEvent, target: &HitTarget)
         let local_y = (pointer.y - target.bounds_y).clamp(0.0, target.bounds_height);
         payload.fields.insert(
             "pointer_x".to_owned(),
-            Value::Number(FiniteReal::new(f64::from(local_x.round())).expect("finite pointer x")),
+            Value::Number(
+                ExactNumber::from_f64_boundary_exact(f64::from(local_x.round()))
+                    .expect("finite pointer x"),
+            ),
         );
         payload.fields.insert(
             "pointer_y".to_owned(),
-            Value::Number(FiniteReal::new(f64::from(local_y.round())).expect("finite pointer y")),
+            Value::Number(
+                ExactNumber::from_f64_boundary_exact(f64::from(local_y.round()))
+                    .expect("finite pointer y"),
+            ),
         );
         payload.fields.insert(
             "pointer_width".to_owned(),
             Value::Number(
-                FiniteReal::new(f64::from(target.bounds_width.round()))
+                ExactNumber::from_f64_boundary_exact(f64::from(target.bounds_width.round()))
                     .expect("finite pointer width"),
             ),
         );
         payload.fields.insert(
             "pointer_height".to_owned(),
             Value::Number(
-                FiniteReal::new(f64::from(target.bounds_height.round()))
+                ExactNumber::from_f64_boundary_exact(f64::from(target.bounds_height.round()))
                     .expect("finite pointer height"),
             ),
         );
@@ -4662,7 +4668,7 @@ document: Document/new(
         .unwrap();
         assert_eq!(
             view.root_value_current("store.credential_count").unwrap(),
-            Value::Number(FiniteReal::from_i64_exact(0).unwrap())
+            Value::Number(ExactNumber::zero())
         );
         view.dispatch_root_source(
             "store.elements.simulate_registration_cancel",
@@ -4685,7 +4691,7 @@ document: Document/new(
         }
         assert_eq!(
             view.root_value_current("store.credential_count").unwrap(),
-            Value::Number(FiniteReal::from_i64_exact(0).unwrap()),
+            Value::Number(ExactNumber::zero()),
             "cancelled registration must not append a credential"
         );
         for (path, expected) in [
@@ -4720,7 +4726,7 @@ document: Document/new(
         }
         assert_eq!(
             view.root_value_current("store.credential_count").unwrap(),
-            Value::Number(FiniteReal::from_i64_exact(1).unwrap()),
+            Value::Number(ExactNumber::one()),
             "one successful registration must append exactly one credential"
         );
         for (path, expected) in [

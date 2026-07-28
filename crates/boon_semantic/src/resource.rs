@@ -1491,7 +1491,7 @@ fn semantic_static_data(
                     SemanticExpressionKind::Number(value) => {
                         values.push(
                             value
-                                .parse::<boon_data::FiniteReal>()
+                                .parse::<boon_data::ExactNumber>()
                                 .map(boon_data::Value::Number)
                                 .map_err(|error| {
                                     format!("invalid finite Number `{value}`: {error}")

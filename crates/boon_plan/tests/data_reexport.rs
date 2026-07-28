@@ -3,9 +3,9 @@ use wasm_bindgen_test::wasm_bindgen_test;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
-fn finite_real_public_path_is_the_canonical_data_type() {
-    let public = boon_plan::FiniteReal::new(59.91).unwrap();
-    let canonical: boon_data::FiniteReal = public;
+fn exact_number_public_path_is_the_canonical_data_type() {
+    let public = "59.91".parse::<boon_plan::ExactNumber>().unwrap();
+    let canonical: &boon_data::ExactNumber = &public;
 
-    assert_eq!(canonical.get(), 59.91);
+    assert_eq!(canonical, &public);
 }

@@ -2,7 +2,7 @@ use super::{
     ActivationBatch, DurableOutboxState, OutboxItemId, RestoreImage, StoredList, StoredRow,
     StoredScalar, StoredValue, validate_outbox_item_schema,
 };
-use boon_data::{FiniteReal, NumberTextFormat, format_number_text};
+use boon_data::{ExactNumber, NumberTextFormat, format_number_text};
 use boon_plan::{
     ApplicationIdentity, DataTypePlan, MachinePlan, MemoryId, MemoryLeafId,
     MigrationArgumentValuePlan, MigrationEdgeId, MigrationEdgePlan, MigrationExpressionPlan,
@@ -834,7 +834,7 @@ fn evaluate_expression(
             }
             Ok(StoredValue::Text(text))
         }
-        MigrationExpressionPlan::Number { value } => Ok(StoredValue::Number(*value)),
+        MigrationExpressionPlan::Number { value } => Ok(StoredValue::Number(value.clone())),
         MigrationExpressionPlan::Variant { tag } => Ok(StoredValue::tag(tag)),
         MigrationExpressionPlan::Tagged { tag, fields } => Ok(StoredValue::Tag {
             tag: tag.clone(),
@@ -967,7 +967,7 @@ fn stored_value_matches_pattern(
             matches!(value, StoredValue::Tag { tag, fields } if tag == name && fields.is_empty())
         }
         boon_plan::PlanRowSelectPattern::Number { value: expected } => {
-            value == &StoredValue::Number(*expected)
+            value == &StoredValue::Number(expected.clone())
         }
         boon_plan::PlanRowSelectPattern::Text { value: expected } => {
             matches!(value, StoredValue::Text(value) if value == expected)
@@ -995,13 +995,13 @@ fn evaluate_fields(
 }
 
 fn stored_integer(value: i64) -> Result<StoredValue, MigrationError> {
-    FiniteReal::from_i64_exact(value)
-        .map(StoredValue::Number)
-        .map_err(|error| MigrationError::Evaluation(error.to_string()))
+    Ok(StoredValue::Number(ExactNumber::from_i64(value)))
 }
 
-fn stored_number_result(value: f64) -> Result<StoredValue, MigrationError> {
-    FiniteReal::new(value)
+fn stored_number_result(
+    value: Result<ExactNumber, boon_data::ExactNumberError>,
+) -> Result<StoredValue, MigrationError> {
+    value
         .map(StoredValue::Number)
         .map_err(|error| MigrationError::Evaluation(error.to_string()))
 }
@@ -1064,7 +1064,7 @@ fn evaluate_call(
             let group_size =
                 integer_arg("group_size")?.map(|value| usize::try_from(value).unwrap_or_default());
             let text = format_number_text(
-                value,
+                &value,
                 NumberTextFormat {
                     radix: u32::try_from(radix).unwrap_or_default(),
                     min_width: usize::try_from(min_width).unwrap_or(usize::MAX),
@@ -1078,7 +1078,7 @@ fn evaluate_call(
         }
         "Text/to_number" => match input.or_else(|| named_value("input")) {
             Some(StoredValue::Text(value)) => value
-                .parse::<FiniteReal>()
+                .parse::<ExactNumber>()
                 .map(StoredValue::Number)
                 .map_err(|_| MigrationError::Evaluation("text is not a number".to_owned())),
             _ => Err(MigrationError::Evaluation(
@@ -1163,19 +1163,16 @@ fn evaluate_infix(
 ) -> Result<StoredValue, MigrationError> {
     match (operator, left, right) {
         ("+", StoredValue::Number(left), StoredValue::Number(right)) => {
-            stored_number_result(left.get() + right.get())
+            stored_number_result(left.checked_add(&right))
         }
         ("-", StoredValue::Number(left), StoredValue::Number(right)) => {
-            stored_number_result(left.get() - right.get())
+            stored_number_result(left.checked_sub(&right))
         }
         ("*", StoredValue::Number(left), StoredValue::Number(right)) => {
-            stored_number_result(left.get() * right.get())
+            stored_number_result(left.checked_mul(&right))
         }
-        ("/", StoredValue::Number(_), StoredValue::Number(right)) if right.get() == 0.0 => Err(
-            MigrationError::Evaluation("number division by zero".to_owned()),
-        ),
         ("/", StoredValue::Number(left), StoredValue::Number(right)) => {
-            stored_number_result(left.get() / right.get())
+            stored_number_result(left.checked_div(&right))
         }
         ("==", left, right) => Ok(StoredValue::truth(left == right)),
         ("!=", left, right) => Ok(StoredValue::truth(left != right)),
@@ -1290,9 +1287,11 @@ mod tests {
 
     #[test]
     fn migration_number_expression_preserves_fractional_values() {
-        let value = FiniteReal::new(1.25).unwrap();
+        let value = "1.25".parse::<ExactNumber>().unwrap();
         let evaluated = evaluate_expression(
-            &MigrationExpressionPlan::Number { value },
+            &MigrationExpressionPlan::Number {
+                value: value.clone(),
+            },
             &BTreeMap::new(),
             &[],
         )

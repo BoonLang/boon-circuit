@@ -5,7 +5,7 @@
 use boon_host_runtime::{
     ContentLease, ContentRef, ContentStore, ContentStoreError, ContentStoreErrorKind,
 };
-use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, FiniteReal};
+use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, ExactNumber};
 use boon_runtime::{
     ContentRefError, ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectInvocation,
     Value,
@@ -1155,7 +1155,7 @@ fn waveform_value(value: SignalValue<'_>) -> Result<(Value, usize), WaveformFail
                 "RealValue",
                 BTreeMap::from([(
                     "value".to_owned(),
-                    Value::Number(FiniteReal::new(value).map_err(|_| {
+                    Value::Number(ExactNumber::from_f64_boundary_exact(value).map_err(|_| {
                         WaveformFailure::new(
                             "invalid_real",
                             "finite waveform real is not a valid Number",
@@ -1307,7 +1307,7 @@ fn unsigned_u64(
 }
 
 fn number(value: i64) -> Value {
-    Value::Number(FiniteReal::from_i64_exact(value).expect("small constant is exact"))
+    Value::Number(ExactNumber::from_i64(value))
 }
 
 fn number_from_usize(value: usize) -> Result<Value, WaveformFailure> {

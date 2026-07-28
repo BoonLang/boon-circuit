@@ -37,7 +37,7 @@ fn stored_number(value: i64) -> boon_persistence::StoredValue {
 
 fn number_constant(value: i64) -> PlanConstantValue {
     PlanConstantValue::Number {
-        value: FiniteReal::from_i64_exact(value).unwrap(),
+        value: ExactNumber::from_i64(value),
     }
 }
 
@@ -7128,7 +7128,7 @@ outputs: [
 
     assert_eq!(
         session.output_value_current("half").unwrap(),
-        Value::Number(FiniteReal::new(0.5).unwrap())
+        Value::Number("0.5".parse().unwrap())
     );
     assert_eq!(session.output_value_current("floor").unwrap(), number(1));
     assert_eq!(session.output_value_current("ceil").unwrap(), number(-1));
@@ -7141,7 +7141,7 @@ outputs: [
     let Value::Number(initial) = session.output_value_current("latitude").unwrap() else {
         panic!("decimal output must remain a real number");
     };
-    assert!((initial.get() - 59.91).abs() < 1e-12);
+    assert_eq!(initial, "59.91".parse::<ExactNumber>().unwrap());
     session
         .apply(SourceEvent {
             sequence: 1,
@@ -7154,13 +7154,13 @@ outputs: [
     let Value::Number(updated) = session.output_value_current("latitude").unwrap() else {
         panic!("decimal arithmetic must produce a real number");
     };
-    assert!((updated.get() - 60.01).abs() < 1e-12);
+    assert_eq!(updated, "60.01".parse::<ExactNumber>().unwrap());
 }
 
 #[test]
 fn whole_and_decimal_numbers_share_one_value_identity() {
-    let whole = Value::Number(FiniteReal::from_i64_exact(1).unwrap());
-    let decimal = Value::Number(FiniteReal::new(1.0).unwrap());
+    let whole = Value::Number(ExactNumber::one());
+    let decimal = Value::Number("1.0".parse().unwrap());
     assert_eq!(whole, decimal);
 }
 

@@ -2,7 +2,7 @@ use boon_host_runtime::{
     HostServiceEffectAdapter, NamedSecret, apply_completion, apply_submission,
 };
 use boon_host_services::{HostServiceConfig, HostServices, SecretMaterial};
-use boon_plan::{ApplicationIdentity, FiniteReal};
+use boon_plan::{ApplicationIdentity, ExactNumber};
 use boon_runtime::{
     ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession, RuntimeSourceUnit,
     SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
@@ -10,7 +10,7 @@ use boon_runtime::{
 use std::time::Duration;
 
 fn number(value: i64) -> Value {
-    Value::Number(FiniteReal::from_i64_exact(value).unwrap())
+    Value::Number(ExactNumber::from_i64(value))
 }
 
 fn program() -> ProgramSession {

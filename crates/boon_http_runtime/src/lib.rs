@@ -6,7 +6,7 @@ use boon_http_client::{
     CancellationToken, EndpointName, ExecuteError, Header, HttpClient, HttpMethod, HttpRequest,
     HttpResponse, LimitKind, QueryParameter, RequestTimeouts, RequestViolation, TimeoutKind,
 };
-use boon_plan::{EffectId, EffectInvocationId, FiniteReal};
+use boon_plan::{EffectId, EffectInvocationId, ExactNumber};
 use boon_runtime::{
     ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectInvocation, Value,
 };
@@ -603,10 +603,10 @@ fn tagged(tag: &str, fields: BTreeMap<String, Value>) -> Value {
 }
 
 fn number(value: i64) -> Value {
-    Value::Number(FiniteReal::from_i64_exact(value).expect("small HTTP integer is exact"))
+    Value::Number(ExactNumber::from_i64(value))
 }
 
-fn duration_ms(value: FiniteReal, endpoint: &str) -> Result<Duration, Failure> {
+fn duration_ms(value: ExactNumber, endpoint: &str) -> Result<Duration, Failure> {
     let milliseconds = value
         .to_i64_exact()
         .ok()
@@ -678,9 +678,9 @@ fn bare_tag_field<'a>(fields: &'a BTreeMap<String, Value>, name: &str) -> Result
     }
 }
 
-fn number_field(fields: &BTreeMap<String, Value>, name: &str) -> Result<FiniteReal, Failure> {
+fn number_field(fields: &BTreeMap<String, Value>, name: &str) -> Result<ExactNumber, Failure> {
     match fields.get(name) {
-        Some(Value::Number(value)) => Ok(*value),
+        Some(Value::Number(value)) => Ok(value.clone()),
         _ => Err(Failure::invalid(
             "unresolved",
             "invalid_intent",

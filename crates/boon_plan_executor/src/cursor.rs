@@ -1,4 +1,5 @@
 use crate::machine::{RowId as RuntimeRowId, Value};
+use boon_data::{ExactNumber, ExactNumberSign};
 use boon_list_access::{
     ClosedTag, RowId, SourceOrderToken, StructuralKey, StructuralValue, TagTypeId,
 };
@@ -11,12 +12,12 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 
-const TOKEN_VERSION: u8 = 6;
+const TOKEN_VERSION: u8 = 7;
 const PAYLOAD_MAGIC: &[u8; 4] = b"BPGC";
 const NONCE_BYTES: usize = 12;
 const AEAD_TAG_BYTES: usize = 16;
 const MAX_CURSOR_BYTES: usize = 4_096;
-const TOKEN_AAD: &[u8] = b"boon.page-cursor.token.v6\0";
+const TOKEN_AAD: &[u8] = b"boon.page-cursor.token.v7\0";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct CursorSealingKey([u8; 32]);
@@ -281,7 +282,17 @@ fn encode_semantic_key(output: &mut Vec<u8>, key: &StructuralKey) -> Result<(), 
         match component {
             StructuralValue::Number(value) => {
                 output.push(0);
-                output.extend_from_slice(&value.to_bits().to_be_bytes());
+                output.push(value.sign() as u8);
+                let numerator = value.numerator_magnitude_bytes();
+                let denominator = value.denominator_bytes();
+                let numerator_len =
+                    u32::try_from(numerator.len()).map_err(|_| CursorError::TooLarge)?;
+                let denominator_len =
+                    u32::try_from(denominator.len()).map_err(|_| CursorError::TooLarge)?;
+                output.extend_from_slice(&numerator_len.to_be_bytes());
+                output.extend_from_slice(&numerator);
+                output.extend_from_slice(&denominator_len.to_be_bytes());
+                output.extend_from_slice(&denominator);
             }
             StructuralValue::Text(value) => {
                 output.push(1);
@@ -308,8 +319,18 @@ fn decode_semantic_key(reader: &mut Reader<'_>) -> Result<StructuralKey, CursorE
     for _ in 0..component_count {
         let component = match reader.u8()? {
             0 => {
-                let value = f64::from_bits(reader.u64()?);
-                StructuralValue::number(value).map_err(|_| CursorError::Invalid)?
+                let sign =
+                    ExactNumberSign::try_from(reader.u8()?).map_err(|_| CursorError::Invalid)?;
+                let numerator_len =
+                    usize::try_from(reader.u32()?).map_err(|_| CursorError::Invalid)?;
+                let numerator = reader.take(numerator_len)?.to_vec();
+                let denominator_len =
+                    usize::try_from(reader.u32()?).map_err(|_| CursorError::Invalid)?;
+                let denominator = reader.take(denominator_len)?;
+                StructuralValue::number(
+                    ExactNumber::from_canonical_bytes(sign, &numerator, denominator)
+                        .map_err(|_| CursorError::Invalid)?,
+                )
             }
             1 => {
                 let length = usize::try_from(reader.u32()?).map_err(|_| CursorError::Invalid)?;
@@ -336,7 +357,13 @@ fn hash_value(
     match value {
         Value::Number(value) => {
             hasher.update([0]);
-            hasher.update(value.get().to_bits().to_be_bytes());
+            hasher.update([value.sign() as u8]);
+            let numerator = value.numerator_magnitude_bytes();
+            let denominator = value.denominator_bytes();
+            hasher.update((numerator.len() as u64).to_be_bytes());
+            hasher.update(numerator);
+            hasher.update((denominator.len() as u64).to_be_bytes());
+            hasher.update(denominator);
         }
         Value::Text(value) => hash_bytes(hasher, 1, value.as_bytes()),
         Value::Bytes(value) => hash_bytes(hasher, 2, value),
@@ -488,7 +515,7 @@ mod tests {
             row_id: RowId::from_u128(0x5152_5354_5556_5758_6162_6364_6566_6768),
         };
         let mut expected = b"BPGC".to_vec();
-        expected.push(6);
+        expected.push(7);
         expected.extend_from_slice(&[0x11; 32]);
         expected.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes());
         expected.extend_from_slice(&[0x22; 32]);
@@ -511,7 +538,7 @@ mod tests {
             accepted_offset: 20,
             semantic_key: StructuralKey::new(vec![
                 StructuralValue::text("secret-key"),
-                StructuralValue::number(42.5).unwrap(),
+                StructuralValue::number("42.5".parse().unwrap()),
                 StructuralValue::ClosedTag(ClosedTag::new(TagTypeId::from_u128(7), 1)),
                 StructuralValue::ClosedTag(ClosedTag::new(TagTypeId::from_u128(8), 3)),
             ])

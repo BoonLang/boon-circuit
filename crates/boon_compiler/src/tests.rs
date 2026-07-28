@@ -1585,9 +1585,9 @@ outputs: [
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
     assert!(compiled.plan.constants.iter().any(|constant| {
         matches!(
-            constant.value,
+            &constant.value,
             boon_plan::PlanConstantValue::Number { value }
-                if (value.get() - 59.91).abs() < f64::EPSILON
+                if value == &"59.91".parse::<boon_plan::ExactNumber>().unwrap()
         )
     }));
     assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
@@ -2291,9 +2291,9 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 }
 
 #[test]
-fn compiler_rejects_integer_literals_not_exactly_representable_as_number() {
-    let error = compile_fixture_source_text_to_machine_plan(
-        "inexact-number.bn",
+fn compiler_preserves_arbitrary_precision_integer_literals_exactly() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "exact-large-number.bn",
         r#"
 store: [
     value: 9007199254740993
@@ -2304,12 +2304,17 @@ outputs: [
 "#,
         TargetProfile::SoftwareDefault,
     )
-    .unwrap_err();
-    let error = error.to_string();
-    assert!(
-        error.contains("cannot be represented exactly as a Boon Number"),
-        "unexpected error: {error}"
-    );
+    .unwrap();
+    let expected = "9007199254740993"
+        .parse::<boon_plan::ExactNumber>()
+        .unwrap();
+    assert!(compiled.plan.constants.iter().any(|constant| {
+        matches!(
+            &constant.value,
+            boon_plan::PlanConstantValue::Number { value } if value == &expected
+        )
+    }));
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
 }
 
 #[test]
@@ -5241,7 +5246,7 @@ document: Document/new(
     };
     assert!(matches!(
         &constant.value,
-        boon_plan::PlanConstantValue::Number { value } if value.get() == 0.0
+        boon_plan::PlanConstantValue::Number { value } if value.is_zero()
     ));
 }
 

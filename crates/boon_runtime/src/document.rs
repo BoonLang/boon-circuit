@@ -1,5 +1,6 @@
 use boon_data::{
-    Bytes, NumberTextFormat, format_number_ascii_text, format_number_text, number_bit_width,
+    Bytes, ExactRoundingRule, NumberTextFormat, format_number_ascii_text, format_number_text,
+    number_bit_width,
 };
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
@@ -16,7 +17,7 @@ use boon_plan::{
     DocumentFunctionId, DocumentMaterialization, DocumentMaterializationId,
     DocumentMaterializationSource, DocumentNameId, DocumentPattern, DocumentRead,
     DocumentRowIdentity, DocumentRuntimeLocalBinding, DocumentScalarOp, DocumentTemplateId,
-    FieldId, FiniteReal, ImportId, ListId, MachinePlan, PlanRowExpressionId, ScopeId, SourceId,
+    ExactNumber, FieldId, ImportId, ListId, MachinePlan, PlanRowExpressionId, ScopeId, SourceId,
     ValueRef,
 };
 use boon_plan_executor::{
@@ -1499,7 +1500,7 @@ fn delta_dependency(delta: &Delta) -> Option<(DocumentDependency, Option<&Value>
 enum EvalValue {
     Absent,
     Truth(bool),
-    Number(f64),
+    Number(ExactNumber),
     Text(String),
     Bytes(Bytes),
     Record(BTreeMap<String, EvalValue>),
@@ -1914,7 +1915,7 @@ impl<'a> Evaluator<'a> {
             } => {
                 let left = self.eval(*left, env)?;
                 let right = (*right).map(|value| self.eval(value, env)).transpose()?;
-                Ok(eval_scalar(*operation, left, right))
+                eval_scalar(*operation, left, right)
             }
             DocumentExprOp::Select { input, arms } => {
                 let input = self.eval(*input, env)?;
@@ -1986,19 +1987,20 @@ impl<'a> Evaluator<'a> {
                 _ => None,
             });
         let Some((list, logical_len)) = runtime_list else {
-            return Ok(eval_builtin(builtin, input, arguments));
+            return eval_builtin(builtin, input, arguments);
         };
         match builtin {
             DocumentBuiltin::ListCount | DocumentBuiltin::ListLength => {
-                Ok(EvalValue::Number(logical_len as f64))
+                Ok(EvalValue::Number(ExactNumber::from_u64(logical_len)))
             }
             DocumentBuiltin::ListIsNotEmpty => Ok(EvalValue::Truth(logical_len != 0)),
             DocumentBuiltin::ListGet => {
-                let index = named_number(&arguments, "index").unwrap_or(0.0);
-                if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+                let Some(index) =
+                    named_number(&arguments, "index").and_then(|value| value.to_u64_exact().ok())
+                else {
                     return Ok(EvalValue::Absent);
-                }
-                self.runtime_list_row(list, logical_len, index as u64)
+                };
+                self.runtime_list_row(list, logical_len, index)
             }
             DocumentBuiltin::ListLatest => {
                 if logical_len == 0 {
@@ -2152,7 +2154,11 @@ impl<'a> Evaluator<'a> {
         Ok(match value {
             DocumentConstantValue::Text { value } => EvalValue::Text(value.clone()),
             DocumentConstantValue::Number { coefficient, scale } => {
-                EvalValue::Number(*coefficient as f64 / 10f64.powi(*scale as i32))
+                EvalValue::Number(format!("{coefficient}e-{scale}").parse().map_err(|error| {
+                    DocumentError::InvalidPlan(format!(
+                        "document Number constant is invalid: {error}"
+                    ))
+                })?)
             }
             DocumentConstantValue::Bytes { value } => EvalValue::Bytes(value.clone().into()),
             DocumentConstantValue::Tag { name } => {
@@ -2728,7 +2734,9 @@ impl<'a> Evaluator<'a> {
                         })
                         .or_else(|| {
                             (name == "key")
-                                .then(|| id.map(|id| EvalValue::Number(id.key as f64)))
+                                .then(|| {
+                                    id.map(|id| EvalValue::Number(ExactNumber::from_u64(id.key)))
+                                })
                                 .flatten()
                         })
                         .unwrap_or(EvalValue::Absent)
@@ -3747,7 +3755,7 @@ impl EvalValue {
         match self {
             Self::Absent => String::new(),
             Self::Truth(value) => if *value { "True" } else { "False" }.to_owned(),
-            Self::Number(value) => format_number(*value),
+            Self::Number(value) => value.to_string(),
             Self::Text(value) => value.clone(),
             Self::Bytes(value) => String::from_utf8_lossy(value).into_owned(),
             Self::Record(fields) => fields
@@ -3771,7 +3779,7 @@ impl EvalValue {
     fn truthy(&self) -> bool {
         match self {
             Self::Truth(value) => *value,
-            Self::Number(value) => *value != 0.0,
+            Self::Number(value) => !value.is_zero(),
             Self::Text(value) => !value.is_empty(),
             Self::Bytes(value) => !value.is_empty(),
             Self::Tag(tag, fields) if fields.is_empty() && tag == "False" => false,
@@ -3786,9 +3794,9 @@ impl EvalValue {
         }
     }
 
-    fn number(&self) -> Option<f64> {
+    fn number(&self) -> Option<ExactNumber> {
         match self {
-            Self::Number(value) => Some(*value),
+            Self::Number(value) => Some(value.clone()),
             Self::Text(value) => value.parse().ok(),
             _ => None,
         }
@@ -3848,7 +3856,7 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
     match value {
         EvalValue::Absent => None,
         EvalValue::Truth(value) => Some(Value::truth(*value)),
-        EvalValue::Number(value) => FiniteReal::new(*value).ok().map(Value::Number),
+        EvalValue::Number(value) => Some(Value::Number(value.clone())),
         EvalValue::Text(value) => Some(Value::Text(value.clone())),
         EvalValue::Bytes(value) => Some(Value::Bytes(value.clone())),
         EvalValue::Record(fields) => fields
@@ -3893,7 +3901,7 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
 
 fn machine_value_to_eval(value: Value) -> EvalValue {
     match value {
-        Value::Number(value) => EvalValue::Number(value.get()),
+        Value::Number(value) => EvalValue::Number(value),
         Value::Text(value) => EvalValue::Text(value),
         Value::Bytes(value) => EvalValue::Bytes(value),
         Value::List(values) => {
@@ -3951,32 +3959,30 @@ fn eval_scalar(
     operation: DocumentScalarOp,
     left: EvalValue,
     right: Option<EvalValue>,
-) -> EvalValue {
+) -> Result<EvalValue, DocumentError> {
     let right = right.unwrap_or(EvalValue::Absent);
-    match operation {
+    Ok(match operation {
         DocumentScalarOp::Add => match (left.number(), right.number()) {
-            (Some(left), Some(right)) => EvalValue::Number(left + right),
+            (Some(left), Some(right)) => EvalValue::Number(document_number_result(
+                left.checked_add(&right),
+                "Number addition",
+            )?),
             _ => EvalValue::Text(format!("{}{}", left.text(), right.text())),
         },
-        DocumentScalarOp::Subtract => numeric_binary(left, right, |left, right| left - right),
-        DocumentScalarOp::Multiply => numeric_binary(left, right, |left, right| left * right),
+        DocumentScalarOp::Subtract => {
+            document_numeric_binary(left, right, "Number subtraction", ExactNumber::checked_sub)?
+        }
+        DocumentScalarOp::Multiply => document_numeric_binary(
+            left,
+            right,
+            "Number multiplication",
+            ExactNumber::checked_mul,
+        )?,
         DocumentScalarOp::Divide => {
-            numeric_binary(
-                left,
-                right,
-                |left, right| {
-                    if right == 0.0 { 0.0 } else { left / right }
-                },
-            )
+            document_numeric_binary(left, right, "Number division", ExactNumber::checked_div)?
         }
         DocumentScalarOp::Remainder => {
-            numeric_binary(
-                left,
-                right,
-                |left, right| {
-                    if right == 0.0 { 0.0 } else { left % right }
-                },
-            )
+            document_numeric_binary(left, right, "Number remainder", ExactNumber::checked_rem)?
         }
         DocumentScalarOp::Equal => EvalValue::Truth(eval_values_equal(&left, &right)),
         DocumentScalarOp::NotEqual => EvalValue::Truth(!eval_values_equal(&left, &right)),
@@ -3988,20 +3994,43 @@ fn eval_scalar(
         }
         DocumentScalarOp::And => EvalValue::Truth(left.truthy() && right.truthy()),
         DocumentScalarOp::Or => EvalValue::Truth(left.truthy() || right.truthy()),
-        DocumentScalarOp::Negate => EvalValue::Number(-left.number().unwrap_or(0.0)),
+        DocumentScalarOp::Negate => {
+            let value = left.number().ok_or_else(|| {
+                DocumentError::Evaluation("Number negation requires one Number".to_owned())
+            })?;
+            EvalValue::Number(document_number_result(
+                ExactNumber::zero().checked_sub(&value),
+                "Number negation",
+            )?)
+        }
         DocumentScalarOp::Not => EvalValue::Truth(!left.truthy()),
-    }
+    })
 }
 
 fn eval_values_equal(left: &EvalValue, right: &EvalValue) -> bool {
     left == right
 }
 
-fn numeric_binary(left: EvalValue, right: EvalValue, apply: impl Fn(f64, f64) -> f64) -> EvalValue {
-    EvalValue::Number(apply(
-        left.number().unwrap_or(0.0),
-        right.number().unwrap_or(0.0),
-    ))
+fn document_numeric_binary(
+    left: EvalValue,
+    right: EvalValue,
+    context: &str,
+    apply: impl Fn(&ExactNumber, &ExactNumber) -> Result<ExactNumber, boon_data::ExactNumberError>,
+) -> Result<EvalValue, DocumentError> {
+    let left = left.number().ok_or_else(|| {
+        DocumentError::Evaluation(format!("{context} left operand is not a Number"))
+    })?;
+    let right = right.number().ok_or_else(|| {
+        DocumentError::Evaluation(format!("{context} right operand is not a Number"))
+    })?;
+    document_number_result(apply(&left, &right), context).map(EvalValue::Number)
+}
+
+fn document_number_result(
+    value: Result<ExactNumber, boon_data::ExactNumberError>,
+    context: &str,
+) -> Result<ExactNumber, DocumentError> {
+    value.map_err(|error| DocumentError::Evaluation(format!("{context}: {error}")))
 }
 
 fn compare_binary(
@@ -4010,7 +4039,7 @@ fn compare_binary(
     apply: impl Fn(std::cmp::Ordering) -> bool,
 ) -> EvalValue {
     let ordering = match (left.number(), right.number()) {
-        (Some(left), Some(right)) => left.total_cmp(&right),
+        (Some(left), Some(right)) => left.cmp(&right),
         _ => left.text().cmp(&right.text()),
     };
     EvalValue::Truth(apply(ordering))
@@ -4020,29 +4049,32 @@ fn eval_builtin(
     builtin: DocumentBuiltin,
     input: Option<EvalValue>,
     arguments: Vec<(String, EvalValue)>,
-) -> EvalValue {
+) -> Result<EvalValue, DocumentError> {
     let has_input = input.is_some();
     let mut values = input
         .into_iter()
         .chain(arguments.iter().map(|(_, value)| value.clone()));
     let first = values.next().unwrap_or(EvalValue::Absent);
-    match builtin {
+    Ok(match builtin {
         DocumentBuiltin::BoolAnd => {
             EvalValue::Truth(first.truthy() && values.all(|value| value.truthy()))
         }
         DocumentBuiltin::BoolNot | DocumentBuiltin::BoolToggle => EvalValue::Truth(!first.truthy()),
         DocumentBuiltin::BytesFind => {
             let needle = values.next().unwrap_or(EvalValue::Absent).text();
-            EvalValue::Number(first.text().find(&needle).unwrap_or(usize::MAX) as f64)
+            EvalValue::Number(ExactNumber::from_usize(
+                first.text().find(&needle).unwrap_or(usize::MAX),
+            ))
         }
         DocumentBuiltin::BytesSlice | DocumentBuiltin::TextSubstring => {
             let text = first.text();
             let start = named_number(&arguments, "from")
                 .or_else(|| named_number(&arguments, "start"))
-                .unwrap_or(0.0) as usize;
+                .and_then(|value| value.to_usize_exact().ok())
+                .unwrap_or(0);
             let end = named_number(&arguments, "to")
                 .or_else(|| named_number(&arguments, "end"))
-                .map(|value| value as usize)
+                .and_then(|value| value.to_usize_exact().ok())
                 .unwrap_or(text.len());
             EvalValue::Text(
                 text.chars()
@@ -4060,13 +4092,9 @@ fn eval_builtin(
         DocumentBuiltin::NumberToAsciiText => EvalValue::Text(
             first
                 .number()
-                .and_then(|value| FiniteReal::new(value).ok())
                 .map(|value| {
-                    format_number_ascii_text(
-                        value,
-                        named_number(&arguments, "width")
-                            .and_then(|width| FiniteReal::new(width).ok()),
-                    )
+                    let width = named_number(&arguments, "width");
+                    format_number_ascii_text(&value, width.as_ref())
                 })
                 .unwrap_or_else(|| "?".to_owned()),
         ),
@@ -4080,7 +4108,10 @@ fn eval_builtin(
             EvalValue::List(list)
         }
         DocumentBuiltin::ListChunk => {
-            let size = named_number(&arguments, "size").unwrap_or(1.0).max(1.0) as usize;
+            let size = named_number(&arguments, "size")
+                .and_then(|value| value.to_usize_exact().ok())
+                .unwrap_or(1)
+                .max(1);
             match first {
                 EvalValue::List(values) => EvalValue::List(
                     values
@@ -4093,12 +4124,14 @@ fn eval_builtin(
         }
         DocumentBuiltin::ListCount | DocumentBuiltin::ListLength => {
             EvalValue::Number(match first {
-                EvalValue::List(values) => values.len() as f64,
-                _ => 0.0,
+                EvalValue::List(values) => ExactNumber::from_usize(values.len()),
+                _ => ExactNumber::zero(),
             })
         }
         DocumentBuiltin::ListGet => {
-            let index = named_number(&arguments, "index").unwrap_or(0.0) as usize;
+            let index = named_number(&arguments, "index")
+                .and_then(|value| value.to_usize_exact().ok())
+                .unwrap_or(0);
             match first {
                 EvalValue::List(mut values) if index < values.len() => values.remove(index),
                 _ => EvalValue::Absent,
@@ -4113,50 +4146,67 @@ fn eval_builtin(
             value => value,
         },
         DocumentBuiltin::ListRange => {
-            let from = named_number(&arguments, "from").unwrap_or(0.0) as i64;
-            let to = named_number(&arguments, "to").unwrap_or(from as f64) as i64;
+            let from = named_number(&arguments, "from")
+                .and_then(|value| value.to_i64_exact().ok())
+                .unwrap_or(0);
+            let to = named_number(&arguments, "to")
+                .and_then(|value| value.to_i64_exact().ok())
+                .unwrap_or(from);
             EvalValue::List(
                 (from..=to)
-                    .map(|value| EvalValue::Number(value as f64))
+                    .map(|value| EvalValue::Number(ExactNumber::from_i64(value)))
                     .collect(),
             )
         }
         DocumentBuiltin::ListSortBy => first,
-        DocumentBuiltin::ListSum => EvalValue::Number(match first {
-            EvalValue::List(values) => values.iter().filter_map(EvalValue::number).sum(),
-            value => value.number().unwrap_or(0.0),
-        }),
-        DocumentBuiltin::NumberBitWidth => EvalValue::Number(
-            first
-                .number()
-                .and_then(|value| FiniteReal::new(value).ok())
-                .and_then(|value| number_bit_width(value).ok())
-                .map(FiniteReal::get)
-                .unwrap_or(0.0),
-        ),
-        DocumentBuiltin::NumberCeil => EvalValue::Number(first.number().unwrap_or(0.0).ceil()),
-        DocumentBuiltin::NumberFloor => EvalValue::Number(first.number().unwrap_or(0.0).floor()),
+        DocumentBuiltin::ListSum => {
+            let numbers = match first {
+                EvalValue::List(values) => values
+                    .iter()
+                    .filter_map(EvalValue::number)
+                    .collect::<Vec<_>>(),
+                value => value.number().into_iter().collect(),
+            };
+            let mut sum = ExactNumber::zero();
+            for value in numbers {
+                sum = document_number_result(sum.checked_add(&value), "List/sum")?;
+            }
+            EvalValue::Number(sum)
+        }
+        DocumentBuiltin::NumberBitWidth => {
+            let value = first.number().unwrap_or_else(ExactNumber::zero);
+            EvalValue::Number(
+                number_bit_width(&value)
+                    .map_err(|error| DocumentError::Evaluation(error.to_string()))?,
+            )
+        }
+        DocumentBuiltin::NumberCeil => {
+            EvalValue::Number(first.number().unwrap_or_else(ExactNumber::zero).ceil())
+        }
+        DocumentBuiltin::NumberFloor => {
+            EvalValue::Number(first.number().unwrap_or_else(ExactNumber::zero).floor())
+        }
         DocumentBuiltin::NumberInterpolate => first,
-        DocumentBuiltin::NumberMax => EvalValue::Number(
-            std::iter::once(first.number().unwrap_or(0.0))
-                .chain(values.filter_map(|value| value.number()))
-                .fold(f64::NEG_INFINITY, f64::max),
-        ),
-        DocumentBuiltin::NumberMin => EvalValue::Number(
-            std::iter::once(first.number().unwrap_or(0.0))
-                .chain(values.filter_map(|value| value.number()))
-                .fold(f64::INFINITY, f64::min),
-        ),
+        DocumentBuiltin::NumberMax => {
+            let mut result = first.number().unwrap_or_else(ExactNumber::zero);
+            for value in values.filter_map(|value| value.number()) {
+                result = result.max(value);
+            }
+            EvalValue::Number(result)
+        }
+        DocumentBuiltin::NumberMin => {
+            let mut result = first.number().unwrap_or_else(ExactNumber::zero);
+            for value in values.filter_map(|value| value.number()) {
+                result = result.min(value);
+            }
+            EvalValue::Number(result)
+        }
         DocumentBuiltin::NumberProjectOffset
         | DocumentBuiltin::NumberProjectTime
         | DocumentBuiltin::NumberProjectWidth => EvalValue::Text(first.text()),
         DocumentBuiltin::NumberToText => {
             let integer_argument = |name: &str| {
-                named_number(&arguments, name).and_then(|value| {
-                    FiniteReal::new(value)
-                        .ok()
-                        .and_then(|value| value.to_i64_exact().ok())
-                })
+                named_number(&arguments, name).and_then(|value| value.to_i64_exact().ok())
             };
             let format = NumberTextFormat {
                 radix: integer_argument("radix")
@@ -4173,13 +4223,20 @@ fn eval_builtin(
             };
             first
                 .number()
-                .and_then(|value| FiniteReal::new(value).ok())
-                .and_then(|value| format_number_text(value, format).ok())
+                .and_then(|value| format_number_text(&value, format).ok())
                 .map(EvalValue::Text)
                 .unwrap_or(EvalValue::Absent)
         }
-        DocumentBuiltin::NumberRound => EvalValue::Number(first.number().unwrap_or(0.0).round()),
-        DocumentBuiltin::NumberTruncate => EvalValue::Number(first.number().unwrap_or(0.0).trunc()),
+        DocumentBuiltin::NumberRound => {
+            let value = first.number().unwrap_or_else(ExactNumber::zero);
+            EvalValue::Number(document_number_result(
+                value.round_to(&ExactNumber::one(), ExactRoundingRule::NearestAwayFromZero),
+                "Number/round",
+            )?)
+        }
+        DocumentBuiltin::NumberTruncate => {
+            EvalValue::Number(first.number().unwrap_or_else(ExactNumber::zero).truncate())
+        }
         DocumentBuiltin::TextAllCharsIn => {
             let allowed = values.next().unwrap_or(EvalValue::Absent).text();
             EvalValue::Truth(
@@ -4235,7 +4292,9 @@ fn eval_builtin(
                 .join("\n"),
             value => value.text(),
         }),
-        DocumentBuiltin::TextLength => EvalValue::Number(first.text().chars().count() as f64),
+        DocumentBuiltin::TextLength => {
+            EvalValue::Number(ExactNumber::from_usize(first.text().chars().count()))
+        }
         DocumentBuiltin::TextSpace => EvalValue::Text(" ".to_owned()),
         DocumentBuiltin::TextTimeRangeLabel => {
             let end = named_value(&arguments, "end")
@@ -4248,9 +4307,11 @@ fn eval_builtin(
         }
         DocumentBuiltin::TextToBytes => EvalValue::Bytes(first.text().into_bytes().into()),
         DocumentBuiltin::TextToLowercase => EvalValue::Text(first.text().to_lowercase()),
-        DocumentBuiltin::TextToNumber => {
-            EvalValue::Number(first.text().parse().unwrap_or_default())
-        }
+        DocumentBuiltin::TextToNumber => first
+            .text()
+            .parse()
+            .map(EvalValue::Number)
+            .unwrap_or(EvalValue::Absent),
         DocumentBuiltin::TextToUppercase => EvalValue::Text(first.text().to_uppercase()),
         DocumentBuiltin::TextTrim => EvalValue::Text(first.text().trim().to_owned()),
         DocumentBuiltin::LightAmbient
@@ -4264,7 +4325,7 @@ fn eval_builtin(
         | DocumentBuiltin::LogInfo
         | DocumentBuiltin::UlidGenerate
         | DocumentBuiltin::UrlEncode => first,
-    }
+    })
 }
 
 fn named_value<'a>(arguments: &'a [(String, EvalValue)], name: &str) -> Option<&'a EvalValue> {
@@ -4273,7 +4334,7 @@ fn named_value<'a>(arguments: &'a [(String, EvalValue)], name: &str) -> Option<&
         .find_map(|(candidate, value)| (candidate == name).then_some(value))
 }
 
-fn named_number(arguments: &[(String, EvalValue)], name: &str) -> Option<f64> {
+fn named_number(arguments: &[(String, EvalValue)], name: &str) -> Option<ExactNumber> {
     named_value(arguments, name).and_then(EvalValue::number)
 }
 
@@ -4372,7 +4433,10 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
                 program.source = value.text();
             }
             "revision" => {
-                program.revision = value.number().unwrap_or(0.0).max(0.0) as u64;
+                program.revision = value
+                    .number()
+                    .and_then(|value| value.to_u64_exact().ok())
+                    .unwrap_or(0);
             }
             "artifact_id" => {
                 program.artifact_id = value.text();
@@ -4397,7 +4461,10 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
                 program.bootstrap_support_sources = embedded_program_source_units(&value);
             }
             "bootstrap_revision" => {
-                program.bootstrap_revision = value.number().unwrap_or(0.0).max(0.0) as u64;
+                program.bootstrap_revision = value
+                    .number()
+                    .and_then(|value| value.to_u64_exact().ok())
+                    .unwrap_or(0);
             }
             "capability_profile" => {
                 program.capability_profile = match value.text().as_str() {
@@ -4460,9 +4527,11 @@ fn text_input_focus_request(value: &EvalValue) -> Option<TextInputFocusRequest> 
 }
 
 fn positive_integral_u64(value: &EvalValue) -> Option<u64> {
-    let value = value.number()?;
-    (value.is_finite() && value >= 1.0 && value <= u64::MAX as f64 && value.fract() == 0.0)
-        .then_some(value as u64)
+    value
+        .number()?
+        .to_u64_exact()
+        .ok()
+        .filter(|value| *value > 0)
 }
 
 fn embedded_program_source_units(value: &EvalValue) -> Vec<EmbeddedProgramSourceUnit> {
@@ -4830,7 +4899,9 @@ fn map_required_bool(
 
 fn map_number(value: &EvalValue, path: &str) -> Result<f64, DocumentError> {
     match value {
-        EvalValue::Number(value) => Ok(*value),
+        EvalValue::Number(value) => value
+            .to_f64_host_rounded()
+            .map_err(|_| map_evaluation_error(path, "is outside the finite render boundary")),
         _ => Err(map_evaluation_error(path, "must be a number")),
     }
 }
@@ -4853,37 +4924,42 @@ fn map_bool(value: &EvalValue, path: &str) -> Result<bool, DocumentError> {
 }
 
 fn map_u8(value: &EvalValue, path: &str) -> Result<u8, DocumentError> {
-    map_integral_number(value, path, 0.0, f64::from(u8::MAX)).map(|value| value as u8)
+    exact_integral_number(value, path)?
+        .to_u64_exact()
+        .ok()
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or_else(|| map_evaluation_error(path, "is outside the u8 range"))
 }
 
 fn map_u16(value: &EvalValue, path: &str) -> Result<u16, DocumentError> {
-    map_integral_number(value, path, 0.0, f64::from(u16::MAX)).map(|value| value as u16)
+    exact_integral_number(value, path)?
+        .to_u64_exact()
+        .ok()
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| map_evaluation_error(path, "is outside the u16 range"))
 }
 
 fn map_u64(value: &EvalValue, path: &str) -> Result<u64, DocumentError> {
-    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-    map_integral_number(value, path, 0.0, MAX_SAFE_INTEGER).map(|value| value as u64)
+    exact_integral_number(value, path)?
+        .to_u64_exact()
+        .map_err(|_| map_evaluation_error(path, "is outside the u64 range"))
 }
 
 fn map_i32(value: &EvalValue, path: &str) -> Result<i32, DocumentError> {
-    map_integral_number(value, path, f64::from(i32::MIN), f64::from(i32::MAX))
-        .map(|value| value as i32)
+    exact_integral_number(value, path)?
+        .to_i64_exact()
+        .ok()
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| map_evaluation_error(path, "is outside the i32 range"))
 }
 
-fn map_integral_number(
-    value: &EvalValue,
+fn exact_integral_number<'a>(
+    value: &'a EvalValue,
     path: &str,
-    minimum: f64,
-    maximum: f64,
-) -> Result<f64, DocumentError> {
-    let value = map_number(value, path)?;
-    if value.is_finite() && value.fract() == 0.0 && value >= minimum && value <= maximum {
-        Ok(value)
-    } else {
-        Err(map_evaluation_error(
-            path,
-            format!("must be an integer within {minimum}..={maximum}"),
-        ))
+) -> Result<&'a ExactNumber, DocumentError> {
+    match value {
+        EvalValue::Number(value) if value.is_whole() => Ok(value),
+        _ => Err(map_evaluation_error(path, "must be a whole Number")),
     }
 }
 
@@ -5178,7 +5254,7 @@ fn lower_nested_scalars(prefix: &str, value: &EvalValue, style: &mut StyleMap) {
 fn scalar_style_value(value: &EvalValue) -> Option<StyleValue> {
     match value {
         EvalValue::Truth(value) => Some(StyleValue::Bool(*value)),
-        EvalValue::Number(value) => Some(StyleValue::Number(*value)),
+        EvalValue::Number(value) => value.to_f64_host_rounded().ok().map(StyleValue::Number),
         EvalValue::Text(value) => Some(StyleValue::Text(value.clone())),
         EvalValue::Tag(_, _) => Some(StyleValue::Text(value.text())),
         _ => None,
@@ -5456,15 +5532,6 @@ fn frame_node_id(plan_id: u64, instance: Option<&str>) -> FrameNodeId {
 fn clamp_range(range: Range<u64>, len: usize) -> Range<u64> {
     let len = len as u64;
     range.start.min(len)..range.end.min(len).max(range.start.min(len))
-}
-
-fn format_number(value: f64) -> String {
-    if value.fract().abs() < f64::EPSILON {
-        format!("{value:.0}")
-    } else {
-        let value = format!("{value:.12}");
-        value.trim_end_matches('0').trim_end_matches('.').to_owned()
-    }
 }
 
 fn format_record(tag: Option<&str>, fields: &BTreeMap<String, EvalValue>) -> String {
@@ -5871,10 +5938,19 @@ mod tests {
         )
     }
 
+    fn eval_number(value: impl ToString) -> EvalValue {
+        EvalValue::Number(
+            value
+                .to_string()
+                .parse()
+                .expect("test Number must be exact and canonical"),
+        )
+    }
+
     fn eval_position(longitude: f64, latitude: f64) -> EvalValue {
         eval_record([
-            ("longitude", EvalValue::Number(longitude)),
-            ("latitude", EvalValue::Number(latitude)),
+            ("longitude", eval_number(longitude)),
+            ("latitude", eval_number(latitude)),
         ])
     }
 
@@ -5889,7 +5965,7 @@ mod tests {
                 "hit_identity".to_owned(),
                 EvalValue::Text(format!("hit-{id}")),
             ),
-            ("z_order".to_owned(), EvalValue::Number(3.0)),
+            ("z_order".to_owned(), eval_number(3)),
             ("selected".to_owned(), EvalValue::Truth(false)),
         ]);
         fields.extend(
@@ -5908,13 +5984,13 @@ mod tests {
                 "point",
                 [
                     ("position", eval_position(-1.0, 1.0)),
-                    ("radius", EvalValue::Number(7.0)),
+                    ("radius", eval_number(7)),
                     ("symbol_ref", EvalValue::Text("circle".to_owned())),
                     (
                         "paint",
                         eval_record([
                             ("fill", EvalValue::Text("#267a66".to_owned())),
-                            ("opacity", EvalValue::Number(0.8)),
+                            ("opacity", eval_number("0.8")),
                         ]),
                     ),
                 ],
@@ -5924,8 +6000,8 @@ mod tests {
                 "cluster",
                 [
                     ("position", eval_position(1.0, 1.0)),
-                    ("count", EvalValue::Number(12.0)),
-                    ("radius", EvalValue::Number(15.0)),
+                    ("count", eval_number(12)),
+                    ("radius", eval_number(15)),
                 ],
             ),
             eval_overlay(
@@ -5954,28 +6030,28 @@ mod tests {
                 [
                     ("position", eval_position(0.0, 0.0)),
                     ("text", EvalValue::Text("Origin".to_owned())),
-                    ("collision_priority", EvalValue::Number(100.0)),
-                    ("font_size", EvalValue::Number(14.0)),
+                    ("collision_priority", eval_number(100)),
+                    ("font_size", eval_number(14)),
                 ],
             ),
         ]);
         let descriptor = evaluate_map_viewport_descriptor(vec![
-            (DocumentArgumentRole::MapGeneration, EvalValue::Number(9.0)),
+            (DocumentArgumentRole::MapGeneration, eval_number(9)),
             (
                 DocumentArgumentRole::MapCamera,
                 eval_record([
-                    ("longitude", EvalValue::Number(0.0)),
-                    ("latitude", EvalValue::Number(0.0)),
-                    ("zoom", EvalValue::Number(2.5)),
-                    ("bearing", EvalValue::Number(15.0)),
+                    ("longitude", eval_number(0)),
+                    ("latitude", eval_number(0)),
+                    ("zoom", eval_number("2.5")),
+                    ("bearing", eval_number(15)),
                 ]),
             ),
             (
                 DocumentArgumentRole::MapBounds,
                 eval_record([
-                    ("width", EvalValue::Number(720.0)),
-                    ("height", EvalValue::Number(480.0)),
-                    ("scale", EvalValue::Number(1.25)),
+                    ("width", eval_number(720)),
+                    ("height", eval_number(480)),
+                    ("scale", eval_number("1.25")),
                 ]),
             ),
             (
@@ -5986,9 +6062,9 @@ mod tests {
                         "url_template_capability",
                         EvalValue::Text("fixture_xyz".to_owned()),
                     ),
-                    ("min_zoom", EvalValue::Number(0.0)),
-                    ("max_zoom", EvalValue::Number(6.0)),
-                    ("tile_size", EvalValue::Number(256.0)),
+                    ("min_zoom", eval_number(0)),
+                    ("max_zoom", eval_number(6)),
+                    ("tile_size", eval_number(256)),
                     ("attribution", EvalValue::Text("Fixture tiles".to_owned())),
                     (
                         "allowed_origins",
@@ -6157,7 +6233,7 @@ mod tests {
                     "input_id".to_owned(),
                     EvalValue::Text("profile-source".to_owned()),
                 ),
-                ("line".to_owned(), EvalValue::Number(7.0)),
+                ("line".to_owned(), eval_number(7)),
                 ("column".to_owned(), EvalValue::Text("3".to_owned())),
             ])),
         );
@@ -6171,7 +6247,7 @@ mod tests {
         );
         assert!(!diagnostic.style.contains_key("activate_focus"));
 
-        for invalid_line in [EvalValue::Number(0.0), EvalValue::Number(1.5)] {
+        for invalid_line in [eval_number(0), eval_number("1.5")] {
             let mut invalid = DocumentNode::new("invalid", DocumentNodeKind::Button);
             apply_value_argument(
                 &mut invalid,
@@ -6182,7 +6258,7 @@ mod tests {
                         EvalValue::Text("profile-source".to_owned()),
                     ),
                     ("line".to_owned(), invalid_line),
-                    ("column".to_owned(), EvalValue::Number(1.0)),
+                    ("column".to_owned(), eval_number(1)),
                 ])),
             );
             assert_eq!(invalid.activation_focus, None);
@@ -6209,7 +6285,7 @@ mod tests {
             ("address".to_owned(), EvalValue::Truth(true)),
             ("unrelated".to_owned(), EvalValue::Text("hidden".to_owned())),
         ]));
-        let explicit_target = EvalValue::Number(7.0);
+        let explicit_target = eval_number(7);
         let explicit_address = EvalValue::Tag("row-7".to_owned(), BTreeMap::new());
         let forward = resolve_semantic_metadata([
             ("style", DocumentArgumentRole::StaticStyle, &style),
@@ -6360,12 +6436,13 @@ mod tests {
         assert_eq!(
             eval_builtin(
                 DocumentBuiltin::TextConcat,
-                Some(EvalValue::Number(3.0)),
+                Some(eval_number(3)),
                 vec![
                     ("with".to_owned(), EvalValue::Text("items left".to_owned())),
                     ("separator".to_owned(), EvalValue::Text(" ".to_owned())),
                 ],
-            ),
+            )
+            .unwrap(),
             EvalValue::Text("3 items left".to_owned())
         );
     }
@@ -6375,12 +6452,13 @@ mod tests {
         assert_eq!(
             eval_builtin(
                 DocumentBuiltin::TextTimeRangeLabel,
-                Some(EvalValue::Number(0.0)),
+                Some(eval_number(0)),
                 vec![
-                    ("end".to_owned(), EvalValue::Number(240.0)),
+                    ("end".to_owned(), eval_number(240)),
                     ("unit".to_owned(), EvalValue::Text("ns".to_owned())),
                 ],
-            ),
+            )
+            .unwrap(),
             EvalValue::Text("0 ns - 240 ns".to_owned())
         );
     }
@@ -6390,15 +6468,16 @@ mod tests {
         let ascii = |value, width| {
             eval_builtin(
                 DocumentBuiltin::NumberToAsciiText,
-                Some(EvalValue::Number(value)),
-                vec![("width".to_owned(), EvalValue::Number(width))],
+                Some(eval_number(value)),
+                vec![("width".to_owned(), eval_number(width))],
             )
+            .unwrap()
         };
-        assert_eq!(ascii(0x48 as f64, 8.0), EvalValue::Text("H".to_owned()));
-        assert_eq!(ascii(0x4845 as f64, 16.0), EvalValue::Text("HE".to_owned()));
-        assert_eq!(ascii(0.0, 7.0), EvalValue::Text("-".to_owned()));
-        assert_eq!(ascii(0.0, 8.0), EvalValue::Text("?".to_owned()));
-        assert_eq!(ascii(1.0, 8.0), EvalValue::Text("?".to_owned()));
+        assert_eq!(ascii(0x48, 8), EvalValue::Text("H".to_owned()));
+        assert_eq!(ascii(0x4845, 16), EvalValue::Text("HE".to_owned()));
+        assert_eq!(ascii(0, 7), EvalValue::Text("-".to_owned()));
+        assert_eq!(ascii(0, 8), EvalValue::Text("?".to_owned()));
+        assert_eq!(ascii(1, 8), EvalValue::Text("?".to_owned()));
     }
 
     #[test]
@@ -6411,8 +6490,8 @@ mod tests {
                     "sizing".to_owned(),
                     EvalValue::Tag("Fill".to_owned(), BTreeMap::new()),
                 ),
-                ("minimum".to_owned(), EvalValue::Number(230.0)),
-                ("maximum".to_owned(), EvalValue::Number(552.0)),
+                ("minimum".to_owned(), eval_number(230)),
+                ("maximum".to_owned(), eval_number(552)),
             ])),
             &mut style,
         );

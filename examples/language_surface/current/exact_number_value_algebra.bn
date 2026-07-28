@@ -1,0 +1,5 @@
+-- Exact rational literals and arithmetic share one canonical Number algebra.
+whole: 9007199254740993
+rational_decimal: 1.25
+decimal_identity: 0.1 + 0.2 == 0.3
+rational_identity: 1 / 3 * 3 == 1

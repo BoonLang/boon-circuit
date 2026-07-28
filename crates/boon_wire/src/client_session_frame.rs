@@ -116,6 +116,7 @@ impl Default for ClientSessionFrameLimits {
                 max_collection_length: 4 * 1024,
                 max_text_bytes: 64 * 1024,
                 max_byte_string_bytes: 128 * 1024,
+                max_number_component_bytes: 128 * 1024,
             },
         }
     }
@@ -910,7 +911,7 @@ mod tests {
         data_golden.extend_from_slice(&[ClientSessionDataOperation::Current as u8, 0xf6]);
         data_golden.extend_from_slice(&[0x11, 0xf6]);
         data_golden.extend_from_slice(&[
-            0x4b, b'B', b'W', b'V', 0x02, 0x05, 0x04, b'N', b'u', b'l', b'l', 0x00,
+            0x4b, b'B', b'W', b'V', 0x03, 0x05, 0x04, b'N', b'u', b'l', b'l', 0x00,
         ]);
         assert_eq!(
             encode_client_session_frame(&data, limits).unwrap(),

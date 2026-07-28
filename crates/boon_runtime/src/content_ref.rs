@@ -1,4 +1,4 @@
-use boon_plan::FiniteReal;
+use boon_plan::ExactNumber;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -67,11 +67,7 @@ impl ContentRef {
     }
 
     pub fn value(&self) -> Result<Value, ContentRefError> {
-        let size = i64::try_from(self.size)
-            .map_err(|_| ContentRefError::new("content size exceeds the Boon Number range"))?;
-        let size = FiniteReal::from_i64_exact(size).map_err(|_| {
-            ContentRefError::new("content size is not exactly representable as a Boon Number")
-        })?;
+        let size = ExactNumber::from_u64(self.size);
         Ok(Value::Record(BTreeMap::from([
             (
                 "digest".to_owned(),

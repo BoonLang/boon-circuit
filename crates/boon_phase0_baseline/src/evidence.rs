@@ -28,7 +28,7 @@ pub const REQUIRED_FIXTURE_DATASET_IDS: &[(&str, &[&str])] = &[
         "exact-arithmetic",
         &[
             "correctness.exact-arithmetic-current.v1",
-            "correctness.future-exact-integer-rejection.v1",
+            "correctness.exact-integer-current.v1",
         ],
     ),
     (

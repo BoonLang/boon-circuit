@@ -1,5 +1,4 @@
--- Phase 0 deliberately records the current binary64 behavior. This is not an
--- exact-Number conformance source.
-large_integer: 9007199254740992
+-- Exact Number conformance source retained by the executable foundation gate.
+large_integer: 9007199254740993
 decimal_sum: 0.1 + 0.2
 rational_analogue: 1 / 3

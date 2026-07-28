@@ -5,7 +5,8 @@ use crate::cursor::{
 };
 use crate::effect_stream::TransientEffectSemanticValidator;
 use boon_data::{
-    Bytes, NumberTextFormat, format_number_ascii_text, format_number_text, number_bit_width,
+    Bytes, ExactRoundingRule, NumberTextFormat, format_number_ascii_text, format_number_text,
+    number_bit_width,
 };
 use boon_list_access::{
     AccessError, AccessMetrics, AccessStream, ClosedTag as AccessClosedTag,
@@ -17,7 +18,7 @@ use boon_list_access::{
 };
 use boon_plan::{
     DataTypePlan, DistributedArgumentId, DistributedCallInstanceId, DistributedCallInstanceRow,
-    DistributedCallMode, EffectInvocationId, EffectInvocationPlan, ExportId, FieldId, FiniteReal,
+    DistributedCallMode, EffectInvocationId, EffectInvocationPlan, ExactNumber, ExportId, FieldId,
     ImportId, ListId, ListInitializerKind, ListStorageSlot, MachinePlan, OutputListFieldRef,
     OwnerInstanceRoute, OwnerInstanceRow, PlanBoundedListPage, PlanConstantId, PlanConstantValue,
     PlanContextualIndexedAccess, PlanContextualOperationKind, PlanDerivedExpression,
@@ -111,7 +112,7 @@ impl fmt::Debug for HostValueBinding {
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[cfg_attr(not(feature = "phase0-instrumentation"), derive(Clone))]
 pub enum Value {
-    Number(FiniteReal),
+    Number(ExactNumber),
     Text(String),
     Bytes(Bytes),
     List(Vec<Value>),
@@ -451,9 +452,7 @@ pub struct ExpressionLocalBinding {
 
 impl Value {
     pub fn integer(value: i64) -> Result<Self, Error> {
-        FiniteReal::from_i64_exact(value)
-            .map(Self::Number)
-            .map_err(|error| Error::Evaluation(error.to_string()))
+        Ok(Self::Number(ExactNumber::from_i64(value)))
     }
 
     pub fn from_data(value: &boon_data::Value) -> Self {
@@ -3730,10 +3729,7 @@ fn ordered_index_schema(plan: &PlanListIndex) -> Result<KeySchema, Error> {
 
 fn structural_index_value(plan: &PlanListIndexKey, value: Value) -> Result<StructuralValue, Error> {
     match (plan.kind, value) {
-        (PlanListIndexKeyKind::Number, Value::Number(value)) => {
-            StructuralValue::number(value.get())
-                .map_err(|error| Error::Evaluation(error.to_string()))
-        }
+        (PlanListIndexKeyKind::Number, Value::Number(value)) => Ok(StructuralValue::number(value)),
         (PlanListIndexKeyKind::Text, Value::Text(value)) => Ok(StructuralValue::text(value)),
         (PlanListIndexKeyKind::ClosedTag { type_id }, Value::Tag { tag: value, fields })
             if fields.is_empty() =>
@@ -5087,7 +5083,7 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
         PlanConstantValue::Text { value } => Ok(Value::Text(value.clone())),
         PlanConstantValue::Tag { name } => Ok(Value::tag(name)),
         PlanConstantValue::Data { value } => Ok(runtime_value_from_data(value)),
-        PlanConstantValue::Number { value } => Ok(Value::Number(*value)),
+        PlanConstantValue::Number { value } => Ok(Value::Number(value.clone())),
         PlanConstantValue::Bytes {
             byte_len,
             inline_bytes,
@@ -5109,7 +5105,7 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
 
 fn runtime_value_from_data(value: &boon_data::Value) -> Value {
     match value {
-        boon_data::Value::Number(value) => Value::Number(*value),
+        boon_data::Value::Number(value) => Value::Number(value.clone()),
         boon_data::Value::Text(value) => Value::Text(value.clone()),
         boon_data::Value::Bytes(value) => Value::Bytes(value.clone()),
         boon_data::Value::List(values) => {
@@ -5133,7 +5129,7 @@ fn runtime_value_from_data(value: &boon_data::Value) -> Value {
 
 fn runtime_value_to_data(value: &Value) -> Result<boon_data::Value, Error> {
     Ok(match value {
-        Value::Number(value) => boon_data::Value::Number(*value),
+        Value::Number(value) => boon_data::Value::Number(value.clone()),
         Value::Text(value) => boon_data::Value::Text(value.clone()),
         Value::Bytes(value) => boon_data::Value::Bytes(value.clone()),
         Value::List(values) => boon_data::Value::List(
@@ -5296,7 +5292,7 @@ fn durable_owner_for_rows(
 
 pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValue, Error> {
     match value {
-        Value::Number(value) => Ok(boon_persistence::StoredValue::Number(*value)),
+        Value::Number(value) => Ok(boon_persistence::StoredValue::Number(value.clone())),
         Value::Text(value) => Ok(boon_persistence::StoredValue::Text(value.clone())),
         Value::Bytes(value) => Ok(boon_persistence::StoredValue::Bytes(value.clone())),
         Value::List(values) => values
@@ -6986,7 +6982,7 @@ enum ExpressionTask<'event, 'plan> {
     DerivedBoolNotAfterValue,
     DerivedNumberCompareAfterValue {
         op: PlanInfixOp,
-        right: FiniteReal,
+        right: ExactNumber,
     },
     DerivedValueCompareAfterLeft {
         op: PlanInfixOp,
@@ -20856,7 +20852,7 @@ impl MachineInstance {
                                     stack.push_task(
                                         ExpressionTask::DerivedNumberCompareAfterValue {
                                             op: *op,
-                                            right: *right,
+                                            right: right.clone(),
                                         },
                                     )?;
                                     stack.push_task(ExpressionTask::ValueRef {
@@ -25823,7 +25819,7 @@ impl MachineInstance {
             PlanRowExpressionNode::TextToNumber { .. } => {
                 let input = next()?;
                 let text = eval_to_text(&input)?;
-                EvalValue::Value(match text.trim().parse::<FiniteReal>() {
+                EvalValue::Value(match text.trim().parse::<ExactNumber>() {
                     Ok(value) => Value::Number(value),
                     Err(_) => Value::Text("NaN".to_owned()),
                 })
@@ -26019,16 +26015,13 @@ impl MachineInstance {
             PlanRowExpressionNode::ListSum { .. } => {
                 let items = eval_to_list(next()?)?;
                 work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                let mut total = 0.0_f64;
+                let mut total = ExactNumber::zero();
                 for item in items {
                     if let Ok(value) = eval_to_number(&item) {
-                        total += value.get();
+                        total = exact_number_result(total.checked_add(&value), "List/sum")?;
                     }
                 }
-                EvalValue::Value(Value::Number(
-                    FiniteReal::new(total)
-                        .map_err(|_| Error::Evaluation("List/sum overflow".to_owned()))?,
-                ))
+                EvalValue::Value(Value::Number(total))
             }
             PlanRowExpressionNode::ObjectField { field, .. } => {
                 self.eval_object_field(next()?, field, context.consumer)?
@@ -26346,7 +26339,7 @@ impl MachineInstance {
                     .unwrap_or(false);
                 EvalValue::Value(Value::Text(
                     format_number_text(
-                        number,
+                        &number,
                         NumberTextFormat {
                             radix,
                             min_width,
@@ -26363,27 +26356,31 @@ impl MachineInstance {
                 let width = take_optional_builtin_arg(&mut args, "width")
                     .map(|width| eval_to_number(&width))
                     .transpose()?;
-                EvalValue::Value(Value::Text(format_number_ascii_text(value, width)))
+                EvalValue::Value(Value::Text(format_number_ascii_text(
+                    &value,
+                    width.as_ref(),
+                )))
             }
             PlanRowBuiltin::NumberCeil
             | PlanRowBuiltin::NumberFloor
             | PlanRowBuiltin::NumberRound
             | PlanRowBuiltin::NumberTruncate => {
-                let value = eval_to_number(&require_input(input)?)?.get();
+                let value = eval_to_number(&require_input(input)?)?;
                 let rounded = match function {
                     PlanRowBuiltin::NumberCeil => value.ceil(),
                     PlanRowBuiltin::NumberFloor => value.floor(),
-                    PlanRowBuiltin::NumberRound => value.round(),
-                    PlanRowBuiltin::NumberTruncate => value.trunc(),
+                    PlanRowBuiltin::NumberRound => exact_number_result(
+                        value.round_to(&ExactNumber::one(), ExactRoundingRule::NearestAwayFromZero),
+                        function.function_name(),
+                    )?,
+                    PlanRowBuiltin::NumberTruncate => value.truncate(),
                     _ => unreachable!(),
                 };
-                EvalValue::Value(Value::Number(finite_number_result(
-                    rounded,
-                    function.function_name(),
-                )?))
+                EvalValue::Value(Value::Number(rounded))
             }
             PlanRowBuiltin::NumberBitWidth => {
-                let width = number_bit_width(eval_to_number(&require_input(input)?)?)
+                let value = eval_to_number(&require_input(input)?)?;
+                let width = number_bit_width(&value)
                     .map_err(|error| Error::Evaluation(error.to_string()))?;
                 EvalValue::Value(Value::Number(width))
             }
@@ -26403,14 +26400,17 @@ impl MachineInstance {
                 let numerator = take_required_builtin_number(&mut args, "numerator", function)?;
                 let denominator = take_required_builtin_number(&mut args, "denominator", function)?;
                 let fallback = take_required_builtin_number(&mut args, "fallback", function)?;
-                let value = if denominator.get() == 0.0 {
+                let value = if denominator.is_zero() {
                     fallback
                 } else {
-                    finite_number_result(
-                        start.get()
-                            + ((end.get() - start.get()) * numerator.get() / denominator.get()),
+                    let span = exact_number_result(end.checked_sub(&start), "Number/interpolate")?;
+                    let scaled =
+                        exact_number_result(span.checked_mul(&numerator), "Number/interpolate")?;
+                    let ratio = exact_number_result(
+                        scaled.checked_div(&denominator),
                         "Number/interpolate",
-                    )?
+                    )?;
+                    exact_number_result(start.checked_add(&ratio), "Number/interpolate")?
                 };
                 EvalValue::Value(Value::Number(value))
             }
@@ -26421,14 +26421,17 @@ impl MachineInstance {
                 let width = take_required_builtin_number(&mut args, "canvas_width", function)?;
                 let fallback = take_required_builtin_number(&mut args, "fallback", function)?;
                 let _zoom = take_optional_builtin_arg(&mut args, "zoom");
-                let span = end.get() - start.get();
-                let value = if span <= 0.0 || width.get() <= 0.0 {
+                let span = exact_number_result(end.checked_sub(&start), "Number/project_offset")?;
+                let value = if !span.is_positive() || !width.is_positive() {
                     fallback
                 } else {
-                    finite_number_result(
-                        ((time.get() - start.get()) * width.get() / span).clamp(0.0, width.get()),
-                        "Number/project_offset",
-                    )?
+                    let offset =
+                        exact_number_result(time.checked_sub(&start), "Number/project_offset")?;
+                    let scaled =
+                        exact_number_result(offset.checked_mul(&width), "Number/project_offset")?;
+                    let projected =
+                        exact_number_result(scaled.checked_div(&span), "Number/project_offset")?;
+                    clamp_exact_number(projected, ExactNumber::zero(), width)
                 };
                 EvalValue::Value(Value::Number(value))
             }
@@ -26438,14 +26441,18 @@ impl MachineInstance {
                 let start = take_required_builtin_number(&mut args, "viewport_start", function)?;
                 let end = take_required_builtin_number(&mut args, "viewport_end", function)?;
                 let fallback = take_required_builtin_number(&mut args, "fallback", function)?;
-                let value = if width.get() <= 0.0 {
+                let value = if !width.is_positive() {
                     fallback
                 } else {
-                    finite_number_result(
-                        (x.get() * (end.get() - start.get()) / width.get() + start.get())
-                            .clamp(start.min(end).get(), start.max(end).get()),
-                        "Number/project_time",
-                    )?
+                    let lower = start.clone().min(end.clone());
+                    let upper = start.clone().max(end.clone());
+                    let span = exact_number_result(end.checked_sub(&start), "Number/project_time")?;
+                    let scaled = exact_number_result(x.checked_mul(&span), "Number/project_time")?;
+                    let ratio =
+                        exact_number_result(scaled.checked_div(&width), "Number/project_time")?;
+                    let projected =
+                        exact_number_result(ratio.checked_add(&start), "Number/project_time")?;
+                    clamp_exact_number(projected, lower, upper)
                 };
                 EvalValue::Value(Value::Number(value))
             }
@@ -26461,18 +26468,30 @@ impl MachineInstance {
                     take_required_builtin_number(&mut args, "canvas_width", function)?;
                 let fallback = take_required_builtin_number(&mut args, "fallback", function)?;
                 let _zoom = take_optional_builtin_arg(&mut args, "zoom");
-                let viewport_span = viewport_end.get() - viewport_start.get();
-                let segment_span = segment_end.get() - segment_start.get();
-                let value =
-                    if viewport_span <= 0.0 || segment_span <= 0.0 || canvas_width.get() <= 0.0 {
-                        fallback
-                    } else {
-                        finite_number_result(
-                            (segment_span * canvas_width.get() / viewport_span)
-                                .clamp(0.0, canvas_width.get()),
-                            "Number/project_width",
-                        )?
-                    };
+                let viewport_span = exact_number_result(
+                    viewport_end.checked_sub(&viewport_start),
+                    "Number/project_width",
+                )?;
+                let segment_span = exact_number_result(
+                    segment_end.checked_sub(&segment_start),
+                    "Number/project_width",
+                )?;
+                let value = if !viewport_span.is_positive()
+                    || !segment_span.is_positive()
+                    || !canvas_width.is_positive()
+                {
+                    fallback
+                } else {
+                    let scaled = exact_number_result(
+                        segment_span.checked_mul(&canvas_width),
+                        "Number/project_width",
+                    )?;
+                    let projected = exact_number_result(
+                        scaled.checked_div(&viewport_span),
+                        "Number/project_width",
+                    )?;
+                    clamp_exact_number(projected, ExactNumber::zero(), canvas_width)
+                };
                 EvalValue::Value(Value::Number(value))
             }
             PlanRowBuiltin::ListGet => {
@@ -27646,7 +27665,7 @@ fn take_required_builtin_number(
     args: &mut EvaluatedBuiltinArgs,
     name: &str,
     function: PlanRowBuiltin,
-) -> Result<FiniteReal, Error> {
+) -> Result<ExactNumber, Error> {
     eval_to_number(&take_required_builtin_arg(args, name, function)?)
 }
 
@@ -28140,11 +28159,11 @@ fn value_to_bool(value: &Value) -> Result<bool, Error> {
         .ok_or_else(|| Error::Evaluation(format!("value {value:?} is not True or False")))
 }
 
-fn eval_to_number(value: &EvalValue) -> Result<FiniteReal, Error> {
+fn eval_to_number(value: &EvalValue) -> Result<ExactNumber, Error> {
     match value {
-        EvalValue::Value(Value::Number(value)) => Ok(*value),
+        EvalValue::Value(Value::Number(value)) => Ok(value.clone()),
         EvalValue::Value(Value::Text(value)) => value
-            .parse::<FiniteReal>()
+            .parse::<ExactNumber>()
             .map_err(|_| Error::Evaluation(format!("text `{value}` is not a number"))),
         other => Err(Error::Evaluation(format!("value {other:?} is not numeric"))),
     }
@@ -28172,9 +28191,19 @@ fn eval_to_bytes(value: &EvalValue) -> Result<Bytes, Error> {
     }
 }
 
-fn finite_number_result(value: f64, context: &str) -> Result<FiniteReal, Error> {
-    FiniteReal::new(value)
-        .map_err(|_| Error::Evaluation(format!("{context} produced a non-finite Number")))
+fn exact_number_result(
+    value: Result<ExactNumber, boon_data::ExactNumberError>,
+    context: &str,
+) -> Result<ExactNumber, Error> {
+    value.map_err(|error| Error::Evaluation(format!("{context}: {error}")))
+}
+
+fn clamp_exact_number(
+    value: ExactNumber,
+    minimum: ExactNumber,
+    maximum: ExactNumber,
+) -> ExactNumber {
+    value.max(minimum).min(maximum)
 }
 
 fn eval_number_infix(op: PlanInfixOp, left: &EvalValue, right: &EvalValue) -> Result<Value, Error> {
@@ -28401,12 +28430,12 @@ fn equal_length_and_all<L, R>(
     Ok(true)
 }
 
-fn eval_to_numeric(value: &EvalValue) -> Result<FiniteReal, Error> {
+fn eval_to_numeric(value: &EvalValue) -> Result<ExactNumber, Error> {
     eval_to_number(value)
 }
 
-fn numeric_infix(left: FiniteReal, op: PlanInfixOp, right: FiniteReal) -> Result<Value, Error> {
-    if matches!(op, PlanInfixOp::Divide | PlanInfixOp::Remainder) && right.get() == 0.0 {
+fn numeric_infix(left: ExactNumber, op: PlanInfixOp, right: ExactNumber) -> Result<Value, Error> {
+    if matches!(op, PlanInfixOp::Divide | PlanInfixOp::Remainder) && right.is_zero() {
         return Err(Error::Evaluation(
             if op == PlanInfixOp::Divide {
                 "div_by_zero"
@@ -28419,14 +28448,12 @@ fn numeric_infix(left: FiniteReal, op: PlanInfixOp, right: FiniteReal) -> Result
     if op.is_comparison() {
         return Ok(Value::truth(numeric_compare(left, op, right)?));
     }
-    let left = left.get();
-    let right = right.get();
     let result = match op {
-        PlanInfixOp::Add => left + right,
-        PlanInfixOp::Subtract => left - right,
-        PlanInfixOp::Multiply => left * right,
-        PlanInfixOp::Divide => left / right,
-        PlanInfixOp::Remainder => left % right,
+        PlanInfixOp::Add => left.checked_add(&right),
+        PlanInfixOp::Subtract => left.checked_sub(&right),
+        PlanInfixOp::Multiply => left.checked_mul(&right),
+        PlanInfixOp::Divide => left.checked_div(&right),
+        PlanInfixOp::Remainder => left.checked_rem(&right),
         PlanInfixOp::Equal
         | PlanInfixOp::NotEqual
         | PlanInfixOp::Less
@@ -28434,10 +28461,10 @@ fn numeric_infix(left: FiniteReal, op: PlanInfixOp, right: FiniteReal) -> Result
         | PlanInfixOp::Greater
         | PlanInfixOp::GreaterOrEqual => unreachable!("comparisons return above"),
     };
-    finite_number_result(result, "numeric operation").map(Value::Number)
+    exact_number_result(result, "numeric operation").map(Value::Number)
 }
 
-fn numeric_compare(left: FiniteReal, op: PlanInfixOp, right: FiniteReal) -> Result<bool, Error> {
+fn numeric_compare(left: ExactNumber, op: PlanInfixOp, right: ExactNumber) -> Result<bool, Error> {
     let ordering = left.cmp(&right);
     match op {
         PlanInfixOp::Equal => Ok(ordering.is_eq()),
@@ -28502,7 +28529,9 @@ fn select_pattern_matches(pattern: &PlanRowSelectPattern, value: &Value) -> bool
         PlanRowSelectPattern::Text { value: expected } => {
             value.visible() == &Value::Text(expected.clone())
         }
-        PlanRowSelectPattern::Number { value: expected } => value == &Value::Number(*expected),
+        PlanRowSelectPattern::Number { value: expected } => {
+            value == &Value::Number(expected.clone())
+        }
         PlanRowSelectPattern::NaN => value == &Value::Text("NaN".to_owned()),
         PlanRowSelectPattern::Wildcard => true,
     }
@@ -29267,9 +29296,9 @@ mod ownership_tests {
             EvalValue::Value(Value::Text("second".to_owned())),
         ];
         let mut work = Work::with_limit(None);
-        let old = clone_whole_list_snapshot(&items, &mut work);
-        let replacement = clone_whole_list_snapshot(&items, &mut work);
-        assert!(!whole_list_snapshot_changed(
+        let old = PrivatePresence::Present(clone_whole_list_snapshot(&items, &mut work));
+        let replacement = PrivatePresence::Present(clone_whole_list_snapshot(&items, &mut work));
+        assert!(!private_list_presence_changed(
             Some(&old),
             &replacement,
             &mut work

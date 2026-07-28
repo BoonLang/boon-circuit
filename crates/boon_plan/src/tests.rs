@@ -1838,10 +1838,7 @@ fn file_read_stream_contract_preserves_delivery_and_intent_bounds() {
         vec![EffectIntentDefaultPlan {
             field_name: "chunk_bytes".to_owned(),
             value: EffectIntentDefaultValuePlan::Number {
-                value: FiniteReal::from_i64_exact(
-                    boon_effect_schema::FILE_STREAM_DEFAULT_CHUNK_BYTES,
-                )
-                .unwrap(),
+                value: ExactNumber::from_i64(boon_effect_schema::FILE_STREAM_DEFAULT_CHUNK_BYTES,),
             },
         }]
     );

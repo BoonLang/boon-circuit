@@ -15,7 +15,7 @@ use boon_host_services::{
     CancellationHandle, HMAC_SHA256_TAG_BYTES, HmacSha256Tag, HostServiceError, HostServices,
     SecretMaterial, SecretRef, TimerReceiveError,
 };
-use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, FiniteReal};
+use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, ExactNumber};
 use boon_runtime::{
     ByteStreamValidator, EffectCommitPermit, EffectStopDisposition, EffectStopReason,
     EffectTerminalReservation, HostCapabilityErrorKind, HostCapabilityRegistry, HostValueBinding,
@@ -3500,20 +3500,8 @@ fn send_outcome(
     }
 }
 
-fn file_number(value: u64, context: &str) -> Result<Value, FileStreamFailure> {
-    let value = i64::try_from(value).map_err(|_| {
-        FileStreamFailure::new(
-            "file_too_large",
-            format!("{context} exceeds the Boon Number range"),
-        )
-    })?;
-    let value = FiniteReal::from_i64_exact(value).map_err(|_| {
-        FileStreamFailure::new(
-            "file_too_large",
-            format!("{context} is not exactly representable as a Boon Number"),
-        )
-    })?;
-    Ok(Value::Number(value))
+fn file_number(value: u64, _context: &str) -> Result<Value, FileStreamFailure> {
+    Ok(Value::Number(ExactNumber::from_u64(value)))
 }
 
 fn release_file_worker(mut active: ActiveFileOperation) {
@@ -3638,7 +3626,7 @@ fn tagged(tag: &str, fields: BTreeMap<String, Value>) -> Value {
 }
 
 fn number(value: i64) -> Value {
-    Value::Number(FiniteReal::from_i64_exact(value).expect("i64 is exactly representable here"))
+    Value::Number(ExactNumber::from_i64(value))
 }
 
 fn failure(code: &str, diagnostic: impl Into<String>) -> Value {

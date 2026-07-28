@@ -283,10 +283,10 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
     },
     LanguageFeatureSpec {
         id: "exact_number_value_algebra",
-        stage: LanguageFeatureStage::Planned,
+        stage: LanguageFeatureStage::Current,
         parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["integer literal", "decimal literal"],
-        summary: "existing number token syntax parses, but exact arithmetic semantics are planned",
+        summary: "integer, decimal, exponent, and fraction results use canonical exact rationals",
     },
     LanguageFeatureSpec {
         id: "flush_control",
@@ -301,13 +301,6 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
         parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["BYTES", "Bytes/"],
         summary: "immutable dynamic, inferred, and fixed-size byte values",
-    },
-    LanguageFeatureSpec {
-        id: "legacy_binary64_numbers",
-        stage: LanguageFeatureStage::Current,
-        parse_expectation: LanguageFeatureParseExpectation::Accept,
-        spellings: &["integer literal", "decimal literal"],
-        summary: "current number literals lower through the legacy finite binary64 value",
     },
     LanguageFeatureSpec {
         id: "map_literals",

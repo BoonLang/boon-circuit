@@ -1,10 +1,11 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test;
 
+use boon_data::ExactNumber;
 use boon_list_access::{
-    AccessError, AccessItem, AccessStream, Direction, FiniteNumber, IndexPlanId, KEY_CODEC_VERSION,
-    KeyComponent, KeyKind, KeySchema, LimitKind, OrderedIndex, RowId, SourceOrderToken,
-    StructuralKey, StructuralValue, WorkLimitExceeded, WorkLimits, WorkTracker,
+    AccessError, AccessItem, AccessStream, Direction, IndexPlanId, KEY_CODEC_VERSION, KeyComponent,
+    KeyKind, KeySchema, LimitKind, OrderedIndex, RowId, SourceOrderToken, StructuralKey,
+    StructuralValue, WorkLimitExceeded, WorkLimits, WorkTracker,
 };
 use std::ops::Bound;
 
@@ -16,16 +17,16 @@ fn token(value: u128) -> SourceOrderToken {
     SourceOrderToken::from_u128(value)
 }
 
-fn key(name: &str, score: f64) -> StructuralKey {
+fn key(name: &str, score: i64) -> StructuralKey {
     StructuralKey::new(vec![
         StructuralValue::text(name),
-        StructuralValue::Number(FiniteNumber::new(score).unwrap()),
+        StructuralValue::number(ExactNumber::from_i64(score)),
     ])
     .unwrap()
 }
 
 fn number(value: i64) -> StructuralValue {
-    StructuralValue::Number(FiniteNumber::new(value as f64).unwrap())
+    StructuralValue::number(ExactNumber::from_i64(value))
 }
 
 fn numeric_key(value: i64) -> StructuralKey {
@@ -53,10 +54,10 @@ fn typed_index_has_one_native_and_wasm_golden_behavior() {
     .unwrap();
     let mut index = OrderedIndex::new(IndexPlanId::from_u128(0x51), schema);
     for (row_id, source_order, name, score) in [
-        (1, 30, "alpha", 3.0),
-        (2, 20, "alpha", 5.0),
-        (3, 10, "alpha", 5.0),
-        (4, 40, "beta", 9.0),
+        (1, 30, "alpha", 3),
+        (2, 20, "alpha", 5),
+        (3, 10, "alpha", 5),
+        (4, 40, "beta", 9),
     ] {
         index
             .insert(row(row_id), token(source_order), key(name, score))
@@ -90,7 +91,7 @@ fn typed_index_has_one_native_and_wasm_golden_behavior() {
     assert_eq!(resumed_metrics.candidates_visited, 1);
     assert_eq!(resumed_metrics.full_scans, 0);
 
-    index.update(row(4), token(40), key("alpha", 6.0)).unwrap();
+    index.update(row(4), token(40), key("alpha", 6)).unwrap();
     let (updated, updated_metrics) = collect_rows(index.text_prefix(&[], "alpha", None).unwrap());
     assert_eq!(
         updated.iter().map(AccessItem::row_id).collect::<Vec<_>>(),
@@ -127,24 +128,7 @@ fn typed_key_codec_has_one_native_and_wasm_byte_layout() {
             .unwrap(),
         )
         .unwrap();
-    let mut expected = vec![
-        KEY_CODEC_VERSION,
-        0x11,
-        0x80,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0x22,
-        b'a',
-        0,
-        u8::MAX,
-        0,
-        0,
-    ];
+    let mut expected = vec![KEY_CODEC_VERSION, 0x11, 1, 0x22, b'a', 0, u8::MAX, 0, 0];
     expected.push(0x44);
     expected.extend_from_slice(truth_type.as_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());

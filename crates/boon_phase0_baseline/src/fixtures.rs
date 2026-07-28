@@ -9,7 +9,7 @@ use boon_compiler::{
     CompiledMachinePlanFromSource, ProgramRole, TargetProfile,
     compile_source_path_to_machine_plan_for_role,
 };
-use boon_plan::{ListId, SourceId};
+use boon_plan::{ExactNumber, ListId, SourceId};
 use boon_plan_executor::{MachineInstance, SessionOptions, SourceEvent, SourcePayload, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,11 +70,18 @@ fn list_id(compiled: &CompiledMachinePlanFromSource, label: &str) -> Result<List
         .ok_or_else(|| format!("MachinePlan has no debug list `{label}`"))
 }
 
-fn number(value: &Value) -> Result<f64, String> {
+fn number(value: &Value) -> Result<ExactNumber, String> {
     let Value::Number(value) = value else {
         return Err(format!("expected Number, received {value:?}"));
     };
-    Ok(value.get())
+    Ok(value.clone())
+}
+
+fn number_is(value: &Value, expected: &str) -> Result<bool, String> {
+    let expected = expected
+        .parse::<ExactNumber>()
+        .map_err(|error| error.to_string())?;
+    Ok(number(value)? == expected)
 }
 
 fn tagged<'a>(
@@ -111,43 +118,47 @@ pub fn direct_and_wrapped_out_execute() -> Result<(), String> {
         let result = machine
             .root_value_current("result")
             .map_err(|error| error.to_string())?;
-        if number(&result)? != 12.0 {
+        if !number_is(&result, "12")? {
             return Err(format!("{name} produced {result:?}; expected Number(12)"));
         }
     }
     Ok(())
 }
 
-pub fn exact_arithmetic_current_binary64_executes() -> Result<(), String> {
-    let mut machine = machine(compile(
+pub fn exact_arithmetic_executes() -> Result<(), String> {
+    let mut current_machine = machine(compile(
         "exact_arithmetic_current.bn",
         TargetProfile::SoftwareDefault,
     )?)?;
-    let large = machine
+    let large = current_machine
         .root_value_current("large_integer")
         .map_err(|error| error.to_string())?;
-    let sum = machine
+    let sum = current_machine
         .root_value_current("decimal_sum")
         .map_err(|error| error.to_string())?;
-    let fraction = machine
+    let fraction = current_machine
         .root_value_current("rational_analogue")
         .map_err(|error| error.to_string())?;
-    if number(&large)? != 9_007_199_254_740_992.0 {
-        return Err(format!("legacy large-integer baseline changed: {large:?}"));
+    if !number_is(&large, "9007199254740993")? {
+        return Err(format!("exact large-integer result changed: {large:?}"));
     }
-    if number(&sum)?.to_bits() != (0.1_f64 + 0.2_f64).to_bits() {
-        return Err(format!("legacy decimal-sum baseline changed: {sum:?}"));
+    if !number_is(&sum, "0.3")? {
+        return Err(format!("exact decimal-sum result changed: {sum:?}"));
     }
-    if number(&fraction)?.to_bits() != (1.0_f64 / 3.0_f64).to_bits() {
-        return Err(format!(
-            "legacy rational analogue baseline changed: {fraction:?}"
-        ));
+    if !number_is(&fraction, "1/3")? {
+        return Err(format!("exact rational result changed: {fraction:?}"));
     }
-    require_compile_rejection(
-        "future_exact_integer.bn",
+    let mut exact_integer = machine(compile(
+        "exact_integer_current.bn",
         TargetProfile::SoftwareDefault,
-        "cannot be represented exactly",
-    )
+    )?)?;
+    let value = exact_integer
+        .root_value_current("exact_only_integer")
+        .map_err(|error| error.to_string())?;
+    if !number_is(&value, "1234567890123456789012345678901234567890")? {
+        return Err(format!("exact integer result changed: {value:?}"));
+    }
+    Ok(())
 }
 
 pub fn tags_presence_and_fault_current_analogue_executes() -> Result<(), String> {
@@ -193,7 +204,7 @@ pub fn typed_views_execute() -> Result<(), String> {
     let result = machine
         .root_value_current("selected_sum")
         .map_err(|error| error.to_string())?;
-    if number(&result)? != 4.0 {
+    if !number_is(&result, "4")? {
         return Err(format!("typed view selected_sum changed: {result:?}"));
     }
     let page = machine
@@ -218,7 +229,7 @@ pub fn proof_erasure_current_path_and_where_rejection_execute() -> Result<(), St
     let result = machine
         .root_value_current("result")
         .map_err(|error| error.to_string())?;
-    if number(&result)? != 42.0 {
+    if !number_is(&result, "42")? {
         return Err(format!("current proof-free path produced {result:?}"));
     }
     require_compile_rejection("future_where.bn", TargetProfile::SoftwareDefault, "WHERE")
@@ -319,7 +330,7 @@ pub fn stale_route_is_rejected_before_current_route_executes() -> Result<(), Str
     let count = current
         .root_value_current("store.count")
         .map_err(|error| error.to_string())?;
-    if number(&count)? != 1.0 {
+    if !number_is(&count, "1")? {
         return Err(format!(
             "current route did not execute exactly once: {count:?}"
         ));
@@ -329,7 +340,7 @@ pub fn stale_route_is_rejected_before_current_route_executes() -> Result<(), Str
     let old_count = old
         .root_value_current("store.count")
         .map_err(|error| error.to_string())?;
-    if number(&old_count)? != 0.0 {
+    if !number_is(&old_count, "0")? {
         return Err(format!(
             "stale routing mutated the old runtime: {old_count:?}"
         ));
@@ -396,7 +407,7 @@ pub fn scalar_and_row_storage_current_analogue_executes() -> Result<(), String> 
     let row_total = machine
         .root_value_current("store.row_total")
         .map_err(|error| error.to_string())?;
-    if number(&count)? != 1.0 || number(&row_total)? != 5.0 {
+    if !number_is(&count, "1")? || !number_is(&row_total, "5")? {
         return Err(format!(
             "current scalar/row analogue changed: count={count:?}, row_total={row_total:?}"
         ));
@@ -416,7 +427,7 @@ pub fn bounded_software_profile_executes_and_future_hardware_fails_closed() -> R
     let result = machine
         .root_value_current("result")
         .map_err(|error| error.to_string())?;
-    if number(&result)? != 3.0 {
+    if !number_is(&result, "3")? {
         return Err(format!("bounded software analogue produced {result:?}"));
     }
     require_compile_rejection(
@@ -436,8 +447,8 @@ mod tests {
     }
 
     #[test]
-    fn fixture_exact_arithmetic_records_current_binary64() {
-        exact_arithmetic_current_binary64_executes().unwrap();
+    fn fixture_exact_arithmetic_is_canonical() {
+        exact_arithmetic_executes().unwrap();
     }
 
     #[test]

@@ -8,7 +8,7 @@ mod binary;
 mod document;
 mod host;
 
-pub use boon_data::{FiniteReal, FiniteRealError};
+pub use boon_data::{ExactNumber, ExactNumberError};
 pub use boon_document_model::{
     ListId, OwnerInstanceRoute, OwnerInstanceRow, PlanStaticOwnerId, ProgramRole, SourceId,
     SourceRouteToken,
@@ -18,7 +18,7 @@ pub use host::*;
 
 pub const PLAN_MAJOR_VERSION: u32 = 6;
 pub const PLAN_MINOR_VERSION: u32 = 0;
-pub const PERSISTENCE_FORMAT_VERSION: u32 = 2;
+pub const PERSISTENCE_FORMAT_VERSION: u32 = 3;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
 pub const INLINE_BYTE_CONSTANT_LIMIT: usize = 1024;
 
@@ -2744,7 +2744,7 @@ pub struct EffectIntentDefaultPlan {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectIntentDefaultValuePlan {
     Tag { name: String },
-    Number { value: FiniteReal },
+    Number { value: ExactNumber },
     Text { value: String },
 }
 
@@ -3052,7 +3052,7 @@ fn validate_effect_intent_defaults(schema: &EffectSchemaPlan) -> Result<(), Plan
                 continue;
             };
             if field_path.as_slice() == [default.field_name.as_str()]
-                && let EffectIntentDefaultValuePlan::Number { value } = default.value
+                && let EffectIntentDefaultValuePlan::Number { value } = &default.value
             {
                 let Ok(value) = value.to_i64_exact() else {
                     return Err(PlanError::new(
@@ -3198,8 +3198,7 @@ fn effect_schema_to_plan(
                 }
                 boon_effect_schema::IntentDefaultValueSpec::ExactInteger(value) => {
                     EffectIntentDefaultValuePlan::Number {
-                        value: FiniteReal::from_i64_exact(value)
-                            .map_err(|error| PlanError::new(error.to_string()))?,
+                        value: ExactNumber::from_i64(value),
                     }
                 }
                 boon_effect_schema::IntentDefaultValueSpec::Text(value) => {
@@ -3617,7 +3616,7 @@ pub enum MigrationExpressionPlan {
         parts: Vec<MigrationExpressionPlan>,
     },
     Number {
-        value: FiniteReal,
+        value: ExactNumber,
     },
     Variant {
         tag: String,
@@ -5278,7 +5277,7 @@ pub enum PlanConstantValue {
         value: String,
     },
     Number {
-        value: FiniteReal,
+        value: ExactNumber,
     },
     Bytes {
         byte_len: u64,
@@ -5614,7 +5613,7 @@ pub enum PlanDerivedExpression {
     NumberCompareConst {
         left: ValueRef,
         op: PlanInfixOp,
-        right: FiniteReal,
+        right: ExactNumber,
     },
     ValueCompare {
         left: ValueRef,
@@ -8635,7 +8634,7 @@ pub struct PlanRowSelectArm {
 pub enum PlanRowSelectPattern {
     Tag { name: String },
     Text { value: String },
-    Number { value: FiniteReal },
+    Number { value: ExactNumber },
     NaN,
     Wildcard,
 }
@@ -8798,8 +8797,8 @@ impl fmt::Display for PlanError {
 
 impl Error for PlanError {}
 
-impl From<FiniteRealError> for PlanError {
-    fn from(error: FiniteRealError) -> Self {
+impl From<ExactNumberError> for PlanError {
+    fn from(error: ExactNumberError) -> Self {
         Self::new(error.to_string())
     }
 }

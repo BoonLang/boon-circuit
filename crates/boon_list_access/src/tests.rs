@@ -1,4 +1,5 @@
 use crate::*;
+use boon_data::ExactNumber;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -27,7 +28,7 @@ fn key(parts: Vec<StructuralValue>) -> StructuralKey {
 }
 
 fn number(value: i64) -> StructuralValue {
-    StructuralValue::Number(FiniteNumber::new(value as f64).unwrap())
+    StructuralValue::number(ExactNumber::from_i64(value))
 }
 
 fn text(value: &str) -> StructuralValue {
@@ -108,54 +109,38 @@ fn reference_rows(
 }
 
 #[test]
-fn finite_numbers_are_canonical_and_strictly_finite() {
-    assert_eq!(
-        FiniteNumber::new(-0.0).unwrap(),
-        FiniteNumber::new(0.0).unwrap()
-    );
-    assert!(matches!(
-        FiniteNumber::new(f64::NAN),
-        Err(KeyError::NonFiniteNumber)
-    ));
-    assert!(matches!(
-        FiniteNumber::new(f64::INFINITY),
-        Err(KeyError::NonFiniteNumber)
-    ));
-    assert!(matches!(
-        FiniteNumber::new(f64::NEG_INFINITY),
-        Err(KeyError::NonFiniteNumber)
-    ));
-
+fn exact_rational_numbers_have_one_directed_key_order() {
     let ascending = schema(&[(KeyKind::Number, Direction::Asc)]);
     let descending = schema(&[(KeyKind::Number, Direction::Desc)]);
     let values = [
-        -f64::MAX,
-        -100.5,
-        -1.0,
-        -f64::MIN_POSITIVE,
-        0.0,
-        f64::MIN_POSITIVE,
-        1.0,
-        100.5,
-        f64::MAX,
-    ];
-    for left in values {
-        for right in values {
-            let left_key = key(vec![StructuralValue::number(left).unwrap()]);
-            let right_key = key(vec![StructuralValue::number(right).unwrap()]);
+        "-100000000000000000000000000000000000000",
+        "-100.5",
+        "-1",
+        "-1/100000000000000000000000000000000000000",
+        "0",
+        "1/100000000000000000000000000000000000000",
+        "1",
+        "100.5",
+        "100000000000000000000000000000000000000",
+    ]
+    .map(|value| value.parse::<ExactNumber>().unwrap());
+    for left in &values {
+        for right in &values {
+            let left_key = key(vec![StructuralValue::number(left.clone())]);
+            let right_key = key(vec![StructuralValue::number(right.clone())]);
             assert_eq!(
                 ascending
                     .encode(&left_key)
                     .unwrap()
                     .cmp(&ascending.encode(&right_key).unwrap()),
-                left.total_cmp(&right)
+                left.cmp(right)
             );
             assert_eq!(
                 descending
                     .encode(&left_key)
                     .unwrap()
                     .cmp(&descending.encode(&right_key).unwrap()),
-                left.total_cmp(&right).reverse()
+                left.cmp(right).reverse()
             );
         }
     }
@@ -172,24 +157,7 @@ fn codec_has_a_stable_typed_byte_layout() {
     let encoded = schema
         .encode(&key(vec![number(0), text("a\0"), truth(true), tag(7)]))
         .unwrap();
-    let mut expected = vec![
-        KEY_CODEC_VERSION,
-        0x11,
-        0x80,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0x22,
-        b'a',
-        0,
-        u8::MAX,
-        0,
-        0,
-    ];
+    let mut expected = vec![KEY_CODEC_VERSION, 0x11, 1, 0x22, b'a', 0, u8::MAX, 0, 0];
     expected.push(0x44);
     expected.extend_from_slice(TRUTH_TAG_TYPE.as_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());

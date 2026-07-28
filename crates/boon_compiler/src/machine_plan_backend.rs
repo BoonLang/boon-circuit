@@ -1467,7 +1467,7 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
             value: String::new(),
         }),
         DataTypePlan::Number => Some(PlanConstantValue::Number {
-            value: FiniteReal::ZERO,
+            value: ExactNumber::zero(),
         }),
         DataTypePlan::Bytes {
             fixed_len: None | Some(0),
@@ -1804,7 +1804,9 @@ fn plan_row_expression_static_data(
             };
             match &constant.value {
                 PlanConstantValue::Text { value } => Some(boon_data::Value::Text(value.clone())),
-                PlanConstantValue::Number { value } => Some(boon_data::Value::Number(*value)),
+                PlanConstantValue::Number { value } => {
+                    Some(boon_data::Value::Number(value.clone()))
+                }
                 PlanConstantValue::Bytes {
                     inline_bytes: Some(bytes),
                     ..
@@ -2875,17 +2877,15 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                 })
             }
             ir::ExecutableExpressionKind::Number(value) => Ok(MigrationExpressionPlan::Number {
-                value: value.parse::<FiniteReal>().map_err(|error| {
+                value: value.parse::<ExactNumber>().map_err(|error| {
                     PlanError::new(format!(
-                        "migration numeric literal `{value}` is not a finite canonical Number: {error}"
+                        "migration numeric literal `{value}` is not an exact canonical Number: {error}"
                     ))
                 })?,
             }),
             ir::ExecutableExpressionKind::BytesByte(value) => {
                 Ok(MigrationExpressionPlan::Number {
-                    value: FiniteReal::from_i64_exact(i64::from(value)).map_err(|error| {
-                        PlanError::new(format!("byte literal could not be lowered: {error}"))
-                    })?,
+                    value: ExactNumber::from_i64(i64::from(value)),
                 })
             }
             ir::ExecutableExpressionKind::Absent => Err(PlanError::new(format!(
@@ -5969,7 +5969,7 @@ fn validate_number_literals(program: &ErasedProgram) -> Result<(), PlanError> {
         let ir::ExecutableExpressionKind::Number(literal) = &expression.kind else {
             continue;
         };
-        literal.parse::<FiniteReal>().map_err(|error| {
+        literal.parse::<ExactNumber>().map_err(|error| {
             PlanError::new(format!(
                 "numeric literal `{literal}` is not a finite canonical Number: {error}"
             ))
@@ -7766,8 +7766,8 @@ fn validate_literal_page_size(
     else {
         return Ok(());
     };
-    let value = value.get();
-    if value.fract() != 0.0 || !(1.0..=10_000.0).contains(&value) {
+    let value = value.to_i64_exact();
+    if !matches!(value, Ok(1..=10_000)) {
         return Err(PlanError::new(
             "`List/page` size must be a whole Number between 1 and 10000",
         ));
@@ -7835,11 +7835,7 @@ fn static_whole_number(
     let PlanConstantValue::Number { value } = &constant.value else {
         return Ok(None);
     };
-    let value = value.get();
-    Ok(
-        (value.is_sign_positive() && value.fract() == 0.0 && value <= u64::MAX as f64)
-            .then_some(value as u64),
-    )
+    Ok(value.to_u64_exact().ok())
 }
 
 fn required_list_terminal_argument(
@@ -11547,7 +11543,7 @@ fn executable_select_pattern(
             PlanRowSelectPattern::Wildcard
         }
         CheckedMatchPattern::Number { value } => PlanRowSelectPattern::Number {
-            value: value.parse::<FiniteReal>().map_err(|error| {
+            value: value.parse::<ExactNumber>().map_err(|error| {
                 PlanError::new(format!(
                     "checked numeric match pattern `{value}` is not finite: {error}"
                 ))
@@ -12548,9 +12544,9 @@ fn resolve_path(
 fn effect_intent_default_constant(value: &EffectIntentDefaultValuePlan) -> PlanConstantValue {
     match value {
         EffectIntentDefaultValuePlan::Tag { name } => PlanConstantValue::Tag { name: name.clone() },
-        EffectIntentDefaultValuePlan::Number { value } => {
-            PlanConstantValue::Number { value: *value }
-        }
+        EffectIntentDefaultValuePlan::Number { value } => PlanConstantValue::Number {
+            value: value.clone(),
+        },
         EffectIntentDefaultValuePlan::Text { value } => PlanConstantValue::Text {
             value: value.clone(),
         },

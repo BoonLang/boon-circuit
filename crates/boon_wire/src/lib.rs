@@ -3,18 +3,19 @@
 //! This format is for process and network boundaries. In-process Boon graphs
 //! should continue to pass `Value` directly without serialization.
 //!
-//! # Version 2 format
+//! # Version 3 format
 //!
 //! Every message starts with `BWV` followed by the one-byte format version.
-//! Values use a one-byte tag. Lengths and collection counts use minimal unsigned
-//! LEB128; numbers use eight little-endian IEEE-754 bytes. Text is UTF-8. Lists
-//! preserve item order, while object and Tag payload keys must be strictly
-//! increasing in Rust `String` order. Tag names use the same length-prefixed
-//! text representation as object keys.
+//! Values use a one-byte tag. Lengths and collection counts use minimal
+//! unsigned LEB128. Numbers use a sign byte followed by minimal big-endian
+//! numerator-magnitude and positive-denominator byte strings. Text is UTF-8.
+//! Lists preserve item order, while object and Tag payload keys must be
+//! strictly increasing in Rust `String` order. Tag names use the same
+//! length-prefixed text representation as object keys.
 
 #![forbid(unsafe_code)]
 
-use boon_data::{FiniteReal, Value};
+use boon_data::{ExactNumber, ExactNumberSign, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -38,7 +39,7 @@ pub use session_control::{
 };
 
 const MAGIC: [u8; 3] = *b"BWV";
-pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION: u8 = 3;
 pub const HEADER: [u8; 4] = [MAGIC[0], MAGIC[1], MAGIC[2], FORMAT_VERSION];
 
 /// The protocol-owned same-origin WebSocket path for Client/Session traffic.
@@ -65,6 +66,7 @@ pub struct Limits {
     pub max_collection_length: usize,
     pub max_text_bytes: usize,
     pub max_byte_string_bytes: usize,
+    pub max_number_component_bytes: usize,
 }
 
 impl Default for Limits {
@@ -76,6 +78,7 @@ impl Default for Limits {
             max_collection_length: 1_000_000,
             max_text_bytes: 1024 * 1024,
             max_byte_string_bytes: 8 * 1024 * 1024,
+            max_number_component_bytes: 128 * 1024,
         }
     }
 }
@@ -88,6 +91,7 @@ pub enum LimitKind {
     CollectionLength,
     TextBytes,
     ByteStringBytes,
+    NumberComponentBytes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,7 +105,6 @@ pub enum WireError {
     NonCanonicalVarint,
     VarintOverflow,
     LengthOverflow,
-    NonFiniteNumber,
     NonCanonicalNumber,
     NonCanonicalMapOrder,
     LimitExceeded {
@@ -131,7 +134,6 @@ impl fmt::Display for WireError {
             Self::LengthOverflow => {
                 formatter.write_str("Boon wire length does not fit this platform")
             }
-            Self::NonFiniteNumber => formatter.write_str("Boon wire number is not finite"),
             Self::NonCanonicalNumber => {
                 formatter.write_str("Boon wire number is not canonically encoded")
             }
@@ -226,7 +228,23 @@ impl Encoder {
         match value {
             Value::Number(number) => {
                 self.byte(VALUE_NUMBER)?;
-                self.write(&number.get().to_bits().to_le_bytes())
+                self.byte(number.sign() as u8)?;
+                let numerator = number.numerator_magnitude_bytes();
+                let denominator = number.denominator_bytes();
+                check_limit(
+                    LimitKind::NumberComponentBytes,
+                    numerator.len(),
+                    self.limits.max_number_component_bytes,
+                )?;
+                check_limit(
+                    LimitKind::NumberComponentBytes,
+                    denominator.len(),
+                    self.limits.max_number_component_bytes,
+                )?;
+                self.length(numerator.len())?;
+                self.write(&numerator)?;
+                self.length(denominator.len())?;
+                self.write(&denominator)
             }
             Value::Text(text) => {
                 self.byte(VALUE_TEXT)?;
@@ -382,19 +400,25 @@ impl Decoder<'_> {
         Ok(fields)
     }
 
-    fn number(&mut self) -> Result<FiniteReal, WireError> {
-        let encoded: [u8; 8] = self
-            .read(8)?
-            .try_into()
-            .map_err(|_| WireError::UnexpectedEnd)?;
-        let value = f64::from_bits(u64::from_le_bytes(encoded));
-        if !value.is_finite() {
-            return Err(WireError::NonFiniteNumber);
-        }
-        if value.to_bits() == (-0.0f64).to_bits() {
-            return Err(WireError::NonCanonicalNumber);
-        }
-        FiniteReal::new(value).map_err(|_| WireError::NonFiniteNumber)
+    fn number(&mut self) -> Result<ExactNumber, WireError> {
+        let sign =
+            ExactNumberSign::try_from(self.byte()?).map_err(|_| WireError::NonCanonicalNumber)?;
+        let numerator_length = self.length()?;
+        check_limit(
+            LimitKind::NumberComponentBytes,
+            numerator_length,
+            self.limits.max_number_component_bytes,
+        )?;
+        let numerator = self.read(numerator_length)?.to_vec();
+        let denominator_length = self.length()?;
+        check_limit(
+            LimitKind::NumberComponentBytes,
+            denominator_length,
+            self.limits.max_number_component_bytes,
+        )?;
+        let denominator = self.read(denominator_length)?;
+        ExactNumber::from_canonical_bytes(sign, &numerator, denominator)
+            .map_err(|_| WireError::NonCanonicalNumber)
     }
 
     fn text(&mut self) -> Result<String, WireError> {
@@ -494,7 +518,7 @@ mod tests {
                 "list".into(),
                 Value::List(vec![
                     Value::tag("Null"),
-                    Value::Number(FiniteReal::new(-12.5).unwrap()),
+                    Value::Number("-12.5".parse().unwrap()),
                     Value::Text("Boon \u{2603}".into()),
                 ]),
             ),
@@ -522,10 +546,7 @@ mod tests {
                 "z".into(),
                 Value::Tag {
                     tag: "Ok".into(),
-                    fields: BTreeMap::from([(
-                        "n".into(),
-                        Value::Number(FiniteReal::new(1.5).unwrap()),
-                    )]),
+                    fields: BTreeMap::from([("n".into(), Value::Number("1.5".parse().unwrap()))]),
                 },
             ),
             ("a".into(), Value::truth(true)),
@@ -536,17 +557,14 @@ mod tests {
             "z".into(),
             Value::Tag {
                 tag: "Ok".into(),
-                fields: BTreeMap::from([(
-                    "n".into(),
-                    Value::Number(FiniteReal::new(1.5).unwrap()),
-                )]),
+                fields: BTreeMap::from([("n".into(), Value::Number("1.5".parse().unwrap()))]),
             },
         );
         let second = Value::Object(reordered);
 
         let golden = vec![
-            b'B', b'W', b'V', 2, 4, 2, 1, b'a', 5, 4, b'T', b'r', b'u', b'e', 0, 1, b'z', 5, 2,
-            b'O', b'k', 1, 1, b'n', 0, 0, 0, 0, 0, 0, 0, 0xf8, 0x3f,
+            b'B', b'W', b'V', 3, 4, 2, 1, b'a', 5, 4, b'T', b'r', b'u', b'e', 0, 1, b'z', 5, 2,
+            b'O', b'k', 1, 1, b'n', 0, 2, 1, 3, 1, 2,
         ];
         assert_eq!(encode(&first).unwrap(), golden);
         assert_eq!(encode(&second).unwrap(), golden);
@@ -555,45 +573,56 @@ mod tests {
 
     #[test]
     fn rejects_malformed_headers_tags_and_trailing_bytes() {
-        assert_eq!(decode(b"bad\x02\x00"), Err(WireError::InvalidMagic));
+        assert_eq!(decode(b"bad\x03\x00"), Err(WireError::InvalidMagic));
         assert_eq!(
             decode(b"BWV\x01\x00"),
             Err(WireError::UnsupportedVersion(1))
         );
-        assert_eq!(decode(b"BWV\x02\xff"), Err(WireError::UnknownTag(0xff)));
-        let mut trailing = encode(&Value::integer(0).unwrap()).unwrap();
+        assert_eq!(decode(b"BWV\x03\xff"), Err(WireError::UnknownTag(0xff)));
+        let zero = Value::integer(0).unwrap();
+        let mut trailing = encode(&zero).unwrap();
+        assert_eq!(decode(&trailing), Ok(zero));
         trailing.push(0);
         assert_eq!(decode(&trailing), Err(WireError::TrailingBytes(1)));
     }
 
     #[test]
     fn rejects_invalid_text_varints_and_numbers() {
-        assert_eq!(decode(b"BWV\x02\x01\x01\xff"), Err(WireError::InvalidUtf8));
+        assert_eq!(decode(b"BWV\x03\x01\x01\xff"), Err(WireError::InvalidUtf8));
         assert_eq!(
-            decode(b"BWV\x02\x01\x80\x00"),
+            decode(b"BWV\x03\x01\x80\x00"),
             Err(WireError::NonCanonicalVarint)
         );
 
-        let mut overflowing = b"BWV\x02\x01".to_vec();
+        let mut overflowing = b"BWV\x03\x01".to_vec();
         overflowing.extend_from_slice(&[0xff; 9]);
         overflowing.push(0x02);
         assert_eq!(decode(&overflowing), Err(WireError::VarintOverflow));
 
-        let mut infinity = b"BWV\x02\x00".to_vec();
-        infinity.extend_from_slice(&f64::INFINITY.to_bits().to_le_bytes());
-        assert_eq!(decode(&infinity), Err(WireError::NonFiniteNumber));
-
-        let mut negative_zero = b"BWV\x02\x00".to_vec();
-        negative_zero.extend_from_slice(&(-0.0f64).to_bits().to_le_bytes());
-        assert_eq!(decode(&negative_zero), Err(WireError::NonCanonicalNumber));
+        assert_eq!(
+            decode(b"BWV\x03\x00\x09\x00\x01\x01"),
+            Err(WireError::NonCanonicalNumber)
+        );
+        assert_eq!(
+            decode(b"BWV\x03\x00\x02\x01\x02\x01\x04"),
+            Err(WireError::NonCanonicalNumber)
+        );
+        assert_eq!(
+            decode(b"BWV\x03\x00\x01\x00\x01\x02"),
+            Err(WireError::NonCanonicalNumber)
+        );
+        assert_eq!(
+            decode(b"BWV\x02\x00"),
+            Err(WireError::UnsupportedVersion(2))
+        );
     }
 
     #[test]
     fn rejects_noncanonical_map_key_order_and_duplicates() {
-        let out_of_order = b"BWV\x02\x04\x02\x01b\x05\x00\x00\x01a\x05\x00\x00";
+        let out_of_order = b"BWV\x03\x04\x02\x01b\x05\x00\x00\x01a\x05\x00\x00";
         assert_eq!(decode(out_of_order), Err(WireError::NonCanonicalMapOrder));
 
-        let duplicate = b"BWV\x02\x04\x02\x01a\x05\x00\x00\x01a\x05\x00\x00";
+        let duplicate = b"BWV\x03\x04\x02\x01a\x05\x00\x00\x01a\x05\x00\x00";
         assert_eq!(decode(duplicate), Err(WireError::NonCanonicalMapOrder));
     }
 

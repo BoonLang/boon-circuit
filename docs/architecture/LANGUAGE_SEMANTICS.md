@@ -17,19 +17,34 @@ that field compares its value, not a hidden runtime object.
 
 ## Number
 
-`Number` is one finite IEEE-754 binary64 semantic type. Integer and decimal
-literals do not create different value kinds. NaN and infinities are rejected,
-and negative zero is normalized to positive zero for equality, ordering,
-hashing, persistence, and protocol identity.
+`Number` is one exact arbitrary-precision rational semantic type. Every value
+is normalized as `numerator / denominator`, with a positive denominator,
+coprime components, and exactly one zero representation (`0 / 1`). Integer,
+decimal, and rational results do not create different value kinds:
 
-The measured hidden-integer specialization was rejected because it doubled
-scalar storage and regressed all measured workloads. See
+```boon
+decimal_identity: 0.1 + 0.2 == 0.3
+rational_identity: 1 / 3 * 3 == 1
+large_whole: 9007199254740993
+```
+
+There is no negative zero, NaN, infinity, wrapping arithmetic, or public
+approximate Number subtype. The earlier binary64 specialization experiment is
+historical evidence about that retired representation, not the current
+semantic contract. See
 [`NUMBER_SPECIALIZATION_EXPERIMENT.md`](NUMBER_SPECIALIZATION_EXPERIMENT.md).
 
-Arithmetic operators produce `Number`. In particular, `/` is real division:
-`1 / 2` is `0.5`. Division or remainder by zero and arithmetic that would
-produce a non-finite result produce a typed error instead of a non-finite
-value.
+Arithmetic operators produce exact `Number` values. In particular, `/` is
+exact rational division: `1 / 2` is `0.5`, and `1 / 3` remains the normalized
+rational `1 / 3`. `%` accepts whole Numbers only and uses Euclidean remainder.
+Division or remainder by zero, a non-whole remainder operand, an invalid
+rounding domain, or exhaustion of an exact-number resource budget is a
+deterministic terminal error. The evaluator never fabricates zero, a
+non-finite value, a business Tag, or an implicit `FLUSH`.
+
+Execution profiles bound numerator and denominator bits, parsed and formatted
+digits, and arithmetic work. Exceeding a bound fails deterministically; it
+does not truncate, approximate, wrap, or silently switch semantics.
 
 Whole-number operations are explicit:
 
@@ -45,8 +60,10 @@ implicitly. Code that derives an index from real arithmetic must select the
 intended rounding operation first.
 
 `Number/to_text()` keeps the same single Number type and never infers or exposes
-an integer storage type. With no formatting options it accepts every finite
-Number and produces its ordinary decimal representation:
+an integer storage type. With no formatting options it produces an exact,
+round-trippable canonical representation: whole values use integer notation,
+terminating rationals use decimal notation, and other values use reduced
+`numerator/denominator` notation:
 
 ```boon
 label: 12.5 |> Number/to_text()
@@ -407,9 +424,11 @@ dynamic comparison patterns fail in the parser with targeted diagnostics.
 Pattern bindings and field projections are then carried structurally through
 the checked and executable artifacts; typechecking does not recover them by
 scanning source tokens. Fixed-width BITS literal patterns remain unavailable
-until the BITS value phase lands. The legacy `NaN` arm remains temporarily
-accepted only while the binary64 `Text/to_number()` profile still exists; the
-exact Number cut replaces it with `Parsed[...] | InvalidNumber[...]`.
+until the BITS value phase lands. The parser still recognizes the legacy `NaN`
+arm only as migration debt for the old `Text/to_number()` failure profile; no
+`Number` value can contain NaN. Its flag-day removal accompanies the
+`Parsed[...] | InvalidNumber[...]` conversion and it must not be used by new
+code.
 
 On an absent event input, event-style `WHEN` returns `SKIP`. Value-style `WHEN`
 does not have absence unless the value being matched is itself an event/optional

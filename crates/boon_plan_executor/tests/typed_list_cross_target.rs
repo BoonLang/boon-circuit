@@ -29,30 +29,13 @@ fn typed_key_codec_has_the_same_golden_bytes_on_native_and_wasm() {
     ])
     .unwrap();
     let key = StructuralKey::new(vec![
-        StructuralValue::number(0.0).unwrap(),
+        StructuralValue::number(boon_data::ExactNumber::zero()),
         StructuralValue::text("a\0"),
         StructuralValue::ClosedTag(ClosedTag::new(truth_type, 1)),
         StructuralValue::ClosedTag(ClosedTag::new(tag_type, 7)),
     ])
     .unwrap();
-    let mut expected = vec![
-        KEY_CODEC_VERSION,
-        0x11,
-        0x80,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0x22,
-        b'a',
-        0,
-        u8::MAX,
-        0,
-        0,
-    ];
+    let mut expected = vec![KEY_CODEC_VERSION, 0x11, 0x01, 0x22, b'a', 0, u8::MAX, 0, 0];
     expected.push(0x44);
     expected.extend_from_slice(truth_type.as_bytes());
     expected.extend_from_slice(&1_u32.to_be_bytes());

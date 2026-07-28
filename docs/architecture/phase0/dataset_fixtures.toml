@@ -31,10 +31,21 @@ owner_plan = "docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md"
 id = "correctness.exact-arithmetic-current.v1"
 category = "correctness"
 behavior = "compile-execute-current"
-purpose = "Current representable arithmetic execution before the exact Number flag-day."
+purpose = "Exact decimal, rational, and above-binary64 arithmetic execution."
 entrypoint = "testdata/phase0/fixtures/exact_arithmetic_current.bn"
 units = ["testdata/phase0/fixtures/exact_arithmetic_current.bn"]
-source_bundle_digest_v1 = "eba2c7134055938df2d2e6f586961b6cdae170d186d3ec30a0d31533b19d2cb8"
+source_bundle_digest_v1 = "04cf85b44be68a4699eb1af88166c6281e5c026cd5d5c7b0e37b87d2feb5392c"
+owner_phase = "goal-phase-2-foundations"
+owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
+
+[[fixtures]]
+id = "correctness.exact-integer-current.v1"
+category = "correctness"
+behavior = "compile-execute-current"
+purpose = "Arbitrary-precision whole Number execution beyond fixed integer widths."
+entrypoint = "testdata/phase0/fixtures/exact_integer_current.bn"
+units = ["testdata/phase0/fixtures/exact_integer_current.bn"]
+source_bundle_digest_v1 = "1420aad647fcab4e8dfb900d7360bf0833b789a5b0512007faeb57cad6ec7e24"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
 
@@ -46,17 +57,6 @@ purpose = "Future BITS syntax rejection before the final bounded-bit value algeb
 entrypoint = "testdata/phase0/fixtures/future_bits.bn"
 units = ["testdata/phase0/fixtures/future_bits.bn"]
 source_bundle_digest_v1 = "15535ead7609116a55cc3b2ec1e3a4c230eb07366c8b8211d1cf930bb09d14e6"
-owner_phase = "goal-phase-2-foundations"
-owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
-
-[[fixtures]]
-id = "correctness.future-exact-integer-rejection.v1"
-category = "correctness"
-behavior = "compile-reject-future"
-purpose = "Exact-only integer source rejection before exact rational NUMBER is implemented."
-entrypoint = "testdata/phase0/fixtures/future_exact_integer.bn"
-units = ["testdata/phase0/fixtures/future_exact_integer.bn"]
-source_bundle_digest_v1 = "2e9195dc1f29056484a6aa80b005742dc522afc828f7d5030ca2580dbdc76292"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
 
@@ -272,7 +272,7 @@ units = [
   "examples/novywave/View/NovyView.bn",
   "examples/novywave/hold.bn",
 ]
-source_bundle_digest_v1 = "c29225327633269bdb67754f82bb800286eb45ab49f4bf6a4d9409832a7cb732"
+source_bundle_digest_v1 = "94710542ea8dc264597531e21ba79a489aba2401bf8ea14511febcb3b7e3a2bc"
 owner_phase = "goal-phase-6-web-persistence"
 owner_plan = "docs/plans/NOVYWAVE_BOON_REWRITE_PLAN.md"
 

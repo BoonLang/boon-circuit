@@ -36,20 +36,20 @@ replacement_seam = "Phase 1 must preserve wrapper equivalence after verified sem
 
 [[fixtures]]
 id = "exact-arithmetic"
-classification = "future-language"
+classification = "current-regression"
 status = "existing"
-target_status = "not-yet-implemented"
-evidence_status = "current-execution-plus-future-rejection"
+target_status = "current-supported"
+evidence_status = "compile-execute-current"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
 path = "testdata/phase0/fixtures/exact_arithmetic_current.bn"
 dataset_fixture_ids = [
   "correctness.exact-arithmetic-current.v1",
-  "correctness.future-exact-integer-rejection.v1",
+  "correctness.exact-integer-current.v1",
 ]
-command = "cargo test -p boon_phase0_baseline fixture_exact_arithmetic_records_current_binary64 --lib"
-expected = "Representable arithmetic executes with current binary64 bits; the exact-only integer fixture fails closed."
-replacement_seam = "Phase 2 replaces these binary64 assertions with exact rational equality and makes future_exact_integer.bn execute exactly."
+command = "cargo test -p boon_phase0_baseline fixture_exact_arithmetic_is_canonical --lib"
+expected = "Decimal and rational identities plus arbitrary-precision whole Numbers execute through the exact Number algebra."
+replacement_seam = "The remaining Phase 2 parsing, rounding-surface, and one-based-position gates extend this exact arithmetic foundation without a binary64 compatibility path."
 
 [[fixtures]]
 id = "tags-presence-fault"

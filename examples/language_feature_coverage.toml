@@ -25,9 +25,9 @@ fixture = "examples/language_surface/current/distributed_role_paths.bn"
 
 [[feature]]
 id = "exact_number_value_algebra"
-stage = "planned"
+stage = "current"
 parser_expectation = "accept"
-fixture = "examples/language_surface/future/exact_number_value_algebra.bn"
+fixture = "examples/language_surface/current/exact_number_value_algebra.bn"
 
 [[feature]]
 id = "flush_control"
@@ -40,12 +40,6 @@ id = "immutable_bytes"
 stage = "current"
 parser_expectation = "accept"
 fixture = "examples/language_surface/current/immutable_bytes.bn"
-
-[[feature]]
-id = "legacy_binary64_numbers"
-stage = "current"
-parser_expectation = "accept"
-fixture = "examples/language_surface/current/legacy_binary64_numbers.bn"
 
 [[feature]]
 id = "map_literals"

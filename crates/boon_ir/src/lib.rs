@@ -1056,6 +1056,8 @@ pub enum ExecutableExpressionKind {
     },
     Number(String),
     BytesByte(u8),
+    /// Private flow absence. It cannot be materialized as public data.
+    Absent,
     Tag(String),
     TaggedObject {
         tag: String,
@@ -4276,6 +4278,7 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
         | ExecutableExpressionKind::Text(_)
         | ExecutableExpressionKind::Number(_)
         | ExecutableExpressionKind::BytesByte(_)
+        | ExecutableExpressionKind::Absent
         | ExecutableExpressionKind::Tag(_)
         | ExecutableExpressionKind::Source { .. }
         | ExecutableExpressionKind::Materialize { .. }
@@ -4702,6 +4705,7 @@ fn executable_list_item_field_names(
             | ExecutableExpressionKind::Text(_)
             | ExecutableExpressionKind::Number(_)
             | ExecutableExpressionKind::BytesByte(_)
+            | ExecutableExpressionKind::Absent
             | ExecutableExpressionKind::Tag(_)
             | ExecutableExpressionKind::Source { .. }
             | ExecutableExpressionKind::Call { .. }

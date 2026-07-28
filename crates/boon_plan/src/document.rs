@@ -125,6 +125,8 @@ pub enum DocumentValueClass {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DocumentExprOp {
+    /// Private flow absence. This is control state, not a document value.
+    Absent,
     Constant {
         constant: DocumentConstantId,
     },
@@ -943,7 +945,9 @@ pub fn verify_map_viewport_constructor_contract(
 impl DocumentExprOp {
     fn expression_refs(&self) -> Vec<DocumentExprId> {
         match self {
-            Self::Constant { .. } | Self::Read { .. } | Self::NoElement => Vec::new(),
+            Self::Absent | Self::Constant { .. } | Self::Read { .. } | Self::NoElement => {
+                Vec::new()
+            }
             Self::Project { input, .. } => vec![*input],
             Self::Record { fields } | Self::TaggedRecord { fields, .. } => {
                 fields.iter().map(|field| field.value).collect()

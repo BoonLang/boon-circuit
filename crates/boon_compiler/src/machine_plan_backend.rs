@@ -56,7 +56,8 @@ fn visit_row_node_children_mut(
     visitor: &mut impl FnMut(&mut PlanRowExpressionId),
 ) {
     match node {
-        PlanRowExpressionNode::Intrinsic { .. }
+        PlanRowExpressionNode::Absent
+        | PlanRowExpressionNode::Intrinsic { .. }
         | PlanRowExpressionNode::Field { .. }
         | PlanRowExpressionNode::Constant { .. }
         | PlanRowExpressionNode::ListRef { .. }
@@ -2872,6 +2873,9 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                     })?,
                 })
             }
+            ir::ExecutableExpressionKind::Absent => Err(PlanError::new(format!(
+                "private absence at executable expression {expr_id} cannot be migration data"
+            ))),
             ir::ExecutableExpressionKind::Tag(tag) => {
                 Ok(MigrationExpressionPlan::Variant { tag })
             }
@@ -6034,6 +6038,7 @@ fn constant_executable_expression_value_inner(
             .ok()
             .map(|value| PlanConstantValue::Number { value }),
         ir::ExecutableExpressionKind::BytesByte(value) => bytes_plan_constant(&[*value]),
+        ir::ExecutableExpressionKind::Absent => None,
         ir::ExecutableExpressionKind::Tag(value) => Some(PlanConstantValue::Tag {
             name: value.clone(),
         }),
@@ -6376,6 +6381,7 @@ fn inferred_executable_expression_value_type_inner(
         ir::ExecutableExpressionKind::BytesByte(_) => {
             Some(PlanValueType::Bytes { fixed_len: Some(1) })
         }
+        ir::ExecutableExpressionKind::Absent => None,
         ir::ExecutableExpressionKind::Tag(_)
         | ir::ExecutableExpressionKind::TaggedObject { .. } => Some(PlanValueType::Tag),
         ir::ExecutableExpressionKind::Bytes {
@@ -10343,6 +10349,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 })?
             }
             ir::ExecutableExpressionKind::BytesByte(value) => self.bytes_constant(vec![value])?,
+            ir::ExecutableExpressionKind::Absent => self.intern(PlanRowExpressionNode::Absent)?,
             ir::ExecutableExpressionKind::Tag(value) => {
                 self.constant(PlanConstantValue::Tag { name: value })?
             }
@@ -11904,6 +11911,7 @@ fn row_expression_value_type(
     expression: PlanRowExpressionId,
 ) -> Result<Option<PlanValueType>, PlanError> {
     Ok(match arena.node(expression)? {
+        PlanRowExpressionNode::Absent => None,
         PlanRowExpressionNode::Intrinsic { .. } => Some(PlanValueType::Tag),
         PlanRowExpressionNode::Field { input } => {
             plan_value_type_for_value_ref(program, index, input)

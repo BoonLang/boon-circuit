@@ -2552,6 +2552,7 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
+        | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Materialize { .. }
@@ -3278,6 +3279,7 @@ fn rebase_expression_kind(
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
+        | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Materialize { .. }
@@ -4113,6 +4115,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
             | SemanticExpressionKind::TextTemplate { .. }
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
+            | SemanticExpressionKind::Absent
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::Call { .. }
             | SemanticExpressionKind::Materialize { .. }
@@ -4650,6 +4653,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
             }
             CheckedExpressionKind::Number { value } => SemanticExpressionKind::Number(value),
             CheckedExpressionKind::BytesByte { value } => SemanticExpressionKind::BytesByte(value),
+            CheckedExpressionKind::Absent => SemanticExpressionKind::Absent,
             CheckedExpressionKind::Tag { name } => SemanticExpressionKind::Tag(name),
             CheckedExpressionKind::TaggedObject { tag, fields } => {
                 SemanticExpressionKind::TaggedObject {

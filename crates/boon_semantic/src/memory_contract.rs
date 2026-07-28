@@ -960,6 +960,7 @@ fn expression_children(
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
+        | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Delimiter
@@ -2047,6 +2048,9 @@ impl SemanticMigrationPurityChecker<'_> {
             }
             SemanticExpressionKind::Drain { .. } => Err(SemanticMemoryError::new(format!(
                 "migration transform expression {expression_id} consumes DRAIN owned by another destination"
+            ))),
+            SemanticExpressionKind::Absent => Err(SemanticMemoryError::new(format!(
+                "private absence at semantic expression {expression_id} cannot be migration data"
             ))),
             SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)

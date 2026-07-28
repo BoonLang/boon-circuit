@@ -984,7 +984,7 @@ impl DocumentRuntime {
 
     fn turn_affects_structure(&self, deltas: &[Delta]) -> bool {
         deltas.iter().any(|delta| match delta {
-            Delta::SetValue { target, .. } => {
+            Delta::SetValue { target, .. } | Delta::ClearValue { target } => {
                 self.structural_dependencies
                     .contains(&DocumentDependency::Value(*target))
                     || matches!(
@@ -1480,6 +1480,7 @@ fn delta_dependency(delta: &Delta) -> Option<(DocumentDependency, Option<&Value>
         Delta::SetValue { target, value } => {
             Some((DocumentDependency::Value(*target), Some(value)))
         }
+        Delta::ClearValue { target } => Some((DocumentDependency::Value(*target), None)),
         Delta::SetDistributedImport { import_id, value } => Some((
             DocumentDependency::DistributedImport(*import_id),
             Some(value),
@@ -1823,6 +1824,7 @@ impl<'a> Evaluator<'a> {
         env: &mut EvalEnv,
     ) -> Result<EvalValue, DocumentError> {
         match op {
+            DocumentExprOp::Absent => Ok(EvalValue::Absent),
             DocumentExprOp::Constant { constant } => self.constant(*constant),
             DocumentExprOp::Read { read } => self.read(read.clone(), env),
             DocumentExprOp::Project { input, field } => {
@@ -2399,9 +2401,9 @@ impl<'a> Evaluator<'a> {
             .clone();
         let next = depth + 1;
         match op.as_ref() {
-            DocumentExprOp::Constant { .. } | DocumentExprOp::NoElement => {
-                Ok(ScalarTargetUse::Independent)
-            }
+            DocumentExprOp::Absent
+            | DocumentExprOp::Constant { .. }
+            | DocumentExprOp::NoElement => Ok(ScalarTargetUse::Independent),
             DocumentExprOp::Read { read } => {
                 if self.direct_read_target(read, env) == Some(target) {
                     Ok(ScalarTargetUse::Unguarded)
@@ -2590,6 +2592,7 @@ impl<'a> Evaluator<'a> {
         };
         match op.as_ref() {
             DocumentExprOp::Constant { .. } | DocumentExprOp::NoElement => true,
+            DocumentExprOp::Absent => false,
             DocumentExprOp::Read { read } => match read {
                 DocumentRead::Parameter { .. }
                 | DocumentRead::Local { .. }

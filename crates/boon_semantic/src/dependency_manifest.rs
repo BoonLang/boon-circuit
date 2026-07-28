@@ -3042,6 +3042,7 @@ fn checked_expression_dependency(
         | CheckedExpressionKind::TextTemplate { .. }
         | CheckedExpressionKind::Number { .. }
         | CheckedExpressionKind::BytesByte { .. }
+        | CheckedExpressionKind::Absent
         | CheckedExpressionKind::Tag { .. }
         | CheckedExpressionKind::TaggedObject { .. }
         | CheckedExpressionKind::When { .. }
@@ -4391,6 +4392,7 @@ fn semantic_expression_dependency(
         SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
+        | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Delimiter => (
             SemanticDependencyChannelV1::StructuralRepresentation,

@@ -1916,7 +1916,8 @@ fn distributed_call_expression_is_safe(
             PlanRowExpressionNode::ListRowField { row, list_id, .. } => {
                 child_is_valid(row) && row_bindings.iter().any(|binding| binding.list == *list_id)
             }
-            PlanRowExpressionNode::Intrinsic { .. }
+            PlanRowExpressionNode::Absent
+            | PlanRowExpressionNode::Intrinsic { .. }
             | PlanRowExpressionNode::ListGetField { .. }
             | PlanRowExpressionNode::ListRef { .. }
             | PlanRowExpressionNode::AuthorityListRef { .. }
@@ -7129,6 +7130,8 @@ impl<'de> Deserialize<'de> for PlanRowBuiltin {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanRowExpressionNode {
+    /// Private flow absence. This node never enters the constant/data tables.
+    Absent,
     Intrinsic {
         intrinsic: PlanIntrinsic,
     },
@@ -7368,7 +7371,8 @@ impl From<ValueRef> for PlanRowExpressionNode {
 impl PlanRowExpressionNode {
     pub fn visit_children(&self, visitor: &mut impl FnMut(PlanRowExpressionId)) {
         match self {
-            Self::Intrinsic { .. }
+            Self::Absent
+            | Self::Intrinsic { .. }
             | Self::Field { .. }
             | Self::Constant { .. }
             | Self::ListRef { .. }
@@ -7562,7 +7566,8 @@ impl PlanRowExpressionNode {
 
     fn visit_children_mut(&mut self, visitor: &mut impl FnMut(&mut PlanRowExpressionId)) {
         match self {
-            Self::Intrinsic { .. }
+            Self::Absent
+            | Self::Intrinsic { .. }
             | Self::Field { .. }
             | Self::Constant { .. }
             | Self::ListRef { .. }

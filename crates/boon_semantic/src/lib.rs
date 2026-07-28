@@ -1836,6 +1836,7 @@ fn semantic_expression_depends_on_role(
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
+            | SemanticExpressionKind::Absent
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::Source { .. }
             | SemanticExpressionKind::Delimiter
@@ -3842,6 +3843,7 @@ fn checked_expression_children_for_call_analysis(
         | Kind::Text { .. }
         | Kind::Number { .. }
         | Kind::BytesByte { .. }
+        | Kind::Absent
         | Kind::Tag { .. }
         | Kind::Source
         | Kind::Delimiter

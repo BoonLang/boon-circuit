@@ -977,6 +977,10 @@ pub enum Delta {
         target: ValueTarget,
         value: Value,
     },
+    /// Clears a derived value whose private presence became absent.
+    ClearValue {
+        target: ValueTarget,
+    },
     SetDistributedImport {
         import_id: ImportId,
         value: Value,
@@ -1622,10 +1626,20 @@ enum RowFieldAvailability {
     Missing,
 }
 
+/// Runtime-only presence envelope for derived scalar caches.
+///
+/// `Absent` is never converted into [`Value`], serialized, persisted, or sent
+/// over a public boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PrivatePresence<T> {
+    Absent,
+    Present(T),
+}
+
 #[derive(Clone, Debug)]
 struct DerivedCell {
     currentness: Currentness,
-    value: Option<Value>,
+    value: Option<PrivatePresence<Value>>,
 }
 
 #[derive(Clone, Debug)]
@@ -7691,7 +7705,8 @@ fn schedule_apply_operands<'event, 'plan>(
                 push(field.value)?;
             }
         }
-        PlanRowExpressionNode::Intrinsic { .. }
+        PlanRowExpressionNode::Absent
+        | PlanRowExpressionNode::Intrinsic { .. }
         | PlanRowExpressionNode::Field { .. }
         | PlanRowExpressionNode::Constant { .. }
         | PlanRowExpressionNode::ListGetField { .. }
@@ -9766,7 +9781,9 @@ impl MachineBuildTask {
             PublishedCurrentnessPhase::EvaluateDirty { next } => {
                 if let Some(field) = build.dirty.get(*next).copied() {
                     let mut work = std::mem::take(&mut self.work);
-                    let result = self.session_mut().ensure_root_field(field, None, &mut work);
+                    let result = self
+                        .session_mut()
+                        .ensure_root_field_presence(field, None, &mut work);
                     self.work = work;
                     result?;
                     *next += 1;
@@ -10201,7 +10218,24 @@ impl MachineInstance {
             let mut bindings = BTreeMap::new();
             let evaluated =
                 self.eval_row_expression(expression, None, None, None, None, &mut bindings, work)?;
-            let value = self.materialize_eval(evaluated)?;
+            let value = match evaluated {
+                EvalValue::Absent => {
+                    return Err(Error::InvalidPlan(format!(
+                        "state {} (`{}`) has a private-absence initializer",
+                        slot.state_id.0,
+                        debug_label(&self.plan.debug_map.state_slots, "state:", slot.state_id.0)
+                            .unwrap_or("<unlabeled>")
+                    )));
+                }
+                value => self.materialize_eval(value).map_err(|error| {
+                    Error::InvalidPlan(format!(
+                        "state {} (`{}`) initializer is not public data: {error}",
+                        slot.state_id.0,
+                        debug_label(&self.plan.debug_map.state_slots, "state:", slot.state_id.0)
+                            .unwrap_or("<unlabeled>")
+                    ))
+                })?,
+            };
             self.root_states.insert(slot.state_id, value);
         }
 
@@ -12044,15 +12078,18 @@ impl MachineInstance {
                     field.0
                 )));
             }
-            snapshot.fields.insert(
-                *field,
-                cell.value
-                    .clone()
-                    .ok_or_else(|| {
-                        Error::Evaluation(format!("demanded field {} has no value", field.0))
-                    })?
-                    .into_visible_facade(),
-            );
+            let value = match cell.value.clone().ok_or_else(|| {
+                Error::Evaluation(format!("demanded field {} has no presence", field.0))
+            })? {
+                PrivatePresence::Present(value) => value,
+                PrivatePresence::Absent => {
+                    return Err(Error::Evaluation(format!(
+                        "demanded field {} is privately absent",
+                        field.0
+                    )));
+                }
+            };
+            snapshot.fields.insert(*field, value.into_visible_facade());
         }
         for (list, state) in &self.lists {
             let rows = state
@@ -12589,7 +12626,10 @@ impl MachineInstance {
                     if !self.metadata.published.contains(&field) {
                         return Err(Error::NotDemanded(field));
                     }
-                    Some(self.ensure_root_field(field, None, &mut work)?)
+                    match self.ensure_root_field_presence(field, None, &mut work)? {
+                        PrivatePresence::Present(value) => Some(value),
+                        PrivatePresence::Absent => None,
+                    }
                 }
                 ValueTarget::RowField { row, field } => {
                     let field = self.resolve_row_field_alias(row, field);
@@ -13211,7 +13251,24 @@ impl MachineInstance {
             let mut bindings = BTreeMap::new();
             let evaluated =
                 self.eval_row_expression(expression, None, None, None, None, &mut bindings, work)?;
-            let value = self.materialize_eval(evaluated)?;
+            let value = match evaluated {
+                EvalValue::Absent => {
+                    return Err(Error::InvalidPlan(format!(
+                        "state {} (`{}`) has a private-absence initializer",
+                        slot.state_id.0,
+                        debug_label(&self.plan.debug_map.state_slots, "state:", slot.state_id.0)
+                            .unwrap_or("<unlabeled>")
+                    )));
+                }
+                value => self.materialize_eval(value).map_err(|error| {
+                    Error::InvalidPlan(format!(
+                        "state {} (`{}`) initializer is not public data: {error}",
+                        slot.state_id.0,
+                        debug_label(&self.plan.debug_map.state_slots, "state:", slot.state_id.0)
+                            .unwrap_or("<unlabeled>")
+                    ))
+                })?,
+            };
             self.root_states.insert(slot.state_id, value);
         }
         Ok(())
@@ -14540,7 +14597,7 @@ impl MachineInstance {
                 self.mark_list_dirty(*list, work);
             }
             for field in &derived {
-                self.ensure_root_field(*field, None, work)?;
+                self.ensure_root_field_presence(*field, None, work)?;
             }
             for list in &derived_lists {
                 self.ensure_list_current(*list, None, work)?;
@@ -14562,7 +14619,7 @@ impl MachineInstance {
                 self.mark_list_dirty(*list, work);
             }
             for field in &derived {
-                self.ensure_root_field(*field, None, work)?;
+                self.ensure_root_field_presence(*field, None, work)?;
             }
             for list in &derived_lists {
                 self.ensure_list_current(*list, None, work)?;
@@ -15101,7 +15158,7 @@ impl MachineInstance {
                 self.mark_root_dirty(*field, work);
             }
             for field in source_fields {
-                self.ensure_root_field(*field, Some(event), work)?;
+                self.ensure_root_field_presence(*field, Some(event), work)?;
             }
         }
         if let Some(source_lists) = metadata.source_derived_lists_by_source.get(&event.source) {
@@ -15853,12 +15910,12 @@ impl MachineInstance {
         Ok(())
     }
 
-    fn ensure_root_field(
+    fn ensure_root_field_presence(
         &mut self,
         field: FieldId,
         event: Option<&SourceEvent>,
         work: &mut Work,
-    ) -> Result<Value, Error> {
+    ) -> Result<PrivatePresence<Value>, Error> {
         self.flush_list_access_dependencies(work)?;
         let currentness = self
             .root_fields
@@ -15874,7 +15931,7 @@ impl MachineInstance {
                     .get(&field)
                     .and_then(|cell| cell.value.clone())
                     .ok_or_else(|| {
-                        Error::Evaluation(format!("current root field {} has no value", field.0))
+                        Error::Evaluation(format!("current root field {} has no presence", field.0))
                     });
             }
             Currentness::Evaluating => return Err(Error::Cycle { field, row: None }),
@@ -15894,14 +15951,22 @@ impl MachineInstance {
             .cloned()
             .ok_or_else(|| Error::InvalidPlan(format!("root field {} has no plan op", field.0)))?;
         let evaluated = self.evaluate_root_computation(field, &op, event, work);
-        let value = match evaluated {
+        let presence = match evaluated {
             Ok(value) => value,
             Err(error) => {
                 self.root_fields
                     .get_mut(&field)
                     .expect("root cell checked above")
                     .currentness = Currentness::Dirty;
-                return Err(error);
+                return Err(match error {
+                    Error::Evaluation(detail) => Error::Evaluation(format!(
+                        "root field {} (`{}`): {detail}",
+                        field.0,
+                        debug_label(&self.plan.debug_map.fields, "field:", field.0)
+                            .unwrap_or("<unlabeled>")
+                    )),
+                    error => error,
+                });
             }
         };
         let old = self
@@ -15910,21 +15975,44 @@ impl MachineInstance {
             .and_then(|cell| cell.value.clone());
         {
             let cell = self.root_fields.get_mut(&field).expect("root cell exists");
-            cell.value = Some(value.clone());
+            cell.value = Some(presence.clone());
             cell.currentness = Currentness::Current;
         }
         work.metrics.recomputed_field_count += 1;
         work.recomputed_targets.insert(ValueTarget::Field(field));
-        if old.as_ref() != Some(&value) {
+        if old.as_ref() != Some(&presence) {
             self.invalidate_root_field(field, work);
             if work.emit {
-                work.deltas.push(Delta::SetValue {
-                    target: ValueTarget::Field(field),
-                    value: value.clone(),
-                });
+                match &presence {
+                    PrivatePresence::Present(value) => work.deltas.push(Delta::SetValue {
+                        target: ValueTarget::Field(field),
+                        value: value.clone(),
+                    }),
+                    PrivatePresence::Absent if matches!(old, Some(PrivatePresence::Present(_))) => {
+                        work.deltas.push(Delta::ClearValue {
+                            target: ValueTarget::Field(field),
+                        });
+                    }
+                    PrivatePresence::Absent => {}
+                }
             }
         }
-        Ok(value)
+        Ok(presence)
+    }
+
+    fn ensure_root_field(
+        &mut self,
+        field: FieldId,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<Value, Error> {
+        match self.ensure_root_field_presence(field, event, work)? {
+            PrivatePresence::Present(value) => Ok(value),
+            PrivatePresence::Absent => Err(Error::Evaluation(format!(
+                "root field {} is privately absent",
+                field.0
+            ))),
+        }
     }
 
     fn ensure_list_current(
@@ -16531,7 +16619,7 @@ impl MachineInstance {
                 return Ok(());
             }
             for field in dirty {
-                self.ensure_root_field(field, event, work)?;
+                self.ensure_root_field_presence(field, event, work)?;
             }
         }
         Err(Error::Evaluation(
@@ -16557,7 +16645,7 @@ impl MachineInstance {
                 match *target {
                     ValueTarget::State(_) => {}
                     ValueTarget::Field(field) => {
-                        self.ensure_root_field(field, event, work)?;
+                        self.ensure_root_field_presence(field, event, work)?;
                     }
                     ValueTarget::RowField { row, field } => {
                         if self.row_exists(row) {
@@ -16709,11 +16797,11 @@ impl MachineInstance {
         op: &PlanOp,
         event: Option<&SourceEvent>,
         work: &mut Work,
-    ) -> Result<Value, Error> {
+    ) -> Result<PrivatePresence<Value>, Error> {
         let value = match &op.kind {
             PlanOpKind::DerivedValue { .. } => {
                 let value = self.evaluate_derived_op(op, None, event, work)?;
-                self.materialize_eval(value)?
+                self.materialize_private_presence(value)?
             }
             PlanOpKind::ListProjection { projection } => {
                 let value = self.evaluate_projection(
@@ -16723,7 +16811,7 @@ impl MachineInstance {
                     event,
                     work,
                 )?;
-                self.materialize_eval(value)?
+                self.materialize_private_presence(value)?
             }
             _ => {
                 return Err(Error::Unsupported {
@@ -18653,6 +18741,16 @@ impl MachineInstance {
         );
     }
 
+    fn materialize_private_presence(
+        &mut self,
+        value: EvalValue,
+    ) -> Result<PrivatePresence<Value>, Error> {
+        match value {
+            EvalValue::Absent => Ok(PrivatePresence::Absent),
+            value => self.materialize_eval(value).map(PrivatePresence::Present),
+        }
+    }
+
     fn materialize_eval(&mut self, value: EvalValue) -> Result<Value, Error> {
         let mut tasks = vec![EvalMaterializationTask::Evaluate(value)];
         let mut values = Vec::<Value>::new();
@@ -19601,6 +19699,9 @@ impl MachineInstance {
                                 .node(expression)
                                 .map_err(|error| Error::InvalidPlan(error.to_string()))?;
                             match node {
+                                PlanRowExpressionNode::Absent => {
+                                    stack.push_value(EvalValue::Absent)?
+                                }
                                 PlanRowExpressionNode::Intrinsic { intrinsic } => stack
                                     .push_value(EvalValue::Value(
                                         self.eval_intrinsic(*intrinsic)?,
@@ -20849,7 +20950,12 @@ impl MachineInstance {
                                             && let Some(value) = self
                                                 .root_fields
                                                 .get(field)
-                                                .and_then(|cell| cell.value.clone())
+                                                .and_then(|cell| match &cell.value {
+                                                    Some(PrivatePresence::Present(value)) => {
+                                                        Some(value.clone())
+                                                    }
+                                                    Some(PrivatePresence::Absent) | None => None,
+                                                })
                                         {
                                             stack.push_value(EvalValue::Value(value))?;
                                             return Ok(());
@@ -20999,14 +21105,13 @@ impl MachineInstance {
                                         .root_fields
                                         .get(&field)
                                         .and_then(|cell| cell.value.clone())
-                                        .map(EvalValue::Value)
                                         .ok_or_else(|| {
                                             Error::Evaluation(format!(
                                                 "current root field {} has no value",
                                                 field.0
                                             ))
                                         })?;
-                                    stack.push_value(value)?;
+                                    stack.push_value(private_presence_eval(&value))?;
                                 }
                                 Currentness::Evaluating => {
                                     return Err(Error::Cycle { field, row: None });
@@ -21047,7 +21152,7 @@ impl MachineInstance {
                             }
                         }
                         ExpressionTask::FinishRoot { field } => {
-                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            let presence = self.materialize_private_presence(stack.pop_value()?)?;
                             if stack.values.len() >= stack.limit {
                                 return Err(Error::InvalidPlan(format!(
                                     "expression value stack exceeded its plan-derived bound of {}",
@@ -21065,7 +21170,7 @@ impl MachineInstance {
                                         field.0
                                     ))
                                 })?;
-                                cell.value = Some(value.clone());
+                                cell.value = Some(presence.clone());
                                 cell.currentness = Currentness::Current;
                             }
                             finish_expression_currentness(
@@ -21074,16 +21179,28 @@ impl MachineInstance {
                             )?;
                             work.metrics.recomputed_field_count += 1;
                             work.recomputed_targets.insert(ValueTarget::Field(field));
-                            if old.as_ref() != Some(&value) {
+                            if old.as_ref() != Some(&presence) {
                                 self.invalidate_root_field(field, work);
                                 if work.emit {
-                                    work.deltas.push(Delta::SetValue {
-                                        target: ValueTarget::Field(field),
-                                        value: value.clone(),
-                                    });
+                                    match &presence {
+                                        PrivatePresence::Present(value) => {
+                                            work.deltas.push(Delta::SetValue {
+                                                target: ValueTarget::Field(field),
+                                                value: value.clone(),
+                                            });
+                                        }
+                                        PrivatePresence::Absent
+                                            if matches!(old, Some(PrivatePresence::Present(_))) =>
+                                        {
+                                            work.deltas.push(Delta::ClearValue {
+                                                target: ValueTarget::Field(field),
+                                            });
+                                        }
+                                        PrivatePresence::Absent => {}
+                                    }
                                 }
                             }
-                            stack.push_value(EvalValue::Value(value))?;
+                            stack.push_value(private_presence_eval(&presence))?;
                         }
                         ExpressionTask::EnsureRow { row, field, event } => {
                             stack.push_task(ExpressionTask::EnsureRowCurrentness {
@@ -24261,7 +24378,12 @@ impl MachineInstance {
                                     expression.0
                                 )));
                             };
-                            let input = self.materialize_eval(stack.pop_value()?)?;
+                            let input = stack.pop_value()?;
+                            if matches!(input, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let input = self.materialize_eval(input)?;
                             let expression = arms
                                 .iter()
                                 .find_map(|arm| {
@@ -25232,7 +25354,8 @@ impl MachineInstance {
             PlanRowExpressionNode::ObjectField { field, .. } => {
                 self.eval_object_field(next()?, field, context.consumer)?
             }
-            PlanRowExpressionNode::Intrinsic { .. }
+            PlanRowExpressionNode::Absent
+            | PlanRowExpressionNode::Intrinsic { .. }
             | PlanRowExpressionNode::Field { .. }
             | PlanRowExpressionNode::Constant { .. }
             | PlanRowExpressionNode::ListGetField { .. }
@@ -26635,6 +26758,13 @@ fn eval_value_is_present(value: &EvalValue) -> bool {
     !matches!(value, EvalValue::Absent)
 }
 
+fn private_presence_eval(value: &PrivatePresence<Value>) -> EvalValue {
+    match value {
+        PrivatePresence::Absent => EvalValue::Absent,
+        PrivatePresence::Present(value) => EvalValue::Value(value.clone()),
+    }
+}
+
 fn expression_row(row: Option<RowId>) -> Option<RowId> {
     row
 }
@@ -27872,7 +28002,8 @@ pub(crate) fn report_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
             Delta::InsertRow { row } => Delta::InsertRow {
                 row: report_row_snapshot(row),
             },
-            delta @ (Delta::ClearDistributedImport { .. }
+            delta @ (Delta::ClearValue { .. }
+            | Delta::ClearDistributedImport { .. }
             | Delta::RemoveRow { .. }
             | Delta::BindSource { .. }
             | Delta::UnbindSource { .. }) => delta,
@@ -27996,6 +28127,7 @@ fn delta_logical_bytes(delta: &Delta) -> u64 {
     let payload = match delta {
         Delta::SetValue { target, value } => value_target_logical_bytes(*target)
             .saturating_add(value_tree_stats(value).logical_payload_bytes),
+        Delta::ClearValue { target } => value_target_logical_bytes(*target),
         Delta::SetDistributedImport { value, .. } => {
             32_u64.saturating_add(value_tree_stats(value).logical_payload_bytes)
         }

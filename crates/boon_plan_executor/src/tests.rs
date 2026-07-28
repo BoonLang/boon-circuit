@@ -8873,10 +8873,12 @@ store: [
     let machine = compiled.plan;
     let load = source_id(&machine, "store.load");
     let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
-    assert_eq!(
-        session.root_value_current("store.signal_request").unwrap(),
-        Value::Text("SKIP".to_owned()),
-        "an inactive LATEST arm must not pre-arm its downstream effect"
+    let inactive = session
+        .root_value_current("store.signal_request")
+        .expect_err("private absence must not materialize as a public root value");
+    assert!(
+        inactive.to_string().contains("privately absent"),
+        "an inactive LATEST arm must remain private absence: {inactive}"
     );
 
     let artifact = |seed: u8, format: &str| {

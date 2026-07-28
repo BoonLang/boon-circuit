@@ -1068,6 +1068,7 @@ fn expression_record_field_names(
             | SemanticExpressionKind::TextTemplate { .. }
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
+            | SemanticExpressionKind::Absent
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::Source { .. }
             | SemanticExpressionKind::Call { .. }
@@ -2589,6 +2590,7 @@ fn collect_lineage_leaves(
                 | SemanticExpressionKind::TextTemplate { .. }
                 | SemanticExpressionKind::Number(_)
                 | SemanticExpressionKind::BytesByte(_)
+                | SemanticExpressionKind::Absent
                 | SemanticExpressionKind::Tag(_)
                 | SemanticExpressionKind::Infix { .. }
                 | SemanticExpressionKind::List { .. }
@@ -2604,6 +2606,7 @@ fn collect_lineage_leaves(
             continue;
         }
         match &value.kind {
+            SemanticExpressionKind::Absent => {}
             SemanticExpressionKind::Materialize { materialization } => {
                 leaves.insert(if row_identity {
                     LineageLeaf::Materialized(*materialization)
@@ -4344,6 +4347,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
+        | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Materialize { .. }

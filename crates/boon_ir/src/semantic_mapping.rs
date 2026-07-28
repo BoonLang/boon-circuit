@@ -7582,6 +7582,7 @@ fn map_expression_kind(
         }
         SemanticExpressionKind::Number(value) => ExecutableExpressionKind::Number(value.clone()),
         SemanticExpressionKind::BytesByte(value) => ExecutableExpressionKind::BytesByte(*value),
+        SemanticExpressionKind::Absent => ExecutableExpressionKind::Absent,
         SemanticExpressionKind::Tag(value) => ExecutableExpressionKind::Tag(value.clone()),
         SemanticExpressionKind::TaggedObject { tag, fields } => {
             ExecutableExpressionKind::TaggedObject {

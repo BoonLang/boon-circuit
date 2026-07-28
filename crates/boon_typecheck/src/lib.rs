@@ -732,6 +732,10 @@ pub enum CheckedExpressionKind {
     BytesByte {
         value: u8,
     },
+    /// Private flow absence produced by the source control spelling `SKIP`.
+    ///
+    /// This is never an application Tag or serializable Boon value.
+    Absent,
     Tag {
         name: String,
     },
@@ -7858,6 +7862,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Delimiter
@@ -8026,6 +8031,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             AstExprKind::ByteLiteral { value, .. } => {
                 CheckedExpressionKind::BytesByte { value: *value }
             }
+            AstExprKind::Tag(name) if name == "SKIP" => CheckedExpressionKind::Absent,
             AstExprKind::Tag(name) => CheckedExpressionKind::Tag { name: name.clone() },
             AstExprKind::TaggedObject {
                 tag,
@@ -8945,6 +8951,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             CheckedExpressionKind::Number { value } => {
                 Some(CheckedOrderSemanticExpression::Number(value.clone()))
             }
+            CheckedExpressionKind::Absent => None,
             CheckedExpressionKind::Tag { name } => {
                 Some(CheckedOrderSemanticExpression::Tag(name.clone()))
             }
@@ -9213,7 +9220,8 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::ExternalRead { .. } => true,
-            CheckedExpressionKind::Passed { .. }
+            CheckedExpressionKind::Absent
+            | CheckedExpressionKind::Passed { .. }
             | CheckedExpressionKind::Drain { .. }
             | CheckedExpressionKind::TaggedObject { .. }
             | CheckedExpressionKind::Source
@@ -9365,6 +9373,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Delimiter
@@ -20181,6 +20190,7 @@ fn checked_inline_list_authority_root(
             | CheckedExpressionKind::TextTemplate { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::TaggedObject { .. }
             | CheckedExpressionKind::Source
@@ -23989,6 +23999,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             | CheckedExpressionKind::TextTemplate { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Infix { .. }
@@ -24123,6 +24134,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             | CheckedExpressionKind::TextTemplate { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Infix { .. }
@@ -24425,6 +24437,7 @@ fn checked_projection_to_expression(
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Delimiter
@@ -24573,6 +24586,7 @@ fn checked_expression_children(
         | CheckedExpressionKind::Text { .. }
         | CheckedExpressionKind::Number { .. }
         | CheckedExpressionKind::BytesByte { .. }
+        | CheckedExpressionKind::Absent
         | CheckedExpressionKind::Tag { .. }
         | CheckedExpressionKind::Source
         | CheckedExpressionKind::Delimiter

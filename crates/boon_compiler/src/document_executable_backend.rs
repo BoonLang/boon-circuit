@@ -699,6 +699,11 @@ impl<'a> DocumentCompiler<'a> {
                     value: vec![*value],
                 },
             )),
+            ir::ExecutableExpressionKind::Absent => Ok(self.push_expr(
+                compiler_id,
+                value_class_for_type(&expression.flow_type.ty),
+                DocumentExprOp::Absent,
+            )),
             ir::ExecutableExpressionKind::Tag(value) => self.compile_tag(compiler_id, value),
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
                 self.compile_record_fields(compiler_id, Some(tag), fields, context)

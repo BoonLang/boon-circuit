@@ -471,6 +471,8 @@ pub enum SemanticExpressionKind {
     },
     Number(String),
     BytesByte(u8),
+    /// Private flow absence. It has no public data representation.
+    Absent,
     Tag(String),
     TaggedObject {
         tag: String,
@@ -1954,6 +1956,7 @@ impl SemanticExecutionGraphV1 {
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
+            | SemanticExpressionKind::Absent
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::Source { .. }
             | SemanticExpressionKind::Delimiter => {}

@@ -2941,7 +2941,7 @@ fn build_source_resources(
                     if value.flow_type
                         != (boon_typecheck::FlowType {
                             mode: boon_typecheck::FlowMode::PresentOrAbsent,
-                            ty: Type::Skip,
+                            ty: Type::Absent,
                         })
                     {
                         return Err(format!(
@@ -2964,7 +2964,7 @@ fn build_source_resources(
                         source.binding_path.clone(),
                         None,
                         None,
-                        Type::Skip,
+                        Type::Absent,
                         span,
                         vec![source.binding_path.clone()],
                     )

@@ -2453,7 +2453,7 @@ fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataT
             Type::List(item) => DataTypePlan::List {
                 item: Box::new(data_type_plan_from_typecheck_type(item)?),
             },
-            Type::Skip
+            Type::Absent
             | Type::RenderContract
             | Type::Function { .. }
             | Type::UnresolvedShape { .. }
@@ -9459,7 +9459,11 @@ fn source_event_transform_expression(
             &candidate_constants,
             value,
         )?;
-        if output_type.is_some_and(|expected| candidate_type != Some(expected)) {
+        let candidate_is_absent =
+            matches!(candidate_arena.node(value)?, PlanRowExpressionNode::Absent);
+        if !candidate_is_absent
+            && output_type.is_some_and(|expected| candidate_type != Some(expected))
+        {
             continue;
         }
         *arena = candidate_arena;
@@ -9471,15 +9475,7 @@ fn source_event_transform_expression(
     }
     let default = match default {
         Some(default) => default,
-        None => {
-            let value = source_event_transform_fresh_value(
-                output_type,
-                arena,
-                &local_constants,
-                &arm_values,
-            )?;
-            row_constant_expression(arena, &mut local_constants, &mut local_inputs, value)?
-        }
+        None => arena.push(PlanRowExpressionNode::Absent)?,
     };
     let arms = arm_values
         .into_iter()
@@ -9583,109 +9579,6 @@ fn source_event_transform_output_type(
         }
     }
     Ok(output_type)
-}
-
-fn source_event_transform_fresh_value(
-    output_type: Option<PlanValueType>,
-    arena: &PlanRowExpressionArena,
-    constants: &[PlanConstant],
-    arms: &[(ValueRef, PlanRowExpressionId)],
-) -> Result<PlanConstantValue, PlanError> {
-    Ok(match output_type {
-        Some(PlanValueType::Text) => PlanConstantValue::Text {
-            value: String::new(),
-        },
-        Some(PlanValueType::Number) => PlanConstantValue::Number {
-            value: FiniteReal::ZERO,
-        },
-        Some(PlanValueType::Bytes { fixed_len }) => {
-            let bytes = vec![0; fixed_len.unwrap_or_default() as usize];
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            PlanConstantValue::Bytes {
-                byte_len: bytes.len() as u64,
-                sha256: format!("{:x}", hasher.finalize()),
-                inline_bytes: Some(bytes),
-            }
-        }
-        Some(PlanValueType::Tag) => {
-            let mut fresh = None;
-            for (_, value) in arms {
-                let PlanRowExpressionNode::Constant { constant_id } = arena.node(*value)? else {
-                    continue;
-                };
-                fresh = constants
-                    .iter()
-                    .find(|constant| constant.id == *constant_id)
-                    .and_then(|constant| match &constant.value {
-                        PlanConstantValue::Tag { .. } => Some(constant.value.clone()),
-                        _ => None,
-                    });
-                if fresh.is_some() {
-                    break;
-                }
-            }
-            fresh.unwrap_or_else(|| PlanConstantValue::Text {
-                value: String::new(),
-            })
-        }
-        Some(PlanValueType::Data) => {
-            let fresh = arms.iter().find_map(|(_, value)| {
-                let PlanRowExpressionNode::Constant { constant_id } = arena.node(*value).ok()?
-                else {
-                    return None;
-                };
-                constants
-                    .iter()
-                    .find(|constant| constant.id == *constant_id)
-                    .and_then(|constant| match &constant.value {
-                        PlanConstantValue::Data { .. } => Some(constant.value.clone()),
-                        _ => None,
-                    })
-            });
-            fresh.ok_or_else(|| {
-                PlanError::new("data source-event transform has no canonical fresh value")
-            })?
-        }
-        Some(PlanValueType::Unknown) | None => {
-            let mut all_bool_constants = true;
-            for (_, value) in arms {
-                if !plan_row_expression_is_bool_constant(arena, constants, *value)? {
-                    all_bool_constants = false;
-                    break;
-                }
-            }
-            if all_bool_constants {
-                PlanConstantValue::Tag {
-                    name: "False".to_owned(),
-                }
-            } else {
-                PlanConstantValue::Text {
-                    value: String::new(),
-                }
-            }
-        }
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn plan_row_expression_is_bool_constant(
-    arena: &PlanRowExpressionArena,
-    constants: &[PlanConstant],
-    expression: PlanRowExpressionId,
-) -> Result<bool, PlanError> {
-    let PlanRowExpressionNode::Constant { constant_id } = arena.node(expression)? else {
-        return Ok(false);
-    };
-    Ok(constants
-        .iter()
-        .find(|constant| constant.id == *constant_id)
-        .is_some_and(|constant| {
-            matches!(
-                &constant.value,
-                PlanConstantValue::Tag { name } if matches!(name.as_str(), "False" | "True")
-            )
-        }))
 }
 
 struct ExecutableRowLowerer<'a> {
@@ -11925,7 +11818,6 @@ fn row_expression_value_type(
                 PlanConstantValue::Bytes { byte_len, .. } => Some(PlanValueType::Bytes {
                     fixed_len: Some(*byte_len),
                 }),
-                PlanConstantValue::Tag { name } if name == "SKIP" => None,
                 PlanConstantValue::Tag { .. } => Some(PlanValueType::Tag),
                 PlanConstantValue::Data { .. } => Some(PlanValueType::Data),
             }),

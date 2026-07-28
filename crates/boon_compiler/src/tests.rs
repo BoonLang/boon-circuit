@@ -1446,7 +1446,7 @@ store: [
 
 #[test]
 fn source_event_transform_ignores_skip_when_inferring_its_value_type() {
-    compile_fixture_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "source-event-skip-type.bn",
         r#"
 store: [
@@ -1461,6 +1461,19 @@ store: [
         TargetProfile::SoftwareDefault,
     )
     .expect("SKIP is absence and must not make a Text event transform an Enum");
+    assert!(
+        compiled
+            .plan
+            .row_expressions
+            .iter()
+            .any(|(_, expression)| matches!(expression, PlanRowExpressionNode::Absent))
+    );
+    assert!(compiled.plan.constants.iter().all(|constant| {
+        !matches!(
+            &constant.value,
+            PlanConstantValue::Tag { name } if name == "SKIP"
+        )
+    }));
 }
 
 #[test]

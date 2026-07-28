@@ -3312,7 +3312,7 @@ fn type_to_data_plan(ty: &Type) -> Option<DataTypePlan> {
                 .collect::<Option<Vec<_>>>()?,
         }),
         Type::Object(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::Function { .. }
         | Type::UnresolvedShape { .. }

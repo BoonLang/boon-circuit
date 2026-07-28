@@ -2619,7 +2619,7 @@ fn value_class_for_type(ty: &Type) -> DocumentValueClass {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::VariantSet(_)
         | Type::Function { .. }
         | Type::UnresolvedShape { .. }

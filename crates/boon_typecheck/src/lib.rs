@@ -20,7 +20,7 @@ pub enum Type {
     Text,
     Number,
     Bytes(BytesType),
-    Skip,
+    Absent,
     VariantSet(Vec<Variant>),
     Object(ObjectShape),
     RenderContract,
@@ -5343,7 +5343,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     BytesSizeSyntax::Fixed(size) => BytesType::Fixed(size),
                     BytesSizeSyntax::Dynamic | BytesSizeSyntax::Infer => BytesType::Dynamic,
                 }),
-                AstExprKind::Tag(tag) if tag == "SKIP" => Type::Skip,
+                AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
                 AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag)]),
                 AstExprKind::TaggedObject { tag, fields } => {
                     Type::VariantSet(vec![Variant::Tagged {
@@ -5444,7 +5444,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 }
                 AstExprKind::MatchArm { output, .. } => output
                     .map(|output| self.infer_checked_expr_flow(output, active).ty)
-                    .unwrap_or(Type::Skip),
+                    .unwrap_or(Type::Absent),
                 AstExprKind::When { input, arms } => {
                     if let Some(selector) = self.exact_pipeline_input(&expr, input) {
                         self.infer_checked_expr_flow(selector, active);
@@ -5458,7 +5458,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 }
                 AstExprKind::Block { result, .. } => result
                     .map(|result| self.infer_checked_expr_flow(result, active).ty)
-                    .unwrap_or(Type::Skip),
+                    .unwrap_or(Type::Absent),
                 AstExprKind::Then { input, output } => output
                     .map(|output| self.infer_checked_expr_flow(output, active).ty)
                     .or_else(|| {
@@ -5475,7 +5475,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                             &self.program.expressions,
                         ) {
                             let update = self.infer_checked_expr_flow(update, active).ty;
-                            if !matches!(update, Type::Skip) {
+                            if !matches!(update, Type::Absent) {
                                 ty = widen_checked_hold_type(&ty, &update);
                             }
                         }
@@ -5491,7 +5491,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 AstExprKind::Latest { branches } => branches
                     .into_iter()
                     .map(|branch| self.infer_checked_expr_flow(branch, active).ty)
-                    .filter(|branch| !matches!(branch, Type::Skip))
+                    .filter(|branch| !matches!(branch, Type::Absent))
                     .reduce(|existing, branch| widen_structural_type(&existing, &branch))
                     .unwrap_or(fallback.ty.clone()),
                 AstExprKind::Source => fallback.ty.clone(),
@@ -6044,7 +6044,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 other @ (Type::Text
                 | Type::Number
                 | Type::Bytes(_)
-                | Type::Skip
+                | Type::Absent
                 | Type::List(_)) => {
                     self.contextual_type_diagnostic(
                         expr_id,
@@ -9869,7 +9869,7 @@ fn validate_source_payload_shape_table(
             | Type::Bytes(_)
             | Type::List(_)
             | Type::VariantSet(_)
-            | Type::Skip
+            | Type::Absent
             | Type::RenderContract
             | Type::Function { .. }
             | Type::UnresolvedShape { .. }
@@ -10332,10 +10332,12 @@ fn merge_principal_context_type(
         (Type::Var(_), Type::Var(_)) => Ok(current.clone()),
         (Type::Var(_), incoming) => Ok(incoming.clone()),
         (current, Type::Var(_)) => Ok(current.clone()),
-        (Type::Unknown | Type::UnresolvedShape { .. } | Type::Skip, incoming) => {
+        (Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent, incoming) => {
             Ok(incoming.clone())
         }
-        (current, Type::Unknown | Type::UnresolvedShape { .. } | Type::Skip) => Ok(current.clone()),
+        (current, Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent) => {
+            Ok(current.clone())
+        }
         (Type::Object(current), Type::Object(incoming)) => {
             let mut fields = current.fields.clone();
             for (field, incoming_type) in incoming.ordered_fields() {
@@ -10505,7 +10507,7 @@ fn alpha_normalize_context_type(
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Unknown => ty.clone(),
@@ -10582,7 +10584,7 @@ fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::Var(_) => ty.clone(),
     }
@@ -10644,7 +10646,7 @@ fn freshen_checked_scheme_type(ty: &Type, next_var: &mut u32) -> Type {
                 })
                 .collect(),
         ),
-        Type::Text | Type::Number | Type::Bytes(_) | Type::Skip | Type::RenderContract => {
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::RenderContract => {
             ty.clone()
         }
     }
@@ -10723,7 +10725,7 @@ fn instantiate_checked_type_scheme_for_call(
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Unknown => ty.clone(),
@@ -10753,7 +10755,7 @@ fn checked_type_contains_var(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Unknown => false,
@@ -10762,7 +10764,7 @@ fn checked_type_contains_var(ty: &Type) -> bool {
 
 fn type_is_recursively_closed(ty: &Type) -> bool {
     match ty {
-        Type::Text | Type::Number | Type::Bytes(_) | Type::Skip | Type::RenderContract => true,
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::RenderContract => true,
         Type::List(item) => type_is_recursively_closed(item),
         Type::Function { args, result } => {
             args.iter().all(type_is_recursively_closed) && type_is_recursively_closed(&result.ty)
@@ -10859,7 +10861,7 @@ fn substitute_checked_type_inner(
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Unknown => ty.clone(),
@@ -11807,7 +11809,7 @@ fn external_data_type_is_closed(ty: &Type) -> bool {
                 !fields.open && fields.fields.values().all(external_data_type_is_closed)
             }
         }),
-        Type::Skip
+        Type::Absent
         | Type::RenderContract
         | Type::Function { .. }
         | Type::UnresolvedShape { .. }
@@ -13314,7 +13316,7 @@ impl<'a> Checker<'a> {
                 .render_contracts
                 .slot_accepts_type(&slot_name, &actual_type)
         {
-            let message = if type_contains_skip(&actual_type) {
+            let message = if type_contains_absence(&actual_type) {
                 "`SKIP` cannot be used as a render value".to_owned()
             } else {
                 render_slot_type_error(&slot_name, &actual_type)
@@ -13527,7 +13529,7 @@ impl<'a> Checker<'a> {
             AstExprKind::BytesLiteral { size, items } => {
                 self.infer_bytes_literal(expr, size, items)
             }
-            AstExprKind::Tag(tag) if tag == "SKIP" => Type::Skip,
+            AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
             AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())]),
             AstExprKind::TaggedObject { tag, fields } => {
                 let shape = ObjectShape::from_ordered_fields(
@@ -13658,7 +13660,7 @@ impl<'a> Checker<'a> {
                             args,
                         ),
                         contextual_body_type.as_ref(),
-                    ) && type_contains_skip(item_type)
+                    ) && type_contains_absence(item_type)
                     {
                         self.diagnostics.push(self.diagnostic_for_expr(
                             new_expr_id,
@@ -13804,14 +13806,14 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::MatchArm { output, .. } => output
                 .map(|output| self.ensure_expr(output).ty)
-                .unwrap_or_else(|| Type::Skip),
+                .unwrap_or_else(|| Type::Absent),
             AstExprKind::Block { bindings, result } => {
                 for binding in bindings {
                     self.ensure_expr(binding.value);
                 }
                 result
                     .map(|result| self.ensure_expr(result).ty)
-                    .unwrap_or(Type::Skip)
+                    .unwrap_or(Type::Absent)
             }
             AstExprKind::Source => exact_empty_object_type(),
             AstExprKind::Identifier(value) => {
@@ -15305,7 +15307,7 @@ impl<'a> Checker<'a> {
         let mut result: Option<Type> = None;
         for branch_expr_id in branch_expr_ids.iter().copied() {
             let branch_type = self.ensure_expr(branch_expr_id).ty;
-            if matches!(branch_type, Type::Skip) {
+            if matches!(branch_type, Type::Absent) {
                 continue;
             }
             result = Some(match result {
@@ -15325,7 +15327,7 @@ impl<'a> Checker<'a> {
         );
         for update_expr_id in updates {
             let update_type = self.ensure_expr(update_expr_id).ty;
-            if !matches!(update_type, Type::Skip) {
+            if !matches!(update_type, Type::Absent) {
                 ty = widen_hold_type(&ty, &update_type);
             }
         }
@@ -15471,7 +15473,7 @@ impl<'a> Checker<'a> {
                 self.program.expressions.as_slice(),
                 |expr| self.static_expr_type(expr, active_functions),
             )),
-            AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
+            AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Absent),
             AstExprKind::Tag(tag) => Some(Type::VariantSet(vec![Variant::Tag(tag.clone())])),
             AstExprKind::ListLiteral { items, .. } => Some(static_list_literal_type(
                 items,
@@ -15505,7 +15507,7 @@ impl<'a> Checker<'a> {
                         .expressions
                         .get(update_expr_id)
                         .and_then(|expr| self.static_expr_type(expr, active_functions))
-                        && !matches!(update_type, Type::Skip)
+                        && !matches!(update_type, Type::Absent)
                     {
                         ty = widen_hold_type(&ty, &update_type);
                     }
@@ -15544,7 +15546,7 @@ impl<'a> Checker<'a> {
                 .expressions
                 .get(*output)
                 .and_then(|expr| self.static_expr_type(expr, active_functions)),
-            AstExprKind::MatchArm { output: None, .. } => Some(Type::Skip),
+            AstExprKind::MatchArm { output: None, .. } => Some(Type::Absent),
             AstExprKind::Source => Some(exact_empty_object_type()),
             AstExprKind::Latest { branches } => self
                 .static_latest_result_type(branches, active_functions)
@@ -15604,7 +15606,7 @@ impl<'a> Checker<'a> {
             else {
                 continue;
             };
-            if matches!(branch_type, Type::Skip) {
+            if matches!(branch_type, Type::Absent) {
                 continue;
             }
             result = Some(match result {
@@ -16655,7 +16657,7 @@ impl<'a> Checker<'a> {
             &self.program.expressions,
         );
         let initial_type = self.ensure_expr(initial).ty;
-        if matches!(initial_type, Type::Skip) {
+        if matches!(initial_type, Type::Absent) {
             self.diagnostics.push(
                 self.diagnostic_for_expr(
                     initial,
@@ -16666,7 +16668,7 @@ impl<'a> Checker<'a> {
         }
         for update in hold_update_exprs(statement, &self.program.expressions) {
             let update_type = self.ensure_expr(update).ty;
-            if matches!(update_type, Type::Skip) {
+            if matches!(update_type, Type::Absent) {
                 continue;
             }
             if concrete_type_conflict(&initial_type, &update_type) {
@@ -16729,7 +16731,7 @@ impl<'a> Checker<'a> {
         let mut expected_type: Option<Type> = None;
         for branch_expr_id in branch_expr_ids {
             let branch_type = self.ensure_expr(branch_expr_id).ty;
-            if matches!(branch_type, Type::Skip) {
+            if matches!(branch_type, Type::Absent) {
                 continue;
             }
             let Some(expected) = expected_type.as_ref() else {
@@ -17137,7 +17139,7 @@ fn statement_contains_output_authority(statement: &AstStatement) -> bool {
 
 fn host_output_type_is_closed(ty: &Type) -> bool {
     match ty {
-        Type::Text | Type::Number | Type::Bytes(_) | Type::Skip => true,
+        Type::Text | Type::Number | Type::Bytes(_) => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {
@@ -17146,7 +17148,8 @@ fn host_output_type_is_closed(ty: &Type) -> bool {
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(host_output_type_is_closed),
         Type::List(item) => host_output_type_is_closed(item),
-        Type::RenderContract
+        Type::Absent
+        | Type::RenderContract
         | Type::Function { .. }
         | Type::UnresolvedShape { .. }
         | Type::Var(_)
@@ -19430,7 +19433,7 @@ fn boon_facing_type_display_tree_with_depth(
         Type::Text => scalar_type_display_node("TEXT"),
         Type::Number => scalar_type_display_node("NUMBER"),
         Type::Bytes(bytes) => scalar_type_display_node(bytes_type_label(bytes)),
-        Type::Skip => scalar_type_display_node("ABSENT"),
+        Type::Absent => scalar_type_display_node("ABSENT"),
         Type::RenderContract => TypeDisplayNode::Object {
             fields: vec![TypeDisplayField {
                 name: "kind".to_owned(),
@@ -19532,7 +19535,7 @@ fn boon_facing_type_label_with_depth(
         Type::Text => "TEXT".to_owned(),
         Type::Number => "NUMBER".to_owned(),
         Type::Bytes(bytes) => bytes_type_label(bytes),
-        Type::Skip => "ABSENT".to_owned(),
+        Type::Absent => "ABSENT".to_owned(),
         Type::RenderContract => document_render_contract_label(compact),
         Type::Unknown | Type::Var(_) => "VALUE".to_owned(),
         Type::UnresolvedShape { reason } => {
@@ -19950,7 +19953,7 @@ fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
     match (left, right) {
         (Type::Unknown, _) | (_, Type::Unknown) => false,
         (Type::UnresolvedShape { .. }, _) | (_, Type::UnresolvedShape { .. }) => false,
-        (Type::Skip, _) | (_, Type::Skip) => false,
+        (Type::Absent, _) | (_, Type::Absent) => false,
         (left, _) if is_open_object_type(left) => false,
         (_, right) if is_open_object_type(right) => false,
         (Type::Text, Type::Text)
@@ -21021,7 +21024,7 @@ fn static_when_type_from_bindings(
         else {
             continue;
         };
-        if matches!(arm_type, Type::Skip) {
+        if matches!(arm_type, Type::Absent) {
             continue;
         }
         result = Some(match result {
@@ -21190,7 +21193,7 @@ fn simple_hold_result_type(
             .get(update_expr_id)
             .map(|expr| simple_expr_type(expr, expressions))
             .unwrap_or_else(open_object_type);
-        if !matches!(update_type, Type::Skip) {
+        if !matches!(update_type, Type::Absent) {
             ty = widen_hold_type(&ty, &update_type);
         }
     }
@@ -21278,7 +21281,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                 Some(simple_expr_type(expr, expressions))
             })
         }
-        AstExprKind::Tag(value) if value == "SKIP" => Type::Skip,
+        AstExprKind::Tag(value) if value == "SKIP" => Type::Absent,
         AstExprKind::Tag(value) => Type::VariantSet(vec![Variant::Tag(value.clone())]),
         AstExprKind::Object(fields) => Type::Object(simple_record_shape(fields, expressions)),
         AstExprKind::ListLiteral { items, .. } => {
@@ -22432,7 +22435,7 @@ fn static_expr_type_from_bindings(
         } => expressions
             .get(*output)
             .and_then(|expr| static_expr_type_from_bindings(expr, expressions, bindings)),
-        AstExprKind::MatchArm { output: None, .. } => Some(Type::Skip),
+        AstExprKind::MatchArm { output: None, .. } => Some(Type::Absent),
         AstExprKind::When { .. } => static_when_type_from_bindings(expr.id, expressions, bindings),
         AstExprKind::Pipe { op, .. } if op == "WHILE" => {
             static_when_type_from_bindings(expr.id, expressions, bindings)
@@ -22446,7 +22449,7 @@ fn static_expr_type_from_bindings(
             expressions,
             |expr| static_expr_type_from_bindings(expr, expressions, bindings),
         )),
-        AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
+        AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Absent),
         AstExprKind::Tag(tag) => Some(Type::VariantSet(vec![Variant::Tag(tag.clone())])),
         AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
             let ty = simple_expr_type(expr, expressions);
@@ -23250,7 +23253,7 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             variants.sort_by_key(variant_sort_key);
             Type::VariantSet(variants)
         }
-        (Type::Skip, ty) | (ty, Type::Skip) => ty.clone(),
+        (Type::Absent, ty) | (ty, Type::Absent) => ty.clone(),
         (ty, no_element) if is_no_element_type(no_element) => ty.clone(),
         (no_element, ty) if is_no_element_type(no_element) => ty.clone(),
         (Type::Text, Type::Text) => Type::Text,
@@ -25823,7 +25826,7 @@ fn source_statement_value_type(
 
 fn is_specific_type(ty: &Type) -> bool {
     match ty {
-        Type::Skip | Type::UnresolvedShape { .. } | Type::Unknown | Type::Var(_) => false,
+        Type::Absent | Type::UnresolvedShape { .. } | Type::Unknown | Type::Var(_) => false,
         ty if is_open_object_type(ty) => false,
         Type::List(item) if is_open_object_type(item) => false,
         _ => true,
@@ -26639,7 +26642,7 @@ fn type_contains_renderable(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::Var(_)
         | Type::Unknown
         | Type::UnresolvedShape { .. } => false,
@@ -26659,7 +26662,7 @@ fn type_contains_no_element(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::Var(_)
         | Type::Unknown
@@ -26667,16 +26670,16 @@ fn type_contains_no_element(ty: &Type) -> bool {
     }
 }
 
-fn type_contains_skip(ty: &Type) -> bool {
+fn type_contains_absence(ty: &Type) -> bool {
     match ty {
-        Type::Skip => true,
-        Type::List(item) => type_contains_skip(item),
-        Type::Object(shape) => shape.fields.values().any(type_contains_skip),
+        Type::Absent => true,
+        Type::List(item) => type_contains_absence(item),
+        Type::Object(shape) => shape.fields.values().any(type_contains_absence),
         Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
             Variant::Tag(_) => false,
-            Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_skip),
+            Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_absence),
         }),
-        Type::Function { result, .. } => type_contains_skip(&result.ty),
+        Type::Function { result, .. } => type_contains_absence(&result.ty),
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -26755,7 +26758,7 @@ fn collect_type_vars(ty: &Type, vars: &mut BTreeSet<TypeVar>) {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::Unknown
         | Type::UnresolvedShape { .. } => {}

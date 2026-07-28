@@ -1033,7 +1033,7 @@ fn render_tree_formal(ty: &Type) -> bool {
         | Type::Bytes(_)
         | Type::Object(_)
         | Type::VariantSet(_)
-        | Type::Skip
+        | Type::Absent
         | Type::Function { .. }
         | Type::UnresolvedShape { .. }
         | Type::Var(_)

@@ -9001,6 +9001,186 @@ store: [
 }
 
 #[test]
+fn private_absence_transitions_clear_derived_publication_without_a_skip_value() {
+    let compiled = compile_server_source(
+        "private-absence-clear-value.bn",
+        r#"
+store: [
+    input: SOURCE
+    result:
+        input.action |> WHEN {
+            Keep => TEXT { saved }
+            __ => SKIP
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let machine = compiled.plan;
+    let input = source_id(&machine, "store.input");
+    let result = field_id(&machine, "store.result");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    assert!(
+        session
+            .root_value_current("store.result")
+            .expect_err("the inactive result must be privately absent")
+            .to_string()
+            .contains("privately absent")
+    );
+
+    let present = session
+        .apply_with_demand(
+            SourceEvent {
+                sequence: 1,
+                source: input,
+                route: route_token(&session, input, None),
+                target: None,
+                payload: SourcePayload {
+                    fields: BTreeMap::from([("action".to_owned(), Value::tag("Keep"))]),
+                    ..SourcePayload::default()
+                },
+            },
+            &[ValueTarget::Field(result)],
+        )
+        .unwrap();
+    assert_eq!(
+        session.root_value_current("store.result").unwrap(),
+        Value::Text("saved".to_owned())
+    );
+    assert!(
+        present.deltas.iter().any(|delta| {
+            matches!(
+                delta,
+                Delta::SetValue {
+                    target: ValueTarget::Field(field),
+                    value: Value::Text(value),
+                } if *field == result && value == "saved"
+            )
+        }),
+        "present transition emitted unexpected deltas: {:#?}",
+        present.deltas
+    );
+
+    let absent = session
+        .apply_with_demand(
+            SourceEvent {
+                sequence: 2,
+                source: input,
+                route: route_token(&session, input, None),
+                target: None,
+                payload: SourcePayload {
+                    fields: BTreeMap::from([("action".to_owned(), Value::tag("Drop"))]),
+                    ..SourcePayload::default()
+                },
+            },
+            &[ValueTarget::Field(result)],
+        )
+        .unwrap();
+    assert!(absent.deltas.iter().any(|delta| {
+        matches!(
+            delta,
+            Delta::ClearValue {
+                target: ValueTarget::Field(field),
+            } if *field == result
+        )
+    }));
+    assert!(
+        session
+            .root_value_current("store.result")
+            .expect_err("the nonmatching result must return to private absence")
+            .to_string()
+            .contains("privately absent")
+    );
+}
+
+#[test]
+fn private_absence_is_distinct_from_an_empty_derived_list() {
+    let compiled = compile_server_source(
+        "private-absence-derived-list.bn",
+        r#"
+store: [
+    input: SOURCE
+    values:
+        input.action |> WHEN {
+            Keep => LIST { [name: TEXT { saved }] }
+            __ => SKIP
+        }
+        |> List/map(item, new: item)
+    count: values |> List/count()
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let machine = compiled.plan;
+    let input = source_id(&machine, "store.input");
+    let values = list_id(&machine, "store.values");
+    let count = field_id(&machine, "store.count");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let initial_error = session
+        .list_value_current(values)
+        .expect_err("an inactive list flow must not become an empty data list")
+        .to_string();
+    assert!(
+        initial_error.contains("absent"),
+        "unexpected private-absence error: {initial_error}"
+    );
+
+    session
+        .apply_with_demand(
+            SourceEvent {
+                sequence: 1,
+                source: input,
+                route: route_token(&session, input, None),
+                target: None,
+                payload: SourcePayload {
+                    fields: BTreeMap::from([("action".to_owned(), Value::tag("Keep"))]),
+                    ..SourcePayload::default()
+                },
+            },
+            &[ValueTarget::Field(count)],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            session.list_value_current(values).unwrap(),
+            Value::List(items)
+                if matches!(items.as_slice(), [Value::Row { .. } | Value::MappedRow { .. }])
+        ),
+        "the matching flow must materialize one current row"
+    );
+    assert_eq!(
+        session.root_value_current("store.count").unwrap(),
+        number(1)
+    );
+
+    session
+        .apply_with_demand(
+            SourceEvent {
+                sequence: 2,
+                source: input,
+                route: route_token(&session, input, None),
+                target: None,
+                payload: SourcePayload {
+                    fields: BTreeMap::from([("action".to_owned(), Value::tag("Drop"))]),
+                    ..SourcePayload::default()
+                },
+            },
+            &[ValueTarget::Field(count)],
+        )
+        .unwrap();
+    let final_error = session
+        .list_value_current(values)
+        .expect_err("an inactive list flow must return to private absence")
+        .to_string();
+    assert!(
+        final_error.contains("absent"),
+        "unexpected private-absence error: {final_error}"
+    );
+}
+
+#[test]
 fn trigger_specialized_effect_arms_share_one_result_lane_without_eager_invocation() {
     let compiled = compile_server_source(
         "trigger-specialized-effect-runtime.bn",
@@ -10421,6 +10601,17 @@ fn source_id(machine: &MachinePlan, path: &str) -> SourceId {
         .find(|route| route.path == path)
         .unwrap_or_else(|| panic!("missing SOURCE route `{path}`"))
         .source_id
+}
+
+fn field_id(machine: &MachinePlan, label: &str) -> FieldId {
+    let id = &machine
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == label)
+        .unwrap_or_else(|| panic!("missing field debug label `{label}`"))
+        .id;
+    FieldId(id.strip_prefix("field:").unwrap().parse().unwrap())
 }
 
 #[test]

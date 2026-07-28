@@ -1645,7 +1645,7 @@ struct DerivedCell {
 #[derive(Clone, Debug)]
 struct DerivedListCell {
     currentness: Currentness,
-    items: Option<Vec<EvalValue>>,
+    items: Option<PrivatePresence<Vec<EvalValue>>>,
     window: Option<DerivedListWindow>,
 }
 
@@ -4480,6 +4480,14 @@ impl Metadata {
                                 }
                             }
                         }
+                        for input in &op.inputs {
+                            if let ValueRef::SourcePayload { source_id, .. } = input {
+                                source_derived_by_source
+                                    .entry(*source_id)
+                                    .or_default()
+                                    .insert(field);
+                            }
+                        }
                     }
                     Some(ValueRef::List(list)) if !op.indexed => {
                         list_computations.insert(list, Arc::new(op.clone()));
@@ -4505,6 +4513,14 @@ impl Metadata {
                                         )));
                                     }
                                 }
+                            }
+                        }
+                        for input in &op.inputs {
+                            if let ValueRef::SourcePayload { source_id, .. } = input {
+                                source_derived_lists_by_source
+                                    .entry(*source_id)
+                                    .or_default()
+                                    .insert(list);
                             }
                         }
                     }
@@ -5470,7 +5486,7 @@ pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Valu
 enum AuthorityUndo {
     RootState {
         state: StateId,
-        value: Option<Value>,
+        value: Option<PrivatePresence<Value>>,
         touched: bool,
     },
     RowField {
@@ -5725,26 +5741,54 @@ fn clone_whole_list_snapshot(items: &[EvalValue], work: &mut Work) -> Vec<EvalVa
 }
 
 #[inline(always)]
-fn whole_list_snapshot_changed(
-    old: Option<&Vec<EvalValue>>,
-    new: &Vec<EvalValue>,
+fn clone_private_list_presence(
+    presence: &PrivatePresence<Vec<EvalValue>>,
+    work: &mut Work,
+) -> PrivatePresence<Vec<EvalValue>> {
+    match presence {
+        PrivatePresence::Absent => PrivatePresence::Absent,
+        PrivatePresence::Present(items) => {
+            PrivatePresence::Present(clone_whole_list_snapshot(items, work))
+        }
+    }
+}
+
+#[inline(always)]
+fn private_list_presence_changed(
+    old: Option<&PrivatePresence<Vec<EvalValue>>>,
+    new: &PrivatePresence<Vec<EvalValue>>,
     work: &mut Work,
 ) -> bool {
+    let old_len = old
+        .and_then(|presence| match presence {
+            PrivatePresence::Present(items) => Some(items.len()),
+            PrivatePresence::Absent => None,
+        })
+        .unwrap_or(0);
+    let new_len = match new {
+        PrivatePresence::Present(items) => items.len(),
+        PrivatePresence::Absent => 0,
+    };
+    record_whole_list_snapshot_comparison(old_len, new_len, work);
+    old != Some(new)
+}
+
+#[inline(always)]
+fn record_whole_list_snapshot_comparison(old_len: usize, new_len: usize, work: &mut Work) {
     #[cfg(feature = "phase0-instrumentation")]
     {
         work.metrics.whole_list_snapshot_comparison_count = work
             .metrics
             .whole_list_snapshot_comparison_count
             .saturating_add(1);
-        let input_items = old.map_or(0, Vec::len).saturating_add(new.len());
+        let input_items = old_len.saturating_add(new_len);
         work.metrics.whole_list_snapshot_comparison_input_item_count = work
             .metrics
             .whole_list_snapshot_comparison_input_item_count
             .saturating_add(u64::try_from(input_items).unwrap_or(u64::MAX));
     }
     #[cfg(not(feature = "phase0-instrumentation"))]
-    let _ = work;
-    old != Some(new)
+    let _ = (old_len, new_len, work);
 }
 
 fn record_ordered_index_fanout(work: &mut Work, fanout: usize) {
@@ -6565,6 +6609,7 @@ struct MaterializedListEvaluationState<'event, 'plan> {
     desired_len: usize,
     remaining: std::vec::IntoIter<EvalValue>,
     desired: Vec<(OwnerAncestryId, BTreeMap<FieldId, Value>)>,
+    private_absence: bool,
     event: Option<&'event SourceEvent>,
     consumer: Option<Consumer>,
 }
@@ -7851,7 +7896,7 @@ pub struct MachineInstance {
     row_owned_call_results:
         BTreeMap<(ImportId, DistributedCallInstanceId), DistributedCurrentCallResult>,
     distributed_current_call_demands: DistributedCurrentCallDemands,
-    root_states: BTreeMap<StateId, Value>,
+    root_states: BTreeMap<StateId, PrivatePresence<Value>>,
     root_fields: BTreeMap<FieldId, DerivedCell>,
     derived_lists: BTreeMap<ListId, DerivedListCell>,
     lists: BTreeMap<ListId, ListState>,
@@ -7962,7 +8007,7 @@ struct ProducerLeaseState {
     seen_global_revision: u64,
     distributed_imports: BTreeMap<ImportId, Value>,
     distributed_import_revisions: BTreeMap<ImportId, u64>,
-    root_states: BTreeMap<StateId, Value>,
+    root_states: BTreeMap<StateId, PrivatePresence<Value>>,
     root_fields: BTreeMap<FieldId, DerivedCell>,
     derived_lists: BTreeMap<ListId, DerivedListCell>,
     lists: BTreeMap<ListId, ListState>,
@@ -9247,7 +9292,9 @@ impl MachineBuildTask {
                         )));
                     }
                     if scalar.touched {
-                        session.root_states.insert(state, scalar.value);
+                        session
+                            .root_states
+                            .insert(state, PrivatePresence::Present(scalar.value));
                         session.touched_root_states.insert(state);
                     }
                 }
@@ -10187,7 +10234,8 @@ impl MachineInstance {
             !slot.indexed && matches!(slot.initializer, ScalarInitializerPlan::Constant { .. })
         }) {
             let value = self.initial_slot_value(slot)?;
-            self.root_states.insert(slot.state_id, value);
+            self.root_states
+                .insert(slot.state_id, PrivatePresence::Present(value));
         }
 
         let list_slots = self
@@ -10218,24 +10266,16 @@ impl MachineInstance {
             let mut bindings = BTreeMap::new();
             let evaluated =
                 self.eval_row_expression(expression, None, None, None, None, &mut bindings, work)?;
-            let value = match evaluated {
-                EvalValue::Absent => {
-                    return Err(Error::InvalidPlan(format!(
-                        "state {} (`{}`) has a private-absence initializer",
-                        slot.state_id.0,
-                        debug_label(&self.plan.debug_map.state_slots, "state:", slot.state_id.0)
-                            .unwrap_or("<unlabeled>")
-                    )));
-                }
-                value => self.materialize_eval(value).map_err(|error| {
+            let value = self
+                .materialize_private_presence(evaluated)
+                .map_err(|error| {
                     Error::InvalidPlan(format!(
-                        "state {} (`{}`) initializer is not public data: {error}",
+                        "state {} (`{}`) initializer is not valid private state: {error}",
                         slot.state_id.0,
                         debug_label(&self.plan.debug_map.state_slots, "state:", slot.state_id.0)
                             .unwrap_or("<unlabeled>")
                     ))
-                })?,
-            };
+                })?;
             self.root_states.insert(slot.state_id, value);
         }
 
@@ -11620,7 +11660,10 @@ impl MachineInstance {
             .derived_lists
             .get(&list)
             .filter(|cell| cell.currentness == Currentness::Current)
-            .and_then(|cell| cell.items.as_ref())
+            .and_then(|cell| match cell.items.as_ref() {
+                Some(PrivatePresence::Present(items)) => Some(items),
+                Some(PrivatePresence::Absent) | None => None,
+            })
         {
             return items.iter().filter_map(eval_row_id).collect();
         }
@@ -11680,7 +11723,15 @@ impl MachineInstance {
         let mut work = self.fresh_work();
         let value =
             self.eval_value_ref(&ValueRef::List(list), None, None, None, None, &mut work)?;
-        let value = self.materialize_eval(value)?.into_visible_facade();
+        let value = match value {
+            EvalValue::Absent => {
+                return Err(Error::Evaluation(format!(
+                    "derived list {} is privately absent",
+                    list.0
+                )));
+            }
+            value => self.materialize_eval(value)?.into_visible_facade(),
+        };
         #[cfg(feature = "phase0-instrumentation")]
         {
             work.metrics.elapsed_boundary_ns = work
@@ -12063,7 +12114,12 @@ impl MachineInstance {
             states: self
                 .root_states
                 .iter()
-                .map(|(state, value)| (*state, value.clone().into_visible_facade()))
+                .filter_map(|(state, presence)| match presence {
+                    PrivatePresence::Present(value) => {
+                        Some((*state, value.clone().into_visible_facade()))
+                    }
+                    PrivatePresence::Absent => None,
+                })
                 .collect(),
             fields: BTreeMap::new(),
             lists: BTreeMap::new(),
@@ -12134,24 +12190,28 @@ impl MachineInstance {
                         .values()
                         .any(|instance| instance.ownership.states.contains(&slot.state_id))
             })
-            .map(|slot| {
-                let value = self
-                    .root_states
-                    .get(&slot.state_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::Evaluation(format!(
-                            "authoritative state {} has no value",
+            .filter_map(|slot| {
+                let touched = self.touched_root_states.contains(&slot.state_id);
+                match self.root_states.get(&slot.state_id) {
+                    Some(PrivatePresence::Present(value)) => Some(Ok((
+                        slot.state_id,
+                        ScalarAuthority {
+                            touched,
+                            value: value.clone(),
+                        },
+                    ))),
+                    Some(PrivatePresence::Absent) if touched => {
+                        Some(Err(Error::Evaluation(format!(
+                            "authoritative state {} is touched but privately absent",
                             slot.state_id.0
-                        ))
-                    })?;
-                Ok((
-                    slot.state_id,
-                    ScalarAuthority {
-                        touched: self.touched_root_states.contains(&slot.state_id),
-                        value,
-                    },
-                ))
+                        ))))
+                    }
+                    Some(PrivatePresence::Absent) => None,
+                    None => Some(Err(Error::Evaluation(format!(
+                        "authoritative state {} has no private presence",
+                        slot.state_id.0
+                    )))),
+                }
             })
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
 
@@ -12621,7 +12681,10 @@ impl MachineInstance {
         let mut work = self.fresh_work();
         for target in targets {
             let value = match *target {
-                ValueTarget::State(state) => self.root_states.get(&state).cloned(),
+                ValueTarget::State(state) => match self.root_states.get(&state) {
+                    Some(PrivatePresence::Present(value)) => Some(value.clone()),
+                    Some(PrivatePresence::Absent) | None => None,
+                },
                 ValueTarget::Field(field) => {
                     if !self.metadata.published.contains(&field) {
                         return Err(Error::NotDemanded(field));
@@ -12633,8 +12696,16 @@ impl MachineInstance {
                 }
                 ValueTarget::RowField { row, field } => {
                     let field = self.resolve_row_field_alias(row, field);
-                    if self.metadata.row_computations.contains_key(&field) {
-                        Some(self.ensure_row_field(row, field, None, &mut work)?)
+                    let derived = self
+                        .lists
+                        .get(&row.list)
+                        .and_then(|list| list.rows.get(&row))
+                        .is_some_and(|row| row.derived.contains_key(&field));
+                    if derived {
+                        match self.ensure_row_field_presence(row, field, None, &mut work)? {
+                            PrivatePresence::Present(value) => Some(value),
+                            PrivatePresence::Absent => None,
+                        }
                     } else {
                         Some(self.row_value(row, field)?)
                     }
@@ -12724,11 +12795,7 @@ impl MachineInstance {
         if let Some(state) =
             unique_root_name(&self.metadata.root_state_by_exact_name, name, "state")?
         {
-            return self
-                .root_states
-                .get(&state)
-                .cloned()
-                .ok_or_else(|| Error::Evaluation(format!("root state `{name}` has no value")));
+            return self.public_root_state_value(state, name);
         }
         if !name.starts_with("store.") {
             let qualified = format!("store.{name}");
@@ -12741,9 +12808,7 @@ impl MachineInstance {
             if let Some(state) =
                 unique_root_name(&self.metadata.root_state_by_exact_name, &qualified, "state")?
             {
-                return self.root_states.get(&state).cloned().ok_or_else(|| {
-                    Error::Evaluation(format!("root state `{qualified}` has no value"))
-                });
+                return self.public_root_state_value(state, &qualified);
             }
         }
 
@@ -12756,14 +12821,22 @@ impl MachineInstance {
                 let mut work = self.fresh_work();
                 self.ensure_root_field(field, None, &mut work)
             }
-            (None, Some([state])) => self
-                .root_states
-                .get(state)
-                .cloned()
-                .ok_or_else(|| Error::Evaluation(format!("root state `{name}` has no value"))),
+            (None, Some([state])) => self.public_root_state_value(*state, name),
             (None, None) => Err(Error::InvalidPlan(format!("no root value `{name}`"))),
             _ => Err(Error::InvalidPlan(format!(
                 "root value name `{name}` is ambiguous"
+            ))),
+        }
+    }
+
+    fn public_root_state_value(&self, state: StateId, name: &str) -> Result<Value, Error> {
+        match self.root_states.get(&state) {
+            Some(PrivatePresence::Present(value)) => Ok(value.clone()),
+            Some(PrivatePresence::Absent) => Err(Error::Evaluation(format!(
+                "root state `{name}` is privately absent"
+            ))),
+            None => Err(Error::Evaluation(format!(
+                "root state `{name}` has no private presence"
             ))),
         }
     }
@@ -13222,7 +13295,8 @@ impl MachineInstance {
                 continue;
             }
             let value = self.initial_slot_value(slot)?;
-            self.root_states.insert(slot.state_id, value);
+            self.root_states
+                .insert(slot.state_id, PrivatePresence::Present(value));
         }
         for slot in &self.plan.storage_layout.list_slots {
             self.lists.entry(slot.list_id).or_default();
@@ -13251,24 +13325,16 @@ impl MachineInstance {
             let mut bindings = BTreeMap::new();
             let evaluated =
                 self.eval_row_expression(expression, None, None, None, None, &mut bindings, work)?;
-            let value = match evaluated {
-                EvalValue::Absent => {
-                    return Err(Error::InvalidPlan(format!(
-                        "state {} (`{}`) has a private-absence initializer",
-                        slot.state_id.0,
-                        debug_label(&self.plan.debug_map.state_slots, "state:", slot.state_id.0)
-                            .unwrap_or("<unlabeled>")
-                    )));
-                }
-                value => self.materialize_eval(value).map_err(|error| {
+            let value = self
+                .materialize_private_presence(evaluated)
+                .map_err(|error| {
                     Error::InvalidPlan(format!(
-                        "state {} (`{}`) initializer is not public data: {error}",
+                        "state {} (`{}`) initializer is not valid private state: {error}",
                         slot.state_id.0,
                         debug_label(&self.plan.debug_map.state_slots, "state:", slot.state_id.0)
                             .unwrap_or("<unlabeled>")
                     ))
-                })?,
-            };
+                })?;
             self.root_states.insert(slot.state_id, value);
         }
         Ok(())
@@ -14600,7 +14666,7 @@ impl MachineInstance {
                 self.ensure_root_field_presence(*field, None, work)?;
             }
             for list in &derived_lists {
-                self.ensure_list_current(*list, None, work)?;
+                self.ensure_list_presence(*list, None, work)?;
             }
 
             let updates = self
@@ -14622,7 +14688,7 @@ impl MachineInstance {
                 self.ensure_root_field_presence(*field, None, work)?;
             }
             for list in &derived_lists {
-                self.ensure_list_current(*list, None, work)?;
+                self.ensure_list_presence(*list, None, work)?;
             }
             let mutations = self
                 .metadata
@@ -15166,7 +15232,7 @@ impl MachineInstance {
                 self.mark_list_dirty(*list, work);
             }
             for list in source_lists {
-                self.ensure_list_current(*list, Some(event), work)?;
+                self.ensure_list_presence(*list, Some(event), work)?;
             }
         }
 
@@ -16015,12 +16081,12 @@ impl MachineInstance {
         }
     }
 
-    fn ensure_list_current(
+    fn ensure_list_presence(
         &mut self,
         list: ListId,
         event: Option<&SourceEvent>,
         work: &mut Work,
-    ) -> Result<Vec<EvalValue>, Error> {
+    ) -> Result<PrivatePresence<Vec<EvalValue>>, Error> {
         self.flush_list_access_dependencies(work)?;
         let currentness = self
             .derived_lists
@@ -16042,10 +16108,13 @@ impl MachineInstance {
                     .and_then(|cell| {
                         cell.items
                             .as_ref()
-                            .map(|items| clone_whole_list_snapshot(items, work))
+                            .map(|presence| clone_private_list_presence(presence, work))
                     })
                     .ok_or_else(|| {
-                        Error::Evaluation(format!("current derived list {} has no items", list.0))
+                        Error::Evaluation(format!(
+                            "current derived list {} has no private presence",
+                            list.0
+                        ))
                     });
             }
             Currentness::Evaluating => return Err(Error::ListCycle { list }),
@@ -16084,8 +16153,8 @@ impl MachineInstance {
             .cloned()
             .ok_or_else(|| Error::InvalidPlan(format!("derived list {} has no plan op", list.0)))?;
         let evaluated = self.evaluate_list_computation(list, &op, event, work);
-        let items = match evaluated {
-            Ok(items) => items,
+        let presence = match evaluated {
+            Ok(presence) => presence,
             Err(error) => {
                 self.derived_lists
                     .get_mut(&list)
@@ -16097,23 +16166,38 @@ impl MachineInstance {
         let old = self.derived_lists.get(&list).and_then(|cell| {
             cell.items
                 .as_ref()
-                .map(|items| clone_whole_list_snapshot(items, work))
+                .map(|presence| clone_private_list_presence(presence, work))
         });
-        let retained_items = clone_whole_list_snapshot(&items, work);
+        let retained_presence = clone_private_list_presence(&presence, work);
         {
             let cell = self
                 .derived_lists
                 .get_mut(&list)
                 .expect("derived list checked above");
-            cell.items = Some(retained_items);
+            cell.items = Some(retained_presence);
             cell.window = None;
             cell.currentness = Currentness::Current;
         }
         work.metrics.recomputed_list_count += 1;
-        if whole_list_snapshot_changed(old.as_ref(), &items, work) {
+        if private_list_presence_changed(old.as_ref(), &presence, work) {
             self.invalidate_list_structure(list, work);
         }
-        Ok(items)
+        Ok(presence)
+    }
+
+    fn ensure_list_current(
+        &mut self,
+        list: ListId,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<Vec<EvalValue>, Error> {
+        match self.ensure_list_presence(list, event, work)? {
+            PrivatePresence::Present(items) => Ok(items),
+            PrivatePresence::Absent => Err(Error::Evaluation(format!(
+                "derived list {} is privately absent",
+                list.0
+            ))),
+        }
     }
 
     fn chunk_projection(&self, list: ListId) -> Option<(ListId, usize)> {
@@ -16243,12 +16327,23 @@ impl MachineInstance {
                         if let Some(window) = &cell.window {
                             break window.logical_len;
                         }
-                        if let Some(items) = &cell.items {
-                            break u64::try_from(items.len()).map_err(|_| {
-                                Error::Evaluation(
-                                    "chunk row count does not fit the logical key space".to_owned(),
-                                )
-                            })?;
+                        if let Some(presence) = &cell.items {
+                            match presence {
+                                PrivatePresence::Present(items) => {
+                                    break u64::try_from(items.len()).map_err(|_| {
+                                        Error::Evaluation(
+                                            "chunk row count does not fit the logical key space"
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                }
+                                PrivatePresence::Absent => {
+                                    return Err(Error::Evaluation(format!(
+                                        "derived chunk list {} is privately absent",
+                                        current.0
+                                    )));
+                                }
+                            }
                         }
                     }
                     Currentness::Evaluating => {
@@ -16264,7 +16359,8 @@ impl MachineInstance {
                         .get_mut(&current)
                         .expect("derived chunk cache checked above");
                     cell.currentness = Currentness::Evaluating;
-                    let had_full_items = cell.items.take().is_some();
+                    let had_full_items =
+                        matches!(cell.items.take(), Some(PrivatePresence::Present(_)));
                     let window = cell.window.take().unwrap_or(DerivedListWindow {
                         logical_len: 0,
                         values_current: false,
@@ -16650,8 +16746,13 @@ impl MachineInstance {
                     ValueTarget::RowField { row, field } => {
                         if self.row_exists(row) {
                             let field = self.resolve_row_field_alias(row, field);
-                            if self.metadata.row_computations.contains_key(&field) {
-                                self.ensure_row_field(row, field, event, work)?;
+                            let derived = self
+                                .lists
+                                .get(&row.list)
+                                .and_then(|list| list.rows.get(&row))
+                                .is_some_and(|row| row.derived.contains_key(&field));
+                            if derived {
+                                self.ensure_row_field_presence(row, field, event, work)?;
                             } else {
                                 self.row_value(row, field)?;
                             }
@@ -16691,13 +16792,13 @@ impl MachineInstance {
         ))
     }
 
-    fn ensure_row_field(
+    fn ensure_row_field_presence(
         &mut self,
         row: RowId,
         field: FieldId,
         event: Option<&SourceEvent>,
         work: &mut Work,
-    ) -> Result<Value, Error> {
+    ) -> Result<PrivatePresence<Value>, Error> {
         self.flush_list_access_dependencies(work)?;
         let field = self.resolve_row_field_alias(row, field);
         if self.touched_row_fields.contains(&(row, field))
@@ -16707,7 +16808,7 @@ impl MachineInstance {
                 .and_then(|list| list.rows.get(&row))
                 .is_some_and(|row| row.default_fields.contains(&field))
         {
-            return self.row_value(row, field);
+            return self.row_value(row, field).map(PrivatePresence::Present);
         }
         let currentness = self
             .lists
@@ -16716,10 +16817,10 @@ impl MachineInstance {
             .and_then(|row| row.derived.get(&field))
             .copied();
         let Some(currentness) = currentness else {
-            return self.row_value(row, field);
+            return self.row_value(row, field).map(PrivatePresence::Present);
         };
         match currentness {
-            Currentness::Current => return self.row_value(row, field),
+            Currentness::Current => return self.row_field_presence(row, field),
             Currentness::Evaluating => {
                 return Err(Error::Cycle {
                     field,
@@ -16755,19 +16856,42 @@ impl MachineInstance {
                 field.0
             )))
         };
-        let value = match evaluated.and_then(|value| self.materialize_eval(value)) {
-            Ok(value) => value,
+        let presence = match evaluated.and_then(|value| self.materialize_private_presence(value)) {
+            Ok(presence) => presence,
             Err(error) => {
                 self.set_row_currentness(row, field, Currentness::Dirty)?;
                 return Err(error);
             }
         };
-        self.set_row_field(row, field, value.clone(), work)?;
+        let applied = match &presence {
+            PrivatePresence::Present(value) => self.set_row_field(row, field, value.clone(), work),
+            PrivatePresence::Absent => self.clear_row_derived_field(row, field, work),
+        };
+        if let Err(error) = applied {
+            self.set_row_currentness(row, field, Currentness::Dirty)?;
+            return Err(error);
+        }
         self.set_row_currentness(row, field, Currentness::Current)?;
         work.metrics.recomputed_field_count += 1;
         work.recomputed_targets
             .insert(ValueTarget::RowField { row, field });
-        Ok(value)
+        Ok(presence)
+    }
+
+    fn ensure_row_field(
+        &mut self,
+        row: RowId,
+        field: FieldId,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<Value, Error> {
+        match self.ensure_row_field_presence(row, field, event, work)? {
+            PrivatePresence::Present(value) => Ok(value),
+            PrivatePresence::Absent => Err(Error::Evaluation(format!(
+                "row {}:{}:{} field {} is privately absent",
+                row.list.0, row.key, row.generation, field.0
+            ))),
+        }
     }
 
     fn row_default_expression(&self, row: RowId, field: FieldId) -> Option<PlanRowExpressionId> {
@@ -16829,13 +16953,17 @@ impl MachineInstance {
         op: &PlanOp,
         event: Option<&SourceEvent>,
         work: &mut Work,
-    ) -> Result<Vec<EvalValue>, Error> {
+    ) -> Result<PrivatePresence<Vec<EvalValue>>, Error> {
         let evaluated = match &op.kind {
             PlanOpKind::DerivedValue { .. } => self.evaluate_derived_op(op, None, event, work)?,
             PlanOpKind::ListProjection { projection } => {
                 let projected =
                     self.evaluate_projection(ValueRef::List(list), op.id, projection, event, work)?;
-                self.reconcile_positional_list_projection(list, projected, work)?
+                if matches!(projected, EvalValue::Absent) {
+                    EvalValue::Absent
+                } else {
+                    self.reconcile_positional_list_projection(list, projected, work)?
+                }
             }
             _ => {
                 return Err(Error::Unsupported {
@@ -16845,9 +16973,10 @@ impl MachineInstance {
             }
         };
         match evaluated {
-            EvalValue::List(items) => Ok(items),
+            EvalValue::Absent => Ok(PrivatePresence::Absent),
+            EvalValue::List(items) => Ok(PrivatePresence::Present(items)),
             _ => Err(Error::InvalidPlan(format!(
-                "list computation {} did not produce a list",
+                "list computation {} produced neither a list nor private absence",
                 op.id.0
             ))),
         }
@@ -17157,6 +17286,8 @@ impl MachineInstance {
         };
         if state.fields.contains_key(&field) {
             RowFieldAvailability::Stored
+        } else if state.derived.get(&field) == Some(&Currentness::Current) {
+            RowFieldAvailability::Missing
         } else if state.default_fields.contains(&field) {
             RowFieldAvailability::DefaultExpression
         } else if self.metadata.row_computations.contains_key(&field) {
@@ -17188,6 +17319,34 @@ impl MachineInstance {
         })
     }
 
+    fn row_field_presence(
+        &self,
+        row: RowId,
+        field: FieldId,
+    ) -> Result<PrivatePresence<Value>, Error> {
+        let field = self.resolve_row_field_alias(row, field);
+        let state = self
+            .lists
+            .get(&row.list)
+            .and_then(|list| list.rows.get(&row))
+            .ok_or_else(|| {
+                Error::Evaluation(format!(
+                    "row {}:{}:{} does not exist",
+                    row.list.0, row.key, row.generation
+                ))
+            })?;
+        if let Some(value) = state.fields.get(&field) {
+            return Ok(PrivatePresence::Present(value.clone()));
+        }
+        if state.derived.get(&field) == Some(&Currentness::Current) {
+            return Ok(PrivatePresence::Absent);
+        }
+        Err(Error::Evaluation(format!(
+            "row {}:{}:{} field {} has no current private presence",
+            row.list.0, row.key, row.generation, field.0
+        )))
+    }
+
     fn set_row_currentness(
         &mut self,
         row: RowId,
@@ -17213,10 +17372,11 @@ impl MachineInstance {
     }
 
     fn set_root_state(&mut self, state: StateId, value: Value, work: &mut Work) -> bool {
-        if self.root_states.get(&state) == Some(&value) {
+        if self.root_states.get(&state) == Some(&PrivatePresence::Present(value.clone())) {
             return false;
         }
-        self.root_states.insert(state, value.clone());
+        self.root_states
+            .insert(state, PrivatePresence::Present(value.clone()));
         work.dirty_states.insert(state);
         if work.emit {
             work.deltas.push(Delta::SetValue {
@@ -17303,6 +17463,50 @@ impl MachineInstance {
             work.deltas.push(Delta::SetValue {
                 target: ValueTarget::RowField { row, field },
                 value: value.clone(),
+            });
+        }
+        self.invalidate_row_field(row, field, work);
+        let fanout = self.mark_ordered_index_row_dirty_for_field(row, field);
+        record_ordered_index_fanout(work, fanout);
+        Ok(true)
+    }
+
+    fn clear_row_derived_field(
+        &mut self,
+        row: RowId,
+        field: FieldId,
+        work: &mut Work,
+    ) -> Result<bool, Error> {
+        let state = self
+            .lists
+            .get(&row.list)
+            .and_then(|list| list.rows.get(&row))
+            .ok_or_else(|| {
+                Error::Evaluation(format!(
+                    "cannot clear field {} on missing row {}:{}:{}",
+                    field.0, row.list.0, row.key, row.generation
+                ))
+            })?;
+        if !state.derived.contains_key(&field) {
+            return Err(Error::InvalidPlan(format!(
+                "field {} on row {}:{}:{} is authority, not a private derived cache",
+                field.0, row.list.0, row.key, row.generation
+            )));
+        }
+        if !state.fields.contains_key(&field) {
+            return Ok(false);
+        }
+        self.mark_list_semantic_change(row.list, work)?;
+        self.lists
+            .get_mut(&row.list)
+            .and_then(|list| list.rows.get_mut(&row))
+            .expect("row checked above")
+            .fields
+            .remove(&field);
+        work.changed_rows.insert(row);
+        if work.emit && !work.suppress_row_deltas.contains(&row) {
+            work.deltas.push(Delta::ClearValue {
+                target: ValueTarget::RowField { row, field },
             });
         }
         self.invalidate_row_field(row, field, work);
@@ -19161,15 +19365,25 @@ impl MachineInstance {
             .map(|row| self.row_owner_ancestry(row))
             .transpose()?
             .unwrap_or(OwnerAncestryId::ROOT);
-        let items = eval_to_list(value)?;
+        let private_absence = matches!(value, EvalValue::Absent);
+        let items = if private_absence {
+            Vec::new()
+        } else {
+            eval_to_list(value)?
+        };
         work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-        self.reconcile_unkeyed_value_list_records(
+        let reconciled = self.reconcile_unkeyed_value_list_records(
             authority.list_id,
             &authority.fields,
             items,
             owner_prefix,
             work,
-        )
+        )?;
+        Ok(if private_absence {
+            EvalValue::Absent
+        } else {
+            reconciled
+        })
     }
 
     fn reconcile_unkeyed_value_list_records(
@@ -19703,8 +19917,8 @@ impl MachineInstance {
                                     stack.push_value(EvalValue::Absent)?
                                 }
                                 PlanRowExpressionNode::Intrinsic { intrinsic } => stack
-                                    .push_value(EvalValue::Value(
-                                        self.eval_intrinsic(*intrinsic)?,
+                                    .push_value(private_presence_eval(
+                                        &self.eval_intrinsic_presence(*intrinsic),
                                     ))?,
                                 PlanRowExpressionNode::Field {
                                     input: ValueRef::DistributedImport(import_id),
@@ -20082,15 +20296,23 @@ impl MachineInstance {
                                 .row_expressions
                                 .node(expression)
                                 .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                            if value_base > stack.values.len() {
+                                return Err(Error::InvalidPlan(format!(
+                                    "row expression {} has an invalid value-stack boundary",
+                                    expression.0
+                                )));
+                            }
+                            if stack.values[value_base..]
+                                .iter()
+                                .any(|value| matches!(value, EvalValue::Absent))
+                            {
+                                stack.values.truncate(value_base);
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
                             if let PlanRowExpressionNode::Object { fields }
                             | PlanRowExpressionNode::TaggedObject { fields, .. } = node
                             {
-                                if value_base > stack.values.len() {
-                                    return Err(Error::InvalidPlan(format!(
-                                        "row expression {} has an invalid value-stack boundary",
-                                        expression.0
-                                    )));
-                                }
                                 let values = stack.values.drain(value_base..).collect::<Vec<_>>();
                                 if values.len() != fields.len() {
                                     return Err(Error::InvalidPlan(format!(
@@ -20414,7 +20636,9 @@ impl MachineInstance {
                                 ..
                             } = materialization;
                             work.active_value_list_authorities.truncate(authority_depth);
-                            let value = match stack.pop_value()? {
+                            let evaluated = stack.pop_value()?;
+                            let private_absence = matches!(evaluated, EvalValue::Absent);
+                            let value = match evaluated {
                                 EvalValue::Absent => EvalValue::List(Vec::new()),
                                 value @ (EvalValue::Record(_)
                                 | EvalValue::Tag { .. }
@@ -20475,7 +20699,11 @@ impl MachineInstance {
                                     owner_prefix,
                                     work,
                                 )?;
-                                stack.push_value(value)?;
+                                stack.push_value(if private_absence {
+                                    EvalValue::Absent
+                                } else {
+                                    value
+                                })?;
                                 return Ok(());
                             }
                             stack.push_task(ExpressionTask::MaterializedListNext {
@@ -20490,6 +20718,7 @@ impl MachineInstance {
                                     desired_len,
                                     remaining: items.into_iter(),
                                     desired: Vec::with_capacity(desired_len),
+                                    private_absence,
                                     event,
                                     consumer,
                                 }),
@@ -20509,7 +20738,11 @@ impl MachineInstance {
                                     state.desired,
                                     work,
                                 )?;
-                                stack.push_value(value)?;
+                                stack.push_value(if state.private_absence {
+                                    EvalValue::Absent
+                                } else {
+                                    value
+                                })?;
                                 return Ok(());
                             };
                             let row = match item {
@@ -20764,7 +20997,12 @@ impl MachineInstance {
                                             .to_owned(),
                                     )
                                 })?;
-                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            let evaluated = stack.pop_value()?;
+                            if matches!(evaluated, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let value = self.materialize_eval(evaluated)?;
                             validate_distributed_boundary_value(
                                 &value,
                                 &argument.data_type,
@@ -20923,8 +21161,8 @@ impl MachineInstance {
                                                 .get(field)
                                                 .is_some_and(|op| source_event_transform_op(op))
                                         {
-                                            stack.push_value(EvalValue::Value(
-                                                self.row_value(row, *field)?,
+                                            stack.push_value(private_presence_eval(
+                                                &self.row_field_presence(row, *field)?,
                                             ))?;
                                             return Ok(());
                                         }
@@ -21019,11 +21257,10 @@ impl MachineInstance {
                                 let value = self
                                     .root_states
                                     .get(&state)
-                                    .cloned()
-                                    .map(EvalValue::Value)
+                                    .map(private_presence_eval)
                                     .ok_or_else(|| {
                                         Error::Evaluation(format!(
-                                            "root state {} has no value",
+                                            "root state {} has no private presence",
                                             state.0
                                         ))
                                     })?;
@@ -21219,7 +21456,9 @@ impl MachineInstance {
                                     .and_then(|list| list.rows.get(&row))
                                     .is_some_and(|row| row.default_fields.contains(&field))
                             {
-                                stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
+                                stack.push_value(private_presence_eval(
+                                    &self.row_field_presence(row, field)?,
+                                ))?;
                                 return Ok(());
                             }
                             let currentness = self
@@ -21234,8 +21473,8 @@ impl MachineInstance {
                             };
                             match currentness {
                                 Currentness::Current => {
-                                    stack.push_value(EvalValue::Value(
-                                        self.row_value(row, field)?,
+                                    stack.push_value(private_presence_eval(
+                                        &self.row_field_presence(row, field)?,
                                     ))?;
                                 }
                                 Currentness::Evaluating => {
@@ -21293,14 +21532,21 @@ impl MachineInstance {
                             }
                         }
                         ExpressionTask::FinishRow { row, field } => {
-                            let value = self.materialize_eval(stack.pop_value()?)?;
+                            let presence = self.materialize_private_presence(stack.pop_value()?)?;
                             if stack.values.len() >= stack.limit {
                                 return Err(Error::InvalidPlan(format!(
                                     "expression value stack exceeded its plan-derived bound of {}",
                                     stack.limit
                                 )));
                             }
-                            self.set_row_field(row, field, value.clone(), work)?;
+                            match &presence {
+                                PrivatePresence::Present(value) => {
+                                    self.set_row_field(row, field, value.clone(), work)?;
+                                }
+                                PrivatePresence::Absent => {
+                                    self.clear_row_derived_field(row, field, work)?;
+                                }
+                            }
                             self.set_row_currentness(row, field, Currentness::Current)?;
                             finish_expression_currentness(
                                 &mut currentness_targets,
@@ -21309,7 +21555,7 @@ impl MachineInstance {
                             work.metrics.recomputed_field_count += 1;
                             work.recomputed_targets
                                 .insert(ValueTarget::RowField { row, field });
-                            stack.push_value(EvalValue::Value(value))?;
+                            stack.push_value(private_presence_eval(&presence))?;
                         }
                         ExpressionTask::EnsureList { list, event } => {
                             stack
@@ -21334,21 +21580,21 @@ impl MachineInstance {
                                         .get(&list)
                                         .is_some_and(|cell| cell.items.is_some()) =>
                                 {
-                                    let items = self
+                                    let presence = self
                                         .derived_lists
                                         .get(&list)
                                         .and_then(|cell| {
-                                            cell.items
-                                                .as_ref()
-                                                .map(|items| clone_whole_list_snapshot(items, work))
+                                            cell.items.as_ref().map(|presence| {
+                                                clone_private_list_presence(presence, work)
+                                            })
                                         })
                                         .ok_or_else(|| {
                                             Error::Evaluation(format!(
-                                                "current derived list {} has no items",
+                                                "current derived list {} has no private presence",
                                                 list.0
                                             ))
                                         })?;
-                                    stack.push_value(EvalValue::List(items))?;
+                                    stack.push_value(private_list_presence_eval(presence))?;
                                 }
                                 Currentness::Evaluating => {
                                     return Err(Error::ListCycle { list });
@@ -21408,11 +21654,15 @@ impl MachineInstance {
                         }
                         ExpressionTask::FinishList { list, op } => {
                             let evaluated = stack.pop_value()?;
-                            let EvalValue::List(items) = evaluated else {
-                                return Err(Error::InvalidPlan(format!(
-                                    "list computation {} did not produce a list",
-                                    op.0
-                                )));
+                            let presence = match evaluated {
+                                EvalValue::Absent => PrivatePresence::Absent,
+                                EvalValue::List(items) => PrivatePresence::Present(items),
+                                _ => {
+                                    return Err(Error::InvalidPlan(format!(
+                                        "list computation {} produced neither a list nor private absence",
+                                        op.0
+                                    )));
+                                }
                             };
                             if stack.values.len() >= stack.limit {
                                 return Err(Error::InvalidPlan(format!(
@@ -21423,9 +21673,9 @@ impl MachineInstance {
                             let old = self.derived_lists.get(&list).and_then(|cell| {
                                 cell.items
                                     .as_ref()
-                                    .map(|items| clone_whole_list_snapshot(items, work))
+                                    .map(|presence| clone_private_list_presence(presence, work))
                             });
-                            let retained_items = clone_whole_list_snapshot(&items, work);
+                            let retained_presence = clone_private_list_presence(&presence, work);
                             {
                                 let cell = self.derived_lists.get_mut(&list).ok_or_else(|| {
                                     Error::InvalidPlan(format!(
@@ -21433,7 +21683,7 @@ impl MachineInstance {
                                         list.0
                                     ))
                                 })?;
-                                cell.items = Some(retained_items);
+                                cell.items = Some(retained_presence);
                                 cell.window = None;
                                 cell.currentness = Currentness::Current;
                             }
@@ -21442,10 +21692,10 @@ impl MachineInstance {
                                 ExpressionCurrentnessTarget::List(list),
                             )?;
                             work.metrics.recomputed_list_count += 1;
-                            if whole_list_snapshot_changed(old.as_ref(), &items, work) {
+                            if private_list_presence_changed(old.as_ref(), &presence, work) {
                                 self.invalidate_list_structure(list, work);
                             }
-                            stack.push_value(EvalValue::List(items))?;
+                            stack.push_value(private_list_presence_eval(presence))?;
                         }
                         ExpressionTask::EvaluateCurrentnessOp { op, row, event } => {
                             let op = metadata.currentness_ops.get(&op).ok_or_else(|| {
@@ -21623,7 +21873,12 @@ impl MachineInstance {
                             }
                         }
                         ExpressionTask::ProjectionAfterSource { op, size, target } => {
-                            let rows = eval_to_list(stack.pop_value()?)?;
+                            let source = stack.pop_value()?;
+                            if matches!(source, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let rows = eval_to_list(source)?;
                             work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                             let mut chunks = Vec::new();
                             for (index, chunk) in rows.chunks(size).enumerate() {
@@ -22651,7 +22906,7 @@ impl MachineInstance {
                             let mut trailing_captures = intrinsics
                                 .into_iter()
                                 .map(|intrinsic| {
-                                    self.eval_intrinsic(intrinsic)
+                                    self.eval_intrinsic_value(intrinsic)
                                         .map(PageTrailingCapture::Value)
                                 })
                                 .collect::<Result<Vec<_>, Error>>()?;
@@ -22807,7 +23062,7 @@ impl MachineInstance {
                                 .transpose()?
                                 .unwrap_or_default();
                             let principal_scope =
-                                self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal)?;
+                                self.eval_intrinsic_value(PlanIntrinsic::SessionInfoPrincipal)?;
                             let capture_fingerprint = capture_fingerprint(
                                 page.view_fingerprint,
                                 self.cursor_ephemeral_launch_epoch,
@@ -23620,7 +23875,7 @@ impl MachineInstance {
                                 .transpose()?
                                 .unwrap_or_default();
                             let principal_scope =
-                                self.eval_intrinsic(PlanIntrinsic::SessionInfoPrincipal)?;
+                                self.eval_intrinsic_value(PlanIntrinsic::SessionInfoPrincipal)?;
                             let capture_fingerprint = capture_fingerprint(
                                 page.view_fingerprint,
                                 self.cursor_ephemeral_launch_epoch,
@@ -24426,6 +24681,14 @@ impl MachineInstance {
                                     function.function_name()
                                 )));
                             }
+                            if stack.values[value_base..]
+                                .iter()
+                                .any(|value| matches!(value, EvalValue::Absent))
+                            {
+                                stack.values.truncate(value_base);
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
                             let mut next_value = || {
                                 if value_base >= stack.values.len() {
                                     return Err(Error::InvalidPlan(format!(
@@ -24468,7 +24731,12 @@ impl MachineInstance {
                             right,
                             context,
                         } => {
-                            let left = eval_to_bool(&stack.pop_value()?)?;
+                            let left = stack.pop_value()?;
+                            if matches!(left, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let left = eval_to_bool(&left)?;
                             let short_circuit = match function {
                                 PlanRowBuiltin::BoolAnd => !left,
                                 PlanRowBuiltin::BoolOr => left,
@@ -24490,7 +24758,12 @@ impl MachineInstance {
                             }
                         }
                         ExpressionTask::BuiltinBoolAfterRight => {
-                            let right = eval_to_bool(&stack.pop_value()?)?;
+                            let right = stack.pop_value()?;
+                            if matches!(right, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let right = eval_to_bool(&right)?;
                             stack.push_value(EvalValue::Value(Value::truth(right)))?;
                         }
                         ExpressionTask::ContextualCollectionAfterSource {
@@ -24519,6 +24792,10 @@ impl MachineInstance {
                                 )?,
                                 None => input,
                             };
+                            if matches!(input, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
                             let (items, directions) = eval_to_ordered_items(input)?;
                             let local = (owner, row_local);
                             if bindings.contains_key(&local) {
@@ -24789,7 +25066,12 @@ impl MachineInstance {
                             direction,
                             context,
                         } => {
-                            let (items, directions) = eval_to_ordered_items(stack.pop_value()?)?;
+                            let source = stack.pop_value()?;
+                            if matches!(source, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let (items, directions) = eval_to_ordered_items(source)?;
                             stack.push_task(ExpressionTask::ContextualOrderAfterDirection {
                                 operation,
                                 owner,
@@ -25487,11 +25769,11 @@ impl MachineInstance {
         ))
     }
 
-    fn eval_intrinsic(&self, intrinsic: PlanIntrinsic) -> Result<Value, Error> {
+    fn eval_intrinsic_presence(&self, intrinsic: PlanIntrinsic) -> PrivatePresence<Value> {
         let SessionContext::Available { status, principal } = &self.options.session_context else {
-            return Err(Error::Evaluation("session scope is unavailable".to_owned()));
+            return PrivatePresence::Absent;
         };
-        Ok(match intrinsic {
+        PrivatePresence::Present(match intrinsic {
             PlanIntrinsic::SessionInfoStatus => match status {
                 SessionConnectionStatus::Connecting => Value::tag("Connecting"),
                 SessionConnectionStatus::Current => Value::tag("Current"),
@@ -25515,6 +25797,15 @@ impl MachineInstance {
                 SessionPrincipal::Anonymous => Value::tag("Anonymous"),
             },
         })
+    }
+
+    fn eval_intrinsic_value(&self, intrinsic: PlanIntrinsic) -> Result<Value, Error> {
+        match self.eval_intrinsic_presence(intrinsic) {
+            PrivatePresence::Present(value) => Ok(value),
+            PrivatePresence::Absent => {
+                Err(Error::Evaluation("session scope is unavailable".to_owned()))
+            }
+        }
     }
 
     fn eval_object_field(
@@ -26693,6 +26984,9 @@ impl MachineInstance {
                     consumer,
                     work,
                 )?;
+                if matches!(rows, EvalValue::Absent) {
+                    return Ok(EvalValue::Absent);
+                }
                 let rows = eval_to_list(rows)?;
                 work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 let mut chunks = Vec::new();
@@ -26716,6 +27010,9 @@ impl MachineInstance {
                 }
                 let source =
                     self.eval_value_ref(source, None, event, output_field, consumer, work)?;
+                if matches!(source, EvalValue::Absent) {
+                    return Ok(EvalValue::Absent);
+                }
                 let rows = eval_to_list(source)?;
                 work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 let chunks = rows
@@ -26762,6 +27059,13 @@ fn private_presence_eval(value: &PrivatePresence<Value>) -> EvalValue {
     match value {
         PrivatePresence::Absent => EvalValue::Absent,
         PrivatePresence::Present(value) => EvalValue::Value(value.clone()),
+    }
+}
+
+fn private_list_presence_eval(value: PrivatePresence<Vec<EvalValue>>) -> EvalValue {
+    match value {
+        PrivatePresence::Absent => EvalValue::Absent,
+        PrivatePresence::Present(items) => EvalValue::List(items),
     }
 }
 

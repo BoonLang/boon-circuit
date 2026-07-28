@@ -71,7 +71,7 @@ fn semantic_data_type(value: &boon_typecheck::Type) -> crate::SemanticDataType {
                 fixed_len: Some(*fixed_len),
             }
         }
-        boon_typecheck::Type::Skip => crate::SemanticDataType::Unknown {
+        boon_typecheck::Type::Absent => crate::SemanticDataType::Unknown {
             reason: "private absence is not semantic data".to_owned(),
         },
         boon_typecheck::Type::VariantSet(variants) => {

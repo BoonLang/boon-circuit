@@ -4136,11 +4136,12 @@ document: Document/new(
             &example.assets,
         )
         .unwrap();
-        assert_eq!(
-            view.root_value_current("store.real_signal_page_request")
-                .unwrap(),
-            Value::Text("SKIP".to_owned()),
-            "inactive NovyWave LATEST request must not be initialized from an untriggered arm"
+        let inactive = view
+            .root_value_current("store.real_signal_page_request")
+            .expect_err("an inactive NovyWave LATEST request must remain private absence");
+        assert!(
+            inactive.to_string().contains("privately absent"),
+            "inactive NovyWave LATEST request escaped its private presence channel: {inactive}"
         );
         dispatch_press(&mut view, "store.elements.load_default_file");
         assert_eq!(view.transient_host.active_call_count(), 1);

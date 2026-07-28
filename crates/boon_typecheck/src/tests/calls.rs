@@ -3990,6 +3990,44 @@ store: [
 }
 
 #[test]
+fn checked_skip_is_private_absence_instead_of_an_application_tag() {
+    let parsed = boon_parser::parse_source(
+        "checked-private-absence.bn",
+        r#"
+store: [
+    trigger: SOURCE
+    candidate:
+        LATEST {
+            trigger |> THEN { TEXT { present } }
+            SKIP
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("private absence is checked");
+    let absent = program
+        .expressions
+        .iter()
+        .find(|expression| matches!(expression.kind, CheckedExpressionKind::Absent))
+        .expect("SKIP lowers to a private absence expression");
+    assert_eq!(absent.flow_type.mode, FlowMode::Absent);
+    assert_eq!(absent.flow_type.ty, Type::Absent);
+    assert!(program.expressions.iter().all(|expression| {
+        !matches!(
+            &expression.kind,
+            CheckedExpressionKind::Tag { name } if name == "SKIP"
+        )
+    }));
+}
+
+#[test]
 fn block_record_parameters_are_instantiated_without_value_placeholders() {
     let parsed = boon_parser::parse_source(
         "fjordpulse-health-record.bn",

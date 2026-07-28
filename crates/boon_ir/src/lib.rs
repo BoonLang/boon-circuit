@@ -3366,7 +3366,7 @@ fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
                 }
             })
         }
-        boon_typecheck::Type::Skip
+        boon_typecheck::Type::Absent
         | boon_typecheck::Type::RenderContract
         | boon_typecheck::Type::Function { .. }
         | boon_typecheck::Type::UnresolvedShape { .. }
@@ -4231,7 +4231,7 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
         boon_typecheck::Type::Text
         | boon_typecheck::Type::Number
         | boon_typecheck::Type::Bytes(_)
-        | boon_typecheck::Type::Skip
+        | boon_typecheck::Type::Absent
         | boon_typecheck::Type::RenderContract
         | boon_typecheck::Type::UnresolvedShape { .. }
         | boon_typecheck::Type::Unknown => false,

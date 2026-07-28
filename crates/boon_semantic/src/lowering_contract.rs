@@ -1774,7 +1774,7 @@ fn resolved_visual_type(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::VariantSet(_)
         | Type::Object(_)
         | Type::RenderContract => true,
@@ -1861,7 +1861,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
 
 fn type_is_closed_host_data(data_type: &Type) -> bool {
     match data_type {
-        Type::Text | Type::Number | Type::Bytes(_) | Type::Skip => true,
+        Type::Text | Type::Number | Type::Bytes(_) => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {
@@ -1870,7 +1870,8 @@ fn type_is_closed_host_data(data_type: &Type) -> bool {
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(type_is_closed_host_data),
         Type::List(item) => type_is_closed_host_data(item),
-        Type::Function { .. }
+        Type::Absent
+        | Type::Function { .. }
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Var(_)

@@ -676,7 +676,7 @@ fn ensure_closed_memory_type(data_type: &Type, context: &str) -> Result<(), Sema
 
 fn type_is_closed_memory_data(data_type: &Type) -> bool {
     match data_type {
-        Type::Text | Type::Number | Type::Bytes(_) | Type::Skip => true,
+        Type::Text | Type::Number | Type::Bytes(_) => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {
@@ -685,7 +685,8 @@ fn type_is_closed_memory_data(data_type: &Type) -> bool {
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(type_is_closed_memory_data),
         Type::List(item) => type_is_closed_memory_data(item),
-        Type::Function { .. }
+        Type::Absent
+        | Type::Function { .. }
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Var(_)

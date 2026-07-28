@@ -1007,7 +1007,7 @@ fn erase_runtime_type_vars(ty: &Type) -> Type {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
-        | Type::Skip
+        | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Unknown => ty.clone(),
@@ -1659,7 +1659,7 @@ pub(crate) fn derive_semantic_execution_graph(
                         checked_expr_id: checked_result,
                         flow_type: boon_typecheck::FlowType {
                             mode: FlowMode::PresentOrAbsent,
-                            ty: Type::Skip,
+                            ty: Type::Absent,
                         },
                         effect: boon_typecheck::CheckedEffectSummary {
                             emits_source: true,

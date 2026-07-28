@@ -646,6 +646,7 @@ fn build_storage_fields(
         &reactive_storage,
         &mut fields,
     )?;
+    append_materialized_value_fields(execution, resources, &mut fields)?;
     append_record_projection_fields(execution, &mut fields)?;
     Ok(fields)
 }
@@ -1084,6 +1085,237 @@ fn flattened_type_fields(data_type: &Type) -> Vec<(Vec<String>, Type)> {
     let mut fields = Vec::new();
     visit(data_type, &mut Vec::new(), &mut fields);
     fields
+}
+
+fn append_materialized_value_fields(
+    execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
+    fields: &mut Vec<SemanticStorageFieldV1>,
+) -> Result<(), SemanticScopeStorageError> {
+    for list in &resources.lists {
+        let row = SemanticRowBinding {
+            list: list.id,
+            scope: list.row_scope,
+        };
+        let parents = fields
+            .iter()
+            .filter(|field| {
+                field.statement == Some(list.statement)
+                    && field.row == Some(row)
+                    && matches!(field.origin, SemanticStorageFieldOriginV1::Reactive { .. })
+            })
+            .map(|field| field.id)
+            .collect::<Vec<_>>();
+        let [parent] = parents.as_slice() else {
+            return Err(SemanticScopeStorageError::new(format!(
+                "list {} statement {} resolves to {} reactive storage roots",
+                list.id,
+                list.statement,
+                parents.len()
+            )));
+        };
+        let materializations = execution
+            .materializations
+            .iter()
+            .filter(|materialization| {
+                materialization.operation == SemanticContextualOperationKind::Map
+                    && materialization.target_list_id == Some(list.id)
+                    && materialization.target_scope_id == Some(list.row_scope)
+            })
+            .collect::<Vec<_>>();
+        if materializations.is_empty() {
+            continue;
+        }
+        for (path, _) in
+            list_authority_fields(&list.item_type, &list.initializer, &list.item_fields)
+        {
+            let [name] = path.as_slice() else {
+                continue;
+            };
+            if fields.iter().any(|field| {
+                field.row == Some(row)
+                    && field.parent == Some(*parent)
+                    && field.name == *name
+                    && field.role == SemanticStorageFieldRoleV1::Value
+            }) {
+                continue;
+            }
+            let mut candidates = BTreeSet::new();
+            for materialization in &materializations {
+                collect_materialized_output_field_candidates(
+                    execution,
+                    materialization.body,
+                    name,
+                    Some(materialization.owner),
+                    &mut BTreeSet::new(),
+                    &mut candidates,
+                )?;
+            }
+            let mut candidates = candidates.into_iter();
+            let Some((declaration, producer, owner)) = candidates.next() else {
+                continue;
+            };
+            if candidates.next().is_some() {
+                continue;
+            }
+            if resources.sources.iter().any(|source| {
+                source.declaration == declaration
+                    && source.expression == producer
+                    && source.owner == owner
+            }) {
+                continue;
+            }
+            let value = require_expression(execution, producer)?;
+            fields.push(SemanticStorageFieldV1 {
+                id: SemanticStorageFieldId(fields.len()),
+                role: SemanticStorageFieldRoleV1::Value,
+                origin: SemanticStorageFieldOriginV1::RecordProjection {
+                    parent: *parent,
+                    expression: producer,
+                    projection: vec![name.clone()],
+                },
+                reactive_field: None,
+                producer_identity: None,
+                declaration: Some(declaration),
+                owner,
+                parent: Some(*parent),
+                row: Some(row),
+                name: name.clone(),
+                diagnostic_path: format!("{}.{}", list.semantic_path, name),
+                statement: None,
+                producer: Some(producer),
+                resource_only: false,
+                flow_type: FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: value.flow_type.ty.clone(),
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_materialized_output_field_candidates(
+    execution: &SemanticExecutionGraphV1,
+    expression: SemanticExprId,
+    field_name: &str,
+    fallback_owner: Option<StaticOwnerId>,
+    visited: &mut BTreeSet<SemanticExprId>,
+    candidates: &mut BTreeSet<(DeclId, SemanticExprId, Option<StaticOwnerId>)>,
+) -> Result<(), SemanticScopeStorageError> {
+    if !visited.insert(expression) {
+        return Ok(());
+    }
+    let value = require_expression(execution, expression)?;
+    match &value.kind {
+        SemanticExpressionKind::Object(fields)
+        | SemanticExpressionKind::Record(fields)
+        | SemanticExpressionKind::TaggedObject { fields, .. } => {
+            let matches = fields
+                .iter()
+                .filter(|field| !field.spread && field.name == field_name)
+                .collect::<Vec<_>>();
+            let field = match matches.as_slice() {
+                [] => return Ok(()),
+                [field] => *field,
+                _ => {
+                    return Err(SemanticScopeStorageError::new(format!(
+                        "materialized output expression {expression} has {} fields named `{field_name}`",
+                        matches.len()
+                    )));
+                }
+            };
+            if let Some(declaration) = field.declaration {
+                let field_value = require_expression(execution, field.value)?;
+                candidates.insert((
+                    declaration,
+                    field.value,
+                    field_value.owner.or(value.owner).or(fallback_owner),
+                ));
+            }
+        }
+        SemanticExpressionKind::Draining { input } => {
+            collect_materialized_output_field_candidates(
+                execution,
+                *input,
+                field_name,
+                fallback_owner,
+                visited,
+                candidates,
+            )?;
+        }
+        SemanticExpressionKind::Block { result, .. } => {
+            collect_materialized_output_field_candidates(
+                execution,
+                *result,
+                field_name,
+                fallback_owner,
+                visited,
+                candidates,
+            )?;
+        }
+        SemanticExpressionKind::Latest { branches } => {
+            for branch in branches {
+                collect_materialized_output_field_candidates(
+                    execution,
+                    *branch,
+                    field_name,
+                    fallback_owner,
+                    visited,
+                    candidates,
+                )?;
+            }
+        }
+        SemanticExpressionKind::When { arms, .. } => {
+            for arm in arms {
+                collect_materialized_output_field_candidates(
+                    execution,
+                    arm.output,
+                    field_name,
+                    fallback_owner,
+                    visited,
+                    candidates,
+                )?;
+            }
+        }
+        SemanticExpressionKind::Then { output, .. }
+        | SemanticExpressionKind::MatchArm { output, .. } => {
+            if let Some(output) = output {
+                collect_materialized_output_field_candidates(
+                    execution,
+                    *output,
+                    field_name,
+                    fallback_owner,
+                    visited,
+                    candidates,
+                )?;
+            }
+        }
+        SemanticExpressionKind::Hold {
+            initial, updates, ..
+        } => {
+            collect_materialized_output_field_candidates(
+                execution,
+                *initial,
+                field_name,
+                fallback_owner,
+                visited,
+                candidates,
+            )?;
+            for update in updates {
+                collect_materialized_output_field_candidates(
+                    execution,
+                    *update,
+                    field_name,
+                    fallback_owner,
+                    visited,
+                    candidates,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn append_record_projection_fields(
@@ -3545,6 +3777,61 @@ mod tests {
                 } if authority == pending.id && !item_path.is_empty()
             )
         }));
+    }
+
+    #[test]
+    fn materialized_map_fields_keep_distinct_value_and_authority_storage() {
+        let parsed = boon_parser::parse_source(
+            "materialized-map-storage.bn",
+            r#"
+store: [
+    cells:
+        List/range(from: 0, to: 3)
+        |> List/map(item, new: [
+            address: item |> Number/to_text(radix: 10)
+            value: item
+        ])
+]
+"#,
+        )
+        .expect("parse");
+        let output = boon_typecheck::check_program(&parsed);
+        assert!(
+            !output.report.has_errors(),
+            "unexpected diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        let checked = output.program.expect("checked");
+        let semantic = crate::elaborate(checked.clone(), &[]).expect("semantic");
+        let graph = graph(&checked, &semantic);
+        let list = semantic
+            .resource_graph()
+            .lists
+            .iter()
+            .find(|list| list.local_name == "cells")
+            .expect("cells list");
+        let row = SemanticRowBinding {
+            list: list.id,
+            scope: list.row_scope,
+        };
+        let address_fields = graph
+            .fields
+            .iter()
+            .filter(|field| field.row == Some(row) && field.name == "address")
+            .collect::<Vec<_>>();
+        let authority = address_fields
+            .iter()
+            .find(|field| field.role == SemanticStorageFieldRoleV1::ListAuthority)
+            .expect("address authority field");
+        let value = address_fields
+            .iter()
+            .find(|field| field.role == SemanticStorageFieldRoleV1::Value)
+            .expect("address value field");
+        assert_ne!(authority.id, value.id);
+        assert!(authority.producer.is_none());
+        assert!(value.declaration.is_some());
+        assert!(value.producer.is_some());
+        assert_eq!(authority.parent, value.parent);
     }
 
     #[test]

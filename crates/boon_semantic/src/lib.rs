@@ -2616,7 +2616,29 @@ fn resolve_out_contracts(
             .iter()
             .map(|substitution| (substitution.variable, substitution.value.clone()))
             .collect::<BTreeMap<_, _>>();
-        for input in &instance.inputs {
+        let ordered_inputs = instance
+            .inputs
+            .iter()
+            .filter(|input| {
+                !matches!(
+                    input.value,
+                    out_net::OutInputValue::Checked(ScopedCheckedExpr {
+                        evaluation_port: Some(_),
+                        ..
+                    })
+                )
+            })
+            .chain(instance.inputs.iter().filter(|input| {
+                matches!(
+                    input.value,
+                    out_net::OutInputValue::Checked(ScopedCheckedExpr {
+                        evaluation_port: Some(_),
+                        ..
+                    })
+                )
+            }))
+            .collect::<Vec<_>>();
+        for input in ordered_inputs {
             let input_parameter = callable
                 .parameters
                 .iter()
@@ -2629,7 +2651,19 @@ fn resolve_out_contracts(
                 })?;
             let actual = match &input.value {
                 out_net::OutInputValue::Checked(scoped) => {
-                    concrete_checked_expression_type(program, graph, *scoped, &mut BTreeSet::new())?
+                    concrete_checked_expression_type(
+                        program,
+                        graph,
+                        *scoped,
+                        &substitutions,
+                        &mut BTreeSet::new(),
+                    )
+                    .map_err(|error| {
+                        SemanticError::new(format!(
+                            "OUT call instance {call_id} `{}` input `{}` with substitutions {substitutions:?}: {error}",
+                            callable.name, input_parameter.name
+                        ))
+                    })?
                 }
                 out_net::OutInputValue::ProducerParameter { flow_type, .. } => flow_type.ty.clone(),
             };
@@ -2707,6 +2741,7 @@ fn concrete_checked_expression_type(
     program: &CheckedProgram,
     graph: &ResolvedOutGraph,
     scoped: ScopedCheckedExpr,
+    active_substitutions: &BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
     visiting: &mut BTreeSet<(boon_typecheck::CheckedExprId, Option<OutCallInstanceId>)>,
 ) -> Result<boon_typecheck::Type, SemanticError> {
     let key = (scoped.expression, scoped.frame);
@@ -2751,14 +2786,88 @@ fn concrete_checked_expression_type(
                         scoped.expression.0
                     ))
                 })?;
-                let base =
-                    concrete_checked_expression_type(program, graph, passed.value, visiting)?;
-                project_out_contract_type(base, projection)
+                let base = concrete_checked_expression_type(
+                    program,
+                    graph,
+                    passed.value,
+                    active_substitutions,
+                    visiting,
+                )?;
+                project_out_contract_type(base, projection).map_err(|error| {
+                    SemanticError::new(format!(
+                        "PASSED expression {} in frame {frame}: {error}",
+                        scoped.expression.0
+                    ))
+                })
             }
             boon_typecheck::CheckedExpressionKind::Read {
                 target, projection, ..
             } => {
-                let actual = scoped
+                if let Some(payload_type) = exact_checked_resource_projection_type(
+                    program,
+                    scoped.expression,
+                    active_substitutions,
+                )? {
+                    return Ok(payload_type);
+                }
+                let output_actual = scoped
+                    .evaluation_port
+                    .map(|port_id| {
+                        let port = graph
+                            .ports
+                            .get(port_id.as_usize())
+                            .filter(|port| port.id == port_id)
+                            .ok_or_else(|| {
+                                SemanticError::new(format!(
+                                    "READ expression {} references missing evaluation port {port_id}",
+                                    scoped.expression.0
+                                ))
+                            })?;
+                        let output = match port.binding {
+                            out_net::OutPortBinding::Fresh { output, .. } => output,
+                            out_net::OutPortBinding::Forward { target } => target,
+                        };
+                        if output != *target {
+                            return Ok(None);
+                        }
+                        let instance = graph
+                            .call_instances
+                            .get(port.call.as_usize())
+                            .filter(|instance| instance.id == port.call)
+                            .ok_or_else(|| {
+                                SemanticError::new(format!(
+                                    "evaluation port {port_id} references missing call {}",
+                                    port.call
+                                ))
+                            })?;
+                        let callable = program
+                            .callables
+                            .iter()
+                            .find(|callable| callable.decl_id == instance.provenance.callable)
+                            .ok_or_else(|| {
+                                SemanticError::new(format!(
+                                    "evaluation port {port_id} references missing callable {}",
+                                    instance.provenance.callable.0
+                                ))
+                            })?;
+                        let parameter = callable
+                            .parameters
+                            .iter()
+                            .find(|parameter| parameter.decl_id == port.formal)
+                            .ok_or_else(|| {
+                                SemanticError::new(format!(
+                                    "evaluation port {port_id} references missing OUT formal {}",
+                                    port.formal.0
+                                ))
+                            })?;
+                        Ok(Some(apply_out_contract_substitutions(
+                            &parameter.flow_type.ty,
+                            active_substitutions,
+                        )))
+                    })
+                    .transpose()?
+                    .flatten();
+                let frame_actual = scoped
                     .frame
                     .map(|frame| {
                         graph
@@ -2778,14 +2887,20 @@ fn concrete_checked_expression_type(
                     })
                     .map(|input| match &input.value {
                         out_net::OutInputValue::Checked(actual) => {
-                            concrete_checked_expression_type(program, graph, *actual, visiting)
+                            concrete_checked_expression_type(
+                                program,
+                                graph,
+                                *actual,
+                                active_substitutions,
+                                visiting,
+                            )
                         }
                         out_net::OutInputValue::ProducerParameter { flow_type, .. } => {
                             Ok(flow_type.ty.clone())
                         }
                     })
                     .transpose()?;
-                let base = match actual {
+                let base = match output_actual.or(frame_actual) {
                     Some(actual) => actual,
                     None => program
                         .declarations
@@ -2799,10 +2914,55 @@ fn concrete_checked_expression_type(
                             ))
                         })?,
                 };
-                project_out_contract_type(base, projection)
+                let target_detail = program
+                    .declarations
+                    .iter()
+                    .find(|declaration| declaration.id == *target)
+                    .map(|declaration| {
+                        format!(
+                            "`{}` ({:?}, scope {}, line {})",
+                            declaration.name,
+                            declaration.kind,
+                            declaration.scope_id.0,
+                            declaration.span.line
+                        )
+                    })
+                    .unwrap_or_else(|| format!("<missing declaration {}>", target.0));
+                let evaluation_detail = scoped
+                    .evaluation_port
+                    .and_then(|port| graph.ports.get(port.as_usize()))
+                    .map(|port| {
+                        let formal_type = graph
+                            .call_instances
+                            .get(port.call.as_usize())
+                            .and_then(|instance| {
+                                program.callables.iter().find(|callable| {
+                                    callable.decl_id == instance.provenance.callable
+                                })
+                            })
+                            .and_then(|callable| {
+                                callable
+                                    .parameters
+                                    .iter()
+                                    .find(|parameter| parameter.decl_id == port.formal)
+                            })
+                            .map(|parameter| format!("{:?}", parameter.flow_type.ty))
+                            .unwrap_or_else(|| "<missing formal type>".to_owned());
+                        format!(
+                            "{} {:?} formal {} type {formal_type}",
+                            port.id, port.binding, port.formal.0
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_owned());
+                project_out_contract_type(base, projection).map_err(|error| {
+                    SemanticError::new(format!(
+                        "READ expression {} target {} {target_detail} in frame {:?} under evaluation port {evaluation_detail}: {error}",
+                        scoped.expression.0, target.0, scoped.frame,
+                    ))
+                })
             }
             _ => {
-                let substitutions = scoped
+                let mut substitutions = scoped
                     .frame
                     .map(|frame| {
                         graph
@@ -2818,16 +2978,122 @@ fn concrete_checked_expression_type(
                             })
                     })
                     .transpose()?
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|substitution| (substitution.variable, substitution.value.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                substitutions.extend(
+                    active_substitutions
+                        .iter()
+                        .map(|(variable, value)| (*variable, value.clone())),
+                );
+                let substitutions = substitutions
+                    .into_iter()
+                    .map(
+                        |(variable, value)| boon_typecheck::CheckedTypeSubstitution {
+                            variable,
+                            value,
+                        },
+                    )
+                    .collect::<Vec<_>>();
                 Ok(boon_typecheck::apply_checked_type_substitutions(
                     &expression.flow_type.ty,
-                    substitutions,
+                    &substitutions,
                 ))
             }
         }
     })();
     visiting.remove(&key);
     resolved
+}
+
+fn exact_checked_resource_projection_type(
+    program: &CheckedProgram,
+    expression: boon_typecheck::CheckedExprId,
+    substitutions: &BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
+) -> Result<Option<boon_typecheck::Type>, SemanticError> {
+    let requirements = program
+        .resource_projection_requirements
+        .iter()
+        .filter(|requirement| requirement.expression == expression)
+        .collect::<Vec<_>>();
+    let requirement = match requirements.as_slice() {
+        [] => return Ok(None),
+        [requirement] => *requirement,
+        _ => {
+            return Err(SemanticError::new(format!(
+                "checked expression {} has {} resource projection requirements",
+                expression.0,
+                requirements.len()
+            )));
+        }
+    };
+    if requirement.source_origins.is_empty() {
+        return Ok(None);
+    }
+
+    let required_type = apply_out_contract_substitutions(&requirement.required_type, substitutions);
+    let mut exact_type = None;
+    for origin in &requirement.source_origins {
+        let source = program
+            .sources
+            .get(origin.source.0 as usize)
+            .filter(|source| source.id == origin.source)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "checked expression {} resource projection references missing source {}",
+                    expression.0, origin.source.0
+                ))
+            })?;
+        let source_type = apply_out_contract_substitutions(&source.payload_type, substitutions);
+        let projected = project_out_contract_type(source_type, &origin.payload_projection)
+            .map_err(|error| {
+                SemanticError::new(format!(
+                    "checked expression {} source {} payload projection {:?}: {error}",
+                    expression.0, origin.source.0, origin.payload_projection
+                ))
+            })?;
+        if !out_contract_type_is_resolved(&projected) {
+            return Err(SemanticError::new(format!(
+                "checked expression {} source {} payload projection has unresolved type {projected:?}",
+                expression.0, origin.source.0
+            )));
+        }
+        match &exact_type {
+            Some(existing) if existing != &projected => {
+                return Err(SemanticError::new(format!(
+                    "checked expression {} source payload origins disagree: {existing:?} versus {projected:?}",
+                    expression.0
+                )));
+            }
+            Some(_) => {}
+            None => exact_type = Some(projected),
+        }
+    }
+    let exact_type = exact_type.expect("nonempty checked source origins");
+    if out_contract_type_is_resolved(&required_type) && required_type != exact_type {
+        return Err(SemanticError::new(format!(
+            "checked expression {} resource requirement type {required_type:?} differs from exact source payload type {exact_type:?}",
+            expression.0
+        )));
+    }
+    Ok(Some(exact_type))
+}
+
+fn apply_out_contract_substitutions(
+    ty: &boon_typecheck::Type,
+    substitutions: &BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
+) -> boon_typecheck::Type {
+    let substitutions = substitutions
+        .iter()
+        .map(
+            |(variable, value)| boon_typecheck::CheckedTypeSubstitution {
+                variable: *variable,
+                value: value.clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    boon_typecheck::apply_checked_type_substitutions(ty, &substitutions)
 }
 
 fn project_out_contract_type(
@@ -2842,7 +3108,8 @@ fn project_out_contract_type(
         };
         ty = shape.fields.get(field).cloned().ok_or_else(|| {
             SemanticError::new(format!(
-                "OUT type projection references missing object field `{field}`"
+                "OUT type projection references missing object field `{field}`; available fields are {:?}",
+                shape.field_order
             ))
         })?;
     }
@@ -4564,6 +4831,70 @@ result:
             .expect("wrapped OUT fixture has two unified ports")
             .as_usize();
         (checked, graph, port)
+    }
+
+    #[test]
+    fn out_contract_uses_exact_mapped_source_payload_projection_type() {
+        let parsed = boon_parser::parse_source(
+            "semantic-mapped-source-out-contract.bn",
+            r#"
+store: [
+    rows:
+        LIST { [name: TEXT { one }] }
+        |> List/map(item, new: selectable_row(row: item))
+    selected_addresses:
+        rows
+        |> List/map(item, new: item.controls.select.address)
+]
+
+FUNCTION selectable_row(row) {
+    [controls: [select: SOURCE], name: row.name]
+}
+"#,
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed)
+            .program
+            .expect("mapped source OUT fixture checks");
+        let address_read = checked
+            .resource_projection_requirements
+            .iter()
+            .find(|requirement| {
+                requirement
+                    .source_origins
+                    .iter()
+                    .any(|origin| origin.payload_projection == ["address"])
+            })
+            .expect("mapped address read has exact checked source provenance");
+        assert_eq!(
+            exact_checked_resource_projection_type(
+                &checked,
+                address_read.expression,
+                &BTreeMap::new()
+            )
+            .unwrap(),
+            Some(Type::Text)
+        );
+        let producer_roots = resolve_producer_roots(&checked, &[]).unwrap();
+        let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with(
+            &checked,
+            producer_roots,
+            |call, _, entry| provisional_out_port_contract(&checked, call, entry),
+            |kind, _, _, _, _| kind == boon_typecheck::CheckedCallableKind::Builtin,
+        )
+        .unwrap();
+        assert!(!out_net.has_errors());
+        let mut graph = out_net.graph;
+        resolve_out_contracts(&checked, &mut graph)
+            .expect("mapped source payload projection resolves its OUT contract");
+        assert!(
+            graph
+                .ports
+                .iter()
+                .all(|port| out_contract_type_is_resolved(&port.contract.resolved_type)),
+            "all mapped-source OUT ports must be concrete: {:#?}",
+            graph.ports
+        );
     }
 
     fn assert_contract_rejection(

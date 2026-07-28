@@ -1785,7 +1785,11 @@ pub(crate) fn derive_semantic_execution_graph(
                             SemanticExpressionKind::FunctionParameter {
                                 parameter: candidate,
                                 ..
-                            } if candidate == semantic_parameter => Some(expression.id),
+                            } if candidate == semantic_parameter
+                                && expression.owner == Some(owner) =>
+                            {
+                                Some(expression.id)
+                            }
                             _ => None,
                         })
                         .collect();
@@ -1993,12 +1997,6 @@ pub(crate) fn derive_semantic_execution_graph(
                 .ok_or(ExpansionError::MissingExpression(
                     expression.checked_expr_id,
                 ))?;
-            origin.owning_statement.ok_or_else(|| {
-                ExpansionError::InvalidLocalBindings(format!(
-                    "checked source {} expression {} has no exact semantic statement",
-                    checked_source.id.0, expression.id
-                ))
-            })?;
             let key = (checked_source.id, expression.owner, origin.call_instance);
             candidates_by_instance
                 .entry(key)
@@ -2011,6 +2009,8 @@ pub(crate) fn derive_semantic_execution_graph(
                     expressions: &arena.expressions,
                     origins: &arena.checked_expression_origins,
                     statements: &statements,
+                    materializations,
+                    out_net,
                     checked_statement: checked_source.statement,
                     declaration: checked_source.declaration,
                     checked_binding: CheckedResourceBinding::Source {
@@ -2020,6 +2020,20 @@ pub(crate) fn derive_semantic_execution_graph(
                     checked_id: checked_source.id.0,
                 },
                 &candidates,
+            )?;
+            let (expression, statement) = ensure_resource_definition_statement(
+                program,
+                &lookup,
+                &semantic_scope_ids,
+                &mut arena,
+                &mut statements,
+                expression,
+                statement,
+                checked_source.statement,
+                checked_source.declaration,
+                CheckedResourceBinding::Source {
+                    source: checked_source.id,
+                },
             )?;
             let expression_definition = &arena.expressions[expression.as_usize()];
             let origin = &arena.checked_expression_origins[expression.as_usize()];
@@ -2102,12 +2116,6 @@ pub(crate) fn derive_semantic_execution_graph(
                 .ok_or(ExpansionError::MissingExpression(
                     expression.checked_expr_id,
                 ))?;
-            origin.owning_statement.ok_or_else(|| {
-                ExpansionError::InvalidLocalBindings(format!(
-                    "checked state {} expression {} has no exact semantic statement",
-                    checked_state.id.0, expression.id
-                ))
-            })?;
             let key = (checked_state.id, expression.owner, origin.call_instance);
             candidates_by_instance
                 .entry(key)
@@ -2120,6 +2128,8 @@ pub(crate) fn derive_semantic_execution_graph(
                     expressions: &arena.expressions,
                     origins: &arena.checked_expression_origins,
                     statements: &statements,
+                    materializations,
+                    out_net,
                     checked_statement: checked_state.statement,
                     declaration: checked_state.declaration,
                     checked_binding: CheckedResourceBinding::State {
@@ -2129,6 +2139,20 @@ pub(crate) fn derive_semantic_execution_graph(
                     checked_id: checked_state.id.0,
                 },
                 &candidates,
+            )?;
+            let (expression, statement) = ensure_resource_definition_statement(
+                program,
+                &lookup,
+                &semantic_scope_ids,
+                &mut arena,
+                &mut statements,
+                expression,
+                statement,
+                checked_state.statement,
+                checked_state.declaration,
+                CheckedResourceBinding::State {
+                    state: checked_state.id,
+                },
             )?;
             let expression_definition = &arena.expressions[expression.as_usize()];
             let origin = &arena.checked_expression_origins[expression.as_usize()];
@@ -2187,6 +2211,8 @@ struct ExactResourceInstanceContext<'a> {
     expressions: &'a [SemanticExpression],
     origins: &'a [SemanticExpressionOrigin],
     statements: &'a [SemanticStatement],
+    materializations: &'a [SemanticContextualMaterialization],
+    out_net: &'a OutNet,
     checked_statement: boon_typecheck::CheckedStatementId,
     declaration: DeclId,
     checked_binding: CheckedResourceBinding,
@@ -2202,6 +2228,8 @@ fn exact_resource_instance_expression(
         expressions,
         origins,
         statements,
+        materializations,
+        out_net,
         checked_statement,
         declaration,
         checked_binding,
@@ -2223,25 +2251,48 @@ fn exact_resource_instance_expression(
             .ok_or(ExpansionError::InvalidLocalBindings(format!(
                 "checked {resource_kind} {checked_id} candidate {id} has no exact origin"
             )))?;
-        let statement_id = origin.owning_statement.ok_or_else(|| {
-            ExpansionError::InvalidLocalBindings(format!(
-                "checked {resource_kind} {checked_id} candidate {id} has no semantic statement"
-            ))
-        })?;
-        let statement = statements
-            .get(statement_id.as_usize())
-            .filter(|statement| statement.id == statement_id)
-            .ok_or(ExpansionError::InvalidLocalBindings(format!(
-                "checked {resource_kind} {checked_id} candidate {id} references missing semantic statement {statement_id}"
-            )))?;
+        let statement = origin
+            .owning_statement
+            .map(|statement_id| {
+                statements
+                    .get(statement_id.as_usize())
+                    .filter(|statement| statement.id == statement_id)
+                    .ok_or(ExpansionError::InvalidLocalBindings(format!(
+                        "checked {resource_kind} {checked_id} candidate {id} references missing semantic statement {statement_id}"
+                    )))
+            })
+            .transpose()?;
         Ok((id, statement))
     };
 
-    let candidates = candidates
+    let mut candidates = candidates
         .iter()
         .copied()
         .map(candidate)
         .collect::<Result<Vec<_>, ExpansionError>>()?;
+    let exact_resource_candidates = candidates
+        .iter()
+        .copied()
+        .filter(|(candidate, _)| {
+            expressions
+                .get(candidate.as_usize())
+                .filter(|expression| expression.id == *candidate)
+                .is_some_and(|expression| match &checked_binding {
+                    CheckedResourceBinding::Source { .. } => {
+                        matches!(expression.kind, SemanticExpressionKind::Source { .. })
+                    }
+                    CheckedResourceBinding::State { .. } => matches!(
+                        expression.kind,
+                        SemanticExpressionKind::Hold { .. } | SemanticExpressionKind::Latest { .. }
+                    ),
+                    CheckedResourceBinding::ListAuthority { .. }
+                    | CheckedResourceBinding::ListAlias { .. } => false,
+                })
+        })
+        .collect::<Vec<_>>();
+    if !exact_resource_candidates.is_empty() {
+        candidates = exact_resource_candidates;
+    }
     let declaration_statements = statements
         .iter()
         .filter(|statement| {
@@ -2260,34 +2311,589 @@ fn exact_resource_instance_expression(
             declaration_statements.len()
         )));
     }
-    if let [candidate] = candidates.as_slice() {
-        return Ok((
-            candidate.0,
-            declaration_statements
-                .first()
-                .copied()
-                .unwrap_or(candidate.1.id),
-        ));
+    let mut occurrence_statements = declaration_statements.clone();
+    if occurrence_statements.is_empty()
+        && let Some((candidate, _)) = candidates.first()
+    {
+        let expression = expressions
+            .get(candidate.as_usize())
+            .filter(|expression| expression.id == *candidate)
+            .ok_or(ExpansionError::MissingExpression(CheckedExprId(
+                candidate.as_usize() as u32,
+            )))?;
+        let mut occurrence_materializations = BTreeSet::new();
+        let mut owner = expression.owner;
+        while let Some(current) = owner {
+            let at_owner = materializations
+                .iter()
+                .filter(|materialization| materialization.owner == current)
+                .map(|materialization| materialization.id)
+                .collect::<BTreeSet<_>>();
+            if !at_owner.is_empty() {
+                occurrence_materializations = at_owner;
+                break;
+            }
+            owner = out_net
+                .static_owners
+                .get(current.as_usize())
+                .filter(|owner| owner.id == current)
+                .and_then(|owner| owner.parent);
+        }
+        occurrence_statements.extend(expressions.iter().filter_map(|expression| {
+            let SemanticExpressionKind::Materialize { materialization } = expression.kind else {
+                return None;
+            };
+            occurrence_materializations
+                .contains(&materialization)
+                .then(|| {
+                    origins
+                        .get(expression.id.as_usize())
+                        .filter(|origin| origin.expression == expression.id)
+                        .and_then(|origin| origin.owning_statement)
+                        .filter(|statement| {
+                            statements
+                                .get(statement.as_usize())
+                                .filter(|candidate| candidate.id == *statement)
+                                .is_some()
+                        })
+                })
+                .flatten()
+        }));
     }
-    let Some(declaration_statement) = declaration_statements.first().copied() else {
+    occurrence_statements.sort();
+    occurrence_statements.dedup();
+    if occurrence_statements.len() > 1 {
+        let declarations = occurrence_statements
+            .iter()
+            .copied()
+            .filter(|statement| {
+                statements
+                    .get(statement.as_usize())
+                    .filter(|candidate| candidate.id == *statement)
+                    .is_some_and(|statement| statement.declaration.is_some())
+            })
+            .collect::<Vec<_>>();
+        if !declarations.is_empty() {
+            occurrence_statements = declarations;
+        }
+    }
+    let owned_statement_ids = candidates
+        .iter()
+        .filter_map(|(_, statement)| statement.map(|statement| statement.id))
+        .collect::<BTreeSet<_>>();
+    let anchor = match occurrence_statements.as_slice() {
+        [statement] => Some(*statement),
+        [] if owned_statement_ids.len() == 1 => owned_statement_ids.iter().next().copied(),
+        [] => None,
+        _ => {
+            let details = occurrence_statements
+                .iter()
+                .filter_map(|id| {
+                    statements
+                        .get(id.as_usize())
+                        .filter(|statement| statement.id == *id)
+                        .map(|statement| {
+                            (
+                                statement.id,
+                                statement.origin.clone(),
+                                statement.declaration,
+                                statement.value,
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "checked {resource_kind} {checked_id} concrete occurrence maps to {} semantic statements {details:?}",
+                occurrence_statements.len(),
+            )));
+        }
+    };
+    let Some(anchor) = anchor else {
+        let occurrence = candidates.first().and_then(|(candidate, _)| {
+            expressions
+                .get(candidate.as_usize())
+                .zip(origins.get(candidate.as_usize()))
+                .map(|(expression, origin)| (expression.owner, origin.call_instance))
+        });
         return Err(ExpansionError::InvalidLocalBindings(format!(
-            "checked {resource_kind} {checked_id} has {} semantic use copies and no exact semantic declaration statement",
-            candidates.len()
+            "checked {resource_kind} {checked_id} occurrence {occurrence:?} has {} semantic use copies and no exact semantic declaration statement",
+            candidates.len(),
         )));
     };
-    let declaration_sites = candidates
+    let definition_sites = candidates
         .iter()
-        .filter(|(_, statement)| statement.id == declaration_statement)
+        .filter(|(_, statement)| statement.is_some_and(|statement| statement.id == anchor))
         .map(|(expression, _)| *expression)
         .collect::<Vec<_>>();
-    let [declaration_site] = declaration_sites.as_slice() else {
+    if let [definition_site] = definition_sites.as_slice() {
+        return Ok((*definition_site, anchor));
+    }
+    if definition_sites.is_empty()
+        && let [candidate] = candidates.as_slice()
+    {
+        return Ok((candidate.0, anchor));
+    }
+    let [definition_site] = definition_sites.as_slice() else {
         return Err(ExpansionError::InvalidLocalBindings(format!(
-            "checked {resource_kind} {checked_id} has {} semantic use copies but {} declaration-owned expressions",
+            "checked {resource_kind} {checked_id} has {} semantic use copies but {} definition-owned expressions",
             candidates.len(),
-            declaration_sites.len()
+            definition_sites.len()
         )));
     };
-    Ok((*declaration_site, declaration_statement))
+    Ok((*definition_site, anchor))
+}
+
+fn ensure_statement_owned_expression(
+    arena: &mut SemanticExpressionArena,
+    expression: SemanticExprId,
+    statement: SemanticStatementId,
+) -> Result<SemanticExprId, ExpansionError> {
+    let definition = arena
+        .expressions
+        .get(expression.as_usize())
+        .filter(|candidate| candidate.id == expression)
+        .cloned()
+        .ok_or(ExpansionError::MissingExpression(CheckedExprId(
+            expression.as_usize() as u32,
+        )))?;
+    let origin = arena
+        .checked_expression_origins
+        .get(expression.as_usize())
+        .filter(|origin| origin.expression == expression)
+        .cloned()
+        .ok_or(ExpansionError::MissingExpression(
+            definition.checked_expr_id,
+        ))?;
+    if origin.owning_statement == Some(statement) {
+        return Ok(expression);
+    }
+    Ok(arena.push(
+        definition.checked_expr_id,
+        origin.checked_scope,
+        origin.checked_span,
+        origin.call_instance,
+        Some(statement),
+        |id, value_id| SemanticExpression {
+            id,
+            value_id,
+            ..definition
+        },
+    ))
+}
+
+fn ensure_resource_statement_owned_expression(
+    arena: &mut SemanticExpressionArena,
+    statements: &[SemanticStatement],
+    expression: SemanticExprId,
+    statement: SemanticStatementId,
+) -> Result<SemanticExprId, ExpansionError> {
+    let origin = arena
+        .checked_expression_origins
+        .get(expression.as_usize())
+        .filter(|origin| origin.expression == expression)
+        .cloned()
+        .ok_or(ExpansionError::MissingExpression(CheckedExprId(
+            expression.as_usize() as u32,
+        )))?;
+    if origin.owning_statement == Some(statement) {
+        return Ok(expression);
+    }
+    let owns_previous_statement_root = origin.owning_statement.is_some_and(|owner| {
+        statements
+            .get(owner.as_usize())
+            .filter(|candidate| candidate.id == owner)
+            .is_some_and(|statement| statement.value == Some(expression))
+    });
+    if !owns_previous_statement_root {
+        let origin = arena
+            .checked_expression_origins
+            .get_mut(expression.as_usize())
+            .filter(|origin| origin.expression == expression)
+            .ok_or(ExpansionError::MissingExpression(CheckedExprId(
+                expression.as_usize() as u32,
+            )))?;
+        origin.owning_statement = Some(statement);
+        return Ok(expression);
+    }
+    ensure_statement_owned_expression(arena, expression, statement)
+}
+
+fn arena_expression_reaches(
+    arena: &SemanticExpressionArena,
+    root: SemanticExprId,
+    target: SemanticExprId,
+) -> Result<bool, ExpansionError> {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        if id == target {
+            return Ok(true);
+        }
+        let expression = arena
+            .expressions
+            .get(id.as_usize())
+            .filter(|candidate| candidate.id == id)
+            .ok_or(ExpansionError::MissingExpression(CheckedExprId(
+                id.as_usize() as u32,
+            )))?;
+        pending.extend(arena_expression_children(&expression.kind));
+    }
+    Ok(false)
+}
+
+fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprId> {
+    match kind {
+        SemanticExpressionKind::CanonicalRead { .. }
+        | SemanticExpressionKind::LocalRead { .. }
+        | SemanticExpressionKind::ExternalRead { .. }
+        | SemanticExpressionKind::ElementState { .. }
+        | SemanticExpressionKind::Drain { .. }
+        | SemanticExpressionKind::Text(_)
+        | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::BytesByte(_)
+        | SemanticExpressionKind::Bool(_)
+        | SemanticExpressionKind::Tag(_)
+        | SemanticExpressionKind::Source { .. }
+        | SemanticExpressionKind::Materialize { .. }
+        | SemanticExpressionKind::Delimiter
+        | SemanticExpressionKind::MaterializationLocal { .. }
+        | SemanticExpressionKind::FunctionParameter { .. } => Vec::new(),
+        SemanticExpressionKind::TextTemplate { segments } => segments
+            .iter()
+            .filter_map(|segment| match segment {
+                SemanticTextSegment::Static { .. } => None,
+                SemanticTextSegment::Dynamic { value } => Some(*value),
+            })
+            .collect(),
+        SemanticExpressionKind::TaggedObject { fields, .. }
+        | SemanticExpressionKind::Object(fields)
+        | SemanticExpressionKind::Record(fields) => {
+            fields.iter().map(|field| field.value).collect()
+        }
+        SemanticExpressionKind::Call { arguments, .. } => {
+            arguments.iter().map(|argument| argument.value).collect()
+        }
+        SemanticExpressionKind::Draining { input }
+        | SemanticExpressionKind::Project { input, .. } => vec![*input],
+        SemanticExpressionKind::Hold {
+            initial, updates, ..
+        } => std::iter::once(*initial)
+            .chain(updates.iter().copied())
+            .collect(),
+        SemanticExpressionKind::Latest { branches } => branches.clone(),
+        SemanticExpressionKind::When { input, arms, .. } => std::iter::once(*input)
+            .chain(arms.iter().map(|arm| arm.output))
+            .collect(),
+        SemanticExpressionKind::Then { input, output } => {
+            std::iter::once(*input).chain(*output).collect()
+        }
+        SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
+        SemanticExpressionKind::Block { bindings, result } => bindings
+            .iter()
+            .map(|binding| binding.value)
+            .chain(std::iter::once(*result))
+            .collect(),
+        SemanticExpressionKind::List { items, .. }
+        | SemanticExpressionKind::Bytes { items, .. } => items.clone(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_resource_definition_statement(
+    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup,
+    semantic_scope_ids: &BTreeMap<boon_typecheck::LexicalScopeId, SemanticScopeId>,
+    arena: &mut SemanticExpressionArena,
+    statements: &mut Vec<SemanticStatement>,
+    expression: SemanticExprId,
+    suggested_statement: SemanticStatementId,
+    checked_statement: boon_typecheck::CheckedStatementId,
+    declaration: DeclId,
+    checked_binding: CheckedResourceBinding,
+) -> Result<(SemanticExprId, SemanticStatementId), ExpansionError> {
+    let origin = arena
+        .checked_expression_origins
+        .get(expression.as_usize())
+        .filter(|origin| origin.expression == expression)
+        .cloned()
+        .ok_or_else(|| {
+            ExpansionError::InvalidLocalBindings(format!(
+                "resource expression {expression} has no exact semantic origin"
+            ))
+        })?;
+    let suggested_definition = statements
+        .get(suggested_statement.as_usize())
+        .filter(|statement| statement.id == suggested_statement);
+    let resource_needs_distinct_producer_statement =
+        matches!(&checked_binding, CheckedResourceBinding::State { .. })
+            && suggested_definition.is_some_and(|statement| {
+                matches!(
+                    statement.origin,
+                    SemanticStatementOrigin::ProducerResult { .. }
+                )
+            });
+    let suggested_reaches_expression = suggested_definition
+        .and_then(|statement| statement.value)
+        .map(|root| arena_expression_reaches(arena, root, expression))
+        .transpose()?
+        .unwrap_or(true);
+    if suggested_definition.is_some_and(|statement| {
+        statement.declaration == Some(declaration)
+            && !resource_needs_distinct_producer_statement
+            && suggested_reaches_expression
+    }) {
+        let checked_expression = arena
+            .expressions
+            .get(expression.as_usize())
+            .filter(|candidate| candidate.id == expression)
+            .map(|candidate| candidate.checked_expr_id)
+            .ok_or(ExpansionError::MissingExpression(CheckedExprId(
+                expression.as_usize() as u32,
+            )))?;
+        let selected_owner = arena.expressions[expression.as_usize()].owner;
+        let owned_candidates = arena
+            .expressions
+            .iter()
+            .zip(&arena.checked_expression_origins)
+            .filter(|(candidate, candidate_origin)| {
+                candidate.checked_expr_id == checked_expression
+                    && candidate.owner == selected_owner
+                    && candidate_origin.expression == candidate.id
+                    && candidate_origin.owning_statement == Some(suggested_statement)
+                    && candidate_origin.call_instance == origin.call_instance
+                    && match &checked_binding {
+                        CheckedResourceBinding::Source { .. } => {
+                            matches!(candidate.kind, SemanticExpressionKind::Source { .. })
+                        }
+                        CheckedResourceBinding::State { .. } => {
+                            matches!(candidate.kind, SemanticExpressionKind::Hold { .. })
+                        }
+                        CheckedResourceBinding::ListAuthority { .. }
+                        | CheckedResourceBinding::ListAlias { .. } => false,
+                    }
+            })
+            .map(|(candidate, _)| candidate.id)
+            .collect::<Vec<_>>();
+        let statement_value_candidate = statements
+            .get(suggested_statement.as_usize())
+            .and_then(|statement| statement.value)
+            .and_then(|value| {
+                arena
+                    .expressions
+                    .get(value.as_usize())
+                    .filter(|candidate| {
+                        candidate.id == value
+                            && candidate.checked_expr_id == checked_expression
+                            && candidate.owner == selected_owner
+                            && arena
+                                .checked_expression_origins
+                                .get(candidate.id.as_usize())
+                                .filter(|candidate_origin| {
+                                    candidate_origin.expression == candidate.id
+                                })
+                                .is_some_and(|candidate_origin| {
+                                    candidate_origin.call_instance == origin.call_instance
+                                })
+                            && match &checked_binding {
+                                CheckedResourceBinding::Source { .. } => {
+                                    matches!(candidate.kind, SemanticExpressionKind::Source { .. })
+                                }
+                                CheckedResourceBinding::State { .. } => {
+                                    matches!(candidate.kind, SemanticExpressionKind::Hold { .. })
+                                }
+                                CheckedResourceBinding::ListAuthority { .. }
+                                | CheckedResourceBinding::ListAlias { .. } => false,
+                            }
+                    })
+                    .map(|candidate| candidate.id)
+            });
+        let selected_is_reachable = if let Some(root) = statements
+            .get(suggested_statement.as_usize())
+            .and_then(|statement| statement.value)
+        {
+            arena_expression_reaches(arena, root, expression)?
+        } else {
+            false
+        };
+        let expression = if selected_is_reachable {
+            expression
+        } else if let Some(value) = statement_value_candidate {
+            value
+        } else {
+            match owned_candidates.as_slice() {
+                [owned] => *owned,
+                [] => ensure_statement_owned_expression(arena, expression, suggested_statement)?,
+                _ => {
+                    return Err(ExpansionError::InvalidLocalBindings(format!(
+                        "resource declaration {} checked expression {} has {} statement-owned semantic definitions",
+                        declaration.0,
+                        checked_expression.0,
+                        owned_candidates.len()
+                    )));
+                }
+            }
+        };
+        let statement = statements
+            .get_mut(suggested_statement.as_usize())
+            .filter(|statement| statement.id == suggested_statement)
+            .ok_or_else(|| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "resource declaration {} references missing semantic statement {suggested_statement}",
+                    declaration.0
+                ))
+            })?;
+        // The declaration value can intentionally wrap the durable resource
+        // expression (for example `HOLD ... |> DRAINING`). Keep that complete
+        // value as the reactive binding producer while giving the exact
+        // source/state expression statement ownership of its own.
+        if statement.value.is_none() {
+            statement.value = Some(expression);
+        }
+        if !statement.checked_resources.contains(&checked_binding) {
+            statement.checked_resources.push(checked_binding);
+        }
+        return Ok((expression, suggested_statement));
+    }
+
+    let checked = program
+        .statements
+        .iter()
+        .find(|statement| statement.id == checked_statement)
+        .ok_or_else(|| {
+            ExpansionError::InvalidLocalBindings(format!(
+                "resource declaration {} references missing checked statement {}",
+                declaration.0, checked_statement.0
+            ))
+        })?;
+    let declaration_parts = |declaration: Option<DeclId>| {
+        declaration
+            .and_then(|declaration| {
+                let checked = lookup.declaration(program, declaration)?;
+                Some((
+                    checked.name.clone(),
+                    canonical_declaration_path(program, lookup, declaration)?,
+                ))
+            })
+            .unzip()
+    };
+    let kind = match &checked.kind {
+        boon_typecheck::CheckedStatementKind::Function { .. } => {
+            let (name, path) = declaration_parts(Some(declaration));
+            match &checked_binding {
+                CheckedResourceBinding::Source { .. } => SemanticStatementKind::Source {
+                    name,
+                    path,
+                    event: None,
+                },
+                CheckedResourceBinding::State { .. } => {
+                    let hold_name = arena
+                        .expressions
+                        .get(expression.as_usize())
+                        .filter(|candidate| candidate.id == expression)
+                        .and_then(|expression| match &expression.kind {
+                            SemanticExpressionKind::Hold { name, .. } => Some(name.clone()),
+                            _ => None,
+                        });
+                    SemanticStatementKind::Hold {
+                        name,
+                        path,
+                        hold_name,
+                    }
+                }
+                CheckedResourceBinding::ListAuthority { .. }
+                | CheckedResourceBinding::ListAlias { .. } => {
+                    return Err(ExpansionError::InvalidLocalBindings(format!(
+                        "list resource declaration {} resolves to function statement {}",
+                        declaration.0, checked_statement.0
+                    )));
+                }
+            }
+        }
+        boon_typecheck::CheckedStatementKind::Field { declaration } => {
+            let (name, path) = declaration_parts(Some(*declaration));
+            SemanticStatementKind::Field {
+                name: name.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
+                path: path.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
+            }
+        }
+        boon_typecheck::CheckedStatementKind::Source { declaration, event } => {
+            let (name, path) = declaration_parts(*declaration);
+            SemanticStatementKind::Source {
+                name,
+                path,
+                event: event.clone(),
+            }
+        }
+        boon_typecheck::CheckedStatementKind::Hold {
+            declaration,
+            name: hold_name,
+        } => {
+            let (name, path) = declaration_parts(*declaration);
+            SemanticStatementKind::Hold {
+                name,
+                path,
+                hold_name: hold_name.clone(),
+            }
+        }
+        boon_typecheck::CheckedStatementKind::List {
+            declaration,
+            capacity,
+        } => {
+            let (name, path) = declaration_parts(*declaration);
+            SemanticStatementKind::List {
+                name,
+                path,
+                capacity: *capacity,
+            }
+        }
+        boon_typecheck::CheckedStatementKind::Block => SemanticStatementKind::Block,
+        boon_typecheck::CheckedStatementKind::Spread => SemanticStatementKind::Spread,
+        boon_typecheck::CheckedStatementKind::Expression => SemanticStatementKind::Expression,
+    };
+    let statement = SemanticStatementId(statements.len());
+    let expression =
+        ensure_resource_statement_owned_expression(arena, statements, expression, statement)?;
+    let flow_type = arena
+        .expressions
+        .get(expression.as_usize())
+        .filter(|candidate| candidate.id == expression)
+        .map(|expression| expression.flow_type.clone())
+        .ok_or(ExpansionError::MissingExpression(CheckedExprId(
+            expression.as_usize() as u32,
+        )))?;
+    statements.push(SemanticStatement {
+        id: statement,
+        origin: SemanticStatementOrigin::Checked {
+            statement: checked_statement,
+        },
+        scope: semantic_scope_ids
+            .get(&checked.scope_id)
+            .copied()
+            .ok_or_else(|| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "resource checked statement {} references missing semantic scope {}",
+                    checked_statement.0, checked.scope_id.0
+                ))
+            })?,
+        parent: None,
+        call_instance: origin.call_instance,
+        span: checked.span,
+        checked_resources: vec![checked_binding],
+        declaration: Some(declaration),
+        flow_type: Some(flow_type),
+        kind,
+        value: Some(expression),
+        value_use: match checked.value_use {
+            CheckedValueUse::RuntimeValue => SemanticMaterializationResultKind::RuntimeValue,
+            CheckedValueUse::RenderSlot => SemanticMaterializationResultKind::RenderSlot,
+        },
+        children: Vec::new(),
+    });
+    Ok((expression, statement))
 }
 
 fn remap_checked_resource_ids(
@@ -2322,16 +2928,24 @@ fn remap_checked_resource_ids(
         .map(|state| (provisional_semantic_state_id(state.id), state.id))
         .collect::<BTreeMap<_, _>>();
     let source_instance = |checked, owner, frame| {
-        semantic_sources
-            .get(&(checked, owner, frame))
-            .copied()
-            .map(|source| (source, owner))
+        [(owner, frame), (None, frame), (None, None)]
+            .into_iter()
+            .find_map(|(candidate_owner, candidate_frame)| {
+                semantic_sources
+                    .get(&(checked, candidate_owner, candidate_frame))
+                    .copied()
+                    .map(|source| (source, candidate_owner))
+            })
     };
     let state_instance = |checked, owner, frame| {
-        semantic_states
-            .get(&(checked, owner, frame))
-            .copied()
-            .map(|state| (state, owner))
+        [(owner, frame), (None, frame), (None, None)]
+            .into_iter()
+            .find_map(|(candidate_owner, candidate_frame)| {
+                semantic_states
+                    .get(&(checked, candidate_owner, candidate_frame))
+                    .copied()
+                    .map(|state| (state, candidate_owner))
+            })
     };
 
     if origins.len() != expressions.len() {
@@ -2410,9 +3024,17 @@ fn remap_checked_resource_ids(
             source.source = source_instance(checked, expression.owner, frame)
                 .map(|(source, _)| source)
                 .ok_or_else(|| {
+                    let available = semantic_sources
+                        .iter()
+                        .filter_map(
+                            |((candidate, owner, frame), source)| {
+                                (*candidate == checked).then_some((*owner, *frame, *source))
+                            },
+                        )
+                        .collect::<Vec<_>>();
                     ExpansionError::InvalidLocalBindings(format!(
-                        "expression {} has no semantic source read instance for checked source {:?}",
-                        expression.id, checked
+                        "expression {} has no semantic source read instance for checked source {:?}, owner {:?}, frame {:?}; available instances: {available:?}",
+                        expression.id, checked, expression.owner, frame
                     ))
                 })?;
         }

@@ -8354,7 +8354,7 @@ fn distributed_compiler_test_program(
     DistributedCompilerProgram {
         revision: 1,
         role,
-        source_label: format!("distributed-{role_name}-test"),
+        source_label: format!("{role_name}/RUN.bn"),
         units: vec![CompilerSourceUnit {
             path: format!("{role_name}/RUN.bn"),
             source: source.to_owned(),
@@ -8782,7 +8782,8 @@ FUNCTION double(value) {
         let ValueRef::Field(result) = instance.result else {
             panic!("producer result must be an ordinary derived field");
         };
-        plan.regions
+        let expression = plan
+            .regions
             .iter()
             .flat_map(|region| &region.ops)
             .find_map(|op| {
@@ -8794,7 +8795,26 @@ FUNCTION double(value) {
                     _ => None,
                 }
             })
-            .expect("producer result computation")
+            .expect("producer result computation");
+        let root = match expression {
+            PlanDerivedExpression::RowExpression { expression }
+            | PlanDerivedExpression::MaterializedRowField { expression, .. } => expression,
+            other => panic!("producer result must retain its row expression: {other:?}"),
+        };
+        let mut nodes = Vec::new();
+        plan.row_expressions
+            .visit(root, &mut |_, node| nodes.push(node.clone()))
+            .unwrap();
+        let constants = nodes
+            .iter()
+            .filter_map(|node| match node {
+                PlanRowExpressionNode::Constant { constant_id } => {
+                    Some(plan.constants[constant_id.0].value.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (expression, nodes, constants)
     };
     assert_ne!(
         producer_expression(&baseline),

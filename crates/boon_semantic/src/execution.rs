@@ -735,8 +735,21 @@ pub(crate) fn checked_semantic_root_specs_v1(
         .iter()
         .filter(|statement| statement.scope_id == checked.root_scope)
     {
-        let CheckedStatementKind::Field { declaration } = statement.kind else {
-            continue;
+        let declaration = match statement.kind {
+            CheckedStatementKind::Field { declaration }
+            | CheckedStatementKind::List {
+                declaration: Some(declaration),
+                ..
+            } => declaration,
+            CheckedStatementKind::Function { .. }
+            | CheckedStatementKind::Source { .. }
+            | CheckedStatementKind::Hold { .. }
+            | CheckedStatementKind::List {
+                declaration: None, ..
+            }
+            | CheckedStatementKind::Block
+            | CheckedStatementKind::Spread
+            | CheckedStatementKind::Expression => continue,
         };
         let root_declaration = require_declaration(declaration)?;
         let retained_kind = match root_declaration.name.as_str() {

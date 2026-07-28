@@ -586,13 +586,32 @@ pub(crate) fn producer_function_ownership_seed(
 fn complete_producer_function_ownership(
     program: &ErasedProgram,
     instances: &[ProducerFunctionInstancePlan],
+    scalar_slots: &[ScalarStorageSlot],
+    list_slots: &[ListStorageSlot],
     indexes: &[PlanListIndex],
     regions: &[OperationRegion],
 ) -> Result<Vec<ProducerFunctionInstancePlan>, PlanError> {
+    let realized_fields = scalar_slots
+        .iter()
+        .filter_map(|slot| slot.indexed_field_id)
+        .chain(list_slots.iter().flat_map(ListStorageSlot::row_field_ids))
+        .chain(
+            regions
+                .iter()
+                .flat_map(|region| &region.ops)
+                .filter_map(|op| match op.output {
+                    Some(ValueRef::Field(field)) => Some(field),
+                    _ => None,
+                }),
+        )
+        .collect::<BTreeSet<_>>();
     let mut completed = Vec::with_capacity(instances.len());
     for instance in instances {
         let owner = ir::StaticOwnerId(instance.owner.static_owner.0);
         let mut ownership = producer_function_ownership_seed(program, owner)?;
+        ownership
+            .fields
+            .retain(|field| realized_fields.contains(field));
         let owned_static_owners = ownership
             .static_owners
             .iter()
@@ -4851,6 +4870,8 @@ pub(crate) fn compile_typed_program_with_distributed_context(
     let producer_function_instances = complete_producer_function_ownership(
         program,
         &distributed.producer_function_instances,
+        &scalar_slots,
+        &list_slots,
         &list_indexes,
         &regions,
     )?;

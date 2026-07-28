@@ -9,8 +9,9 @@ use crate::{
     SemanticBlockBinding, SemanticCallableId, SemanticContextualOperationKind,
     SemanticContextualRowPredecessor, SemanticExecutionGraphV1, SemanticExprId,
     SemanticExpressionKind, SemanticListId, SemanticLocalBindingId, SemanticMaterializationId,
-    SemanticRowBinding, SemanticRowScopeId, SemanticSourceId, SemanticSourceOrigin,
-    SemanticStateId, SemanticStatementId, SemanticStatementKind, SemanticValueListAuthorityId,
+    SemanticMaterializationResultKind, SemanticRowBinding, SemanticRowScopeId, SemanticSourceId,
+    SemanticSourceOrigin, SemanticStateId, SemanticStatement, SemanticStatementId,
+    SemanticStatementKind, SemanticStatementOrigin, SemanticValueId, SemanticValueListAuthorityId,
     StaticOwnerId,
 };
 use boon_typecheck::{
@@ -125,6 +126,7 @@ pub struct SemanticValueListAuthorityV1 {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticValueListRoleV1 {
     ScalarAuthority,
+    InlineValue,
     Alias { target: DeclId },
     Absent,
 }
@@ -306,6 +308,9 @@ impl From<CheckedSpan> for SemanticResourceSpanV1 {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SemanticResourceAliasV1 {
+    /// Lexical/provenance owner, not a runtime lookup namespace. Reused
+    /// contextual call frames may contribute the same alias and owner for
+    /// multiple occurrence-specific source or state targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
     pub alias: String,
@@ -466,6 +471,7 @@ struct ListTarget {
     span: SemanticResourceSpanV1,
     alias: Option<DeclId>,
     absent: bool,
+    value_only: bool,
     origin: SemanticListResourceOriginV1,
     key_policy: SemanticListKeyPolicyV1,
 }
@@ -478,16 +484,26 @@ type DiscoveredListResources = (
 
 fn discover_list_resources(
     checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    execution: &mut SemanticExecutionGraphV1,
 ) -> Result<DiscoveredListResources, String> {
     let targets = typed_list_targets(checked, execution)?;
     let mut row_scopes = Vec::with_capacity(targets.len());
     let mut lists = Vec::with_capacity(targets.len());
     let mut value_list_authorities = Vec::new();
     for target in targets {
-        let initializer = semantic_list_initializer(execution, target.producer, &target.path)?;
-        if target.absent || target.alias.is_some() || !matches!(target.item_type, Type::Object(_)) {
-            let role = if target.absent {
+        let initializer = if target.value_only {
+            SemanticListInitializerV1::Empty
+        } else {
+            semantic_list_initializer(execution, target.producer, &target.path)?
+        };
+        if target.value_only
+            || target.absent
+            || target.alias.is_some()
+            || !matches!(target.item_type, Type::Object(_))
+        {
+            let role = if target.value_only {
+                SemanticValueListRoleV1::InlineValue
+            } else if target.absent {
                 SemanticValueListRoleV1::Absent
             } else if let Some(target) = target.alias {
                 SemanticValueListRoleV1::Alias { target }
@@ -540,7 +556,7 @@ fn discover_list_resources(
 
 fn typed_list_targets(
     checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    execution: &mut SemanticExecutionGraphV1,
 ) -> Result<Vec<ListTarget>, String> {
     let direct = direct_storage_statements(execution);
     let mut targets = Vec::new();
@@ -600,6 +616,7 @@ fn typed_list_targets(
             span,
             alias: direct_list_alias_target(execution, statement),
             absent: expression.flow_type.mode == boon_typecheck::FlowMode::Absent,
+            value_only: false,
             origin: SemanticListResourceOriginV1::Derived {
                 statement: statement.id,
                 producer,
@@ -618,22 +635,25 @@ fn typed_list_targets(
                 checked_list.id.0
             )
         })?;
-        let matches = targets
-            .iter()
-            .enumerate()
-            .filter(|(_, target)| {
-                target.declaration == checked_list.declaration
-                    && target.path == path
-                    && execution
-                        .expressions
-                        .get(target.producer.as_usize())
-                        .is_some_and(|expression| {
-                            expression.id == target.producer
-                                && expression.checked_expr_id == checked_list.producer
-                        })
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        for (index, target) in targets.iter().enumerate() {
+            if target.declaration != checked_list.declaration || target.path != path {
+                continue;
+            }
+            let Some(authority) = inline_list_authority_root(execution, target.producer)? else {
+                continue;
+            };
+            if expression(execution, authority)?.checked_expr_id == checked_list.producer {
+                matches.push(index);
+            }
+        }
+        if matches.is_empty()
+            && let Some(target) =
+                synthesize_inline_checked_list_target(checked, execution, checked_list, &path)?
+        {
+            matches.push(targets.len());
+            targets.push(target);
+        }
         let [index] = matches.as_slice() else {
             return Err(format!(
                 "checked list {} declaration {} path `{path}` maps to {} exact semantic list producers",
@@ -654,8 +674,14 @@ fn typed_list_targets(
             || target.alias.is_some()
         {
             return Err(format!(
-                "checked list {} differs from semantic list target {} in item type, capacity, or authority shape",
-                checked_list.id.0, target.statement
+                "checked list {} differs from semantic list target {}: item type {:?} vs {:?}, capacity {:?} vs {:?}, alias {:?}",
+                checked_list.id.0,
+                target.statement,
+                checked_list.item_type,
+                target.item_type,
+                checked_list.capacity,
+                target.capacity,
+                target.alias,
             ));
         }
         target.origin = SemanticListResourceOriginV1::CheckedLiteral {
@@ -669,6 +695,202 @@ fn typed_list_targets(
         target.span = checked_list.span.into();
     }
     Ok(targets)
+}
+
+fn synthesize_inline_checked_list_target(
+    checked: &CheckedProgram,
+    execution: &mut SemanticExecutionGraphV1,
+    checked_list: &boon_typecheck::CheckedList,
+    path: &str,
+) -> Result<Option<ListTarget>, String> {
+    let binding = CheckedResourceBinding::ListAuthority {
+        list: checked_list.id,
+    };
+    let candidates = execution
+        .expressions
+        .iter()
+        .filter(|expression| {
+            expression.checked_expr_id == checked_list.producer
+                && matches!(expression.kind, SemanticExpressionKind::List { .. })
+        })
+        .filter_map(|expression| {
+            let origin = execution
+                .checked_expression_origins
+                .get(expression.id.as_usize())
+                .filter(|origin| origin.expression == expression.id)?;
+            let statement_id = origin.owning_statement?;
+            execution
+                .statements
+                .get(statement_id.as_usize())
+                .filter(|statement| {
+                    statement.id == statement_id && statement.checked_resources.contains(&binding)
+                })
+                .map(|_| (expression.id, statement_id))
+        })
+        .collect::<Vec<_>>();
+    let concrete_candidates = candidates
+        .iter()
+        .copied()
+        .filter(|(expression, statement)| {
+            execution
+                .statements
+                .get(statement.as_usize())
+                .filter(|candidate| candidate.id == *statement)
+                .is_some_and(|statement| {
+                    statement.declaration.is_none()
+                        && statement.value == Some(*expression)
+                        && matches!(
+                            &statement.kind,
+                            SemanticStatementKind::List {
+                                path: Some(candidate_path),
+                                ..
+                            } if candidate_path == path
+                        )
+                })
+        })
+        .collect::<Vec<_>>();
+    let (candidate, existing_statement) = match concrete_candidates.as_slice() {
+        [(expression, statement)] => (*expression, Some(*statement)),
+        [] => match candidates.as_slice() {
+            [(expression, _)] => (*expression, None),
+            [] => return Ok(None),
+            _ => {
+                return Err(format!(
+                    "checked inline list {} resolves to {} exact semantic authority expressions",
+                    checked_list.id.0,
+                    candidates.len()
+                ));
+            }
+        },
+        _ => {
+            return Err(format!(
+                "checked inline list {} resolves to {} concrete semantic authority statements",
+                checked_list.id.0,
+                concrete_candidates.len()
+            ));
+        }
+    };
+    let definition = expression(execution, candidate)?.clone();
+    let origin = execution
+        .checked_expression_origins
+        .get(candidate.as_usize())
+        .filter(|origin| origin.expression == candidate)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "checked inline list {} expression {candidate} has no exact origin",
+                checked_list.id.0
+            )
+        })?;
+    let local_name = checked
+        .declarations
+        .iter()
+        .find(|declaration| declaration.id == checked_list.declaration)
+        .map(|declaration| declaration.name.clone())
+        .or_else(|| path.rsplit('.').next().map(str::to_owned))
+        .ok_or_else(|| {
+            format!(
+                "checked inline list {} has no semantic local name",
+                checked_list.id.0
+            )
+        })?;
+    let (producer, statement) = if let Some(statement) = existing_statement {
+        (candidate, statement)
+    } else {
+        let parent = origin.owning_statement;
+        let statement = SemanticStatementId(execution.statements.len());
+        let producer = SemanticExprId(execution.expressions.len());
+        let mut concrete = definition.clone();
+        concrete.id = producer;
+        concrete.value_id = SemanticValueId(producer.as_usize());
+        execution.expressions.push(concrete);
+        let mut concrete_origin = origin.clone();
+        concrete_origin.expression = producer;
+        concrete_origin.owning_statement = Some(statement);
+        execution.checked_expression_origins.push(concrete_origin);
+        let scope = execution
+            .scopes
+            .iter()
+            .find(|scope| scope.checked_scope == origin.checked_scope)
+            .map(|scope| scope.id)
+            .ok_or_else(|| {
+                format!(
+                    "checked inline list {} expression {candidate} references missing semantic scope {}",
+                    checked_list.id.0, origin.checked_scope.0
+                )
+            })?;
+        execution.statements.push(SemanticStatement {
+            id: statement,
+            origin: SemanticStatementOrigin::Checked {
+                statement: checked_list.statement,
+            },
+            scope,
+            parent,
+            call_instance: origin.call_instance,
+            span: checked_list.span,
+            checked_resources: vec![binding],
+            declaration: None,
+            flow_type: Some(definition.flow_type.clone()),
+            kind: SemanticStatementKind::List {
+                name: Some(local_name.clone()),
+                path: Some(path.to_owned()),
+                capacity: checked_list.capacity,
+            },
+            value: Some(producer),
+            value_use: SemanticMaterializationResultKind::RuntimeValue,
+            children: Vec::new(),
+        });
+        if let Some(parent_id) = parent {
+            let parent = execution
+                .statements
+                .get_mut(parent_id.as_usize())
+                .filter(|candidate| candidate.id == parent_id)
+                .ok_or_else(|| {
+                    format!(
+                        "checked inline list {} references missing parent semantic statement {parent_id}",
+                        checked_list.id.0
+                    )
+                })?;
+            if !parent.children.contains(&statement) {
+                parent.children.push(statement);
+            }
+        }
+        (producer, statement)
+    };
+    let Type::List(item_type) = &definition.flow_type.ty else {
+        return Err(format!(
+            "checked inline list {} semantic authority is not list-typed",
+            checked_list.id.0
+        ));
+    };
+    let mut item_fields = ordered_object_fields(item_type);
+    for field in expression_record_field_names(execution, producer)? {
+        if !item_fields.contains(&field) {
+            item_fields.push(field);
+        }
+    }
+    Ok(Some(ListTarget {
+        statement,
+        declaration: checked_list.declaration,
+        producer,
+        path: path.to_owned(),
+        local_name,
+        capacity: checked_list.capacity,
+        item_type: (**item_type).clone(),
+        item_fields,
+        span: checked_list.span.into(),
+        alias: None,
+        absent: definition.flow_type.mode == boon_typecheck::FlowMode::Absent,
+        value_only: true,
+        origin: SemanticListResourceOriginV1::CheckedLiteral {
+            checked_list: checked_list.id,
+        },
+        key_policy: match checked_list.key_policy {
+            CheckedListKeyPolicy::GeneratedOccurrenceU64 { has_generation } => {
+                SemanticListKeyPolicyV1::GeneratedOccurrenceU64 { has_generation }
+            }
+        },
+    }))
 }
 
 fn direct_storage_statements(
@@ -1672,6 +1894,118 @@ fn bind_materialization_sources(
 /// projected paths, materialization locals resolve through their typed
 /// materialization, and only the special `.items` projection crosses a
 /// `List/chunk` row boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StatementValueOccurrence {
+    statement: SemanticStatementId,
+    value: SemanticExprId,
+    owner: Option<StaticOwnerId>,
+    call_instance: Option<OutCallInstanceId>,
+    producer_result: bool,
+}
+
+fn statement_value_occurrences(
+    execution: &SemanticExecutionGraphV1,
+) -> Result<BTreeMap<DeclId, Vec<StatementValueOccurrence>>, String> {
+    let mut values = BTreeMap::<DeclId, Vec<StatementValueOccurrence>>::new();
+    for statement in &execution.statements {
+        let (Some(declaration), Some(value)) = (statement.declaration, statement.value) else {
+            continue;
+        };
+        let expression = expression(execution, value)?;
+        let origin = execution
+            .checked_expression_origins
+            .get(value.as_usize())
+            .filter(|origin| origin.expression == value)
+            .ok_or_else(|| {
+                format!(
+                    "semantic statement {} value {value} has no exact expression origin",
+                    statement.id
+                )
+            })?;
+        if statement.call_instance.is_some()
+            && origin.call_instance.is_some()
+            && statement.call_instance != origin.call_instance
+        {
+            return Err(format!(
+                "semantic statement {} and value {value} disagree on call occurrence",
+                statement.id
+            ));
+        }
+        values
+            .entry(declaration)
+            .or_default()
+            .push(StatementValueOccurrence {
+                statement: statement.id,
+                value,
+                owner: expression.owner,
+                call_instance: statement.call_instance.or(origin.call_instance),
+                producer_result: matches!(
+                    statement.origin,
+                    SemanticStatementOrigin::ProducerResult { .. }
+                ),
+            });
+    }
+    for occurrences in values.values_mut() {
+        occurrences.sort_by_key(|occurrence| {
+            (
+                occurrence.owner,
+                occurrence.call_instance,
+                occurrence.producer_result,
+                occurrence.statement,
+            )
+        });
+    }
+    Ok(values)
+}
+
+fn statement_value_for_expression(
+    execution: &SemanticExecutionGraphV1,
+    values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
+    declaration: DeclId,
+    consumer: SemanticExprId,
+) -> Result<Option<SemanticExprId>, String> {
+    let consumer_expression = expression(execution, consumer)?;
+    let origin = execution
+        .checked_expression_origins
+        .get(consumer.as_usize())
+        .filter(|origin| origin.expression == consumer)
+        .ok_or_else(|| format!("semantic expression {consumer} has no exact occurrence origin"))?;
+    let Some(occurrences) = values.get(&declaration) else {
+        return Ok(None);
+    };
+    let mut exact = occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence.owner == consumer_expression.owner
+                && occurrence.call_instance == origin.call_instance
+        })
+        .collect::<Vec<_>>();
+    if exact.is_empty() {
+        exact.extend(
+            occurrences.iter().filter(|occurrence| {
+                occurrence.owner.is_none() && occurrence.call_instance.is_none()
+            }),
+        );
+    }
+    exact.sort_by_key(|occurrence| (occurrence.producer_result, occurrence.statement));
+    let Some(preferred) = exact.first().copied() else {
+        return Ok(None);
+    };
+    let same_rank = exact
+        .iter()
+        .take_while(|candidate| candidate.producer_result == preferred.producer_result)
+        .map(|candidate| candidate.value)
+        .collect::<BTreeSet<_>>();
+    if same_rank.len() != 1 {
+        return Err(format!(
+            "semantic declaration {} expression {consumer} resolves to {} exact occurrence values {same_rank:?}",
+            declaration.0,
+            same_rank.len()
+        ));
+    }
+    Ok(Some(preferred.value))
+}
+
 fn semantic_storage_scopes(
     execution: &SemanticExecutionGraphV1,
     lists: &[SemanticListResourceV1],
@@ -1702,20 +2036,7 @@ fn semantic_storage_scopes(
             .push(list.declaration);
     }
 
-    let mut statement_values = BTreeMap::new();
-    for statement in &execution.statements {
-        let (Some(declaration), Some(value)) = (statement.declaration, statement.value) else {
-            continue;
-        };
-        if let Some(previous) = statement_values.insert(declaration, value)
-            && previous != value
-        {
-            return Err(format!(
-                "semantic declaration {} has multiple statement values {previous} and {value}",
-                declaration.0
-            ));
-        }
-    }
+    let statement_values = statement_value_occurrences(execution)?;
 
     let mut materializations_by_local = BTreeMap::new();
     for materialization in &execution.materializations {
@@ -1778,7 +2099,7 @@ fn semantic_expression_storage_scopes(
     execution: &SemanticExecutionGraphV1,
     id: SemanticExprId,
     scopes: &[BTreeSet<SemanticRowScopeId>],
-    statement_values: &BTreeMap<DeclId, SemanticExprId>,
+    statement_values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
     scopes_by_declaration: &BTreeMap<DeclId, SemanticRowScopeId>,
     scopes_by_path: &BTreeMap<String, SemanticRowScopeId>,
     declarations_by_scope: &BTreeMap<SemanticRowScopeId, Vec<DeclId>>,
@@ -1811,9 +2132,7 @@ fn semantic_expression_storage_scopes(
         if let Some(scope) = scopes_by_declaration.get(&target) {
             return Ok(BTreeSet::from([*scope]));
         }
-        statement_values
-            .get(&target)
-            .copied()
+        statement_value_for_expression(execution, statement_values, target, id)?
             .map(&child_scopes)
             .transpose()
             .map(Option::unwrap_or_default)
@@ -1842,7 +2161,9 @@ fn semantic_expression_storage_scopes(
                     ))
                 };
             };
-            let Some(producer) = statement_values.get(declaration).copied() else {
+            let Some(producer) =
+                statement_value_for_expression(execution, statement_values, *declaration, id)?
+            else {
                 return Ok(BTreeSet::new());
             };
             let SemanticExpressionKind::Call {
@@ -2627,7 +2948,7 @@ fn build_source_resources(
                 source.owner,
                 alias,
                 SemanticResourceAliasTargetV1::Source(source.id),
-            )?;
+            );
         }
         resources.push(SemanticSourceResourceV1 {
             id: source.id,
@@ -2740,7 +3061,7 @@ fn build_state_resources(
                 state.owner,
                 declared_path.clone(),
                 SemanticResourceAliasTargetV1::State(state.id),
-            )?;
+            );
         }
         let path = semantic_path
             .clone()
@@ -3281,9 +3602,12 @@ fn validate_dense_resource_ids(
                     authority.id, authority.statement
                 )
             })?;
-        if statement.declaration != Some(authority.declaration)
-            || statement.value != Some(authority.producer)
-        {
+        let declaration_matches = if authority.role == SemanticValueListRoleV1::InlineValue {
+            statement.declaration.is_none()
+        } else {
+            statement.declaration == Some(authority.declaration)
+        };
+        if !declaration_matches || statement.value != Some(authority.producer) {
             return Err(format!(
                 "semantic value-list authority {} does not exactly match its statement",
                 authority.id
@@ -3328,12 +3652,16 @@ fn validate_dense_resource_ids(
                 ));
             }
             SemanticValueListRoleV1::ScalarAuthority
+            | SemanticValueListRoleV1::InlineValue
             | SemanticValueListRoleV1::Alias { .. }
             | SemanticValueListRoleV1::Absent => {}
         }
-        if authority.initializer
-            != semantic_list_initializer(execution, authority.producer, &authority.semantic_path)?
-        {
+        let expected_initializer = if authority.role == SemanticValueListRoleV1::InlineValue {
+            SemanticListInitializerV1::Empty
+        } else {
+            semantic_list_initializer(execution, authority.producer, &authority.semantic_path)?
+        };
+        if authority.initializer != expected_initializer {
             return Err(format!(
                 "semantic value-list authority {} has stale initializer value or provenance",
                 authority.id
@@ -3383,20 +3711,59 @@ fn validate_dense_resource_ids(
                     source.statement
                 )
             })?;
+        let statement_value = statement.value.ok_or_else(|| {
+            format!(
+                "semantic source statement {} has no value",
+                source.statement
+            )
+        })?;
+        let expression_is_statement_value =
+            expression_reaches(execution, statement_value, source.expression)?;
+        let expression_is_exact_invocation_source = match source.origin {
+            SemanticSourceOrigin::Checked { .. } => false,
+            SemanticSourceOrigin::ProducerInvocation {
+                function,
+                producer,
+                identity,
+            } => {
+                let matches = graph
+                    .producer_resources
+                    .iter()
+                    .filter(|resource| {
+                        resource.identity == identity
+                            && resource.function == producer
+                            && resource.callable == function
+                            && resource.result_statement == source.statement
+                            && resource.invocation_source == Some(source.id)
+                    })
+                    .count();
+                if matches > 1 {
+                    return Err(format!(
+                        "semantic producer invocation source {id} resolves to {matches} producer resources"
+                    ));
+                }
+                matches == 1
+            }
+        };
         if statement.declaration != Some(source.declaration)
-            || !expression_reaches(
-                execution,
-                statement.value.ok_or_else(|| {
-                    format!(
-                        "semantic source statement {} has no value",
-                        source.statement
-                    )
-                })?,
-                source.expression,
-            )?
+            || (!expression_is_statement_value && !expression_is_exact_invocation_source)
         {
+            let statement_expression = expression(execution, statement_value)?;
+            let source_expression = expression(execution, source.expression)?;
+            let source_origin = execution
+                .checked_expression_origins
+                .get(source.expression.as_usize());
             return Err(format!(
-                "semantic source resource {id} has stale statement provenance"
+                "semantic source resource {id} has stale statement provenance: origin={:?}, statement={}, statement_declaration={:?}, source_declaration={}, statement_value={statement_value} ({:?}, checked={}), source_expression={} ({:?}, checked={}, semantic_origin={source_origin:?}), value_reaches_source={expression_is_statement_value}, exact_invocation_source={expression_is_exact_invocation_source}",
+                source.origin,
+                source.statement,
+                statement.declaration,
+                source.declaration.0,
+                statement_expression.kind,
+                statement_expression.checked_expr_id.0,
+                source.expression,
+                source_expression.kind,
+                source_expression.checked_expr_id.0,
             ));
         }
     }
@@ -3471,7 +3838,9 @@ pub(crate) fn validate_checked_list_classification(
     execution: &SemanticExecutionGraphV1,
     graph: &SemanticResourceGraphV1,
 ) -> Result<(), String> {
-    let (row_scopes, lists, value_list_authorities) = discover_list_resources(checked, execution)?;
+    let mut snapshot = execution.clone();
+    let (row_scopes, lists, value_list_authorities) =
+        discover_list_resources(checked, &mut snapshot)?;
     if graph.row_scopes != row_scopes
         || graph.lists != lists
         || graph.value_list_authorities != value_list_authorities
@@ -3725,18 +4094,9 @@ fn validate_resource_aliases(graph: &SemanticResourceGraphV1) -> Result<(), Stri
     if graph.aliases.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err("semantic resource aliases are not strictly sorted and unique".to_owned());
     }
-    let mut identities = BTreeMap::new();
     for alias in &graph.aliases {
         if alias.alias.trim().is_empty() {
             return Err("semantic resource alias is empty".to_owned());
-        }
-        if let Some(previous) = identities.insert((alias.owner, alias.alias.clone()), alias.target)
-            && previous != alias.target
-        {
-            return Err(format!(
-                "semantic resource alias `{}` owner {:?} has conflicting targets",
-                alias.alias, alias.owner
-            ));
         }
         match alias.target {
             SemanticResourceAliasTargetV1::Source(id) => {
@@ -4089,24 +4449,17 @@ fn insert_alias(
     owner: Option<StaticOwnerId>,
     alias: String,
     target: SemanticResourceAliasTargetV1,
-) -> Result<(), String> {
-    if let Some(previous) = aliases
-        .iter()
-        .find(|candidate| candidate.owner == owner && candidate.alias == alias)
-    {
-        if previous.target != target {
-            return Err(format!(
-                "semantic resource alias `{alias}` owner {owner:?} has conflicting targets"
-            ));
-        }
-        return Ok(());
+) {
+    if aliases.iter().any(|candidate| {
+        candidate.owner == owner && candidate.alias == alias && candidate.target == target
+    }) {
+        return;
     }
     aliases.push(SemanticResourceAliasV1 {
         owner,
         alias,
         target,
     });
-    Ok(())
 }
 
 fn payload_fields(data_type: &Type) -> Vec<SemanticPayloadFieldV1> {
@@ -4692,6 +5045,22 @@ kept: mapped |> List/retain(item, if: True)
                 children: Vec::new(),
             },
         ];
+        execution.checked_expression_origins = execution
+            .expressions
+            .iter()
+            .map(|expression| crate::SemanticExpressionOrigin {
+                expression: expression.id,
+                checked_expression: expression.checked_expr_id,
+                checked_scope: boon_typecheck::LexicalScopeId(0),
+                checked_span: boon_typecheck::CheckedSpan::default(),
+                owning_statement: match expression.id {
+                    SemanticExprId(0) => Some(SemanticStatementId(0)),
+                    SemanticExprId(3) => Some(SemanticStatementId(1)),
+                    _ => None,
+                },
+                call_instance: None,
+            })
+            .collect();
         execution
             .materializations
             .push(synthetic_materialization(0, SemanticExprId(4)));

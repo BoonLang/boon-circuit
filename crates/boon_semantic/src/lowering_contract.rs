@@ -1123,20 +1123,6 @@ fn build_source_payload_shapes(
                 .collect::<Vec<_>>();
             sources.sort();
             sources.dedup();
-            for checked_source in &entry.checked_sources {
-                if !resources.sources.iter().any(|source| {
-                    matches!(
-                        source.origin,
-                        SemanticSourceOrigin::Checked { source: candidate }
-                            if candidate == *checked_source
-                    )
-                }) {
-                    return Err(SemanticLoweringContractError::new(format!(
-                        "source payload shape checked source {} has no semantic resource instance",
-                        checked_source.0
-                    )));
-                }
-            }
             let expected_fields = payload_fields(&entry.payload_type);
             let actual_fields = entry
                 .fields

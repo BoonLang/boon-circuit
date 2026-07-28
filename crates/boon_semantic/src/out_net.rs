@@ -942,7 +942,10 @@ where
                 .map(|signature| &signature.result)
                 .unwrap_or(&checked_call.result);
             let result = FlowType {
-                mode: result_scheme.mode,
+                // The callable signature supplies the generic result type, but
+                // temporal gating is occurrence-specific and has already been
+                // resolved on the checked call.
+                mode: checked_call.result.mode,
                 ty: apply_checked_type_substitutions(&result_scheme.ty, &type_substitutions),
             };
             self.call_instances.push(OutCallInstance {

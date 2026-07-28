@@ -37,8 +37,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x0f, 0x92, 0xc1, 0x05, 0xe7, 0x1c, 0xda, 0xaf, 0x64, 0x74, 0xf4, 0xf0, 0x87, 0xca, 0x04, 0x6e,
-    0x5c, 0xaa, 0xf9, 0xb8, 0x30, 0x45, 0x68, 0x8b, 0x7f, 0x3c, 0x14, 0x18, 0xdf, 0x92, 0xb2, 0xee,
+    0x62, 0xf4, 0x4e, 0x8b, 0xf7, 0xb0, 0x5e, 0x80, 0x1c, 0x84, 0xcd, 0x1a, 0x80, 0x1e, 0xee, 0xd3,
+    0x5c, 0xbd, 0xbd, 0x9b, 0x32, 0xd1, 0x9f, 0xf5, 0x3b, 0xfd, 0x05, 0xf4, 0xa0, 0x50, 0x4c, 0x5a,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -1262,6 +1262,7 @@ fn exact_bundle_call_arguments(
         contexts,
         result,
         effect,
+        instance,
         ..
     } = &call_expression.kind
     else {
@@ -1401,16 +1402,45 @@ fn exact_bundle_call_arguments(
                             occurrence.occurrence_path, value
                         ))
                     })?;
+                let call_instance = consumer_program
+                    .resolved_out_graph()
+                    .call_instances
+                    .get(instance.as_usize())
+                    .filter(|candidate| candidate.id == *instance)
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "distributed occurrence `{}` references missing concrete call frame {}",
+                            occurrence.occurrence_path, instance
+                        ))
+                    })?;
+                let instantiated_value_flow_type = boon_typecheck::FlowType {
+                    mode: value_flow_type.mode,
+                    ty: boon_typecheck::apply_checked_type_substitutions(
+                        &value_flow_type.ty,
+                        &call_instance.type_substitutions,
+                    ),
+                };
                 if argument.checked_value != *checked_value
                     || argument.value != *value
                     || argument.from_pipe != *from_pipe
                     || static_checked_value != checked_value
                     || static_from_pipe != from_pipe
-                    || *value_flow_type != value_definition.flow_type
+                    || instantiated_value_flow_type != value_definition.flow_type
                 {
                     return Err(SemanticError::new(format!(
-                        "distributed occurrence `{}` explicit parameter ordinal {} has inconsistent value provenance",
-                        occurrence.occurrence_path, consumer_parameter.ordinal
+                        "distributed occurrence `{}` explicit parameter ordinal {} has inconsistent value provenance: argument checked/value/from-pipe {:?}/{}/{}; binding {:?}/{}/{}; static checked/from-pipe {:?}/{}; instantiated/value flow {:?}/{:?}",
+                        occurrence.occurrence_path,
+                        consumer_parameter.ordinal,
+                        argument.checked_value,
+                        argument.value,
+                        argument.from_pipe,
+                        checked_value,
+                        value,
+                        from_pipe,
+                        static_checked_value,
+                        static_from_pipe,
+                        instantiated_value_flow_type,
+                        value_definition.flow_type,
                     )));
                 }
                 BundleSemanticCallArgumentBindingV1::Explicit {

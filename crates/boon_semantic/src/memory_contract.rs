@@ -375,8 +375,8 @@ fn build_memories(
         let field = require_storage_field(storage, storage_field)?;
         if field.flow_type != state.flow_type {
             return Err(SemanticMemoryError::new(format!(
-                "published state {} type differs from storage field {}",
-                state.id, storage_field
+                "published state {} type {:?} differs from storage field {} type {:?}",
+                state.id, state.flow_type, storage_field, field.flow_type
             )));
         }
         ensure_closed_memory_type(

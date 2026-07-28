@@ -639,7 +639,9 @@ fn build_storage_fields(
     }
 
     append_list_authority_fields(
+        execution,
         resources,
+        reactive,
         &reactive_by_statement,
         &reactive_storage,
         &mut fields,
@@ -680,11 +682,15 @@ fn nearest_parent_storage_field(
 }
 
 fn append_list_authority_fields(
+    execution: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
+    reactive: &SemanticReactiveGraphV1,
     reactive_by_statement: &BTreeMap<SemanticStatementId, &crate::SemanticFieldV1>,
     reactive_storage: &BTreeMap<SemanticFieldId, SemanticStorageFieldId>,
     fields: &mut Vec<SemanticStorageFieldV1>,
 ) -> Result<(), SemanticScopeStorageError> {
+    let mutation_value_types = list_mutation_value_types(execution, reactive)?;
+    let mut matched_mutation_values = BTreeSet::new();
     for list in &resources.lists {
         let row = SemanticRowBinding {
             list: list.id,
@@ -700,9 +706,26 @@ fn append_list_authority_fields(
                     list.id, list.statement
                 ))
             })?;
-        for (path, data_type) in
+        for (path, mut data_type) in
             list_authority_fields(&list.item_type, &list.initializer, &list.item_fields)
         {
+            let mutation_value = mutation_value_types.get(&(list.id, path.clone()));
+            if let Some(exact) = mutation_value {
+                if data_type != *exact
+                    && !matches!(
+                        data_type,
+                        Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_)
+                    )
+                {
+                    return Err(SemanticScopeStorageError::new(format!(
+                        "list {} mutation value field `{}` has type {exact:?}, but its authority schema has type {data_type:?}",
+                        list.id,
+                        path.join(".")
+                    )));
+                }
+                data_type = exact.clone();
+                matched_mutation_values.insert((list.id, path.clone()));
+            }
             let name = path.last().cloned().ok_or_else(|| {
                 SemanticScopeStorageError::new(format!(
                     "list {} produced an empty authority field path",
@@ -736,7 +759,11 @@ fn append_list_authority_fields(
             }
             fields.push(SemanticStorageFieldV1 {
                 id: SemanticStorageFieldId(fields.len()),
-                role: SemanticStorageFieldRoleV1::ListAuthority,
+                role: if mutation_value.is_some() {
+                    SemanticStorageFieldRoleV1::ValueAuthority
+                } else {
+                    SemanticStorageFieldRoleV1::ListAuthority
+                },
                 origin: SemanticStorageFieldOriginV1::ListAuthority {
                     list: list.id,
                     item_path: path.clone(),
@@ -759,7 +786,19 @@ fn append_list_authority_fields(
             });
         }
     }
+    let unmatched_mutation_values = mutation_value_types
+        .keys()
+        .filter(|key| !matched_mutation_values.contains(*key))
+        .collect::<Vec<_>>();
+    if !unmatched_mutation_values.is_empty() {
+        return Err(SemanticScopeStorageError::new(format!(
+            "list mutation value fields have no exact authority schema entries: {unmatched_mutation_values:?}"
+        )));
+    }
     for authority in &resources.value_list_authorities {
+        if authority.role == crate::SemanticValueListRoleV1::InlineValue {
+            continue;
+        }
         let parent = reactive_by_statement
             .get(&authority.statement)
             .and_then(|field| reactive_storage.get(&field.id))
@@ -816,6 +855,36 @@ fn append_list_authority_fields(
         }
     }
     Ok(())
+}
+
+fn list_mutation_value_types(
+    execution: &SemanticExecutionGraphV1,
+    reactive: &SemanticReactiveGraphV1,
+) -> Result<BTreeMap<(SemanticListId, Vec<String>), Type>, SemanticScopeStorageError> {
+    let mut result = BTreeMap::new();
+    for mutation in &reactive.list_mutations {
+        let crate::SemanticListMutationKindV1::Append { item, .. } = &mutation.kind else {
+            continue;
+        };
+        let expression = require_expression(execution, *item)?;
+        let mut value_fields = flattened_type_fields(&expression.flow_type.ty);
+        if value_fields.is_empty() {
+            value_fields.push((vec!["value".to_owned()], expression.flow_type.ty.clone()));
+        }
+        for (path, data_type) in value_fields {
+            let key = (mutation.list, path.clone());
+            if let Some(previous) = result.insert(key, data_type.clone())
+                && previous != data_type
+            {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "list {} append field `{}` has conflicting exact value types {previous:?} and {data_type:?}",
+                    mutation.list,
+                    path.join(".")
+                )));
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn list_authority_fields(
@@ -2089,11 +2158,9 @@ fn build_external_references(
             *external_identity,
         ));
     }
-    for use_site in &reactive.dependency_uses {
-        let crate::SemanticDependencyTargetV1::ExternalCall { call, expression } = use_site.target
-        else {
-            continue;
-        };
+    for schedule in &reactive.call_invocations {
+        let call = schedule.call;
+        let expression = schedule.expression;
         let call = execution
             .calls
             .get(call.as_usize())

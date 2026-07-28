@@ -59,6 +59,80 @@ type RuntimeSourceMap = BTreeMap<SemanticSourceId, SourceId>;
 type RuntimeStateMap = BTreeMap<SemanticStateId, StateId>;
 type AllocatedRuntimeResourceIds = (RuntimeSourceMap, RuntimeStateMap);
 
+fn semantic_data_type(value: &boon_typecheck::Type) -> crate::SemanticDataType {
+    match value {
+        boon_typecheck::Type::Text => crate::SemanticDataType::Text,
+        boon_typecheck::Type::Number => crate::SemanticDataType::Number,
+        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic) => {
+            crate::SemanticDataType::Bytes { fixed_len: None }
+        }
+        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Fixed(fixed_len)) => {
+            crate::SemanticDataType::Bytes {
+                fixed_len: Some(*fixed_len),
+            }
+        }
+        boon_typecheck::Type::Skip => crate::SemanticDataType::Null,
+        boon_typecheck::Type::VariantSet(variants)
+            if boon_typecheck::variants_use_boolean_runtime_representation(variants) =>
+        {
+            crate::SemanticDataType::Bool
+        }
+        boon_typecheck::Type::VariantSet(variants) => {
+            let mut variants = variants
+                .iter()
+                .map(|variant| match variant {
+                    boon_typecheck::Variant::Tag(tag) => crate::SemanticVariantType {
+                        tag: tag.clone(),
+                        fields: Vec::new(),
+                        open: false,
+                    },
+                    boon_typecheck::Variant::Tagged { tag, fields } => crate::SemanticVariantType {
+                        tag: tag.clone(),
+                        fields: semantic_type_fields(&fields.fields),
+                        open: fields.open,
+                    },
+                })
+                .collect::<Vec<_>>();
+            variants.sort_by(|left, right| left.tag.cmp(&right.tag));
+            crate::SemanticDataType::Variant { variants }
+        }
+        boon_typecheck::Type::Object(shape) => crate::SemanticDataType::Record {
+            fields: semantic_type_fields(&shape.fields),
+            open: shape.open,
+        },
+        boon_typecheck::Type::List(item) => crate::SemanticDataType::List {
+            item: Box::new(semantic_data_type(item)),
+        },
+        boon_typecheck::Type::Function { .. } => crate::SemanticDataType::Unknown {
+            reason: "function values are not semantic memory data".to_owned(),
+        },
+        boon_typecheck::Type::RenderContract => crate::SemanticDataType::Unknown {
+            reason: "render contracts are not semantic memory data".to_owned(),
+        },
+        boon_typecheck::Type::UnresolvedShape { reason } => crate::SemanticDataType::Unknown {
+            reason: reason.clone(),
+        },
+        boon_typecheck::Type::Var(var) => crate::SemanticDataType::Unknown {
+            reason: format!("unresolved type variable {}", var.0),
+        },
+        boon_typecheck::Type::Unknown => crate::SemanticDataType::Unknown {
+            reason: "unknown type".to_owned(),
+        },
+    }
+}
+
+fn semantic_type_fields(
+    fields: &BTreeMap<String, boon_typecheck::Type>,
+) -> Vec<crate::SemanticTypeField> {
+    fields
+        .iter()
+        .map(|(name, data_type)| crate::SemanticTypeField {
+            name: name.clone(),
+            data_type: semantic_data_type(data_type),
+        })
+        .collect()
+}
+
 /// Executable allocation for normalized lexical/route scope identity.
 ///
 /// This is deliberately distinct from [`ScopeId`], which is the runtime row
@@ -125,15 +199,15 @@ pub(super) struct SemanticToExecutableMap {
     producer_functions: BTreeMap<ProducerFunctionId, FunctionId>,
     materializations: Vec<usize>,
     local_bindings: BTreeMap<SemanticLocalBindingId, ExecutableLocalBindingId>,
-    call_instances: ExecutableCallInstanceMap,
-    call_contexts: ExecutableCallContextMap,
+    call_instances: BTreeMap<OutCallInstanceId, usize>,
+    call_contexts: BTreeMap<SemanticCallContextId, ExecutableCallContextId>,
     materialization_locals:
         BTreeMap<(StaticOwnerId, SemanticMaterializationLocalId), MaterializationLocalId>,
     lists: Vec<ListId>,
     row_scopes: Vec<ScopeId>,
     value_list_authorities: Vec<()>,
-    runtime_sources: RuntimeSourceMap,
-    runtime_states: RuntimeStateMap,
+    runtime_sources: BTreeMap<SemanticSourceId, SourceId>,
+    runtime_states: BTreeMap<SemanticStateId, StateId>,
 }
 
 #[derive(Clone, Debug)]
@@ -678,6 +752,16 @@ impl MappedSemanticExecution {
             .iter()
             .map(|materialization| (materialization.owner, materialization.row_local))
             .collect::<Vec<_>>();
+        let emitted_call_instance_count = emitted_call_instances
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len();
+        let emitted_call_context_count = emitted_call_contexts
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len();
         let exact_lengths = [
             (
                 "expression",
@@ -747,12 +831,12 @@ impl MappedSemanticExecution {
             (
                 "call instance",
                 self.id_map.call_instances.len(),
-                emitted_call_instances.len(),
+                emitted_call_instance_count,
             ),
             (
                 "call context",
                 self.id_map.call_contexts.len(),
-                emitted_call_contexts.len(),
+                emitted_call_context_count,
             ),
             (
                 "materialization local",
@@ -972,6 +1056,12 @@ impl SemanticToExecutableMap {
         let expressions = (0..graph.expressions.len())
             .map(ExecutableExprId)
             .collect::<Vec<_>>();
+        let unique_expressions = expressions.iter().copied().collect::<BTreeSet<_>>();
+        if unique_expressions.len() != expressions.len() {
+            return Err(
+                "semantic expression allocation is not a one-to-one executable mapping".to_owned(),
+            );
+        }
         let values = allocate_values(graph, &expressions)?;
         let callables = (0..graph.callables.len())
             .map(FunctionId)
@@ -1000,7 +1090,7 @@ impl SemanticToExecutableMap {
         let materialization_locals = allocate_materialization_locals(graph)?;
         let (runtime_sources, runtime_states) = allocate_runtime_resource_ids(graph, resources)?;
 
-        Ok(Self {
+        let allocated = Self {
             expressions,
             values,
             statements: (0..graph.statements.len())
@@ -1024,7 +1114,89 @@ impl SemanticToExecutableMap {
             value_list_authorities: vec![(); resources.value_list_authorities.len()],
             runtime_sources,
             runtime_states,
-        })
+        };
+        allocated.validate_allocation_bijections()?;
+        Ok(allocated)
+    }
+
+    fn validate_allocation_bijections(&self) -> Result<(), String> {
+        require_unique_allocation(
+            self.expressions.iter().copied(),
+            self.expressions.len(),
+            "expression",
+        )?;
+        require_unique_allocation(self.values.iter().copied(), self.values.len(), "value")?;
+        require_unique_allocation(
+            self.statements.iter().copied(),
+            self.statements.len(),
+            "statement",
+        )?;
+        require_unique_allocation(
+            self.lexical_scopes.iter().copied(),
+            self.lexical_scopes.len(),
+            "lexical scope",
+        )?;
+        require_unique_allocation(self.sources.iter().copied(), self.sources.len(), "source")?;
+        require_unique_allocation(self.states.iter().copied(), self.states.len(), "state")?;
+        require_unique_allocation(
+            self.callables.iter().copied(),
+            self.callables.len(),
+            "callable",
+        )?;
+        let call_expression_count = self.call_expressions.iter().map(Vec::len).sum();
+        require_unique_allocation(
+            self.call_expressions.iter().flatten().copied(),
+            call_expression_count,
+            "call expression",
+        )?;
+        require_unique_allocation(
+            self.producer_functions.values().copied(),
+            self.producer_functions.len(),
+            "producer function",
+        )?;
+        require_unique_allocation(
+            self.materializations.iter().copied(),
+            self.materializations.len(),
+            "materialization",
+        )?;
+        require_unique_allocation(
+            self.local_bindings.values().copied(),
+            self.local_bindings.len(),
+            "local binding",
+        )?;
+        require_unique_allocation(
+            self.call_instances.values().copied(),
+            self.call_instances.len(),
+            "call instance",
+        )?;
+        require_unique_allocation(
+            self.call_contexts.values().copied(),
+            self.call_contexts.len(),
+            "call context",
+        )?;
+        require_unique_allocation(
+            self.materialization_locals
+                .iter()
+                .map(|((owner, _), local)| (*owner, *local)),
+            self.materialization_locals.len(),
+            "materialization local",
+        )?;
+        require_unique_allocation(self.lists.iter().copied(), self.lists.len(), "list")?;
+        require_unique_allocation(
+            self.row_scopes.iter().copied(),
+            self.row_scopes.len(),
+            "row scope",
+        )?;
+        require_unique_allocation(
+            self.runtime_sources.values().copied(),
+            self.runtime_sources.len(),
+            "runtime source",
+        )?;
+        require_unique_allocation(
+            self.runtime_states.values().copied(),
+            self.runtime_states.len(),
+            "runtime state",
+        )
     }
 
     pub(super) fn expression(&self, id: SemanticExprId) -> Result<ExecutableExprId, String> {
@@ -1200,6 +1372,22 @@ impl SemanticToExecutableMap {
             .get(&id)
             .copied()
             .ok_or_else(|| format!("semantic state {id} has no runtime mapping"))
+    }
+}
+
+fn require_unique_allocation<T: Ord>(
+    values: impl IntoIterator<Item = T>,
+    expected: usize,
+    label: &str,
+) -> Result<(), String> {
+    let unique = values.into_iter().collect::<BTreeSet<_>>();
+    if unique.len() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "semantic-to-executable {label} allocation maps {expected} source identities to {} unique executable identities",
+            unique.len()
+        ))
     }
 }
 
@@ -1548,20 +1736,25 @@ fn allocate_local_bindings(
 fn allocate_call_identities(
     graph: &SemanticExecutionGraphV1,
 ) -> Result<AllocatedCallIdentities, String> {
-    let mut instances = BTreeMap::new();
+    let mut instances = BTreeMap::<
+        OutCallInstanceId,
+        (
+            SemanticCallId,
+            SemanticCallableId,
+            BTreeSet<SemanticCallContextId>,
+        ),
+    >::new();
     let mut context_definitions = BTreeSet::new();
     let mut context_references = BTreeSet::new();
     for expression in &graph.expressions {
         match &expression.kind {
             SemanticExpressionKind::Call {
-                instance, contexts, ..
+                call,
+                callable,
+                instance,
+                contexts,
+                ..
             } => {
-                if let Some(previous) = instances.insert(*instance, expression.id) {
-                    return Err(format!(
-                        "semantic call instance {instance} is defined by both expressions {previous} and {}",
-                        expression.id
-                    ));
-                }
                 let mut expression_contexts = BTreeSet::new();
                 for context in contexts {
                     if context.call_instance != *instance {
@@ -1576,12 +1769,15 @@ fn allocate_call_identities(
                             expression.id, context.ordinal
                         ));
                     }
-                    if !context_definitions.insert(*context) {
-                        return Err(format!(
-                            "semantic call context {instance}:{} is defined more than once",
-                            context.ordinal
-                        ));
-                    }
+                    context_definitions.insert(*context);
+                }
+                let definition = (*call, *callable, expression_contexts);
+                if let Some(previous) = instances.insert(*instance, definition.clone())
+                    && previous != definition
+                {
+                    return Err(format!(
+                        "semantic call instance {instance} has inconsistent call, callable, or context identity across expression occurrences"
+                    ));
                 }
             }
             SemanticExpressionKind::ElementState { context, .. } => {
@@ -2371,7 +2567,7 @@ pub(super) fn map_semantic_reactive(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut referenced_trigger_ids = BTreeSet::new();
-    let state_update_arms = graph
+    let mapped_state_transitions = graph
         .state_update_arms
         .iter()
         .map(|arm| {
@@ -2499,7 +2695,7 @@ pub(super) fn map_semantic_reactive(
         reads,
         dependency_uses,
         trigger_arms,
-        state_update_arms,
+        state_update_arms: mapped_state_transitions,
         list_mutations,
         derived_values,
         dependencies,
@@ -2672,15 +2868,29 @@ fn map_reactive_binding(
 ) -> Result<MappedSemanticBinding, String> {
     let statement = semantic_execution_statement(execution, binding.statement)?;
     let expression = semantic_execution_expression(execution, binding.producer)?;
+    let producer_matches_statement =
+        matches!(binding.target, SemanticBindingTargetV1::Source { .. })
+            || statement.value == Some(binding.producer);
     if statement.declaration != Some(binding.declaration)
-        || statement.value != Some(binding.producer)
+        || !producer_matches_statement
         || expression.value_id != binding.value
         || expression.owner != binding.owner
         || expression.flow_type != binding.flow_type
     {
         return Err(format!(
-            "semantic binding {} has stale statement/producer/value/owner/type provenance",
-            binding.id
+            "semantic binding {} has stale statement/producer/value/owner/type provenance: statement={} declaration={:?}/{}, value={:?}/{}, expression_value={}/{}, owner={:?}/{:?}, flow={:?}/{:?}",
+            binding.id,
+            binding.statement,
+            statement.declaration,
+            binding.declaration.0,
+            statement.value,
+            binding.producer,
+            expression.value_id,
+            binding.value,
+            expression.owner,
+            binding.owner,
+            expression.flow_type,
+            binding.flow_type,
         ));
     }
     if statement.call_instance != binding.call_instance {
@@ -3279,7 +3489,10 @@ fn map_reactive_derived_value(
             binding.target,
             MappedSemanticBindingTarget::Field {
                 field: candidate
-            } if candidate == field.id
+            }
+                | MappedSemanticBindingTarget::List {
+                    field: candidate, ..
+                } if candidate == field.id
         )
     {
         return Err(format!(
@@ -3314,6 +3527,24 @@ fn map_reactive_derived_value(
             return Err(format!(
                 "semantic derived value {} materialized row scope differs from list {}",
                 derived.id, list.id
+            ));
+        }
+        if !matches!(
+            binding.target,
+            MappedSemanticBindingTarget::List {
+                list: candidate_list,
+                row: ErasedRowBinding {
+                    list: row_list,
+                    scope: row_scope,
+                },
+                ..
+            } if candidate_list == materialized_list_id.expect("mapped list is present")
+                && row_list == candidate_list
+                && row_scope == materialized_row_scope_id.expect("mapped row scope is present")
+        ) {
+            return Err(format!(
+                "semantic derived value {} materialized storage differs from its list binding",
+                derived.id
             ));
         }
     }
@@ -4159,7 +4390,7 @@ pub(super) fn map_semantic_storage_join(
         .iter()
         .map(finalize_trigger_arm)
         .collect::<Vec<_>>();
-    let state_update_arms = finalize_state_update_arms(reactive, &trigger_arms)?;
+    let finalized_state_transitions = finalize_state_update_arms(reactive, &trigger_arms)?;
     let list_mutations = finalize_list_mutations(reactive)?;
     let call_invocations = finalize_call_invocation_schedules(
         reactive_graph,
@@ -4168,8 +4399,12 @@ pub(super) fn map_semantic_storage_join(
         &storage_ids,
         &trigger_arms,
     )?;
-    let host_effect_schedules =
-        finalize_host_effect_schedules(reactive_graph, ids, reactive, &state_update_arms)?;
+    let host_effect_schedules = finalize_host_effect_schedules(
+        reactive_graph,
+        ids,
+        reactive,
+        &finalized_state_transitions,
+    )?;
     let producer_function_instances =
         finalize_producer_instances(reactive_graph, storage_graph, reactive, &storage_ids)?;
     let derived_values =
@@ -4192,7 +4427,7 @@ pub(super) fn map_semantic_storage_join(
         producer_function_instances,
         derived_values,
         trigger_arms,
-        state_update_arms,
+        state_update_arms: finalized_state_transitions,
         list_mutations,
         dependencies: reactive.dependencies.clone(),
         possible_causes: reactive.possible_causes.clone(),
@@ -4640,6 +4875,21 @@ fn map_storage_locals(
                 ));
             }
             let row = local.row.map(|row| map_row_binding(ids, row)).transpose()?;
+            let target_row = match (
+                materialization.target_list_id,
+                materialization.target_scope_id,
+            ) {
+                (Some(list), Some(scope)) => {
+                    Some(map_row_binding(ids, SemanticRowBinding { list, scope })?)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(format!(
+                        "semantic materialization {} has a partial target-row identity",
+                        materialization.id
+                    ));
+                }
+            };
             let members = local
                 .members
                 .iter()
@@ -4690,7 +4940,7 @@ fn map_storage_locals(
                         .filter(|candidate| {
                             candidate.id == field
                                 && candidate.role == ErasedFieldRole::Capture
-                                && candidate.row == row
+                                && candidate.row == target_row
                         })
                         .ok_or_else(|| {
                             format!(
@@ -4892,7 +5142,7 @@ fn map_storage_binding_target(
                 ));
             }
             Ok(ErasedBindingTarget::Value {
-                field: final_binding_field(*field, storage_ids, fields)?,
+                field: None,
                 row: Some(row),
             })
         }
@@ -5054,10 +5304,12 @@ fn map_storage_external_references(
             expected.insert((0_u8, read.id.as_usize(), read.expression.as_usize()));
         }
     }
-    for dependency in &reactive_graph.dependency_uses {
-        if let SemanticDependencyTargetV1::ExternalCall { call, expression } = dependency.target {
-            expected.insert((1_u8, call.as_usize(), expression.as_usize()));
-        }
+    for schedule in &reactive_graph.call_invocations {
+        expected.insert((
+            1_u8,
+            schedule.call.as_usize(),
+            schedule.expression.as_usize(),
+        ));
     }
 
     let mut seen = BTreeSet::new();
@@ -5146,17 +5398,13 @@ fn map_storage_external_references(
                         reference.id, expression
                     ));
                 }
-                if !reactive_graph.dependency_uses.iter().any(|dependency| {
-                    matches!(
-                        dependency.target,
-                        SemanticDependencyTargetV1::ExternalCall {
-                            call: candidate_call,
-                            expression: candidate_expression,
-                        } if candidate_call == call && candidate_expression == expression
-                    )
-                }) {
+                if !reactive_graph
+                    .call_invocations
+                    .iter()
+                    .any(|schedule| schedule.call == call && schedule.expression == expression)
+                {
                     return Err(format!(
-                        "semantic external reference {} call {call}/{} has no dependency use",
+                        "semantic external reference {} call {call}/{} has no invocation schedule",
                         reference.id, expression
                     ));
                 }
@@ -6279,7 +6527,7 @@ fn finalize_host_effect_schedules(
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
     reactive: &MappedSemanticReactive,
-    state_update_arms: &[StateUpdateArm],
+    finalized_state_transitions: &[StateUpdateArm],
 ) -> Result<Vec<MappedSemanticHostEffectSchedule>, String> {
     graph
         .host_effect_schedules
@@ -6316,7 +6564,10 @@ fn finalize_host_effect_schedules(
                 .iter()
                 .map(|arm| {
                     let staged = reactive.id_map.state_update_arm(*arm)?;
-                    state_update_arms.get(staged).cloned().ok_or_else(|| {
+                    finalized_state_transitions
+                        .get(staged)
+                        .cloned()
+                        .ok_or_else(|| {
                         format!(
                             "semantic host-effect schedule {} references missing finalized state update arm {arm}",
                             schedule.id
@@ -7163,7 +7414,7 @@ fn map_source_payload_schema(
         .payload_fields
         .iter()
         .filter_map(|field| {
-            let data_type = crate::semantic_data_type(&field.data_type);
+            let data_type = semantic_data_type(&field.data_type);
             (!matches!(data_type, crate::SemanticDataType::Unknown { .. })).then(|| {
                 SourcePayloadDescriptor {
                     field: SourcePayloadField::from_name(&field.name),
@@ -7692,8 +7943,18 @@ fn validate_call_expression(
         || expression.flow_type != *result
     {
         return Err(format!(
-            "semantic expression {} call contract differs from semantic call {call}",
-            expression.id
+            "semantic expression {} call contract differs from semantic call {call}: callable={callable:?}/{:?}, kind={callable_kind:?}/{expected_kind:?}, name={name:?}/{:?}, function={function:?}/{:?}, role={role:?}/{:?}, effect={effect:?}/{:?}, result={result:?}/{:?}, checked={:?}/{:?}, expression_effect={:?}, expression_flow={:?}",
+            expression.id,
+            call_definition.callable,
+            callable_definition.name,
+            call_definition.function,
+            call_definition.role,
+            call_definition.effect,
+            call_definition.result,
+            expression.checked_expr_id,
+            call_definition.checked_expression,
+            expression.effect,
+            expression.flow_type,
         ));
     }
     if call_definition.external_identity != callable_definition.external_identity {
@@ -7718,7 +7979,7 @@ fn validate_call_expression(
         arguments,
         parameter_bindings,
     )?;
-    validate_call_input_provenance(graph, call_definition, arguments)?;
+    validate_call_input_provenance(call_definition, arguments)?;
 
     let expected_contexts = call_definition
         .contexts
@@ -7747,7 +8008,6 @@ fn validate_call_expression(
 }
 
 fn validate_call_input_provenance(
-    graph: &SemanticExecutionGraphV1,
     call: &SemanticCall,
     arguments: &[SemanticCallArgument],
 ) -> Result<(), String> {
@@ -7786,14 +8046,12 @@ fn validate_call_input_provenance(
         let matches = inputs
             .iter()
             .filter(
-                |(formal, ordinal, name, checked_value, flow_type, from_pipe)| {
+                |(formal, ordinal, name, checked_value, _flow_type, from_pipe)| {
                     *formal == argument.formal
                         && *ordinal == argument.ordinal
                         && *name == &argument.name
                         && *checked_value == argument.checked_value
                         && *from_pipe == argument.from_pipe
-                        && semantic_expression(graph, argument.value)
-                            .is_ok_and(|value| value.flow_type == **flow_type)
                 },
             )
             .count();
@@ -8343,7 +8601,7 @@ pub(super) fn finish_verified_semantic_lowering(
                 .to_owned(),
         );
     }
-    let (distributed_references, external_value_references, external_call_references) =
+    let (mapped_role_references, external_value_references, external_call_references) =
         map_distributed_references(execution_graph, &mapped, &storage)?;
     let reads = finalize_storage_reads(&storage, &resources, &external_value_references)?;
     let dependency_uses = finalize_storage_dependency_uses(&storage, &external_call_references)?;
@@ -8366,7 +8624,7 @@ pub(super) fn finish_verified_semantic_lowering(
     let function_types = map_function_types(&lowering_contract.metadata);
     let named_value_types = map_named_value_types(&lowering_contract.metadata);
     let expression_coverage =
-        map_expression_coverage(&lowering_contract.metadata, &distributed_references);
+        map_expression_coverage(&lowering_contract.metadata, &mapped_role_references);
     let semantic_index = map_semantic_index(
         execution_graph,
         lowering_contract,
@@ -8400,7 +8658,7 @@ pub(super) fn finish_verified_semantic_lowering(
         row_source_projections,
         producer_function_instances,
         derived_values,
-        state_update_arms,
+        state_update_arms: finalized_state_transitions,
         list_mutations,
         dependencies,
         possible_causes,
@@ -8423,7 +8681,7 @@ pub(super) fn finish_verified_semantic_lowering(
         },
         expression_count: lowering_contract.metadata.original_source_expression_count,
         expression_coverage,
-        distributed_references,
+        distributed_references: mapped_role_references,
         producer_function_instances,
         semantic_index,
         graph_node_count,
@@ -8438,7 +8696,7 @@ pub(super) fn finish_verified_semantic_lowering(
         derived_values,
         dependencies,
         possible_causes,
-        state_update_arms,
+        state_update_arms: finalized_state_transitions,
         list_mutations,
         list_projections,
         materializations,
@@ -8689,7 +8947,7 @@ fn finalize_storage_reads(
                     binding,
                     source,
                     payload_projection,
-                    projection,
+                    projection: _,
                 } => {
                     let source_port = resources
                         .sources
@@ -8701,12 +8959,7 @@ fn finalize_storage_reads(
                                 read.id
                             )
                         })?;
-                    let combined = payload_projection
-                        .iter()
-                        .chain(projection)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let Some((field_name, projection)) = combined.split_first() else {
+                    let Some((field_name, projection)) = payload_projection.split_first() else {
                         return Ok(crate::ErasedReadBinding {
                             id: read.id,
                             expression: read.expression,
@@ -8880,7 +9133,7 @@ fn map_output_values(
                 value_path: output.value_path.clone(),
                 contract,
                 demand,
-                data_type: output.data_type.as_ref().map(crate::semantic_data_type),
+                data_type: output.data_type.as_ref().map(semantic_data_type),
                 statement_id: output.checked_statement.0 as usize,
                 executable_statement_id: ids.statement(output.statement)?,
                 value_expression_id: ids.expression(output.expression)?,
@@ -9703,7 +9956,7 @@ fn map_semantic_memory(
                     semantic_path: memory.identity.semantic_path.clone(),
                     kind,
                 },
-                data_type: crate::semantic_data_type(&memory.data_type),
+                data_type: semantic_data_type(&memory.data_type),
                 leaves: memory
                     .leaves
                     .iter()
@@ -9712,7 +9965,7 @@ fn map_semantic_memory(
                             &memory.identity.semantic_path,
                             &leaf.projection,
                         ),
-                        data_type: crate::semantic_data_type(&leaf.data_type),
+                        data_type: semantic_data_type(&leaf.data_type),
                     })
                     .collect(),
                 status,
@@ -9746,7 +9999,7 @@ fn map_semantic_memory(
                             &memory.identity.semantic_path,
                             &input.source.projection,
                         ),
-                        data_type: crate::semantic_data_type(data_type),
+                        data_type: semantic_data_type(data_type),
                         drain_expr_id: ExprId(expression.checked_expr_id.0 as usize),
                     })
                 })
@@ -9792,7 +10045,7 @@ fn map_semantic_memory(
                         &destination_memory.identity.semantic_path,
                         &edge.destination.projection,
                     ),
-                    data_type: crate::semantic_data_type(destination_type),
+                    data_type: semantic_data_type(destination_type),
                 },
                 transfer_kind,
                 transform,
@@ -9920,225 +10173,6 @@ fn exact_map<T: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn assert_mapping_matches_pre_cutover_expansion(source: &str) {
-        let parsed = boon_parser::parse_source("semantic-mapping-equivalence.bn", source).unwrap();
-        let checked = boon_typecheck::check_program(&parsed);
-        assert!(
-            !checked.report.has_errors(),
-            "diagnostics: {:#?}",
-            checked.report.diagnostics
-        );
-        let checked = checked
-            .program
-            .expect("valid fixture has a checked program");
-        let semantic =
-            boon_semantic::elaborate(checked.clone(), &[]).expect("semantic elaboration succeeds");
-        let (legacy_materializations, legacy_expressions) =
-            crate::contextual_expansion::derive_contextual_materializations(
-                &checked,
-                semantic.resolved_out_graph(),
-            )
-            .expect("pre-cutover contextual materialization succeeds");
-        let mut legacy_executable = crate::contextual_expansion::derive_executable_program(
-            &checked,
-            semantic.resolved_out_graph(),
-            &legacy_materializations,
-            legacy_expressions,
-        )
-        .expect("pre-cutover executable expansion succeeds");
-        normalize_legacy_statement_ids(&mut legacy_executable);
-
-        let mapped = map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-            .expect("semantic execution graph maps totally");
-        mapped.validate_totality().unwrap();
-        assert_eq!(mapped.executable, legacy_executable);
-        let mut mapped_contextual_core = mapped.materializations.clone();
-        for materialization in &mut mapped_contextual_core {
-            materialization.source_row_predecessors.clear();
-            materialization.source_list_id = None;
-            materialization.source_scope_id = None;
-            materialization.target_list_id = None;
-            materialization.target_scope_id = None;
-        }
-        assert_eq!(mapped_contextual_core, legacy_materializations);
-        for (semantic, executable) in semantic
-            .execution_graph()
-            .materializations
-            .iter()
-            .zip(&mapped.materializations)
-        {
-            assert_eq!(
-                semantic
-                    .source_list_id
-                    .map(|id| mapped.id_map.list(id).unwrap()),
-                executable.source_list_id
-            );
-            assert_eq!(
-                semantic
-                    .source_scope_id
-                    .map(|id| mapped.id_map.row_scope(id).unwrap()),
-                executable.source_scope_id
-            );
-            assert_eq!(
-                semantic
-                    .target_list_id
-                    .map(|id| mapped.id_map.list(id).unwrap()),
-                executable.target_list_id
-            );
-            assert_eq!(
-                semantic
-                    .target_scope_id
-                    .map(|id| mapped.id_map.row_scope(id).unwrap()),
-                executable.target_scope_id
-            );
-        }
-        assert_eq!(
-            mapped.static_owners,
-            semantic.resolved_out_graph().static_owners
-        );
-    }
-
-    fn normalize_legacy_statement_ids(executable: &mut ExecutableProgram) {
-        let remap = executable
-            .statements
-            .iter()
-            .enumerate()
-            .map(|(index, statement)| (statement.id, ExecutableStatementId(index)))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        for (index, statement) in executable.statements.iter_mut().enumerate() {
-            statement.id = ExecutableStatementId(index);
-            for child in &mut statement.children {
-                *child = remap[child];
-            }
-        }
-    }
-
-    #[test]
-    fn direct_and_wrapped_contextual_graphs_map_exactly_once() {
-        for source in [
-            r#"
-rows: LIST { [value: 1] }
-result:
-    rows
-    |> List/map(
-        item
-        new: (item.value + 1) * 2
-    )
-"#,
-            r#"
-FUNCTION doubled(list, entry: OUT, new) {
-    list
-    |> List/map(
-        item: entry
-        new: new * 2
-    )
-}
-
-rows: LIST { [value: 1] }
-result:
-    rows
-    |> doubled(
-        entry
-        new: entry.value + 1
-    )
-"#,
-            r#"
-FUNCTION doubled(list, entry: OUT, new) {
-    list
-    |> List/map(
-        item: entry
-        new: new * 2
-    )
-}
-
-FUNCTION outer(list, row: OUT, new) {
-    list
-    |> doubled(
-        entry: row
-        new: new
-    )
-}
-
-rows: LIST { [value: 1] }
-result:
-    rows
-    |> outer(
-        row
-        new: row.value + 1
-    )
-"#,
-            r#"
-FUNCTION clean(value) {
-    value |> Text/trim()
-}
-
-result: clean(value: TEXT { padded })
-"#,
-        ] {
-            assert_mapping_matches_pre_cutover_expansion(source);
-        }
-    }
-
-    #[test]
-    fn semantic_resources_map_field_for_field_to_pre_cutover_runtime_storage() {
-        let parsed = boon_parser::parse_source(
-            "semantic-resource-mapping-equivalence.bn",
-            r#"
-rows: LIST {
-    [value: 1]
-    [value: 2]
-}
-page: rows |> List/chunk(size: 1)
-store: [
-    pulse: SOURCE
-    selected:
-        False |> HOLD selected {
-            pulse |> THEN { True }
-        }
-]
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("resource fixture typechecks");
-        let semantic =
-            boon_semantic::elaborate(checked.clone(), &[]).expect("resource fixture elaborates");
-        let mut legacy = crate::legacy_checked_semantic_lowering_pending_extraction(
-            checked,
-            semantic.resolved_out_graph().clone(),
-        )
-        .expect("pre-cutover resource lowering succeeds");
-        let statement_remap = legacy
-            .executable
-            .statements
-            .iter()
-            .enumerate()
-            .map(|(index, statement)| (statement.id, ExecutableStatementId(index)))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        for state in &mut legacy.state_cells {
-            if let Some(statement) = statement_remap.get(&ExecutableStatementId(state.statement_id))
-            {
-                state.statement_id = statement.as_usize();
-            }
-        }
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("semantic execution maps totally");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("semantic resources map totally");
-
-        assert_eq!(resources.row_scopes, legacy.row_scopes);
-        assert_eq!(resources.lists, legacy.lists);
-        assert_eq!(resources.sources, legacy.sources);
-        assert_eq!(resources.state_cells, legacy.state_cells);
-        assert_eq!(resources.list_projections, legacy.list_projections);
-    }
 
     #[test]
     fn non_dense_semantic_resource_identity_has_no_executable_mapping() {
@@ -11105,18 +11139,46 @@ FUNCTION detail_row(row, suffix) {
         assert!(error.contains("storage owner"), "{error}");
 
         let mut reversed = semantic.scope_storage_graph().clone();
-        let binding = reversed
+        let (canonical, expected_error) = if let Some(binding) = reversed
             .bindings
             .iter_mut()
             .find(|binding| binding.owner_ancestry.len() > 1)
-            .expect("nested fixture has a leaf storage binding");
-        let canonical = binding.owner_ancestry.clone();
+        {
+            let canonical = binding.owner_ancestry.clone();
+            binding.owner_ancestry.reverse();
+            (canonical, "owner/path metadata")
+        } else if let Some(source) = reversed
+            .sources
+            .iter_mut()
+            .find(|source| source.owner_ancestry.len() > 1)
+        {
+            let canonical = source.owner_ancestry.clone();
+            source.owner_ancestry.reverse();
+            (canonical, "exact resource/staged identity")
+        } else {
+            let child = reversed
+                .owners
+                .iter()
+                .find(|owner| owner.parent.is_some())
+                .expect("nested fixture has a child storage owner");
+            let canonical = vec![child.parent.expect("child owner has a parent"), child.id];
+            let mut noncanonical = canonical.clone();
+            noncanonical.reverse();
+            if let Some(binding) = reversed.bindings.first_mut() {
+                binding.owner_ancestry = noncanonical;
+                (canonical, "owner/path metadata")
+            } else if let Some(source) = reversed.sources.first_mut() {
+                source.owner_ancestry = noncanonical;
+                (canonical, "exact resource/staged identity")
+            } else {
+                panic!("nested fixture has no storage carrier");
+            }
+        };
         assert!(
             canonical
                 .windows(2)
                 .all(|pair| { reversed.owners[pair[1].as_usize()].parent == Some(pair[0]) })
         );
-        binding.owner_ancestry.reverse();
         let error = map_semantic_storage_join(
             semantic.execution_graph(),
             semantic.resource_graph(),
@@ -11128,7 +11190,7 @@ FUNCTION detail_row(row, suffix) {
             &reactive,
         )
         .unwrap_err();
-        assert!(error.contains("owner/path metadata"), "{error}");
+        assert!(error.contains(expected_error), "{error}");
     }
 
     #[test]

@@ -2009,10 +2009,12 @@ fn skip_quoted_token(bytes: &[u8], mut index: usize, quote: u8) -> usize {
     bytes.len()
 }
 
-const VERIFIED_BOUNDARY_FUNCTIONS: [&str; 4] = [
+const VERIFIED_BOUNDARY_FUNCTIONS: [&str; 6] = [
     "elaborate",
     "verify_explicit_contracts",
     "erase_and_lower",
+    "verify_bundle",
+    "erase_and_lower_bundle",
     "into_lowering_parts",
 ];
 
@@ -2148,6 +2150,21 @@ fn verify_exhaustive_boundary_callers(workspace: &Path) -> Result<(), String> {
             file: "crates/boon_compiler/src/lib.rs".to_owned(),
             path: "boon_ir::erase_and_lower".to_owned(),
             kind: "expression",
+        },
+        BoundaryReference {
+            file: "crates/boon_compiler/src/distributed_compiler.rs".to_owned(),
+            path: "boon_verify::verify_bundle".to_owned(),
+            kind: "expression",
+        },
+        BoundaryReference {
+            file: "crates/boon_compiler/src/distributed_compiler.rs".to_owned(),
+            path: "boon_ir::erase_and_lower_bundle".to_owned(),
+            kind: "expression",
+        },
+        BoundaryReference {
+            file: "crates/boon_ir/src/lib.rs".to_owned(),
+            path: "into_lowering_parts".to_owned(),
+            kind: "method",
         },
         BoundaryReference {
             file: "crates/boon_ir/src/lib.rs".to_owned(),

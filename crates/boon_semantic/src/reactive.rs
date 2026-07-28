@@ -542,9 +542,8 @@ struct ReactiveBuilder<'a> {
     resources: &'a SemanticResourceGraphV1,
     out_net: &'a ResolvedOutGraph,
     expressions: ExpressionIndex<'a>,
-    statement_values: BTreeMap<DeclId, Vec<SemanticStatementId>>,
     local_values: BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
-    parameter_inputs: BTreeMap<SemanticParameterId, Vec<SemanticExprId>>,
+    parameter_inputs: BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
 }
 
 impl<'a> ReactiveBuilder<'a> {
@@ -554,17 +553,6 @@ impl<'a> ReactiveBuilder<'a> {
         out_net: &'a ResolvedOutGraph,
     ) -> Result<Self, SemanticReactiveError> {
         let expressions = ExpressionIndex::new(execution)?;
-        let mut statement_values = BTreeMap::<DeclId, Vec<SemanticStatementId>>::new();
-        for statement in &execution.statements {
-            if statement.value.is_some()
-                && let Some(declaration) = statement.declaration
-            {
-                statement_values
-                    .entry(declaration)
-                    .or_default()
-                    .push(statement.id);
-            }
-        }
         let mut local_values = BTreeMap::new();
         for expression in &execution.expressions {
             if let SemanticExpressionKind::Block { bindings, .. } = &expression.kind {
@@ -583,16 +571,38 @@ impl<'a> ReactiveBuilder<'a> {
         }
         let mut parameter_inputs = BTreeMap::new();
         for function in &execution.functions {
-            for parameter in &function.parameters {
-                if parameter_inputs
-                    .insert(parameter.id, parameter.input_expressions.clone())
-                    .is_some()
-                {
-                    return Err(SemanticReactiveError::new(format!(
-                        "semantic parameter {:?} has multiple producer-input inventories",
-                        parameter.id
-                    )));
+            let function_inputs = function
+                .parameters
+                .iter()
+                .map(|parameter| (parameter.id, parameter.input_expressions.as_slice()))
+                .collect::<BTreeMap<_, _>>();
+            let mut pending = vec![function.root];
+            let mut visited = BTreeSet::new();
+            while let Some(expression_id) = pending.pop() {
+                if !visited.insert(expression_id) {
+                    continue;
                 }
+                let expression = expressions.expression(expression_id)?;
+                if let SemanticExpressionKind::FunctionParameter { parameter, .. } =
+                    &expression.kind
+                {
+                    let inputs = function_inputs.get(parameter).ok_or_else(|| {
+                        SemanticReactiveError::new(format!(
+                            "producer function {} expression {} references undeclared parameter {:?}",
+                            function.producer, expression.id, parameter
+                        ))
+                    })?;
+                    if let Some(previous) =
+                        parameter_inputs.insert(expression.id, (*inputs).to_vec())
+                        && previous != **inputs
+                    {
+                        return Err(SemanticReactiveError::new(format!(
+                            "semantic parameter expression {} belongs to multiple producer-input inventories",
+                            expression.id
+                        )));
+                    }
+                }
+                pending.extend(semantic_expression_children(&expression.kind, execution)?);
             }
         }
         Ok(Self {
@@ -600,7 +610,6 @@ impl<'a> ReactiveBuilder<'a> {
             resources,
             out_net,
             expressions,
-            statement_values,
             local_values,
             parameter_inputs,
         })
@@ -614,16 +623,16 @@ impl<'a> ReactiveBuilder<'a> {
         let mut triggers = TriggerResolver::new(
             self.execution,
             self.resources,
+            self.out_net,
             &self.expressions,
             &bindings,
-            &self.statement_values,
             &self.local_values,
             &self.parameter_inputs,
         )?;
 
         let raw_state_arms = self.build_state_update_arms(&mut triggers)?;
         let raw_mutations = self.build_list_mutations(&mut triggers)?;
-        let raw_derived = self.build_raw_derived_values(&bindings, &mut triggers)?;
+        let raw_derived = self.build_raw_derived_values(&fields, &bindings, &mut triggers)?;
         let raw_call_invocations =
             self.build_call_invocation_schedules(&bindings, &mut triggers)?;
 
@@ -941,8 +950,36 @@ impl<'a> ReactiveBuilder<'a> {
             .iter()
             .map(|source| source.statement)
             .collect::<BTreeSet<_>>();
+        let statement_parents = self
+            .execution
+            .statements
+            .iter()
+            .flat_map(|parent| parent.children.iter().map(move |child| (*child, parent.id)))
+            .collect::<BTreeMap<_, _>>();
+        let direct_storage_statements = self
+            .execution
+            .statements
+            .iter()
+            .filter(|statement| {
+                let Some(parent) = statement_parents.get(&statement.id) else {
+                    return true;
+                };
+                self.execution
+                    .statements
+                    .get(parent.as_usize())
+                    .filter(|candidate| candidate.id == *parent)
+                    .is_some_and(|parent| {
+                        parent.declaration.is_some()
+                            && matches!(parent.kind, SemanticStatementKind::Field { .. })
+                    })
+            })
+            .map(|statement| statement.id)
+            .collect::<BTreeSet<_>>();
         let mut candidates = Vec::new();
         for statement in &self.execution.statements {
+            if !direct_storage_statements.contains(&statement.id) {
+                continue;
+            }
             let Some(declaration) = statement.declaration else {
                 continue;
             };
@@ -1113,22 +1150,34 @@ impl<'a> ReactiveBuilder<'a> {
             let Some(declaration) = statement.declaration else {
                 continue;
             };
-            let Some(producer) = statement.value else {
+            let Some(statement_producer) = statement.value else {
                 continue;
             };
-            let expression = self.expressions.expression(producer)?;
-            let target = if let Some(state) = state_by_statement.get(&statement.id) {
-                SemanticBindingTargetV1::State { state: state.id }
+            let (producer, target) = if let Some(state) = state_by_statement.get(&statement.id) {
+                let statement_expression = self.expressions.expression(statement_producer)?;
+                let producer = if statement_expression.flow_type == state.flow_type {
+                    statement_producer
+                } else {
+                    state.expression
+                };
+                (producer, SemanticBindingTargetV1::State { state: state.id })
             } else if let Some(list) = list_by_statement.get(&statement.id) {
-                SemanticBindingTargetV1::List { list: list.id }
+                (
+                    statement_producer,
+                    SemanticBindingTargetV1::List { list: list.id },
+                )
             } else if let Some(field) = fields_by_statement.get(&statement.id) {
-                SemanticBindingTargetV1::Field { field: *field }
+                (
+                    statement_producer,
+                    SemanticBindingTargetV1::Field { field: *field },
+                )
             } else if source_by_statement.contains_key(&statement.id) {
                 // The exact source-expression candidate was emitted above.
                 continue;
             } else {
                 continue;
             };
+            let expression = self.expressions.expression(producer)?;
             candidates.push((
                 statement.id,
                 declaration,
@@ -1303,23 +1352,15 @@ impl<'a> ReactiveBuilder<'a> {
         bindings: &'b [SemanticBindingV1],
     ) -> Result<&'b SemanticBindingV1, SemanticReactiveError> {
         let origin = self.expressions.origin(expression.id)?;
-        let matches = bindings
-            .iter()
-            .filter(|binding| {
-                binding.declaration == declaration
-                    && binding.owner == expression.owner
-                    && binding.call_instance == origin.call_instance
-            })
-            .collect::<Vec<_>>();
-        let [binding] = matches.as_slice() else {
-            return Err(SemanticReactiveError::new(format!(
-                "semantic canonical read {} resolves declaration {} to {} exact owner/frame bindings",
-                expression.id,
-                declaration.0,
-                matches.len()
-            )));
-        };
-        Ok(*binding)
+        lexical_binding_for_decl(
+            self.execution,
+            self.out_net,
+            bindings,
+            declaration,
+            expression,
+            origin.call_instance,
+            "semantic canonical read",
+        )
     }
 
     fn build_state_update_arms(
@@ -1505,45 +1546,107 @@ impl<'a> ReactiveBuilder<'a> {
 
     fn build_raw_derived_values(
         &self,
+        semantic_fields: &[SemanticFieldV1],
         bindings: &[SemanticBindingV1],
         triggers: &mut TriggerResolver<'_>,
     ) -> Result<Vec<RawDerivedValue>, SemanticReactiveError> {
-        let fields = bindings
+        let fields_by_statement = semantic_fields
             .iter()
-            .filter_map(|binding| match binding.target {
-                SemanticBindingTargetV1::Field { field } => Some((binding, field)),
-                SemanticBindingTargetV1::Source { .. }
-                | SemanticBindingTargetV1::State { .. }
-                | SemanticBindingTargetV1::List { .. } => None,
+            .map(|field| (field.statement, field.id))
+            .collect::<BTreeMap<_, _>>();
+        let mut fields = Vec::new();
+        for binding in bindings {
+            let (field, materialized) = match binding.target {
+                SemanticBindingTargetV1::Field { field } => (field, None),
+                SemanticBindingTargetV1::List { list } => {
+                    let resource = self
+                        .resources
+                        .lists
+                        .iter()
+                        .find(|resource| resource.id == list)
+                        .ok_or_else(|| {
+                            SemanticReactiveError::new(format!(
+                                "list binding {} references missing semantic list {list}",
+                                binding.id
+                            ))
+                        })?;
+                    let producer = self.expressions.expression(binding.producer)?;
+                    if matches!(
+                        resource.origin,
+                        SemanticListResourceOriginV1::CheckedLiteral { .. }
+                    ) && matches!(producer.kind, SemanticExpressionKind::List { .. })
+                    {
+                        continue;
+                    }
+                    let field = fields_by_statement
+                        .get(&binding.statement)
+                        .copied()
+                        .ok_or_else(|| {
+                            SemanticReactiveError::new(format!(
+                                "computed list binding {} statement {} has no semantic field identity",
+                                binding.id, binding.statement
+                            ))
+                        })?;
+                    (field, Some((resource.id, resource.row_scope)))
+                }
+                SemanticBindingTargetV1::Source { .. } | SemanticBindingTargetV1::State { .. } => {
+                    continue;
+                }
+            };
+            fields.push((binding, field, materialized));
+        }
+        let hold_body_statements = self.hold_body_statement_ids();
+        let retained_output_statements = self
+            .execution
+            .roots
+            .iter()
+            .filter(|root| {
+                matches!(
+                    root.kind,
+                    SemanticRootKindV1::RetainedVisualDocument
+                        | SemanticRootKindV1::RetainedVisualScene
+                )
             })
-            .collect::<Vec<_>>();
+            .map(|root| root.statement)
+            .collect::<BTreeSet<_>>();
         let mut result = Vec::new();
-        for (binding, field) in fields {
-            let triggers_for_value = triggers.trigger_arms_for_expression(binding.producer)?;
+        for (binding, field, materialized) in fields {
+            if hold_body_statements.contains(&binding.statement)
+                || retained_output_statements.contains(&binding.statement)
+            {
+                continue;
+            }
+            let structural_group = self.statement_is_structural_group(binding.statement)?;
+            let structural_host_output = structural_group
+                && self.execution.roots.iter().any(|root| {
+                    root.statement == binding.statement
+                        && root.kind == SemanticRootKindV1::HostValue
+                });
+            if structural_group && !structural_host_output {
+                continue;
+            }
+            let triggers_for_value = if structural_group
+                || materialized.is_some()
+                || !self.expression_owns_event(binding.producer)?
+            {
+                Vec::new()
+            } else {
+                triggers.trigger_arms_for_expression(binding.producer)?
+            };
             let causes = triggers_for_value
                 .iter()
                 .map(|arm| arm.cause)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            let materialized = self
-                .resources
-                .lists
-                .iter()
-                .find(|list| {
-                    matches!(
-                        list.origin,
-                        SemanticListResourceOriginV1::Derived { statement, .. }
-                            if statement == binding.statement
-                    )
-                })
-                .map(|list| (list.id, list.row_scope));
             let kind = if materialized.is_some() {
                 SemanticDerivedValueKindV1::ListView
-            } else if self.expression_is_aggregate(binding.producer)? {
-                SemanticDerivedValueKindV1::Aggregate
+            } else if structural_group {
+                SemanticDerivedValueKindV1::Pure
             } else if !causes.is_empty() {
                 SemanticDerivedValueKindV1::SourceEventTransform
+            } else if self.expression_is_aggregate(binding.producer)? {
+                SemanticDerivedValueKindV1::Aggregate
             } else {
                 SemanticDerivedValueKindV1::Pure
             };
@@ -1562,7 +1665,8 @@ impl<'a> ReactiveBuilder<'a> {
                 }
                 _ => Vec::new(),
             };
-            let startup_recompute = causes.is_empty();
+            let startup_recompute =
+                matches!(kind, SemanticDerivedValueKindV1::SourceEventTransform);
             result.push(RawDerivedValue {
                 binding: binding.id,
                 field,
@@ -1580,6 +1684,93 @@ impl<'a> ReactiveBuilder<'a> {
         }
         result.sort_by_key(|derived| derived.binding);
         Ok(result)
+    }
+
+    fn hold_body_statement_ids(&self) -> BTreeSet<SemanticStatementId> {
+        let mut pending = self
+            .execution
+            .statements
+            .iter()
+            .filter(|statement| matches!(statement.kind, SemanticStatementKind::Hold { .. }))
+            .flat_map(|statement| statement.children.iter().copied())
+            .collect::<Vec<_>>();
+        let mut result = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !result.insert(id) {
+                continue;
+            }
+            if let Some(statement) = self
+                .execution
+                .statements
+                .get(id.as_usize())
+                .filter(|candidate| candidate.id == id)
+            {
+                pending.extend(statement.children.iter().copied());
+            }
+        }
+        result
+    }
+
+    fn expression_owns_event(&self, id: SemanticExprId) -> Result<bool, SemanticReactiveError> {
+        let expression = self.expressions.expression(id)?;
+        Ok(matches!(
+            expression.flow_type.mode,
+            FlowMode::TickPresent | FlowMode::PresentOrAbsent
+        ) || matches!(
+            expression.kind,
+            SemanticExpressionKind::Latest { .. } | SemanticExpressionKind::Hold { .. }
+        ) || matches!(
+            &expression.kind,
+            SemanticExpressionKind::Call { name, .. } if name == "List/latest"
+        ))
+    }
+
+    fn statement_is_structural_group(
+        &self,
+        id: SemanticStatementId,
+    ) -> Result<bool, SemanticReactiveError> {
+        let statement = self
+            .execution
+            .statements
+            .get(id.as_usize())
+            .filter(|candidate| candidate.id == id)
+            .ok_or_else(|| {
+                SemanticReactiveError::new(format!(
+                    "derived value references missing semantic statement {id}"
+                ))
+            })?;
+        if !matches!(statement.kind, SemanticStatementKind::Field { .. }) {
+            return Ok(false);
+        }
+        let Some(value) = statement.value else {
+            return Ok(false);
+        };
+        let expression = self.expressions.expression(value)?;
+        if !matches!(
+            expression.kind,
+            SemanticExpressionKind::Object(_)
+                | SemanticExpressionKind::Record(_)
+                | SemanticExpressionKind::TaggedObject { .. }
+        ) || statement.children.is_empty()
+        {
+            return Ok(false);
+        }
+        Ok(statement.children.iter().all(|child| {
+            self.execution
+                .statements
+                .get(child.as_usize())
+                .filter(|candidate| candidate.id == *child)
+                .is_some_and(|child| {
+                    matches!(
+                        child.kind,
+                        SemanticStatementKind::Field { .. }
+                            | SemanticStatementKind::Source { .. }
+                            | SemanticStatementKind::Hold { .. }
+                            | SemanticStatementKind::List { .. }
+                            | SemanticStatementKind::Spread
+                    )
+                })
+        }))
     }
 
     fn expression_is_aggregate(
@@ -1768,6 +1959,7 @@ impl<'a> ReactiveBuilder<'a> {
         for expression in &self.execution.expressions {
             let SemanticExpressionKind::Call {
                 call,
+                callable_kind,
                 arguments,
                 result,
                 effect,
@@ -1787,8 +1979,25 @@ impl<'a> ReactiveBuilder<'a> {
                         expression.id, call
                     ))
                 })?;
-            if call_definition.external_identity.is_none() {
+            if *callable_kind != crate::SemanticCallableKind::External {
                 continue;
+            }
+            let callable = self
+                .execution
+                .callables
+                .get(call_definition.callable.as_usize())
+                .filter(|candidate| candidate.id == call_definition.callable)
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "external call expression {} references missing callable {}",
+                        expression.id, call_definition.callable
+                    ))
+                })?;
+            if callable.kind != boon_typecheck::CheckedCallableKind::External {
+                return Err(SemanticReactiveError::new(format!(
+                    "external call expression {} maps to non-external callable {}",
+                    expression.id, callable.id
+                )));
             }
             if expression.flow_type != *result || expression.effect != *effect {
                 return Err(SemanticReactiveError::new(format!(
@@ -1835,8 +2044,8 @@ impl<'a> ReactiveBuilder<'a> {
             }
             if !current_capable && invocation_arms.is_empty() {
                 return Err(SemanticReactiveError::new(format!(
-                    "external call expression {} is eventful, stateful, or host-effectful but has no exact source/state invocation arm",
-                    expression.id
+                    "distributed call `{}` expression {} is eventful, stateful, or host-effectful but has no exact SOURCE or state trigger",
+                    call_definition.function, expression.id
                 )));
             }
             schedules.push(RawCallInvocationSchedule {
@@ -2183,12 +2392,129 @@ impl<'a> ExpressionIndex<'a> {
 struct TriggerResolver<'a> {
     execution: &'a SemanticExecutionGraphV1,
     resources: &'a SemanticResourceGraphV1,
+    out_net: &'a ResolvedOutGraph,
     expressions: &'a ExpressionIndex<'a>,
     bindings: &'a [SemanticBindingV1],
-    statement_values: &'a BTreeMap<DeclId, Vec<SemanticStatementId>>,
     local_values: &'a BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
-    parameter_inputs: &'a BTreeMap<SemanticParameterId, Vec<SemanticExprId>>,
+    parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
     causes_cache: BTreeMap<SemanticExprId, BTreeSet<SemanticEventCauseV1>>,
+}
+
+fn lexical_owner_distance(
+    execution: &SemanticExecutionGraphV1,
+    descendant: Option<StaticOwnerId>,
+    ancestor: Option<StaticOwnerId>,
+) -> Result<Option<usize>, SemanticReactiveError> {
+    let mut current = descendant;
+    let mut distance = 0usize;
+    let mut visited = BTreeSet::new();
+    loop {
+        if current == ancestor {
+            return Ok(Some(distance));
+        }
+        let Some(owner) = current else {
+            return Ok(None);
+        };
+        if !visited.insert(owner) {
+            return Err(SemanticReactiveError::new(format!(
+                "semantic static owner {owner} has cyclic ancestry"
+            )));
+        }
+        let definition = execution
+            .static_owners
+            .get(owner.as_usize())
+            .filter(|candidate| candidate.id == owner)
+            .ok_or_else(|| {
+                SemanticReactiveError::new(format!(
+                    "semantic static owner ancestry references missing owner {owner}"
+                ))
+            })?;
+        current = definition.parent;
+        distance = distance.saturating_add(1);
+    }
+}
+
+fn lexical_call_frame_distance(
+    out_net: &ResolvedOutGraph,
+    descendant: Option<crate::OutCallInstanceId>,
+    ancestor: Option<crate::OutCallInstanceId>,
+) -> Result<Option<usize>, SemanticReactiveError> {
+    let mut current = descendant;
+    let mut distance = 0usize;
+    let mut visited = BTreeSet::new();
+    loop {
+        if current == ancestor {
+            return Ok(Some(distance));
+        }
+        let Some(call) = current else {
+            return Ok(None);
+        };
+        if !visited.insert(call) {
+            return Err(SemanticReactiveError::new(format!(
+                "semantic call frame {call} has cyclic ancestry"
+            )));
+        }
+        let instance = out_net
+            .call_instances
+            .get(call.as_usize())
+            .filter(|candidate| candidate.id == call)
+            .ok_or_else(|| {
+                SemanticReactiveError::new(format!(
+                    "semantic call-frame ancestry references missing call {call}"
+                ))
+            })?;
+        current = instance.parent;
+        distance = distance.saturating_add(1);
+    }
+}
+
+fn lexical_binding_for_decl<'a>(
+    execution: &SemanticExecutionGraphV1,
+    out_net: &ResolvedOutGraph,
+    bindings: &'a [SemanticBindingV1],
+    declaration: DeclId,
+    expression: &SemanticExpression,
+    call_instance: Option<crate::OutCallInstanceId>,
+    diagnostic: &str,
+) -> Result<&'a SemanticBindingV1, SemanticReactiveError> {
+    let mut candidates = Vec::new();
+    for binding in bindings
+        .iter()
+        .filter(|binding| binding.declaration == declaration)
+    {
+        let Some(frame_distance) =
+            lexical_call_frame_distance(out_net, call_instance, binding.call_instance)?
+        else {
+            continue;
+        };
+        let Some(owner_distance) =
+            lexical_owner_distance(execution, expression.owner, binding.owner)?
+        else {
+            continue;
+        };
+        candidates.push(((frame_distance, owner_distance), binding));
+    }
+    candidates.sort_by_key(|(distance, binding)| (*distance, binding.id));
+    let Some((best_distance, _)) = candidates.first() else {
+        return Err(SemanticReactiveError::new(format!(
+            "{diagnostic} {} resolves declaration {} to no lexically visible owner/frame binding",
+            expression.id, declaration.0
+        )));
+    };
+    let best = candidates
+        .iter()
+        .filter(|(distance, _)| distance == best_distance)
+        .map(|(_, binding)| *binding)
+        .collect::<Vec<_>>();
+    let [binding] = best.as_slice() else {
+        return Err(SemanticReactiveError::new(format!(
+            "{diagnostic} {} resolves declaration {} to {} equally-near lexical bindings",
+            expression.id,
+            declaration.0,
+            best.len()
+        )));
+    };
+    Ok(*binding)
 }
 
 impl<'a> TriggerResolver<'a> {
@@ -2196,11 +2522,11 @@ impl<'a> TriggerResolver<'a> {
     fn new(
         execution: &'a SemanticExecutionGraphV1,
         resources: &'a SemanticResourceGraphV1,
+        out_net: &'a ResolvedOutGraph,
         expressions: &'a ExpressionIndex<'a>,
         bindings: &'a [SemanticBindingV1],
-        statement_values: &'a BTreeMap<DeclId, Vec<SemanticStatementId>>,
         local_values: &'a BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
-        parameter_inputs: &'a BTreeMap<SemanticParameterId, Vec<SemanticExprId>>,
+        parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
     ) -> Result<Self, SemanticReactiveError> {
         for source in &resources.sources {
             if execution
@@ -2231,9 +2557,9 @@ impl<'a> TriggerResolver<'a> {
         Ok(Self {
             execution,
             resources,
+            out_net,
             expressions,
             bindings,
-            statement_values,
             local_values,
             parameter_inputs,
             causes_cache: BTreeMap::new(),
@@ -2283,10 +2609,10 @@ impl<'a> TriggerResolver<'a> {
                 self.collect_event_causes(producer, visited, causes)?;
             }
             SemanticExpressionKind::FunctionParameter { parameter, .. } => {
-                let inputs = self.parameter_inputs.get(parameter).ok_or_else(|| {
+                let inputs = self.parameter_inputs.get(&id).ok_or_else(|| {
                     SemanticReactiveError::new(format!(
-                        "semantic function parameter {:?} has no exact input inventory",
-                        parameter
+                        "semantic function parameter expression {} ({:?}) has no exact producer input inventory",
+                        id, parameter
                     ))
                 })?;
                 for input in inputs {
@@ -2352,16 +2678,60 @@ impl<'a> TriggerResolver<'a> {
             }
         }
         if matches!(expression.kind, SemanticExpressionKind::Source { .. }) {
-            let matches = self
+            let mut matches = self
                 .resources
                 .sources
                 .iter()
                 .filter(|source| source.expression == expression.id)
                 .map(|source| source.id)
                 .collect::<Vec<_>>();
+            if matches.is_empty() {
+                let origin = self.expressions.origin(expression.id)?;
+                matches = self
+                    .resources
+                    .sources
+                    .iter()
+                    .filter_map(|source| {
+                        let definition = self
+                            .execution
+                            .sources
+                            .get(source.id.as_usize())
+                            .filter(|definition| definition.id == source.id)?;
+                        let producer = self
+                            .execution
+                            .expressions
+                            .get(definition.expression.as_usize())
+                            .filter(|producer| producer.id == definition.expression)?;
+                        (producer.checked_expr_id == expression.checked_expr_id
+                            && definition.owner == expression.owner
+                            && definition.call_instance == origin.call_instance)
+                            .then_some(source.id)
+                    })
+                    .collect();
+            }
+            matches.sort();
+            matches.dedup();
             let [source] = matches.as_slice() else {
+                let details = matches
+                    .iter()
+                    .filter_map(|source| {
+                        self.execution
+                            .sources
+                            .get(source.as_usize())
+                            .filter(|definition| definition.id == *source)
+                            .map(|definition| {
+                                (
+                                    definition.id,
+                                    definition.expression,
+                                    definition.owner,
+                                    definition.call_instance,
+                                    definition.binding_path.as_str(),
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
                 return Err(SemanticReactiveError::new(format!(
-                    "semantic SOURCE expression {} resolves to {} source resources",
+                    "semantic SOURCE expression {} resolves to {} exact occurrence resources: {details:?}",
                     expression.id,
                     matches.len()
                 )));
@@ -2680,32 +3050,15 @@ impl<'a> TriggerResolver<'a> {
         expression: &SemanticExpression,
     ) -> Result<&SemanticBindingV1, SemanticReactiveError> {
         let origin = self.expressions.origin(expression.id)?;
-        // Absence is represented as an empty candidate set solely so the
-        // exact-cardinality check below reports zero; it never suppresses or
-        // substitutes a binding.
-        let statement_ids = self
-            .statement_values
-            .get(&declaration)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let matches = self
-            .bindings
-            .iter()
-            .filter(|binding| {
-                statement_ids.contains(&binding.statement)
-                    && binding.owner == expression.owner
-                    && binding.call_instance == origin.call_instance
-            })
-            .collect::<Vec<_>>();
-        let [binding] = matches.as_slice() else {
-            return Err(SemanticReactiveError::new(format!(
-                "reactive expression {} resolves declaration {} to {} exact bindings",
-                expression.id,
-                declaration.0,
-                matches.len()
-            )));
-        };
-        Ok(*binding)
+        lexical_binding_for_decl(
+            self.execution,
+            self.out_net,
+            self.bindings,
+            declaration,
+            expression,
+            origin.call_instance,
+            "reactive expression",
+        )
     }
 }
 
@@ -2896,16 +3249,14 @@ fn unique_binding_for_target<'a>(
         })?;
     let matches = bindings
         .iter()
-        .filter(|binding| {
-            binding.target == target
-                && binding.owner == expression.owner
-                && binding.call_instance == origin.call_instance
-        })
+        .filter(|binding| binding.target == target)
         .collect::<Vec<_>>();
     let [binding] = matches.as_slice() else {
         return Err(SemanticReactiveError::new(format!(
-            "semantic read {} resolves target {:?} to {} exact bindings",
+            "semantic read {} at owner {:?}, frame {:?} resolves occurrence target {:?} to {} exact bindings",
             expression.id,
+            expression.owner,
+            origin.call_instance,
             target,
             matches.len()
         )));

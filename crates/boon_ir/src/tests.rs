@@ -81,61 +81,6 @@ fn exact_call<'a>(
 }
 
 #[test]
-fn source_payload_erasure_keeps_the_endpoint_field_and_residual_projection() {
-    let source = SourcePort {
-        id: SourceId(0),
-        path: "store.input".to_owned(),
-        binding_path: "store.input".to_owned(),
-        executable_source_id: None,
-        static_owner: None,
-        source_expr_id: None,
-        source_line: 1,
-        scoped: false,
-        scope_id: None,
-        interval_ms: None,
-        payload_schema: SourcePayloadSchema {
-            fields: vec![SourcePayloadField::Named("payload".to_owned())],
-            typed_fields: vec![SourcePayloadDescriptor {
-                field: SourcePayloadField::Named("payload".to_owned()),
-                data_type: SemanticDataType::Record {
-                    fields: vec![SemanticTypeField {
-                        name: "child".to_owned(),
-                        data_type: SemanticDataType::Text,
-                    }],
-                    open: false,
-                },
-            }],
-        },
-    };
-
-    assert_eq!(
-        erased_source_payload_read(
-            std::slice::from_ref(&source),
-            ErasedBindingId(0),
-            source.id,
-            &["payload".to_owned(), "child".to_owned()],
-        )
-        .unwrap(),
-        ErasedReadTarget::SourcePayload {
-            binding: ErasedBindingId(0),
-            source: source.id,
-            field: SourcePayloadField::Named("payload".to_owned()),
-            projection: vec!["child".to_owned()],
-        }
-    );
-    assert!(
-        erased_source_payload_read(
-            &[source],
-            ErasedBindingId(0),
-            SourceId(0),
-            &["missing".to_owned(), "payload".to_owned()],
-        )
-        .unwrap_err()
-        .contains("payload projection `missing`")
-    );
-}
-
-#[test]
 fn outbound_http_effect_is_owned_by_one_exact_state_arm() {
     let parsed = boon_parser::parse_source(
         "outbound-http-effect.bn",

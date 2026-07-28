@@ -1253,6 +1253,16 @@ fields = [
 ]
 
 [[records]]
+kind = "struct"
+source = "crates/boon_ir/src/lib.rs"
+name = "ErasedBundle"
+fields = [
+  { name = "role_programs", disposition = "r-f-priv-id-pc-n", reviewed = true },
+  { name = "bundle_semantic_program_digest", disposition = "r-a-priv-id-pc-n", reviewed = true },
+  { name = "bundle_verification_manifest_digest", disposition = "r-a-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
 kind = "enum"
 source = "crates/boon_ir/src/lib.rs"
 name = "ErasedDependencyTarget"
@@ -1583,6 +1593,15 @@ disposition = "r-f-priv-id-pc-n"
 reviewed = true
 fields = [
   { name = "reference", disposition = "r-f-priv-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "ElementState"
+disposition = "r-frc-priv-id-pc-n"
+reviewed = true
+fields = [
+  { name = "context", disposition = "r-frc-priv-id-pc-n", reviewed = true },
+  { name = "projection", disposition = "r-frc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -9732,6 +9751,13 @@ fields = [
 ]
 
 [[records.variants]]
+name = "InlineValue"
+disposition = "r-frc-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
 name = "Alias"
 disposition = "r-frc-priv-sp-id-pc-n"
 reviewed = true
@@ -10394,6 +10420,32 @@ fields = [
 [[records]]
 kind = "enum"
 source = "crates/boon_semantic/src/view_contract.rs"
+name = "SemanticViewBindingKindV1"
+
+[[records.variants]]
+name = "Data"
+disposition = "a-c-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Source"
+disposition = "r-rc-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Target"
+disposition = "a-c-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/view_contract.rs"
 name = "SemanticViewBindingTargetV1"
 
 [[records.variants]]
@@ -10425,6 +10477,9 @@ fields = [
   { name = "expression", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "value", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "target", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "kind", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "canonical_attribute", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "additional_projection", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "route_scope", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "row", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
   { name = "diagnostic_node", disposition = "r-d-diag-so-n", reviewed = true },

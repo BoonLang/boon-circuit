@@ -7417,6 +7417,13 @@ impl<'a> CheckedProgramBuilder<'a> {
                 });
                 continue;
             };
+            let authority_item_type = declaration_values
+                .get(&declaration)
+                .and_then(|(_, flow_type)| match &flow_type.ty {
+                    Type::List(item_type) => Some(item_type.as_ref().clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| item_type.as_ref().clone());
             let projection = checked_declaration_resource_projection(
                 &self.signatures,
                 &declaration_values,
@@ -7436,7 +7443,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     anchor: declaration,
                     projection,
                 },
-                item_type: item_type.as_ref().clone(),
+                item_type: authority_item_type,
                 capacity: *capacity,
                 key_policy: CheckedListKeyPolicy::GeneratedOccurrenceU64 {
                     has_generation: true,

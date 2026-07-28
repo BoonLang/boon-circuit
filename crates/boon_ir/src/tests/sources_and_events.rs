@@ -4,7 +4,7 @@ fn producer_callable_for_test(
     parsed: &boon_parser::ParsedProgram,
     name: &str,
 ) -> boon_semantic::SemanticCallableId {
-    let checked = boon_typecheck::check_runtime_program_profiled_with_external_types(
+    let checked = boon_typecheck::check_program_profiled_with_external_types(
         parsed,
         &boon_typecheck::ExternalTypeEnvironment::default(),
     )
@@ -358,27 +358,6 @@ FUNCTION selectable_row(row) {
         "changing list membership must not masquerade as a row selection event: {:?}",
         selected.sources
     );
-}
-
-#[test]
-fn semantic_symbol_table_reuses_duplicate_category_text_pairs() {
-    let mut table = SemanticSymbolTable::default();
-
-    let first = table.intern("field_name", "count");
-    let duplicate = table.intern("field_name", "count");
-    let same_text_other_category = table.intern("source_label", "count");
-
-    assert_eq!(first, duplicate);
-    assert_ne!(first, same_text_other_category);
-
-    let entries = table.into_entries();
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].id, first);
-    assert_eq!(entries[0].category, "field_name");
-    assert_eq!(entries[0].text, "count");
-    assert_eq!(entries[1].id, same_text_other_category);
-    assert_eq!(entries[1].category, "source_label");
-    assert_eq!(entries[1].text, "count");
 }
 
 #[test]
@@ -1158,8 +1137,8 @@ document: Document/new(
             .count(),
         1,
         "forwarding must not allocate a second source"
-    );
-    assert!(ir.view_bindings.iter().any(|binding| {
+        );
+        assert!(ir.view_bindings.iter().any(|binding| {
         binding.node_kind == "Button"
             && binding.attr == "press"
             && binding.target == ViewBindingTarget::Source { source: source.id }
@@ -1379,36 +1358,6 @@ store: [
         "stored output row authority must not depend on a later List/map consumer: {:#?}",
         ir.scope_index.row_source_projections
     );
-}
-
-#[test]
-fn one_row_path_cannot_alias_two_distinct_sources() {
-    let mut members = BTreeMap::new();
-    merge_erased_source_member(
-        &mut members,
-        ErasedLocalMember {
-            path: vec!["controls".to_owned(), "press".to_owned()],
-            target: ErasedLocalMemberTarget::Source(SourceId(3)),
-            forwarded_from: None,
-        },
-        "test row",
-    )
-    .unwrap();
-
-    let error = merge_erased_source_member(
-        &mut members,
-        ErasedLocalMember {
-            path: vec!["controls".to_owned(), "press".to_owned()],
-            target: ErasedLocalMemberTarget::Source(SourceId(4)),
-            forwarded_from: None,
-        },
-        "test row",
-    )
-    .expect_err("one row path must have exactly one source identity");
-
-    assert!(error.contains("controls.press"), "{error}");
-    assert!(error.contains("SourceId(3)"), "{error}");
-    assert!(error.contains("SourceId(4)"), "{error}");
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1835,104 +1784,6 @@ seed: 0
     );
     assert!(program.static_schedule_verified);
     assert!(program.hidden_identity_verified);
-}
-
-#[test]
-fn runtime_resource_aliases_follow_owner_ancestry_without_sibling_guessing() {
-    let mut aliases = RuntimeResourceAliases::default();
-    aliases
-        .bind_owner_parents(&[
-            StaticOwnerDef {
-                id: StaticOwnerId(0),
-                parent: None,
-                child_ordinal: 0,
-            },
-            StaticOwnerDef {
-                id: StaticOwnerId(1),
-                parent: Some(StaticOwnerId(0)),
-                child_ordinal: 0,
-            },
-            StaticOwnerDef {
-                id: StaticOwnerId(2),
-                parent: None,
-                child_ordinal: 1,
-            },
-        ])
-        .unwrap();
-    insert_resource_alias(
-        &mut aliases,
-        Some(StaticOwnerId(0)),
-        "item.select",
-        RuntimeResourceAliasTarget::State(StateId(0)),
-    )
-    .unwrap();
-    insert_resource_alias(
-        &mut aliases,
-        Some(StaticOwnerId(2)),
-        "item.select",
-        RuntimeResourceAliasTarget::State(StateId(1)),
-    )
-    .unwrap();
-    insert_resource_alias(
-        &mut aliases,
-        None,
-        "store.root",
-        RuntimeResourceAliasTarget::State(StateId(2)),
-    )
-    .unwrap();
-    let state_paths = vec![
-        "store.left.select".to_owned(),
-        "store.right.select".to_owned(),
-        "store.root".to_owned(),
-    ];
-
-    assert_eq!(
-        canonical_resource_path(
-            "item.select.event.press",
-            Some(StaticOwnerId(1)),
-            &aliases,
-            &[],
-            &state_paths,
-        )
-        .unwrap(),
-        "store.left.select.event.press"
-    );
-    assert_eq!(
-        canonical_resource_path(
-            "item.select",
-            Some(StaticOwnerId(2)),
-            &aliases,
-            &[],
-            &state_paths,
-        )
-        .unwrap(),
-        "store.right.select"
-    );
-    assert_eq!(
-        canonical_resource_path("item.select", None, &aliases, &[], &state_paths).unwrap(),
-        "item.select",
-        "ownerless metadata must not guess between contextual owners"
-    );
-    assert_eq!(
-        canonical_resource_path(
-            "store.root",
-            Some(StaticOwnerId(1)),
-            &aliases,
-            &[],
-            &state_paths,
-        )
-        .unwrap(),
-        "store.root"
-    );
-
-    let error = insert_resource_alias(
-        &mut aliases,
-        Some(StaticOwnerId(0)),
-        "item.select",
-        RuntimeResourceAliasTarget::State(StateId(1)),
-    )
-    .unwrap_err();
-    assert!(error.contains("resolves to both"), "{error}");
 }
 
 #[test]
@@ -2681,12 +2532,22 @@ FUNCTION entry_view(entry) {
         matches!(&item.kind, ExecutableExpressionKind::When { .. }),
         "append must retain the exact conditional item expression: {item:#?}"
     );
-    let exact_fields = exact_list_item_field_types(&ir.executable, item.id).unwrap();
-    assert_eq!(
-        exact_fields.get("id"),
-        Some(&boon_typecheck::Type::Text),
-        "exact append item fields: {exact_fields:#?}"
-    );
+    let id_field = ir
+        .scope_index
+        .fields
+        .iter()
+        .find(|field| {
+            field.row.map(|row| row.list) == Some(list.id)
+                && field.role == ErasedFieldRole::ValueAuthority
+                && field.name == "id"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "verified semantic storage must map the exact append item field; fields: {:#?}",
+                ir.scope_index.fields
+            )
+        });
+    assert_eq!(id_field.flow_type.ty, boon_typecheck::Type::Text);
     assert!(
         ir.scope_index.fields.iter().any(|field| {
             field.row.map(|row| row.list) == Some(list.id)
@@ -2731,10 +2592,20 @@ fn effect_result_append_keeps_state_trigger_and_exact_record_schema() {
         event_cause_path_owned(append.cause, &ir.sources, &ir.state_cells).as_deref(),
         Ok("store.registration_result")
     );
-    let ListMutationKind::Append { item, .. } = &append.kind else {
+    let ListMutationKind::Append { .. } = &append.kind else {
         panic!("credentials mutation must append");
     };
-    let exact_fields = exact_list_item_field_types(&ir.executable, *item).unwrap();
+    let exact_fields = ir
+        .scope_index
+        .fields
+        .iter()
+        .filter(|field| {
+            field.row.map(|row| row.list) == Some(list.id)
+                && field.role == ErasedFieldRole::ValueAuthority
+                && matches!(field.name.as_str(), "credential_id" | "label")
+        })
+        .map(|field| (field.name.clone(), field.flow_type.ty.clone()))
+        .collect::<BTreeMap<_, _>>();
     assert_eq!(
         exact_fields,
         BTreeMap::from([

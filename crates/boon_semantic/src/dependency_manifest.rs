@@ -5110,7 +5110,7 @@ fn inventory_reactive(
             ],
             top_subject(
                 SemanticDependencySubjectKindV1::ReactiveCallSchedule,
-                call_entity(schedule.call),
+                expression_entity(schedule.expression),
             ),
             SemanticDependencySemanticsV1 {
                 multiplicity: if schedule.current_capable {
@@ -6256,7 +6256,7 @@ fn inventory_view(
     }
 
     for binding in &view.bindings {
-        let capture = reactive
+        let _capture = reactive
             .view_captures
             .get(binding.capture.as_usize())
             .filter(|capture| capture.id == binding.capture)
@@ -6266,13 +6266,10 @@ fn inventory_view(
                     binding.id, binding.capture
                 ))
             })?;
-        let mut owner_candidates = vec![
+        let owner_candidates = vec![
             view_root_owner(view, binding.root, execution, owners)?,
             view_node_owner(view, binding.node, execution, owners)?,
             view_argument_owner(view, binding.argument, execution, owners)?,
-            owners.expression(binding.expression)?,
-            owners.expression(capture.expression)?,
-            semantic_scope_owner(execution, binding.route_scope, owners)?,
         ];
         let target = match binding.target {
             SemanticViewBindingTargetV1::Data { read } => {
@@ -6286,17 +6283,10 @@ fn inventory_view(
                             binding.id
                         ))
                     })?;
-                owner_candidates.push(owners.expression(read.expression)?);
                 read_entity(read.id)
             }
-            SemanticViewBindingTargetV1::Event { source } => {
-                owner_candidates.push(owners.source(source)?);
-                source_entity(source)
-            }
+            SemanticViewBindingTargetV1::Event { source } => source_entity(source),
         };
-        if let Some(row) = binding.row {
-            owner_candidates.push(owners.list(row.list)?);
-        }
         let owner = exact_owner(owner_candidates, &format!("view binding {}", binding.id))?;
         let entity = view_binding_entity(binding.id);
         let mut references = vec![

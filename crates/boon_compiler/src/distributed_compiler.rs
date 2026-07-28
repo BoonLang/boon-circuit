@@ -117,8 +117,7 @@ struct PrelinkedCallSite {
     occurrence_path: String,
     canonical_function: String,
     producer_role: ProgramRole,
-    stable_identity: DistributedDeclarationId,
-    call_site_id: RemoteCallSiteId,
+    producer_materialization_identity: [u8; 32],
     mode: DistributedCallMode,
 }
 
@@ -175,6 +174,7 @@ struct CallLink {
     owner: PlanOwner,
     stable_identity: DistributedDeclarationId,
     call_site_id: RemoteCallSiteId,
+    producer_materialization_identity: [u8; 32],
     call: DistributedCall,
     function_export_id: ExportId,
     result: DistributedCallResultPlan,
@@ -204,11 +204,17 @@ pub fn compile_distributed_runtime_source_programs(
     let DistributedSemanticFixedPoint {
         bundle,
         prelinked_calls,
-    } = resolve_distributed_semantic_fixed_point(&solved.checked, &prelude)?;
-    let mut semantic_programs = bundle
+    } = resolve_distributed_semantic_fixed_point(&solved.checked)?;
+    let lower_started = Instant::now();
+    let verified_bundle = boon_verify::verify_bundle(
+        bundle,
+        boon_verify::VerificationPolicyV1::explicit_contracts_bootstrap(),
+    )?;
+    let erased_bundle = boon_ir::erase_and_lower_bundle(verified_bundle)?;
+    let lower_ms = elapsed_ms(lower_started);
+    let mut erased_programs = erased_bundle
         .into_role_programs()
         .into_iter()
-        .map(|program| (program.role(), program))
         .collect::<BTreeMap<_, _>>();
     let mut lowered = BTreeMap::<ProgramRole, LoweredRole>::new();
     for role in [
@@ -218,9 +224,10 @@ pub fn compile_distributed_runtime_source_programs(
     ] {
         let program = lower_parsed_role(
             parsed.get(&role).expect("validated parsed role"),
-            semantic_programs
+            erased_programs
                 .remove(&role)
-                .expect("fixed-point semantic role authority"),
+                .expect("atomically erased role authority"),
+            lower_ms,
         )?;
         lowered.insert(role, program);
     }
@@ -330,7 +337,6 @@ struct DistributedSemanticFixedPoint {
 
 fn resolve_distributed_semantic_fixed_point(
     checked: &BTreeMap<ProgramRole, CheckedProgram>,
-    prelude: &DistributedGraphPrelude,
 ) -> CompilerResult<DistributedSemanticFixedPoint> {
     let roles = [
         ProgramRole::Client,
@@ -424,7 +430,7 @@ fn resolve_distributed_semantic_fixed_point(
                 )
                 .into());
             }
-            let prelinked_calls = prelinked_calls_from_semantic_bundle(&confirmed_bundle, prelude)?;
+            let prelinked_calls = prelinked_calls_from_semantic_bundle(&confirmed_bundle)?;
             return Ok(DistributedSemanticFixedPoint {
                 bundle: confirmed_bundle,
                 prelinked_calls,
@@ -727,26 +733,9 @@ fn semantic_program_array(
 
 fn prelinked_calls_from_semantic_bundle(
     bundle: &boon_semantic::BundleSemanticProgramV1,
-    prelude: &DistributedGraphPrelude,
 ) -> Result<BTreeMap<(ProgramRole, String), PrelinkedCallSite>, PlanError> {
     let mut prelinked = BTreeMap::new();
     for crossing in bundle.call_crossings() {
-        let stable_identity = DistributedDeclarationId::from_semantic_path(
-            role_namespace(crossing.consumer_role),
-            &format!(
-                "semantic-call-site:{}",
-                distributed_identity_hex(&crossing.producer_materialization_identity)
-            ),
-        )?;
-        let call_site_id = RemoteCallSiteId::from_identity(
-            prelude.graph_identity.graph_id,
-            prelude
-                .endpoints
-                .get(&crossing.consumer_role)
-                .expect("consumer endpoint")
-                .endpoint_id,
-            stable_identity,
-        )?;
         let mode = match crossing.mode {
             boon_semantic::ProducerMaterializationMode::Current => DistributedCallMode::Current,
             boon_semantic::ProducerMaterializationMode::Invocation => {
@@ -758,15 +747,15 @@ fn prelinked_calls_from_semantic_bundle(
             occurrence_path: crossing.occurrence_path.clone(),
             canonical_function: crossing.canonical_function.clone(),
             producer_role: crossing.producer_role,
-            stable_identity,
-            call_site_id,
+            producer_materialization_identity: crossing.producer_materialization_identity,
             mode,
         };
         let key = (crossing.consumer_role, crossing.occurrence_path.clone());
         if let Some(previous) = prelinked.insert(key, site.clone())
             && (previous.canonical_function != site.canonical_function
                 || previous.producer_role != site.producer_role
-                || previous.call_site_id != site.call_site_id
+                || previous.producer_materialization_identity
+                    != site.producer_materialization_identity
                 || previous.mode != site.mode)
         {
             return Err(PlanError::new(format!(
@@ -812,11 +801,9 @@ fn parse_role(request: &DistributedCompilerProgram) -> CompilerResult<ParsedRole
 
 fn lower_parsed_role(
     program: &ParsedRole,
-    semantic: boon_semantic::SemanticProgram,
+    ir: ErasedProgram,
+    lower_ms: f64,
 ) -> CompilerResult<LoweredRole> {
-    let lower_started = Instant::now();
-    let ir = super::verify_and_lower_semantic(semantic)?;
-    let lower_ms = elapsed_ms(lower_started);
     let verify_started = Instant::now();
     verify_hidden_identity(&ir)?;
     verify_static_schedule(&ir)?;
@@ -1737,6 +1724,7 @@ fn link_lowered_roles(
     let mut function_links = BTreeMap::<(ProgramRole, String), FunctionLink>::new();
     let mut call_links = Vec::new();
     let mut linked_call_occurrences = BTreeSet::new();
+    let mut call_site_ordinals = BTreeMap::<(ProgramRole, String, String), usize>::new();
     let mut next_synthetic_source_ids = lowered
         .iter()
         .map(|(role, program)| (*role, program.ir.sources.len()))
@@ -2040,8 +2028,34 @@ fn link_lowered_roles(
                 call.owner,
                 &format!("distributed call `{}`", call.canonical_function),
             )?;
-            let stable_identity = prelinked.stable_identity;
-            let call_site_id = prelinked.call_site_id;
+            let stable_owner_path = owner_path
+                .split_once("@row-owner:")
+                .or_else(|| owner_path.split_once("@owner:"))
+                .map_or(owner_path.as_str(), |(path, _)| path);
+            let ordinal_key = (
+                *consumer_role,
+                stable_owner_path.to_owned(),
+                call.canonical_function.clone(),
+            );
+            let occurrence_ordinal = call_site_ordinals.entry(ordinal_key).or_default();
+            let stable_identity = DistributedDeclarationId::from_semantic_path(
+                role_namespace(*consumer_role),
+                &format!(
+                    "call:{stable_owner_path}:{}:{}",
+                    call.canonical_function, *occurrence_ordinal
+                ),
+            )?;
+            *occurrence_ordinal = occurrence_ordinal.checked_add(1).ok_or_else(|| {
+                PlanError::new("distributed call-site occurrence ordinals exhausted")
+            })?;
+            let call_site_id = RemoteCallSiteId::from_identity(
+                graph_identity.graph_id,
+                endpoints
+                    .get(consumer_role)
+                    .expect("consumer endpoint")
+                    .endpoint_id,
+                stable_identity,
+            )?;
             let result = match mode {
                 DistributedCallMode::Current => DistributedCallResultPlan::Current {
                     import_id: ImportId::from_remote_call_result(call_site_id)?,
@@ -2096,6 +2110,7 @@ fn link_lowered_roles(
                 owner,
                 stable_identity,
                 call_site_id,
+                producer_materialization_identity: prelinked.producer_materialization_identity,
                 call: call.clone(),
                 function_export_id: function.export_id,
                 result,
@@ -2170,20 +2185,28 @@ fn link_lowered_roles(
         let producer = lowered
             .get(&function.producer_role)
             .expect("compiled function producer");
-        let instance = producer
+        let instances = producer
             .ir
             .producer_function_instances
             .iter()
-            .find(|instance| {
-                instance.identity == link.call_site_id.0
-                    && instance.function_name == function_link.local_function
-            })
-            .ok_or_else(|| {
-                PlanError::new(format!(
-                    "producer function `{}` has no exact pre-lowered graph instance",
-                    link.call.canonical_function
-                ))
-            })?;
+            .filter(|instance| instance.identity == link.producer_materialization_identity)
+            .collect::<Vec<_>>();
+        let [instance] = instances.as_slice() else {
+            return Err(PlanError::new(format!(
+                "producer function `{}` materialization {} maps to {} pre-lowered graph instances",
+                link.call.canonical_function,
+                distributed_identity_hex(&link.producer_materialization_identity),
+                instances.len()
+            ))
+            .into());
+        };
+        if instance.function_name != function_link.local_function {
+            return Err(PlanError::new(format!(
+                "producer function `{}` materialization resolves to executable function `{}`",
+                link.call.canonical_function, instance.function_name
+            ))
+            .into());
+        }
         let instance_plan = ProducerFunctionInstancePlan::new(
             link.call_site_id,
             function,

@@ -1748,9 +1748,7 @@ impl<'a> ReactiveBuilder<'a> {
         let expression = self.expressions.expression(value)?;
         if !matches!(
             expression.kind,
-            SemanticExpressionKind::Object(_)
-                | SemanticExpressionKind::Record(_)
-                | SemanticExpressionKind::TaggedObject { .. }
+            SemanticExpressionKind::Object(_) | SemanticExpressionKind::TaggedObject { .. }
         ) || statement.children.is_empty()
         {
             return Ok(false);
@@ -3075,7 +3073,6 @@ fn semantic_expression_children(
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Delimiter
@@ -3102,8 +3099,7 @@ fn semantic_expression_children(
             })
             .collect(),
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
         SemanticExpressionKind::Block { bindings, result } => bindings

@@ -1065,9 +1065,7 @@ fn concrete_structural_type(
     kind: &SemanticExpressionKind,
 ) -> Option<Type> {
     match kind {
-        SemanticExpressionKind::Object(fields) | SemanticExpressionKind::Record(fields) => {
-            concrete_record_type(expressions, fields)
-        }
+        SemanticExpressionKind::Object(fields) => concrete_record_type(expressions, fields),
         SemanticExpressionKind::TaggedObject { tag, fields } => {
             let Type::Object(shape) = concrete_record_type(expressions, fields)? else {
                 return None;
@@ -2554,7 +2552,6 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Materialize { .. }
@@ -2569,8 +2566,7 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
             })
             .collect(),
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
         SemanticExpressionKind::Call { arguments, .. } => {
@@ -3282,7 +3278,6 @@ fn rebase_expression_kind(
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Materialize { .. }
@@ -3301,8 +3296,7 @@ fn rebase_expression_kind(
             }
         }
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             for field in fields {
                 rebase(&mut field.value);
             }
@@ -3690,7 +3684,6 @@ impl<'a> LocalProvenanceResolver<'a> {
                             vec![value]
                         }
                         SemanticExpressionKind::Object(fields)
-                        | SemanticExpressionKind::Record(fields)
                         | SemanticExpressionKind::TaggedObject { fields, .. } => {
                             fields.iter().map(|field| field.value).collect()
                         }
@@ -3758,7 +3751,6 @@ impl<'a> LocalProvenanceResolver<'a> {
                             cached(value)?.projected(&projection)
                         }
                         SemanticExpressionKind::Object(fields)
-                        | SemanticExpressionKind::Record(fields)
                         | SemanticExpressionKind::TaggedObject { fields, .. } => {
                             if fields.is_empty() {
                                 runtime_value_provenance()
@@ -4047,7 +4039,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
         };
         match kind {
             SemanticExpressionKind::Object(fields)
-            | SemanticExpressionKind::Record(fields)
             | SemanticExpressionKind::TaggedObject { fields, .. } => {
                 record_value_provenance(&self.expressions, fields)
             }
@@ -4122,7 +4113,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
             | SemanticExpressionKind::TextTemplate { .. }
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
-            | SemanticExpressionKind::Bool(_)
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::Call { .. }
             | SemanticExpressionKind::Materialize { .. }
@@ -4660,7 +4650,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
             }
             CheckedExpressionKind::Number { value } => SemanticExpressionKind::Number(value),
             CheckedExpressionKind::BytesByte { value } => SemanticExpressionKind::BytesByte(value),
-            CheckedExpressionKind::Bool { value } => SemanticExpressionKind::Bool(value),
             CheckedExpressionKind::Tag { name } => SemanticExpressionKind::Tag(name),
             CheckedExpressionKind::TaggedObject { tag, fields } => {
                 SemanticExpressionKind::TaggedObject {
@@ -4772,9 +4761,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 SemanticExpressionKind::Block { bindings, result }
             }
             CheckedExpressionKind::Object { fields } => SemanticExpressionKind::Object(
-                self.expand_fields(scoped.frame, scoped.value_frame, fields)?,
-            ),
-            CheckedExpressionKind::Record { fields } => SemanticExpressionKind::Record(
                 self.expand_fields(scoped.frame, scoped.value_frame, fields)?,
             ),
             CheckedExpressionKind::List { capacity, items } => SemanticExpressionKind::List {
@@ -5245,7 +5231,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
             };
             let direct_field = match &self.expressions[input.as_usize()].kind {
                 SemanticExpressionKind::Object(record_fields)
-                | SemanticExpressionKind::Record(record_fields)
                     if record_fields.iter().all(|field| !field.spread) =>
                 {
                     let matches = record_fields

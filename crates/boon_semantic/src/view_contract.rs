@@ -832,7 +832,6 @@ impl BindingLeafTraversal<'_> {
             (
                 BindingLeafMode::Element,
                 SemanticExpressionKind::Object(fields)
-                | SemanticExpressionKind::Record(fields)
                 | SemanticExpressionKind::TaggedObject { fields, .. },
             ) => {
                 for field in fields {
@@ -861,7 +860,6 @@ impl BindingLeafTraversal<'_> {
             (
                 BindingLeafMode::Style { .. },
                 SemanticExpressionKind::Object(fields)
-                | SemanticExpressionKind::Record(fields)
                 | SemanticExpressionKind::TaggedObject { fields, .. },
             ) => {
                 for field in fields {
@@ -883,7 +881,6 @@ impl BindingLeafTraversal<'_> {
             (
                 BindingLeafMode::Events { attribute },
                 SemanticExpressionKind::Object(fields)
-                | SemanticExpressionKind::Record(fields)
                 | SemanticExpressionKind::TaggedObject { fields, .. },
             ) => {
                 for field in fields {
@@ -933,7 +930,6 @@ fn expression_children(
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Delimiter
@@ -957,8 +953,7 @@ fn expression_children(
             })
             .collect(),
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
         SemanticExpressionKind::Call { arguments, .. } => {
@@ -993,9 +988,7 @@ fn expression_children(
 fn record_style_render_node(expression: &SemanticExpression) -> bool {
     if !matches!(
         expression.kind,
-        SemanticExpressionKind::Object(_)
-            | SemanticExpressionKind::Record(_)
-            | SemanticExpressionKind::TaggedObject { .. }
+        SemanticExpressionKind::Object(_) | SemanticExpressionKind::TaggedObject { .. }
     ) {
         return false;
     }

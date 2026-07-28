@@ -392,7 +392,7 @@ impl<'a> DocumentCompiler<'a> {
             } else {
                 match &expression.kind {
                     ir::ExecutableExpressionKind::Object(fields)
-                    | ir::ExecutableExpressionKind::Record(fields)
+                    | ir::ExecutableExpressionKind::Object(fields)
                         if fields.iter().all(|field| !field.spread) =>
                     {
                         let matches = fields
@@ -699,9 +699,6 @@ impl<'a> DocumentCompiler<'a> {
                     value: vec![*value],
                 },
             )),
-            ir::ExecutableExpressionKind::Bool(value) => {
-                Ok(self.constant_expr(compiler_id, DocumentConstantValue::Bool { value: *value }))
-            }
             ir::ExecutableExpressionKind::Tag(value) => self.compile_tag(compiler_id, value),
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
                 self.compile_record_fields(compiler_id, Some(tag), fields, context)
@@ -917,8 +914,7 @@ impl<'a> DocumentCompiler<'a> {
                         "match arm executable expression {compiler_id} has no output"
                     ))
                 }),
-            ir::ExecutableExpressionKind::Object(fields)
-            | ir::ExecutableExpressionKind::Record(fields) => {
+            ir::ExecutableExpressionKind::Object(fields) => {
                 self.compile_record_fields(compiler_id, None, fields, context)
             }
             ir::ExecutableExpressionKind::Block { bindings, result } => {
@@ -1488,10 +1484,6 @@ impl<'a> DocumentCompiler<'a> {
             });
             return Ok(DocumentPattern::Constant { constant });
         }
-        if let CheckedMatchPattern::Bool { value } = pattern {
-            let constant = self.push_constant(DocumentConstantValue::Bool { value: *value });
-            return Ok(DocumentPattern::Constant { constant });
-        }
         if let CheckedMatchPattern::Number { value } = pattern {
             let (coefficient, scale) = parse_decimal(value)?;
             let constant = self.push_constant(DocumentConstantValue::Number { coefficient, scale });
@@ -1510,7 +1502,6 @@ impl<'a> DocumentCompiler<'a> {
             ))),
             CheckedMatchPattern::Wildcard
             | CheckedMatchPattern::Binding { .. }
-            | CheckedMatchPattern::Bool { .. }
             | CheckedMatchPattern::Number { .. }
             | CheckedMatchPattern::Text { .. } => unreachable!(),
         }
@@ -2655,7 +2646,6 @@ fn executable_debug_label(program: &ErasedProgram, id: ir::ExecutableExprId) -> 
         ir::ExecutableExpressionKind::Project { fields, .. } => {
             format!("project {}", fields.join("."))
         }
-        ir::ExecutableExpressionKind::Record(_) => "record".to_owned(),
         ir::ExecutableExpressionKind::Object(_) => "object".to_owned(),
         ir::ExecutableExpressionKind::List { .. } => "list".to_owned(),
         _ => format!("{:?}", std::mem::discriminant(&expression.kind)),

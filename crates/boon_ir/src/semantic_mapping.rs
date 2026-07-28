@@ -7582,7 +7582,6 @@ fn map_expression_kind(
         }
         SemanticExpressionKind::Number(value) => ExecutableExpressionKind::Number(value.clone()),
         SemanticExpressionKind::BytesByte(value) => ExecutableExpressionKind::BytesByte(*value),
-        SemanticExpressionKind::Bool(value) => ExecutableExpressionKind::Bool(*value),
         SemanticExpressionKind::Tag(value) => ExecutableExpressionKind::Tag(value.clone()),
         SemanticExpressionKind::TaggedObject { tag, fields } => {
             ExecutableExpressionKind::TaggedObject {
@@ -7677,12 +7676,6 @@ fn map_expression_kind(
             }
         }
         SemanticExpressionKind::Object(fields) => ExecutableExpressionKind::Object(
-            fields
-                .iter()
-                .map(|field| map_record_field(ids, field))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        SemanticExpressionKind::Record(fields) => ExecutableExpressionKind::Record(
             fields
                 .iter()
                 .map(|field| map_record_field(ids, field))
@@ -9741,7 +9734,7 @@ fn map_semantic_symbols(
                     insert("document_attr", &field.name);
                 }
             }
-            SemanticExpressionKind::Object(fields) | SemanticExpressionKind::Record(fields) => {
+            SemanticExpressionKind::Object(fields) => {
                 for field in fields {
                     insert("document_attr", &field.name);
                     insert("style_attr", &field.name);

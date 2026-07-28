@@ -2894,9 +2894,6 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                     })?,
                 })
             }
-            ir::ExecutableExpressionKind::Bool(value) => {
-                Ok(MigrationExpressionPlan::Bool { value })
-            }
             ir::ExecutableExpressionKind::Tag(tag) => {
                 Ok(MigrationExpressionPlan::Variant { tag })
             }
@@ -2906,8 +2903,7 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                     fields: self.lower_fields(&fields)?,
                 })
             }
-            ir::ExecutableExpressionKind::Object(fields)
-            | ir::ExecutableExpressionKind::Record(fields) => {
+            ir::ExecutableExpressionKind::Object(fields) => {
                 Ok(MigrationExpressionPlan::Record {
                     fields: self.lower_fields(&fields)?,
                 })
@@ -6063,9 +6059,6 @@ fn constant_executable_expression_value_inner(
             .ok()
             .map(|value| PlanConstantValue::Number { value }),
         ir::ExecutableExpressionKind::BytesByte(value) => bytes_plan_constant(&[*value]),
-        ir::ExecutableExpressionKind::Bool(value) => {
-            Some(PlanConstantValue::Bool { value: *value })
-        }
         ir::ExecutableExpressionKind::Tag(value) => Some(PlanConstantValue::Enum {
             value: value.clone(),
         }),
@@ -6421,7 +6414,6 @@ fn inferred_executable_expression_value_type_inner(
         ir::ExecutableExpressionKind::BytesByte(_) => {
             Some(PlanValueType::Bytes { fixed_len: Some(1) })
         }
-        ir::ExecutableExpressionKind::Bool(_) => Some(PlanValueType::Bool),
         ir::ExecutableExpressionKind::Tag(_)
         | ir::ExecutableExpressionKind::TaggedObject { .. } => Some(PlanValueType::Enum),
         ir::ExecutableExpressionKind::Bytes {
@@ -6485,7 +6477,6 @@ fn inferred_executable_expression_value_type_inner(
         | ir::ExecutableExpressionKind::When { .. }
         | ir::ExecutableExpressionKind::MatchArm { .. }
         | ir::ExecutableExpressionKind::Object(_)
-        | ir::ExecutableExpressionKind::Record(_)
         | ir::ExecutableExpressionKind::List { .. }
         | ir::ExecutableExpressionKind::Bytes {
             fixed_size: None, ..
@@ -10374,9 +10365,6 @@ impl<'a> ExecutableRowLowerer<'a> {
                 })?
             }
             ir::ExecutableExpressionKind::BytesByte(value) => self.bytes_constant(vec![value])?,
-            ir::ExecutableExpressionKind::Bool(value) => {
-                self.constant(PlanConstantValue::Bool { value })?
-            }
             ir::ExecutableExpressionKind::Tag(value) => {
                 self.constant(PlanConstantValue::Enum { value })?
             }
@@ -10656,8 +10644,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 output.ok_or_else(|| PlanError::new("match arm has no output"))?,
                 owner,
             )?,
-            ir::ExecutableExpressionKind::Object(fields)
-            | ir::ExecutableExpressionKind::Record(fields) => {
+            ir::ExecutableExpressionKind::Object(fields) => {
                 let fields = self.lower_fields(fields, owner)?;
                 self.intern(PlanRowExpressionNode::Object { fields })?
             }
@@ -11647,7 +11634,6 @@ fn executable_select_pattern(
         CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. } => {
             PlanRowSelectPattern::Wildcard
         }
-        CheckedMatchPattern::Bool { value } => PlanRowSelectPattern::Bool { value: *value },
         CheckedMatchPattern::Number { value } => PlanRowSelectPattern::Number {
             value: value.parse::<FiniteReal>().map_err(|error| {
                 PlanError::new(format!(

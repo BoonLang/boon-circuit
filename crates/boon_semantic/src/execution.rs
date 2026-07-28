@@ -471,7 +471,6 @@ pub enum SemanticExpressionKind {
     },
     Number(String),
     BytesByte(u8),
-    Bool(bool),
     Tag(String),
     TaggedObject {
         tag: String,
@@ -531,7 +530,6 @@ pub enum SemanticExpressionKind {
         output: Option<SemanticExprId>,
     },
     Object(Vec<SemanticRecordField>),
-    Record(Vec<SemanticRecordField>),
     Block {
         bindings: Vec<SemanticBlockBinding>,
         result: SemanticExprId,
@@ -1717,8 +1715,7 @@ impl SemanticExecutionGraphV1 {
                 }
             }
             SemanticExpressionKind::TaggedObject { fields, .. }
-            | SemanticExpressionKind::Object(fields)
-            | SemanticExpressionKind::Record(fields) => {
+            | SemanticExpressionKind::Object(fields) => {
                 for field in fields {
                     self.require_expression(field.value, context("record field"))?;
                 }
@@ -1957,7 +1954,6 @@ impl SemanticExecutionGraphV1 {
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
-            | SemanticExpressionKind::Bool(_)
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::Source { .. }
             | SemanticExpressionKind::Delimiter => {}

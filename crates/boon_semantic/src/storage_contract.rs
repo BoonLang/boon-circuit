@@ -1209,7 +1209,6 @@ fn collect_materialized_output_field_candidates(
     let value = require_expression(execution, expression)?;
     match &value.kind {
         SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields)
         | SemanticExpressionKind::TaggedObject { fields, .. } => {
             let matches = fields
                 .iter()
@@ -1332,7 +1331,6 @@ fn append_record_projection_fields(
         let expression = require_expression(execution, producer)?;
         let record_fields = match &expression.kind {
             SemanticExpressionKind::Object(fields)
-            | SemanticExpressionKind::Record(fields)
             | SemanticExpressionKind::TaggedObject { fields, .. } => fields,
             _ => continue,
         };
@@ -3062,7 +3060,6 @@ fn named_value_origin_is_structural_container_placeholder(
     Ok(matches!(
         &expression.kind,
         boon_typecheck::CheckedExpressionKind::Object { fields }
-            | boon_typecheck::CheckedExpressionKind::Record { fields }
             if fields.is_empty()
     ) || matches!(
         &expression.kind,
@@ -3583,7 +3580,6 @@ fn expression_children(
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Delimiter
@@ -3607,8 +3603,7 @@ fn expression_children(
             })
             .collect(),
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
         SemanticExpressionKind::Call { arguments, .. } => {

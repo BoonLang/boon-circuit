@@ -574,7 +574,6 @@ pub struct CheckedSpan {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckedMatchPattern {
     Wildcard,
-    Bool { value: bool },
     Number { value: String },
     Text { value: String },
     NaN,
@@ -587,7 +586,6 @@ impl From<&AstMatchPattern> for CheckedMatchPattern {
     fn from(pattern: &AstMatchPattern) -> Self {
         match pattern {
             AstMatchPattern::Wildcard => Self::Wildcard,
-            AstMatchPattern::Bool { value } => Self::Bool { value: *value },
             AstMatchPattern::Number { value } => Self::Number {
                 value: value.clone(),
             },
@@ -734,9 +732,6 @@ pub enum CheckedExpressionKind {
     BytesByte {
         value: u8,
     },
-    Bool {
-        value: bool,
-    },
     Tag {
         name: String,
     },
@@ -789,9 +784,6 @@ pub enum CheckedExpressionKind {
         result: Option<CheckedExprId>,
     },
     Object {
-        fields: Vec<CheckedRecordField>,
-    },
-    Record {
         fields: Vec<CheckedRecordField>,
     },
     List {
@@ -4181,7 +4173,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 recurse(*left, expected.clone(), target, active);
                 recurse(*right, expected, target, active);
             }
-            AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
+            AstExprKind::Object(fields) => {
                 let expected_shape = expected.as_ref().and_then(|expected| match expected {
                     Type::Object(shape) => Some(shape),
                     _ => None,
@@ -4293,8 +4285,6 @@ impl<'a> CheckedProgramBuilder<'a> {
             | AstExprKind::TextLiteral(_)
             | AstExprKind::Number(_)
             | AstExprKind::ByteLiteral { .. }
-            | AstExprKind::Bool(_)
-            | AstExprKind::Enum(_)
             | AstExprKind::Tag(_)
             | AstExprKind::Source
             | AstExprKind::Delimiter
@@ -4377,12 +4367,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .program
                     .expressions
                     .get(expression.0 as usize)
-                    .is_some_and(|expression| {
-                        matches!(
-                            expression.kind,
-                            AstExprKind::Record(_) | AstExprKind::Object(_)
-                        )
-                    });
+                    .is_some_and(|expression| matches!(expression.kind, AstExprKind::Object(_)));
                 InferredStructuralValue {
                     flow_type,
                     structural_record,
@@ -5041,7 +5026,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         let expr = self.program.expressions.get(expression.0 as usize)?.clone();
         let mode = match &expr.kind {
             AstExprKind::Source | AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
-            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
+            AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
             AstExprKind::Identifier(name) => self
                 .infer_instantiated_read_mode(
                     expression,
@@ -5123,11 +5108,8 @@ impl<'a> CheckedProgramBuilder<'a> {
             | AstExprKind::Number(_)
             | AstExprKind::ByteLiteral { .. }
             | AstExprKind::BytesLiteral { .. }
-            | AstExprKind::Bool(_)
-            | AstExprKind::Enum(_)
             | AstExprKind::Tag(_)
             | AstExprKind::TaggedObject { .. }
-            | AstExprKind::Record(_)
             | AstExprKind::Object(_)
             | AstExprKind::ListLiteral { .. }
             | AstExprKind::Infix { .. }
@@ -5229,9 +5211,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         };
         let expr = self.program.expressions.get(expression.0 as usize)?.clone();
         match expr.kind {
-            AstExprKind::Record(fields)
-            | AstExprKind::Object(fields)
-            | AstExprKind::TaggedObject { fields, .. } => {
+            AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
                 let value = fields
                     .iter()
                     .find(|candidate| !candidate.spread && candidate.name == *field)?
@@ -5359,15 +5339,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                     BytesSizeSyntax::Fixed(size) => BytesType::Fixed(size),
                     BytesSizeSyntax::Dynamic | BytesSizeSyntax::Infer => BytesType::Dynamic,
                 }),
-                AstExprKind::Bool(value) => Type::VariantSet(vec![Variant::Tag(if value {
-                    "True".to_owned()
-                } else {
-                    "False".to_owned()
-                })]),
-                AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Type::Skip,
-                AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
-                    Type::VariantSet(vec![Variant::Tag(tag)])
-                }
+                AstExprKind::Tag(tag) if tag == "SKIP" => Type::Skip,
+                AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag)]),
                 AstExprKind::TaggedObject { tag, fields } => {
                     Type::VariantSet(vec![Variant::Tagged {
                         tag,
@@ -5385,20 +5358,18 @@ impl<'a> CheckedProgramBuilder<'a> {
                         ),
                     }])
                 }
-                AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
-                    Type::Object(ObjectShape::from_ordered_fields(
-                        fields
-                            .into_iter()
-                            .filter(|field| !field.spread)
-                            .map(|field| {
-                                (
-                                    field.name,
-                                    self.infer_checked_expr_flow(field.value, active).ty,
-                                )
-                            }),
-                        false,
-                    ))
-                }
+                AstExprKind::Object(fields) => Type::Object(ObjectShape::from_ordered_fields(
+                    fields
+                        .into_iter()
+                        .filter(|field| !field.spread)
+                        .map(|field| {
+                            (
+                                field.name,
+                                self.infer_checked_expr_flow(field.value, active).ty,
+                            )
+                        }),
+                    false,
+                )),
                 AstExprKind::ListLiteral { items, .. } => {
                     let fallback_item = match &fallback.ty {
                         Type::List(item) => Some((**item).clone()),
@@ -5543,7 +5514,7 @@ impl<'a> CheckedProgramBuilder<'a> {
     ) -> FlowMode {
         match &expr.kind {
             AstExprKind::Source | AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
-            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
+            AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
             AstExprKind::Identifier(name) => self
                 .checked_read_flow_mode(expr_id, std::slice::from_ref(name), active)
                 .unwrap_or(fallback),
@@ -5992,9 +5963,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         while visited.insert(current) {
             let expression = self.program.expressions.get(current)?;
             match &expression.kind {
-                AstExprKind::Record(fields)
-                | AstExprKind::Object(fields)
-                | AstExprKind::TaggedObject { fields, .. } => {
+                AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
                     let name = projection.get(offset)?;
                     current = fields
                         .iter()
@@ -6643,7 +6612,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 let kind = if statement
                     .expr
                     .and_then(|expr_id| self.program.expressions.get(expr_id))
-                    .is_some_and(|expr| matches!(expr.kind, AstExprKind::Record(_)))
+                    .is_some_and(|expr| matches!(expr.kind, AstExprKind::Object(_)))
                 {
                     CheckedScopeKind::Record
                 } else {
@@ -7838,8 +7807,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .collect()
             }
             CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields }
-            | CheckedExpressionKind::Record { fields } => {
+            | CheckedExpressionKind::Object { fields } => {
                 fields.iter().map(|field| field.value).collect()
             }
             CheckedExpressionKind::List { items, .. }
@@ -7874,7 +7842,6 @@ impl<'a> CheckedProgramBuilder<'a> {
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Bool { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Delimiter
@@ -8043,10 +8010,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             AstExprKind::ByteLiteral { value, .. } => {
                 CheckedExpressionKind::BytesByte { value: *value }
             }
-            AstExprKind::Bool(value) => CheckedExpressionKind::Bool { value: *value },
-            AstExprKind::Enum(name) | AstExprKind::Tag(name) => {
-                CheckedExpressionKind::Tag { name: name.clone() }
-            }
+            AstExprKind::Tag(name) => CheckedExpressionKind::Tag { name: name.clone() },
             AstExprKind::TaggedObject {
                 tag,
                 fields: record,
@@ -8151,9 +8115,6 @@ impl<'a> CheckedProgramBuilder<'a> {
                 result: result.map(id),
             },
             AstExprKind::Object(record) => CheckedExpressionKind::Object {
-                fields: fields(record),
-            },
-            AstExprKind::Record(record) => CheckedExpressionKind::Record {
                 fields: fields(record),
             },
             AstExprKind::ListLiteral { capacity, items } => CheckedExpressionKind::List {
@@ -8575,7 +8536,6 @@ enum CheckedOrderSemanticExpression {
     Text(String),
     TextTemplate(Vec<CheckedOrderSemanticTextSegment>),
     Number(String),
-    Bool(bool),
     Tag(String),
     Call {
         function: String,
@@ -8969,9 +8929,6 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             CheckedExpressionKind::Number { value } => {
                 Some(CheckedOrderSemanticExpression::Number(value.clone()))
             }
-            CheckedExpressionKind::Bool { value } => {
-                Some(CheckedOrderSemanticExpression::Bool(*value))
-            }
             CheckedExpressionKind::Tag { name } => {
                 Some(CheckedOrderSemanticExpression::Tag(name.clone()))
             }
@@ -9094,7 +9051,6 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             | CheckedExpressionKind::MatchArm { output: None, .. }
             | CheckedExpressionKind::Block { result: None, .. }
             | CheckedExpressionKind::Object { .. }
-            | CheckedExpressionKind::Record { .. }
             | CheckedExpressionKind::List { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Bytes { .. }
@@ -9239,7 +9195,6 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Bool { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::ExternalRead { .. } => true,
             CheckedExpressionKind::Passed { .. }
@@ -9252,7 +9207,6 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             | CheckedExpressionKind::MatchArm { output: None, .. }
             | CheckedExpressionKind::Block { result: None, .. }
             | CheckedExpressionKind::Object { .. }
-            | CheckedExpressionKind::Record { .. }
             | CheckedExpressionKind::List { .. }
             | CheckedExpressionKind::Bytes { .. }
             | CheckedExpressionKind::Delimiter
@@ -9366,8 +9320,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                 })
                 .collect(),
             CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields }
-            | CheckedExpressionKind::Record { fields } => {
+            | CheckedExpressionKind::Object { fields } => {
                 fields.iter().map(|field| field.value).collect()
             }
             CheckedExpressionKind::Draining { input }
@@ -9396,7 +9349,6 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Bool { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Delimiter
@@ -11149,7 +11101,7 @@ fn statement_body_container_expression(
             matches!(
                 expr.kind,
                 AstExprKind::Block { .. }
-                    | AstExprKind::Record(_)
+                    | AstExprKind::Object(_)
                     | AstExprKind::ListLiteral { .. }
             )
         })
@@ -11184,9 +11136,7 @@ fn direct_expression_children(expr: &AstExpr) -> Vec<usize> {
                 AstTextSegment::Dynamic { value } => Some(*value),
             })
             .collect(),
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
+        AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
             fields.iter().map(|field| field.value).collect()
         }
         AstExprKind::Call { args, pass, .. } => args
@@ -11226,8 +11176,6 @@ fn direct_expression_children(expr: &AstExpr) -> Vec<usize> {
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
         | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
         | AstExprKind::Drain { .. }
         | AstExprKind::Identifier(_)
@@ -13553,15 +13501,8 @@ impl<'a> Checker<'a> {
             AstExprKind::BytesLiteral { size, items } => {
                 self.infer_bytes_literal(expr, size, items)
             }
-            AstExprKind::Bool(value) => Type::VariantSet(vec![Variant::Tag(if *value {
-                "True".to_owned()
-            } else {
-                "False".to_owned()
-            })]),
-            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Type::Skip,
-            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
-                Type::VariantSet(vec![Variant::Tag(tag.clone())])
-            }
+            AstExprKind::Tag(tag) if tag == "SKIP" => Type::Skip,
+            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())]),
             AstExprKind::TaggedObject { tag, fields } => {
                 let shape = ObjectShape::from_ordered_fields(
                     fields
@@ -13576,9 +13517,7 @@ impl<'a> Checker<'a> {
                     fields: shape,
                 }])
             }
-            AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
-                Type::Object(self.infer_record_shape(fields))
-            }
+            AstExprKind::Object(fields) => Type::Object(self.infer_record_shape(fields)),
             AstExprKind::Drain { path } => self.type_for_path(expr.id, &drain_path_parts(path)),
             AstExprKind::ListLiteral { items, .. } => {
                 let item_type = items
@@ -14128,7 +14067,7 @@ impl<'a> Checker<'a> {
 
         let prefix_enabled = named_arg_expr(args, "prefix")
             .and_then(|expr_id| self.program.expressions.get(expr_id))
-            .is_some_and(|expr| matches!(expr.kind, AstExprKind::Bool(true)));
+            .is_some_and(|expr| matches!(&expr.kind, AstExprKind::Tag(tag) if tag == "True"));
         if prefix_enabled {
             let radix = named_arg_expr(args, "radix")
                 .and_then(|expr_id| self.static_integer_literal(expr_id))
@@ -14316,8 +14255,7 @@ impl<'a> Checker<'a> {
     ) {
         match named_arg_expr(args, "encoding").and_then(|arg| self.program.expressions.get(arg)) {
             Some(AstExpr {
-                kind:
-                    AstExprKind::Tag(value) | AstExprKind::Enum(value) | AstExprKind::Identifier(value),
+                kind: AstExprKind::Tag(value) | AstExprKind::Identifier(value),
                 ..
             }) if value == "Utf8" || value == "Ascii" => {}
             Some(expr) => self.diagnostics.push(
@@ -14337,8 +14275,7 @@ impl<'a> Checker<'a> {
     fn check_bytes_numeric_arguments(&mut self, expr_id: usize, args: &[AstCallArg]) {
         match named_arg_expr(args, "endian").and_then(|arg| self.program.expressions.get(arg)) {
             Some(AstExpr {
-                kind:
-                    AstExprKind::Tag(value) | AstExprKind::Enum(value) | AstExprKind::Identifier(value),
+                kind: AstExprKind::Tag(value) | AstExprKind::Identifier(value),
                 ..
             }) if value == "Little" || value == "Big" => {}
             Some(expr) => self.diagnostics.push(
@@ -15179,7 +15116,7 @@ impl<'a> Checker<'a> {
             .expressions
             .get(named_arg_expr(args, "encoding")?)?;
         match &expr.kind {
-            AstExprKind::Tag(value) | AstExprKind::Enum(value) | AstExprKind::Identifier(value)
+            AstExprKind::Tag(value) | AstExprKind::Identifier(value)
                 if value == "Utf8" || value == "Ascii" =>
             {
                 Some(value.clone())
@@ -15476,7 +15413,7 @@ impl<'a> Checker<'a> {
                         })
                 }
             }
-            AstExprKind::Object(fields) | AstExprKind::Record(fields) => Some(Type::Object(
+            AstExprKind::Object(fields) => Some(Type::Object(
                 self.static_record_shape(fields, active_functions),
             )),
             AstExprKind::TaggedObject { tag, fields } => {
@@ -15508,11 +15445,8 @@ impl<'a> Checker<'a> {
                 self.program.expressions.as_slice(),
                 |expr| self.static_expr_type(expr, active_functions),
             )),
-            AstExprKind::Bool(_) => Some(true_false_type()),
-            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
-            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
-                Some(Type::VariantSet(vec![Variant::Tag(tag.clone())]))
-            }
+            AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
+            AstExprKind::Tag(tag) => Some(Type::VariantSet(vec![Variant::Tag(tag.clone())])),
             AstExprKind::ListLiteral { items, .. } => Some(static_list_literal_type(
                 items,
                 self.program.expressions.as_slice(),
@@ -16279,7 +16213,7 @@ impl<'a> Checker<'a> {
                 let path = parts.join(".");
                 flow_binding_mode(&self.flow_bindings, &path).unwrap_or(FlowMode::Continuous)
             }
-            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
+            AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
             AstExprKind::Call { function, args, .. }
                 if self.external_types.functions.contains_key(function) =>
             {
@@ -16849,15 +16783,13 @@ impl<'a> Checker<'a> {
         ) {
             return;
         }
-        let (AstExprKind::Object(fields) | AstExprKind::Record(fields)) = &expr.kind else {
+        let AstExprKind::Object(fields) = &expr.kind else {
             let ty = self.ensure_expr(expr_id).ty;
             if !matches!(
                 expr.kind,
                 AstExprKind::StringLiteral(_)
                     | AstExprKind::TextLiteral(_)
                     | AstExprKind::Number(_)
-                    | AstExprKind::Bool(_)
-                    | AstExprKind::Enum(_)
                     | AstExprKind::Tag(_)
             ) {
                 return;
@@ -16967,7 +16899,7 @@ impl<'a> Checker<'a> {
         let Some(expr) = self.program.expressions.get(expr_id) else {
             return;
         };
-        let (AstExprKind::Object(fields) | AstExprKind::Record(fields)) = &expr.kind else {
+        let AstExprKind::Object(fields) = &expr.kind else {
             let ty = self.ensure_expr(expr_id).ty;
             if matches!(
                 ty,
@@ -17537,9 +17469,7 @@ fn collect_expr_user_function_calls(
             collect_expr_user_function_calls(*left, expressions, user_functions, calls);
             collect_expr_user_function_calls(*right, expressions, user_functions, calls);
         }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
+        AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
             for field in fields {
                 collect_expr_user_function_calls(field.value, expressions, user_functions, calls);
             }
@@ -17564,8 +17494,6 @@ fn collect_expr_user_function_calls(
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
         | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Latest { .. }
@@ -17937,7 +17865,7 @@ fn resolved_constant_value_for_expr(
             }
         }
         AstExprKind::ByteLiteral { .. } => None,
-        AstExprKind::Enum(value) | AstExprKind::Tag(value)
+        AstExprKind::Tag(value)
             if matches!(value.as_str(), "Little" | "Big" | "Utf8" | "Ascii") =>
         {
             Some(ResolvedConstantValue::Symbol {
@@ -20485,9 +20413,7 @@ fn expr_contains_expr_id_seen(
             expr_contains_expr_id_seen(*left, needle, expressions, seen)
                 || expr_contains_expr_id_seen(*right, needle, expressions, seen)
         }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => fields
+        AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => fields
             .iter()
             .any(|field| expr_contains_expr_id_seen(field.value, needle, expressions, seen)),
         _ => false,
@@ -21085,7 +21011,6 @@ fn reachable_static_when_arms(
             continue;
         };
         let tag = match semantic_pattern {
-            AstMatchPattern::Bool { value } => Some(if *value { "True" } else { "False" }),
             AstMatchPattern::Tag { name } => Some(name.as_str()),
             _ => None,
         };
@@ -21126,7 +21051,7 @@ fn reachable_static_when_arms(
                 selector_type: Some(Type::VariantSet(remaining.clone())),
                 catch_all: false,
             }),
-            AstMatchPattern::Bool { .. } | AstMatchPattern::Tag { .. } => unreachable!(),
+            AstMatchPattern::Tag { .. } => unreachable!(),
         }
     }
     reachable
@@ -21198,7 +21123,7 @@ fn simple_hold_result_type(
 
 fn object_shape_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Option<ObjectShape> {
     let fields = match &expressions.get(expr_id)?.kind {
-        AstExprKind::Object(fields) | AstExprKind::Record(fields) => fields,
+        AstExprKind::Object(fields) => fields,
         _ => return None,
     };
     Some(simple_record_shape(fields, expressions))
@@ -21267,18 +21192,9 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                 Some(simple_expr_type(expr, expressions))
             })
         }
-        AstExprKind::Bool(value) => Type::VariantSet(vec![Variant::Tag(if *value {
-            "True".to_owned()
-        } else {
-            "False".to_owned()
-        })]),
-        AstExprKind::Tag(value) | AstExprKind::Enum(value) if value == "SKIP" => Type::Skip,
-        AstExprKind::Tag(value) | AstExprKind::Enum(value) => {
-            Type::VariantSet(vec![Variant::Tag(value.clone())])
-        }
-        AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
-            Type::Object(simple_record_shape(fields, expressions))
-        }
+        AstExprKind::Tag(value) if value == "SKIP" => Type::Skip,
+        AstExprKind::Tag(value) => Type::VariantSet(vec![Variant::Tag(value.clone())]),
+        AstExprKind::Object(fields) => Type::Object(simple_record_shape(fields, expressions)),
         AstExprKind::ListLiteral { items, .. } => {
             static_list_literal_type(items, expressions, |item| {
                 Some(simple_expr_type(item, expressions))
@@ -21581,9 +21497,7 @@ fn expr_contains_render_constructor_seen(
             expr_contains_render_constructor_seen(*left, expressions, seen)
                 || expr_contains_render_constructor_seen(*right, expressions, seen)
         }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => fields
+        AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => fields
             .iter()
             .any(|field| expr_contains_render_constructor_seen(field.value, expressions, seen)),
         AstExprKind::BytesLiteral { items, .. } => items
@@ -21595,7 +21509,7 @@ fn expr_contains_render_constructor_seen(
                 expr_contains_render_constructor_seen(*value, expressions, seen)
             }
         }),
-        AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "NoElement" => true,
+        AstExprKind::Tag(tag) if tag == "NoElement" => true,
         AstExprKind::ListLiteral { .. }
         | AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
@@ -21604,8 +21518,6 @@ fn expr_contains_render_constructor_seen(
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Latest { .. }
@@ -21767,9 +21679,7 @@ fn collect_param_requirements_expr(
                 );
             }
         }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
+        AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
             for field in fields {
                 collect_param_requirements_expr(
                     field.value,
@@ -21799,8 +21709,6 @@ fn collect_param_requirements_expr(
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
         | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Latest { .. }
@@ -22407,22 +22315,20 @@ fn static_expr_type_from_bindings(
         return Some(signature.result_type);
     }
     match &expr.kind {
-        AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
-            Some(Type::Object(ObjectShape::from_ordered_fields(
-                fields.iter().filter(|field| !field.spread).map(|field| {
-                    (
-                        field.name.clone(),
-                        expressions
-                            .get(field.value)
-                            .and_then(|field_expr| {
-                                static_expr_type_from_bindings(field_expr, expressions, bindings)
-                            })
-                            .unwrap_or_else(open_object_type),
-                    )
-                }),
-                false,
-            )))
-        }
+        AstExprKind::Object(fields) => Some(Type::Object(ObjectShape::from_ordered_fields(
+            fields.iter().filter(|field| !field.spread).map(|field| {
+                (
+                    field.name.clone(),
+                    expressions
+                        .get(field.value)
+                        .and_then(|field_expr| {
+                            static_expr_type_from_bindings(field_expr, expressions, bindings)
+                        })
+                        .unwrap_or_else(open_object_type),
+                )
+            }),
+            false,
+        ))),
         AstExprKind::Identifier(name) => bindings.static_binding(name).cloned(),
         AstExprKind::Path(parts) => static_path_type_from_bindings(parts, bindings),
         AstExprKind::Drain { path } => {
@@ -22455,11 +22361,8 @@ fn static_expr_type_from_bindings(
             expressions,
             |expr| static_expr_type_from_bindings(expr, expressions, bindings),
         )),
-        AstExprKind::Bool(_) => Some(true_false_type()),
-        AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
-        AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
-            Some(Type::VariantSet(vec![Variant::Tag(tag.clone())]))
-        }
+        AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
+        AstExprKind::Tag(tag) => Some(Type::VariantSet(vec![Variant::Tag(tag.clone())])),
         AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
             let ty = simple_expr_type(expr, expressions);
             is_specific_type(&ty).then_some(ty)
@@ -22536,27 +22439,25 @@ fn static_expr_type_with_external_types(
                 .get(function)
                 .map(|signature| signature.result.ty.clone())
         }
-        AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
-            Some(Type::Object(ObjectShape::from_ordered_fields(
-                fields.iter().filter(|field| !field.spread).map(|field| {
-                    (
-                        field.name.clone(),
-                        expressions
-                            .get(field.value)
-                            .and_then(|field_expr| {
-                                static_expr_type_with_external_types(
-                                    field_expr,
-                                    expressions,
-                                    bindings,
-                                    external_types,
-                                )
-                            })
-                            .unwrap_or_else(open_object_type),
-                    )
-                }),
-                false,
-            )))
-        }
+        AstExprKind::Object(fields) => Some(Type::Object(ObjectShape::from_ordered_fields(
+            fields.iter().filter(|field| !field.spread).map(|field| {
+                (
+                    field.name.clone(),
+                    expressions
+                        .get(field.value)
+                        .and_then(|field_expr| {
+                            static_expr_type_with_external_types(
+                                field_expr,
+                                expressions,
+                                bindings,
+                                external_types,
+                            )
+                        })
+                        .unwrap_or_else(open_object_type),
+                )
+            }),
+            false,
+        ))),
         AstExprKind::TaggedObject { tag, fields } => {
             Some(Type::VariantSet(vec![Variant::Tagged {
                 tag: tag.clone(),
@@ -23523,9 +23424,7 @@ fn syntax_source_sites(program: &ParsedProgram) -> Vec<SyntaxSourceSite> {
             }
             _ => {
                 match &expr.kind {
-                    AstExprKind::Object(fields)
-                    | AstExprKind::Record(fields)
-                    | AstExprKind::TaggedObject { fields, .. } => {
+                    AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
                         for field in fields {
                             let projection_len = projection.len();
                             if !field.spread {
@@ -23969,8 +23868,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                 resolved.extend(self.declaration_sources(*target, &combined, visiting));
             }
             CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields }
-            | CheckedExpressionKind::Record { fields } => {
+            | CheckedExpressionKind::Object { fields } => {
                 if let Some((field, rest)) = projection.split_first() {
                     for candidate in fields.iter().filter(|candidate| candidate.name == *field) {
                         resolved.extend(self.expression_sources(candidate.value, rest, visiting));
@@ -24034,7 +23932,6 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             | CheckedExpressionKind::TextTemplate { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Bool { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Infix { .. }
@@ -24162,7 +24059,6 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             }
             CheckedExpressionKind::TaggedObject { .. }
             | CheckedExpressionKind::Object { .. }
-            | CheckedExpressionKind::Record { .. }
             | CheckedExpressionKind::Passed { .. }
             | CheckedExpressionKind::ExternalRead { .. }
             | CheckedExpressionKind::Drain { .. }
@@ -24170,7 +24066,6 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             | CheckedExpressionKind::TextTemplate { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Bool { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Infix { .. }
@@ -24424,8 +24319,7 @@ fn checked_projection_to_expression(
             |child, visiting: &mut BTreeSet<_>| visit(expressions, calls, child, target, visiting);
         let result = match &expression.kind {
             CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields }
-            | CheckedExpressionKind::Record { fields } => fields.iter().find_map(|field| {
+            | CheckedExpressionKind::Object { fields } => fields.iter().find_map(|field| {
                 let mut projection = direct(field.value, visiting)?;
                 projection.insert(0, field.name.clone());
                 Some(projection)
@@ -24474,7 +24368,6 @@ fn checked_projection_to_expression(
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
             | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Bool { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Delimiter
@@ -24586,8 +24479,7 @@ fn checked_expression_children(
             })
             .collect(),
         CheckedExpressionKind::TaggedObject { fields, .. }
-        | CheckedExpressionKind::Object { fields }
-        | CheckedExpressionKind::Record { fields } => {
+        | CheckedExpressionKind::Object { fields } => {
             fields.iter().map(|field| field.value).collect()
         }
         CheckedExpressionKind::Draining { input } => vec![*input],
@@ -24624,7 +24516,6 @@ fn checked_expression_children(
         | CheckedExpressionKind::Text { .. }
         | CheckedExpressionKind::Number { .. }
         | CheckedExpressionKind::BytesByte { .. }
-        | CheckedExpressionKind::Bool { .. }
         | CheckedExpressionKind::Tag { .. }
         | CheckedExpressionKind::Source
         | CheckedExpressionKind::Delimiter
@@ -25157,9 +25048,7 @@ fn collect_contextual_binding_field_requirements(
                 );
             }
         }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
+        AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
             let expected_fields = match expected.as_ref() {
                 Some(Type::Object(shape)) => Some(&shape.fields),
                 _ => None,
@@ -25211,8 +25100,6 @@ fn collect_contextual_binding_field_requirements(
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
         | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
         | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Delimiter
@@ -25636,7 +25523,6 @@ fn expr_kind_gets_type_hint(kind: &AstExprKind) -> bool {
         AstExprKind::StringLiteral(_)
             | AstExprKind::TextLiteral(_)
             | AstExprKind::Number(_)
-            | AstExprKind::Bool(_)
             | AstExprKind::Delimiter
             | AstExprKind::Unknown(_)
             | AstExprKind::Source
@@ -25651,9 +25537,7 @@ fn type_hint_category_for_expr(kind: &AstExprKind) -> &'static str {
         AstExprKind::Path(_) => "path",
         AstExprKind::MatchArm { .. } => "match_arm",
         AstExprKind::Identifier(_) => "expression",
-        AstExprKind::Object(_) | AstExprKind::Record(_) | AstExprKind::TaggedObject { .. } => {
-            "expression"
-        }
+        AstExprKind::Object(_) | AstExprKind::TaggedObject { .. } => "expression",
         _ => "expression",
     }
 }
@@ -26733,7 +26617,7 @@ fn type_contains_skip(ty: &Type) -> bool {
 }
 
 fn expr_is_skip(expr: &AstExpr) -> bool {
-    matches!(&expr.kind, AstExprKind::Tag(tag) | AstExprKind::Enum(tag) if tag == "SKIP")
+    matches!(&expr.kind, AstExprKind::Tag(tag) if tag == "SKIP")
 }
 
 fn open_object_type() -> Type {

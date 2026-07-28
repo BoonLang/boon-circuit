@@ -609,7 +609,6 @@ pub enum AstTextSegment {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AstMatchPattern {
     Wildcard,
-    Bool { value: bool },
     Number { value: String },
     Text { value: String },
     NaN,
@@ -636,8 +635,6 @@ pub enum AstExprKind {
         digits: String,
         value: u8,
     },
-    Bool(bool),
-    Enum(String),
     Tag(String),
     TaggedObject {
         tag: String,
@@ -693,7 +690,6 @@ pub enum AstExprKind {
         result: Option<usize>,
     },
     Object(Vec<AstRecordField>),
-    Record(Vec<AstRecordField>),
     ListLiteral {
         capacity: Option<usize>,
         #[serde(default)]
@@ -1494,7 +1490,7 @@ fn statement_child_pipeline_input(
     match &expressions.get(owner)?.kind {
         AstExprKind::MatchArm { output, .. } | AstExprKind::Then { output, .. } => *output,
         AstExprKind::Block { .. }
-        | AstExprKind::Record(_)
+        | AstExprKind::Object(_)
         | AstExprKind::ListLiteral { .. }
         | AstExprKind::BytesLiteral { .. }
         | AstExprKind::Hold { .. }
@@ -1663,7 +1659,7 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
                 *result = child_result;
             }
         }
-        AstExprKind::Record(fields) => {
+        AstExprKind::Object(fields) => {
             if fields.is_empty() {
                 *fields = record_fields;
             }
@@ -1695,7 +1691,7 @@ fn expression_owns_statement_children(expr_id: usize, expressions: &[AstExpr]) -
         matches!(
             &expression.kind,
             AstExprKind::Block { .. }
-                | AstExprKind::Record(_)
+                | AstExprKind::Object(_)
                 | AstExprKind::ListLiteral { .. }
                 | AstExprKind::BytesLiteral { .. }
                 | AstExprKind::Hold { .. }
@@ -1729,7 +1725,7 @@ fn statement_value_expression(statement: &AstStatement, expressions: &[AstExpr])
             matches!(
                 &expr.kind,
                 AstExprKind::Block { .. }
-                    | AstExprKind::Record(_)
+                    | AstExprKind::Object(_)
                     | AstExprKind::ListLiteral { .. }
                     | AstExprKind::BytesLiteral { .. }
                     | AstExprKind::Hold { .. }
@@ -2274,7 +2270,7 @@ fn ast_statement(
             push_ast_expr(
                 item,
                 expressions,
-                AstExprKind::Record(Vec::new()),
+                AstExprKind::Object(Vec::new()),
                 item.start,
                 item.end,
             )
@@ -2287,7 +2283,7 @@ fn ast_statement(
         Some(push_ast_expr(
             item,
             expressions,
-            AstExprKind::Record(Vec::new()),
+            AstExprKind::Object(Vec::new()),
             item.start,
             item.end,
         ))
@@ -2394,10 +2390,10 @@ fn ast_expr_kind(
         return AstExprKind::Source;
     }
     if tokens == ["True"] {
-        return AstExprKind::Bool(true);
+        return AstExprKind::Tag("True".to_owned());
     }
     if tokens == ["False"] {
-        return AstExprKind::Bool(false);
+        return AstExprKind::Tag("False".to_owned());
     }
     if let Some(number) = ast_number_literal(tokens) {
         return AstExprKind::Number(number);
@@ -2547,10 +2543,14 @@ fn ast_match_pattern(tokens: &[String], item: &ParserItem, source: &str) -> AstM
         return AstMatchPattern::Wildcard;
     }
     if tokens == ["True"] {
-        return AstMatchPattern::Bool { value: true };
+        return AstMatchPattern::Tag {
+            name: "True".to_owned(),
+        };
     }
     if tokens == ["False"] {
-        return AstMatchPattern::Bool { value: false };
+        return AstMatchPattern::Tag {
+            name: "False".to_owned(),
+        };
     }
     if tokens == ["NaN"] {
         return AstMatchPattern::NaN;
@@ -4641,6 +4641,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn true_and_false_use_the_canonical_tag_ast_and_match_pattern() {
+        let parsed = parse_source(
+            "truth-tags.bn",
+            r#"
+truth: True
+selected:
+    truth |> WHEN {
+        True => False
+        False => True
+    }
+"#,
+        )
+        .unwrap();
+
+        let expression_tags = parsed
+            .expressions
+            .iter()
+            .filter_map(|expression| match &expression.kind {
+                AstExprKind::Tag(tag) => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(expression_tags.contains(&"True"));
+        assert!(expression_tags.contains(&"False"));
+
+        let pattern_tags = parsed
+            .expressions
+            .iter()
+            .filter_map(|expression| match &expression.kind {
+                AstExprKind::MatchArm {
+                    semantic_pattern: AstMatchPattern::Tag { name },
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pattern_tags, ["True", "False"]);
+
+        let artifact = serde_json::to_string(&parsed).unwrap();
+        assert!(!artifact.contains("\"kind\":\"bool\""));
+        assert!(!artifact.contains("\"kind\":\"enum\""));
+        assert!(!artifact.contains("\"kind\":\"record\""));
+    }
+
+    #[test]
     fn parsed_program_digest_is_order_independent_and_uses_normalized_paths() {
         let forward = parse_project(
             "app/main.bn",
@@ -4895,7 +4940,7 @@ rows: LIST {
             .expressions
             .iter()
             .find_map(|expression| match &expression.kind {
-                AstExprKind::Record(fields) if fields.iter().any(|field| field.name == "value") => {
+                AstExprKind::Object(fields) if fields.iter().any(|field| field.name == "value") => {
                     Some(fields)
                 }
                 _ => None,

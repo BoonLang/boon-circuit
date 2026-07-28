@@ -3347,7 +3347,7 @@ result: entry_view(entry: [id: 1])
         .iter()
         .find(|expression| expression.id == result)
         .expect("parser-owned checked record");
-    let CheckedExpressionKind::Record { fields } = &record.kind else {
+    let CheckedExpressionKind::Object { fields } = &record.kind else {
         panic!("record block lowered to non-record expression: {record:?}");
     };
     let [id_field] = fields.as_slice() else {
@@ -3439,7 +3439,7 @@ result: wrapped(input: TEXT { ok })
         .iter()
         .find(|expression| expression.id == result)
         .expect("record result expression");
-    let CheckedExpressionKind::Record { fields } = &record.kind else {
+    let CheckedExpressionKind::Object { fields } = &record.kind else {
         panic!("record wrapper result is not a checked record: {record:?}");
     };
     let value = fields.first().expect("value field").value;
@@ -3489,7 +3489,7 @@ result: wrapped(input: TEXT { ok })
         .iter()
         .find(|expression| expression.id == result)
         .expect("record result expression");
-    let CheckedExpressionKind::Record { fields } = &record.kind else {
+    let CheckedExpressionKind::Object { fields } = &record.kind else {
         panic!("record wrapper result is not a checked record: {record:?}");
     };
     let first = fields

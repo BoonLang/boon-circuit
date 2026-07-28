@@ -1781,8 +1781,7 @@ fn semantic_expression_depends_on_role(
                 }));
             }
             SemanticExpressionKind::TaggedObject { fields, .. }
-            | SemanticExpressionKind::Object(fields)
-            | SemanticExpressionKind::Record(fields) => {
+            | SemanticExpressionKind::Object(fields) => {
                 pending.extend(fields.iter().map(|field| field.value));
             }
             SemanticExpressionKind::Block { bindings, result } => {
@@ -1837,7 +1836,6 @@ fn semantic_expression_depends_on_role(
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
-            | SemanticExpressionKind::Bool(_)
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::Source { .. }
             | SemanticExpressionKind::Delimiter
@@ -3754,7 +3752,7 @@ fn checked_expression_children_for_call_analysis(
                 boon_typecheck::CheckedTextSegment::Static { .. } => None,
             })
             .collect(),
-        Kind::TaggedObject { fields, .. } | Kind::Object { fields } | Kind::Record { fields } => {
+        Kind::TaggedObject { fields, .. } | Kind::Object { fields } => {
             fields.iter().map(|field| field.value).collect()
         }
         Kind::Call { call } => calls
@@ -3798,7 +3796,6 @@ fn checked_expression_children_for_call_analysis(
         | Kind::Text { .. }
         | Kind::Number { .. }
         | Kind::BytesByte { .. }
-        | Kind::Bool { .. }
         | Kind::Tag { .. }
         | Kind::Source
         | Kind::Delimiter

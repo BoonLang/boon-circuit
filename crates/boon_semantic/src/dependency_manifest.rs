@@ -2305,8 +2305,7 @@ fn inventory_checked(
                 }
             }
             CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields }
-            | CheckedExpressionKind::Record { fields } => {
+            | CheckedExpressionKind::Object { fields } => {
                 for (ordinal, field) in fields.iter().enumerate() {
                     collector.structural(
                         owner,
@@ -3043,7 +3042,6 @@ fn checked_expression_dependency(
         | CheckedExpressionKind::TextTemplate { .. }
         | CheckedExpressionKind::Number { .. }
         | CheckedExpressionKind::BytesByte { .. }
-        | CheckedExpressionKind::Bool { .. }
         | CheckedExpressionKind::Tag { .. }
         | CheckedExpressionKind::TaggedObject { .. }
         | CheckedExpressionKind::When { .. }
@@ -3053,7 +3051,6 @@ fn checked_expression_dependency(
         | CheckedExpressionKind::MatchArm { .. }
         | CheckedExpressionKind::Block { .. }
         | CheckedExpressionKind::Object { .. }
-        | CheckedExpressionKind::Record { .. }
         | CheckedExpressionKind::List { .. }
         | CheckedExpressionKind::Bytes { .. }
         | CheckedExpressionKind::Delimiter => (
@@ -4292,8 +4289,7 @@ fn semantic_expression_dependency(
             )
         }
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             references.extend(
                 fields
                     .iter()
@@ -4395,7 +4391,6 @@ fn semantic_expression_dependency(
         SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Delimiter => (
             SemanticDependencyChannelV1::StructuralRepresentation,

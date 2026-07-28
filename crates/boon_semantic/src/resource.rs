@@ -981,7 +981,6 @@ fn expression_record_field_names(
         let value = expression(execution, id)?;
         match &value.kind {
             SemanticExpressionKind::Object(record_fields)
-            | SemanticExpressionKind::Record(record_fields)
             | SemanticExpressionKind::TaggedObject {
                 fields: record_fields,
                 ..
@@ -1026,7 +1025,6 @@ fn expression_record_field_names(
             | SemanticExpressionKind::TextTemplate { .. }
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
-            | SemanticExpressionKind::Bool(_)
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::Source { .. }
             | SemanticExpressionKind::Call { .. }
@@ -1122,7 +1120,7 @@ fn semantic_initial_record(
 ) -> Result<SemanticListInitialRowV1, String> {
     let value = expression(execution, expression_id)?;
     let fields = match &value.kind {
-        SemanticExpressionKind::Object(fields) | SemanticExpressionKind::Record(fields) => {
+        SemanticExpressionKind::Object(fields) => {
             let mut result = Vec::new();
             for field in fields {
                 if field.spread {
@@ -1460,9 +1458,6 @@ fn semantic_static_data(
                             &[*value],
                         )));
                     }
-                    SemanticExpressionKind::Bool(value) => {
-                        values.push(boon_data::Value::Bool(*value));
-                    }
                     SemanticExpressionKind::Tag(tag) => {
                         values.push(boon_data::Value::Variant {
                             tag: tag.clone(),
@@ -1492,8 +1487,7 @@ fn semantic_static_data(
                             });
                         }
                     }
-                    SemanticExpressionKind::Object(fields)
-                    | SemanticExpressionKind::Record(fields) => {
+                    SemanticExpressionKind::Object(fields) => {
                         let parts = fields
                             .iter()
                             .map(|field| StaticRecordPart {
@@ -2489,9 +2483,7 @@ fn collect_lineage_leaves(
                     combined.extend(projection);
                     pending.push((*input, combined, row_identity));
                 }
-                SemanticExpressionKind::Object(_)
-                | SemanticExpressionKind::Record(_)
-                | SemanticExpressionKind::TaggedObject { .. } => {
+                SemanticExpressionKind::Object(_) | SemanticExpressionKind::TaggedObject { .. } => {
                     let (projected, remaining) =
                         exact_semantic_record_projection(execution, id, &projection)?;
                     if projected == id {
@@ -2555,7 +2547,6 @@ fn collect_lineage_leaves(
                 | SemanticExpressionKind::TextTemplate { .. }
                 | SemanticExpressionKind::Number(_)
                 | SemanticExpressionKind::BytesByte(_)
-                | SemanticExpressionKind::Bool(_)
                 | SemanticExpressionKind::Tag(_)
                 | SemanticExpressionKind::Infix { .. }
                 | SemanticExpressionKind::List { .. }
@@ -2672,14 +2663,12 @@ fn collect_lineage_leaves(
             | SemanticExpressionKind::TextTemplate { .. }
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
-            | SemanticExpressionKind::Bool(_)
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::TaggedObject { .. }
             | SemanticExpressionKind::Source { .. }
             | SemanticExpressionKind::Call { .. }
             | SemanticExpressionKind::Infix { .. }
             | SemanticExpressionKind::Object(_)
-            | SemanticExpressionKind::Record(_)
             | SemanticExpressionKind::Bytes { .. }
             | SemanticExpressionKind::Delimiter => {
                 return Err(format!(
@@ -2764,7 +2753,6 @@ fn exact_semantic_record_projection(
         let value = expression(execution, expression_id)?;
         let fields = match &value.kind {
             SemanticExpressionKind::Object(fields)
-            | SemanticExpressionKind::Record(fields)
             | SemanticExpressionKind::TaggedObject { fields, .. } => fields,
             _ => break,
         };
@@ -4314,7 +4302,6 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Materialize { .. }
@@ -4329,8 +4316,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
             })
             .collect(),
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
         SemanticExpressionKind::Call { arguments, .. } => {
@@ -4715,7 +4701,7 @@ kept: mapped |> List/retain(item, if: True)
                 synthetic_expression(
                     1,
                     object_type.clone(),
-                    SemanticExpressionKind::Record(vec![crate::SemanticRecordField {
+                    SemanticExpressionKind::Object(vec![crate::SemanticRecordField {
                         declaration: None,
                         name: "rows".to_owned(),
                         value: SemanticExprId(0),

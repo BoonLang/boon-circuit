@@ -1980,7 +1980,7 @@ store: [
     assert!(
         subtree
             .iter()
-            .any(|expression| matches!(expression.kind, ExecutableExpressionKind::Bool(false)))
+            .any(|expression| matches!(&expression.kind, ExecutableExpressionKind::Tag(tag) if tag == "False"))
     );
 }
 
@@ -2070,7 +2070,7 @@ store: [
     assert_eq!(authority_fields, BTreeSet::from(["members", "name"]));
     let item = &ir.executable.expressions[item.as_usize()];
     let fields = match &item.kind {
-        ExecutableExpressionKind::Object(fields) | ExecutableExpressionKind::Record(fields) => {
+        ExecutableExpressionKind::Object(fields) => {
             fields
         }
         other => panic!("append item must be an exact record, got {other:?}"),

@@ -1059,7 +1059,6 @@ pub enum ExecutableExpressionKind {
     },
     Number(String),
     BytesByte(u8),
-    Bool(bool),
     Tag(String),
     TaggedObject {
         tag: String,
@@ -1111,7 +1110,6 @@ pub enum ExecutableExpressionKind {
         output: Option<ExecutableExprId>,
     },
     Object(Vec<ExecutableRecordField>),
-    Record(Vec<ExecutableRecordField>),
     Block {
         bindings: Vec<ExecutableBlockBinding>,
         result: ExecutableExprId,
@@ -4279,7 +4277,6 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
         | ExecutableExpressionKind::Text(_)
         | ExecutableExpressionKind::Number(_)
         | ExecutableExpressionKind::BytesByte(_)
-        | ExecutableExpressionKind::Bool(_)
         | ExecutableExpressionKind::Tag(_)
         | ExecutableExpressionKind::Source { .. }
         | ExecutableExpressionKind::Materialize { .. }
@@ -4294,8 +4291,7 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
             })
             .collect(),
         ExecutableExpressionKind::TaggedObject { fields, .. }
-        | ExecutableExpressionKind::Object(fields)
-        | ExecutableExpressionKind::Record(fields) => {
+        | ExecutableExpressionKind::Object(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
         ExecutableExpressionKind::Block { bindings, result } => bindings
@@ -4660,7 +4656,6 @@ fn executable_list_item_field_names(
         };
         match &expression.kind {
             ExecutableExpressionKind::Object(record_fields)
-            | ExecutableExpressionKind::Record(record_fields)
             | ExecutableExpressionKind::TaggedObject {
                 fields: record_fields,
                 ..
@@ -4708,7 +4703,6 @@ fn executable_list_item_field_names(
             | ExecutableExpressionKind::Text(_)
             | ExecutableExpressionKind::Number(_)
             | ExecutableExpressionKind::BytesByte(_)
-            | ExecutableExpressionKind::Bool(_)
             | ExecutableExpressionKind::Tag(_)
             | ExecutableExpressionKind::Source { .. }
             | ExecutableExpressionKind::Call { .. }

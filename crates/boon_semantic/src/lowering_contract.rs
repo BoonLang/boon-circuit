@@ -1812,7 +1812,6 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Materialize { .. }
@@ -1827,8 +1826,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
             })
             .collect(),
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
         SemanticExpressionKind::Call { arguments, .. } => {

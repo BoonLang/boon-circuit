@@ -960,7 +960,6 @@ fn expression_children(
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Bool(_)
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Source { .. }
         | SemanticExpressionKind::Delimiter
@@ -984,8 +983,7 @@ fn expression_children(
             })
             .collect(),
         SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields)
-        | SemanticExpressionKind::Record(fields) => {
+        | SemanticExpressionKind::Object(fields) => {
             fields.iter().map(|field| field.value).collect()
         }
         SemanticExpressionKind::Call { arguments, .. } => {
@@ -2053,7 +2051,6 @@ impl SemanticMigrationPurityChecker<'_> {
             SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)
-            | SemanticExpressionKind::Bool(_)
             | SemanticExpressionKind::Tag(_) => Ok(()),
             SemanticExpressionKind::TextTemplate { segments } => {
                 for segment in segments {
@@ -2064,8 +2061,7 @@ impl SemanticMigrationPurityChecker<'_> {
                 Ok(())
             }
             SemanticExpressionKind::TaggedObject { fields, .. }
-            | SemanticExpressionKind::Object(fields)
-            | SemanticExpressionKind::Record(fields) => {
+            | SemanticExpressionKind::Object(fields) => {
                 if fields.iter().any(|field| field.spread) {
                     return Err(SemanticMemoryError::new(format!(
                         "migration transform expression {expression_id} uses record spread"

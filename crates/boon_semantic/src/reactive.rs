@@ -3112,7 +3112,9 @@ fn semantic_expression_children(
         SemanticExpressionKind::Call { arguments, .. } => {
             arguments.iter().map(|argument| argument.value).collect()
         }
-        SemanticExpressionKind::Draining { input }
+        SemanticExpressionKind::Flush { payload: input }
+        | SemanticExpressionKind::FlushBoundary { input }
+        | SemanticExpressionKind::Draining { input }
         | SemanticExpressionKind::Project { input, .. } => vec![*input],
         SemanticExpressionKind::Hold {
             initial, updates, ..

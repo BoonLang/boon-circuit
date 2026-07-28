@@ -3043,6 +3043,7 @@ fn checked_expression_dependency(
         | CheckedExpressionKind::Number { .. }
         | CheckedExpressionKind::BytesByte { .. }
         | CheckedExpressionKind::Absent
+        | CheckedExpressionKind::Flush { .. }
         | CheckedExpressionKind::Tag { .. }
         | CheckedExpressionKind::TaggedObject { .. }
         | CheckedExpressionKind::When { .. }
@@ -4393,6 +4394,8 @@ fn semantic_expression_dependency(
         | SemanticExpressionKind::Number(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
+        | SemanticExpressionKind::Flush { .. }
+        | SemanticExpressionKind::FlushBoundary { .. }
         | SemanticExpressionKind::Tag(_)
         | SemanticExpressionKind::Delimiter => (
             SemanticDependencyChannelV1::StructuralRepresentation,

@@ -7583,6 +7583,14 @@ fn map_expression_kind(
         SemanticExpressionKind::Number(value) => ExecutableExpressionKind::Number(value.clone()),
         SemanticExpressionKind::BytesByte(value) => ExecutableExpressionKind::BytesByte(*value),
         SemanticExpressionKind::Absent => ExecutableExpressionKind::Absent,
+        SemanticExpressionKind::Flush { payload } => ExecutableExpressionKind::Flush {
+            payload: ids.expression(*payload)?,
+        },
+        SemanticExpressionKind::FlushBoundary { input } => {
+            ExecutableExpressionKind::FlushBoundary {
+                input: ids.expression(*input)?,
+            }
+        }
         SemanticExpressionKind::Tag(value) => ExecutableExpressionKind::Tag(value.clone()),
         SemanticExpressionKind::TaggedObject { tag, fields } => {
             ExecutableExpressionKind::TaggedObject {

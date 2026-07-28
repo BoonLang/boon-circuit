@@ -473,6 +473,16 @@ pub enum SemanticExpressionKind {
     BytesByte(u8),
     /// Private flow absence. It has no public data representation.
     Absent,
+    /// Private fail-fast control. This node produces no ordinary value until a
+    /// compiler-inserted lexical boundary consumes the carrier.
+    Flush {
+        payload: SemanticExprId,
+    },
+    /// Removes the private fail-fast carrier and exposes its payload as the
+    /// boundary's ordinary closed Tag/tagged-object result.
+    FlushBoundary {
+        input: SemanticExprId,
+    },
     Tag(String),
     TaggedObject {
         tag: String,
@@ -1868,7 +1878,9 @@ impl SemanticExecutionGraphV1 {
             SemanticExpressionKind::Materialize { materialization } => {
                 self.require_materialization(*materialization, context("materialization"))?;
             }
-            SemanticExpressionKind::Draining { input }
+            SemanticExpressionKind::Flush { payload: input }
+            | SemanticExpressionKind::FlushBoundary { input }
+            | SemanticExpressionKind::Draining { input }
             | SemanticExpressionKind::Project { input, .. } => {
                 self.require_expression(*input, context("input"))?;
             }

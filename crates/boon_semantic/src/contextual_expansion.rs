@@ -23,7 +23,7 @@ use boon_typecheck::{
     CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
     CheckedExpressionKind, CheckedParameterKind, CheckedParameterRequirement, CheckedPassedAccess,
     CheckedProgram, CheckedResourceBinding, CheckedTextSegment, CheckedValueUse, ContextFormalId,
-    DeclId, FlowMode, Type, apply_checked_type_substitutions, is_renderable_type,
+    DeclId, FlowMode, FlowType, Type, apply_checked_type_substitutions, is_renderable_type,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1471,7 +1471,7 @@ pub(crate) fn derive_semantic_execution_graph(
         let value = statement
             .value
             .map(|expression| {
-                builder.expand_with_inherited_owner(
+                let value = builder.expand_with_inherited_owner(
                     ScopedCheckedExpr {
                         expression,
                         frame: None,
@@ -1479,7 +1479,18 @@ pub(crate) fn derive_semantic_execution_graph(
                         value_frame: None,
                     },
                     None,
-                )
+                )?;
+                let is_host_root = !semantic_statement_parents.contains_key(&semantic_statement);
+                if declaration.is_some() || is_host_root {
+                    let flow_type = declaration.and_then(|declaration| {
+                        lookup
+                            .declaration(program, declaration)
+                            .map(|declaration| declaration.flow_type.clone())
+                    });
+                    builder.wrap_flush_boundary(expression, value, None, flow_type)
+                } else {
+                    Ok(value)
+                }
             })
             .transpose()?;
         let declaration_parts = |declaration: Option<DeclId>| {
@@ -2573,7 +2584,9 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
         SemanticExpressionKind::Call { arguments, .. } => {
             arguments.iter().map(|argument| argument.value).collect()
         }
-        SemanticExpressionKind::Draining { input }
+        SemanticExpressionKind::Flush { payload: input }
+        | SemanticExpressionKind::FlushBoundary { input }
+        | SemanticExpressionKind::Draining { input }
         | SemanticExpressionKind::Project { input, .. } => vec![*input],
         SemanticExpressionKind::Hold {
             initial, updates, ..
@@ -3325,7 +3338,9 @@ fn rebase_expression_kind(
                 }
             }
         }
-        SemanticExpressionKind::Draining { input }
+        SemanticExpressionKind::Flush { payload: input }
+        | SemanticExpressionKind::FlushBoundary { input }
+        | SemanticExpressionKind::Draining { input }
         | SemanticExpressionKind::Project { input, .. } => rebase(input),
         SemanticExpressionKind::Hold {
             initial, updates, ..
@@ -4060,7 +4075,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     },
                 }],
             },
-            SemanticExpressionKind::Draining { input } => child(*input),
+            SemanticExpressionKind::Flush { payload: input }
+            | SemanticExpressionKind::FlushBoundary { input }
+            | SemanticExpressionKind::Draining { input } => child(*input),
             SemanticExpressionKind::Latest { branches } => {
                 let members = branches
                     .iter()
@@ -4654,6 +4671,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
             CheckedExpressionKind::Number { value } => SemanticExpressionKind::Number(value),
             CheckedExpressionKind::BytesByte { value } => SemanticExpressionKind::BytesByte(value),
             CheckedExpressionKind::Absent => SemanticExpressionKind::Absent,
+            CheckedExpressionKind::Flush { payload } => SemanticExpressionKind::Flush {
+                payload: self.expand_in_frame(payload, scoped.frame, scoped.value_frame)?,
+            },
             CheckedExpressionKind::Tag { name } => SemanticExpressionKind::Tag(name),
             CheckedExpressionKind::TaggedObject { tag, fields } => {
                 SemanticExpressionKind::TaggedObject {
@@ -4744,24 +4764,40 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 let bindings = bindings
                     .into_iter()
                     .map(|binding| {
+                        let value = self.expand(ScopedCheckedExpr {
+                            expression: binding.value,
+                            frame: scoped.frame,
+                            evaluation_port: None,
+                            value_frame: Some(frame),
+                        })?;
+                        let value = self.wrap_flush_boundary(
+                            binding.value,
+                            value,
+                            owner,
+                            self.lookup
+                                .declaration(self.program, binding.declaration)
+                                .map(|declaration| declaration.flow_type.clone()),
+                        )?;
                         Ok(SemanticBlockBinding {
                             id: binding_ids[&binding.declaration],
                             declaration: binding.declaration,
-                            value: self.expand(ScopedCheckedExpr {
-                                expression: binding.value,
-                                frame: scoped.frame,
-                                evaluation_port: None,
-                                value_frame: Some(frame),
-                            })?,
+                            value,
                         })
                     })
                     .collect::<Result<Vec<_>, ExpansionError>>()?;
+                let result_expression = result;
                 let result = self.expand(ScopedCheckedExpr {
                     expression: result,
                     frame: scoped.frame,
                     evaluation_port: None,
                     value_frame: Some(frame),
                 })?;
+                let result = self.wrap_flush_boundary(
+                    result_expression,
+                    result,
+                    owner,
+                    Some(expression.flow_type.clone()),
+                )?;
                 SemanticExpressionKind::Block { bindings, result }
             }
             CheckedExpressionKind::Object { fields } => SemanticExpressionKind::Object(
@@ -4846,7 +4882,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 .result_expression
                 .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
             let call_owner = self.out_net.owner_for_call(instance).or(owner);
-            return self.expand_with_inherited_owner(
+            let result = self.expand_with_inherited_owner(
                 ScopedCheckedExpr {
                     expression: result,
                     frame: Some(instance),
@@ -4854,6 +4890,14 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     value_frame: scoped.value_frame,
                 },
                 call_owner,
+            )?;
+            return self.wrap_flush_boundary(
+                callable
+                    .result_expression
+                    .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?,
+                result,
+                call_owner,
+                Some(callable.result.clone()),
             );
         }
         if !matches!(checked_call.context_binding, CheckedContextBinding::None) {
@@ -5013,14 +5057,48 @@ impl<'a> SemanticExpressionBuilder<'a> {
         fields
             .into_iter()
             .map(|field| {
+                let value = self.expand_in_frame(field.value, frame, value_frame)?;
+                let value = self.wrap_flush_boundary(
+                    field.value,
+                    value,
+                    self.owner_stack.last().copied().flatten(),
+                    field.declaration.and_then(|declaration| {
+                        self.lookup
+                            .declaration(self.program, declaration)
+                            .map(|declaration| declaration.flow_type.clone())
+                    }),
+                )?;
                 Ok(SemanticRecordField {
                     declaration: field.declaration,
                     name: field.name,
-                    value: self.expand_in_frame(field.value, frame, value_frame)?,
+                    value,
                     spread: field.spread,
                 })
             })
             .collect()
+    }
+
+    fn wrap_flush_boundary(
+        &mut self,
+        checked_expression: CheckedExprId,
+        input: SemanticExprId,
+        owner: Option<StaticOwnerId>,
+        flow_type: Option<FlowType>,
+    ) -> Result<SemanticExprId, ExpansionError> {
+        let origin = self
+            .lookup
+            .expression(self.program, checked_expression)
+            .cloned()
+            .ok_or(ExpansionError::MissingExpression(checked_expression))?;
+        let boundary = self.push(
+            &origin,
+            owner,
+            SemanticExpressionKind::FlushBoundary { input },
+        );
+        if let Some(flow_type) = flow_type {
+            self.expressions[boundary.as_usize()].flow_type = flow_type;
+        }
+        Ok(boundary)
     }
 
     fn expand_statement_child_values(

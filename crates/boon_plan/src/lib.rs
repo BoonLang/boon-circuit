@@ -1916,7 +1916,12 @@ fn distributed_call_expression_is_safe(
             PlanRowExpressionNode::ListRowField { row, list_id, .. } => {
                 child_is_valid(row) && row_bindings.iter().any(|binding| binding.list == *list_id)
             }
+            // A lexical boundary proves that no live control carrier crosses
+            // the distributed cut. Its ordinary payload/result is validated
+            // by the surrounding typed argument contract.
+            PlanRowExpressionNode::FlushBoundary { .. } => true,
             PlanRowExpressionNode::Absent
+            | PlanRowExpressionNode::Flush { .. }
             | PlanRowExpressionNode::Intrinsic { .. }
             | PlanRowExpressionNode::ListGetField { .. }
             | PlanRowExpressionNode::ListRef { .. }
@@ -7132,6 +7137,14 @@ impl<'de> Deserialize<'de> for PlanRowBuiltin {
 pub enum PlanRowExpressionNode {
     /// Private flow absence. This node never enters the constant/data tables.
     Absent,
+    /// Private fail-fast control. Neither node is legal in constant,
+    /// persistence, migration, or distributed-wire data.
+    Flush {
+        payload: PlanRowExpressionId,
+    },
+    FlushBoundary {
+        input: PlanRowExpressionId,
+    },
     Intrinsic {
         intrinsic: PlanIntrinsic,
     },
@@ -7380,7 +7393,9 @@ impl PlanRowExpressionNode {
             | Self::Local { .. }
             | Self::LocalRow { .. }
             | Self::EventRow { .. } => {}
-            Self::TextTrim { input }
+            Self::Flush { payload: input }
+            | Self::FlushBoundary { input }
+            | Self::TextTrim { input }
             | Self::TextIsEmpty { input }
             | Self::TextLength { input }
             | Self::TextToNumber { input }
@@ -7575,7 +7590,9 @@ impl PlanRowExpressionNode {
             | Self::Local { .. }
             | Self::LocalRow { .. }
             | Self::EventRow { .. } => {}
-            Self::TextTrim { input }
+            Self::Flush { payload: input }
+            | Self::FlushBoundary { input }
+            | Self::TextTrim { input }
             | Self::TextIsEmpty { input }
             | Self::TextLength { input }
             | Self::TextToNumber { input }

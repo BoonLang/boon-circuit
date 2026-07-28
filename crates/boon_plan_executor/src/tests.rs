@@ -7240,6 +7240,51 @@ store: [
 }
 
 #[test]
+fn flush_is_private_until_the_named_root_boundary() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let payload = row_constant(&mut row_expressions, PlanConstantId(0));
+    let flush = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::Flush { payload },
+    );
+    let boundary = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::FlushBoundary { input: flush },
+    );
+    assert!(
+        row_expressions
+            .iter()
+            .any(|(_, node)| { matches!(node, PlanRowExpressionNode::Flush { .. }) })
+    );
+    assert!(
+        row_expressions
+            .iter()
+            .any(|(_, node)| { matches!(node, PlanRowExpressionNode::FlushBoundary { .. }) })
+    );
+
+    let mut session = MachineInstance::new(
+        plan(
+            RootOutputDemand::All,
+            row_expressions,
+            vec![constant(0, tag_constant("InvalidInput"))],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![derived(0, 0, Vec::new(), Some(boundary))],
+            Vec::new(),
+            Vec::new(),
+            vec![(FieldId(0), "result")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        session.root_value_current("result").unwrap(),
+        Value::tag("InvalidInput")
+    );
+}
+
+#[test]
 fn removed_error_builtins_are_rejected() {
     assert!(
         compile_server_source(

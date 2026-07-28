@@ -1800,7 +1800,9 @@ fn semantic_expression_depends_on_role(
                     })?;
                 pending.extend(definition.expression_roots());
             }
-            SemanticExpressionKind::Draining { input }
+            SemanticExpressionKind::Flush { payload: input }
+            | SemanticExpressionKind::FlushBoundary { input }
+            | SemanticExpressionKind::Draining { input }
             | SemanticExpressionKind::Project { input, .. } => pending.push(*input),
             SemanticExpressionKind::Hold {
                 initial, updates, ..
@@ -3815,7 +3817,7 @@ fn checked_expression_children_for_call_analysis(
                     .chain(call.context_binding.explicit().map(|(value, _)| value))
             })
             .collect(),
-        Kind::Draining { input } => vec![*input],
+        Kind::Flush { payload: input } | Kind::Draining { input } => vec![*input],
         Kind::Hold { initial, .. } => vec![*initial],
         Kind::Latest { branches } => branches.clone(),
         Kind::When { input, arms } | Kind::While { input, arms } => {

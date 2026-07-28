@@ -5965,6 +5965,9 @@ fn instantiate_plan_owner(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EvalValue {
     Absent,
+    /// Private fail-fast carrier. It is intercepted by the expression
+    /// evaluator and must never reach ordinary data materialization.
+    Flushed(Value),
     Value(Value),
     Row(RowId),
     List(Vec<EvalValue>),
@@ -5982,6 +5985,32 @@ enum EvalValue {
         items: Vec<OrderedEvalItem>,
         directions: Vec<EvalOrderDirection>,
     },
+}
+
+fn validate_flush_payload_value(value: &Value) -> Result<(), Error> {
+    let Value::Tag { fields, .. } = value else {
+        return Err(Error::InvalidPlan(
+            "FLUSH payload materialized as a non-Tag value".to_owned(),
+        ));
+    };
+    let mut pending = fields.values().collect::<Vec<_>>();
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+            Value::Record(fields) | Value::Tag { fields, .. } => {
+                pending.extend(fields.values());
+            }
+            Value::List(_)
+            | Value::MappedRow { .. }
+            | Value::Row { .. }
+            | Value::HostBound { .. } => {
+                return Err(Error::InvalidPlan(
+                    "FLUSH payload contains collection, row, or host-bound data".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 enum EvalMaterializationCollection {
@@ -6655,6 +6684,19 @@ struct ExpressionCatchFrame {
     list_access_flush_started: bool,
 }
 
+struct ExpressionFlushFrame {
+    task_depth: usize,
+    value_depth: usize,
+    binding_depth: usize,
+    currentness_depth: usize,
+    authority_depth: usize,
+    detached_index_depth: usize,
+    ordered_index_evaluation_depth: usize,
+    access_cleanup_depth: usize,
+    work_limit_catch_depth: usize,
+    list_access_flush_started: bool,
+}
+
 #[derive(Clone, Copy)]
 enum AccessCleanupKind {
     ListAccess,
@@ -7258,6 +7300,8 @@ enum ExpressionTask<'event, 'plan> {
     },
     FinishListAccessDependenciesFlush,
     FinishWorkLimitCatch,
+    FinishFlush,
+    FinishFlushBoundary,
     SelectAfterInput {
         expression: PlanRowExpressionId,
         context: ExpressionContext<'event>,
@@ -7751,6 +7795,8 @@ fn schedule_apply_operands<'event, 'plan>(
             }
         }
         PlanRowExpressionNode::Absent
+        | PlanRowExpressionNode::Flush { .. }
+        | PlanRowExpressionNode::FlushBoundary { .. }
         | PlanRowExpressionNode::Intrinsic { .. }
         | PlanRowExpressionNode::Field { .. }
         | PlanRowExpressionNode::Constant { .. }
@@ -18966,6 +19012,11 @@ impl MachineInstance {
                             "private absence reached a data materialization boundary".to_owned(),
                         ));
                     }
+                    EvalValue::Flushed(_) => {
+                        return Err(Error::Evaluation(
+                            "live FLUSH control reached a data materialization boundary".to_owned(),
+                        ));
+                    }
                     EvalValue::Value(value) => values.push(value),
                     EvalValue::Row(row) => values.push(row_identity_value(row)),
                     EvalValue::List(items) => {
@@ -19870,6 +19921,7 @@ impl MachineInstance {
         let mut binding_undos = Vec::<ExpressionBindingUndo>::new();
         let mut currentness_targets = Vec::<ExpressionCurrentnessTarget>::new();
         let mut catch_frames = Vec::<ExpressionCatchFrame>::new();
+        let mut flush_frames = Vec::<ExpressionFlushFrame>::new();
         let mut detached_ordered_indexes = BTreeMap::<PlanListIndexId, DetachedOrderedIndex>::new();
         let mut detached_ordered_index_order = Vec::<PlanListIndexId>::new();
         let mut ordered_index_evaluations = Vec::<PlanListIndexId>::new();
@@ -19915,6 +19967,33 @@ impl MachineInstance {
                             match node {
                                 PlanRowExpressionNode::Absent => {
                                     stack.push_value(EvalValue::Absent)?
+                                }
+                                PlanRowExpressionNode::Flush { payload } => {
+                                    stack.push_task(ExpressionTask::FinishFlush)?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: *payload,
+                                        context,
+                                    })?;
+                                }
+                                PlanRowExpressionNode::FlushBoundary { input } => {
+                                    flush_frames.push(ExpressionFlushFrame {
+                                        task_depth: stack.tasks.len(),
+                                        value_depth: stack.values.len(),
+                                        binding_depth: binding_undos.len(),
+                                        currentness_depth: currentness_targets.len(),
+                                        authority_depth: work.active_value_list_authorities.len(),
+                                        detached_index_depth: detached_ordered_index_order.len(),
+                                        ordered_index_evaluation_depth: ordered_index_evaluations
+                                            .len(),
+                                        access_cleanup_depth: access_cleanups.len(),
+                                        work_limit_catch_depth: catch_frames.len(),
+                                        list_access_flush_started,
+                                    });
+                                    stack.push_task(ExpressionTask::FinishFlushBoundary)?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: *input,
+                                        context,
+                                    })?;
                                 }
                                 PlanRowExpressionNode::Intrinsic { intrinsic } => stack
                                     .push_value(private_presence_eval(
@@ -24619,6 +24698,26 @@ impl MachineInstance {
                                 )
                             })?;
                         }
+                        ExpressionTask::FinishFlush => {
+                            let payload = self.materialize_eval(stack.pop_value()?)?;
+                            validate_flush_payload_value(&payload)?;
+                            stack.push_value(EvalValue::Flushed(payload))?;
+                        }
+                        ExpressionTask::FinishFlushBoundary => {
+                            let frame = flush_frames.pop().ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "FLUSH boundary continuation disappeared".to_owned(),
+                                )
+                            })?;
+                            if stack.tasks.len() != frame.task_depth
+                                || stack.values.len() != frame.value_depth.saturating_add(1)
+                            {
+                                return Err(Error::InvalidPlan(
+                                    "FLUSH boundary completed with an invalid expression stack"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
                         ExpressionTask::SelectAfterInput {
                             expression,
                             context,
@@ -25274,6 +25373,74 @@ impl MachineInstance {
                     }
                     Ok(())
                 })();
+                if task_result.is_ok() {
+                    let flushed = match stack.values.last() {
+                        Some(EvalValue::Flushed(payload)) => Some(payload.clone()),
+                        _ => None,
+                    };
+                    if let Some(payload) = flushed {
+                        if let Some(frame) = flush_frames.pop() {
+                            stack.tasks.truncate(frame.task_depth);
+                            stack.values.truncate(frame.value_depth);
+                            while binding_undos.len() > frame.binding_depth {
+                                restore_expression_binding(
+                                    bindings,
+                                    binding_undos
+                                        .pop()
+                                        .expect("binding depth checked before FLUSH unwind"),
+                                );
+                            }
+                            while currentness_targets.len() > frame.currentness_depth {
+                                self.rollback_expression_currentness(
+                                    currentness_targets
+                                        .pop()
+                                        .expect("currentness depth checked before FLUSH unwind"),
+                                );
+                            }
+                            work.active_value_list_authorities
+                                .truncate(frame.authority_depth);
+                            while detached_ordered_index_order.len() > frame.detached_index_depth {
+                                let index_id = detached_ordered_index_order
+                                    .pop()
+                                    .expect("detached index depth checked before FLUSH unwind");
+                                if let Some(detached) = detached_ordered_indexes.remove(&index_id) {
+                                    self.ordered_indexes.insert(index_id, detached.index);
+                                    self.dirty_ordered_index_rows
+                                        .entry(index_id)
+                                        .or_default()
+                                        .extend(detached.rollback_dirty_rows);
+                                }
+                            }
+                            while ordered_index_evaluations.len()
+                                > frame.ordered_index_evaluation_depth
+                            {
+                                let index = ordered_index_evaluations
+                                    .pop()
+                                    .expect("ordered index depth checked before FLUSH unwind");
+                                self.evaluating_ordered_indexes.remove(&index);
+                            }
+                            for cleanup in access_cleanups
+                                .drain(frame.access_cleanup_depth..)
+                                .flatten()
+                            {
+                                if matches!(cleanup.kind, AccessCleanupKind::ListAccess) {
+                                    record_access_metrics(work, cleanup.metrics, 0);
+                                }
+                            }
+                            catch_frames.truncate(frame.work_limit_catch_depth);
+                            if list_access_flush_started && !frame.list_access_flush_started {
+                                self.list_access_flush_in_progress = false;
+                                list_access_flush_started = false;
+                            }
+                            stack.push_value(EvalValue::Value(payload))?;
+                        } else {
+                            stack.tasks.clear();
+                            stack.values.clear();
+                            stack.push_value(EvalValue::Flushed(payload))?;
+                        }
+                        continue;
+                    }
+                }
                 if let Err(error) = task_result {
                     if matches!(error, Error::WorkBudgetExceeded { .. })
                         && let Some(frame) = catch_frames.pop()
@@ -25637,6 +25804,8 @@ impl MachineInstance {
                 self.eval_object_field(next()?, field, context.consumer)?
             }
             PlanRowExpressionNode::Absent
+            | PlanRowExpressionNode::Flush { .. }
+            | PlanRowExpressionNode::FlushBoundary { .. }
             | PlanRowExpressionNode::Intrinsic { .. }
             | PlanRowExpressionNode::Field { .. }
             | PlanRowExpressionNode::Constant { .. }
@@ -27153,6 +27322,7 @@ fn eval_row_id(value: &EvalValue) -> Option<RowId> {
             Some(*id)
         }
         EvalValue::Absent
+        | EvalValue::Flushed(_)
         | EvalValue::Value(_)
         | EvalValue::List(_)
         | EvalValue::Record(_)

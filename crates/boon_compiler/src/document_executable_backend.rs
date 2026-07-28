@@ -704,6 +704,10 @@ impl<'a> DocumentCompiler<'a> {
                 value_class_for_type(&expression.flow_type.ty),
                 DocumentExprOp::Absent,
             )),
+            ir::ExecutableExpressionKind::Flush { .. }
+            | ir::ExecutableExpressionKind::FlushBoundary { .. } => Err(PlanError::new(format!(
+                "FLUSH control at executable expression {compiler_id} cannot be materialized as retained document data"
+            ))),
             ir::ExecutableExpressionKind::Tag(value) => self.compile_tag(compiler_id, value),
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
                 self.compile_record_fields(compiler_id, Some(tag), fields, context)

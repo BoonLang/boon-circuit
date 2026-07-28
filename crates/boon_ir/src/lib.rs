@@ -1058,6 +1058,14 @@ pub enum ExecutableExpressionKind {
     BytesByte(u8),
     /// Private flow absence. It cannot be materialized as public data.
     Absent,
+    /// Private fail-fast control; the carrier is consumed by
+    /// `FlushBoundary` and never enters the public value algebra.
+    Flush {
+        payload: ExecutableExprId,
+    },
+    FlushBoundary {
+        input: ExecutableExprId,
+    },
     Tag(String),
     TaggedObject {
         tag: String,
@@ -4304,7 +4312,9 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
         ExecutableExpressionKind::Call { arguments, .. } => {
             arguments.iter().map(|argument| argument.value).collect()
         }
-        ExecutableExpressionKind::Draining { input }
+        ExecutableExpressionKind::Flush { payload: input }
+        | ExecutableExpressionKind::FlushBoundary { input }
+        | ExecutableExpressionKind::Draining { input }
         | ExecutableExpressionKind::Project { input, .. } => vec![*input],
         ExecutableExpressionKind::Hold {
             initial, updates, ..
@@ -4687,7 +4697,9 @@ fn executable_list_item_field_names(
             ExecutableExpressionKind::List { items, .. } => {
                 pending.extend(items.iter().copied());
             }
-            ExecutableExpressionKind::Draining { input }
+            ExecutableExpressionKind::Flush { payload: input }
+            | ExecutableExpressionKind::FlushBoundary { input }
+            | ExecutableExpressionKind::Draining { input }
             | ExecutableExpressionKind::Project { input, .. } => {
                 pending.push(*input);
             }

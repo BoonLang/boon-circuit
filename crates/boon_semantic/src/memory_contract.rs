@@ -991,7 +991,9 @@ fn expression_children(
         SemanticExpressionKind::Call { arguments, .. } => {
             arguments.iter().map(|argument| argument.value).collect()
         }
-        SemanticExpressionKind::Draining { input }
+        SemanticExpressionKind::Flush { payload: input }
+        | SemanticExpressionKind::FlushBoundary { input }
+        | SemanticExpressionKind::Draining { input }
         | SemanticExpressionKind::Project { input, .. } => vec![*input],
         SemanticExpressionKind::Hold {
             initial, updates, ..
@@ -2053,6 +2055,11 @@ impl SemanticMigrationPurityChecker<'_> {
             SemanticExpressionKind::Absent => Err(SemanticMemoryError::new(format!(
                 "private absence at semantic expression {expression_id} cannot be migration data"
             ))),
+            SemanticExpressionKind::Flush { .. } | SemanticExpressionKind::FlushBoundary { .. } => {
+                Err(SemanticMemoryError::new(format!(
+                    "live FLUSH control at semantic expression {expression_id} cannot be migration data"
+                )))
+            }
             SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
             | SemanticExpressionKind::BytesByte(_)

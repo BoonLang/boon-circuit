@@ -65,7 +65,9 @@ fn visit_row_node_children_mut(
         | PlanRowExpressionNode::Local { .. }
         | PlanRowExpressionNode::LocalRow { .. }
         | PlanRowExpressionNode::EventRow { .. } => {}
-        PlanRowExpressionNode::TextTrim { input }
+        PlanRowExpressionNode::Flush { payload: input }
+        | PlanRowExpressionNode::FlushBoundary { input }
+        | PlanRowExpressionNode::TextTrim { input }
         | PlanRowExpressionNode::TextIsEmpty { input }
         | PlanRowExpressionNode::TextLength { input }
         | PlanRowExpressionNode::TextToNumber { input }
@@ -2876,6 +2878,12 @@ impl ExecutableMigrationExpressionLowerer<'_> {
             ir::ExecutableExpressionKind::Absent => Err(PlanError::new(format!(
                 "private absence at executable expression {expr_id} cannot be migration data"
             ))),
+            ir::ExecutableExpressionKind::Flush { .. }
+            | ir::ExecutableExpressionKind::FlushBoundary { .. } => {
+                Err(PlanError::new(format!(
+                    "live FLUSH control at executable expression {expr_id} cannot be migration data"
+                )))
+            }
             ir::ExecutableExpressionKind::Tag(tag) => {
                 Ok(MigrationExpressionPlan::Variant { tag })
             }
@@ -6382,6 +6390,10 @@ fn inferred_executable_expression_value_type_inner(
             Some(PlanValueType::Bytes { fixed_len: Some(1) })
         }
         ir::ExecutableExpressionKind::Absent => None,
+        ir::ExecutableExpressionKind::Flush { payload }
+        | ir::ExecutableExpressionKind::FlushBoundary { input: payload } => {
+            inferred_executable_expression_value_type_inner(program, *payload, visiting)
+        }
         ir::ExecutableExpressionKind::Tag(_)
         | ir::ExecutableExpressionKind::TaggedObject { .. } => Some(PlanValueType::Tag),
         ir::ExecutableExpressionKind::Bytes {
@@ -10243,6 +10255,14 @@ impl<'a> ExecutableRowLowerer<'a> {
             }
             ir::ExecutableExpressionKind::BytesByte(value) => self.bytes_constant(vec![value])?,
             ir::ExecutableExpressionKind::Absent => self.intern(PlanRowExpressionNode::Absent)?,
+            ir::ExecutableExpressionKind::Flush { payload } => {
+                let payload = self.lower_scoped(payload, owner)?;
+                self.intern(PlanRowExpressionNode::Flush { payload })?
+            }
+            ir::ExecutableExpressionKind::FlushBoundary { input } => {
+                let input = self.lower_scoped(input, owner)?;
+                self.intern(PlanRowExpressionNode::FlushBoundary { input })?
+            }
             ir::ExecutableExpressionKind::Tag(value) => {
                 self.constant(PlanConstantValue::Tag { name: value })?
             }
@@ -11805,6 +11825,10 @@ fn row_expression_value_type(
 ) -> Result<Option<PlanValueType>, PlanError> {
     Ok(match arena.node(expression)? {
         PlanRowExpressionNode::Absent => None,
+        PlanRowExpressionNode::Flush { payload }
+        | PlanRowExpressionNode::FlushBoundary { input: payload } => {
+            row_expression_value_type(program, index, arena, constants, *payload)?
+        }
         PlanRowExpressionNode::Intrinsic { .. } => Some(PlanValueType::Tag),
         PlanRowExpressionNode::Field { input } => {
             plan_value_type_for_value_ref(program, index, input)

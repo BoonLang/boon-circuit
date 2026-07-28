@@ -286,7 +286,7 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
         stage: LanguageFeatureStage::Planned,
         parse_expectation: LanguageFeatureParseExpectation::Reject,
         spellings: &["FLUSH"],
-        summary: "fail-fast FLUSH control is planned and rejected today",
+        summary: "fail-fast FLUSH control remains rejected until activation rollback is complete",
     },
     LanguageFeatureSpec {
         id: "immutable_bytes",
@@ -635,6 +635,11 @@ pub enum AstExprKind {
     TaggedObject {
         tag: String,
         fields: Vec<AstRecordField>,
+    },
+    /// Private fail-fast control. The payload is ordinary Boon data, but the
+    /// `FLUSH` carrier itself never enters the public value algebra.
+    Flush {
+        payload: Option<usize>,
     },
     Source,
     Call {
@@ -1489,6 +1494,7 @@ fn statement_child_pipeline_input(
         | AstExprKind::Object(_)
         | AstExprKind::ListLiteral { .. }
         | AstExprKind::BytesLiteral { .. }
+        | AstExprKind::Flush { .. }
         | AstExprKind::Hold { .. }
         | AstExprKind::Latest { .. }
         | AstExprKind::When { .. } => None,
@@ -1647,6 +1653,11 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
                 *output = child_result;
             }
         }
+        AstExprKind::Flush { payload } => {
+            if payload.is_none() {
+                *payload = child_result;
+            }
+        }
         AstExprKind::Block { bindings, result } => {
             if bindings.is_empty() {
                 *bindings = block_bindings;
@@ -1690,6 +1701,7 @@ fn expression_owns_statement_children(expr_id: usize, expressions: &[AstExpr]) -
                 | AstExprKind::Object(_)
                 | AstExprKind::ListLiteral { .. }
                 | AstExprKind::BytesLiteral { .. }
+                | AstExprKind::Flush { .. }
                 | AstExprKind::Hold { .. }
                 | AstExprKind::Latest { .. }
                 | AstExprKind::When { .. }
@@ -1724,6 +1736,7 @@ fn statement_value_expression(statement: &AstStatement, expressions: &[AstExpr])
                     | AstExprKind::Object(_)
                     | AstExprKind::ListLiteral { .. }
                     | AstExprKind::BytesLiteral { .. }
+                    | AstExprKind::Flush { .. }
                     | AstExprKind::Hold { .. }
                     | AstExprKind::Latest { .. }
                     | AstExprKind::When { .. }
@@ -2423,6 +2436,17 @@ fn ast_expr_kind(
     }
     if tokens == ["Text/empty", "(", ")"] {
         return AstExprKind::TextLiteral(String::new());
+    }
+    if tokens.first().map(String::as_str) == Some("FLUSH") {
+        let payload = if tokens.get(1).map(String::as_str) == Some("{")
+            && matching_close(tokens, 1) == Some(tokens.len() - 1)
+        {
+            (!tokens[2..tokens.len() - 1].is_empty())
+                .then(|| parse_ast_expr(&tokens[2..tokens.len() - 1], item, expressions, source))
+        } else {
+            None
+        };
+        return AstExprKind::Flush { payload };
     }
     if tokens.first().map(String::as_str) == Some("BLOCK")
         && tokens.last().map(String::as_str) == Some("{")

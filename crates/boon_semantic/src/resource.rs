@@ -1053,7 +1053,9 @@ fn expression_record_field_names(
             SemanticExpressionKind::List { items, .. } => {
                 pending.extend(items.iter().copied());
             }
-            SemanticExpressionKind::Draining { input }
+            SemanticExpressionKind::Flush { payload: input }
+            | SemanticExpressionKind::FlushBoundary { input }
+            | SemanticExpressionKind::Draining { input }
             | SemanticExpressionKind::Project { input, .. } => pending.push(*input),
             SemanticExpressionKind::Block { bindings, result } => {
                 pending.extend(bindings.iter().map(|binding| binding.value));
@@ -2537,7 +2539,9 @@ fn collect_lineage_leaves(
                     }
                     pending.push((projected, remaining, row_identity));
                 }
-                SemanticExpressionKind::Draining { input } => {
+                SemanticExpressionKind::Flush { payload: input }
+                | SemanticExpressionKind::FlushBoundary { input }
+                | SemanticExpressionKind::Draining { input } => {
                     pending.push((*input, projection, row_identity));
                 }
                 SemanticExpressionKind::Block { result, .. } => {
@@ -2655,7 +2659,9 @@ fn collect_lineage_leaves(
             SemanticExpressionKind::Project { input, fields } => {
                 pending.push((*input, fields.clone(), row_identity));
             }
-            SemanticExpressionKind::Draining { input } => {
+            SemanticExpressionKind::Flush { payload: input }
+            | SemanticExpressionKind::FlushBoundary { input }
+            | SemanticExpressionKind::Draining { input } => {
                 pending.push((*input, Vec::new(), row_identity));
             }
             SemanticExpressionKind::Block { result, .. } => {
@@ -4368,7 +4374,9 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
         SemanticExpressionKind::Call { arguments, .. } => {
             arguments.iter().map(|argument| argument.value).collect()
         }
-        SemanticExpressionKind::Draining { input }
+        SemanticExpressionKind::Flush { payload: input }
+        | SemanticExpressionKind::FlushBoundary { input }
+        | SemanticExpressionKind::Draining { input }
         | SemanticExpressionKind::Project { input, .. } => vec![*input],
         SemanticExpressionKind::Hold {
             initial, updates, ..

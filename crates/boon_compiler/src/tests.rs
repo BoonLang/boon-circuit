@@ -395,6 +395,51 @@ fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
     let EffectResultRoute::Target { target, policy } = &invocation.result;
     assert!(matches!(target, ValueRef::State(_)));
     assert_eq!(*policy, EffectResultPolicy::ReturnValue);
+    let store_last_status = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.last_status")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("store.last_status field");
+    let output_last_status = match &compiled.plan.output_root("last_status").unwrap().value {
+        OutputValueRef::RuntimeValue {
+            value: ValueRef::Field(field),
+            ..
+        } => *field,
+        value => panic!("unexpected last_status output value: {value:#?}"),
+    };
+    if output_last_status != store_last_status {
+        let expression = compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .find_map(|op| {
+                (op.output == Some(ValueRef::Field(output_last_status))).then_some(&op.kind)
+            })
+            .and_then(|kind| match kind {
+                PlanOpKind::DerivedValue {
+                    expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                    ..
+                } => Some(*expression),
+                _ => None,
+            })
+            .expect("last_status output alias expression");
+        assert!(
+            matches!(
+                row_node(&compiled.plan.row_expressions, expression),
+                PlanRowExpressionNode::Field {
+                    input: ValueRef::Field(field)
+                } if *field == store_last_status
+            ),
+            "output alias bypassed store.last_status: {:#?}",
+            row_node(&compiled.plan.row_expressions, expression)
+        );
+    }
     let verification = verify_plan(&compiled.plan).unwrap();
     assert_eq!(
         verification.status,

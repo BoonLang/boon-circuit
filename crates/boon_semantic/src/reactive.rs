@@ -1257,23 +1257,24 @@ impl<'a> ReactiveBuilder<'a> {
                             payload_projection: source_read.payload_projection.clone(),
                             projection: projection.clone(),
                         }
-                    } else if let Some(state) = unique_state_origin(expression)? {
-                        let binding = unique_binding_for_target(
-                            bindings,
-                            SemanticBindingTargetV1::State { state },
-                            expression,
-                            self.execution,
-                        )?;
-                        SemanticReadTargetV1::StateProjection {
-                            binding: binding.id,
-                            state,
-                            projection: projection.clone(),
-                        }
                     } else {
                         let binding = self.resolve_decl_binding(*target, expression, bindings)?;
-                        SemanticReadTargetV1::Binding {
-                            binding: binding.id,
-                            projection: projection.clone(),
+                        match binding.target {
+                            SemanticBindingTargetV1::State { state } => {
+                                SemanticReadTargetV1::StateProjection {
+                                    binding: binding.id,
+                                    state,
+                                    projection: projection.clone(),
+                                }
+                            }
+                            SemanticBindingTargetV1::Field { .. }
+                            | SemanticBindingTargetV1::Source { .. }
+                            | SemanticBindingTargetV1::List { .. } => {
+                                SemanticReadTargetV1::Binding {
+                                    binding: binding.id,
+                                    projection: projection.clone(),
+                                }
+                            }
                         }
                     }
                 }
@@ -3201,28 +3202,6 @@ fn exact_unique_list_argument(
         _ => Err(SemanticReactiveError::new(format!(
             "semantic call expression {expression} has {} exact list-typed input formals",
             list_arguments.len()
-        ))),
-    }
-}
-
-fn unique_state_origin(
-    expression: &SemanticExpression,
-) -> Result<Option<SemanticStateId>, SemanticReactiveError> {
-    let states = expression
-        .provenance
-        .members
-        .iter()
-        .filter_map(|member| match member.origin {
-            SemanticValueOrigin::State { state, .. } => Some(state),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    match states.len() {
-        0 => Ok(None),
-        1 => Ok(states.iter().next().copied()),
-        count => Err(SemanticReactiveError::new(format!(
-            "semantic read {} has {count} exact state origins",
-            expression.id
         ))),
     }
 }

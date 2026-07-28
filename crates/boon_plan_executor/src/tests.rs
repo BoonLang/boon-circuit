@@ -2889,6 +2889,17 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         .find(|field| field.name == "rank")
         .map(|field| field.field_id)
         .expect("store.ordered.rank");
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .filter(|op| matches!(op.kind, PlanOpKind::DerivedValue { .. }))
+            .filter(|op| matches!(op.output, Some(ValueRef::List(_))))
+            .all(|op| !op.indexed),
+        "whole-list materializations must not be labeled as row computations"
+    );
     let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     let (_, metrics) = session.list_value_current_with_metrics(ordered).unwrap();

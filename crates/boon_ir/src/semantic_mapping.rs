@@ -3603,7 +3603,13 @@ fn map_reactive_derived_value(
         SemanticDerivedValueKindV1::Aggregate => DerivedValueKind::Aggregate,
         SemanticDerivedValueKindV1::Pure => DerivedValueKind::Pure,
     };
-    let scope_id = field.row.map(|row| row.scope);
+    // A materialized list field carries its target row identity so storage can
+    // own the list's row fields.  That does not make the list-producing
+    // operation row-indexed: the operation computes the whole list and writes
+    // it into the keyed materialization.  Only scalar fields owned by an
+    // existing row execute once per row.
+    let indexed = field.row.is_some() && materialized_list_id.is_none();
+    let scope_id = indexed.then(|| field.row.expect("indexed field has a row").scope);
     let derived_index = context
         .reactive_ids
         .derived_values
@@ -3632,7 +3638,7 @@ fn map_reactive_derived_value(
         trigger_arms: mapped_triggers,
         default_roots,
         sources: source_paths,
-        indexed: field.row.is_some(),
+        indexed,
         scope_id,
         startup_recompute: derived.startup_recompute,
     })

@@ -994,6 +994,14 @@ impl DependencyOwnerIndex {
                         &format!("storage field {}", field.id),
                     )?);
                 }
+                SemanticStorageFieldOriginV1::StateAuthority { state } => {
+                    candidates.push(*state_owner.get(state.as_usize()).ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "storage field {} references missing state {state}",
+                            field.id
+                        ))
+                    })?);
+                }
                 SemanticStorageFieldOriginV1::ListAuthority { list, .. } => {
                     candidates.push(*list_owner.get(list.as_usize()).ok_or_else(|| {
                         CallableDependencyManifestError::new(format!(
@@ -6676,6 +6684,9 @@ fn inventory_storage(
             SemanticStorageFieldOriginV1::Reactive {
                 field: reactive_field,
             } => references.push(dependency_entity(field_entity(*reactive_field))),
+            SemanticStorageFieldOriginV1::StateAuthority { state } => {
+                references.push(dependency_entity(state_entity(*state)));
+            }
             SemanticStorageFieldOriginV1::ListAuthority { list, .. } => {
                 references.push(dependency_entity(list_entity(*list)));
             }

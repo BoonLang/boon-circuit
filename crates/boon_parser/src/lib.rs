@@ -283,10 +283,10 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
     },
     LanguageFeatureSpec {
         id: "flush_control",
-        stage: LanguageFeatureStage::Planned,
-        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["FLUSH"],
-        summary: "fail-fast FLUSH control remains rejected until activation rollback is complete",
+        summary: "typed fail-fast FLUSH control with lexical boundary unwrapping",
     },
     LanguageFeatureSpec {
         id: "immutable_bytes",

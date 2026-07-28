@@ -92,3 +92,120 @@ fn boundary_union_unification_selects_the_compatible_structural_arm() {
 
     assert_eq!(substitutions.get(&variable), Some(&Type::Number));
 }
+
+#[test]
+fn named_flush_boundary_reports_the_exposed_payload_union() {
+    let parsed = boon_parser::parse_source(
+        "named-flush-boundary.bn",
+        r#"
+store: [
+    result:
+        Valid
+        |> WHEN {
+            Valid => Complete
+            __ => FLUSH { Invalid }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let entry = output
+        .report
+        .named_value_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.path == "store.result")
+        .expect("named result entry");
+    assert_eq!(
+        entry.flow_type.ty,
+        canonical_union_type(vec![closed_tag("Complete"), closed_tag("Invalid")]),
+        "checked program: {:#?}",
+        output.program
+    );
+}
+
+#[test]
+fn executable_flush_example_reports_every_named_boundary_payload() {
+    let parsed = boon_parser::parse_source(
+        "flush_error_propagation.bn",
+        include_str!("../../../../examples/flush_error_propagation.bn"),
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let entry = output
+        .report
+        .named_value_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.path == "store.normal_pipeline")
+        .expect("normal pipeline entry");
+    assert_eq!(
+        entry.flow_type.ty,
+        canonical_union_type(vec![
+            closed_tag("NormalComplete"),
+            closed_tag("NormalError")
+        ]),
+        "checked program: {:#?}",
+        output.program
+    );
+}
+
+#[test]
+fn potentially_flushing_hold_initializer_is_rejected() {
+    let parsed = boon_parser::parse_source(
+        "flushing-hold-initializer.bn",
+        r#"
+store: [
+    state:
+        FLUSH { InitialError }
+        |> HOLD state {}
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.program.is_none());
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("a `HOLD` initializer must produce a valid storable value and cannot `FLUSH`")
+    }));
+}
+
+#[test]
+fn collection_and_flow_authority_flush_payloads_are_rejected() {
+    for (name, source) in [
+        (
+            "collection-flush-payload.bn",
+            "result: FLUSH { LIST { Invalid } }\n",
+        ),
+        (
+            "flow-flush-payload.bn",
+            "trigger: SOURCE\nresult: FLUSH { trigger }\n",
+        ),
+    ] {
+        let parsed = boon_parser::parse_source(name, source).unwrap();
+        let output = check_program(&parsed);
+        assert!(output.program.is_none(), "{name} unexpectedly typechecked");
+        assert!(
+            output.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains(
+                    "`FLUSH` payload must be a continuous closed Tag, tagged object, or closed union without collection, flow, or host values",
+                )
+            }),
+            "{name} diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+    }
+}

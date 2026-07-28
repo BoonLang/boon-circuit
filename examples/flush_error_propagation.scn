@@ -1,0 +1,39 @@
+name = "FLUSH error propagation"
+source = "examples/flush_error_propagation.bn"
+
+[[step]]
+id = "initial-contracts"
+  [step.expect_root_text]
+  "store.normal_pipeline" = "NormalComplete"
+  "store.bypass_handled" = "BypassHandled"
+  "store.function_success" = "FunctionValid"
+  "store.function_handled" = "FunctionHandled"
+  "store.block_handled" = "BlockHandled"
+  "store.root_handled" = "RootHandled"
+  "store.hold_handled" = "HoldReady"
+  "store.collection_handled" = "CollectionHandled"
+  "store.isolated_count" = "3"
+  "store.isolation_complete" = "IsolationComplete"
+
+[[step]]
+id = "hold-flush"
+source_intent_exemption = "Language control-flow coverage dispatches the declared SOURCE directly."
+expected_source_event = { source = "store.fail_hold", text = "fail" }
+  [step.expect_root_text]
+  "store.hold_boundary" = "HoldError"
+  "store.hold_handled" = "HoldHandled"
+
+[[step]]
+id = "inspect-preserved-state"
+source_intent_exemption = "Language control-flow coverage dispatches the declared SOURCE directly."
+expected_source_event = { source = "store.inspect_hold", key = "Enter" }
+  [step.expect_root_text]
+  "store.observed_boundary" = "Ready"
+
+[[step]]
+id = "recover-after-flush"
+source_intent_exemption = "Language control-flow coverage dispatches the declared SOURCE directly."
+expected_source_event = { source = "store.recover_hold" }
+  [step.expect_root_text]
+  "store.hold_boundary" = "Recovered"
+  "store.hold_handled" = "HoldRecovered"

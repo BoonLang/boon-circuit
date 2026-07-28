@@ -25,9 +25,9 @@ fixture = "examples/language_surface/future/exact_number_value_algebra.bn"
 
 [[feature]]
 id = "flush_control"
-stage = "planned"
-parser_expectation = "reject"
-fixture = "examples/language_surface/future/flush_control.bn"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/flush_control.bn"
 
 [[feature]]
 id = "immutable_bytes"

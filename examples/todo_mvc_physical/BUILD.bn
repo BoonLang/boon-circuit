@@ -1,6 +1,7 @@
 -- Generates Assets.bn from SVG icon files
--- FLUSH: exits expression, creates hidden FLUSHED[value] wrapper
--- FLUSHED[value] propagates transparently, unwraps at boundaries
+-- FLUSH aborts the current operator activation and remains private control
+-- until a named, FUNCTION, BLOCK-final, or host/root boundary exposes its
+-- payload as ordinary error data.
 -- Two-binding pattern: generation_result → generation_error_handling
 
 icons_directory: TEXT { ./assets/icons }

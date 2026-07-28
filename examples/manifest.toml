@@ -715,3 +715,13 @@ budget = "examples/basic_examples.budget.toml"
 category = "basic"
 order = 48
 shown_by_default = true
+
+[[example]]
+id = "flush_error_propagation"
+label = "FLUSH Error Propagation"
+source = "examples/flush_error_propagation.bn"
+scenario = "examples/flush_error_propagation.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 49
+shown_by_default = true

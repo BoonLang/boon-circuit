@@ -4747,6 +4747,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             infer_checked_expression_flush_types(self.program, &self.inferred_expr_types);
         self.expression_flush_types = inferred.types;
         self.diagnostics.extend(inferred.diagnostics);
+        self.invalidate_flush_boundary_authoritative_types();
 
         for expression in &self.program.expressions {
             let AstExprKind::Hold { initial, .. } = expression.kind else {
@@ -4764,6 +4765,75 @@ impl<'a> CheckedProgramBuilder<'a> {
 
         self.begin_checked_flow_inference_epoch();
         self.infer_checked_types();
+    }
+
+    fn invalidate_flush_boundary_authoritative_types(&mut self) {
+        let mut derived_expressions = self
+            .expression_flush_types
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let direct_flush_declarations = self
+            .declarations
+            .iter()
+            .filter_map(|declaration| {
+                declaration
+                    .value
+                    .filter(|value| {
+                        self.expression_flush_types
+                            .contains_key(&(value.0 as usize))
+                    })
+                    .map(|_| declaration.id)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut derived_declarations = direct_flush_declarations.clone();
+
+        loop {
+            let mut changed = false;
+            for declaration in &self.declarations {
+                if declaration
+                    .value
+                    .is_some_and(|value| derived_expressions.contains(&(value.0 as usize)))
+                {
+                    changed |= derived_declarations.insert(declaration.id);
+                }
+            }
+            for expression in &self.program.expressions {
+                let has_derived_child = direct_expression_children(expression)
+                    .iter()
+                    .any(|child| derived_expressions.contains(child));
+                let reads_derived_declaration = checked_read_path_parts(expression)
+                    .and_then(|parts| {
+                        let scope_id = self
+                            .expression_scopes
+                            .get(&expression.id)
+                            .copied()
+                            .unwrap_or(LexicalScopeId(0));
+                        self.resolve_checked_read_path(expression.id, scope_id, &parts)
+                            .map(|(target, _)| (target, scope_id))
+                    })
+                    .is_some_and(|(target, scope_id)| {
+                        if !derived_declarations.contains(&target) {
+                            return false;
+                        }
+                        if !direct_flush_declarations.contains(&target) {
+                            return true;
+                        }
+                        !self
+                            .declaration(target)
+                            .and_then(|declaration| declaration.body_scope)
+                            .is_some_and(|body| self.scope_descends_from(scope_id, body))
+                    });
+                if has_derived_child || reads_derived_declaration {
+                    changed |= derived_expressions.insert(expression.id);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.authoritative_expr_types
+            .retain(|expression| !derived_expressions.contains(expression));
     }
 
     fn refresh_checked_callable_result_types(&mut self) -> bool {
@@ -7650,7 +7720,14 @@ impl<'a> CheckedProgramBuilder<'a> {
         };
         declaration.value = Some(value);
         if let Some(expression) = expressions.iter().find(|expression| expression.id == value) {
-            declaration.flow_type = expression.flow_type.clone();
+            let mut flow_type = expression.flow_type.clone();
+            if let Some(flush_type) = &expression.flush_type {
+                flow_type.ty = canonical_union_type(vec![flow_type.ty, flush_type.clone()]);
+                if flow_type.mode == FlowMode::Absent {
+                    flow_type.mode = FlowMode::Continuous;
+                }
+            }
+            declaration.flow_type = flow_type;
         }
     }
 
@@ -10203,6 +10280,45 @@ fn checked_named_value_statement_declaration(
         })
 }
 
+fn checked_named_value_origin_exposes_flush_boundary(
+    program: &CheckedProgram,
+    origin: &NamedValueTypeOrigin,
+) -> bool {
+    fn visit(
+        program: &CheckedProgram,
+        statement: CheckedStatementId,
+        visited: &mut BTreeSet<CheckedStatementId>,
+    ) -> bool {
+        if !visited.insert(statement) {
+            return false;
+        }
+        let Some(statement) = program
+            .statements
+            .iter()
+            .find(|candidate| candidate.id == statement)
+        else {
+            return false;
+        };
+        if statement.value.is_some_and(|value| {
+            program
+                .expressions
+                .iter()
+                .find(|candidate| candidate.id == value)
+                .is_some_and(|expression| expression.flush_type.is_some())
+        }) {
+            return true;
+        }
+        statement
+            .children
+            .iter()
+            .any(|child| visit(program, *child, visited))
+    }
+
+    origin
+        .statement
+        .is_some_and(|statement| visit(program, statement, &mut BTreeSet::new()))
+}
+
 fn checked_named_value_origin_flow_type(
     program: &CheckedProgram,
     origin: &NamedValueTypeOrigin,
@@ -10242,12 +10358,33 @@ fn checked_named_value_origin_flow_type(
             .flow_type
             .clone()
     } else if let Some(value) = origin.value {
-        program
+        let expression = program
             .expressions
             .iter()
-            .find(|expression| expression.id == value)?
-            .flow_type
-            .clone()
+            .find(|expression| expression.id == value)?;
+        let mut flow = if checked_named_value_origin_exposes_flush_boundary(program, origin) {
+            origin
+                .declaration
+                .and_then(|declaration| {
+                    program
+                        .declarations
+                        .iter()
+                        .find(|candidate| candidate.id == declaration)
+                })
+                .map_or_else(
+                    || expression.flow_type.clone(),
+                    |declaration| declaration.flow_type.clone(),
+                )
+        } else {
+            expression.flow_type.clone()
+        };
+        if let Some(flush_type) = &expression.flush_type {
+            flow.ty = union_structural_type(&flow.ty, flush_type);
+            if flow.mode == FlowMode::Absent {
+                flow.mode = FlowMode::Continuous;
+            }
+        }
+        flow
     } else {
         program
             .declarations
@@ -13442,7 +13579,12 @@ impl<'a> Checker<'a> {
                         .iter()
                         .find(|expression| expression.id == value)
                 })
-                .map(|expression| expression.flow_type.ty.clone())
+                .map(|expression| {
+                    expression.flush_type.as_ref().map_or_else(
+                        || expression.flow_type.ty.clone(),
+                        |flush_type| union_structural_type(&expression.flow_type.ty, flush_type),
+                    )
+                })
                 .unwrap_or(Type::Unknown);
             if !host_output_type_is_closed(&ty) {
                 self.diagnostics.push(diagnostic_for_statement(

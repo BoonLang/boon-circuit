@@ -2791,8 +2791,14 @@ fn map_reactive_field(
         || statement.flow_type.as_ref() != Some(&field.flow_type)
     {
         return Err(format!(
-            "semantic field {} has stale statement/declaration/value/type provenance",
-            field.id
+            "semantic field {} has stale statement/declaration/value/type provenance: statement declaration {:?}, value {:?}, flow {:?}; field declaration {}, producer {}, flow {:?}",
+            field.id,
+            statement.declaration,
+            statement.value,
+            statement.flow_type,
+            field.declaration.0,
+            field.producer,
+            field.flow_type,
         ));
     }
     let expression = semantic_execution_expression(execution, field.producer)?;
@@ -2868,9 +2874,15 @@ fn map_reactive_binding(
 ) -> Result<MappedSemanticBinding, String> {
     let statement = semantic_execution_statement(execution, binding.statement)?;
     let expression = semantic_execution_expression(execution, binding.producer)?;
-    let producer_matches_statement =
-        matches!(binding.target, SemanticBindingTargetV1::Source { .. })
-            || statement.value == Some(binding.producer);
+    let producer_matches_statement = match binding.target {
+        SemanticBindingTargetV1::Source { .. } => true,
+        SemanticBindingTargetV1::State { state } => {
+            semantic_state_resource(resources, state)?.expression == binding.producer
+        }
+        SemanticBindingTargetV1::Field { .. } | SemanticBindingTargetV1::List { .. } => {
+            statement.value == Some(binding.producer)
+        }
+    };
     if statement.declaration != Some(binding.declaration)
         || !producer_matches_statement
         || expression.value_id != binding.value
@@ -4720,6 +4732,17 @@ fn map_storage_fields(
                         ));
                     }
                 }
+                SemanticStorageFieldOriginV1::StateAuthority { state } => {
+                    ids.state(*state)?;
+                    if field.role != SemanticStorageFieldRoleV1::ValueAuthority
+                        || field.reactive_field.is_some()
+                    {
+                        return Err(format!(
+                            "state-authority storage field {} has inconsistent role or reactive identity",
+                            field.id
+                        ));
+                    }
+                }
                 SemanticStorageFieldOriginV1::ListAuthority { list, .. } => {
                     ids.list(*list)?;
                     if field.reactive_field.is_some() {
@@ -5012,6 +5035,7 @@ fn map_storage_binding_target(
     target: &SemanticStorageBindingTargetV1,
     mapped: &MappedSemanticBinding,
     ids: &SemanticToExecutableMap,
+    storage: &SemanticScopeStorageGraphV1,
     storage_ids: &SemanticStorageToErasedMap,
     fields: &[ErasedFieldDef],
     reactive_fields: &[MappedSemanticField],
@@ -5100,10 +5124,24 @@ fn map_storage_binding_target(
             let field = field
                 .map(|field| {
                     let final_field = storage_ids.storage_field(field)?;
-                    if storage_ids.reactive_field(*reactive_field)? != final_field {
+                    let is_public_field =
+                        storage_ids.reactive_field(*reactive_field)? == final_field;
+                    let is_state_authority = storage
+                        .fields
+                        .get(field.as_usize())
+                        .filter(|candidate| candidate.id == field)
+                        .is_some_and(|candidate| {
+                            matches!(
+                                candidate.origin,
+                                SemanticStorageFieldOriginV1::StateAuthority {
+                                    state: candidate_state
+                                } if candidate_state == *state
+                            )
+                        });
+                    if !is_public_field && !is_state_authority {
                         return Err(format!(
-                            "storage binding {} state field {} is not the exact join for reactive field {}",
-                            mapped.id, field, reactive_field
+                            "storage binding {} state field {} is neither the public reactive field {} nor state {} authority",
+                            mapped.id, field, reactive_field, state
                         ));
                     }
                     final_binding_field(field, storage_ids, fields)
@@ -5194,6 +5232,7 @@ fn map_storage_bindings(
                 &storage_binding.target,
                 mapped,
                 ids,
+                storage,
                 storage_ids,
                 fields,
                 &reactive.fields,

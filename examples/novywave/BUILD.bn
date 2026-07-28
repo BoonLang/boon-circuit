@@ -1,5 +1,8 @@
 -- Generates static assets for the NovyWave playground example.
 -- This is intentionally generic build glue, not a port of NovyWave Rust code.
+-- FLUSH aborts the current operator activation and remains private control
+-- until a named, FUNCTION, BLOCK-final, or host/root boundary exposes its
+-- payload as ordinary error data.
 
 icons_directory: TEXT { ./assets/icons }
 output_file: TEXT { ./Generated/Assets.bn }

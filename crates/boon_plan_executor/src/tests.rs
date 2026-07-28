@@ -7285,6 +7285,85 @@ fn flush_is_private_until_the_named_root_boundary() {
 }
 
 #[test]
+fn public_flush_preserves_hold_state_bypasses_downstream_and_recovers() {
+    let compiled = compile_server_source(
+        "public-flush-hold-executor.bn",
+        r#"
+store: [
+    fail: SOURCE
+    recover: SOURCE
+    value:
+        Ready |> HOLD value {
+            fail |> THEN {
+                FLUSH { InvalidUpdate[position: 1] }
+                |> WHEN { __ => ShouldNotRun }
+            }
+            recover |> THEN { Recovered }
+        }
+    exposed: value
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let machine = compiled.plan;
+    let fail = source_id(&machine, "store.fail");
+    let recover = source_id(&machine, "store.recover");
+    let exposed = field_id(&machine, "store.exposed");
+    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        Value::tag("Ready")
+    );
+    let flushed = session
+        .apply_with_demand(
+            SourceEvent {
+                sequence: 1,
+                source: fail,
+                route: route_token(&session, fail, None),
+                target: None,
+                payload: SourcePayload::default(),
+            },
+            &[ValueTarget::Field(exposed)],
+        )
+        .unwrap();
+    assert!(flushed.authority_deltas.is_empty());
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        Value::tag("Ready")
+    );
+    assert_eq!(
+        session.root_value_current("store.exposed").unwrap(),
+        Value::tagged(
+            "InvalidUpdate",
+            BTreeMap::from([("position".to_owned(), number(1))]),
+        )
+    );
+
+    session
+        .apply_with_demand(
+            SourceEvent {
+                sequence: 2,
+                source: recover,
+                route: route_token(&session, recover, None),
+                target: None,
+                payload: SourcePayload::default(),
+            },
+            &[ValueTarget::Field(exposed)],
+        )
+        .unwrap();
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        Value::tag("Recovered")
+    );
+    assert_eq!(
+        session.root_value_current("store.exposed").unwrap(),
+        Value::tag("Recovered")
+    );
+}
+
+#[test]
 fn flushing_state_update_preserves_prior_state_and_later_activation_recovers() {
     let mut row_expressions = PlanRowExpressionArena::new();
     let payload = row_constant(&mut row_expressions, PlanConstantId(1));

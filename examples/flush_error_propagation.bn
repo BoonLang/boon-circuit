@@ -1,0 +1,163 @@
+-- Executable FLUSH contract: hidden fail-fast control aborts one expression
+-- activation, unwraps to ordinary error Tags at lexical boundaries, never
+-- enters HOLD storage, and recovers on a later independent activation.
+
+FUNCTION validate(value) {
+    value |> WHEN {
+        Valid => FunctionValid
+        __ => FLUSH { FunctionError }
+    }
+}
+
+store: [
+    fail_hold: SOURCE
+    inspect_hold: SOURCE
+    recover_hold: SOURCE
+
+    normal_pipeline:
+        Valid
+        |> WHEN {
+            Valid => NormalComplete
+            __ => FLUSH { NormalError }
+        }
+
+    bypass_boundary:
+        Invalid
+        |> WHEN {
+            Invalid => FLUSH { BypassError }
+            __ => NormalComplete
+        }
+        |> WHEN { __ => ShouldNotRun }
+    bypass_handled:
+        bypass_boundary |> WHEN {
+            BypassError => BypassHandled
+            __ => Unexpected
+        }
+
+    function_success: Valid |> validate()
+    function_boundary: Invalid |> validate()
+    function_reflush:
+        function_boundary
+        |> WHEN {
+            FunctionValid => FunctionValid
+            error => FLUSH { error }
+        }
+        |> WHEN { __ => ShouldNotRun }
+    function_handled:
+        function_reflush |> WHEN {
+            FunctionError => FunctionHandled
+            __ => Unexpected
+        }
+
+    block_boundary:
+        BLOCK {
+            FLUSH { BlockError }
+        }
+    block_handled:
+        block_boundary |> WHEN {
+            BlockError => BlockHandled
+            __ => Unexpected
+        }
+
+    root_boundary: FLUSH { RootError }
+    root_handled:
+        root_boundary |> WHEN {
+            RootError => RootHandled
+            __ => Unexpected
+        }
+
+    hold_state:
+        Ready |> HOLD hold_state {
+            fail_hold |> THEN {
+                FLUSH { HoldError }
+                |> WHEN { __ => ShouldNotRun }
+            }
+            recover_hold |> THEN { Recovered }
+        }
+    hold_boundary: hold_state
+    hold_handled:
+        hold_boundary |> WHEN {
+            HoldError => HoldHandled
+            Ready => HoldReady
+            Recovered => HoldRecovered
+        }
+
+    observed_state:
+        Unknown |> HOLD observed_state {
+            inspect_hold |> THEN { hold_state }
+        }
+    observed_boundary: observed_state
+
+    collection_items:
+        LIST {
+            [kind: Good]
+            [kind: FirstFailure]
+            [kind: LaterFailure]
+        }
+    collection_boundary:
+        collection_items
+        |> List/map(item, new:
+            item.kind |> WHEN {
+                Good => Mapped
+                FirstFailure => FLUSH { FirstFailure }
+                LaterFailure => FLUSH { LaterFailure }
+            }
+        )
+        |> List/count()
+    collection_handled:
+        collection_boundary |> WHEN {
+            FirstFailure => CollectionHandled
+            __ => Unexpected
+        }
+
+    isolated_inputs:
+        LIST {
+            [kind: Good]
+            [kind: Bad]
+            [kind: Good]
+        }
+    isolated_items:
+        isolated_inputs
+        |> List/map(item, new:
+            item.kind |> WHEN {
+                Good => ItemOk
+                Bad => ItemError
+            }
+        )
+    isolated_count: isolated_items |> List/count()
+    isolation_complete:
+        isolated_count == 3 |> WHEN {
+            True => IsolationComplete
+            False => IsolationIncomplete
+        }
+]
+
+-- Host/root reporting keeps every transient FLUSH boundary explicitly
+-- demanded during the activation that produces it.
+outputs: [
+    normal_pipeline: store.normal_pipeline
+    bypass_boundary: store.bypass_boundary
+    bypass_handled: store.bypass_handled
+    function_success: store.function_success
+    function_boundary: store.function_boundary
+    function_reflush: store.function_reflush
+    function_handled: store.function_handled
+    block_boundary: store.block_boundary
+    block_handled: store.block_handled
+    root_boundary: store.root_boundary
+    root_handled: store.root_handled
+    hold_boundary: store.hold_boundary
+    hold_handled: store.hold_handled
+    observed_boundary: store.observed_boundary
+    collection_boundary: store.collection_boundary
+    collection_handled: store.collection_handled
+    isolated_count: store.isolated_count
+    isolation_complete: store.isolation_complete
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: TEXT { FLUSH propagation is reported through host/root outputs }
+    )
+)

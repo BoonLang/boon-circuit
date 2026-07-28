@@ -1501,7 +1501,9 @@ pub(crate) fn derive_semantic_execution_graph(
                             .declaration(program, declaration)
                             .map(|declaration| declaration.flow_type.clone())
                     });
-                    builder.wrap_flush_boundary(expression, value, None, flow_type)
+                    let boundary_expression =
+                        builder.flush_boundary_origin_for_value(expression, value);
+                    builder.wrap_flush_boundary(boundary_expression, value, None, flow_type)
                 } else {
                     Ok(value)
                 }
@@ -4784,8 +4786,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             evaluation_port: None,
                             value_frame: Some(frame),
                         })?;
+                        let boundary_expression =
+                            self.flush_boundary_origin_for_value(binding.value, value);
                         let value = self.wrap_flush_boundary(
-                            binding.value,
+                            boundary_expression,
                             value,
                             owner,
                             self.lookup
@@ -4806,8 +4810,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     evaluation_port: None,
                     value_frame: Some(frame),
                 })?;
+                let boundary_expression =
+                    self.flush_boundary_origin_for_value(result_expression, result);
                 let result = self.wrap_flush_boundary(
-                    result_expression,
+                    boundary_expression,
                     result,
                     owner,
                     Some(expression.flow_type.clone()),
@@ -4905,10 +4911,13 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 },
                 call_owner,
             )?;
+            let result_expression = callable
+                .result_expression
+                .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
+            let boundary_expression =
+                self.flush_boundary_origin_for_value(result_expression, result);
             return self.wrap_flush_boundary(
-                callable
-                    .result_expression
-                    .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?,
+                boundary_expression,
                 result,
                 call_owner,
                 Some(callable.result.clone()),
@@ -5072,8 +5081,21 @@ impl<'a> SemanticExpressionBuilder<'a> {
             .into_iter()
             .map(|field| {
                 let value = self.expand_in_frame(field.value, frame, value_frame)?;
+                let boundary_expression = field
+                    .declaration
+                    .and_then(|declaration| {
+                        self.lookup
+                            .declaration(self.program, declaration)
+                            .and_then(|declaration| declaration.value)
+                    })
+                    .filter(|expression| {
+                        self.lookup
+                            .expression(self.program, *expression)
+                            .is_some_and(|expression| expression.flush_type.is_some())
+                    })
+                    .unwrap_or_else(|| self.flush_boundary_origin_for_value(field.value, value));
                 let value = self.wrap_flush_boundary(
-                    field.value,
+                    boundary_expression,
                     value,
                     self.owner_stack.last().copied().flatten(),
                     field.declaration.and_then(|declaration| {
@@ -5092,6 +5114,36 @@ impl<'a> SemanticExpressionBuilder<'a> {
             .collect()
     }
 
+    fn flush_boundary_origin_for_value(
+        &self,
+        checked_expression: CheckedExprId,
+        semantic_expression: SemanticExprId,
+    ) -> CheckedExprId {
+        if self
+            .lookup
+            .expression(self.program, checked_expression)
+            .is_some_and(|expression| expression.flush_type.is_some())
+        {
+            return checked_expression;
+        }
+        let Some(SemanticExpressionKind::CanonicalRead { target, .. }) = self
+            .expressions
+            .get(semantic_expression.as_usize())
+            .map(|expression| &expression.kind)
+        else {
+            return checked_expression;
+        };
+        self.lookup
+            .declaration(self.program, *target)
+            .and_then(|declaration| declaration.value)
+            .filter(|expression| {
+                self.lookup
+                    .expression(self.program, *expression)
+                    .is_some_and(|expression| expression.flush_type.is_some())
+            })
+            .unwrap_or(checked_expression)
+    }
+
     fn wrap_flush_boundary(
         &mut self,
         checked_expression: CheckedExprId,
@@ -5107,14 +5159,11 @@ impl<'a> SemanticExpressionBuilder<'a> {
         let Some(flush_type) = origin.flush_type.clone() else {
             return Ok(input);
         };
-        let flow_type = flow_type.unwrap_or_else(|| {
-            let mut flow_type = origin.flow_type.clone();
-            flow_type.ty = boon_typecheck::canonical_union_type(vec![flow_type.ty, flush_type]);
-            if flow_type.mode == boon_typecheck::FlowMode::Absent {
-                flow_type.mode = boon_typecheck::FlowMode::Continuous;
-            }
-            flow_type
-        });
+        let mut flow_type = flow_type.unwrap_or_else(|| origin.flow_type.clone());
+        flow_type.ty = boon_typecheck::canonical_union_type(vec![flow_type.ty, flush_type]);
+        if flow_type.mode == boon_typecheck::FlowMode::Absent {
+            flow_type.mode = boon_typecheck::FlowMode::Continuous;
+        }
         let boundary = self.push(
             &origin,
             owner,
@@ -5660,6 +5709,60 @@ mod tests {
             );
         };
         materialization
+    }
+
+    #[test]
+    fn structural_named_field_flow_tracks_exposed_flush_boundary() {
+        let source = r#"
+store: [
+    fail: SOURCE
+    value:
+        Ready |> HOLD value {
+            fail |> THEN {
+                FLUSH { InvalidUpdate[position: 1] }
+            }
+        }
+    exposed: value
+]
+"#;
+        let graph = semantic_graph(source);
+        let store = graph
+            .statements
+            .iter()
+            .find(|statement| {
+                matches!(
+                    &statement.kind,
+                    SemanticStatementKind::Field { path, .. } if path == "store"
+                )
+            })
+            .expect("store statement");
+        let value = store.value.expect("store value");
+        let expression = &graph.expressions[value.as_usize()];
+
+        assert_eq!(
+            store.flow_type.as_ref(),
+            Some(&expression.flow_type),
+            "structural statement and expression disagree: {expression:#?}"
+        );
+        let SemanticExpressionKind::Object(fields) = &expression.kind else {
+            panic!("store is not a semantic object: {expression:#?}");
+        };
+        let exposed = fields
+            .iter()
+            .find(|field| field.name == "exposed")
+            .expect("exposed field");
+        assert!(
+            matches!(
+                &graph.expressions[exposed.value.as_usize()].flow_type.ty,
+                Type::VariantSet(variants)
+                    if variants.iter().any(|variant| matches!(
+                        variant,
+                        boon_typecheck::Variant::Tagged { tag, .. } if tag == "InvalidUpdate"
+                    ))
+            ),
+            "exposed FLUSH boundary expression: {:#?}",
+            graph.expressions[exposed.value.as_usize()]
+        );
     }
 
     #[test]

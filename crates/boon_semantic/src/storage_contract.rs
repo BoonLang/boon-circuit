@@ -225,6 +225,9 @@ pub enum SemanticStorageFieldOriginV1 {
     Reactive {
         field: SemanticFieldId,
     },
+    StateAuthority {
+        state: SemanticStateId,
+    },
     ListAuthority {
         list: SemanticListId,
         item_path: Vec<String>,
@@ -638,6 +641,12 @@ fn build_storage_fields(
         });
     }
 
+    append_state_authority_fields(
+        resources,
+        &reactive_by_statement,
+        &reactive_storage,
+        &mut fields,
+    )?;
     append_list_authority_fields(
         execution,
         resources,
@@ -649,6 +658,63 @@ fn build_storage_fields(
     append_materialized_value_fields(execution, resources, &mut fields)?;
     append_record_projection_fields(execution, &mut fields)?;
     Ok(fields)
+}
+
+fn append_state_authority_fields(
+    resources: &SemanticResourceGraphV1,
+    reactive_by_statement: &BTreeMap<SemanticStatementId, &crate::SemanticFieldV1>,
+    reactive_storage: &BTreeMap<SemanticFieldId, SemanticStorageFieldId>,
+    fields: &mut Vec<SemanticStorageFieldV1>,
+) -> Result<(), SemanticScopeStorageError> {
+    for state in &resources.states {
+        let Some(reactive_field) = reactive_by_statement.get(&state.statement).copied() else {
+            continue;
+        };
+        if reactive_field.flow_type == state.flow_type {
+            continue;
+        }
+        let public_field = reactive_storage
+            .get(&reactive_field.id)
+            .copied()
+            .and_then(|field| fields.get(field.as_usize()))
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "state {} public reactive field {} has no storage field",
+                    state.id, reactive_field.id
+                ))
+            })?;
+        let expected_row = state
+            .target_list
+            .zip(state.row_scope)
+            .map(|(list, scope)| SemanticRowBinding { list, scope });
+        if reactive_field.declaration != state.declaration
+            || public_field.row != expected_row
+            || public_field.statement != Some(state.statement)
+        {
+            return Err(SemanticScopeStorageError::new(format!(
+                "state {} and public reactive field {} have inconsistent declaration, row, or statement provenance",
+                state.id, reactive_field.id
+            )));
+        }
+        fields.push(SemanticStorageFieldV1 {
+            id: SemanticStorageFieldId(fields.len()),
+            role: SemanticStorageFieldRoleV1::ValueAuthority,
+            origin: SemanticStorageFieldOriginV1::StateAuthority { state: state.id },
+            reactive_field: None,
+            producer_identity: None,
+            declaration: Some(state.declaration),
+            owner: state.owner,
+            parent: public_field.parent,
+            row: expected_row,
+            name: public_field.name.clone(),
+            diagnostic_path: public_field.diagnostic_path.clone(),
+            statement: Some(state.statement),
+            producer: Some(state.expression),
+            resource_only: false,
+            flow_type: state.flow_type.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn nearest_parent_storage_field(
@@ -1563,6 +1629,7 @@ fn relative_resource_path(
 fn storage_field_item_path(field: &SemanticStorageFieldV1) -> Option<Vec<String>> {
     match &field.origin {
         SemanticStorageFieldOriginV1::ListAuthority { item_path, .. } => Some(item_path.clone()),
+        SemanticStorageFieldOriginV1::StateAuthority { .. } => None,
         SemanticStorageFieldOriginV1::Reactive { .. }
         | SemanticStorageFieldOriginV1::ValueListAuthority { .. }
         | SemanticStorageFieldOriginV1::RecordProjection { .. }
@@ -2171,13 +2238,34 @@ fn build_storage_bindings(
                                 binding.id
                             ))
                         })?;
-                    let field = reactive
-                        .fields
+                    let authority_fields = fields
                         .iter()
-                        .find(|field| field.statement == state.statement)
-                        .map(|field| storage_field_for_reactive(fields, field.id))
-                        .transpose()?
-                        .map(|field| field.id);
+                        .filter(|field| {
+                            matches!(
+                                field.origin,
+                                SemanticStorageFieldOriginV1::StateAuthority {
+                                    state: candidate
+                                } if candidate == state.id
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let field = match authority_fields.as_slice() {
+                        [authority] => Some(authority.id),
+                        [] => reactive
+                            .fields
+                            .iter()
+                            .find(|field| field.statement == state.statement)
+                            .map(|field| storage_field_for_reactive(fields, field.id))
+                            .transpose()?
+                            .map(|field| field.id),
+                        _ => {
+                            return Err(SemanticScopeStorageError::new(format!(
+                                "state {} resolves to {} authority storage fields",
+                                state.id,
+                                authority_fields.len()
+                            )));
+                        }
+                    };
                     let row = state
                         .target_list
                         .zip(state.row_scope)
@@ -2576,6 +2664,7 @@ fn build_named_value_storage(
                     &target,
                     &root_flow,
                     projected_storage_type,
+                    &named_value.flow_type,
                 )
                 .map_err(|error| {
                     SemanticScopeStorageError::new(format!(
@@ -2988,6 +3077,7 @@ fn named_value_origin_contract_flow(
     target: &SemanticNamedValueStorageTargetV1,
     root_flow: &FlowType,
     projected_storage_type: &Type,
+    named_flow: &FlowType,
 ) -> Result<FlowType, SemanticScopeStorageError> {
     if matches!(target, SemanticNamedValueStorageTargetV1::Source { .. }) {
         // Source payload shape/type authority is the exact CheckedSourceId ->
@@ -2998,15 +3088,37 @@ fn named_value_origin_contract_flow(
             ty: projected_storage_type.clone(),
         });
     }
-    if named_value_origin_is_structural_container_placeholder(checked, origin)? {
-        // A checked empty record attached to a statement with structural
-        // children is the parser/typechecker anchor for the assembled
-        // container, not a competing zero-field runtime representation. The
-        // exact semantic statement/target join above owns its concrete shape.
+    if matches!(target, SemanticNamedValueStorageTargetV1::State { .. })
+        && named_value_origin_exposes_flush_boundary(checked, origin)?
+    {
+        // The checked named value describes the public `T | E` boundary, while
+        // a state target deliberately points at the separate storable `T`
+        // authority. The public reactive field retains the union; this row
+        // validates only the state authority representation.
         return Ok(FlowType {
             mode: root_flow.mode,
             ty: projected_storage_type.clone(),
         });
+    }
+    if named_value_origin_is_structural_container(checked, origin)? {
+        // A record/list attached to a statement with structural children is
+        // the parser/typechecker anchor for an assembled container. Its child
+        // statements own the exact named-value contracts, including exposed
+        // FLUSH boundary unions, while this row describes their concrete
+        // storage container. Requiring the container storage itself to contain
+        // a private control-only alternative would incorrectly make FLUSH
+        // storable.
+        return Ok(FlowType {
+            mode: root_flow.mode,
+            ty: projected_storage_type.clone(),
+        });
+    }
+    if named_value_origin_exposes_flush_boundary(checked, origin)? {
+        // The lowering table is the sealed public boundary authority. It has
+        // already combined the normal result with the ordinary payload union
+        // exposed by FLUSH anywhere in this named statement's subtree.
+        derive_storage_representation(projected_storage_type, &named_flow.ty)?;
+        return Ok(named_flow.clone());
     }
     let checked_flow = if let Some(value) = origin.checked.value {
         Some(
@@ -3065,7 +3177,85 @@ fn named_value_origin_contract_flow(
     })
 }
 
-fn named_value_origin_is_structural_container_placeholder(
+fn named_value_origin_exposes_flush_boundary(
+    checked: &CheckedProgram,
+    origin: &crate::SemanticNamedValueTypeOriginV1,
+) -> Result<bool, SemanticScopeStorageError> {
+    if let Some(statement) = origin.checked.statement {
+        fn statement_contains_flush(
+            checked: &CheckedProgram,
+            statement: boon_typecheck::CheckedStatementId,
+            visited: &mut BTreeSet<boon_typecheck::CheckedStatementId>,
+        ) -> Result<bool, SemanticScopeStorageError> {
+            if !visited.insert(statement) {
+                return Ok(false);
+            }
+            let statement = checked
+                .statements
+                .iter()
+                .find(|candidate| candidate.id == statement)
+                .ok_or_else(|| {
+                    SemanticScopeStorageError::new(format!(
+                        "named-value FLUSH boundary references missing checked statement {}",
+                        statement.0
+                    ))
+                })?;
+            if statement.value.is_some_and(|value| {
+                checked
+                    .expressions
+                    .iter()
+                    .find(|candidate| candidate.id == value)
+                    .is_some_and(|expression| expression.flush_type.is_some())
+            }) {
+                return Ok(true);
+            }
+            for child in &statement.children {
+                if statement_contains_flush(checked, *child, visited)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        if statement_contains_flush(checked, statement, &mut BTreeSet::new())? {
+            return Ok(true);
+        }
+    }
+    let expression = if let Some(value) = origin.checked.value {
+        Some(value)
+    } else if let Some(declaration) = origin.checked.declaration {
+        checked
+            .declarations
+            .iter()
+            .find(|candidate| candidate.id == declaration)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing checked declaration {}",
+                    declaration.0
+                ))
+            })?
+            .value
+    } else {
+        None
+    };
+    let Some(expression) = expression else {
+        return Ok(false);
+    };
+    Ok(checked
+        .expressions
+        .iter()
+        .find(|candidate| candidate.id == expression)
+        .ok_or_else(|| {
+            SemanticScopeStorageError::new(format!(
+                "named-value FLUSH boundary references missing checked expression {}",
+                expression.0
+            ))
+        })?
+        .flush_type
+        .is_some())
+}
+
+fn named_value_origin_is_structural_container(
     checked: &CheckedProgram,
     origin: &crate::SemanticNamedValueTypeOriginV1,
 ) -> Result<bool, SemanticScopeStorageError> {
@@ -3098,11 +3288,8 @@ fn named_value_origin_is_structural_container_placeholder(
         })?;
     Ok(matches!(
         &expression.kind,
-        boon_typecheck::CheckedExpressionKind::Object { fields }
-            if fields.is_empty()
-    ) || matches!(
-        &expression.kind,
-        boon_typecheck::CheckedExpressionKind::List { items, .. } if items.is_empty()
+        boon_typecheck::CheckedExpressionKind::Object { .. }
+            | boon_typecheck::CheckedExpressionKind::List { .. }
     ))
 }
 
@@ -3283,6 +3470,27 @@ fn validate_storage_shape(
                 return Err(SemanticScopeStorageError::new(format!(
                     "storage field {} differs from reactive field {reactive_field}",
                     field.id
+                )));
+            }
+        }
+        if let SemanticStorageFieldOriginV1::StateAuthority { state } = field.origin {
+            let state = require_state(resources, state)?;
+            let expected_row = state
+                .target_list
+                .zip(state.row_scope)
+                .map(|(list, scope)| SemanticRowBinding { list, scope });
+            if field.role != SemanticStorageFieldRoleV1::ValueAuthority
+                || field.reactive_field.is_some()
+                || field.declaration != Some(state.declaration)
+                || field.owner != state.owner
+                || field.row != expected_row
+                || field.statement != Some(state.statement)
+                || field.producer != Some(state.expression)
+                || field.flow_type != state.flow_type
+            {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "state-authority storage field {} differs from state {}",
+                    field.id, state.id
                 )));
             }
         }

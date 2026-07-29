@@ -5077,6 +5077,8 @@ fn machine_build_task_slices_full_authority_restore_and_runtime_rebuild() {
                 rows,
             },
         )]),
+        maps: BTreeMap::new(),
+        sets: BTreeMap::new(),
     };
     let synchronous = MachineInstanceBuilder::new(machine.clone(), SessionOptions::default())
         .unwrap()
@@ -5170,6 +5172,8 @@ fn failed_machine_build_task_cannot_publish_on_a_later_poll() {
                 rows: Vec::new(),
             },
         )]),
+        maps: BTreeMap::new(),
+        sets: BTreeMap::new(),
     };
     let mut task = MachineInstanceBuilder::new(compiled.plan, SessionOptions::default())
         .unwrap()
@@ -8485,6 +8489,8 @@ fn inspection_reports_hide_nested_bindings_while_boundaries_fail_closed() {
             },
         )]),
         lists: BTreeMap::new(),
+        maps: BTreeMap::new(),
+        sets: BTreeMap::new(),
     };
     let mut session = MachineInstanceBuilder::new(machine, SessionOptions::default())
         .unwrap()

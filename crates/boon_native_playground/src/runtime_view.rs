@@ -3600,6 +3600,7 @@ fn format_inspection_value(value: &Value, depth: usize) -> String {
             fields.len()
         ),
         Value::HostBound { visible, .. } => format_inspection_value(visible, depth),
+        Value::CollectionAuthority { .. } => "<live collection authority>".to_owned(),
     }
 }
 

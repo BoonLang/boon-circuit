@@ -423,6 +423,7 @@ fn hash_value(
             hasher.update([10]);
             hash_value(hasher, visible, identities)?;
         }
+        Value::CollectionAuthority { .. } => return Err(CursorError::Invalid),
         Value::Map(entries) => {
             hasher.update([12]);
             hasher.update((entries.len() as u64).to_be_bytes());

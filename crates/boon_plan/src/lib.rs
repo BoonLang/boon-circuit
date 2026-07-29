@@ -152,6 +152,7 @@ plan_usize_ids!(
     ScopeId,
     PlanLocalId,
     PlanListIndexId,
+    PlanCollectionAuthorityId,
     PlanRowExpressionId,
 );
 
@@ -1933,10 +1934,10 @@ fn distributed_call_expression_is_safe(
             PlanRowExpressionNode::ObjectField { object, field } => {
                 distributed_name_is_canonical(field) && child_is_valid(object)
             }
-            PlanRowExpressionNode::MapLiteral { entries } => entries
+            PlanRowExpressionNode::MapLiteral { entries, .. } => entries
                 .iter()
                 .all(|entry| child_is_valid(&entry.key) && child_is_valid(&entry.value)),
-            PlanRowExpressionNode::SetLiteral { items } => items.iter().all(child_is_valid),
+            PlanRowExpressionNode::SetLiteral { items, .. } => items.iter().all(child_is_valid),
             PlanRowExpressionNode::Select { input, arms } => {
                 !arms.is_empty()
                     && child_is_valid(input)
@@ -5721,6 +5722,50 @@ impl PlanDerivedExpression {
         Ok(())
     }
 
+    /// Visits only inputs that make the enclosing derived consumer broadly
+    /// currentness-dependent. The receiver of a keyed MAP/SET observation is
+    /// intentionally excluded: the executor installs an exact key/item
+    /// dependency after evaluating that receiver. Query-key arguments remain
+    /// broad inputs so changing the observed address recomputes the consumer.
+    pub fn visit_currentness_inputs(
+        &self,
+        arena: &PlanRowExpressionArena,
+        visitor: &mut impl FnMut(ValueRef),
+    ) -> Result<(), PlanError> {
+        match self {
+            Self::SourceEventTransform { default, arms, .. } => {
+                arena.visit_currentness_inputs(*default, visitor)?;
+                for arm in arms {
+                    visitor(arm.trigger.clone());
+                    arena.visit_currentness_inputs(arm.value, visitor)?;
+                }
+            }
+            Self::BoolNot { input } | Self::NumberCompareConst { left: input, .. } => {
+                visitor(input.clone());
+            }
+            Self::ValueCompare { left, right, .. } => {
+                visitor(left.clone());
+                visitor(right.clone());
+            }
+            Self::RowExpression { expression } | Self::MaterializedRowField { expression, .. } => {
+                arena.visit_currentness_inputs(*expression, visitor)?;
+            }
+            Self::SourceKeyTextTrimNonEmpty {
+                source_id,
+                key_field,
+                state,
+                ..
+            } => {
+                visitor(ValueRef::SourcePayload {
+                    source_id: *source_id,
+                    field: key_field.clone(),
+                });
+                visitor(state.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub fn visit_intrinsics(
         &self,
         arena: &PlanRowExpressionArena,
@@ -7482,9 +7527,11 @@ pub enum PlanRowExpressionNode {
         arms: Vec<PlanRowSelectArm>,
     },
     MapLiteral {
+        authority: PlanCollectionAuthorityId,
         entries: Vec<PlanRowMapEntry>,
     },
     SetLiteral {
+        authority: PlanCollectionAuthorityId,
         items: Vec<PlanRowExpressionId>,
     },
 }
@@ -7683,13 +7730,13 @@ impl PlanRowExpressionNode {
             Self::Object { fields } | Self::TaggedObject { fields, .. } => {
                 fields.iter().map(|field| field.value).for_each(visitor);
             }
-            Self::MapLiteral { entries } => {
+            Self::MapLiteral { entries, .. } => {
                 for entry in entries {
                     visitor(entry.key);
                     visitor(entry.value);
                 }
             }
-            Self::SetLiteral { items } => items.iter().copied().for_each(visitor),
+            Self::SetLiteral { items, .. } => items.iter().copied().for_each(visitor),
             Self::BuiltinCall { input, args, .. } => {
                 if let Some(input) = input {
                     visitor(*input);
@@ -7899,13 +7946,13 @@ impl PlanRowExpressionNode {
                     .map(|field| &mut field.value)
                     .for_each(visitor);
             }
-            Self::MapLiteral { entries } => {
+            Self::MapLiteral { entries, .. } => {
                 for entry in entries {
                     visitor(&mut entry.key);
                     visitor(&mut entry.value);
                 }
             }
-            Self::SetLiteral { items } => items.iter_mut().for_each(visitor),
+            Self::SetLiteral { items, .. } => items.iter_mut().for_each(visitor),
             Self::BuiltinCall { input, args, .. } => {
                 if let Some(input) = input {
                     visitor(input);
@@ -8254,6 +8301,67 @@ impl PlanRowExpressionArena {
             PlanRowExpressionNode::EventRow { source, .. } => visitor(ValueRef::Source(*source)),
             _ => {}
         })
+    }
+
+    pub fn visit_currentness_inputs(
+        &self,
+        root: PlanRowExpressionId,
+        visitor: &mut impl FnMut(ValueRef),
+    ) -> Result<(), PlanError> {
+        self.node(root)?;
+        let mut visited = BTreeSet::new();
+        let mut stack = vec![(root, false)];
+        while let Some((expression, keyed_receiver)) = stack.pop() {
+            if !visited.insert((expression, keyed_receiver)) {
+                continue;
+            }
+            let node = self.node(expression)?;
+            match node {
+                PlanRowExpressionNode::Field { input } if !keyed_receiver => {
+                    visitor(input.clone());
+                }
+                PlanRowExpressionNode::Constant { constant_id } if !keyed_receiver => {
+                    visitor(ValueRef::Constant(*constant_id));
+                }
+                PlanRowExpressionNode::ListGetField { list_id, .. }
+                | PlanRowExpressionNode::ListRef { list_id }
+                | PlanRowExpressionNode::AuthorityListRef { list_id }
+                | PlanRowExpressionNode::ListRowField { list_id, .. }
+                    if !keyed_receiver =>
+                {
+                    visitor(ValueRef::List(*list_id));
+                }
+                PlanRowExpressionNode::EventRow { source, .. } if !keyed_receiver => {
+                    visitor(ValueRef::Source(*source));
+                }
+                PlanRowExpressionNode::BuiltinCall {
+                    function,
+                    input,
+                    args,
+                } if !keyed_receiver
+                    && matches!(
+                        function,
+                        PlanRowBuiltin::MapGet | PlanRowBuiltin::SetContains
+                    ) =>
+                {
+                    if let Some(input) = input {
+                        stack.push((*input, true));
+                    }
+                    stack.extend(args.iter().rev().map(|argument| (argument.value, false)));
+                }
+                _ => {
+                    let mut children = Vec::new();
+                    node.visit_children(&mut |child| children.push(child));
+                    stack.extend(
+                        children
+                            .into_iter()
+                            .rev()
+                            .map(|child| (child, keyed_receiver)),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn visit_list_fields(

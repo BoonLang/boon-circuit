@@ -2160,7 +2160,10 @@ fn scenario_value_text(value: &Value) -> RuntimeResult<String> {
         | Value::Set(_)
         | Value::Tag { .. }
         | Value::MappedRow { .. }
-        | Value::Row { .. } => Err("scenario text expectation targeted a structured value".into()),
+        | Value::Row { .. }
+        | Value::CollectionAuthority { .. } => {
+            Err("scenario text expectation targeted a structured value".into())
+        }
         Value::HostBound { .. } => {
             Err("scenario text expectation targeted a process-local host value".into())
         }

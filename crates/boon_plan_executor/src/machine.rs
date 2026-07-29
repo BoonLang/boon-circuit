@@ -20,18 +20,18 @@ use boon_plan::{
     DataTypePlan, DistributedArgumentId, DistributedCallInstanceId, DistributedCallInstanceRow,
     DistributedCallMode, EffectInvocationId, EffectInvocationPlan, ExactNumber, ExportId, FieldId,
     ImportId, ListId, ListInitializerKind, ListStorageSlot, MachinePlan, OutputListFieldRef,
-    OwnerInstanceRoute, OwnerInstanceRow, PlanBoundedListPage, PlanConstantId, PlanConstantValue,
-    PlanContextualIndexedAccess, PlanContextualOperationKind, PlanDerivedExpression,
-    PlanDerivedKind, PlanInfixOp, PlanInitialListFieldInitializer, PlanIntrinsic, PlanListAccess,
-    PlanListAccessSelection, PlanListIndex, PlanListIndexId, PlanListIndexKey,
-    PlanListIndexKeyKind, PlanListIndexKeyMultiplicity, PlanListMap, PlanListMaterialization,
-    PlanListMutation, PlanListPage, PlanListProjection, PlanLocalId, PlanMaterializedRowFieldCopy,
-    PlanOp, PlanOpId, PlanOpKind, PlanOrderDirection, PlanOrderOperationKind, PlanOwner,
-    PlanRowBuiltin, PlanRowCallArg, PlanRowExpressionArena, PlanRowExpressionId,
-    PlanRowExpressionNode, PlanRowObjectField, PlanRowSelectPattern, PlanStaticOwnerId,
-    PlanValueListAuthority, ProducerFunctionInstancePlan, RemoteCallSiteId, RemoteCallSitePlan,
-    RootOutputDemand, ScalarInitializerPlan, ScalarStorageSlot, ScopeId, SourceId,
-    SourcePayloadField, SourceRoute, SourceRouteToken, StateId, ValueRef, verify_plan,
+    OwnerInstanceRoute, OwnerInstanceRow, PlanBoundedListPage, PlanCollectionAuthorityId,
+    PlanConstantId, PlanConstantValue, PlanContextualIndexedAccess, PlanContextualOperationKind,
+    PlanDerivedExpression, PlanDerivedKind, PlanInfixOp, PlanInitialListFieldInitializer,
+    PlanIntrinsic, PlanListAccess, PlanListAccessSelection, PlanListIndex, PlanListIndexId,
+    PlanListIndexKey, PlanListIndexKeyKind, PlanListIndexKeyMultiplicity, PlanListMap,
+    PlanListMaterialization, PlanListMutation, PlanListPage, PlanListProjection, PlanLocalId,
+    PlanMaterializedRowFieldCopy, PlanOp, PlanOpId, PlanOpKind, PlanOrderDirection,
+    PlanOrderOperationKind, PlanOwner, PlanRowBuiltin, PlanRowCallArg, PlanRowExpressionArena,
+    PlanRowExpressionId, PlanRowExpressionNode, PlanRowObjectField, PlanRowSelectPattern,
+    PlanStaticOwnerId, PlanValueListAuthority, ProducerFunctionInstancePlan, RemoteCallSiteId,
+    RemoteCallSitePlan, RootOutputDemand, ScalarInitializerPlan, ScalarStorageSlot, ScopeId,
+    SourceId, SourcePayloadField, SourceRoute, SourceRouteToken, StateId, ValueRef, verify_plan,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -109,6 +109,20 @@ impl fmt::Debug for HostValueBinding {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CollectionAuthorityProducerScope {
+    pub origin: MachineOrigin,
+    pub call_site_id: RemoteCallSiteId,
+    pub call_instance_id: DistributedCallInstanceId,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CollectionAuthorityAddress {
+    pub authority: PlanCollectionAuthorityId,
+    pub owner_ancestors: Vec<OwnerInstanceRow>,
+    pub producer: Option<CollectionAuthorityProducerScope>,
+}
+
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[cfg_attr(not(feature = "phase0-instrumentation"), derive(Clone))]
 pub enum Value {
@@ -133,6 +147,13 @@ pub enum Value {
     HostBound {
         visible: Box<Value>,
         binding: HostValueBinding,
+    },
+    /// A live MAP/SET authority handle. The opaque address participates in
+    /// internal alias equality; public boundaries replace it with the current
+    /// canonical contents before exposing a Value.
+    #[serde(skip)]
+    CollectionAuthority {
+        address: CollectionAuthorityAddress,
     },
     Map(BTreeMap<Value, Value>),
     Set(BTreeSet<Value>),
@@ -298,6 +319,7 @@ fn value_tree_stats(value: &Value) -> ValueTreeStats {
                 stats.add_value(68);
                 visit(visible, stats);
             }
+            Value::CollectionAuthority { .. } => stats.add_value(24),
             Value::Map(entries) => {
                 stats.add_value(8);
                 for (key, value) in entries {
@@ -331,6 +353,7 @@ fn value_is_recursive(value: &Value) -> bool {
             | Value::MappedRow { .. }
             | Value::Row { .. }
             | Value::HostBound { .. }
+            | Value::CollectionAuthority { .. }
     )
 }
 
@@ -386,6 +409,9 @@ impl Clone for Value {
             Value::HostBound { visible, binding } => Value::HostBound {
                 visible: visible.clone(),
                 binding: binding.clone(),
+            },
+            Value::CollectionAuthority { address } => Value::CollectionAuthority {
+                address: address.clone(),
             },
             Value::Map(entries) => Value::Map(entries.clone()),
             Value::Set(items) => Value::Set(items.clone()),
@@ -532,6 +558,7 @@ impl Value {
     pub fn contains_host_binding(&self) -> bool {
         match self {
             Self::HostBound { .. } => true,
+            Self::CollectionAuthority { .. } => false,
             Self::List(values) => values.iter().any(Self::contains_host_binding),
             Self::Record(fields) | Self::MappedRow { fields, .. } | Self::Tag { fields, .. } => {
                 fields.values().any(Self::contains_host_binding)
@@ -545,9 +572,30 @@ impl Value {
         }
     }
 
+    fn contains_collection_authority(&self) -> bool {
+        match self {
+            Self::CollectionAuthority { .. } => true,
+            Self::HostBound { visible, .. } => visible.contains_collection_authority(),
+            Self::List(values) => values.iter().any(Self::contains_collection_authority),
+            Self::Record(fields) | Self::MappedRow { fields, .. } | Self::Tag { fields, .. } => {
+                fields.values().any(Self::contains_collection_authority)
+            }
+            Self::Row { fields, .. } => fields.values().any(Self::contains_collection_authority),
+            Self::Map(entries) => entries.iter().any(|(key, value)| {
+                key.contains_collection_authority() || value.contains_collection_authority()
+            }),
+            Self::Set(items) => items.iter().any(Self::contains_collection_authority),
+            Self::Number(_) | Self::Text(_) | Self::Bytes(_) => false,
+        }
+    }
+
     fn into_visible_facade(self) -> Self {
         match self {
             Self::HostBound { visible, .. } => visible.into_visible_facade(),
+            // MachineInstance must resolve this handle before a public
+            // boundary. Keeping it opaque here prevents a one-key mutation
+            // from cloning the complete collection merely to update aliases.
+            value @ Self::CollectionAuthority { .. } => value,
             Self::List(values) => {
                 Self::List(values.into_iter().map(Self::into_visible_facade).collect())
             }
@@ -1063,6 +1111,27 @@ pub enum AuthorityDelta {
         row: RowId,
         next_key: u64,
     },
+    MapUpsert {
+        address: CollectionAuthorityAddress,
+        revision: u64,
+        key: Value,
+        value: Value,
+    },
+    MapRemove {
+        address: CollectionAuthorityAddress,
+        revision: u64,
+        key: Value,
+    },
+    SetAdd {
+        address: CollectionAuthorityAddress,
+        revision: u64,
+        item: Value,
+    },
+    SetRemove {
+        address: CollectionAuthorityAddress,
+        revision: u64,
+        item: Value,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1371,6 +1440,20 @@ pub struct ListAuthority {
     pub rows: Vec<RowAuthority>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MapAuthority {
+    pub touched: bool,
+    pub revision: u64,
+    pub entries: BTreeMap<Value, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetAuthority {
+    pub touched: bool,
+    pub revision: u64,
+    pub items: BTreeSet<Value>,
+}
+
 /// Runtime-ID authority image used at the machine-instance boundary.
 ///
 /// Durable storage translates the runtime IDs through `MachinePlan::persistence`;
@@ -1381,6 +1464,8 @@ pub struct AuthoritySnapshot {
     pub through_turn_sequence: u64,
     pub states: BTreeMap<StateId, ScalarAuthority>,
     pub lists: BTreeMap<ListId, ListAuthority>,
+    pub maps: BTreeMap<CollectionAuthorityAddress, MapAuthority>,
+    pub sets: BTreeMap<CollectionAuthorityAddress, SetAuthority>,
 }
 
 impl Snapshot {
@@ -3847,6 +3932,9 @@ enum DynamicDependency {
     RowField(RowId, FieldId),
     ListAccess(PlanListIndexId, EvaluatedListAccessSelection),
     List(ListId),
+    Collection(CollectionAuthorityAddress),
+    MapKey(CollectionAuthorityAddress, Value),
+    SetItem(CollectionAuthorityAddress, Value),
     DistributedImport(ImportId),
     DistributedCallResult(ImportId, DistributedCallInstanceId),
 }
@@ -3858,6 +3946,9 @@ struct DynamicDependencies {
     by_row_field: BTreeMap<(RowId, FieldId), BTreeSet<Consumer>>,
     by_list_access: BTreeMap<(PlanListIndexId, EvaluatedListAccessSelection), BTreeSet<Consumer>>,
     by_list: BTreeMap<ListId, BTreeSet<Consumer>>,
+    by_collection: BTreeMap<CollectionAuthorityAddress, BTreeSet<Consumer>>,
+    by_map_key: BTreeMap<(CollectionAuthorityAddress, Value), BTreeSet<Consumer>>,
+    by_set_item: BTreeMap<(CollectionAuthorityAddress, Value), BTreeSet<Consumer>>,
     by_distributed_import: BTreeMap<ImportId, BTreeSet<Consumer>>,
     by_distributed_call_result: BTreeMap<(ImportId, DistributedCallInstanceId), BTreeSet<Consumer>>,
     by_consumer: BTreeMap<Consumer, BTreeSet<DynamicDependency>>,
@@ -3884,6 +3975,15 @@ impl DynamicDependencies {
                 }
                 DynamicDependency::List(list) => {
                     remove_consumer(&mut self.by_list, &list, consumer)
+                }
+                DynamicDependency::Collection(address) => {
+                    remove_consumer(&mut self.by_collection, &address, consumer)
+                }
+                DynamicDependency::MapKey(address, key) => {
+                    remove_consumer(&mut self.by_map_key, &(address, key), consumer)
+                }
+                DynamicDependency::SetItem(address, item) => {
+                    remove_consumer(&mut self.by_set_item, &(address, item), consumer)
                 }
                 DynamicDependency::DistributedImport(import) => {
                     remove_consumer(&mut self.by_distributed_import, &import, consumer)
@@ -3929,6 +4029,24 @@ impl DynamicDependencies {
             }
             DynamicDependency::List(list) => {
                 self.by_list.entry(list).or_default().insert(consumer);
+            }
+            DynamicDependency::Collection(address) => {
+                self.by_collection
+                    .entry(address)
+                    .or_default()
+                    .insert(consumer);
+            }
+            DynamicDependency::MapKey(address, key) => {
+                self.by_map_key
+                    .entry((address, key))
+                    .or_default()
+                    .insert(consumer);
+            }
+            DynamicDependency::SetItem(address, item) => {
+                self.by_set_item
+                    .entry((address, item))
+                    .or_default()
+                    .insert(consumer);
             }
             DynamicDependency::DistributedImport(import) => {
                 self.by_distributed_import
@@ -4220,6 +4338,37 @@ fn distributed_import_contracts(
         }
     }
     Ok(by_id)
+}
+
+fn broad_currentness_inputs(
+    op: &PlanOp,
+    arena: &PlanRowExpressionArena,
+) -> Result<BTreeSet<ValueRef>, Error> {
+    let PlanOpKind::DerivedValue {
+        expression: Some(expression),
+        ..
+    } = &op.kind
+    else {
+        return Ok(op.inputs.iter().cloned().collect());
+    };
+    let mut expression_inputs = BTreeSet::new();
+    expression
+        .visit_inputs(arena, &mut |input| {
+            expression_inputs.insert(input);
+        })
+        .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+    let mut inputs = op
+        .inputs
+        .iter()
+        .filter(|input| !expression_inputs.contains(*input))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    expression
+        .visit_currentness_inputs(arena, &mut |input| {
+            inputs.insert(input);
+        })
+        .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+    Ok(inputs)
 }
 
 impl Metadata {
@@ -4932,7 +5081,8 @@ impl Metadata {
             }
             let (typed_access_lists, direct_list_inputs) =
                 typed_access_and_direct_list_inputs(op, arena, &self.list_indexes)?;
-            for input in &op.inputs {
+            let currentness_inputs = broad_currentness_inputs(op, arena)?;
+            for input in &currentness_inputs {
                 match input {
                     ValueRef::State(state) if !self.indexed_state_owner.contains_key(state) => {
                         dependencies
@@ -4965,7 +5115,8 @@ impl Metadata {
         for (output, op) in &self.list_computations {
             let (typed_access_lists, direct_list_inputs) =
                 typed_access_and_direct_list_inputs(op, arena, &self.list_indexes)?;
-            for input in &op.inputs {
+            let currentness_inputs = broad_currentness_inputs(op, arena)?;
+            for input in &currentness_inputs {
                 match input {
                     ValueRef::State(state) if !self.indexed_state_owner.contains_key(state) => {
                         dependencies
@@ -5000,7 +5151,8 @@ impl Metadata {
             let Some(owner) = self.row_field_owner.get(output).copied() else {
                 continue;
             };
-            for input in &op.inputs {
+            let currentness_inputs = broad_currentness_inputs(op, arena)?;
+            for input in &currentness_inputs {
                 match input {
                     ValueRef::State(state) => {
                         if self.indexed_state_owner.get(state) == Some(&owner) {
@@ -5254,6 +5406,12 @@ fn runtime_value_to_data(value: &Value) -> Result<boon_data::Value, Error> {
                 "host-bound values cannot cross an ordinary data boundary".to_owned(),
             ));
         }
+        Value::CollectionAuthority { .. } => {
+            return Err(Error::Evaluation(
+                "live collection authority must be resolved before crossing an ordinary data boundary"
+                    .to_owned(),
+            ));
+        }
     })
 }
 
@@ -5437,6 +5595,9 @@ pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValu
         Value::HostBound { .. } => Err(Error::Evaluation(
             "host-bound values are transient and cannot be persisted".to_owned(),
         )),
+        Value::CollectionAuthority { .. } => Err(Error::Evaluation(
+            "live collection authority must be resolved before persistence".to_owned(),
+        )),
     }
 }
 
@@ -5577,6 +5738,7 @@ fn runtime_value_kind(value: &Value) -> &'static str {
         Value::MappedRow { .. } => "MappedRow",
         Value::Row { .. } => "Row",
         Value::HostBound { visible, .. } => runtime_value_kind(visible),
+        Value::CollectionAuthority { .. } => "CollectionAuthority",
     }
 }
 
@@ -5685,6 +5847,74 @@ enum AuthorityUndo {
         undo: SourceOrderUndo,
         owner_partition: Option<(OwnerAncestryId, Vec<RowId>)>,
     },
+    Collection {
+        address: CollectionAuthorityAddress,
+        previous: Option<CollectionAuthorityState>,
+    },
+    CollectionProducer {
+        site: CollectionProducerSite,
+        previous: Option<CollectionProducerCandidate>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CollectionAuthorityState {
+    Map(MapAuthority),
+    Set(SetAuthority),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CollectionProducerSite {
+    MapLiteral {
+        address: CollectionAuthorityAddress,
+        entry: u32,
+    },
+    SetLiteral {
+        address: CollectionAuthorityAddress,
+        item: u32,
+    },
+    Builtin {
+        address: CollectionAuthorityAddress,
+        expression: PlanRowExpressionId,
+    },
+}
+
+impl CollectionProducerSite {
+    fn address(&self) -> &CollectionAuthorityAddress {
+        match self {
+            Self::MapLiteral { address, .. }
+            | Self::SetLiteral { address, .. }
+            | Self::Builtin { address, .. } => address,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CollectionProducerCandidate {
+    MapUpsert { key: Value, value: Value },
+    MapRemove { key: Value },
+    SetAdd { item: Value },
+    SetRemove { item: Value },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PendingCollectionOperationKey {
+    Map {
+        address: CollectionAuthorityAddress,
+        key: Value,
+    },
+    Set {
+        address: CollectionAuthorityAddress,
+        item: Value,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingCollectionOperation {
+    MapUpsert(Value),
+    MapRemove,
+    SetAdd,
+    SetRemove,
 }
 
 #[derive(Clone)]
@@ -5750,6 +5980,10 @@ struct Work {
     authority_undo: Vec<AuthorityUndo>,
     undo_root_states: HashSet<StateId>,
     undo_row_fields: HashSet<(RowId, FieldId)>,
+    undo_collection_authorities: BTreeSet<CollectionAuthorityAddress>,
+    undo_collection_producers: BTreeSet<CollectionProducerSite>,
+    pending_collection_operations:
+        BTreeMap<PendingCollectionOperationKey, PendingCollectionOperation>,
     list_revision_undo: BTreeMap<ListId, u64>,
     distributed_context_undo: Option<DistributedContextUndo>,
     effect_activation_undo: BTreeMap<EffectConsumer, Option<EffectActivation>>,
@@ -5802,6 +6036,9 @@ impl Work {
         self.authority_undo.clear();
         self.undo_root_states.clear();
         self.undo_row_fields.clear();
+        self.undo_collection_authorities.clear();
+        self.undo_collection_producers.clear();
+        self.pending_collection_operations.clear();
         self.list_revision_undo.clear();
         self.distributed_context_undo = None;
         self.effect_activation_undo.clear();
@@ -5844,6 +6081,9 @@ impl Work {
         self.authority_undo.clear();
         self.undo_root_states.clear();
         self.undo_row_fields.clear();
+        self.undo_collection_authorities.clear();
+        self.undo_collection_producers.clear();
+        self.pending_collection_operations.clear();
         self.list_revision_undo.clear();
         self.committed_transient_effects.clear();
         self.completed_transient_effects.clear();
@@ -6091,6 +6331,10 @@ fn authority_delta_is_producer_local(
         AuthorityDelta::ReplaceList { list_id, .. } => ownership.lists.contains(list_id),
         AuthorityDelta::InsertRow { row, .. } => ownership.lists.contains(&row.id.list),
         AuthorityDelta::RemoveRow { row, .. } => ownership.lists.contains(&row.list),
+        AuthorityDelta::MapUpsert { address, .. }
+        | AuthorityDelta::MapRemove { address, .. }
+        | AuthorityDelta::SetAdd { address, .. }
+        | AuthorityDelta::SetRemove { address, .. } => address.producer.is_some(),
     }
 }
 
@@ -6164,6 +6408,29 @@ enum EvalValue {
     },
 }
 
+fn eval_contains_collection_authority(value: &EvalValue) -> bool {
+    match value {
+        EvalValue::Value(value) | EvalValue::Flushed(value) => {
+            value.contains_collection_authority()
+        }
+        EvalValue::List(values) => values.iter().any(eval_contains_collection_authority),
+        EvalValue::Record(fields) | EvalValue::Tag { fields, .. } => {
+            fields.values().any(eval_contains_collection_authority)
+        }
+        EvalValue::MappedRow {
+            fields, captures, ..
+        } => {
+            fields.values().any(eval_contains_collection_authority)
+                || captures.values().any(eval_contains_collection_authority)
+        }
+        EvalValue::OrderedList { items, .. } => items.iter().any(|item| {
+            eval_contains_collection_authority(&item.value)
+                || item.keys.iter().any(Value::contains_collection_authority)
+        }),
+        EvalValue::Absent | EvalValue::Row(_) => false,
+    }
+}
+
 enum ControlOutcome<T> {
     Normal(T),
     Flushed(Value),
@@ -6187,7 +6454,8 @@ fn validate_flush_payload_value(value: &Value) -> Result<(), Error> {
             | Value::Set(_)
             | Value::MappedRow { .. }
             | Value::Row { .. }
-            | Value::HostBound { .. } => {
+            | Value::HostBound { .. }
+            | Value::CollectionAuthority { .. } => {
                 return Err(Error::InvalidPlan(
                     "FLUSH payload contains collection, row, or host-bound data".to_owned(),
                 ));
@@ -7155,6 +7423,7 @@ enum ExpressionTask<'event, 'plan> {
     DerivedValueCompareAfterRight {
         op: PlanInfixOp,
         left: EvalValue,
+        context: ExpressionContext<'event>,
     },
     BeginRowOwnedCall {
         import_id: ImportId,
@@ -7499,6 +7768,7 @@ enum ExpressionTask<'event, 'plan> {
     BuiltinAfterOperands {
         expression: PlanRowExpressionId,
         value_base: usize,
+        context: ExpressionContext<'event>,
     },
     BuiltinBoolAfterLeft {
         function: PlanRowBuiltin,
@@ -7979,13 +8249,13 @@ fn schedule_apply_operands<'event, 'plan>(
                 push(*part)?;
             }
         }
-        PlanRowExpressionNode::MapLiteral { entries } => {
+        PlanRowExpressionNode::MapLiteral { entries, .. } => {
             for entry in entries.iter().rev() {
                 push(entry.value)?;
                 push(entry.key)?;
             }
         }
-        PlanRowExpressionNode::SetLiteral { items } => {
+        PlanRowExpressionNode::SetLiteral { items, .. } => {
             for item in items.iter().rev() {
                 push(*item)?;
             }
@@ -8062,7 +8332,23 @@ fn schedule_builtin_operands<'event, 'plan>(
                     function.function_name()
                 ))
             })?;
-            push_expression_operand(stack, input, context)?;
+            let receiver_context = if matches!(
+                function,
+                PlanRowBuiltin::MapUpsert
+                    | PlanRowBuiltin::MapRemove
+                    | PlanRowBuiltin::MapGet
+                    | PlanRowBuiltin::SetAdd
+                    | PlanRowBuiltin::SetRemove
+                    | PlanRowBuiltin::SetContains
+            ) {
+                ExpressionContext {
+                    consumer: None,
+                    ..context
+                }
+            } else {
+                context
+            };
+            push_expression_operand(stack, input, receiver_context)?;
         } else if let Some(argument) = args.iter().find(|argument| argument.name == parameter.name)
         {
             push_expression_operand(stack, argument.value, context)?;
@@ -8152,6 +8438,8 @@ pub struct MachineInstance {
     root_fields: BTreeMap<FieldId, DerivedCell>,
     derived_lists: BTreeMap<ListId, DerivedListCell>,
     lists: BTreeMap<ListId, ListState>,
+    collection_authorities: BTreeMap<CollectionAuthorityAddress, CollectionAuthorityState>,
+    collection_producers: BTreeMap<CollectionProducerSite, CollectionProducerCandidate>,
     ordered_indexes: BTreeMap<PlanListIndexId, OrderedIndex>,
     dirty_ordered_indexes: BTreeSet<PlanListIndexId>,
     dirty_ordered_index_rows: BTreeMap<PlanListIndexId, BTreeSet<RowId>>,
@@ -8253,6 +8541,16 @@ struct ProducerLeaseKey {
     call_instance_id: DistributedCallInstanceId,
 }
 
+impl ProducerLeaseKey {
+    fn collection_scope(self) -> CollectionAuthorityProducerScope {
+        CollectionAuthorityProducerScope {
+            origin: self.origin,
+            call_site_id: self.call_site_id,
+            call_instance_id: self.call_instance_id,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct ProducerLeaseState {
     initialized: bool,
@@ -8263,6 +8561,8 @@ struct ProducerLeaseState {
     root_fields: BTreeMap<FieldId, DerivedCell>,
     derived_lists: BTreeMap<ListId, DerivedListCell>,
     lists: BTreeMap<ListId, ListState>,
+    collection_authorities: BTreeMap<CollectionAuthorityAddress, CollectionAuthorityState>,
+    collection_producers: BTreeMap<CollectionProducerSite, CollectionProducerCandidate>,
     ordered_indexes: BTreeMap<PlanListIndexId, OrderedIndex>,
     dirty_ordered_indexes: BTreeSet<PlanListIndexId>,
     dirty_ordered_index_rows: BTreeMap<PlanListIndexId, BTreeSet<RowId>>,
@@ -8438,6 +8738,8 @@ enum AuthorityRestorePhase {
     States,
     Lists,
     ValidateRows(ListRowsCursor),
+    Maps,
+    Sets,
     Complete,
 }
 
@@ -8445,6 +8747,8 @@ struct AuthorityRestoreBuild {
     through_turn_sequence: u64,
     states: std::collections::btree_map::IntoIter<StateId, ScalarAuthority>,
     lists: std::collections::btree_map::IntoIter<ListId, ListAuthority>,
+    maps: std::collections::btree_map::IntoIter<CollectionAuthorityAddress, MapAuthority>,
+    sets: std::collections::btree_map::IntoIter<CollectionAuthorityAddress, SetAuthority>,
     current_list: Option<AuthorityListRestoreBuild>,
     phase: AuthorityRestorePhase,
 }
@@ -8652,10 +8956,19 @@ fn record_ordered_index_integrity(
 
 impl AuthorityRestoreBuild {
     fn new(authority: AuthoritySnapshot) -> Self {
+        let AuthoritySnapshot {
+            through_turn_sequence,
+            states,
+            lists,
+            maps,
+            sets,
+        } = authority;
         Self {
-            through_turn_sequence: authority.through_turn_sequence,
-            states: authority.states.into_iter(),
-            lists: authority.lists.into_iter(),
+            through_turn_sequence,
+            states: states.into_iter(),
+            lists: lists.into_iter(),
+            maps: maps.into_iter(),
+            sets: sets.into_iter(),
             current_list: None,
             phase: AuthorityRestorePhase::Begin,
         }
@@ -8680,6 +8993,8 @@ impl DurableRestoreBuild {
             through_turn_sequence: self.through_turn_sequence,
             states: std::mem::take(&mut self.states),
             lists: std::mem::take(&mut self.translated_lists),
+            maps: BTreeMap::new(),
+            sets: BTreeMap::new(),
         }
     }
 }
@@ -8734,6 +9049,8 @@ impl MachineInstanceBuilder {
                 root_fields: BTreeMap::new(),
                 derived_lists: BTreeMap::new(),
                 lists: BTreeMap::new(),
+                collection_authorities: BTreeMap::new(),
+                collection_producers: BTreeMap::new(),
                 ordered_indexes: BTreeMap::new(),
                 dirty_ordered_indexes: BTreeSet::new(),
                 dirty_ordered_index_rows: BTreeMap::new(),
@@ -9522,6 +9839,8 @@ impl MachineBuildTask {
                 let session = self.session_mut();
                 session.turn_sequence = build.through_turn_sequence;
                 session.touched_root_states.clear();
+                session.collection_authorities.clear();
+                session.collection_producers.clear();
                 build.phase = AuthorityRestorePhase::States;
             }
             AuthorityRestorePhase::States => {
@@ -9566,8 +9885,28 @@ impl MachineBuildTask {
                 if let Some(row) = self.next_list_row(cursor) {
                     self.session_mut().validate_row_ownership_for_row(row)?;
                 } else {
-                    build.phase = AuthorityRestorePhase::Complete;
+                    build.phase = AuthorityRestorePhase::Maps;
                 }
+            }
+            AuthorityRestorePhase::Maps => {
+                let Some((address, authority)) = build.maps.next() else {
+                    build.phase = AuthorityRestorePhase::Sets;
+                    return Ok(false);
+                };
+                self.session_mut().restore_collection_authority(
+                    address,
+                    CollectionAuthorityState::Map(authority),
+                )?;
+            }
+            AuthorityRestorePhase::Sets => {
+                let Some((address, authority)) = build.sets.next() else {
+                    build.phase = AuthorityRestorePhase::Complete;
+                    return Ok(false);
+                };
+                self.session_mut().restore_collection_authority(
+                    address,
+                    CollectionAuthorityState::Set(authority),
+                )?;
             }
             AuthorityRestorePhase::Complete => return Ok(true),
         }
@@ -10268,6 +10607,9 @@ impl MachineInstance {
         self.root_fields.extend(lease.root_fields);
         self.derived_lists.extend(lease.derived_lists);
         self.lists.extend(lease.lists);
+        self.collection_authorities
+            .extend(lease.collection_authorities);
+        self.collection_producers.extend(lease.collection_producers);
         self.ordered_indexes.extend(lease.ordered_indexes);
         self.dirty_ordered_indexes
             .extend(lease.dirty_ordered_indexes);
@@ -10330,6 +10672,7 @@ impl MachineInstance {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
+        let collection_scope = active.key.collection_scope();
         let mut lease = ProducerLeaseState {
             initialized: active.initialized,
             seen_global_revision: self.global_dependency_revision,
@@ -10343,6 +10686,13 @@ impl MachineInstance {
                 owned_lists.contains(list)
             }),
             lists: take_map_where(&mut self.lists, |list, _| owned_lists.contains(list)),
+            collection_authorities: take_map_where(
+                &mut self.collection_authorities,
+                |address, _| address.producer == Some(collection_scope),
+            ),
+            collection_producers: take_map_where(&mut self.collection_producers, |site, _| {
+                site.address().producer == Some(collection_scope)
+            }),
             ordered_indexes: take_map_where(&mut self.ordered_indexes, |index, _| {
                 owned_indexes.contains(index)
             }),
@@ -10939,7 +11289,7 @@ impl MachineInstance {
                 None => None,
             };
             self.turn_sequence = sequence;
-            let (deltas, authority_deltas) = take_report_deltas(&mut work);
+            let (deltas, authority_deltas) = self.take_report_deltas(&mut work)?;
             work.finish_metrics();
             let turn = Turn {
                 sequence,
@@ -11324,7 +11674,7 @@ impl MachineInstance {
                 .checked_add(1)
                 .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
             self.commit_transient_effects(&mut work)?;
-            let (deltas, authority_deltas) = take_report_deltas(&mut work);
+            let (deltas, authority_deltas) = self.take_report_deltas(&mut work)?;
             work.finish_metrics();
             let turn = Turn {
                 sequence: self.turn_sequence,
@@ -11693,7 +12043,7 @@ impl MachineInstance {
                     self.ensure_published_current(None, &mut work)?;
                 }
                 self.turn_sequence = sequence;
-                let (deltas, authority_deltas) = take_report_deltas(&mut work);
+                let (deltas, authority_deltas) = self.take_report_deltas(&mut work)?;
                 work.finish_metrics();
                 let turn = Turn {
                     sequence,
@@ -11982,7 +12332,10 @@ impl MachineInstance {
                     list.0
                 )));
             }
-            value => self.materialize_eval(value)?.into_visible_facade(),
+            value => {
+                let value = self.materialize_eval(value)?;
+                self.resolve_boundary_value(value)?.into_visible_facade()
+            }
         };
         #[cfg(feature = "phase0-instrumentation")]
         {
@@ -12089,8 +12442,14 @@ impl MachineInstance {
                         .get(field)
                         .is_none_or(|currentness| *currentness == Currentness::Current)
                 })
-                .map(|(field, value)| (*field, value.clone().into_visible_facade()))
-                .collect(),
+                .map(|(field, value)| {
+                    Ok((
+                        *field,
+                        self.resolve_boundary_value(value.clone())?
+                            .into_visible_facade(),
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, Error>>()?,
         })
     }
 
@@ -12362,17 +12721,18 @@ impl MachineInstance {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
+        let mut states = BTreeMap::new();
+        for (state, presence) in &self.root_states {
+            if let PrivatePresence::Present(value) = presence {
+                states.insert(
+                    *state,
+                    self.resolve_boundary_value(value.clone())?
+                        .into_visible_facade(),
+                );
+            }
+        }
         let mut snapshot = Snapshot {
-            states: self
-                .root_states
-                .iter()
-                .filter_map(|(state, presence)| match presence {
-                    PrivatePresence::Present(value) => {
-                        Some((*state, value.clone().into_visible_facade()))
-                    }
-                    PrivatePresence::Absent => None,
-                })
-                .collect(),
+            states,
             fields: BTreeMap::new(),
             lists: BTreeMap::new(),
         };
@@ -12397,7 +12757,10 @@ impl MachineInstance {
                     )));
                 }
             };
-            snapshot.fields.insert(*field, value.into_visible_facade());
+            snapshot.fields.insert(
+                *field,
+                self.resolve_boundary_value(value)?.into_visible_facade(),
+            );
         }
         for (list, state) in &self.lists {
             let rows = state
@@ -12418,8 +12781,14 @@ impl MachineInstance {
                                     .get(field)
                                     .is_none_or(|currentness| *currentness == Currentness::Current)
                             })
-                            .map(|(field, value)| (*field, value.clone().into_visible_facade()))
-                            .collect(),
+                            .map(|(field, value)| {
+                                Ok((
+                                    *field,
+                                    self.resolve_boundary_value(value.clone())?
+                                        .into_visible_facade(),
+                                ))
+                            })
+                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -12478,10 +12847,32 @@ impl MachineInstance {
             lists.insert(slot.list_id, self.list_authority(slot.list_id)?);
         }
 
+        let maps = self
+            .collection_authorities
+            .iter()
+            .filter_map(|(address, authority)| match authority {
+                CollectionAuthorityState::Map(authority) if address.producer.is_none() => {
+                    Some((address.clone(), authority.clone()))
+                }
+                CollectionAuthorityState::Map(_) | CollectionAuthorityState::Set(_) => None,
+            })
+            .collect();
+        let sets = self
+            .collection_authorities
+            .iter()
+            .filter_map(|(address, authority)| match authority {
+                CollectionAuthorityState::Set(authority) if address.producer.is_none() => {
+                    Some((address.clone(), authority.clone()))
+                }
+                CollectionAuthorityState::Set(_) | CollectionAuthorityState::Map(_) => None,
+            })
+            .collect();
         Ok(AuthoritySnapshot {
             through_turn_sequence: self.turn_sequence,
             states,
             lists,
+            maps,
+            sets,
         })
     }
 
@@ -12737,6 +13128,10 @@ impl MachineInstance {
                 AuthorityDelta::RemoveRow { row, .. } => {
                     self.metadata.durable_lists.contains(&row.list)
                 }
+                AuthorityDelta::MapUpsert { .. }
+                | AuthorityDelta::MapRemove { .. }
+                | AuthorityDelta::SetAdd { .. }
+                | AuthorityDelta::SetRemove { .. } => false,
             })
             .filter(|delta| {
                 process_local
@@ -12860,6 +13255,13 @@ impl MachineInstance {
                         next_order_token: list.next_order_token,
                     })
                 }
+                AuthorityDelta::MapUpsert { .. }
+                | AuthorityDelta::MapRemove { .. }
+                | AuthorityDelta::SetAdd { .. }
+                | AuthorityDelta::SetRemove { .. } => Err(Error::InvalidPlan(
+                    "collection authority delta reached legacy scalar/list persistence lowering"
+                        .to_owned(),
+                )),
             })
             .collect()
     }
@@ -12964,7 +13366,10 @@ impl MachineInstance {
                 }
             };
             if let Some(value) = value {
-                values.insert(*target, value.into_visible_facade());
+                values.insert(
+                    *target,
+                    self.resolve_boundary_value(value)?.into_visible_facade(),
+                );
             }
         }
         Ok(values)
@@ -12997,8 +13402,8 @@ impl MachineInstance {
         let mut work = self.fresh_work();
         let evaluated =
             self.eval_row_expression(expression, row, None, None, None, &mut locals, &mut work)?;
-        self.materialize_eval(evaluated)
-            .map(Value::into_visible_facade)
+        let value = self.materialize_eval(evaluated)?;
+        Ok(self.resolve_boundary_value(value)?.into_visible_facade())
     }
 
     /// Establishes a currentness barrier for an already-owned demand set
@@ -13010,8 +13415,8 @@ impl MachineInstance {
     }
 
     pub fn root_value_current(&mut self, name: &str) -> Result<Value, Error> {
-        self.root_value_current_complete(name)
-            .map(Value::into_visible_facade)
+        let value = self.root_value_current_complete(name)?;
+        Ok(self.resolve_boundary_value(value)?.into_visible_facade())
     }
 
     pub fn root_value_current_with_metrics(
@@ -13023,9 +13428,8 @@ impl MachineInstance {
         let mut work = self.fresh_work();
         let field = unique_root_name(&self.metadata.root_field_by_exact_name, name, "field")?
             .ok_or_else(|| Error::InvalidPlan(format!("no root field `{name}`")))?;
-        let value = self
-            .ensure_root_field(field, None, &mut work)?
-            .into_visible_facade();
+        let value = self.ensure_root_field(field, None, &mut work)?;
+        let value = self.resolve_boundary_value(value)?.into_visible_facade();
         #[cfg(feature = "phase0-instrumentation")]
         {
             work.metrics.elapsed_boundary_ns = work
@@ -13129,12 +13533,13 @@ impl MachineInstance {
         };
         if let (ValueRef::List(list), boon_plan::DataTypePlan::List { item }) = (&value, &data_type)
         {
-            return self.output_list_current(*list, item, &list_fields);
+            let value = self.output_list_current(*list, item, &list_fields)?;
+            return self.resolve_boundary_value(value);
         }
         let mut work = self.fresh_work();
         let evaluated = self.eval_value_ref(&value, None, None, None, None, &mut work)?;
         let value = self.materialize_eval(evaluated)?;
-        normalize_host_output_value(value)
+        normalize_host_output_value(self.resolve_boundary_value(value)?)
     }
 
     fn output_list_current(
@@ -14123,7 +14528,7 @@ impl MachineInstance {
                 });
             self.commit_transient_effects(&mut work)?;
             self.turn_sequence = sequence;
-            let (deltas, authority_deltas) = take_report_deltas(&mut work);
+            let (deltas, authority_deltas) = self.take_report_deltas(&mut work)?;
             work.finish_metrics();
             let turn = Turn {
                 sequence,
@@ -14248,7 +14653,7 @@ impl MachineInstance {
             work.completed_transient_effects.push((call_id, removed));
             self.commit_transient_effects(&mut work)?;
             self.turn_sequence = sequence;
-            let (deltas, authority_deltas) = take_report_deltas(&mut work);
+            let (deltas, authority_deltas) = self.take_report_deltas(&mut work)?;
             work.finish_metrics();
             let turn = Turn {
                 sequence,
@@ -14443,7 +14848,7 @@ impl MachineInstance {
 
             self.commit_transient_effects(&mut work)?;
             self.turn_sequence = sequence;
-            let (deltas, authority_deltas) = take_report_deltas(&mut work);
+            let (deltas, authority_deltas) = self.take_report_deltas(&mut work)?;
             work.finish_metrics();
             let turn = Turn {
                 sequence,
@@ -15241,6 +15646,22 @@ impl MachineInstance {
                             .order = previous_order;
                     }
                 }
+                AuthorityUndo::Collection { address, previous } => match previous {
+                    Some(previous) => {
+                        self.collection_authorities.insert(address, previous);
+                    }
+                    None => {
+                        self.collection_authorities.remove(&address);
+                    }
+                },
+                AuthorityUndo::CollectionProducer { site, previous } => match previous {
+                    Some(previous) => {
+                        self.collection_producers.insert(site, previous);
+                    }
+                    None => {
+                        self.collection_producers.remove(&site);
+                    }
+                },
             }
         }
         for (list_id, revision) in std::mem::take(&mut work.list_revision_undo) {
@@ -15264,6 +15685,9 @@ impl MachineInstance {
         }
         work.undo_root_states.clear();
         work.undo_row_fields.clear();
+        work.undo_collection_authorities.clear();
+        work.undo_collection_producers.clear();
+        work.pending_collection_operations.clear();
         work.deltas.clear();
         work.authority_deltas.clear();
         work.outbox_changes.clear();
@@ -15326,7 +15750,7 @@ impl MachineInstance {
 
         #[cfg(feature = "phase0-instrumentation")]
         let delta_started = Instant::now();
-        let (deltas, authority_deltas) = take_report_deltas(work);
+        let (deltas, authority_deltas) = self.take_report_deltas(work)?;
         #[cfg(feature = "phase0-instrumentation")]
         {
             work.metrics.elapsed_delta_ns = work
@@ -19281,6 +19705,9 @@ impl MachineInstance {
                         | DynamicDependency::RootField(_)
                         | DynamicDependency::ListAccess(_, _)
                         | DynamicDependency::List(_)
+                        | DynamicDependency::Collection(_)
+                        | DynamicDependency::MapKey(_, _)
+                        | DynamicDependency::SetItem(_, _)
                         | DynamicDependency::DistributedImport(_)
                         | DynamicDependency::DistributedCallResult(_, _) => None,
                     }),
@@ -19293,6 +19720,601 @@ impl MachineInstance {
         if let Some(consumer) = consumer {
             self.dynamic_dependencies
                 .insert(consumer, DynamicDependency::List(list));
+        }
+    }
+
+    fn restore_collection_authority(
+        &mut self,
+        address: CollectionAuthorityAddress,
+        authority: CollectionAuthorityState,
+    ) -> Result<(), Error> {
+        if address.producer.is_some() {
+            return Err(Error::InvalidPlan(
+                "runtime authority restore cannot contain producer-local collection state"
+                    .to_owned(),
+            ));
+        }
+        let is_map = matches!(authority, CollectionAuthorityState::Map(_));
+        let mut declared_kind = None;
+        for (_, node) in self.plan.row_expressions.iter() {
+            let candidate = match node {
+                PlanRowExpressionNode::MapLiteral { authority, .. }
+                    if *authority == address.authority =>
+                {
+                    Some(true)
+                }
+                PlanRowExpressionNode::SetLiteral { authority, .. }
+                    if *authority == address.authority =>
+                {
+                    Some(false)
+                }
+                _ => None,
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if declared_kind
+                .replace(candidate)
+                .is_some_and(|kind| kind != candidate)
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "collection authority {} is declared as both MAP and SET",
+                    address.authority.0
+                )));
+            }
+        }
+        let Some(declared_kind) = declared_kind else {
+            return Err(Error::InvalidPlan(format!(
+                "restore image contains unknown collection authority {}",
+                address.authority.0
+            )));
+        };
+        if declared_kind != is_map {
+            return Err(Error::InvalidPlan(format!(
+                "restore image gives collection authority {} the wrong kind",
+                address.authority.0
+            )));
+        }
+        for (depth, owner) in address.owner_ancestors.iter().enumerate() {
+            let row = RowId {
+                list: owner.list,
+                key: owner.key,
+                generation: owner.generation,
+            };
+            let actual = self.row_owner_rows(row)?;
+            if actual != address.owner_ancestors[..=depth] {
+                return Err(Error::InvalidPlan(format!(
+                    "collection authority {} has a mixed structural owner at depth {depth}",
+                    address.authority.0
+                )));
+            }
+        }
+        let revision = match &authority {
+            CollectionAuthorityState::Map(authority) => {
+                for key in authority.entries.keys() {
+                    if !runtime_value_to_data(key)?.is_key_safe() {
+                        return Err(Error::InvalidPlan(format!(
+                            "restored MAP authority {} contains a non-key-safe key",
+                            address.authority.0
+                        )));
+                    }
+                }
+                authority.revision
+            }
+            CollectionAuthorityState::Set(authority) => {
+                for item in &authority.items {
+                    if !runtime_value_to_data(item)?.is_key_safe() {
+                        return Err(Error::InvalidPlan(format!(
+                            "restored SET authority {} contains a non-key-safe item",
+                            address.authority.0
+                        )));
+                    }
+                }
+                authority.revision
+            }
+        };
+        if revision > self.turn_sequence {
+            return Err(Error::InvalidPlan(format!(
+                "collection authority {} revision {revision} exceeds restored turn {}",
+                address.authority.0, self.turn_sequence
+            )));
+        }
+        if self
+            .collection_authorities
+            .insert(address.clone(), authority)
+            .is_some()
+        {
+            return Err(Error::InvalidPlan(format!(
+                "restore image repeats collection authority {} in one dynamic scope",
+                address.authority.0
+            )));
+        }
+        Ok(())
+    }
+
+    fn collection_authority_address(
+        &self,
+        authority: PlanCollectionAuthorityId,
+        context: ExpressionContext<'_>,
+    ) -> Result<CollectionAuthorityAddress, Error> {
+        let owner_ancestors = context
+            .row
+            .map(|row| self.row_owner_rows(row))
+            .transpose()?
+            .unwrap_or_default();
+        let producer = self
+            .active_producer_lease
+            .as_ref()
+            .map(|active| active.key.collection_scope());
+        Ok(CollectionAuthorityAddress {
+            authority,
+            owner_ancestors,
+            producer,
+        })
+    }
+
+    fn collection_authority_handle(
+        &self,
+        address: &CollectionAuthorityAddress,
+    ) -> Result<Value, Error> {
+        if !self.collection_authorities.contains_key(address) {
+            return Err(Error::InvalidPlan(format!(
+                "collection authority {} has no live state for its dynamic scope",
+                address.authority.0
+            )));
+        }
+        Ok(Value::CollectionAuthority {
+            address: address.clone(),
+        })
+    }
+
+    fn collection_authority_snapshot(
+        &self,
+        address: &CollectionAuthorityAddress,
+    ) -> Result<Value, Error> {
+        match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Map(authority)) => {
+                Ok(Value::Map(authority.entries.clone()))
+            }
+            Some(CollectionAuthorityState::Set(authority)) => {
+                Ok(Value::Set(authority.items.clone()))
+            }
+            None => Err(Error::InvalidPlan(format!(
+                "collection authority {} has no live state for its dynamic scope",
+                address.authority.0
+            ))),
+        }
+    }
+
+    fn record_collection_authority_undo(
+        &self,
+        address: &CollectionAuthorityAddress,
+        work: &mut Work,
+    ) {
+        if work.undo_collection_authorities.insert(address.clone()) {
+            work.authority_undo.push(AuthorityUndo::Collection {
+                address: address.clone(),
+                previous: self.collection_authorities.get(address).cloned(),
+            });
+        }
+    }
+
+    fn record_collection_producer_undo(&self, site: &CollectionProducerSite, work: &mut Work) {
+        if work.undo_collection_producers.insert(site.clone()) {
+            work.authority_undo.push(AuthorityUndo::CollectionProducer {
+                site: site.clone(),
+                previous: self.collection_producers.get(site).cloned(),
+            });
+        }
+    }
+
+    fn ensure_map_authority(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Map(_)) => return Ok(()),
+            Some(CollectionAuthorityState::Set(_)) => {
+                return Err(Error::InvalidPlan(format!(
+                    "collection authority {} is used as both MAP and SET",
+                    address.authority.0
+                )));
+            }
+            None => {}
+        }
+        self.record_collection_authority_undo(address, work);
+        self.collection_authorities.insert(
+            address.clone(),
+            CollectionAuthorityState::Map(MapAuthority {
+                touched: false,
+                revision: 0,
+                entries: BTreeMap::new(),
+            }),
+        );
+        Ok(())
+    }
+
+    fn ensure_set_authority(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Set(_)) => return Ok(()),
+            Some(CollectionAuthorityState::Map(_)) => {
+                return Err(Error::InvalidPlan(format!(
+                    "collection authority {} is used as both SET and MAP",
+                    address.authority.0
+                )));
+            }
+            None => {}
+        }
+        self.record_collection_authority_undo(address, work);
+        self.collection_authorities.insert(
+            address.clone(),
+            CollectionAuthorityState::Set(SetAuthority {
+                touched: false,
+                revision: 0,
+                items: BTreeSet::new(),
+            }),
+        );
+        Ok(())
+    }
+
+    fn update_collection_producer(
+        &mut self,
+        site: CollectionProducerSite,
+        candidate: CollectionProducerCandidate,
+        work: &mut Work,
+    ) -> Result<bool, Error> {
+        if self.collection_producers.get(&site) == Some(&candidate) {
+            return Ok(false);
+        }
+        if self.collection_producers.contains_key(&site) && !work.emit {
+            return Err(Error::Evaluation(format!(
+                "collection authority producer at expression {} changed outside an atomic turn",
+                match &site {
+                    CollectionProducerSite::Builtin { expression, .. } => expression.0,
+                    CollectionProducerSite::MapLiteral { address, .. }
+                    | CollectionProducerSite::SetLiteral { address, .. } => address.authority.0,
+                }
+            )));
+        }
+        self.record_collection_producer_undo(&site, work);
+        self.collection_producers.insert(site, candidate);
+        Ok(true)
+    }
+
+    fn admit_collection_operation(
+        work: &mut Work,
+        key: PendingCollectionOperationKey,
+        operation: PendingCollectionOperation,
+    ) -> Result<bool, Error> {
+        match work.pending_collection_operations.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(operation);
+                Ok(true)
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &operation => {
+                Ok(false)
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) if !work.emit => {
+                // Bootstrap evaluates one causal pipeline against an empty
+                // authority before any source-event turn exists. Preserve that
+                // expression order here; once a logical turn is emitting,
+                // competing same-sequence writers remain a hard conflict.
+                entry.insert(operation);
+                Ok(true)
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(Error::Evaluation(
+                "conflicting MAP/SET operations address the same key or item in one logical turn"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    fn next_collection_revision(&self, current: u64, work: &Work) -> Result<u64, Error> {
+        if !work.emit {
+            return Ok(current);
+        }
+        self.turn_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Evaluation("collection authority revision overflow".to_owned()))
+    }
+
+    fn invalidate_map_key(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        key: &Value,
+        work: &mut Work,
+    ) {
+        let mut consumers = self
+            .dynamic_dependencies
+            .by_collection
+            .get(address)
+            .cloned()
+            .unwrap_or_default();
+        consumers.extend(
+            self.dynamic_dependencies
+                .by_map_key
+                .get(&(address.clone(), key.clone()))
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+        self.propagate_dirty(
+            consumers
+                .into_iter()
+                .map(DirtyPropagationTask::MarkConsumer),
+            work,
+        );
+    }
+
+    fn invalidate_set_item(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        item: &Value,
+        work: &mut Work,
+    ) {
+        let mut consumers = self
+            .dynamic_dependencies
+            .by_collection
+            .get(address)
+            .cloned()
+            .unwrap_or_default();
+        consumers.extend(
+            self.dynamic_dependencies
+                .by_set_item
+                .get(&(address.clone(), item.clone()))
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+        self.propagate_dirty(
+            consumers
+                .into_iter()
+                .map(DirtyPropagationTask::MarkConsumer),
+            work,
+        );
+    }
+
+    fn submit_map_upsert(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        key: Value,
+        value: Value,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        if !Self::admit_collection_operation(
+            work,
+            PendingCollectionOperationKey::Map {
+                address: address.clone(),
+                key: key.clone(),
+            },
+            PendingCollectionOperation::MapUpsert(value.clone()),
+        )? {
+            return Ok(());
+        }
+        work.consume(1)?;
+        self.record_collection_authority_undo(address, work);
+        let current_revision = match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Map(authority)) => authority.revision,
+            _ => {
+                return Err(Error::InvalidPlan(format!(
+                    "MAP authority {} disappeared before upsert",
+                    address.authority.0
+                )));
+            }
+        };
+        let revision = self.next_collection_revision(current_revision, work)?;
+        let changed = {
+            let Some(CollectionAuthorityState::Map(authority)) =
+                self.collection_authorities.get_mut(address)
+            else {
+                unreachable!("validated MAP authority changed kind")
+            };
+            let changed = authority.entries.get(&key) != Some(&value);
+            if changed {
+                authority.entries.insert(key.clone(), value.clone());
+                authority.revision = revision;
+                authority.touched |= work.emit;
+            }
+            changed
+        };
+        if changed && work.emit {
+            work.authority_deltas.push(AuthorityDelta::MapUpsert {
+                address: address.clone(),
+                revision,
+                key: key.clone(),
+                value,
+            });
+            self.invalidate_map_key(address, &key, work);
+        }
+        Ok(())
+    }
+
+    fn submit_map_remove(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        key: Value,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        if !Self::admit_collection_operation(
+            work,
+            PendingCollectionOperationKey::Map {
+                address: address.clone(),
+                key: key.clone(),
+            },
+            PendingCollectionOperation::MapRemove,
+        )? {
+            return Ok(());
+        }
+        work.consume(1)?;
+        self.record_collection_authority_undo(address, work);
+        let current_revision = match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Map(authority)) => authority.revision,
+            _ => {
+                return Err(Error::InvalidPlan(format!(
+                    "MAP authority {} disappeared before removal",
+                    address.authority.0
+                )));
+            }
+        };
+        let revision = self.next_collection_revision(current_revision, work)?;
+        let changed = {
+            let Some(CollectionAuthorityState::Map(authority)) =
+                self.collection_authorities.get_mut(address)
+            else {
+                unreachable!("validated MAP authority changed kind")
+            };
+            let changed = authority.entries.remove(&key).is_some();
+            if changed {
+                authority.revision = revision;
+                authority.touched |= work.emit;
+            }
+            changed
+        };
+        if changed && work.emit {
+            work.authority_deltas.push(AuthorityDelta::MapRemove {
+                address: address.clone(),
+                revision,
+                key: key.clone(),
+            });
+            self.invalidate_map_key(address, &key, work);
+        }
+        Ok(())
+    }
+
+    fn submit_set_add(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        item: Value,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        if !Self::admit_collection_operation(
+            work,
+            PendingCollectionOperationKey::Set {
+                address: address.clone(),
+                item: item.clone(),
+            },
+            PendingCollectionOperation::SetAdd,
+        )? {
+            return Ok(());
+        }
+        work.consume(1)?;
+        self.record_collection_authority_undo(address, work);
+        let current_revision = match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Set(authority)) => authority.revision,
+            _ => {
+                return Err(Error::InvalidPlan(format!(
+                    "SET authority {} disappeared before add",
+                    address.authority.0
+                )));
+            }
+        };
+        let revision = self.next_collection_revision(current_revision, work)?;
+        let changed = {
+            let Some(CollectionAuthorityState::Set(authority)) =
+                self.collection_authorities.get_mut(address)
+            else {
+                unreachable!("validated SET authority changed kind")
+            };
+            let changed = authority.items.insert(item.clone());
+            if changed {
+                authority.revision = revision;
+                authority.touched |= work.emit;
+            }
+            changed
+        };
+        if changed && work.emit {
+            work.authority_deltas.push(AuthorityDelta::SetAdd {
+                address: address.clone(),
+                revision,
+                item: item.clone(),
+            });
+            self.invalidate_set_item(address, &item, work);
+        }
+        Ok(())
+    }
+
+    fn submit_set_remove(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        item: Value,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        if !Self::admit_collection_operation(
+            work,
+            PendingCollectionOperationKey::Set {
+                address: address.clone(),
+                item: item.clone(),
+            },
+            PendingCollectionOperation::SetRemove,
+        )? {
+            return Ok(());
+        }
+        work.consume(1)?;
+        self.record_collection_authority_undo(address, work);
+        let current_revision = match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Set(authority)) => authority.revision,
+            _ => {
+                return Err(Error::InvalidPlan(format!(
+                    "SET authority {} disappeared before removal",
+                    address.authority.0
+                )));
+            }
+        };
+        let revision = self.next_collection_revision(current_revision, work)?;
+        let changed = {
+            let Some(CollectionAuthorityState::Set(authority)) =
+                self.collection_authorities.get_mut(address)
+            else {
+                unreachable!("validated SET authority changed kind")
+            };
+            let changed = authority.items.remove(&item);
+            if changed {
+                authority.revision = revision;
+                authority.touched |= work.emit;
+            }
+            changed
+        };
+        if changed && work.emit {
+            work.authority_deltas.push(AuthorityDelta::SetRemove {
+                address: address.clone(),
+                revision,
+                item: item.clone(),
+            });
+            self.invalidate_set_item(address, &item, work);
+        }
+        Ok(())
+    }
+
+    fn register_map_key_dependency(
+        &mut self,
+        consumer: Option<Consumer>,
+        address: &CollectionAuthorityAddress,
+        key: &Value,
+    ) {
+        if let Some(consumer) = consumer {
+            self.dynamic_dependencies.insert(
+                consumer,
+                DynamicDependency::MapKey(address.clone(), key.clone()),
+            );
+        }
+    }
+
+    fn register_set_item_dependency(
+        &mut self,
+        consumer: Option<Consumer>,
+        address: &CollectionAuthorityAddress,
+        item: &Value,
+    ) {
+        if let Some(consumer) = consumer {
+            self.dynamic_dependencies.insert(
+                consumer,
+                DynamicDependency::SetItem(address.clone(), item.clone()),
+            );
         }
     }
 
@@ -19414,6 +20436,352 @@ impl MachineInstance {
             EvalValue::Absent => Ok(PrivatePresence::Absent),
             value => self.materialize_eval(value).map(PrivatePresence::Present),
         }
+    }
+
+    fn resolve_boundary_value(&self, value: Value) -> Result<Value, Error> {
+        fn resolve(
+            session: &MachineInstance,
+            value: Value,
+            active: &mut BTreeSet<CollectionAuthorityAddress>,
+            depth: usize,
+        ) -> Result<Value, Error> {
+            if depth > 256 {
+                return Err(Error::Evaluation(
+                    "public value exceeds the bounded nested-authority depth".to_owned(),
+                ));
+            }
+            Ok(match value {
+                Value::CollectionAuthority { address } => {
+                    if !active.insert(address.clone()) {
+                        return Err(Error::InvalidPlan(format!(
+                            "collection authority {} forms a nested authority cycle",
+                            address.authority.0
+                        )));
+                    }
+                    let snapshot = session.collection_authority_snapshot(&address)?;
+                    let resolved = resolve(session, snapshot, active, depth + 1)?;
+                    active.remove(&address);
+                    resolved
+                }
+                Value::HostBound { visible, .. } => resolve(session, *visible, active, depth + 1)?,
+                Value::List(values) => Value::List(
+                    values
+                        .into_iter()
+                        .map(|value| resolve(session, value, active, depth + 1))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                Value::Record(fields) => Value::Record(
+                    fields
+                        .into_iter()
+                        .map(|(name, value)| {
+                            Ok((name, resolve(session, value, active, depth + 1)?))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                ),
+                Value::Tag { tag, fields } => Value::Tag {
+                    tag,
+                    fields: fields
+                        .into_iter()
+                        .map(|(name, value)| {
+                            Ok((name, resolve(session, value, active, depth + 1)?))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                },
+                Value::MappedRow { id, fields } => Value::MappedRow {
+                    id,
+                    fields: fields
+                        .into_iter()
+                        .map(|(name, value)| {
+                            Ok((name, resolve(session, value, active, depth + 1)?))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                },
+                Value::Row { id, fields } => Value::Row {
+                    id,
+                    fields: fields
+                        .into_iter()
+                        .map(|(field, value)| {
+                            Ok((field, resolve(session, value, active, depth + 1)?))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                },
+                Value::Map(entries) => Value::Map(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| {
+                            Ok((
+                                resolve(session, key, active, depth + 1)?,
+                                resolve(session, value, active, depth + 1)?,
+                            ))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                ),
+                Value::Set(items) => Value::Set(
+                    items
+                        .into_iter()
+                        .map(|item| resolve(session, item, active, depth + 1))
+                        .collect::<Result<BTreeSet<_>, _>>()?,
+                ),
+                value @ (Value::Number(_) | Value::Text(_) | Value::Bytes(_)) => value,
+            })
+        }
+
+        resolve(self, value, &mut BTreeSet::new(), 0)
+    }
+
+    fn resolve_observed_value(
+        &mut self,
+        value: Value,
+        consumer: Option<Consumer>,
+    ) -> Result<Value, Error> {
+        if let Some(consumer) = consumer {
+            fn visit(
+                session: &MachineInstance,
+                value: &Value,
+                active: &mut BTreeSet<CollectionAuthorityAddress>,
+                addresses: &mut BTreeSet<CollectionAuthorityAddress>,
+                depth: usize,
+            ) -> Result<(), Error> {
+                if depth > 256 {
+                    return Err(Error::Evaluation(
+                        "observed value exceeds the bounded nested-authority depth".to_owned(),
+                    ));
+                }
+                match value {
+                    Value::CollectionAuthority { address } => {
+                        if !active.insert(address.clone()) {
+                            return Err(Error::InvalidPlan(format!(
+                                "collection authority {} forms a nested authority cycle",
+                                address.authority.0
+                            )));
+                        }
+                        addresses.insert(address.clone());
+                        match session.collection_authorities.get(address) {
+                            Some(CollectionAuthorityState::Map(authority)) => {
+                                for (key, value) in &authority.entries {
+                                    visit(session, key, active, addresses, depth + 1)?;
+                                    visit(session, value, active, addresses, depth + 1)?;
+                                }
+                            }
+                            Some(CollectionAuthorityState::Set(authority)) => {
+                                for item in &authority.items {
+                                    visit(session, item, active, addresses, depth + 1)?;
+                                }
+                            }
+                            None => {
+                                return Err(Error::InvalidPlan(format!(
+                                    "collection authority {} has no live state for its dynamic scope",
+                                    address.authority.0
+                                )));
+                            }
+                        }
+                        active.remove(address);
+                    }
+                    Value::List(values) => {
+                        for value in values {
+                            visit(session, value, active, addresses, depth + 1)?;
+                        }
+                    }
+                    Value::Record(fields)
+                    | Value::MappedRow { fields, .. }
+                    | Value::Tag { fields, .. } => {
+                        for value in fields.values() {
+                            visit(session, value, active, addresses, depth + 1)?;
+                        }
+                    }
+                    Value::Row { fields, .. } => {
+                        for value in fields.values() {
+                            visit(session, value, active, addresses, depth + 1)?;
+                        }
+                    }
+                    Value::HostBound { visible, .. } => {
+                        visit(session, visible, active, addresses, depth + 1)?;
+                    }
+                    Value::Map(entries) => {
+                        for (key, value) in entries {
+                            visit(session, key, active, addresses, depth + 1)?;
+                            visit(session, value, active, addresses, depth + 1)?;
+                        }
+                    }
+                    Value::Set(items) => {
+                        for item in items {
+                            visit(session, item, active, addresses, depth + 1)?;
+                        }
+                    }
+                    Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+                }
+                Ok(())
+            }
+
+            let mut addresses = BTreeSet::new();
+            visit(self, &value, &mut BTreeSet::new(), &mut addresses, 0)?;
+            for address in addresses {
+                self.dynamic_dependencies
+                    .insert(consumer, DynamicDependency::Collection(address));
+            }
+        }
+        self.resolve_boundary_value(value)
+    }
+
+    fn take_report_deltas(
+        &self,
+        work: &mut Work,
+    ) -> Result<(Vec<Delta>, Vec<AuthorityDelta>), Error> {
+        let deltas = std::mem::take(&mut work.deltas)
+            .into_iter()
+            .map(|delta| {
+                Ok(match delta {
+                    Delta::SetValue { target, value } => Delta::SetValue {
+                        target,
+                        value: self.resolve_boundary_value(value)?,
+                    },
+                    Delta::SetDistributedImport { import_id, value } => {
+                        Delta::SetDistributedImport {
+                            import_id,
+                            value: self.resolve_boundary_value(value)?,
+                        }
+                    }
+                    Delta::InsertRow { row } => Delta::InsertRow {
+                        row: RowSnapshot {
+                            id: row.id,
+                            provenance: row.provenance,
+                            fields: row
+                                .fields
+                                .into_iter()
+                                .map(|(field, value)| {
+                                    Ok((field, self.resolve_boundary_value(value)?))
+                                })
+                                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                        },
+                    },
+                    delta @ (Delta::ClearValue { .. }
+                    | Delta::ClearDistributedImport { .. }
+                    | Delta::RemoveRow { .. }
+                    | Delta::BindSource { .. }
+                    | Delta::UnbindSource { .. }) => delta,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let authority_deltas = std::mem::take(&mut work.authority_deltas)
+            .into_iter()
+            .map(|delta| {
+                Ok(match delta {
+                    AuthorityDelta::SetRoot { state, value } => AuthorityDelta::SetRoot {
+                        state,
+                        value: self.resolve_boundary_value(value)?,
+                    },
+                    AuthorityDelta::SetRowField {
+                        row,
+                        owner_ancestors,
+                        materialization_origin,
+                        field,
+                        value,
+                    } => AuthorityDelta::SetRowField {
+                        row,
+                        owner_ancestors,
+                        materialization_origin,
+                        field,
+                        value: self.resolve_boundary_value(value)?,
+                    },
+                    AuthorityDelta::ReplaceList { list_id, authority } => {
+                        AuthorityDelta::ReplaceList {
+                            list_id,
+                            authority: ListAuthority {
+                                touched: authority.touched,
+                                revision: authority.revision,
+                                next_key: authority.next_key,
+                                next_order_token: authority.next_order_token,
+                                rows: authority
+                                    .rows
+                                    .into_iter()
+                                    .map(|row| {
+                                        Ok(RowAuthority {
+                                            id: row.id,
+                                            source_order_token: row.source_order_token,
+                                            owner_ancestors: row.owner_ancestors,
+                                            materialization_origin: row.materialization_origin,
+                                            fields: row
+                                                .fields
+                                                .into_iter()
+                                                .map(|(field, value)| {
+                                                    Ok((field, self.resolve_boundary_value(value)?))
+                                                })
+                                                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                                            touched_fields: row.touched_fields,
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, Error>>()?,
+                            },
+                        }
+                    }
+                    AuthorityDelta::InsertRow {
+                        row,
+                        index,
+                        next_key,
+                    } => AuthorityDelta::InsertRow {
+                        row: RowAuthority {
+                            id: row.id,
+                            source_order_token: row.source_order_token,
+                            owner_ancestors: row.owner_ancestors,
+                            materialization_origin: row.materialization_origin,
+                            fields: row
+                                .fields
+                                .into_iter()
+                                .map(|(field, value)| {
+                                    Ok((field, self.resolve_boundary_value(value)?))
+                                })
+                                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+                            touched_fields: row.touched_fields,
+                        },
+                        index,
+                        next_key,
+                    },
+                    AuthorityDelta::MapUpsert {
+                        address,
+                        revision,
+                        key,
+                        value,
+                    } => AuthorityDelta::MapUpsert {
+                        address,
+                        revision,
+                        key: self.resolve_boundary_value(key)?,
+                        value: self.resolve_boundary_value(value)?,
+                    },
+                    AuthorityDelta::MapRemove {
+                        address,
+                        revision,
+                        key,
+                    } => AuthorityDelta::MapRemove {
+                        address,
+                        revision,
+                        key: self.resolve_boundary_value(key)?,
+                    },
+                    AuthorityDelta::SetAdd {
+                        address,
+                        revision,
+                        item,
+                    } => AuthorityDelta::SetAdd {
+                        address,
+                        revision,
+                        item: self.resolve_boundary_value(item)?,
+                    },
+                    AuthorityDelta::SetRemove {
+                        address,
+                        revision,
+                        item,
+                    } => AuthorityDelta::SetRemove {
+                        address,
+                        revision,
+                        item: self.resolve_boundary_value(item)?,
+                    },
+                    delta @ AuthorityDelta::RemoveRow { .. } => delta,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let deltas = report_deltas(deltas);
+        let authority_deltas = report_authority_deltas(authority_deltas);
+        record_delta_metrics(&mut work.metrics, &deltas, &authority_deltas);
+        Ok((deltas, authority_deltas))
     }
 
     fn materialize_eval(&mut self, value: EvalValue) -> Result<Value, Error> {
@@ -20781,6 +22149,7 @@ impl MachineInstance {
                                     stack.push_task(ExpressionTask::BuiltinAfterOperands {
                                         expression,
                                         value_base,
+                                        context,
                                     })?;
                                     schedule_builtin_operands(
                                         &mut stack, *function, *input, args, context,
@@ -21382,13 +22751,14 @@ impl MachineInstance {
                             stack.push_task(ExpressionTask::DerivedValueCompareAfterRight {
                                 op,
                                 left,
+                                context,
                             })?;
                             stack.push_task(ExpressionTask::ValueRef {
                                 value_ref: ExpressionValueRef::Derived(right),
                                 context,
                             })?;
                         }
-                        ExpressionTask::DerivedValueCompareAfterRight { op, left } => {
+                        ExpressionTask::DerivedValueCompareAfterRight { op, left, context } => {
                             let right = stack.pop_value()?;
                             let EvalValue::Value(left) = left else {
                                 return Err(Error::Evaluation(
@@ -21400,6 +22770,8 @@ impl MachineInstance {
                                     "right comparison operand is not a scalar value".to_owned(),
                                 ));
                             };
+                            let left = self.resolve_observed_value(left, context.consumer)?;
+                            let right = self.resolve_observed_value(right, context.consumer)?;
                             let value = compare_update_values(&left, op, &right)?;
                             stack.push_value(EvalValue::Value(Value::truth(value)))?;
                         }
@@ -25230,6 +26602,7 @@ impl MachineInstance {
                         ExpressionTask::BuiltinAfterOperands {
                             expression,
                             value_base,
+                            context,
                         } => {
                             let node = plan
                                 .row_expressions
@@ -25295,7 +26668,9 @@ impl MachineInstance {
                                     function.function_name()
                                 )));
                             }
-                            let value = self.eval_builtin_values(function, input, args, work)?;
+                            let value = self.eval_builtin_values(
+                                expression, function, input, args, context, work,
+                            )?;
                             stack.push_value(value)?;
                         }
                         ExpressionTask::BuiltinBoolAfterLeft {
@@ -26276,7 +27651,18 @@ impl MachineInstance {
             PlanRowExpressionNode::NumberInfix { op, .. } => {
                 let left = next()?;
                 let right = next()?;
-                EvalValue::Value(eval_number_infix(*op, &left, &right)?)
+                if matches!(op, PlanInfixOp::Equal | PlanInfixOp::NotEqual)
+                    && (eval_contains_collection_authority(&left)
+                        || eval_contains_collection_authority(&right))
+                {
+                    let left = self.materialize_eval(left)?;
+                    let right = self.materialize_eval(right)?;
+                    let left = self.resolve_observed_value(left, context.consumer)?;
+                    let right = self.resolve_observed_value(right, context.consumer)?;
+                    EvalValue::Value(Value::truth(compare_update_values(&left, *op, &right)?))
+                } else {
+                    EvalValue::Value(eval_number_infix(*op, &left, &right)?)
+                }
             }
             PlanRowExpressionNode::TextConcat { parts } => {
                 let mut text = String::new();
@@ -26311,10 +27697,10 @@ impl MachineInstance {
                 }
                 EvalValue::List(values)
             }
-            PlanRowExpressionNode::MapLiteral { entries } => {
-                work.consume(entries.len().try_into().unwrap_or(u64::MAX))?;
-                let mut values = BTreeMap::new();
-                for _ in entries {
+            PlanRowExpressionNode::MapLiteral { authority, entries } => {
+                let address = self.collection_authority_address(*authority, context)?;
+                self.ensure_map_authority(&address, work)?;
+                for (entry, _) in entries.iter().enumerate() {
                     let key = self.materialize_eval(next()?)?;
                     let data_key = runtime_value_to_data(&key)?;
                     if !data_key.is_key_safe() {
@@ -26323,18 +27709,29 @@ impl MachineInstance {
                         ));
                     }
                     let value = self.materialize_eval(next()?)?;
-                    if values.insert(key, value).is_some() {
-                        return Err(Error::Evaluation(
-                            "MAP literal contains a duplicate key".to_owned(),
-                        ));
+                    let site = CollectionProducerSite::MapLiteral {
+                        address: address.clone(),
+                        entry: u32::try_from(entry).map_err(|_| {
+                            Error::InvalidPlan(
+                                "MAP literal entry count exceeds authority identity space"
+                                    .to_owned(),
+                            )
+                        })?,
+                    };
+                    let candidate = CollectionProducerCandidate::MapUpsert {
+                        key: key.clone(),
+                        value: value.clone(),
+                    };
+                    if self.update_collection_producer(site, candidate, work)? {
+                        self.submit_map_upsert(&address, key, value, work)?;
                     }
                 }
-                EvalValue::Value(Value::Map(values))
+                EvalValue::Value(self.collection_authority_handle(&address)?)
             }
-            PlanRowExpressionNode::SetLiteral { items } => {
-                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                let mut values = BTreeSet::new();
-                for _ in items {
+            PlanRowExpressionNode::SetLiteral { authority, items } => {
+                let address = self.collection_authority_address(*authority, context)?;
+                self.ensure_set_authority(&address, work)?;
+                for (item_index, _) in items.iter().enumerate() {
                     let item = self.materialize_eval(next()?)?;
                     let data_item = runtime_value_to_data(&item)?;
                     if !data_item.is_key_safe() {
@@ -26342,13 +27739,21 @@ impl MachineInstance {
                             "SET literal item is not key-safe".to_owned(),
                         ));
                     }
-                    if !values.insert(item) {
-                        return Err(Error::Evaluation(
-                            "SET literal contains a duplicate item".to_owned(),
-                        ));
+                    let site = CollectionProducerSite::SetLiteral {
+                        address: address.clone(),
+                        item: u32::try_from(item_index).map_err(|_| {
+                            Error::InvalidPlan(
+                                "SET literal item count exceeds authority identity space"
+                                    .to_owned(),
+                            )
+                        })?,
+                    };
+                    let candidate = CollectionProducerCandidate::SetAdd { item: item.clone() };
+                    if self.update_collection_producer(site, candidate, work)? {
+                        self.submit_set_add(&address, item, work)?;
                     }
                 }
-                EvalValue::Value(Value::Set(values))
+                EvalValue::Value(self.collection_authority_handle(&address)?)
             }
             PlanRowExpressionNode::ListSum { .. } => {
                 let items = eval_to_list(next()?)?;
@@ -26596,9 +28001,11 @@ impl MachineInstance {
 
     fn eval_builtin_values(
         &mut self,
+        expression: PlanRowExpressionId,
         function: PlanRowBuiltin,
         input: Option<EvalValue>,
         mut args: EvaluatedBuiltinArgs,
+        context: ExpressionContext<'_>,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
         let require_input = |input: Option<EvalValue>| {
@@ -26896,9 +28303,11 @@ impl MachineInstance {
                 value
             }
             PlanRowBuiltin::MapUpsert => {
-                let Value::Map(mut entries) = self.materialize_eval(require_input(input)?)? else {
+                let EvalValue::Value(Value::CollectionAuthority { address }) =
+                    require_input(input)?
+                else {
                     return Err(Error::Evaluation(
-                        "Map/upsert input is not a MAP".to_owned(),
+                        "Map/upsert requires a live MAP authority".to_owned(),
                     ));
                 };
                 let entry = self
@@ -26925,14 +28334,25 @@ impl MachineInstance {
                         "Map/upsert key is not key-safe".to_owned(),
                     ));
                 }
-                work.consume(1)?;
-                entries.insert(key, value);
-                EvalValue::Value(Value::Map(entries))
+                let site = CollectionProducerSite::Builtin {
+                    address: address.clone(),
+                    expression,
+                };
+                let candidate = CollectionProducerCandidate::MapUpsert {
+                    key: key.clone(),
+                    value: value.clone(),
+                };
+                if self.update_collection_producer(site, candidate, work)? {
+                    self.submit_map_upsert(&address, key, value, work)?;
+                }
+                EvalValue::Value(self.collection_authority_handle(&address)?)
             }
             PlanRowBuiltin::MapRemove => {
-                let Value::Map(mut entries) = self.materialize_eval(require_input(input)?)? else {
+                let EvalValue::Value(Value::CollectionAuthority { address }) =
+                    require_input(input)?
+                else {
                     return Err(Error::Evaluation(
-                        "Map/remove input is not a MAP".to_owned(),
+                        "Map/remove requires a live MAP authority".to_owned(),
                     ));
                 };
                 let key =
@@ -26942,13 +28362,23 @@ impl MachineInstance {
                         "Map/remove key is not key-safe".to_owned(),
                     ));
                 }
-                work.consume(1)?;
-                entries.remove(&key);
-                EvalValue::Value(Value::Map(entries))
+                let site = CollectionProducerSite::Builtin {
+                    address: address.clone(),
+                    expression,
+                };
+                let candidate = CollectionProducerCandidate::MapRemove { key: key.clone() };
+                if self.update_collection_producer(site, candidate, work)? {
+                    self.submit_map_remove(&address, key, work)?;
+                }
+                EvalValue::Value(self.collection_authority_handle(&address)?)
             }
             PlanRowBuiltin::MapGet => {
-                let Value::Map(entries) = self.materialize_eval(require_input(input)?)? else {
-                    return Err(Error::Evaluation("Map/get input is not a MAP".to_owned()));
+                let EvalValue::Value(Value::CollectionAuthority { address }) =
+                    require_input(input)?
+                else {
+                    return Err(Error::Evaluation(
+                        "Map/get requires a live MAP authority".to_owned(),
+                    ));
                 };
                 let key =
                     self.materialize_eval(take_required_builtin_arg(&mut args, "key", function)?)?;
@@ -26956,8 +28386,18 @@ impl MachineInstance {
                     return Err(Error::Evaluation("Map/get key is not key-safe".to_owned()));
                 }
                 work.consume(1)?;
+                self.register_map_key_dependency(context.consumer, &address, &key);
+                let Some(CollectionAuthorityState::Map(authority)) =
+                    self.collection_authorities.get(&address)
+                else {
+                    return Err(Error::InvalidPlan(format!(
+                        "Map/get authority {} is missing or has the wrong kind",
+                        address.authority.0
+                    )));
+                };
                 EvalValue::Value(
-                    entries
+                    authority
+                        .entries
                         .get(&key)
                         .cloned()
                         .map(found_value)
@@ -26965,22 +28405,34 @@ impl MachineInstance {
                 )
             }
             PlanRowBuiltin::SetAdd => {
-                let Value::Set(mut items) = self.materialize_eval(require_input(input)?)? else {
-                    return Err(Error::Evaluation("Set/add input is not a SET".to_owned()));
+                let EvalValue::Value(Value::CollectionAuthority { address }) =
+                    require_input(input)?
+                else {
+                    return Err(Error::Evaluation(
+                        "Set/add requires a live SET authority".to_owned(),
+                    ));
                 };
                 let item =
                     self.materialize_eval(take_required_builtin_arg(&mut args, "item", function)?)?;
                 if !runtime_value_to_data(&item)?.is_key_safe() {
                     return Err(Error::Evaluation("Set/add item is not key-safe".to_owned()));
                 }
-                work.consume(1)?;
-                items.insert(item);
-                EvalValue::Value(Value::Set(items))
+                let site = CollectionProducerSite::Builtin {
+                    address: address.clone(),
+                    expression,
+                };
+                let candidate = CollectionProducerCandidate::SetAdd { item: item.clone() };
+                if self.update_collection_producer(site, candidate, work)? {
+                    self.submit_set_add(&address, item, work)?;
+                }
+                EvalValue::Value(self.collection_authority_handle(&address)?)
             }
             PlanRowBuiltin::SetRemove => {
-                let Value::Set(mut items) = self.materialize_eval(require_input(input)?)? else {
+                let EvalValue::Value(Value::CollectionAuthority { address }) =
+                    require_input(input)?
+                else {
                     return Err(Error::Evaluation(
-                        "Set/remove input is not a SET".to_owned(),
+                        "Set/remove requires a live SET authority".to_owned(),
                     ));
                 };
                 let item =
@@ -26990,14 +28442,22 @@ impl MachineInstance {
                         "Set/remove item is not key-safe".to_owned(),
                     ));
                 }
-                work.consume(1)?;
-                items.remove(&item);
-                EvalValue::Value(Value::Set(items))
+                let site = CollectionProducerSite::Builtin {
+                    address: address.clone(),
+                    expression,
+                };
+                let candidate = CollectionProducerCandidate::SetRemove { item: item.clone() };
+                if self.update_collection_producer(site, candidate, work)? {
+                    self.submit_set_remove(&address, item, work)?;
+                }
+                EvalValue::Value(self.collection_authority_handle(&address)?)
             }
             PlanRowBuiltin::SetContains => {
-                let Value::Set(items) = self.materialize_eval(require_input(input)?)? else {
+                let EvalValue::Value(Value::CollectionAuthority { address }) =
+                    require_input(input)?
+                else {
                     return Err(Error::Evaluation(
-                        "Set/contains input is not a SET".to_owned(),
+                        "Set/contains requires a live SET authority".to_owned(),
                     ));
                 };
                 let item =
@@ -27008,7 +28468,16 @@ impl MachineInstance {
                     ));
                 }
                 work.consume(1)?;
-                EvalValue::Value(Value::truth(items.contains(&item)))
+                self.register_set_item_dependency(context.consumer, &address, &item);
+                let Some(CollectionAuthorityState::Set(authority)) =
+                    self.collection_authorities.get(&address)
+                else {
+                    return Err(Error::InvalidPlan(format!(
+                        "Set/contains authority {} is missing or has the wrong kind",
+                        address.authority.0
+                    )));
+                };
+                EvalValue::Value(Value::truth(authority.items.contains(&item)))
             }
             PlanRowBuiltin::TextJoin => {
                 let items = eval_to_list(require_input(input)?)?;
@@ -28068,6 +29537,9 @@ pub(crate) fn normalize_host_output_value(value: Value) -> Result<Value, Error> 
         Value::HostBound { .. } => Err(Error::Evaluation(
             "host outputs cannot expose process-local host bindings".to_owned(),
         )),
+        Value::CollectionAuthority { .. } => Err(Error::Evaluation(
+            "host outputs cannot expose a live collection authority".to_owned(),
+        )),
         Value::Number(_) | Value::Text(_) | Value::Bytes(_) => Ok(value),
     }
 }
@@ -28117,6 +29589,9 @@ fn normalize_effect_intent_value(value: Value) -> Result<Value, Error> {
         | value @ Value::Number(_)
         | value @ Value::Text(_)
         | value @ Value::Bytes(_) => Ok(value),
+        Value::CollectionAuthority { .. } => Err(Error::Evaluation(
+            "effect intents cannot expose a live collection authority".to_owned(),
+        )),
     }
 }
 
@@ -28641,7 +30116,8 @@ fn value_to_text(value: &Value) -> Result<String, Error> {
         | Value::Set(_)
         | Value::Tag { .. }
         | Value::MappedRow { .. }
-        | Value::Row { .. } => Err(Error::Evaluation(
+        | Value::Row { .. }
+        | Value::CollectionAuthority { .. } => Err(Error::Evaluation(
             "list, record, or structured tag cannot be converted to text".to_owned(),
         )),
         Value::HostBound { .. } => Err(Error::Evaluation(
@@ -29416,6 +30892,28 @@ fn report_authority_deltas(deltas: Vec<AuthorityDelta>) -> Vec<AuthorityDelta> {
                 next_key,
             },
             delta @ AuthorityDelta::RemoveRow { .. } => delta,
+            AuthorityDelta::MapUpsert {
+                address,
+                revision,
+                key,
+                value,
+            } => AuthorityDelta::MapUpsert {
+                address,
+                revision,
+                key: report_boundary_value(key),
+                value: report_boundary_value(value),
+            },
+            delta @ AuthorityDelta::MapRemove { .. } => delta,
+            AuthorityDelta::SetAdd {
+                address,
+                revision,
+                item,
+            } => AuthorityDelta::SetAdd {
+                address,
+                revision,
+                item: report_boundary_value(item),
+            },
+            delta @ AuthorityDelta::SetRemove { .. } => delta,
         })
         .collect()
 }
@@ -29582,6 +31080,15 @@ fn authority_delta_logical_bytes(delta: &AuthorityDelta) -> u64 {
             .saturating_add(8)
             .saturating_add(8),
         AuthorityDelta::RemoveRow { .. } => 24 + 8,
+        AuthorityDelta::MapUpsert { key, value, .. } => 24_u64
+            .saturating_add(value_tree_stats(key).logical_payload_bytes)
+            .saturating_add(value_tree_stats(value).logical_payload_bytes),
+        AuthorityDelta::MapRemove { key, .. } => {
+            24_u64.saturating_add(value_tree_stats(key).logical_payload_bytes)
+        }
+        AuthorityDelta::SetAdd { item, .. } | AuthorityDelta::SetRemove { item, .. } => {
+            24_u64.saturating_add(value_tree_stats(item).logical_payload_bytes)
+        }
     };
     1_u64.saturating_add(payload)
 }
@@ -29612,6 +31119,7 @@ fn record_delta_metrics(
 ) {
 }
 
+#[cfg(all(test, feature = "phase0-instrumentation"))]
 fn take_report_deltas(work: &mut Work) -> (Vec<Delta>, Vec<AuthorityDelta>) {
     let deltas = report_deltas(std::mem::take(&mut work.deltas));
     let authority_deltas = report_authority_deltas(std::mem::take(&mut work.authority_deltas));

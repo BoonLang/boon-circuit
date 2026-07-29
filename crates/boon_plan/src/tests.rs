@@ -333,7 +333,13 @@ fn plan_row_builtin_signatures_are_complete_and_queryable() {
             builtin.fixed_result_type().is_some()
                 || matches!(
                     builtin,
-                    PlanRowBuiltin::ListGet | PlanRowBuiltin::ListLatest | PlanRowBuiltin::ListTake
+                    PlanRowBuiltin::ListGet
+                        | PlanRowBuiltin::ListLatest
+                        | PlanRowBuiltin::ListTake
+                        | PlanRowBuiltin::MapUpsert
+                        | PlanRowBuiltin::MapRemove
+                        | PlanRowBuiltin::SetAdd
+                        | PlanRowBuiltin::SetRemove
                 ),
             "{} lacks fixed result metadata",
             builtin

@@ -3970,6 +3970,9 @@ fn machine_value_to_eval(value: Value) -> EvalValue {
             provenance: BTreeMap::new(),
         },
         Value::HostBound { visible, .. } => machine_value_to_eval(*visible),
+        Value::CollectionAuthority { .. } => {
+            panic!("live collection authority crossed the executor document boundary")
+        }
         Value::Map(entries) => EvalValue::Map(
             entries
                 .into_iter()

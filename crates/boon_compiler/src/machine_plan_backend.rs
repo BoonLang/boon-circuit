@@ -247,13 +247,13 @@ fn visit_row_node_children_mut(
                 visitor(&mut field.value);
             }
         }
-        PlanRowExpressionNode::MapLiteral { entries } => {
+        PlanRowExpressionNode::MapLiteral { entries, .. } => {
             for entry in entries {
                 visitor(&mut entry.key);
                 visitor(&mut entry.value);
             }
         }
-        PlanRowExpressionNode::SetLiteral { items } => {
+        PlanRowExpressionNode::SetLiteral { items, .. } => {
             for item in items {
                 visitor(item);
             }
@@ -10902,14 +10902,20 @@ impl<'a> ExecutableRowLowerer<'a> {
                         value: self.lower_scoped(value, owner)?,
                     });
                 }
-                self.intern(PlanRowExpressionNode::MapLiteral { entries: lowered })?
+                self.intern(PlanRowExpressionNode::MapLiteral {
+                    authority: boon_plan::PlanCollectionAuthorityId(root.as_usize()),
+                    entries: lowered,
+                })?
             }
             ir::ExecutableExpressionKind::Set { items } => {
                 let items = items
                     .into_iter()
                     .map(|item| self.lower_scoped(item, owner))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.intern(PlanRowExpressionNode::SetLiteral { items })?
+                self.intern(PlanRowExpressionNode::SetLiteral {
+                    authority: boon_plan::PlanCollectionAuthorityId(root.as_usize()),
+                    items,
+                })?
             }
             ir::ExecutableExpressionKind::Bytes { .. } => {
                 self.bytes_constant(executable_static_bytes(self.program, root).ok_or_else(

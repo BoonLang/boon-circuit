@@ -717,7 +717,7 @@ pub(crate) fn encode_row_component(row: &StoredRow) -> Result<EncodedComponent, 
     encoder.map(row.fields.len() as u64).map_err(encode_error)?;
     for (field, value) in &row.fields {
         encode_digest(&mut encoder, field.as_bytes())?;
-        encode_component_value(&mut encoder, value, 0, &mut blobs, &mut references)?;
+        encode_component_shell(&mut encoder, value, 0, &mut blobs, &mut references)?;
     }
     encoder
         .array(row.touched_fields.len() as u64)
@@ -750,7 +750,7 @@ pub(crate) fn decode_row_component(
     let mut references = BTreeMap::new();
     for _ in 0..field_count {
         let field = MemoryLeafId(decode_digest(&mut decoder)?);
-        let value = decode_component_value(&mut decoder, limits, 0, Some(blobs), &mut references)?;
+        let value = decode_component_shell(&mut decoder, limits, 0, Some(blobs), &mut references)?;
         if fields.insert(field, value).is_some() {
             return Err(CodecError::new("stored row repeats a field ID"));
         }
@@ -791,7 +791,7 @@ pub(crate) fn row_component_blob_references(
     let mut references = BTreeMap::new();
     for _ in 0..field_count {
         decode_digest(&mut decoder)?;
-        decode_component_value(&mut decoder, limits, 0, None, &mut references)?;
+        decode_component_shell(&mut decoder, limits, 0, None, &mut references)?;
     }
     let touched_count = collection_len(&mut decoder, limits, "touched row fields", true)?;
     for _ in 0..touched_count {
@@ -1051,7 +1051,7 @@ fn encode_durable_change(
             encode_durable_owner(encoder, owner)?;
             encode_optional_durable_owner(encoder, materialization_origin.as_ref())?;
             encode_digest(encoder, field_id.as_bytes())?;
-            encode_value(encoder, value, 0)?;
+            encode_stored_value_shell(encoder, value, 0)?;
         }
         DurableChange::InsertRow {
             memory_id,
@@ -1232,7 +1232,7 @@ fn decode_durable_change(
             owner: decode_durable_owner(decoder, limits)?,
             materialization_origin: decode_optional_durable_owner(decoder, limits)?,
             field_id: MemoryLeafId(decode_digest(decoder)?),
-            value: decode_value(decoder, limits, 0)?,
+            value: decode_stored_value_shell(decoder, limits, 0)?,
         }),
         (4, 7) => Ok(DurableChange::InsertRow {
             memory_id: MemoryId(decode_digest(decoder)?),
@@ -1865,7 +1865,7 @@ fn encode_row(encoder: &mut CborEncoder<'_>, row: &StoredRow) -> Result<(), Code
     encoder.map(row.fields.len() as u64).map_err(encode_error)?;
     for (field, value) in &row.fields {
         encode_digest(encoder, field.as_bytes())?;
-        encode_value(encoder, value, 0)?;
+        encode_stored_value_shell(encoder, value, 0)?;
     }
     encoder
         .array(row.touched_fields.len() as u64)
@@ -1887,7 +1887,7 @@ fn decode_row(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<StoredR
     let mut fields = BTreeMap::new();
     for _ in 0..field_count {
         let field = MemoryLeafId(decode_digest(decoder)?);
-        let value = decode_value(decoder, limits, 0)?;
+        let value = decode_stored_value_shell(decoder, limits, 0)?;
         if fields.insert(field, value).is_some() {
             return Err(CodecError::new("stored row repeats a field ID"));
         }

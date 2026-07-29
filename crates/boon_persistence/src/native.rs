@@ -2739,6 +2739,9 @@ fn delete_scalar(
 
 fn validate_row(memory: MemoryId, row: &StoredRow, sparse: bool) -> Result<(), StoreError> {
     super::validate_row_owner(memory, row)?;
+    for value in row.fields.values() {
+        super::validate_stored_value_shell(value, 0)?;
+    }
     if !row
         .touched_fields
         .iter()
@@ -3531,7 +3534,7 @@ mod tests {
                 }],
             },
             materialization_origin: None,
-            fields: BTreeMap::from([(field, StoredValue::Text(text.to_owned()))]),
+            fields: BTreeMap::from([(field, StoredValueShell::Text(text.to_owned()))]),
             touched_fields: BTreeSet::from([field]),
         }
     }
@@ -3881,7 +3884,7 @@ mod tests {
                         },
                         materialization_origin: None,
                         field_id: formula,
-                        value: StoredValue::Text("=A1".to_owned()),
+                        value: StoredValueShell::Text("=A1".to_owned()),
                     },
                     DurableChange::SetRowField {
                         memory_id: cells,
@@ -3897,7 +3900,7 @@ mod tests {
                         },
                         materialization_origin: None,
                         field_id: formula,
-                        value: StoredValue::Text("=A1+1".to_owned()),
+                        value: StoredValueShell::Text("=A1+1".to_owned()),
                     },
                 ],
                 outbox_changes: Vec::new(),
@@ -3923,7 +3926,7 @@ mod tests {
         assert_eq!(stored.rows.len(), 1);
         assert_eq!(
             stored.rows[0].fields[&formula],
-            StoredValue::Text("=A1+1".to_owned())
+            StoredValueShell::Text("=A1+1".to_owned())
         );
     }
 
@@ -4366,7 +4369,10 @@ mod tests {
                         }],
                     },
                     materialization_origin: None,
-                    fields: BTreeMap::from([(field, StoredValue::Bytes(payload.clone().into()))]),
+                    fields: BTreeMap::from([(
+                        field,
+                        StoredValueShell::Bytes(payload.clone().into()),
+                    )]),
                     touched_fields: BTreeSet::from([field]),
                 }],
             },

@@ -3483,6 +3483,12 @@ impl ListMemoryPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanCollectionOwnerRow {
+    pub scope: ScopeId,
+    pub list: ListId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectionMemoryPlan {
     pub authority: PlanCollectionAuthorityId,
     pub memory_id: MemoryId,
@@ -3492,6 +3498,7 @@ pub struct CollectionMemoryPlan {
     pub type_fingerprint: [u8; 32],
     pub owner: MemoryOwnerPath,
     pub runtime_owner: PlanOwner,
+    pub runtime_owner_rows: Vec<PlanCollectionOwnerRow>,
 }
 
 impl CollectionMemoryPlan {
@@ -3502,6 +3509,7 @@ impl CollectionMemoryPlan {
         data_type: DataTypePlan,
         owner: MemoryOwnerPath,
         runtime_owner: PlanOwner,
+        runtime_owner_rows: Vec<PlanCollectionOwnerRow>,
     ) -> Result<Self, PlanError> {
         let semantic_path = semantic_path.into();
         let data_type = data_type.canonicalized();
@@ -3520,6 +3528,19 @@ impl CollectionMemoryPlan {
                 "root collection memory owner cannot retain row ancestors",
             ));
         }
+        let lexical_owner_rows = runtime_owner
+            .ancestors
+            .iter()
+            .map(|ancestor| PlanCollectionOwnerRow {
+                scope: ancestor.scope,
+                list: ancestor.list,
+            })
+            .collect::<Vec<_>>();
+        if !runtime_owner_rows.starts_with(&lexical_owner_rows) {
+            return Err(PlanError::new(
+                "collection memory runtime row owner does not extend its lexical owner",
+            ));
+        }
         Ok(Self {
             authority,
             memory_id: MemoryId::from_identity(&owner, &semantic_path, kind)?,
@@ -3529,6 +3550,7 @@ impl CollectionMemoryPlan {
             data_type,
             owner,
             runtime_owner,
+            runtime_owner_rows,
         })
     }
 }
@@ -11234,6 +11256,14 @@ fn visit_plan_row_expressions(
             roots.push(*expression);
         }
     }
+    for slot in &plan.storage_layout.list_slots {
+        roots.extend(
+            slot.initial_rows
+                .iter()
+                .flat_map(|row| &row.fields)
+                .filter_map(|field| field.initializer.expression()),
+        );
+    }
     if let Some(document) = &plan.document {
         roots.extend(
             document
@@ -11871,6 +11901,27 @@ fn plan_owner_resolves(plan: &MachinePlan, owner: &PlanOwner) -> bool {
     })
 }
 
+fn collection_owner_rows_resolve(plan: &MachinePlan, collection: &CollectionMemoryPlan) -> bool {
+    let lexical_owner_rows = collection
+        .runtime_owner
+        .ancestors
+        .iter()
+        .map(|ancestor| PlanCollectionOwnerRow {
+            scope: ancestor.scope,
+            list: ancestor.list,
+        })
+        .collect::<Vec<_>>();
+    collection
+        .runtime_owner_rows
+        .starts_with(&lexical_owner_rows)
+        && collection.runtime_owner_rows.iter().all(|owner| {
+            plan.storage_layout
+                .list_slots
+                .iter()
+                .any(|slot| slot.list_id == owner.list && slot.scope_id == Some(owner.scope))
+        })
+}
+
 fn scalar_storage_owners_resolve(plan: &MachinePlan) -> bool {
     plan.storage_layout.scalar_slots.iter().all(|slot| {
         plan_owner_resolves(plan, &slot.owner)
@@ -12185,18 +12236,17 @@ fn collection_authorities_consistent(plan: &MachinePlan) -> bool {
         .map(|collection| (collection.authority, collection.kind))
         .collect::<BTreeMap<_, _>>();
     if planned.len() != plan.persistence.collections.len()
-        || plan
-            .persistence
-            .collections
-            .iter()
-            .any(|collection| !plan_owner_resolves(plan, &collection.runtime_owner))
+        || plan.persistence.collections.iter().any(|collection| {
+            !plan_owner_resolves(plan, &collection.runtime_owner)
+                || !collection_owner_rows_resolve(plan, collection)
+        })
     {
         return false;
     }
 
     let mut observed = BTreeMap::new();
     let mut duplicate = false;
-    if visit_plan_row_expressions(plan, &mut |_, expression| {
+    if visit_plan_row_expressions(plan, &mut |expression_id, expression| {
         let authority = match expression {
             PlanRowExpressionNode::MapLiteral { authority, .. } => {
                 Some((*authority, MemoryKind::Map))
@@ -12207,7 +12257,9 @@ fn collection_authorities_consistent(plan: &MachinePlan) -> bool {
             _ => None,
         };
         if let Some((authority, kind)) = authority
-            && observed.insert(authority, kind).is_some()
+            && observed
+                .insert(authority, (kind, expression_id))
+                .is_some_and(|previous| previous != (kind, expression_id))
         {
             duplicate = true;
         }
@@ -12217,9 +12269,11 @@ fn collection_authorities_consistent(plan: &MachinePlan) -> bool {
         return false;
     }
     !duplicate
-        && planned
-            .iter()
-            .all(|(authority, kind)| observed.get(authority) == Some(kind))
+        && planned.iter().all(|(authority, kind)| {
+            observed
+                .get(authority)
+                .is_some_and(|(observed, _)| observed == kind)
+        })
 }
 
 fn persistence_ordering_is_deterministic(persistence: &PersistencePlan) -> bool {

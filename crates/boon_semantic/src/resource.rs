@@ -213,6 +213,11 @@ pub enum SemanticInitialValueV1 {
     Unknown {
         summary: String,
     },
+    /// The exact executable expression is retained on the enclosing initial
+    /// field. This marker distinguishes a checked collection authority from
+    /// an unresolved initializer while keeping authority identity out of the
+    /// public value payload.
+    ExpressionAuthority,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1350,9 +1355,48 @@ fn semantic_initial_value(
     if let Some(path) = semantic_root_initial_path(execution, expression_id) {
         return Ok(SemanticInitialValueV1::RootInitialField { path });
     }
-    semantic_static_data(execution, expression_id)
-        .map(semantic_initial_value_from_data)
-        .map_err(|error| format!("semantic initial expression {expression_id}: {error}"))
+    match semantic_static_data(execution, expression_id) {
+        Ok(value) => Ok(semantic_initial_value_from_data(value)),
+        Err(_error)
+            if semantic_type_contains_collection_authority(
+                &expression(execution, expression_id)?.flow_type.ty,
+            ) =>
+        {
+            Ok(SemanticInitialValueV1::ExpressionAuthority)
+        }
+        Err(error) => Err(format!(
+            "semantic initial expression {expression_id}: {error}"
+        )),
+    }
+}
+
+fn semantic_type_contains_collection_authority(ty: &Type) -> bool {
+    match ty {
+        Type::List(_) | Type::Map { .. } | Type::Set(_) => true,
+        Type::Object(shape) => shape
+            .fields
+            .values()
+            .any(semantic_type_contains_collection_authority),
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            boon_typecheck::Variant::Tag(_) => false,
+            boon_typecheck::Variant::Tagged { fields, .. } => fields
+                .fields
+                .values()
+                .any(semantic_type_contains_collection_authority),
+        }),
+        Type::Union(members) => members
+            .iter()
+            .any(semantic_type_contains_collection_authority),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Absent
+        | Type::RenderContract
+        | Type::Function { .. }
+        | Type::UnresolvedShape { .. }
+        | Type::Var(_)
+        | Type::Unknown => false,
+    }
 }
 
 fn semantic_initial_value_from_data(value: boon_data::Value) -> SemanticInitialValueV1 {

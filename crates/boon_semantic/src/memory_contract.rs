@@ -116,6 +116,8 @@ pub struct SemanticMemoryV1 {
     pub id: SemanticMemoryId,
     pub identity: SemanticMemoryIdentityV1,
     pub backing: SemanticMemoryBackingV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structural_owner_rows: Vec<SemanticRowBinding>,
     pub data_type: Type,
     pub leaves: Vec<SemanticMemoryLeafV1>,
     pub status: SemanticMemoryStatusV1,
@@ -440,6 +442,7 @@ fn build_memories(
                 state: state.id,
                 row,
             },
+            structural_owner_rows: Vec::new(),
             data_type: state.flow_type.ty.clone(),
             status: SemanticMemoryStatusV1::Active,
         });
@@ -507,6 +510,7 @@ fn build_memories(
                 list: list.id,
                 row,
             },
+            structural_owner_rows: Vec::new(),
             data_type,
             status: SemanticMemoryStatusV1::Active,
         });
@@ -570,12 +574,91 @@ fn build_memories(
                 expression: expression.id,
                 owner: expression.owner,
             },
+            structural_owner_rows: collection_structural_owner_rows(
+                execution,
+                resources,
+                expression.id,
+            )?,
             data_type: expression.flow_type.ty.clone(),
             status: SemanticMemoryStatusV1::Active,
         });
     }
 
     Ok(memories)
+}
+
+fn collection_structural_owner_rows(
+    execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
+    target: SemanticExprId,
+) -> Result<Vec<SemanticRowBinding>, SemanticMemoryError> {
+    let mut candidates = Vec::<(SemanticRowBinding, SemanticExprId)>::new();
+    for list in &resources.lists {
+        let row = SemanticRowBinding {
+            list: list.id,
+            scope: list.row_scope,
+        };
+        match &list.initializer {
+            crate::SemanticListInitializerV1::RecordLiteral { rows, .. } => {
+                for initial in rows {
+                    if expression_reaches(execution, initial.expression, target)? {
+                        candidates.push((row, initial.expression));
+                    }
+                }
+            }
+            crate::SemanticListInitializerV1::ValueLiteral { values, .. } => {
+                for initial in values {
+                    if expression_reaches(execution, initial.expression, target)? {
+                        candidates.push((row, initial.expression));
+                    }
+                }
+            }
+            crate::SemanticListInitializerV1::Empty
+            | crate::SemanticListInitializerV1::Range { .. } => {}
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    for pair in candidates.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(SemanticMemoryError::new(format!(
+                "collection authority expression {target} is constructed beneath multiple initial occurrences of list {}",
+                pair[0].0.list
+            )));
+        }
+    }
+
+    let mut ranked = candidates
+        .iter()
+        .copied()
+        .map(|candidate| {
+            let mut descendants = 0_usize;
+            for other in &candidates {
+                if candidate != *other && expression_reaches(execution, candidate.1, other.1)? {
+                    descendants = descendants.saturating_add(1);
+                }
+            }
+            Ok((std::cmp::Reverse(descendants), candidate))
+        })
+        .collect::<Result<Vec<_>, SemanticMemoryError>>()?;
+    ranked.sort();
+
+    for left in 0..ranked.len() {
+        for right in (left + 1)..ranked.len() {
+            let left_root = ranked[left].1.1;
+            let right_root = ranked[right].1.1;
+            if !expression_reaches(execution, left_root, right_root)?
+                && !expression_reaches(execution, right_root, left_root)?
+            {
+                return Err(SemanticMemoryError::new(format!(
+                    "collection authority expression {target} has incomparable initial LIST occurrence parents"
+                )));
+            }
+        }
+    }
+
+    Ok(ranked.into_iter().map(|(_, (row, _))| row).collect())
 }
 
 fn collection_statement_path(
@@ -2666,6 +2749,12 @@ fn validate_memory_shape(
                 state,
                 row,
             } => {
+                if !memory.structural_owner_rows.is_empty() {
+                    return Err(SemanticMemoryError::new(format!(
+                        "semantic state memory `{}` retains structural collection-owner rows",
+                        memory.identity.semantic_path
+                    )));
+                }
                 let field = require_storage_field(storage, storage_field)?;
                 if field.flow_type.ty != memory.data_type {
                     return Err(SemanticMemoryError::new(format!(
@@ -2724,6 +2813,12 @@ fn validate_memory_shape(
                 list,
                 row,
             } => {
+                if !memory.structural_owner_rows.is_empty() {
+                    return Err(SemanticMemoryError::new(format!(
+                        "semantic list memory `{}` retains structural collection-owner rows",
+                        memory.identity.semantic_path
+                    )));
+                }
                 let field = require_storage_field(storage, storage_field)?;
                 if field.flow_type.ty != memory.data_type {
                     return Err(SemanticMemoryError::new(format!(
@@ -2766,6 +2861,8 @@ fn validate_memory_shape(
             }
             SemanticMemoryBackingV1::Collection { expression, owner } => {
                 let expression = require_expression(execution, expression)?;
+                let expected_owner_rows =
+                    collection_structural_owner_rows(execution, resources, expression.id)?;
                 let kind_matches = matches!(
                     (memory.identity.kind, &expression.kind, &memory.data_type),
                     (
@@ -2780,11 +2877,12 @@ fn validate_memory_shape(
                 );
                 if !kind_matches
                     || expression.owner != owner
+                    || memory.structural_owner_rows != expected_owner_rows
                     || expression.flow_type.ty != memory.data_type
                     || !matches!(memory.status, SemanticMemoryStatusV1::Active)
                 {
                     return Err(SemanticMemoryError::new(format!(
-                        "semantic collection memory `{}` does not exactly join its executable authority, owner, type, and active status",
+                        "semantic collection memory `{}` does not exactly join its executable authority, lexical owner, structural owner rows, type, and active status",
                         memory.identity.semantic_path
                     )));
                 }
@@ -3053,6 +3151,7 @@ mod tests {
                 state: SemanticStateId(id),
                 row: None,
             },
+            structural_owner_rows: Vec::new(),
             leaves: semantic_memory_leaves(&data_type),
             data_type,
             status,

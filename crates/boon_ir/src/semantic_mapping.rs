@@ -7426,6 +7426,7 @@ fn map_initial_value(value: &SemanticInitialValueV1) -> InitialValue {
         SemanticInitialValueV1::Unknown { summary } => InitialValue::Unknown {
             summary: summary.clone(),
         },
+        SemanticInitialValueV1::ExpressionAuthority => InitialValue::ExpressionAuthority,
     }
 }
 
@@ -10204,6 +10205,12 @@ fn map_semantic_memory(
                     .collect(),
                 status,
                 runtime_backing,
+                structural_owner_rows: memory
+                    .structural_owner_rows
+                    .iter()
+                    .copied()
+                    .map(|row| map_row_binding(ids, row))
+                    .collect::<Result<Vec<_>, _>>()?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

@@ -11,7 +11,7 @@ use boon_example_manifest::{
 use boon_persistence::{
     InMemoryDriver, PersistenceCommand, PersistenceDriver, PersistenceResult,
     PersistenceWorkerConfig, RestoreImage, ShutdownAck, StagedMigration, StoredValue,
-    stage_migration,
+    StoredValueShell, stage_migration,
 };
 use boon_plan::{
     ApplicationIdentity, ExactNumber, MachinePlan, MemoryId, MigrationPredecessorBinding,
@@ -224,7 +224,7 @@ struct ActiveFault {
 struct CanonicalRow {
     key: u64,
     generation: u64,
-    values: BTreeMap<String, StoredValue>,
+    values: BTreeMap<String, StoredValueShell>,
     touched_fields: BTreeSet<String>,
 }
 

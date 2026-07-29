@@ -29,6 +29,8 @@ pub struct SemanticMemory {
     pub leaves: Vec<SemanticMemoryLeaf>,
     pub status: SemanticMemoryStatus,
     pub runtime_backing: SemanticMemoryRuntimeBacking,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structural_owner_rows: Vec<super::ErasedRowBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

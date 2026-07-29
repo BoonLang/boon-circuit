@@ -1,7 +1,8 @@
 use boon_persistence::{
-    CheckpointBatch, InMemoryDriver, PersistenceCommand, PersistenceDriver, PersistenceResult,
+    CheckpointBatch, DurableChange, InMemoryDriver, PersistenceCommand, PersistenceDriver,
+    PersistenceResult,
 };
-use boon_plan::{FieldId, MachinePlan, SourceId, TargetProfile};
+use boon_plan::{FieldId, ListId, MachinePlan, SourceId, TargetProfile};
 use boon_plan_executor::{
     AuthorityDelta, MachineInstance, MachineInstanceBuilder, SessionOptions, SourceEvent,
     SourcePayload, Value, ValueTarget,
@@ -25,6 +26,17 @@ fn field_id(plan: &MachinePlan, label: &str) -> FieldId {
         .unwrap_or_else(|| panic!("missing field debug label `{label}`"))
         .id;
     FieldId(id.strip_prefix("field:").unwrap().parse().unwrap())
+}
+
+fn list_id(plan: &MachinePlan, label: &str) -> ListId {
+    let id = &plan
+        .debug_map
+        .list_slots
+        .iter()
+        .find(|entry| entry.label == label)
+        .unwrap_or_else(|| panic!("missing list debug label `{label}`"))
+        .id;
+    ListId(id.strip_prefix("list:").unwrap().parse().unwrap())
 }
 
 fn source_event(
@@ -240,6 +252,165 @@ document: Document/new(
         assert_eq!(owner.key, Value::Text("order-a".to_owned()));
         assert_eq!(owner.generation, 1);
     }
+}
+
+#[test]
+fn removing_a_list_occurrence_retires_its_nested_collection_authorities() {
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "nested-list-authority-lifecycle.bn",
+        r#"
+store: [
+    remove: SOURCE
+    rows:
+        LIST {
+            [
+                id: TEXT { row-a }
+                lines: MAP { TEXT { sku-a } => 1 }
+            ]
+        }
+        |> List/remove(item, when:
+            remove
+            |> THEN { item.id == remove.id }
+        )
+    observed_lines:
+        rows
+        |> List/map(item, new:
+            item.lines
+            |> Map/get(key: TEXT { sku-a })
+        )
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { nested list authority })
+)
+"#,
+        TargetProfile::SoftwareBounded,
+    )
+    .unwrap();
+    let plan = compiled.plan;
+    let remove = source_id(&plan, "store.remove");
+    let rows = list_id(&plan, "store.rows");
+    let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
+    session.root_value_current("store.observed_lines").unwrap();
+    let Value::List(initial_rows) = session.list_value_current(rows).unwrap() else {
+        panic!("nested LIST fixture did not publish a list");
+    };
+    assert_eq!(initial_rows.len(), 1);
+
+    let initial = session.authority_snapshot().unwrap();
+    let row = initial
+        .lists
+        .get(&rows)
+        .and_then(|list| list.rows.first())
+        .expect("one initial LIST occurrence");
+    let child = initial.maps.keys().next().expect("nested MAP authority");
+    assert_eq!(child.owner_ancestors.last().unwrap().list, rows);
+    assert_eq!(child.owner_ancestors.last().unwrap().key, row.id.key);
+    assert_eq!(
+        child.owner_ancestors.last().unwrap().generation,
+        row.id.generation
+    );
+    assert!(child.collection_ancestors.is_empty());
+    let initial_durable = session.semantic_value_image().unwrap();
+    assert_eq!(initial_durable.maps.len(), 1);
+    assert_eq!(
+        initial_durable
+            .maps
+            .keys()
+            .next()
+            .unwrap()
+            .owner
+            .ancestors
+            .len(),
+        1
+    );
+    let application = initial_durable.application.clone();
+    let schema_hash = initial_durable.schema_hash;
+    let mut persistence = InMemoryDriver::default();
+    let initialized = persistence.execute(PersistenceCommand::Initialize(initial_durable));
+    assert!(
+        matches!(initialized, PersistenceResult::Initialized(Ok(_))),
+        "nested LIST authority initialization failed: {initialized:?}"
+    );
+
+    let turn = session
+        .apply(source_event(
+            &session,
+            1,
+            remove,
+            BTreeMap::from([("id".to_owned(), Value::Text("row-a".to_owned()))]),
+        ))
+        .unwrap();
+    assert!(session.list_row_snapshots(rows).unwrap().is_empty());
+    assert!(session.authority_snapshot().unwrap().maps.is_empty());
+    let delete = turn
+        .authority_deltas
+        .iter()
+        .position(|delta| matches!(delta, AuthorityDelta::DeleteMap { .. }))
+        .expect("nested MAP deletion delta");
+    let parent = turn
+        .authority_deltas
+        .iter()
+        .position(|delta| {
+            matches!(
+                delta,
+                AuthorityDelta::RemoveRow { .. } | AuthorityDelta::ReplaceList { .. }
+            )
+        })
+        .expect("LIST occurrence retirement delta");
+    assert!(
+        delete < parent,
+        "nested authority must retire before its parent occurrence"
+    );
+    let durable_delete = turn
+        .durable_changes
+        .iter()
+        .position(|change| matches!(change, DurableChange::DeleteMap { .. }))
+        .expect("durable nested MAP deletion");
+    let durable_parent = turn
+        .durable_changes
+        .iter()
+        .position(|change| {
+            matches!(
+                change,
+                DurableChange::SetList { .. } | DurableChange::RemoveRow { .. }
+            )
+        })
+        .expect("durable LIST occurrence retirement");
+    assert!(durable_delete < durable_parent);
+    let checkpoint = CheckpointBatch {
+        application: application.clone(),
+        schema_hash,
+        base_epoch: 0,
+        next_epoch: 1,
+        first_turn_sequence: 1,
+        last_turn_sequence: 1,
+        changes: turn.durable_changes,
+        outbox_changes: Vec::new(),
+        content_artifact_changes: Vec::new(),
+        checksum: [0; 32],
+    }
+    .seal();
+    assert!(matches!(
+        persistence.execute(PersistenceCommand::Commit(checkpoint)),
+        PersistenceResult::Committed(Ok(_))
+    ));
+    let durable_image = persistence
+        .image(&application)
+        .cloned()
+        .expect("checkpointed LIST occurrence retirement");
+    assert!(durable_image.maps.is_empty());
+    let mut restored = MachineInstanceBuilder::new(plan, SessionOptions::default())
+        .unwrap()
+        .restore_durable(durable_image)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(
+        restored.list_value_current(rows).unwrap(),
+        Value::List(vec![])
+    );
+    assert!(restored.authority_snapshot().unwrap().maps.is_empty());
 }
 
 #[test]

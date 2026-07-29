@@ -52,7 +52,7 @@ pub struct StoredRow {
     pub source_order_token: u128,
     pub owner: DurableOwner,
     pub materialization_origin: Option<DurableOwner>,
-    pub fields: BTreeMap<MemoryLeafId, StoredValue>,
+    pub fields: BTreeMap<MemoryLeafId, StoredValueShell>,
     pub touched_fields: BTreeSet<MemoryLeafId>,
 }
 
@@ -342,7 +342,7 @@ pub enum DurableChange {
         owner: DurableOwner,
         materialization_origin: Option<DurableOwner>,
         field_id: MemoryLeafId,
-        value: StoredValue,
+        value: StoredValueShell,
     },
     InsertRow {
         memory_id: MemoryId,
@@ -2474,8 +2474,47 @@ fn validate_collection_authority_graph(image: &RestoreImage) -> Result<(), Store
             }
         }
     }
+    for (list_memory_id, list) in &image.lists {
+        for row in &list.rows {
+            for shell in row.fields.values() {
+                for child_id in stored_shell_child_authorities(shell) {
+                    let exists = usize::from(image.maps.contains_key(&child_id))
+                        + usize::from(image.sets.contains_key(&child_id));
+                    if exists != 1 {
+                        return Err(StoreError::InvalidAuthority(format!(
+                            "list {list_memory_id} row {}:{} references missing or ambiguous child collection {}",
+                            row.key, row.generation, child_id.memory_id
+                        )));
+                    }
+                    if !child_id.collection_ancestors.is_empty()
+                        || child_id.owner != row.owner
+                        || child_id.owner.ancestors.last()
+                            != Some(&DurableRowId {
+                                list_memory_id: *list_memory_id,
+                                row_key: row.key,
+                                row_generation: row.generation,
+                            })
+                    {
+                        return Err(StoreError::InvalidAuthority(format!(
+                            "list {list_memory_id} row {}:{} child collection {} disagrees with its typed parent edge",
+                            row.key, row.generation, child_id.memory_id
+                        )));
+                    }
+                    let count = attachments.entry(child_id).or_default();
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        StoreError::InvalidAuthority(
+                            "collection authority attachment count overflow".to_owned(),
+                        )
+                    })?;
+                }
+            }
+        }
+    }
     for collection_id in image.maps.keys().chain(image.sets.keys()) {
-        let expected = u64::from(!collection_id.collection_ancestors.is_empty());
+        let expected = u64::from(
+            !collection_id.collection_ancestors.is_empty()
+                || !collection_id.owner.ancestors.is_empty(),
+        );
         if attachments.get(collection_id).copied().unwrap_or(0) != expected {
             return Err(StoreError::InvalidAuthority(format!(
                 "collection {} does not have exactly one typed parent edge",
@@ -2525,6 +2564,9 @@ fn validate_list(memory_id: MemoryId, list: &StoredList) -> Result<(), StoreErro
             )));
         }
         validate_row_owner(memory_id, row)?;
+        for value in row.fields.values() {
+            validate_stored_value_shell(value, 0)?;
+        }
         if !row
             .touched_fields
             .is_subset(&row.fields.keys().copied().collect())
@@ -2983,7 +3025,7 @@ fn hash_changes(hasher: &mut Sha256, changes: &[DurableChange]) {
                     None => hasher.update([0]),
                 }
                 hasher.update(field_id.as_bytes());
-                hash_stored_value(hasher, value);
+                hash_stored_value_shell(hasher, value);
             }
             DurableChange::InsertRow {
                 memory_id,
@@ -3257,7 +3299,7 @@ fn hash_stored_row(hasher: &mut Sha256, row: &StoredRow) {
     hasher.update((row.fields.len() as u64).to_be_bytes());
     for (field, field_value) in &row.fields {
         hasher.update(field.as_bytes());
-        hash_stored_value(hasher, field_value);
+        hash_stored_value_shell(hasher, field_value);
     }
     hasher.update((row.touched_fields.len() as u64).to_be_bytes());
     for field in &row.touched_fields {
@@ -3498,6 +3540,13 @@ mod tests {
         StoredValue::integer(value).unwrap()
     }
 
+    fn shell_number(value: i64) -> StoredValueShell {
+        let StoredValue::Number(value) = number(value) else {
+            unreachable!("integer helper always returns a number")
+        };
+        StoredValueShell::Number(value)
+    }
+
     fn application() -> ApplicationIdentity {
         ApplicationIdentity::new("dev.boon.counter", "manual", "local")
     }
@@ -3575,7 +3624,7 @@ mod tests {
                 source_order_token: 1_u128 << 64,
                 owner: owner.clone(),
                 materialization_origin: Some(DurableOwner::default()),
-                fields: BTreeMap::from([(field, number(1))]),
+                fields: BTreeMap::from([(field, shell_number(1))]),
                 touched_fields: BTreeSet::from([field]),
             }],
         };
@@ -3611,7 +3660,7 @@ mod tests {
             },
             materialization_origin: None,
             field_id: field,
-            value: number(1),
+            value: shell_number(1),
         };
         let batch = |change| {
             CheckpointBatch {
@@ -3713,6 +3762,68 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("stale parent MAP key generation")
+        );
+    }
+
+    #[test]
+    fn list_occurrence_shell_is_the_typed_parent_edge_for_a_child_collection() {
+        let list_memory = list_memory("rows");
+        let child_memory = map_memory("rows.lines");
+        let field = MemoryLeafId::from_memory_path(list_memory, "rows.lines").unwrap();
+        let owner = DurableOwner {
+            ancestors: vec![DurableRowId {
+                list_memory_id: list_memory,
+                row_key: 1,
+                row_generation: 1,
+            }],
+        };
+        let child_id = DurableCollectionId {
+            memory_id: child_memory,
+            owner: owner.clone(),
+            collection_ancestors: Vec::new(),
+        };
+        let mut image = RestoreImage::empty(application(), 1, [1; 32]);
+        image.lists.insert(
+            list_memory,
+            StoredList {
+                touched: true,
+                revision: 0,
+                next_key: 2,
+                next_order_token: 2_u128 << 64,
+                rows: vec![StoredRow {
+                    key: 1,
+                    generation: 1,
+                    source_order_token: 1_u128 << 64,
+                    owner,
+                    materialization_origin: None,
+                    fields: BTreeMap::from([(
+                        field,
+                        StoredValueShell::ChildAuthority(child_id.clone()),
+                    )]),
+                    touched_fields: BTreeSet::new(),
+                }],
+            },
+        );
+        image.maps.insert(
+            child_id,
+            StoredMap {
+                touched: false,
+                revision: 0,
+                next_key_generation: 1,
+                key_generations: BTreeMap::new(),
+                entries: BTreeMap::new(),
+            },
+        );
+        validate_initial_image(&image).unwrap();
+
+        image.lists.get_mut(&list_memory).unwrap().rows[0]
+            .fields
+            .clear();
+        assert!(
+            validate_initial_image(&image)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one typed parent edge")
         );
     }
 
@@ -4267,7 +4378,7 @@ mod tests {
                     },
                     materialization_origin: None,
                     field_id: field,
-                    value: StoredValue::Text("=A1".to_owned()),
+                    value: StoredValueShell::Text("=A1".to_owned()),
                 },
                 DurableChange::SetRowField {
                     memory_id: list,
@@ -4283,7 +4394,7 @@ mod tests {
                     },
                     materialization_origin: None,
                     field_id: field,
-                    value: StoredValue::Text("=A1+1".to_owned()),
+                    value: StoredValueShell::Text("=A1+1".to_owned()),
                 },
             ],
             outbox_changes: Vec::new(),
@@ -4302,7 +4413,7 @@ mod tests {
         assert_eq!(stored.rows.len(), 1);
         assert_eq!(
             stored.rows[0].fields[&field],
-            StoredValue::Text("=A1+1".to_owned())
+            StoredValueShell::Text("=A1+1".to_owned())
         );
     }
 

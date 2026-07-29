@@ -2442,18 +2442,59 @@ fn semantic_collection_memory_plan(
             memory.identity.semantic_path
         )));
     }
+    let runtime_owner = plan_owner_for_static_owner(
+        program,
+        owner,
+        &format!("collection memory `{}`", memory.identity.semantic_path),
+    )?;
+    let lexical_owner_rows = runtime_owner
+        .ancestors
+        .iter()
+        .map(|ancestor| PlanCollectionOwnerRow {
+            scope: ancestor.scope,
+            list: ancestor.list,
+        })
+        .collect::<Vec<_>>();
+    let structural_owner_rows = memory
+        .structural_owner_rows
+        .iter()
+        .map(|row| PlanCollectionOwnerRow {
+            scope: ScopeId(row.scope.0),
+            list: plan_list_id(row.list),
+        })
+        .collect::<Vec<_>>();
+    let runtime_owner_rows =
+        merge_collection_owner_rows(&lexical_owner_rows, &structural_owner_rows);
     CollectionMemoryPlan::new(
         PlanCollectionAuthorityId(expression.as_usize()),
         kind,
         memory.identity.semantic_path.clone(),
         semantic_data_type_plan(&memory.data_type),
         semantic_memory_owner(memory),
-        plan_owner_for_static_owner(
-            program,
-            owner,
-            &format!("collection memory `{}`", memory.identity.semantic_path),
-        )?,
+        runtime_owner,
+        runtime_owner_rows,
     )
+}
+
+fn merge_collection_owner_rows(
+    lexical: &[PlanCollectionOwnerRow],
+    structural: &[PlanCollectionOwnerRow],
+) -> Vec<PlanCollectionOwnerRow> {
+    if structural.starts_with(lexical) {
+        return structural.to_vec();
+    }
+    if lexical.starts_with(structural) {
+        return lexical.to_vec();
+    }
+    let overlap = (1..=lexical.len().min(structural.len()))
+        .rev()
+        .find(|length| lexical[lexical.len() - length..] == structural[..*length])
+        .unwrap_or(0);
+    lexical
+        .iter()
+        .chain(&structural[overlap..])
+        .cloned()
+        .collect()
 }
 
 fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataTypePlan> {
@@ -6151,6 +6192,7 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
         }),
         InitialValue::RootInitialField { .. }
         | InitialValue::RowInitialField { .. }
+        | InitialValue::ExpressionAuthority
         | InitialValue::Unknown { .. } => None,
     }
 }
@@ -6803,6 +6845,12 @@ fn plan_initial_list_rows(
                             InitialValue::Unknown { summary } => {
                                 return Err(PlanError::new(format!(
                                     "list `{}` initial field `{}` has unsupported expression `{summary}`",
+                                    list.name, field.name
+                                )));
+                            }
+                            InitialValue::ExpressionAuthority => {
+                                return Err(PlanError::new(format!(
+                                    "list `{}` initial field `{}` lost its checked collection-authority expression",
                                     list.name, field.name
                                 )));
                             }

@@ -17,7 +17,7 @@ use super::{
     ActivationBatch, CheckpointBatch, ContentArtifact, ContentArtifactBinding, ContentArtifactId,
     ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
     DurableChange, DurableCollectionId, DurableOutboxChange, OutboxItemId, PersistenceResult,
-    RestoreImage, StoreError, StoredRow, StoredValue, encode_restore_image,
+    RestoreImage, StoreError, StoredRow, StoredValue, StoredValueShell, encode_restore_image,
     validate_content_artifact,
 };
 use boon_plan::{ApplicationIdentity, MemoryId, MigrationEdgeId};
@@ -33,7 +33,7 @@ use super::{
     CompactRequest, DurableContentArtifactChange, ExportApplicationRequest, InspectRequest,
     LoadContentArtifactRequest, PersistenceCommand, PersistenceInspectorSnapshot,
     PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch,
-    RestoreRequest, ShutdownAck, StoredList, StoredMap, StoredSet, StoredValueShell,
+    RestoreRequest, ShutdownAck, StoredList, StoredMap, StoredSet,
     apply_durable_content_artifact_changes, exact_content_artifact_closure,
     inspector_snapshot_with_artifacts, validate_application_transfer,
     validate_content_artifact_manifest, validate_content_artifact_storage,
@@ -2211,7 +2211,7 @@ fn durable_change_admission_cost(change: &DurableChange) -> BrowserPersistenceAd
         }
         DurableChange::SetRowField { owner, value, .. } => 160usize
             .saturating_add(owner_bytes(owner))
-            .saturating_add(stored_value_bytes(value, 0)),
+            .saturating_add(stored_value_shell_bytes(value, 0)),
         DurableChange::InsertRow { row, .. } => 128usize.saturating_add(stored_row_bytes(row)),
         DurableChange::RemoveRow { .. } => 112,
         DurableChange::SetMap { value, .. } => {
@@ -2262,7 +2262,7 @@ fn stored_row_bytes(row: &StoredRow) -> usize {
     for value in row.fields.values() {
         bytes = bytes
             .saturating_add(32)
-            .saturating_add(stored_value_bytes(value, 0));
+            .saturating_add(stored_value_shell_bytes(value, 0));
     }
     bytes
 }
@@ -4635,6 +4635,9 @@ async fn store_key_exists(
 
 fn validate_stored_row(memory: MemoryId, row: &StoredRow, sparse: bool) -> Result<(), StoreError> {
     super::validate_row_owner(memory, row)?;
+    for value in row.fields.values() {
+        super::validate_stored_value_shell(value, 0)?;
+    }
     if !row
         .touched_fields
         .iter()
@@ -6687,6 +6690,13 @@ mod tests {
         StoredValue::integer(value).unwrap()
     }
 
+    fn shell_number(value: i64) -> StoredValueShell {
+        let StoredValue::Number(value) = number(value) else {
+            unreachable!("integer helper always returns a number")
+        };
+        StoredValueShell::Number(value)
+    }
+
     fn application() -> ApplicationIdentity {
         ApplicationIdentity::new("dev.boon.web", "golden", "browser")
     }
@@ -6747,8 +6757,8 @@ mod tests {
             },
             materialization_origin: None,
             fields: BTreeMap::from([
-                (first, StoredValue::Text("text".to_owned())),
-                (second, StoredValue::Bytes(vec![0, 1, 2, 255].into())),
+                (first, StoredValueShell::Text("text".to_owned())),
+                (second, StoredValueShell::Bytes(vec![0, 1, 2, 255].into())),
             ]),
             touched_fields: BTreeSet::from([first, second]),
         };
@@ -6962,7 +6972,7 @@ mod tests {
                 },
                 materialization_origin: None,
                 field_id: field,
-                value: number(9),
+                value: shell_number(9),
             }],
             outbox_changes: vec![DurableOutboxChange::BeginDispatch {
                 item_id: OutboxItemId([0x41; 32]),
@@ -7177,7 +7187,7 @@ mod tests {
                         }],
                     },
                     materialization_origin: None,
-                    fields: BTreeMap::from([(field, StoredValue::Bytes(payload.into()))]),
+                    fields: BTreeMap::from([(field, StoredValueShell::Bytes(payload.into()))]),
                     touched_fields: BTreeSet::from([field]),
                 }],
             },

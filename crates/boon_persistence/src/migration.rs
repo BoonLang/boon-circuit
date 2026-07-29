@@ -1,6 +1,6 @@
 use super::{
     ActivationBatch, DurableOutboxState, OutboxItemId, RestoreImage, StoredList, StoredRow,
-    StoredScalar, StoredValue, validate_outbox_item_schema,
+    StoredScalar, StoredValue, StoredValueShell, validate_outbox_item_schema,
 };
 use boon_data::{ExactNumber, ExactNumberParseReason, NumberTextFormat, format_number_text};
 use boon_plan::{
@@ -726,7 +726,7 @@ fn apply_indexed_transfer(
                         .next()
                         .unwrap_or("")
                         .to_owned(),
-                    value.clone(),
+                    stored_value_from_shell(value)?,
                 );
             }
             if !complete {
@@ -749,15 +749,82 @@ fn apply_indexed_transfer(
             .get_mut(&owner)
             .expect("destination list was installed");
         let target_row = ensure_target_row(target_list, source_row)?;
-        target_row
-            .fields
-            .insert(transfer.destination.leaf_id, value);
+        target_row.fields.insert(
+            transfer.destination.leaf_id,
+            stored_value_shell_from_value(value)?,
+        );
         target_row
             .touched_fields
             .insert(transfer.destination.leaf_id);
         transformed += 1;
     }
     Ok(transformed)
+}
+
+fn stored_value_from_shell(value: &StoredValueShell) -> Result<StoredValue, MigrationError> {
+    Ok(match value {
+        StoredValueShell::Number(value) => StoredValue::Number(value.clone()),
+        StoredValueShell::Text(value) => StoredValue::Text(value.clone()),
+        StoredValueShell::Bytes(value) => StoredValue::Bytes(value.clone()),
+        StoredValueShell::List(values) => StoredValue::List(
+            values
+                .iter()
+                .map(stored_value_from_shell)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        StoredValueShell::Object(fields) => StoredValue::Object(
+            fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), stored_value_from_shell(value)?)))
+                .collect::<Result<BTreeMap<_, _>, MigrationError>>()?,
+        ),
+        StoredValueShell::Tag { tag, fields } => StoredValue::Tag {
+            tag: tag.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), stored_value_from_shell(value)?)))
+                .collect::<Result<BTreeMap<_, _>, MigrationError>>()?,
+        },
+        StoredValueShell::ChildAuthority(_) => {
+            return Err(MigrationError::InvalidTransfer(
+                "indexed migration cannot reinterpret a nested collection authority as ordinary data"
+                    .to_owned(),
+            ));
+        }
+    })
+}
+
+fn stored_value_shell_from_value(value: StoredValue) -> Result<StoredValueShell, MigrationError> {
+    Ok(match value {
+        StoredValue::Number(value) => StoredValueShell::Number(value),
+        StoredValue::Text(value) => StoredValueShell::Text(value),
+        StoredValue::Bytes(value) => StoredValueShell::Bytes(value),
+        StoredValue::List(values) => StoredValueShell::List(
+            values
+                .into_iter()
+                .map(stored_value_shell_from_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        StoredValue::Object(fields) => StoredValueShell::Object(
+            fields
+                .into_iter()
+                .map(|(name, value)| Ok((name, stored_value_shell_from_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>, MigrationError>>()?,
+        ),
+        StoredValue::Tag { tag, fields } => StoredValueShell::Tag {
+            tag,
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| Ok((name, stored_value_shell_from_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>, MigrationError>>()?,
+        },
+        StoredValue::Map(_) | StoredValue::Set(_) => {
+            return Err(MigrationError::InvalidTransfer(
+                "indexed migration cannot materialize MAP or SET snapshots inside a row field"
+                    .to_owned(),
+            ));
+        }
+    })
 }
 
 fn ensure_target_row<'a>(
@@ -1624,10 +1691,13 @@ mod tests {
                         },
                         materialization_origin: None,
                         fields: BTreeMap::from([
-                            (source_title.leaf_id, StoredValue::Text("first".to_owned())),
+                            (
+                                source_title.leaf_id,
+                                StoredValueShell::Text("first".to_owned()),
+                            ),
                             (
                                 source_constructor.leaf_id,
-                                StoredValue::Text("constructor".to_owned()),
+                                StoredValueShell::Text("constructor".to_owned()),
                             ),
                         ]),
                         touched_fields: BTreeSet::from([
@@ -1668,7 +1738,10 @@ mod tests {
         );
         assert_eq!(
             migrated.rows[0].fields,
-            BTreeMap::from([(target_title.leaf_id, StoredValue::Text("first".to_owned()))])
+            BTreeMap::from([(
+                target_title.leaf_id,
+                StoredValueShell::Text("first".to_owned())
+            )])
         );
         assert_eq!(
             migrated.rows[0].touched_fields,

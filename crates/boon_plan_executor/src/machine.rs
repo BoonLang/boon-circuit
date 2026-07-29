@@ -4255,7 +4255,7 @@ struct DurableListRuntimeMetadata {
 struct DurableCollectionRuntimeMetadata {
     authority: PlanCollectionAuthorityId,
     kind: boon_plan::MemoryKind,
-    runtime_owner: PlanOwner,
+    runtime_owner_rows: Vec<boon_plan::PlanCollectionOwnerRow>,
 }
 
 #[derive(Clone, Debug)]
@@ -5086,7 +5086,7 @@ impl Metadata {
             let metadata = DurableCollectionRuntimeMetadata {
                 authority: memory.authority,
                 kind: memory.kind,
-                runtime_owner: memory.runtime_owner.clone(),
+                runtime_owner_rows: memory.runtime_owner_rows.clone(),
             };
             if durable_collection_by_memory
                 .insert(memory.memory_id, metadata.clone())
@@ -5600,7 +5600,7 @@ fn stable_list_fields(
 }
 
 fn stored_list(
-    plan: &MachinePlan,
+    session: &MachineInstance,
     memory: &boon_plan::ListMemoryPlan,
     authority: &ListAuthority,
     touched_only: bool,
@@ -5609,7 +5609,7 @@ fn stored_list(
         .rows
         .iter()
         .filter(|row| !touched_only || !row.touched_fields.is_empty())
-        .map(|row| stored_row(plan, memory, row, touched_only))
+        .map(|row| stored_row(session, memory, row, touched_only))
         .collect::<Result<Vec<_>, _>>()?;
     if !authority.touched {
         for row in &mut rows {
@@ -5634,7 +5634,7 @@ fn stored_list(
 }
 
 fn stored_row(
-    plan: &MachinePlan,
+    session: &MachineInstance,
     memory: &boon_plan::ListMemoryPlan,
     row: &RowAuthority,
     touched_only: bool,
@@ -5645,10 +5645,11 @@ fn stored_row(
         .iter()
         .filter(|(field, _)| !touched_only || row.touched_fields.contains(field))
         .filter_map(|(field, value)| {
-            stable_fields
-                .get(field)
-                .copied()
-                .map(|stable| stored_value(value).map(|value| (stable, value)))
+            stable_fields.get(field).copied().map(|stable| {
+                session
+                    .stored_value_shell(value)
+                    .map(|value| (stable, value))
+            })
         })
         .collect::<Result<BTreeMap<_, _>, Error>>()?;
     let touched_fields = row
@@ -5660,11 +5661,11 @@ fn stored_row(
         key: row.id.key,
         generation: row.id.generation,
         source_order_token: row.source_order_token,
-        owner: durable_owner_for_rows(plan, &row.owner_ancestors)?,
+        owner: durable_owner_for_rows(&session.plan, &row.owner_ancestors)?,
         materialization_origin: row
             .materialization_origin
             .as_ref()
-            .map(|origin| durable_owner_for_rows(plan, origin))
+            .map(|origin| durable_owner_for_rows(&session.plan, origin))
             .transpose()?,
         fields,
         touched_fields,
@@ -10122,23 +10123,23 @@ impl MachineBuildTask {
                 build.memory_id
             )));
         }
-        let fields = row
-            .fields
-            .into_iter()
-            .map(|(stable, value)| {
-                let field = metadata
-                    .fields_by_leaf
-                    .get(&stable)
-                    .copied()
-                    .ok_or_else(|| {
-                        Error::InvalidPlan(format!(
-                            "restore list {} contains unknown row leaf {stable}",
-                            build.memory_id
-                        ))
-                    })?;
-                Ok((field, runtime_value(value)?))
-            })
-            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        let mut fields = BTreeMap::new();
+        for (stable, value) in row.fields {
+            let field = metadata
+                .fields_by_leaf
+                .get(&stable)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "restore list {} contains unknown row leaf {stable}",
+                        build.memory_id
+                    ))
+                })?;
+            fields.insert(
+                field,
+                self.session_mut().runtime_value_from_stored_shell(value)?,
+            );
+        }
         let touched_fields = row
             .touched_fields
             .into_iter()
@@ -13410,7 +13411,7 @@ impl MachineInstance {
             })?;
             let durable_structure = self.metadata.durable_lists.contains(&slot.list_id);
             let mut stored = stored_list(
-                &self.plan,
+                self,
                 list_memory,
                 list,
                 !durable_structure || (!include_untouched_values && !list.touched),
@@ -13426,10 +13427,24 @@ impl MachineInstance {
                     continue;
                 }
             } else if include_untouched_values {
-                stored.touched = false;
+                stored.touched = true;
                 stored.next_key = list.next_key;
+                stored.next_order_token = list.next_order_token;
                 for row in &mut stored.rows {
                     row.touched_fields.clear();
+                    row.source_order_token = list
+                        .rows
+                        .iter()
+                        .find(|authority| {
+                            authority.id.key == row.key && authority.id.generation == row.generation
+                        })
+                        .map(|authority| authority.source_order_token)
+                        .ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "semantic list baseline {} lost row {}:{} ordering",
+                                list_memory.memory_id, row.key, row.generation
+                            ))
+                        })?;
                 }
             } else if !stored.touched && stored.rows.is_empty() {
                 continue;
@@ -13636,7 +13651,7 @@ impl MachineInstance {
                             .map(|origin| durable_owner_for_rows(&self.plan, origin))
                             .transpose()?,
                         field_id,
-                        value: stored_value(value)?,
+                        value: self.stored_value_shell(value)?,
                     })
                 }
                 AuthorityDelta::ReplaceList { list_id, authority } => {
@@ -13649,7 +13664,7 @@ impl MachineInstance {
                     }
                     Ok(boon_persistence::DurableChange::SetList {
                         memory_id: memory.memory_id,
-                        value: stored_list(&self.plan, memory, authority, false)?,
+                        value: stored_list(self, memory, authority, false)?,
                     })
                 }
                 AuthorityDelta::InsertRow {
@@ -13668,7 +13683,7 @@ impl MachineInstance {
                         memory_id: memory.memory_id,
                         list_revision: list.revision,
                         index: *index,
-                        row: stored_row(&self.plan, memory, row, false)?,
+                        row: stored_row(self, memory, row, false)?,
                         next_key: *next_key,
                         next_order_token: list.next_order_token,
                     })
@@ -15695,11 +15710,11 @@ impl MachineInstance {
                     address.authority.0
                 ))
             })?;
-        if address.owner_ancestors.len() != metadata.runtime_owner.ancestors.len()
+        if address.owner_ancestors.len() != metadata.runtime_owner_rows.len()
             || address
                 .owner_ancestors
                 .iter()
-                .zip(&metadata.runtime_owner.ancestors)
+                .zip(&metadata.runtime_owner_rows)
                 .any(|(actual, expected)| actual.list != expected.list)
         {
             return Err(Error::InvalidPlan(format!(
@@ -15769,18 +15784,18 @@ impl MachineInstance {
                     collection_id.memory_id
                 ))
             })?;
-        if collection_id.owner.ancestors.len() != metadata.runtime_owner.ancestors.len() {
+        if collection_id.owner.ancestors.len() != metadata.runtime_owner_rows.len() {
             return Err(Error::InvalidPlan(format!(
                 "collection memory {} owner has {} rows, expected {}",
                 collection_id.memory_id,
                 collection_id.owner.ancestors.len(),
-                metadata.runtime_owner.ancestors.len()
+                metadata.runtime_owner_rows.len()
             )));
         }
         let owner_ancestors = self.runtime_owner_rows(&collection_id.owner)?;
         if owner_ancestors
             .iter()
-            .zip(&metadata.runtime_owner.ancestors)
+            .zip(&metadata.runtime_owner_rows)
             .any(|(actual, expected)| actual.list != expected.list)
         {
             return Err(Error::InvalidPlan(format!(
@@ -30807,6 +30822,11 @@ impl MachineInstance {
                     row.list.0, row.key, row.generation
                 ))
             })?;
+        let owner_rows = self.row_owner_rows(row)?;
+        self.retire_collection_authorities(
+            |candidate| candidate.owner_ancestors.starts_with(&owner_rows),
+            work,
+        );
         let touched_fields = self
             .touched_row_fields
             .iter()

@@ -759,6 +759,9 @@ pub enum InitialValue {
     Unknown {
         summary: String,
     },
+    /// The enclosing list field carries the exact executable expression that
+    /// constructs a nested collection authority in the occurrence scope.
+    ExpressionAuthority,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4872,6 +4875,7 @@ fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
         InitialValue::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown initializer", summary)
         }
+        InitialValue::ExpressionAuthority => Ok(()),
         InitialValue::Text { .. }
         | InitialValue::Number { .. }
         | InitialValue::Bytes { .. }

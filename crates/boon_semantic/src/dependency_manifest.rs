@@ -6116,15 +6116,7 @@ fn inventory_view(
     )?;
 
     for root in &view.roots {
-        let owner = exact_owner(
-            vec![
-                owners.statement(root.statement)?,
-                owners.expression(root.expression)?,
-                owners.binding(root.binding)?,
-                semantic_scope_owner(execution, root.route_scope, owners)?,
-            ],
-            &format!("view root {}", root.id),
-        )?;
+        let owner = view_root_owner(view, root.id, execution, owners)?;
         collect_dependency!(
             collector,
             owner,
@@ -6392,27 +6384,10 @@ fn inventory_view(
     Ok(())
 }
 
-fn semantic_scope_owner(
-    execution: &SemanticExecutionGraphV1,
-    scope: SemanticScopeId,
-    owners: &DependencyOwnerIndex,
-) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
-    let scope = execution
-        .scopes
-        .get(scope.as_usize())
-        .filter(|candidate| candidate.id == scope)
-        .ok_or_else(|| {
-            CallableDependencyManifestError::new(format!(
-                "dependency ownership references missing semantic scope {scope}"
-            ))
-        })?;
-    owners.checked_scope(scope.checked_scope)
-}
-
 fn view_root_owner(
     view: &SemanticViewBindingGraphV1,
     root: SemanticViewRootId,
-    execution: &SemanticExecutionGraphV1,
+    _execution: &SemanticExecutionGraphV1,
     owners: &DependencyOwnerIndex,
 ) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
     let root = view
@@ -6424,12 +6399,15 @@ fn view_root_owner(
                 "dependency ownership references missing view root {root}"
             ))
         })?;
+    // `route_scope` is a lexical definition coordinate and remains a
+    // dependency reference. The retained root itself is an executable
+    // occurrence, so only its statement, expression, and binding determine
+    // primary ownership.
     exact_owner(
         vec![
             owners.statement(root.statement)?,
             owners.expression(root.expression)?,
             owners.binding(root.binding)?,
-            semantic_scope_owner(execution, root.route_scope, owners)?,
         ],
         &format!("view root {}", root.id),
     )

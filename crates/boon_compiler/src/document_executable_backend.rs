@@ -1719,17 +1719,6 @@ impl<'a> DocumentCompiler<'a> {
         context: &CompileContext,
         final_class: DocumentValueClass,
     ) -> Result<DocumentExprId, PlanError> {
-        if let GlobalValue::Inline(producer) = global {
-            let expression = self.compile_expression_projection(
-                producer,
-                projection,
-                context,
-                None,
-                final_class,
-            )?;
-            self.record_compiled_path(&joined_path(path, projection), expression);
-            return Ok(expression);
-        }
         let exact_path = joined_path(path, projection);
         if !projection.is_empty()
             && let Some(exact) = self.value_index.resolve(&exact_path)
@@ -1783,6 +1772,17 @@ impl<'a> DocumentCompiler<'a> {
                 self.record_compiled_path(&exact_path, expression);
                 return Ok(expression);
             }
+        }
+        if let GlobalValue::Inline(producer) = global {
+            let expression = self.compile_expression_projection(
+                producer,
+                projection,
+                context,
+                None,
+                final_class,
+            )?;
+            self.record_compiled_path(&exact_path, expression);
+            return Ok(expression);
         }
         if let GlobalValue::Source(source) = global
             && !projection.is_empty()

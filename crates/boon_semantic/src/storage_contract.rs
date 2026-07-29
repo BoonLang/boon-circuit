@@ -2472,9 +2472,6 @@ fn build_row_source_projections(
         }
     }
     for materialization in &execution.materializations {
-        if materialization.operation != SemanticContextualOperationKind::Map {
-            continue;
-        }
         let Some(row) = materialization
             .target_list_id
             .zip(materialization.target_scope_id)
@@ -2482,12 +2479,15 @@ fn build_row_source_projections(
         else {
             continue;
         };
-        let body = require_expression(execution, materialization.body)?;
-        for member in &body.provenance.members {
-            match member.origin {
-                SemanticValueOrigin::Source { source, .. } => {
-                    require_source(resources, source)?;
-                    if !member.path.is_empty() {
+        match materialization.operation {
+            SemanticContextualOperationKind::Map => {
+                let body = require_expression(execution, materialization.body)?;
+                for member in &body.provenance.members {
+                    if let SemanticValueOrigin::Source { source, .. } = member.origin {
+                        require_source(resources, source)?;
+                        if member.path.is_empty() {
+                            continue;
+                        }
                         insert_row_source_projection(
                             &mut projections,
                             row,
@@ -2497,11 +2497,41 @@ fn build_row_source_projections(
                         )?;
                     }
                 }
-                SemanticValueOrigin::Runtime
-                | SemanticValueOrigin::ProducerSource { .. }
-                | SemanticValueOrigin::State { .. }
-                | SemanticValueOrigin::MaterializationLocal { .. } => {}
             }
+            SemanticContextualOperationKind::Filter
+            | SemanticContextualOperationKind::Retain
+            | SemanticContextualOperationKind::Remove
+            | SemanticContextualOperationKind::SortBy
+            | SemanticContextualOperationKind::ThenBy => {
+                let local = locals
+                    .iter()
+                    .find(|local| {
+                        local.owner == materialization.owner
+                            && local.local == materialization.row_local
+                    })
+                    .ok_or_else(|| {
+                        SemanticScopeStorageError::new(format!(
+                            "{:?} materialization {} has no exact storage local",
+                            materialization.operation, materialization.id
+                        ))
+                    })?;
+                for member in &local.members {
+                    let SemanticStorageLocalMemberTargetV1::Source(source) = member.target else {
+                        continue;
+                    };
+                    require_source(resources, source)?;
+                    insert_row_source_projection(
+                        &mut projections,
+                        row,
+                        &member.path,
+                        source,
+                        "identity-preserving materialization",
+                    )?;
+                }
+            }
+            SemanticContextualOperationKind::Every
+            | SemanticContextualOperationKind::Any
+            | SemanticContextualOperationKind::Find => {}
         }
     }
     Ok(projections

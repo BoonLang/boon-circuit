@@ -513,9 +513,14 @@ fn fjordpulse_scale_access_matrix_is_bounded_across_58_500_rows() {
     let (deep_page, deep_metrics) = session
         .root_value_current_with_metrics("store.page")
         .expect("deep station page must execute");
-    let Value::Record(deep_page) = deep_page else {
+    let Value::Tag {
+        tag,
+        fields: deep_page,
+    } = deep_page
+    else {
         panic!("deep station page must be structural")
     };
+    assert_eq!(tag, "Page");
     assert!(matches!(&deep_page["items"], Value::List(items) if items.len() == 20));
     assert_eq!(
         turn.metrics

@@ -2574,11 +2574,97 @@ fn provisional_out_port_contract(
     })
 }
 
+fn out_contract_resolution_order(graph: &ResolvedOutGraph) -> Result<Vec<usize>, SemanticError> {
+    // Nested contextual bodies can be allocated before the enclosing output
+    // port whose item contract they project. Resolve those exact port
+    // dependencies first instead of relying on allocation order.
+    fn visit(
+        graph: &ResolvedOutGraph,
+        port_index: usize,
+        states: &mut [u8],
+        order: &mut Vec<usize>,
+    ) -> Result<(), SemanticError> {
+        match states.get(port_index).copied() {
+            Some(2) => return Ok(()),
+            Some(1) => {
+                return Err(SemanticError::new(format!(
+                    "OUT contract evaluation-port dependencies contain a cycle at port {port_index}"
+                )));
+            }
+            Some(0) => {}
+            _ => {
+                return Err(SemanticError::new(format!(
+                    "OUT contract resolution references missing port {port_index}"
+                )));
+            }
+        }
+        states[port_index] = 1;
+
+        let port = graph.ports.get(port_index).ok_or_else(|| {
+            SemanticError::new(format!(
+                "OUT contract resolution references missing port {port_index}"
+            ))
+        })?;
+        let call = graph
+            .call_instances
+            .get(port.call.as_usize())
+            .filter(|call| call.id == port.call)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "OUT port {port_index} references missing call {}",
+                    port.call
+                ))
+            })?;
+        let dependencies = call
+            .inputs
+            .iter()
+            .filter_map(|input| match input.value {
+                out_net::OutInputValue::Checked(ScopedCheckedExpr {
+                    evaluation_port: Some(dependency),
+                    ..
+                }) => Some(dependency),
+                _ => None,
+            })
+            .filter(|dependency| {
+                graph
+                    .ports
+                    .get(dependency.as_usize())
+                    .is_none_or(|dependency_port| dependency_port.call != call.id)
+            })
+            .collect::<BTreeSet<_>>();
+        for dependency in dependencies {
+            let dependency_index = dependency.as_usize();
+            if graph
+                .ports
+                .get(dependency_index)
+                .is_none_or(|port| port.id != dependency)
+            {
+                return Err(SemanticError::new(format!(
+                    "OUT port {port_index} references missing evaluation port {dependency}"
+                )));
+            }
+            visit(graph, dependency_index, states, order)?;
+        }
+
+        states[port_index] = 2;
+        order.push(port_index);
+        Ok(())
+    }
+
+    let mut states = vec![0; graph.ports.len()];
+    let mut order = Vec::with_capacity(graph.ports.len());
+    for port_index in 0..graph.ports.len() {
+        visit(graph, port_index, &mut states, &mut order)?;
+    }
+    Ok(order)
+}
+
 fn resolve_out_contracts(
     program: &CheckedProgram,
     graph: &mut ResolvedOutGraph,
 ) -> Result<(), SemanticError> {
-    for port_index in 0..graph.ports.len() {
+    let resolution_order = out_contract_resolution_order(graph)?;
+    for port_index in resolution_order {
         let (call_id, formal, net_id) = {
             let port = &graph.ports[port_index];
             (port.call, port.formal, port.net)
@@ -2854,6 +2940,16 @@ fn concrete_checked_expression_type(
                         .iter()
                         .map(|substitution| (substitution.variable, substitution.value.clone())),
                 );
+                let checked_result =
+                    apply_out_contract_substitutions(&callable.result.ty, &substitutions);
+                if out_contract_type_is_resolved(&checked_result) {
+                    // The checked call already owns a concrete result contract.
+                    // Re-walking unrelated monomorphic inputs here would
+                    // duplicate typechecker-specific argument rules (for
+                    // example render metadata syntax) without contributing any
+                    // result substitutions.
+                    return Ok(checked_result);
+                }
                 let ordered_inputs = instance
                     .inputs
                     .iter()
